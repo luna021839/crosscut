@@ -373,7 +373,8 @@ def shorten_joint_incoming_return(camera, transition, containment, *, fps,
 def review_joint_dissolve_containment(*, segments, transitions, source_geometries,
         geometry_provider, fps, minimum_face_visible=.98, minimum_body_visible=.72,
         pixel_containment_provider=None, legacy_face_only_maximum_zoom=1.12,
-        legacy_face_only_maximum_center_shift=.025, frame_counts=None):
+        legacy_face_only_maximum_center_shift=.025, frame_counts=None,
+        bracketed_body_containment_provider=None):
     """Review every transformed output frame on its actual render source clock.
 
 The provider accepts (request source index, source-local seconds), NOT master
@@ -387,6 +388,7 @@ This is containment evidence, not a final artistic/pixel quality judgement.
     from .direct_member_transform import map_box_to_portrait_fill,box_visible_fraction
     from .render import quantized_segment_frame_counts
     from .focal_pixel_containment_support import FocalPixelContainmentSupport
+    from .focal_bracket_containment import FocalBracketContainmentSupport
     segments=tuple(segments);transitions=tuple(transitions)
     counts=quantized_segment_frame_counts(segments,fps) if frame_counts is None else tuple(frame_counts)
     if len(counts)!=len(segments) or any(isinstance(n,bool) or not isinstance(n,int) or n<2 for n in counts):
@@ -410,6 +412,27 @@ This is containment evidence, not a final artistic/pixel quality judgement.
             if abs(state.roll_degrees)>1e-9:
                 row.update(passed=False,reason='rotated_containment_not_measured')
             elif not valid:
+                body_support = (bracketed_body_containment_provider(segment.source_index, local)
+                    if scope == 'nominal' and bracketed_body_containment_provider else None)
+                if (isinstance(body_support, FocalBracketContainmentSupport)
+                        and body_support.source_index == segment.source_index
+                        and abs(body_support.source_seconds-local) <= 1e-9):
+                    geometry = source_geometries[segment.source_index]
+                    body_box = body_support.bbox_xywh
+                    body_fraction = box_visible_fraction(map_box_to_portrait_fill(body_box, geometry),
+                        zoom=state.zoom, center_x=state.center_x, center_y=state.center_y)
+                    upper_box = (*body_box[:3], body_box[3]*.25)
+                    upper_fraction = box_visible_fraction(map_box_to_portrait_fill(upper_box, geometry),
+                        zoom=state.zoom, center_x=state.center_x, center_y=state.center_y)
+                    row.update(passed=body_fraction >= minimum_body_visible and upper_fraction >= minimum_face_visible,
+                        reason='bracketed_observed_body_containment', body_visible_fraction=body_fraction,
+                        upper_body_visible_fraction=upper_fraction,
+                        anchor_source_seconds=list(body_support.anchor_source_seconds),
+                        observed_body_box=list(body_box), face_detection_claimed=False,
+                        cross_source_pose_authority=False)
+                    rows.append(row)
+                    if not row['passed']:failures.append(row)
+                    continue
                 support=pixel_containment_provider(segment.source_index,local) if pixel_containment_provider else None
                 if (isinstance(support,FocalPixelContainmentSupport) and support.source_index==segment.source_index
                     and abs(support.source_seconds-local)<=1e-9):

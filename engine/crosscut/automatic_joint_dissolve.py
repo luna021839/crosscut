@@ -7,6 +7,7 @@ from .direct_member_editorial_motion import DirectMemberEditorialMotionConfig
 from .direct_member_target_face import FOCAL_FACE_BASIS
 from .direct_member_transform import map_box_to_portrait_fill
 from .focal_pixel_containment_support import measure_focal_pixel_containment
+from .focal_bracket_containment import measure_bracketed_body_containment
 from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_dissolve_registration,
     materialize_joint_dissolve_registration,review_joint_dissolve_containment,shorten_joint_incoming_return,
     joint_pose_anchor_observations)
@@ -38,7 +39,7 @@ All measurement calls use the actual source-local clocks of the render plan.
         if not 0<=compact<len(eligible) or segment.source_index!=eligible[compact]:
             raise ValueError('automatic joint camera selected source differs from render source')
     counts=quantized_segment_frame_counts(segments,fps)
-    samples={};pixel_cache={};rows=[];owned_incoming=set()
+    samples={};pixel_cache={};body_bracket_cache={};rows=[];owned_incoming=set()
     solves=registration_cache if registration_cache is not None else {}
     def sample(request,local):
         key=(request,local)
@@ -89,6 +90,37 @@ All measurement calls use the actual source-local clocks of the render plan.
                     source_times=local_times,focal_boxes=values[before:after+1],query_index=2-before,
                     fps=fps,native_scene_cut_seconds=native[request])
             pixel_cache[key]=support
+            return support
+        def bracketed_body(request, local):
+            key = (request, local, rates[request], native[request])
+            if key in body_bracket_cache:return body_bracket_cache[key]
+            body_bracket_cache[key] = None
+            # Reuse detections already made by the failed strict focal query.
+            # Never start a new anonymous detector or overwrite its identity.
+            body_provider = getattr(focal_provider, 'bodies', None)
+            if body_provider is None:return None
+            compact = reverse[request]
+            sampler = focal_provider.faces._samplers[compact]
+            frame_key = focal_provider.faces._identity_key(compact, sampler, local)
+            frame = body_provider._frame_cache.get(frame_key)
+            if frame is None or frame.source_index != compact or not frame.observations:return None
+            step = rates[request]/fps
+            before = after = None
+            for distance in (1, 2, 3, 4):
+                if before is None and local-distance*step >= 0:
+                    value = sample(request, local-distance*step)
+                    if value is not None and value.subject_bbox_xywh is not None:
+                        before = (request, local-distance*step, value)
+                if after is None:
+                    value = sample(request, local+distance*step)
+                    if value is not None and value.subject_bbox_xywh is not None:
+                        after = (request, local+distance*step, value)
+                if before is not None and after is not None:break
+            if before is None or after is None:return None
+            support = measure_bracketed_body_containment(source_index=request, source_seconds=local,
+                observed_query_boxes=tuple(o.person.bbox_xywh for o in frame.observations),
+                anchors=(before, after), native_scene_cut_seconds=native[request])
+            body_bracket_cache[key] = support
             return support
         observations=[];failure=None
         for side,segment in enumerate(pair):
@@ -166,6 +198,7 @@ All measurement calls use the actual source-local clocks of the render plan.
             row.update(reason='camera_composition_unavailable',detail=str(error));continue
         containment=review_joint_dissolve_containment(segments=(a,b),transitions=(registered,),
             source_geometries=geometry_by_request,geometry_provider=sample,pixel_containment_provider=pixels,
+            bracketed_body_containment_provider=bracketed_body,
             fps=fps,frame_counts=counts[index:index+2],minimum_face_visible=settings.minimum_dense_face_visible_fraction,
             minimum_body_visible=settings.minimum_face_associated_subject_visible_fraction,
             legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
@@ -179,6 +212,7 @@ All measurement calls use the actual source-local clocks of the render plan.
                 alternate_b=replace(b,editorial_transform=alternate)
                 revised=review_joint_dissolve_containment(segments=(a,alternate_b),transitions=(registered,),
                     source_geometries=geometry_by_request,geometry_provider=sample,pixel_containment_provider=pixels,
+                    bracketed_body_containment_provider=bracketed_body,
                     fps=fps,frame_counts=counts[index:index+2],minimum_face_visible=settings.minimum_dense_face_visible_fraction,
                     minimum_body_visible=settings.minimum_face_associated_subject_visible_fraction,
                     legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
