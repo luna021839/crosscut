@@ -16,7 +16,10 @@ from typing import Any
 
 from .joint_boundary_provider import (
     ProgressDecodedBoundaryOptionProvider, _source_runtime_stat_identity,
+    _SCALAR_BRIDGE_CACHE_NAMESPACE, _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD,
 )
+from .joint_scalar_reader_compatibility import previous_reader_scalar_analyzer
+from .source_scalar_cache import PersistentSourceScalarCache
 
 
 class JointObservationBank:
@@ -86,6 +89,8 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         super().__init__(**kwargs)
         self._observation_bank = observation_bank
         self._pending_observations: dict[tuple, Any] = {}
+        self._legacy_scalar_entries_admitted = 0
+        self._legacy_scalar_conflicts = 0
         self._observation_namespace = (
             self._configuration_identity, self._source_runtime_stat_identities,
         )
@@ -159,6 +164,34 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         self._remember_observation(key, value)
         return value
 
+    def _load_scalar_bridge_persistent_cache(self, segment_index):
+        was_loaded = segment_index in self._scalar_bridge_persistent_cache_loaded_segments
+        super()._load_scalar_bridge_persistent_cache(segment_index)
+        if was_loaded or segment_index not in self._scalar_bridge_persistent_cache_loaded_segments:
+            return
+        current_cache = self._scalar_bridge_persistent_caches[segment_index]
+        legacy_analyzer = previous_reader_scalar_analyzer(current_cache.analyzer)
+        if legacy_analyzer is None:
+            return
+        direct_root = self.feature_derived_cache_directory
+        legacy_cache = PersistentSourceScalarCache(
+            source_cache_directory=direct_root, source_path=self.sources[0],
+            namespace=_SCALAR_BRIDGE_CACHE_NAMESPACE, analyzer=legacy_analyzer,
+            derived_cache_directory=direct_root,
+        )
+        legacy = self._decode_scalar_bridge_shard_payload(
+            legacy_cache.get(), segment_index=segment_index)
+        current = self._scalar_bridge_persistent_entries_by_segment[segment_index]
+        for key, value in sorted(legacy.items()):
+            if key in current:
+                if current[key] != value:
+                    self._legacy_scalar_conflicts += 1
+                continue  # Fresh exact evaluation has precedence.
+            if len(current) >= _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD:
+                break
+            current[key] = value
+            self._legacy_scalar_entries_admitted += 1
+
     def _enforce_transient_cache_limits(self):
         super()._enforce_transient_cache_limits()
         if self._active_transaction_journal is None:
@@ -173,4 +206,9 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
 
     def to_dict(self):
         return {**super().to_dict(),
+                "scalar_bridge_reader_compatibility": {
+                    "admitted_entries": self._legacy_scalar_entries_admitted,
+                    "conflicting_legacy_entries_ignored": self._legacy_scalar_conflicts,
+                    "renderer_proofs_reused": False,
+                },
                 "observation_reuse": self._observation_bank.diagnostics()}
