@@ -5,7 +5,7 @@ import unittest
 
 from crosscut.body_pose_2d import BodyPose2DEvidence
 from crosscut.visible_arm_motion import (
-    VisibleArmObservation, compare_arm_motion, visible_arm_observation,
+    VisibleArmObservation, compare_arm_motion, compare_arm_endpoints, visible_arm_observation,
 )
 
 
@@ -85,6 +85,43 @@ class VisibleArmMotionTests(unittest.TestCase):
         result = compare_arm_motion([(0., observation()), (1., None)], window([0.,1.]))
         self.assertFalse(result['available'])
         self.assertEqual(result['reason'], 'missing_observation')
+
+    def test_endpoint_shape_is_not_lost_when_context_motion_is_missing(self):
+        a, b = observation(), observation(.2)
+        motion = compare_arm_motion([(0.,None),(1.,a)], [(0.,b),(1.,None)])
+        self.assertFalse(motion['available'])
+        endpoints = compare_arm_endpoints(a,b)
+        self.assertTrue(endpoints['available'])
+        self.assertAlmostEqual(endpoints['endpoint_rms'], 1.)
+        self.assertFalse(endpoints['temporal_motion_proven'])
+
+    def test_endpoint_match_does_not_claim_same_motion_direction(self):
+        result = compare_arm_endpoints(observation(), observation())
+        self.assertEqual(result['endpoint_rms'], 0.)
+        self.assertFalse(result['temporal_motion_proven'])
+        self.assertFalse(result['quality_calibrated'])
+        self.assertFalse(result['final_media_authority'])
+
+    def test_endpoint_masks_missing_and_insufficient_joints(self):
+        self.assertFalse(compare_arm_endpoints(None, observation())['available'])
+        result = compare_arm_endpoints(observation(missing=(4,5)), observation(.1))
+        self.assertTrue(result['available'])
+        self.assertEqual(result['common_arm_joint_count'], 2)
+        self.assertFalse(compare_arm_endpoints(observation(missing=(2,4,5)), observation())['available'])
+
+    def test_endpoint_shape_is_symmetric_and_camera_zoom_translation_invariant(self):
+        a, b = observation(), observation(transform=(.7,.1,.1))
+        self.assertLess(compare_arm_endpoints(a,b)['endpoint_rms'], 1e-12)
+        c = observation(.1)
+        self.assertEqual(compare_arm_endpoints(a,c)['endpoint_rms'], compare_arm_endpoints(c,a)['endpoint_rms'])
+
+    def test_endpoint_rejects_invalid_or_unanchored_observations(self):
+        for invalid in (
+            VisibleArmObservation(((math.nan,0.),)*6, (True,)*6),
+            VisibleArmObservation(((0.,0.),)*6, (False,)*6),
+        ):
+            with self.assertRaises(ValueError):
+                compare_arm_endpoints(invalid, observation())
 
     def test_invalid_observations_and_clocks_are_rejected(self):
         good = observation()

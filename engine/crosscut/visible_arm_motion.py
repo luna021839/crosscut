@@ -127,3 +127,40 @@ def compare_arm_motion(
                   velocity_cosine=max(-1., min(1., cosine)) if cosine is not None else None,
                   outgoing_speed=magnitude_a, incoming_speed=magnitude_b)
     return result
+
+
+def compare_arm_endpoints(
+    outgoing: VisibleArmObservation | None,
+    incoming: VisibleArmObservation | None,
+) -> dict[str, object]:
+    """Measure exact-cut arm shape independently of temporal-flow availability.
+
+    An absent preceding/following observation cannot erase a genuinely measured
+    endpoint pair. Conversely, this endpoint measurement does not claim a
+    movement direction, temporal phase match, or acceptance of the edit.
+    """
+    result: dict[str, object] = dict(
+        basis=ARM_MOTION_BASIS, available=False, reason='missing_observation',
+        common_arm_joint_count=0, endpoint_rms=None,
+        temporal_motion_proven=False, quality_calibrated=False,
+        final_media_authority=False,
+    )
+    if outgoing is None or incoming is None:
+        return result
+    for observation in (outgoing, incoming):
+        if (not isinstance(observation, VisibleArmObservation)
+                or len(observation.coordinates) != 6 or len(observation.visible) != 6
+                or any(type(v) is not bool for v in observation.visible)
+                or not all(observation.visible[:2])
+                or any(len(p) != 2 or any(isinstance(v, bool) or not isinstance(v, Real)
+                    or not math.isfinite(v) for v in p) for p in observation.coordinates)):
+            raise ValueError('invalid shoulder-normalized visible-arm observation')
+    joints = [j for j in range(2, 6) if outgoing.visible[j] and incoming.visible[j]]
+    result['common_arm_joint_count'] = len(joints)
+    if len(joints) < 2:
+        result['reason'] = 'insufficient_common_arm_joints'
+        return result
+    distance = math.sqrt(sum(math.dist(outgoing.coordinates[j], incoming.coordinates[j])**2
+                             for j in joints) / len(joints))
+    result.update(available=True, reason='observed', endpoint_rms=distance)
+    return result
