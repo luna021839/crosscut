@@ -11,6 +11,7 @@ dependencies = [
   "numpy>=2.0",
   "opencv-contrib-python>=4.10",
   "tensorflow==2.20.0",
+  "yt-dlp[default]>=2026.8.19",
 ]
 
 [project.optional-dependencies]

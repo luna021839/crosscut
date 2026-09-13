@@ -763,7 +763,32 @@ class YTDLPClient:
         payload["_crosscut_ytdlp_returncode"] = completed.returncode
         return payload
 
-    def download(self, candidate: AcquisitionCandidate, directory: Path) -> Path:
+    def best_video_dimensions(self, video_id: str) -> tuple[int, int]:
+        """Check actual public formats; a configured 4K preference is not proof."""
+        if _VIDEO_ID.fullmatch(video_id) is None:
+            raise ValueError("invalid video ID for format inspection")
+        command = (*self.command, "--no-config", "--no-cookies", "--no-playlist",
+            "--skip-download", "--dump-single-json", "--socket-timeout", "10",
+            "--retries", "0", f"https://www.youtube.com/watch?v={video_id}")
+        try:
+            completed = self._runner(command, check=False, capture_output=True,
+                text=True, timeout=40)
+            payload = json.loads(completed.stdout)
+            if completed.returncode or not isinstance(payload, dict) or payload.get("id") != video_id:
+                raise ValueError("format metadata ID or process status mismatch")
+            dimensions = [(int(f["width"]), int(f["height"])) for f in payload.get("formats", [])
+                if isinstance(f, dict) and f.get("vcodec") not in (None, "none")
+                and isinstance(f.get("width"), (int, float)) and isinstance(f.get("height"), (int, float))
+                and 0 < f["width"] <= 3840 and 0 < f["height"] <= 3840]
+            if not dimensions:
+                raise ValueError("no usable video formats in metadata")
+            return max(dimensions, key=lambda wh: wh[0]*wh[1])
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, OverflowError) as exc:
+            raise AcquisitionError(f"{video_id}: 포맷 메타데이터 확인 실패 ({exc})") from exc
+
+    def download(self, candidate: AcquisitionCandidate, directory: Path, *, timeout_seconds: float = 1800) -> Path:
+        if not 1 <= timeout_seconds <= 1800:
+            raise ValueError("download timeout must be between 1 and 1800 seconds")
         videos_directory = directory / "videos"
         videos_directory.mkdir(parents=True, exist_ok=True)
         if _cached_video_paths(videos_directory, candidate.video_id):
@@ -797,7 +822,7 @@ class YTDLPClient:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=timeout_seconds,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AcquisitionError(f"{candidate.title}: 다운로드 실패 ({exc})") from exc
@@ -4247,7 +4272,8 @@ def acquire_sources(
 
     if request.source_cache_directory is None:
         raise ValueError("automatic source acquisition needs a cache directory")
-    cache_directory = request.source_cache_directory
+    from .source_format_revision import resolve_group_format_cache
+    cache_directory = resolve_group_format_cache(request)
     if cache_directory.is_symlink():
         raise AcquisitionError(
             "소스 캐시 폴더가 심볼릭 링크여서 안전하게 사용할 수 없습니다: "
@@ -4309,6 +4335,10 @@ def acquire_sources(
         reusable.manifest["cache_refresh_upgrade"] = cache_refresh_upgrade
         _write_manifest(manifest_path, reusable.manifest)
         if not cache_refresh_upgrade["refresh_required"]:
+            from .source_format_refresh import refresh_group_cached_formats
+            reusable = refresh_group_cached_formats(request=request, artifact=reusable,
+                reporter=reporter, client=client, media_validator=media_validator,
+                media_probe=scoped_media_probe, group_quality_analyzer=scoped_group_quality_analyzer)
             reporter.status(
                 f"검증된 IVE 소스 {len(reusable.source_paths)}개 캐시를 재사용합니다."
             )
@@ -4318,7 +4348,7 @@ def acquire_sources(
             reporter.progress(0.20, "IVE 교차편집 소스 확인 완료")
             return _build_acquisition_artifact(
                 source_paths=reusable.source_paths,
-                manifest_path=manifest_path,
+                manifest_path=reusable.manifest_path,
                 manifest=reusable.manifest,
             )
         prior_manifest = reusable.manifest
