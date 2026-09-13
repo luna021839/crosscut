@@ -9915,6 +9915,7 @@ def _direct_member_dense_render_feedback_binding(
     selector_config = DirectMemberVisualConfig(
         boundary_search_radius_frames=6,
         boundary_search_step_frames=2,
+        hold_cadence_basis="duration",
     )
     motion_config = (
         _direct_member_editorial_motion_config_from_visual_config(
@@ -15802,6 +15803,7 @@ def _select_direct_member_partition_profile(
     selection_config = DirectMemberVisualConfig(
         boundary_search_radius_frames=6,
         boundary_search_step_frames=2,
+        hold_cadence_basis="duration",
     )
     represented_source_count = (
         len(source_cycle)

@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 
 from .member_bridge_contract import (
+    MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
     MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS,
     MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
@@ -254,6 +255,7 @@ class DirectMemberVisualConfig:
     maximum_same_source_hold_fraction: float = 0.12
     maximum_same_source_hold_count: int = 8
     maximum_consecutive_same_source_holds: int = 1
+    hold_cadence_basis: str = "count_and_duration"
     maximum_same_source_run_seconds: float = 7.2
     minimum_adjacent_motion_magnitude: float = 0.020
     minimum_temporal_motion_component_count: int = 2
@@ -427,6 +429,8 @@ class DirectMemberVisualConfig:
             )
         if self.maximum_same_source_run_seconds <= 0.0:
             raise ValueError("maximum_same_source_run_seconds must be positive")
+        if self.hold_cadence_basis not in ("count_and_duration", "duration"):
+            raise ValueError("member hold cadence basis is invalid")
         if not 1.02 <= self.transform_repair_maximum_zoom <= 1.50:
             raise ValueError("direct member transform repair zoom is invalid")
         if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.160:
@@ -744,7 +748,11 @@ class DirectMemberVisualConfig:
                 "maximum_count": self.maximum_same_source_hold_count,
                 "maximum_consecutive": (
                     self.maximum_consecutive_same_source_holds
+                    if self.hold_cadence_basis == "count_and_duration"
+                    or self.maximum_consecutive_same_source_holds == 0 else None
                 ),
+                "cadence_basis": self.hold_cadence_basis,
+                "total_count_and_highlight_budgets_preserved": True,
                 "maximum_same_source_run_seconds": (
                     self.maximum_same_source_run_seconds
                 ),
@@ -973,6 +981,18 @@ class DirectMemberVisualConfig:
                 "quota_conflict_effect": "fail_closed",
             },
         }
+
+
+def _effective_consecutive_hold_limit(config: DirectMemberVisualConfig, boundary_count: int) -> int:
+    """Duration cadence does not count music subdivisions as new shot holds.
+
+    Global hold density/count and actual run duration remain separate hard limits.
+    An explicit zero still disables holds under either policy. Legacy scalar
+    callers keep the count-and-duration default; the professional app opts in.
+    """
+    if config.hold_cadence_basis == "duration" and config.maximum_consecutive_same_source_holds > 0:
+        return min(boundary_count, config.maximum_same_source_hold_count)
+    return config.maximum_consecutive_same_source_holds
 
 
 @dataclass(frozen=True, slots=True)
@@ -1765,6 +1785,7 @@ def _scored_boundary_search_mismatch(
     mismatch = candidate.matrix[outgoing_source_index][incoming_source_index]
     if mismatch.cinematic_bridge is not None:
         handle_failures: list[str] = []
+        handles = []
         for label, source_index in (("outgoing", outgoing_source_index),
                                      ("incoming", incoming_source_index)):
             samples = (
@@ -1775,6 +1796,12 @@ def _scored_boundary_search_mismatch(
             handle_failures.extend(member_bridge_handle_quality_failures(
                 tuple(sample.descriptor.quality_score if sample.descriptor is not None else None
                       for sample in samples), label=label))
+            handles.append(samples)
+        if mismatch.cinematic_bridge.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS:
+            handle_failures.extend(_focal_bridge_handle_pose_failures(
+                candidate.outgoing[outgoing_source_index] if outgoing_source_index < len(candidate.outgoing) else None,
+                candidate.incoming[incoming_source_index] if incoming_source_index < len(candidate.incoming) else None,
+                *handles, source_indices=(outgoing_source_index, incoming_source_index)))
         if handle_failures:
             # These are the exact samples the downstream effect author uses.
             # A required effect cannot rescue a severe edge when its own
@@ -2630,15 +2657,35 @@ class DirectMemberVisualSelection:
         if sum(hold_flags) > maximum_holds:
             raise ValueError("direct member same-source hold budget exceeded")
         consecutive_holds = 0
+        consecutive_limit = _effective_consecutive_hold_limit(self.config, len(hold_flags))
         for is_hold in hold_flags:
             consecutive_holds = consecutive_holds + 1 if is_hold else 0
             if (
                 consecutive_holds
-                > self.config.maximum_consecutive_same_source_holds
+                > consecutive_limit
             ):
                 raise ValueError("direct member consecutive hold budget exceeded")
         if len(self.span_validity) != len(self.source_indices):
             raise ValueError("direct member span validity must match the path")
+        if self.config.hold_cadence_basis == "duration":
+            # Independently validate the final, offset-adjusted artifact, not
+            # just the solver's nominal grid or aggregated source durations.
+            clocks = (self.span_validity[0].canonical_master_start,
+                      *self.selected_boundary_master_seconds,
+                      self.span_validity[-1].canonical_master_end)
+            durations = tuple(b - a for a, b in zip(clocks, clocks[1:]))
+            if any(not math.isfinite(d) or d <= 0 for d in durations):
+                raise ValueError("duration cadence needs positive exact shot spans")
+            limit = max(self.config.maximum_same_source_run_seconds,
+                        _DIRECT_MEMBER_HETEROGENEOUS_MAXIMUM_RUN_SECONDS) if heterogeneous_usage else self.config.maximum_same_source_run_seconds
+            # Match the existing local-audition extension, derived from the
+            # configured radius rather than trusting serialized diagnostics.
+            limit += self.config.boundary_search_radius_frames * self.config.sample_frame_step_seconds
+            run = 0.
+            for index, duration in enumerate(durations):
+                run = run + duration if index and self.source_indices[index] == self.source_indices[index - 1] else duration
+                if run > limit + 1e-7:
+                    raise ValueError("direct member duration cadence run limit exceeded")
         if any(
             not self.span_validity[index].sources[source_index].valid
             for index, source_index in enumerate(self.source_indices)
@@ -3377,6 +3424,63 @@ def _boundary_sample_with_focal_geometry(
         if attention is None and focal.body_track is not None and focal.person is not None:
             attention = _AttentionGeometry(focal.person.bbox_xywh, focal.person.centroid_xy, FOCAL_SELECTOR_BODY_BASIS)
     return _BoundarySample(master_seconds, source_local_seconds, descriptor, attention, focal)
+
+
+def _focal_sample_in_body_attention_basis(sample: _BoundarySample | None) -> _BoundarySample | None:
+    """Project an exact target observation, never an aggregate or guessed body.
+
+    Selection and required-effect authoring must use this same projection when
+    one endpoint cannot observe a face. Preserve the original focal evidence.
+    """
+    if not isinstance(sample, _BoundarySample):
+        return None
+    focal = sample.focal_geometry
+    person = (focal.person if isinstance(focal, FocalSelectorGeometry)
+              and math.isclose(focal.source_seconds, sample.source_local_seconds,
+                               abs_tol=1e-9, rel_tol=0)
+              and (focal.face_bbox_xywh is not None or focal.body_track is not None)
+              else None)
+    return replace(sample, attention=(
+        _AttentionGeometry(person.bbox_xywh, person.centroid_xy, FOCAL_SELECTOR_BODY_BASIS)
+        if person is not None else None))
+
+
+def _focal_bridge_handle_pose_failures(
+    outgoing: _BoundarySample | None, incoming: _BoundarySample | None,
+    outgoing_handles: Sequence[_BoundarySample], incoming_handles: Sequence[_BoundarySample],
+    *, source_indices: tuple[int, int],
+    maximum_pose_mismatch: float = MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
+) -> tuple[str, ...]:
+    """One overlap-pose contract for early selection and effect authoring.
+
+    This consumes the existing exact observations only. It neither decodes nor
+    turns unknown target geometry into a negative whole-source judgement.
+    """
+    if len(outgoing_handles) != 2 or len(incoming_handles) != 2:
+        return ('focal_bridge_exact_handle_pose_missing',)
+    endpoints = (outgoing, incoming)
+    body_basis = any(getattr(getattr(s, 'attention', None), 'basis', None)
+                     == FOCAL_SELECTOR_BODY_BASIS for s in endpoints)
+    basis = FOCAL_SELECTOR_BODY_BASIS if body_basis else FOCAL_SELECTOR_FACE_BASIS
+    pairs = (endpoints, *zip(outgoing_handles, incoming_handles))
+    for pair_index, pair in enumerate(pairs):
+        if body_basis:
+            pair = tuple(_focal_sample_in_body_attention_basis(s) for s in pair)
+        for sample, source in zip(pair, source_indices):
+            focal = getattr(sample, 'focal_geometry', None)
+            if (not isinstance(focal, FocalSelectorGeometry) or focal.source_index != source
+                    or not math.isclose(focal.source_seconds, sample.source_local_seconds,
+                                        abs_tol=1e-9, rel_tol=0)
+                    or getattr(getattr(sample, 'attention', None), 'basis', None) != basis
+                    or (basis == FOCAL_SELECTOR_FACE_BASIS and focal.face_bbox_xywh is None)):
+                return ('focal_bridge_handle_pose_unverified',)
+        if pair_index:
+            geometry = tuple(s.focal_geometry for s in pair)
+            pose = focal_pose_shape_mismatch(*geometry)
+            if (pose is None or pose > maximum_pose_mismatch + 1e-9
+                    or common_focal_pose_vectors(geometry) is None):
+                return ('focal_bridge_handle_pose_unverified',)
+    return ()
 
 
 def _attention_geometry_for_basis(
@@ -4797,14 +4901,10 @@ def _boundary_mismatch(
            for sample in (outgoing, incoming)):
         # One side cannot measure a face while the other measures a torso.
         # Both endpoints AND their motion neighbors use the same target body.
-        def focal_body_sample(sample):
-            if sample is None:
-                return None
-            person = sample.focal_geometry.person if sample.focal_geometry else None
-            return replace(sample, attention=_AttentionGeometry(person.bbox_xywh, person.centroid_xy,
-                FOCAL_SELECTOR_BODY_BASIS) if person is not None else None)
-        outgoing, incoming = focal_body_sample(outgoing), focal_body_sample(incoming)
-        outgoing_previous, incoming_next = focal_body_sample(outgoing_previous), focal_body_sample(incoming_next)
+        outgoing, incoming = (_focal_sample_in_body_attention_basis(sample)
+                              for sample in (outgoing, incoming))
+        outgoing_previous, incoming_next = (_focal_sample_in_body_attention_basis(sample)
+                                            for sample in (outgoing_previous, incoming_next))
     outgoing_output = _sample_in_portrait_fill(
         outgoing,
         outgoing_source_geometry,
@@ -8204,7 +8304,7 @@ def _milp_bounded_same_source_hold_visual_path(
             0.0,
             float(maximum_priority_cut_hold_count),
         )
-    consecutive_limit = config.maximum_consecutive_same_source_holds
+    consecutive_limit = _effective_consecutive_hold_limit(config, boundary_count)
     for start in range(
         0,
         max(0, boundary_count - consecutive_limit),
@@ -8395,7 +8495,7 @@ def _milp_bounded_same_source_hold_visual_path(
             consecutive_holds,
         )
         maximum_run_seconds = max(maximum_run_seconds, run_seconds)
-    if maximum_consecutive_holds > config.maximum_consecutive_same_source_holds:
+    if maximum_consecutive_holds > _effective_consecutive_hold_limit(config, boundary_count):
         audit_failures.append("maximum_consecutive_same_source_holds_exceeded")
     if maximum_run_seconds > config.maximum_same_source_run_seconds + 1e-7:
         audit_failures.append("maximum_same_source_run_seconds_exceeded")
@@ -8462,8 +8562,9 @@ def _milp_bounded_same_source_hold_visual_path(
                 config.maximum_same_source_hold_fraction
             ),
             "maximum_consecutive_same_source_holds": (
-                config.maximum_consecutive_same_source_holds
+                _effective_consecutive_hold_limit(config, boundary_count)
             ),
+            "hold_cadence_basis": config.hold_cadence_basis,
             "maximum_same_source_run_seconds": (
                 config.maximum_same_source_run_seconds
             ),
@@ -8567,7 +8668,8 @@ def _bounded_same_source_hold_visual_path(
             ),
         ),
     )
-    if maximum_hold_count <= 0 or config.maximum_consecutive_same_source_holds <= 0:
+    consecutive_limit = _effective_consecutive_hold_limit(config, boundary_count)
+    if maximum_hold_count <= 0 or consecutive_limit <= 0:
         return None
     total_duration = sum(durations)
     duration_targets = tuple(
@@ -8692,7 +8794,7 @@ def _bounded_same_source_hold_visual_path(
                         if (
                             hold_count >= maximum_hold_count
                             or consecutive_hold_count
-                            >= config.maximum_consecutive_same_source_holds
+                            >= consecutive_limit
                             or (
                                 is_priority_hold
                                 and priority_hold_count
@@ -8861,8 +8963,9 @@ def _bounded_same_source_hold_visual_path(
                         config.maximum_same_source_hold_fraction
                     ),
                     "maximum_consecutive_same_source_holds": (
-                        config.maximum_consecutive_same_source_holds
+                        _effective_consecutive_hold_limit(config, boundary_count)
                     ),
+                    "hold_cadence_basis": config.hold_cadence_basis,
                     "maximum_same_source_run_seconds": (
                         config.maximum_same_source_run_seconds
                     ),
@@ -9263,8 +9366,9 @@ def _heterogeneous_cinematic_visual_path(
         "maximum_priority_cut_hold_count": maximum_priority_cut_hold_count,
         "maximum_same_source_hold_count": maximum_hold_count,
         "maximum_consecutive_same_source_holds": (
-            config.maximum_consecutive_same_source_holds
+            _effective_consecutive_hold_limit(config, boundary_count)
         ),
+        "hold_cadence_basis": config.hold_cadence_basis,
         "maximum_same_source_run_seconds": maximum_same_source_run_seconds,
         "cinematic_bridge_budget": {
             "contract": "role_separated_duration_scaled_bridge_budget_v1",
@@ -9971,7 +10075,7 @@ def _heterogeneous_cinematic_visual_path(
             float(maximum_priority_cut_hold_count),
             family="priority_hold_budget",
         )
-    consecutive_limit = config.maximum_consecutive_same_source_holds
+    consecutive_limit = _effective_consecutive_hold_limit(config, boundary_count)
     for start in range(max(0, boundary_count - consecutive_limit)):
         add_constraint(
             tuple(

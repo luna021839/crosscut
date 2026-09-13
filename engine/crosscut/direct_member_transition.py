@@ -25,12 +25,16 @@ from .direct_member_visual import (
     FOCAL_POSE_MOTION_BRIDGE_BASIS,
     verified_focal_pose_motion_bridge,
     verified_focal_pose_dissolve_spacing,
+    _focal_sample_in_body_attention_basis,
+    _focal_bridge_handle_pose_failures,
+    _DIRECT_MEMBER_CINEMATIC_USAGE_POLICIES,
 )
 from .focal_selector_geometry import (
     FocalSelectorGeometry, FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_BODY_BASIS,
     FOCAL_SELECTOR_POSE_BASIS, common_focal_pose_vectors, focal_pose_shape_mismatch,
 )
 from .member_bridge_contract import (
+    MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY,
     RequiredMemberBridgeAuthoringError,
     member_bridge_handle_quality_failures,
@@ -102,7 +106,7 @@ class DirectMemberPoseDissolveConfig:
     maximum_silhouette_mismatch: float = 0.34
     maximum_future_attention_position_mismatch: float = 0.32
     maximum_future_attention_scale_mismatch: float = 0.30
-    maximum_future_pose_mismatch: float = 0.40
+    maximum_future_pose_mismatch: float = MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH
     maximum_future_formation_mismatch: float = 0.32
     maximum_future_silhouette_mismatch: float = 0.36
     maximum_handle_entry_attention_position_jump: float = 0.30
@@ -755,9 +759,22 @@ def _required_bridge_attention_basis(
     left: Any,
     right: Any,
     bridge: Any,
+    *, required_basis: str | None = None,
 ) -> str | None:
     """Accept unlike attention boxes only under the selector's pose contract."""
 
+    # The selector compares a hidden-face/visible-face pair on the same
+    # authenticated body basis. Reproduce that projection, not a mixed-box
+    # exemption through the unrelated aggregate-silhouette contract.
+    focal_bridge = (isinstance(bridge, DirectMemberCinematicBridge)
+                    and bridge.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS)
+    if focal_bridge and (required_basis == FOCAL_SELECTOR_BODY_BASIS or any(
+            _verified_attention_sample_basis(sample) == FOCAL_SELECTOR_BODY_BASIS
+            for sample in (left, right))):
+        left, right = (_focal_sample_in_body_attention_basis(sample)
+                       for sample in (left, right))
+        shared = _attention_basis_pair(left, right)
+        return shared if shared == FOCAL_SELECTOR_BODY_BASIS else None
     shared = _attention_basis_pair(left, right)
     if shared is not None:
         return shared
@@ -1549,7 +1566,7 @@ def _required_cinematic_bridge_candidate(
         return (None, ("cinematic_bridge_contract_missing",))
     if (
         getattr(visual_selection, "usage_policy", None)
-        != "heterogeneous_role_aware_cinematic_v1"
+        not in _DIRECT_MEMBER_CINEMATIC_USAGE_POLICIES
     ):
         reasons.append("cinematic_bridge_usage_authority_missing")
     if getattr(mismatch, "transform_repair", None) is not None:
@@ -1942,17 +1959,10 @@ def _required_cinematic_bridge_candidate(
         # another member's aggregate silhouette/formation to fill that gap.
         handles = (tuple(getattr(diagnostic, "outgoing_handle_samples", ())),
                    tuple(getattr(diagnostic, "incoming_handle_samples", ())))
-        if any(len(samples) != 2 for samples in handles):
-            reasons.append("focal_bridge_exact_handle_pose_missing")
-        else:
-            for left, right in zip(*handles):
-                geometry = tuple(getattr(sample, "focal_geometry", None) for sample in (left, right))
-                pose = (focal_pose_shape_mismatch(*geometry)
-                        if all(isinstance(value, FocalSelectorGeometry) for value in geometry) else None)
-                if (_attention_basis_pair(left, right) != attention_basis
-                    or pose is None or pose > config.maximum_future_pose_mismatch + 1e-9
-                    or common_focal_pose_vectors(geometry) is None):
-                    reasons.append("focal_bridge_handle_pose_unverified")
+        reasons.extend(_focal_bridge_handle_pose_failures(
+            outgoing_sample, incoming_sample, *handles,
+            source_indices=(left_source, right_source),
+            maximum_pose_mismatch=config.maximum_future_pose_mismatch))
 
     available_handle = (
         eligible_source_durations_seconds[left_source]

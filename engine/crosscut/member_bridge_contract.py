@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 
 
 MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY = 0.68
+MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH = 0.40
 MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS = 3.0
 # The established ordinary pose-dissolve cadence, not a new generic effect
 # allowance. Both events must have independently verified focal articulation.

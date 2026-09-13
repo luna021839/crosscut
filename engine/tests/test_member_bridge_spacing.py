@@ -20,6 +20,7 @@ from crosscut.member_bridge_contract import (
 from crosscut.render import RenderSegment, TransitionKind, DIRECT_MEMBER_POSE_DISSOLVE_REASON
 from engine.tests.test_direct_member_visual import _optimizer_mismatch, _descriptor
 from engine.tests.test_focal_articulation import evidence, window
+from engine.tests.test_focal_selector_geometry import sample
 
 
 def edge(*, focal=True, cost=.3):
@@ -34,10 +35,10 @@ def edge(*, focal=True, cost=.3):
 
 
 def state(cut, mismatch, offset=0):
-    handle = SimpleNamespace(descriptor=_descriptor(.2))
+    samples = lambda time: tuple(sample(source=s, seconds=time) for s in range(3))
     return _DirectBoundarySearchCandidate(offset_frames=offset, cut_master_seconds=cut,
-        outgoing_previous=(), outgoing=(), incoming=(),
-        incoming_next=(handle,) * 3, incoming_future=(handle,) * 3,
+        outgoing_previous=samples(cut-2/29.97), outgoing=samples(cut-1/29.97), incoming=samples(cut),
+        incoming_next=samples(cut+1/29.97), incoming_future=samples(cut+.2),
         matrix=((mismatch,) * 3,) * 3)
 
 
