@@ -5,8 +5,8 @@ the same camera feed (a re-encode, clean crop, or lightly reframed derivative).
 Treating those files as independent cameras inflates source diversity and lets
 an editor evade per-source occupancy limits.  This module resolves that
 ambiguity from *content*: checked source clocks map a common canonical schedule
-to source-local time, ffprobe supplies the actual decoded-frame PTS, and one
-forward decode supplies the requested frames.
+to source-local time, ffprobe supplies the complete verified presentation grid
+or decoded-frame PTS, and one forward decode supplies the requested frames.
 
 Only scalar measurements and decode provenance are serializable.  Frames, ORB
 descriptors, and any other image representation are transient and are never
@@ -31,6 +31,7 @@ import numpy as np
 
 from . import reference_match as reference_match_module
 from .reference_match import ReferenceMatchConfig, decode_target_frames_sequential
+from .seek_locality import probe_constant_frame_clock
 from .source_scalar_cache import PersistentSourceScalarCache, source_content_sha256
 from .timewarp import TimeWarpMap
 from .visual_feature_cache import python_symbol_dependency_sha256
@@ -1188,6 +1189,27 @@ def _probe_actual_video_pts(path: Path, *, timeout_seconds: float) -> tuple[floa
     return tuple(values)
 
 
+def _probe_derivative_video_pts(
+    path: Path, *, timeout_seconds: float,
+) -> tuple[tuple[float, ...], str]:
+    """Avoid full video decoding only for a completely checked CFR grid.
+
+    This is not an average-FPS approximation: every packet timestamp/duration,
+    declared count, codec and zero presentation origin must agree. The shared
+    clock validator permits only AV1/H264 with decoder-parity coverage. VFR,
+    unsupported codecs, incomplete metadata and failed probes still use the
+    original decoded-frame scan. Actual sample pixels always remain decoded.
+    """
+    clock = probe_constant_frame_clock(path, timeout_seconds=min(10., timeout_seconds))
+    if clock is not None:
+        # Match ffprobe's six-decimal *_timestamp_time serialization exactly.
+        values = tuple(round(float(index / clock.frame_rate), 6)
+                       for index in range(clock.frame_count))
+        return values, "verified_complete_cfr_packet_presentation_grid"
+    return (_probe_actual_video_pts(path, timeout_seconds=timeout_seconds),
+            "ffprobe_best_effort_timestamp_time")
+
+
 def _nearest_pts_index(values: Sequence[float], target: float) -> int:
     position = bisect_left(values, target)
     candidates = tuple(
@@ -1336,6 +1358,10 @@ class PersistentSourceDerivativeDiversityCache:
                         module_path,
                         root_symbols=("analyze_source_derivative_diversity",),
                     )
+                ),
+                "constant_frame_clock_ast": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("seek_locality.py"),
+                    root_symbols=("probe_constant_frame_clock",),
                 ),
                 reference_module_path.name: source_content_sha256(
                     reference_module_path
@@ -1488,8 +1514,9 @@ def analyze_source_derivative_diversity(
     for source_index, (path, offset, clock) in enumerate(
         zip(normalized_sources, offsets, clocks, strict=True)
     ):
+        pts_basis = "unavailable"
         try:
-            raw_pts = _probe_actual_video_pts(
+            raw_pts, pts_basis = _probe_derivative_video_pts(
                 path, timeout_seconds=settings.ffprobe_timeout_seconds
             )
             pts_origin = raw_pts[0]
@@ -1554,7 +1581,7 @@ def analyze_source_derivative_diversity(
                         if clock is not None and not clock.scalar_fallback
                         else "scalar_fallback_not_production_complete"
                     ),
-                    "pts_basis": "ffprobe_best_effort_timestamp_time",
+                    "pts_basis": pts_basis,
                     "pts_frame_count": len(raw_pts),
                     "pts_origin_seconds": pts_origin,
                     "median_pts_step_seconds": median_step,
@@ -1575,7 +1602,7 @@ def analyze_source_derivative_diversity(
                         if clock is not None and not clock.scalar_fallback
                         else "scalar_fallback_not_production_complete"
                     ),
-                    "pts_basis": "ffprobe_best_effort_timestamp_time",
+                    "pts_basis": pts_basis,
                     "requested_sample_count": len(canonical_times),
                     "decoded_sample_count": 0,
                     "error": f"{type(exc).__name__}: {exc}",
