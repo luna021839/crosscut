@@ -45,6 +45,7 @@ class JointProposalPool:
     cadence_profiles: tuple[str, ...]
     full_boundary_pair_count: int
     candidate_lattice: tuple[tuple[TimelineCandidate, ...], ...] = ()
+    warm_start_paths: tuple[tuple[TimelineCandidate, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.paths or len(self.paths) != len(self.cadence_profiles):
@@ -54,17 +55,23 @@ class JointProposalPool:
             raise ValueError("proposal paths must share a complete timeline")
         if any(not isinstance(c, TimelineCandidate) for path in self.paths for c in path):
             raise TypeError("proposal paths require measured timeline candidates")
+        if len(self.warm_start_paths) > 3 or any(
+            len(path) != length or any(c not in row for c, row in zip(path, self.candidate_lattice))
+            for path in self.warm_start_paths
+        ) or (self.warm_start_paths and len(self.candidate_lattice) != length):
+            raise ValueError("warm proposals must rebind to the complete current lattice")
         if (isinstance(self.full_boundary_pair_count, bool)
                 or not isinstance(self.full_boundary_pair_count, int)
                 or self.full_boundary_pair_count < 0):
             raise ValueError("proposal pool pair count is invalid")
 
     def domain(self, maximum_paths: int) -> frozenset[BoundaryMeasurementKey]:
-        if isinstance(maximum_paths, bool) or not isinstance(maximum_paths, int) or maximum_paths < 1:
+        if (isinstance(maximum_paths, bool) or not isinstance(maximum_paths, int)
+                or maximum_paths < 0 or (maximum_paths == 0 and not self.warm_start_paths)):
             raise ValueError("proposal path limit must be a positive integer")
         proposed = frozenset(
             BoundaryMeasurementKey.from_candidates(index, outgoing, incoming)
-            for path in self.paths[:maximum_paths]
+            for path in self.warm_start_paths + self.paths[:maximum_paths]
             for index, (outgoing, incoming) in enumerate(zip(path, path[1:]))
         )
         # A complete proposal must not force a premature return to its source
@@ -86,6 +93,8 @@ class JointProposalPool:
             "cadence_profiles": list(self.cadence_profiles),
             "full_boundary_pair_count": self.full_boundary_pair_count,
             "source_continuations_included": bool(self.candidate_lattice),
+            "warm_start_proposal_count": len(self.warm_start_paths),
+            "warm_start_proofs_restored": False,
             "final_media_authority": False,
             "raw_descriptors_persisted": False,
         }
@@ -252,9 +261,10 @@ def select_with_joint_proposal_domains(
     local_repairs = []
     added_pair_budget = local_proposal_added_pair_budget(pool)
     limit_index = 0
+    limits = ((0,) + PROPOSAL_PATH_LIMITS) if pool.warm_start_paths else PROPOSAL_PATH_LIMITS
     last_failure = None
-    while limit_index < len(PROPOSAL_PATH_LIMITS):
-        limit = PROPOSAL_PATH_LIMITS[limit_index]
+    while limit_index < len(limits):
+        limit = limits[limit_index]
         domain = pool.domain(limit) | extra_domain
         if domain in seen_domains:
             limit_index += 1
@@ -264,7 +274,8 @@ def select_with_joint_proposal_domains(
         if remaining <= 0:
             break
         event = {
-            "contract": CONTRACT, "proposal_path_count": min(limit, len(pool.paths)),
+            "contract": CONTRACT, "proposal_path_count": min(limit, len(pool.paths)) + len(pool.warm_start_paths),
+            "warm_start_only": limit == 0,
             "boundary_pair_count": len(domain), "full_boundary_pair_count": pool.full_boundary_pair_count,
             "remaining_proof_calls": remaining, "final_media_authority": False,
             "raw_frame_visual_limits_used_as_final_authority": False,
@@ -287,6 +298,11 @@ def select_with_joint_proposal_domains(
             events.append(event)
             if report is not None:
                 report({**event, "phase": "proposal_domain_exhausted"})
+            if limit == 0:
+                # A stale hint must not spend local repair work ahead of the
+                # current descriptor proposals, nor replenish proof budgets.
+                limit_index += 1
+                continue
             repair = (
                 add_local_proposal_detour(pool, domain, exc)
                 if len(extra_domain) < added_pair_budget

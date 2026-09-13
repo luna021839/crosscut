@@ -28109,6 +28109,21 @@ def analyze(
                         )
                     reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
                     joint_proposal_pool = build_joint_proposal_pool(workspace)
+                    if visual_candidate_checkpoint_input_identity is not None:
+                        from .joint_proposal_checkpoint import find_joint_proposal_restart
+                        joint_proposal_restart = find_joint_proposal_restart(
+                            request.output_directory,
+                            expected_input_identity=visual_candidate_checkpoint_input_identity,
+                            lattice=workspace.candidates_by_segment,
+                        )
+                        if joint_proposal_restart is not None:
+                            joint_proposal_pool = replace(joint_proposal_pool,
+                                warm_start_paths=joint_proposal_restart.paths)
+                            reporter.emit("joint_proposal_restart", **joint_proposal_restart.scalar_audit())
+                            reporter.log(
+                                f"입력·시계가 같은 이전 경로 {len(joint_proposal_restart.paths)}개를 탐색 제안으로 복원 · "
+                                "컷·트랙 증명 및 렌더 검증은 전부 다시 수행"
+                            )
                     reporter.emit("joint_proposal_pool", **joint_proposal_pool.scalar_audit())
                     reporter.log(
                         f"전체 편집 제안 {len(joint_proposal_pool.paths)}개 확보 · "
@@ -30469,6 +30484,8 @@ def analyze(
                     attempted_candidate_indices.add(materialized.candidate_index)
                     attempted_materialized_candidates.append(materialized)
                     if joint_visual_selection_active:
+                        reporter.emit("execution_stage", phase="group_candidate_derivation",
+                            candidate_index=materialized.candidate_index)
                         reporter.status(
                             "joint 후보 경계 보정·완전 파생 중… "
                             "후보 "
@@ -30948,6 +30965,8 @@ def analyze(
                         )
                     post_repair_structure_passing_complete_count += 1
                     if joint_visual_selection_active:
+                        reporter.emit("execution_stage", phase="group_candidate_render_qa",
+                            candidate_index=materialized.candidate_index)
                         reporter.status(
                             "joint 후보 480p 렌더·디코딩 QA 중… "
                             "후보 "
