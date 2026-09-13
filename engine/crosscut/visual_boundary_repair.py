@@ -1427,6 +1427,19 @@ def _temporal_pose_motion_evidence(
     )
 
 
+def _face_resolved_scale_delta(outgoing: FrameVisualDescriptor, incoming: FrameVisualDescriptor) -> float:
+    """Compare measured face heights before the framing class saturates.
+
+    A 47%-height and 69%-height face both classify as maximum close-up, but
+    are not the same on-screen size. Preserve the established .42 unit scale
+    and legacy/body-only semantics; only the premature clipping is removed.
+    """
+    if (outgoing.shot_scale_basis == incoming.shot_scale_basis == "dominant_face_height"
+            and outgoing.primary_face_bbox is not None and incoming.primary_face_bbox is not None):
+        return min(1.0, abs(outgoing.primary_face_bbox[3] - incoming.primary_face_bbox[3]) / .42)
+    return abs(outgoing.shot_scale - incoming.shot_scale)
+
+
 def _visual_evidence(
     outgoing: FrameVisualDescriptor,
     incoming: FrameVisualDescriptor,
@@ -1527,7 +1540,7 @@ def _visual_evidence(
     )
     focus = _bbox_mismatch(outgoing.primary_face_bbox, incoming.primary_face_bbox)
     structure = _rms(outgoing.structure_embedding, incoming.structure_embedding)
-    scale = abs(outgoing.shot_scale - incoming.shot_scale)
+    scale = _face_resolved_scale_delta(outgoing, incoming)
     shot_type = _shot_type_mismatch(outgoing.shot_type, incoming.shot_type)
     outgoing_stability = (
         describe_boundary_side_stability(

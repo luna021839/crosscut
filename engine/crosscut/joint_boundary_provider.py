@@ -951,6 +951,10 @@ def _crop_resolved_transforms(
         if basis == "dominant_face"
         else None
     )
+    if basis == "dominant_face" and matched_faces is None:
+        from .paired_face_crop_geometry import matched_face_crops
+        matched_faces = matched_face_crops(outgoing_bbox, incoming_bbox,
+            allow_partial_extent_match=True)
     # Retain the prior bounded proposal when an exact face pair cannot fit or
     # the only geometry is an aggregate silhouette. Decoded gates, not this
     # geometric proposal, decide whether any such partial repair is acceptable.
@@ -5301,6 +5305,13 @@ class DecodedBoundaryOptionProvider:
                 _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD
             ),
             "implementation_sha256": {
+                "paired_face_crop_geometry_sha256": hashlib.sha256(
+                    Path(__file__).with_name("paired_face_crop_geometry.py").read_bytes()
+                ).hexdigest(),
+                "visual_boundary_evidence_ast": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("visual_boundary_repair.py"),
+                    root_symbols=("_visual_evidence",),
+                ),
                 "boundary_local_camera_sha256": hashlib.sha256(
                     Path(__file__).with_name("boundary_local_camera.py").read_bytes()
                 ).hexdigest(),
