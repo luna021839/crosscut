@@ -380,6 +380,10 @@ class TimelineCandidate:
     exit_motion: tuple[float, float] | None = None
     candidate_id: str = ""
     shot_id: str = ""
+    # A measured endpoint is not a multi-frame window. Keep the contracts
+    # separate so exact-offset comparison does not fabricate duplicate frames.
+    entry_face_geometry_exact: tuple[float, ...] = field(default=(), repr=False)
+    exit_face_geometry_exact: tuple[float, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if self.segment_index < 0:
@@ -479,6 +483,12 @@ class TimelineCandidate:
         ):
             if any(not isinstance(value, (int, float)) for value in embedding):
                 raise ValueError("pose embeddings must be numeric")
+        for geometry in (self.entry_face_geometry_exact, self.exit_face_geometry_exact):
+            if geometry and (len(geometry) != 10
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not isfinite(float(value)) for value in geometry)
+                    or geometry[4] <= 0):
+                raise ValueError("exact face geometry needs ten finite values and positive eye scale")
         for window in (
             self.entry_face_geometry_window,
             self.exit_face_geometry_window,
@@ -1337,6 +1347,7 @@ def _has_exit_boundary_descriptor(candidate: TimelineCandidate) -> bool:
         or candidate.exit_face_identity_embedding
         or candidate.exit_color_embedding
         or candidate.exit_face_geometry_window
+        or candidate.exit_face_geometry_exact
         or candidate.exit_motion is not None
     )
 
@@ -1359,6 +1370,7 @@ def _has_entry_boundary_descriptor(candidate: TimelineCandidate) -> bool:
         or candidate.entry_face_identity_embedding
         or candidate.entry_color_embedding
         or candidate.entry_face_geometry_window
+        or candidate.entry_face_geometry_exact
         or candidate.entry_motion is not None
     )
 
@@ -1834,10 +1846,13 @@ def _transition_score(
             previous_color,
             current_color,
         )
-        score -= config.face_geometry_transition_weight * face_geometry_minimax_mismatch(
-            previous.exit_face_geometry_window,
-            current.entry_face_geometry_window,
-        )
+        if previous.exit_face_geometry_exact and current.entry_face_geometry_exact:
+            face_mismatch = _face_geometry_mismatch(previous.exit_face_geometry_exact,
+                                                   current.entry_face_geometry_exact)
+        else:
+            face_mismatch = face_geometry_minimax_mismatch(previous.exit_face_geometry_window,
+                                                          current.entry_face_geometry_window)
+        score -= config.face_geometry_transition_weight * face_mismatch
     return (score, run_length)
 
 

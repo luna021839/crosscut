@@ -492,6 +492,8 @@ def _decoded_montage_role_control_inputs(
                     entry_shot_type=sample_types[0],
                     shot_type=sample_types[1],
                     exit_shot_type=sample_types[2],
+                    is_group_wide=(candidate.is_group_wide and sample_types[1]
+                        in (ShotType.WIDE, ShotType.GROUP_WIDE)),
                 )
                 if changed
                 else candidate

@@ -1025,6 +1025,29 @@ def _crop_resolved_transforms(
     )
 
 
+def _exact_face_geometry(
+    descriptor: FrameVisualDescriptor,
+    transform: BoundaryTransformState,
+    *,
+    descriptor_already_transformed: bool,
+) -> tuple[float, ...]:
+    """Use fresh exact-frame geometry, never the seed's stale temporal window.
+
+    A single observed pair is not a multi-frame stability claim. Unremeasured
+    transforms remain neutral instead of comparing raw eyes with cropped eyes.
+    No additional face/model inference is needed here.
+    """
+    if (not descriptor_already_transformed
+            and (transform.crop_xywh is not None or abs(transform.rotation_degrees) > _EPSILON)):
+        return ()
+    geometry = descriptor.primary_face_geometry
+    if (descriptor.primary_face_bbox is None or geometry is None or len(geometry) != 10
+            or any(not math.isfinite(float(value)) for value in geometry)
+            or geometry[4] <= 0):
+        return ()
+    return tuple(geometry)
+
+
 def _updated_outgoing_candidate(
     candidate: TimelineCandidate,
     descriptor: FrameVisualDescriptor,
@@ -1057,6 +1080,8 @@ def _updated_outgoing_candidate(
         exit_face_identity_embedding=face_identity,
         exit_color_embedding=descriptor.color_embedding,
         exit_face_geometry_window=(),
+        exit_face_geometry_exact=_exact_face_geometry(descriptor, transform,
+            descriptor_already_transformed=descriptor_already_transformed),
         exit_focus_bbox_xywh=_normalized_bbox_after_crop(
             descriptor.primary_face_bbox,
             crop,
@@ -1106,6 +1131,8 @@ def _updated_incoming_candidate(
         entry_face_identity_embedding=face_identity,
         entry_color_embedding=descriptor.color_embedding,
         entry_face_geometry_window=(),
+        entry_face_geometry_exact=_exact_face_geometry(descriptor, transform,
+            descriptor_already_transformed=descriptor_already_transformed),
         entry_focus_bbox_xywh=_normalized_bbox_after_crop(
             descriptor.primary_face_bbox,
             crop,
