@@ -1091,6 +1091,7 @@ class _JointState:
     source_before_run: str | None
     previous_boundary_offset: int | None
     endpoint_renderer_state: _RendererSemanticState | None
+    source_run_start_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1434,6 +1435,7 @@ def _state_sort_key(state: _JointState) -> tuple[object, ...]:
         if state.previous_boundary_offset is not None
         else -10_000,
         _renderer_semantic_sort_key(state.endpoint_renderer_state),
+        state.source_run_start_seconds if state.source_run_start_seconds is not None else -1.,
     )
 
 
@@ -1782,6 +1784,7 @@ def _select_joint_timeline_candidates_core(
         SegmentBridgeDispositionBatchProvider | None
     ) = None,
     fps: float = 29.97,
+    minimum_internal_source_run_seconds: float | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -1826,6 +1829,12 @@ def _select_joint_timeline_candidates_core(
     against this lattice and rejected before the option provider can decode it.
     """
 
+    if minimum_internal_source_run_seconds is not None:
+        if (isinstance(minimum_internal_source_run_seconds, bool)
+                or not isinstance(minimum_internal_source_run_seconds, (int, float))
+                or not isfinite(minimum_internal_source_run_seconds)
+                or minimum_internal_source_run_seconds <= 0):
+            raise ValueError("minimum internal source run must be finite and positive")
     if not callable(option_provider):
         raise TypeError("option_provider must be callable")
     if option_rehydrator is not None and not callable(option_rehydrator):
@@ -2331,6 +2340,21 @@ def _select_joint_timeline_candidates_core(
             shared_bridge_evidence_cache._admit(evidence)
         return evidence
 
+    def source_run_closes_too_soon(
+        state: _JointState, option: AuthorizedBoundaryOption,
+    ) -> bool:
+        # Match final review's internal-run rule on shifted boundary clocks.
+        # First and last runs can be short because the requested range is trimmed.
+        if (minimum_internal_source_run_seconds is None
+                or state.source_before_run is None
+                or option.measurement_key.outgoing.source_id
+                == option.measurement_key.incoming.source_id):
+            return False
+        if state.source_run_start_seconds is None:
+            raise RuntimeError("joint DP lost the shifted source-run entry clock")
+        end = option.measurement_key.outgoing.end_seconds + option.frame_offset / resolved_fps
+        return end - state.source_run_start_seconds < minimum_internal_source_run_seconds
+
     def prime_bridge_evidence_for_layer(
         segment_position: int,
         frontier: Mapping[_JointState, Sequence[_JointNode]],
@@ -2357,6 +2381,8 @@ def _select_joint_timeline_candidates_core(
                 int,
                 int,
                 _RendererSemanticState,
+                float | None,
+                str | None,
             ],
             tuple[_JointState, AuthorizedBoundaryOption],
         ] = {}
@@ -2400,6 +2426,8 @@ def _select_joint_timeline_candidates_core(
                     previous_state.shot_run,
                     expected_entry_offset,
                     expected_entry_state,
+                    previous_state.source_run_start_seconds,
+                    previous_state.source_before_run,
                 ),
                 (previous_state, representative_entry_option),
             )
@@ -2438,6 +2466,8 @@ def _select_joint_timeline_candidates_core(
                 if not options:
                     continue
                 for option in options:
+                    if source_run_closes_too_soon(previous_state, option):
+                        continue
                     last_duration_frames = (
                         current_candidate.duration_seconds * resolved_fps
                         - option.frame_offset
@@ -2626,6 +2656,8 @@ def _select_joint_timeline_candidates_core(
             source_before_run=None,
             previous_boundary_offset=None,
             endpoint_renderer_state=None,
+            source_run_start_seconds=(candidate.start_seconds
+                if minimum_internal_source_run_seconds is not None else None),
         )
         first_layer[state] = [
             _JointNode(
@@ -2726,6 +2758,9 @@ def _select_joint_timeline_candidates_core(
                     else previous_candidate.source_id
                 )
                 for option in options:
+                    if source_run_closes_too_soon(previous_state, option):
+                        reject("internal_source_run_too_short")
+                        continue
                     first_duration_frames = (
                         (
                             previous_candidate.end_seconds
@@ -2933,6 +2968,11 @@ def _select_joint_timeline_candidates_core(
                     previous_boundary_offset=option.frame_offset,
                     endpoint_renderer_state=_renderer_semantic_state(
                         option.incoming_transform
+                    ),
+                    source_run_start_seconds=(
+                        None if minimum_internal_source_run_seconds is None else
+                        previous_state.source_run_start_seconds if same_source else
+                        current_candidate.start_seconds + option.frame_offset / resolved_fps
                     ),
                 )
                 stream = _JointNodeStream(
@@ -3305,6 +3345,7 @@ def select_joint_timeline(
         SegmentBridgeDispositionBatchProvider | None
     ) = None,
     fps: float = 29.97,
+    minimum_internal_source_run_seconds: float | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -3331,6 +3372,7 @@ def select_joint_timeline(
         bridge_provider=bridge_provider,
         bridge_disposition_batch_provider=bridge_disposition_batch_provider,
         fps=fps,
+        minimum_internal_source_run_seconds=minimum_internal_source_run_seconds,
         mode=mode,
         target_member=target_member,
         config=config,
@@ -3358,6 +3400,7 @@ def select_joint_timeline_candidates(
         SegmentBridgeDispositionBatchProvider | None
     ) = None,
     fps: float = 29.97,
+    minimum_internal_source_run_seconds: float | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -3441,6 +3484,7 @@ def select_joint_timeline_candidates(
                     bridge_disposition_batch_provider
                 ),
                 fps=fps,
+                minimum_internal_source_run_seconds=minimum_internal_source_run_seconds,
                 mode=mode,
                 target_member=target_member,
                 config=config,

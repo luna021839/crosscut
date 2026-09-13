@@ -61,6 +61,7 @@ from .timeline_review import (
     JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
     JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
     TimelineReview,
+    TimelineReviewConfig,
     review_timeline,
 )
 from .render import (
@@ -2129,6 +2130,7 @@ def select_joint_visual_candidates(
                     ),
                     fps=fps,
                     config=profile.config,
+                    minimum_internal_source_run_seconds=TimelineReviewConfig().short_flash_seconds,
                     preferred_source_ids=preferred_source_ids,
                     maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
                     boundary_search_domain=search_domain,
