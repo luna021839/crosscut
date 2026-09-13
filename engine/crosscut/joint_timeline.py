@@ -1786,6 +1786,7 @@ def _select_joint_timeline_candidates_core(
     config: TimelineConfig | None = None,
     preferred_source_ids: Sequence[str | None] | None = None,
     maximum_results: int,
+    boundary_search_domain: frozenset[BoundaryMeasurementKey] | None = None,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
     nonwide_source_switch_bonus_by_segment: Mapping[int, float] | None = None,
@@ -1887,6 +1888,14 @@ def _select_joint_timeline_candidates_core(
         raise TypeError("config must be a TimelineConfig")
     timeline_mode, target = _resolve_mode_and_target(mode, target_member)
     segments = _normalise_segments(candidates_by_segment)
+    if boundary_search_domain is not None:
+        for key in boundary_search_domain:
+            if not isinstance(key, BoundaryMeasurementKey):
+                raise TypeError("boundary search domain requires exact candidate pairs")
+            if (key.boundary_index >= len(segments) - 1
+                    or key.outgoing not in segments[key.boundary_index]
+                    or key.incoming not in segments[key.boundary_index + 1]):
+                raise ValueError("boundary search domain does not match this lattice")
     unique_candidate_path_components = all(
         len(
             {
@@ -2415,6 +2424,8 @@ def _select_joint_timeline_candidates_core(
                     previous_candidate,
                     current_candidate,
                 )
+                if boundary_search_domain is not None and measurement_key not in boundary_search_domain:
+                    continue
                 options = selectable_options(locate_options(measurement_key))
                 if not options:
                     continue
@@ -2664,6 +2675,11 @@ def _select_joint_timeline_candidates_core(
                     previous_candidate,
                     current_candidate,
                 )
+                if boundary_search_domain is not None and measurement_key not in boundary_search_domain:
+                    # Search capacity is not measured visual incompatibility.
+                    # No offset audit or renderer evidence is fabricated here.
+                    reject("outside_proposal_search_domain")
+                    continue
                 option_set = locate_options(measurement_key)
                 options = selectable_options(option_set)
                 if not options:
@@ -3326,6 +3342,7 @@ def select_joint_timeline_candidates(
     config: TimelineConfig | None = None,
     preferred_source_ids: Sequence[str | None] | None = None,
     maximum_results: int = 8,
+    boundary_search_domain: Collection[BoundaryMeasurementKey] | None = None,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
     nonwide_source_switch_bonus_by_segment: Mapping[int, float] | None = None,
@@ -3349,6 +3366,9 @@ def select_joint_timeline_candidates(
     forbidden path so exclusions cannot hide the next eligible result.
     """
 
+    search_domain = (
+        None if boundary_search_domain is None else frozenset(boundary_search_domain)
+    )
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
     external_selection_no_goods = _canonical_forbidden_boundary_selections(
@@ -3405,6 +3425,7 @@ def select_joint_timeline_candidates(
                 config=config,
                 preferred_source_ids=preferred_source_ids,
                 maximum_results=maximum_results,
+                boundary_search_domain=search_domain,
                 emission_adjustments=emission_adjustments,
                 source_switch_bonus_by_segment=(
                     source_switch_bonus_by_segment

@@ -1678,6 +1678,7 @@ def select_joint_visual_candidates(
     ),
     decoded_montage_feedback: JointDecodedMontageFeedback | None = None,
     progress_callback: JointTimelineProgressCallback | None = None,
+    boundary_search_domain: Collection[BoundaryMeasurementKey] | None = None,
 ) -> JointVisualSelectionSet:
     """Run the existing professional controls through the decoded joint DP.
 
@@ -1702,6 +1703,7 @@ def select_joint_visual_candidates(
         raise ValueError(
             "joint visual selection requires the transient optimizer workspace"
         )
+    search_domain = None if boundary_search_domain is None else frozenset(boundary_search_domain)
     if not isinstance(provider, DecodedBoundaryOptionProvider):
         raise TypeError("provider must be a DecodedBoundaryOptionProvider")
     if progress_callback is not None and not callable(progress_callback):
@@ -2129,6 +2131,7 @@ def select_joint_visual_candidates(
                     config=profile.config,
                     preferred_source_ids=preferred_source_ids,
                     maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
+                    boundary_search_domain=search_domain,
                     forbidden_boundary_edges=hard_forbidden_boundary_edges,
                     forbidden_boundary_selections=exact_boundary_no_goods,
                     forbidden_complete_paths=external_complete_path_no_goods,

@@ -372,6 +372,10 @@ from .joint_visual_candidate_adapter import (
     materialize_joint_visual_candidates,
     select_joint_visual_candidates,
 )
+from .joint_proposal_domain import (
+    build_joint_proposal_pool,
+    select_with_joint_proposal_domains,
+)
 from .joint_timeline import (
     BoundarySelectionNoGood,
     JointTimelinePathSignature,
@@ -28103,6 +28107,12 @@ def analyze(
                             "joint visual selection could not recover its "
                             "transient optimizer workspace"
                         )
+                    reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
+                    joint_proposal_pool = build_joint_proposal_pool(workspace)
+                    reporter.log(
+                        f"전체 편집 제안 {len(joint_proposal_pool.paths)}개 확보 · "
+                        "제안 연결점만 정밀 분석 · 최종 픽셀/트랙/렌더 게이트 유지"
+                    )
                     def report_joint_visual_selection_progress(
                         progress: JointTimelineProgress,
                         *,
@@ -28171,38 +28181,35 @@ def analyze(
                             runtime = JointSelectionRuntime(
                                 provider, batch_index=batch_index,
                             )
-                            return select_joint_visual_candidates(
-                                visual_candidate_set,
-                                provider=provider,
-                                fps=29.97,
-                                minimum_unique_paths=(
-                                    JOINT_RELEASE_CANDIDATE_COUNT
+                            return select_with_joint_proposal_domains(
+                                joint_proposal_pool,
+                                maximum_proof_calls=proof_budget,
+                                report=lambda event: reporter.emit(
+                                    "joint_proposal_search", **event,
                                 ),
-                                minimum_required_candidates=JOINT_RELEASE_CANDIDATE_COUNT,
-                                maximum_candidates=(
-                                    JOINT_COMPARISON_CANDIDATE_BUDGET
-                                ),
-                                forbidden_boundary_selections=(
-                                    boundary_feedback
-                                ),
-                                forbidden_complete_paths=(
-                                    complete_path_feedback
-                                ),
-                                maximum_proof_materialization_calls=(
-                                    proof_budget
-                                ),
-                                decoded_montage_feedback=(
-                                    JointDecodedMontageFeedback(
-                                        observations=(
-                                            joint_decoded_montage_observations
+                                select=lambda **domain_arguments: (
+                                    select_joint_visual_candidates(
+                                        visual_candidate_set,
+                                        provider=provider,
+                                        fps=29.97,
+                                        minimum_unique_paths=JOINT_RELEASE_CANDIDATE_COUNT,
+                                        minimum_required_candidates=JOINT_RELEASE_CANDIDATE_COUNT,
+                                        maximum_candidates=JOINT_COMPARISON_CANDIDATE_BUDGET,
+                                        forbidden_boundary_selections=boundary_feedback,
+                                        forbidden_complete_paths=complete_path_feedback,
+                                        **domain_arguments,
+                                        decoded_montage_feedback=(
+                                            JointDecodedMontageFeedback(
+                                                observations=joint_decoded_montage_observations,
+                                            )
+                                            if joint_decoded_montage_observations
+                                            else None
+                                        ),
+                                        progress_callback=(
+                                            lambda progress: report_joint_visual_selection_progress(
+                                                progress, runtime=runtime,
+                                            )
                                         )
-                                    )
-                                    if joint_decoded_montage_observations
-                                    else None
-                                ),
-                                progress_callback=(
-                                    lambda progress: report_joint_visual_selection_progress(
-                                        progress, runtime=runtime,
                                     )
                                 ),
                             )
