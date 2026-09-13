@@ -9871,6 +9871,7 @@ def _direct_member_dense_render_feedback_binding(
                 ),
                 Path(__file__).with_name("direct_member_look.py"),
                 Path(__file__).with_name("automatic_joint_dissolve.py"),
+                Path(__file__).with_name("member_joint_camera_preflight.py"),
                 Path(__file__).with_name("joint_dissolve_registration.py"),
                 Path(__file__).with_name("joint_dissolve_pose.py"),
                 Path(__file__).with_name("focal_pixel_containment_support.py"),
@@ -34441,6 +34442,7 @@ def analyze(
             )
 
             effect_authoring_failed_edges: list[tuple[float, int, int]] = []
+            joint_camera_ranking_penalties: dict[tuple[float, int, int], tuple] = {}
 
             def _select_direct_member_render_path(
                 render_infeasible_transition_edges: Sequence[
@@ -34457,6 +34459,13 @@ def analyze(
                 ] = (),
                 preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
+                ranked_camera_edges = {tuple(edge[:3]): tuple(edge)
+                                       for edge in render_penalized_transition_edges}
+                for edge in joint_camera_ranking_penalties.values():
+                    old_edge = ranked_camera_edges.get(edge[:3])
+                    if old_edge is None or old_edge[3] < edge[3]:
+                        ranked_camera_edges[edge[:3]] = edge
+                render_penalized_transition_edges = tuple(ranked_camera_edges.values())
                 render_infeasible_transition_edges = tuple(dict.fromkeys((
                     *render_infeasible_transition_edges, *effect_authoring_failed_edges,
                 )))
@@ -35165,8 +35174,10 @@ def analyze(
                 from .automatic_joint_dissolve import (
                     register_automatic_member_dissolves,
                 )
+                from .member_joint_camera_preflight import MemberJointCameraPreflight
 
                 joint_dissolve_registration_cache: dict = {}
+                joint_camera_preflight = MemberJointCameraPreflight()
                 maximum_path_selection_attempt_count = (
                     _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
                     + _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
@@ -35538,6 +35549,68 @@ def analyze(
                         f"{candidate_joint_dissolve_audit['applied_count']}개 · "
                         "최종 품질은 실제 출력 QA에서 판정"
                     )
+                    joint_camera_preflight_report = joint_camera_preflight.review(
+                        visual_selection=direct_visual_selection,
+                        render_segments=attached_segments,
+                        transitions=candidate_member_transitions,
+                        camera_audit=candidate_joint_dissolve_audit,
+                    )
+                    if not joint_camera_preflight_report['passed']:
+                        if dense_camera_reselection_count >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS:
+                            joint_camera_preflight_report = {
+                                **joint_camera_preflight_report,
+                                'reason': 'joint_camera_shared_reselection_budget_exhausted',
+                                'reselection_requested': False,
+                            }
+                        _write_analysis_manifest_atomically(
+                            request.output_directory / (
+                                f"{base_filename}-member-joint-camera-preflight-"
+                                f"{_path_selection_attempt:02d}.json"
+                            ),
+                            {**joint_camera_preflight_report,
+                             'camera_audit': candidate_joint_dissolve_audit,
+                             'decoded_proxy_render_count': decoded_proxy_render_count},
+                        )
+                        if not joint_camera_preflight_report['reselection_requested']:
+                            error = DirectMemberVisualSelectionError(
+                                'required member cameras remain unapplied before encoding',
+                                {'failure': joint_camera_preflight_report['reason'],
+                                 'joint_camera_preflight': joint_camera_preflight_report,
+                                 'constraint_infeasibility_proven': False,
+                                 'hard_cut_fallback_authorized': False},
+                            )
+                            raise _report_direct_member_selection_failure(
+                                error, output_directory=request.output_directory,
+                                base_filename=base_filename,
+                                target_member=request.target_member.value, reporter=reporter,
+                                eligible_indices=eligible_indices,
+                            ) from error
+                        # Soft, run-local costs: an unmeasured ramp is not proof
+                        # that this source or neighboring cut cannot be used.
+                        for edge in joint_camera_preflight_report['ranking_penalties']:
+                            edge = tuple(edge)
+                            joint_camera_ranking_penalties[edge[:3]] = edge
+                        reporter.log(
+                            "필수 포즈 전환의 카메라 미적용 · 프록시 인코딩 생략 · "
+                            "소스 제외나 하드컷 강등 없이 같은 분할에서 경로 재선택"
+                        )
+                        try:
+                            (segments, member_transitions, direct_segment_details,
+                             direct_cadence, direct_visual_selection) = _select_direct_member_render_path(
+                                tuple(render_infeasible_transition_edges),
+                                render_penalized_transition_edges=tuple(render_penalized_transition_edges),
+                                preferred_partition_unit_counts=_selected_partition_unit_counts_for_retry(),
+                            )
+                        except DirectMemberVisualSelectionError as error:
+                            raise _report_direct_member_selection_failure(
+                                error, output_directory=request.output_directory,
+                                base_filename=base_filename,
+                                target_member=request.target_member.value, reporter=reporter,
+                                eligible_indices=eligible_indices,
+                            ) from error
+                        dense_camera_reselection_count += 1
+                        dense_render_path_reselection_count += 1
+                        continue
                     assert direct_full_frame_ratios is not None
                     candidate_segments = (
                         _attach_direct_member_portrait_fill_geometry(
