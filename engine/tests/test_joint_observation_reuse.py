@@ -2,7 +2,9 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import numpy as np
 
 from crosscut.joint_boundary_provider import DecodedBoundaryOptionProvider
 from crosscut.joint_observation_reuse import (
@@ -63,6 +65,48 @@ class JointObservationReuseTests(unittest.TestCase):
         self.assertFalse(second._bridge_memo)
         self.assertEqual(second._configuration_identity, first._configuration_identity)
         second.close()
+
+    def test_production_raster_reuse_ignores_proof_labels_not_clock_or_geometry(self):
+        with tempfile.TemporaryDirectory(prefix="joint-raster-observation-") as directory:
+            sources = (Path(directory) / "a.mp4", Path(directory) / "b.mp4")
+            for source in sources:
+                source.touch()
+            overrides = dict(sources=sources, descriptor_provider=None,
+                             transformed_descriptor_provider=None,
+                             face_identity_provider=None)
+            raw = _descriptor(.5, face_bbox=(.4, .2, .2, .2))
+            transform = BoundaryTransformState(
+                "proof-a", crop_xywh=(.1, .1, .8, .8), track_id="track-a",
+                subject_basis="dominant_face")
+            sampler = Mock()
+            sampler.frame_at.return_value = np.full((48, 64, 3), 96, np.uint8)
+            sampler.frame_digest_at.return_value = "b" * 64
+            with patch("crosscut.joint_boundary_provider.describe_frame", return_value=raw) as describe:
+                with self.provider(**overrides) as first:
+                    with patch.object(first, "_sampler", return_value=sampler):
+                        self.assertEqual(first._sample_transformed_descriptor(0, 10., raw, transform), raw)
+                with self.provider(**overrides) as second:
+                    with patch.object(second, "_sampler", return_value=sampler):
+                        relabeled = replace(transform, transform_identity="proof-b", track_id="track-b")
+                        self.assertEqual(second._sample_transformed_descriptor(0, 10., raw, relabeled), raw)
+                        self.assertEqual(describe.call_count, 1)
+                        self.assertFalse(second._materialization_by_proof)
+                        for index, seconds, geometry in (
+                            (0, 10.001, relabeled),
+                            (1, 10., relabeled),
+                            (0, 10., replace(relabeled, crop_xywh=(.11, .1, .8, .8))),
+                            (0, 10., replace(relabeled, rotation_degrees=.1)),
+                        ):
+                            second._sample_transformed_descriptor(index, seconds, raw, geometry)
+                        self.assertEqual(describe.call_count, 5)
+
+    def test_injected_transform_provider_retains_full_proof_identity(self):
+        raw = _descriptor(.5)
+        with self.provider() as first:
+            first._sample_transformed_descriptor(0, 10., raw, BoundaryTransformState("a"))
+        with self.provider() as second:
+            second._sample_transformed_descriptor(0, 10., raw, BoundaryTransformState("b"))
+        self.assertEqual(self.calls[1], 2)
 
     def test_complete_boundary_options_equal_uncached_provider(self):
         with DecodedBoundaryOptionProvider(

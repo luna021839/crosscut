@@ -127,8 +127,19 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         return value
 
     def _sample_transformed_descriptor(self, source_index, seconds, raw_descriptor, transform):
-        key = self._observation_key("transformed", source_index, seconds,
-                                    raw_descriptor, transform)
+        if self._descriptor_provider is None and self._transformed_descriptor_provider is None:
+            # Production remeasurement depends on decoded pixels and crop/roll,
+            # not the boundary proof/track label or the supplied raw descriptor.
+            # Keep exact clocks and geometry; no approximate crop/time aliasing.
+            # The namespace still binds the provider, model and source context.
+            key = self._observation_key(
+                "production-transformed-raster-v1", source_index, seconds,
+                transform.crop_xywh, float(transform.rotation_degrees),
+            )
+        else:
+            # Injected providers may legitimately interpret every field.
+            key = self._observation_key("transformed", source_index, seconds,
+                                        raw_descriptor, transform)
         hit, value = self._observation_bank.lookup(key)
         if hit:
             self.transformed_descriptor_cache_hit_count += 1
