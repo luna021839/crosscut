@@ -1085,13 +1085,20 @@ class DirectBoundaryMotionEvidence:
     pose_phase_continuation_mismatch: float | None
     output_space_subject_motion_used: bool
     soft_preference_applied: float
+    motion_basis: str = "aggregate_pose_silhouette_subject_v1"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "contract": (
-                "cut_adjacent_exact_entry_output_space_pose_motion_v3"
+                "cut_adjacent_focal_articulation_separate_framing_v4"
+                if self.motion_basis == "focal_common_joint_articulation_v1"
+                else "cut_adjacent_exact_entry_output_space_pose_motion_v3"
             ),
             "timestamp_bound_adjacent": self.timestamp_bound_adjacent,
+            "motion_basis": self.motion_basis,
+            "subject_motion_separate_from_articulation": (
+                self.motion_basis == "focal_common_joint_articulation_v1"
+            ),
             "master_timestamps_seconds": {
                 "outgoing_previous": self.outgoing_previous_master_seconds,
                 "outgoing_endpoint": self.outgoing_endpoint_master_seconds,
@@ -1121,6 +1128,10 @@ class DirectBoundaryMotionEvidence:
                 "incoming_subject": self.incoming_subject_motion_magnitude,
                 "outgoing_aggregate": self.outgoing_motion_magnitude,
                 "incoming_aggregate": self.incoming_motion_magnitude,
+                # Preserve the old aggregate keys for readers; motion_basis
+                # now explicitly identifies what drives the decision.
+                "outgoing_decision": self.outgoing_motion_magnitude,
+                "incoming_decision": self.incoming_motion_magnitude,
             },
             "motion_component_counts": {
                 "outgoing": self.outgoing_motion_component_count,
@@ -4443,16 +4454,26 @@ def _cut_adjacent_motion_evidence(
         if adjacent
         else {}
     )
+    # Torso-normalized target joints measure articulation. Face-box travel
+    # measures camera/subject framing, not another sample of that motion.
+    # Averaging the two suppresses moving arms under a stationary face and
+    # lets a camera pan hide opposed choreography. Keep screen motion below
+    # as independent evidence; framing still has its own repair/hard gates.
+    outgoing_decision = outgoing_components
+    incoming_decision = incoming_components
+    if focal_window:
+        outgoing_decision = {k: v for k, v in outgoing_components.items() if k == "pose"}
+        incoming_decision = {k: v for k, v in incoming_components.items() if k == "pose"}
     outgoing_motion = (
-        sum(value[0] for value in outgoing_components.values())
-        / len(outgoing_components)
-        if outgoing_components
+        sum(value[0] for value in outgoing_decision.values())
+        / len(outgoing_decision)
+        if outgoing_decision
         else None
     )
     incoming_motion = (
-        sum(value[0] for value in incoming_components.values())
-        / len(incoming_components)
-        if incoming_components
+        sum(value[0] for value in incoming_decision.values())
+        / len(incoming_decision)
+        if incoming_decision
         else None
     )
     left = outgoing_endpoint.descriptor
@@ -4480,7 +4501,10 @@ def _cut_adjacent_motion_evidence(
             outgoing_endpoint.attention,
             incoming_start.attention,
         )
-        if subject_scale_mismatch is not None:
+        # Size discontinuity belongs to attention/camera registration, not
+        # target pose shape. Otherwise an effect intended to repair framing
+        # cannot even be proposed despite compatible, measured choreography.
+        if subject_scale_mismatch is not None and not focal_window:
             endpoint_components.append(subject_scale_mismatch)
     endpoint_mismatch = (
         sum(endpoint_components) / len(endpoint_components)
@@ -4506,11 +4530,11 @@ def _cut_adjacent_motion_evidence(
     common_directions = [
         cosine
         for name in ("pose", "silhouette", "subject")
-        if name in outgoing_components and name in incoming_components
+        if name in outgoing_decision and name in incoming_decision
         and (
             cosine := _direction_cosine(
-                outgoing_components[name][1],
-                incoming_components[name][1],
+                outgoing_decision[name][1],
+                incoming_decision[name][1],
             )
         )
         is not None
@@ -4521,8 +4545,8 @@ def _cut_adjacent_motion_evidence(
         else None
     )
     speed_ratio_mismatch = _motion_speed_ratio_mismatch(
-        outgoing_components,
-        incoming_components,
+        outgoing_decision,
+        incoming_decision,
     )
     outgoing_subject = outgoing_components.get("subject")
     incoming_subject = incoming_components.get("subject")
@@ -4649,6 +4673,8 @@ def _cut_adjacent_motion_evidence(
         pose_phase_continuation_mismatch=pose_phase_mismatch,
         output_space_subject_motion_used=output_space_subject_motion_used,
         soft_preference_applied=soft_preference,
+        motion_basis=("focal_common_joint_articulation_v1" if focal_window
+                      else "aggregate_pose_silhouette_subject_v1"),
     )
 
 
