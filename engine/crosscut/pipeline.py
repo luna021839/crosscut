@@ -28125,6 +28125,23 @@ def analyze(
                                 "컷·트랙 증명 및 렌더 검증은 전부 다시 수행"
                             )
                     reporter.emit("joint_proposal_pool", **joint_proposal_pool.scalar_audit())
+                    from .joint_switch_requirements import SourceSwitchRequirement
+                    joint_switch_requirements = ()
+                    joint_switch_families = None
+                    if (visual_section_plan is not None and rendered_montage_config is not None
+                            and source_derivative_diversity_result is not None):
+                        joint_switch_requirements = tuple(SourceSwitchRequirement(
+                            section.start_seconds, section.end_seconds,
+                            max(1, math.ceil(rendered_montage_config.highlight_product_minimum_source_switches_per_minute
+                                * (section.end_seconds-section.start_seconds) / 60.0 - 1e-12)))
+                            for section in visual_section_plan.sections if section.role.value == "chorus_like")
+                        joint_switch_families = {str(i): str(family) for i,family in
+                            enumerate(source_derivative_diversity_result.family_ids)}
+                        reporter.emit("joint_section_switch_requirements",
+                            windows=[asdict(w) for w in joint_switch_requirements],
+                            count_basis="quantized_cross_derivative_family_cuts_inside_section",
+                            derived_from_existing_decoded_montage_minimum=True,
+                            quality_gates_waived=False)
                     reporter.log(
                         f"전체 편집 제안 {len(joint_proposal_pool.paths)}개 확보 · "
                         "제안 연결점만 정밀 분석 · 최종 픽셀/트랙/렌더 게이트 유지"
@@ -28216,6 +28233,8 @@ def analyze(
                                         minimum_unique_paths=JOINT_RELEASE_CANDIDATE_COUNT,
                                         minimum_required_candidates=JOINT_RELEASE_CANDIDATE_COUNT,
                                         maximum_candidates=JOINT_COMPARISON_CANDIDATE_BUDGET,
+                                        source_switch_requirements=joint_switch_requirements,
+                                        source_switch_families=joint_switch_families,
                                         forbidden_boundary_selections=boundary_feedback,
                                         forbidden_complete_paths=complete_path_feedback,
                                         **domain_arguments,

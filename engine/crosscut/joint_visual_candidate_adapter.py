@@ -57,6 +57,7 @@ from .timeline import (
 )
 from .timeline_no_good import TimelineNoGoodSet
 from .joint_highlight_opportunity import redistribute_highlight_switch_budget
+from .joint_switch_requirements import SourceSwitchRequirement
 from .timeline_review import (
     JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
     JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
@@ -1680,6 +1681,8 @@ def select_joint_visual_candidates(
     decoded_montage_feedback: JointDecodedMontageFeedback | None = None,
     progress_callback: JointTimelineProgressCallback | None = None,
     boundary_search_domain: Collection[BoundaryMeasurementKey] | None = None,
+    source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
+    source_switch_families: Mapping[str, str] | None = None,
 ) -> JointVisualSelectionSet:
     """Run the existing professional controls through the decoded joint DP.
 
@@ -2131,6 +2134,8 @@ def select_joint_visual_candidates(
                     fps=fps,
                     config=profile.config,
                     minimum_internal_source_run_seconds=TimelineReviewConfig().short_flash_seconds,
+                    source_switch_requirements=source_switch_requirements,
+                    source_switch_families=source_switch_families,
                     preferred_source_ids=preferred_source_ids,
                     maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
                     boundary_search_domain=search_domain,

@@ -45,6 +45,7 @@ from .timeline_no_good import (
 )
 from .vision import IVEMember
 from .joint_highlight_opportunity import exact_nonwide_pair
+from .joint_switch_requirements import SourceSwitchCounter, SourceSwitchRequirement
 
 
 JOINT_BOUNDARY_FRAME_OFFSETS = tuple(range(-8, 9))
@@ -1092,6 +1093,7 @@ class _JointState:
     previous_boundary_offset: int | None
     endpoint_renderer_state: _RendererSemanticState | None
     source_run_start_seconds: float | None = None
+    required_source_switch_counts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1436,6 +1438,7 @@ def _state_sort_key(state: _JointState) -> tuple[object, ...]:
         else -10_000,
         _renderer_semantic_sort_key(state.endpoint_renderer_state),
         state.source_run_start_seconds if state.source_run_start_seconds is not None else -1.,
+        state.required_source_switch_counts,
     )
 
 
@@ -1785,6 +1788,8 @@ def _select_joint_timeline_candidates_core(
     ) = None,
     fps: float = 29.97,
     minimum_internal_source_run_seconds: float | None = None,
+    source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
+    source_switch_families: Mapping[str, str] | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -1916,6 +1921,10 @@ def _select_joint_timeline_candidates_core(
         == len(segment)
         for segment in segments
     )
+    switch_counter = (SourceSwitchCounter(source_switch_requirements, segments,
+        fps=resolved_fps, maximum_offset_frames=max(JOINT_BOUNDARY_FRAME_OFFSETS),
+        domain=boundary_search_domain, source_families=source_switch_families)
+        if source_switch_requirements else None)
     no_goods = compile_timeline_no_good_constraint_index(
         segments,
         forbidden_boundary_edges,
@@ -2658,6 +2667,7 @@ def _select_joint_timeline_candidates_core(
             endpoint_renderer_state=None,
             source_run_start_seconds=(candidate.start_seconds
                 if minimum_internal_source_run_seconds is not None else None),
+            required_source_switch_counts=(switch_counter.initial_counts if switch_counter else ()),
         )
         first_layer[state] = [
             _JointNode(
@@ -2758,6 +2768,13 @@ def _select_joint_timeline_candidates_core(
                     else previous_candidate.source_id
                 )
                 for option in options:
+                    if switch_counter is not None:
+                        next_counts = switch_counter.advance(previous_state.required_source_switch_counts,
+                            left=previous_state.source_id, right=current_candidate.source_id,
+                            nominal_boundary_seconds=current_candidate.start_seconds, frame_offset=option.frame_offset)
+                        if not switch_counter.feasible(next_counts, segment_position):
+                            reject("section_source_switch_minimum_unreachable")
+                            continue
                     if source_run_closes_too_soon(previous_state, option):
                         reject("internal_source_run_too_short")
                         continue
@@ -2974,6 +2991,11 @@ def _select_joint_timeline_candidates_core(
                         previous_state.source_run_start_seconds if same_source else
                         current_candidate.start_seconds + option.frame_offset / resolved_fps
                     ),
+                    required_source_switch_counts=(switch_counter.advance(
+                        previous_state.required_source_switch_counts,
+                        left=previous_state.source_id, right=current_candidate.source_id,
+                        nominal_boundary_seconds=current_candidate.start_seconds, frame_offset=option.frame_offset)
+                        if switch_counter is not None else ()),
                 )
                 stream = _JointNodeStream(
                     previous_nodes=ranked_previous_nodes,
@@ -3346,6 +3368,8 @@ def select_joint_timeline(
     ) = None,
     fps: float = 29.97,
     minimum_internal_source_run_seconds: float | None = None,
+    source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
+    source_switch_families: Mapping[str, str] | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -3373,6 +3397,8 @@ def select_joint_timeline(
         bridge_disposition_batch_provider=bridge_disposition_batch_provider,
         fps=fps,
         minimum_internal_source_run_seconds=minimum_internal_source_run_seconds,
+        source_switch_requirements=source_switch_requirements,
+        source_switch_families=source_switch_families,
         mode=mode,
         target_member=target_member,
         config=config,
@@ -3401,6 +3427,8 @@ def select_joint_timeline_candidates(
     ) = None,
     fps: float = 29.97,
     minimum_internal_source_run_seconds: float | None = None,
+    source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
+    source_switch_families: Mapping[str, str] | None = None,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
@@ -3485,6 +3513,8 @@ def select_joint_timeline_candidates(
                 ),
                 fps=fps,
                 minimum_internal_source_run_seconds=minimum_internal_source_run_seconds,
+                source_switch_requirements=source_switch_requirements,
+                source_switch_families=source_switch_families,
                 mode=mode,
                 target_member=target_member,
                 config=config,
