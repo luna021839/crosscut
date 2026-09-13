@@ -531,8 +531,32 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "9f3590797903f8bbb52fd57d992b7d7f93b5992081acb4b2c659c3948dee8834",
+            "14ec585b0d692c05498594a529632dca6c89be35fcba77ac9b67999c64da1d5f",
         )
+
+    def test_h264_locality_exact_forward_migration_preserves_records(self) -> None:
+        previous_components = _audited_active_analyzer_components()
+        current_components = _audited_active_analyzer_components()
+        previous_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "9f3590797903f8bbb52fd57d992b7d7f93b5992081acb4b2c659c3948dee8834"
+        )
+        current_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "14ec585b0d692c05498594a529632dca6c89be35fcba77ac9b67999c64da1d5f"
+        )
+        previous = _analyzer_from_components(previous_components)
+        current = _analyzer_from_components(current_components)
+        self.assertEqual(previous.digest, "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509")
+        self.assertEqual(current.digest, "0d665ac9a9b9ef183e0c666196d63cfd84c77f35fbe3d4c59fac1350c4fa1e8d")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"same-source")
+            request = _request()
+            old = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=previous)
+            self.assertTrue(old.put(request, {"value": 1.0}))
+            new = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertEqual(new.get_by_locator(request.locator), {"value": 1.0})
+            self.assertEqual(new.diagnostics()["decode_free_hit_count"], 1)
 
     def test_seek_locality_endpoint_preserves_audited_predecessors(self) -> None:
         current = "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509"

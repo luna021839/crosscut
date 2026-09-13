@@ -51,7 +51,11 @@ _STABLE_FILE_DIGEST_PROCESS_CACHE: dict[
     tuple[str, tuple[int, int, int, int, int]], str
 ] = {}
 _STABLE_FILE_DIGEST_PROCESS_CACHE_LIMIT = 64
-_MAXIMUM_DECODE_FREE_LOCATOR_RECORDS = 4_096
+# One 3-minute stage across exact-offset requests and compatible generations
+# already exceeds 4,096 records. This is a metadata-only index (not pixels or
+# descriptors); retain a bounded full-song budget instead of disabling all
+# decode-free reuse halfway through ordinary production source caches.
+_MAXIMUM_DECODE_FREE_LOCATOR_RECORDS = 32_768
 _LOCATOR_INDEX_OVER_BUDGET_PROCESS_ROOTS: set[str] = set()
 
 
@@ -145,6 +149,23 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # H264 locality has identical decoded pixels on all 1,728 actual XOXZ
+    # requests, plus sequential/B-frame/open-GOP regressions. Only this exact
+    # reader dependency changed; model/schema/runtime mismatches still fail.
+    "0d665ac9a9b9ef183e0c666196d63cfd84c77f35fbe3d4c59fac1350c4fa1e8d": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "9f3590797903f8bbb52fd57d992b7d7f93b5992081acb4b2c659c3948dee8834"
+            ),
+            current_descriptor_digest=(
+                "14ec585b0d692c05498594a529632dca6c89be35fcba77ac9b67999c64da1d5f"
+            ),
+        ),
+    ),
     # Verified AV1 decoder locality: 170 real frame payloads and real full
     # descriptors are byte-identical. The endpoint includes the entire reader
     # dependency hash; unknown reader/model/runtime changes never migrate.

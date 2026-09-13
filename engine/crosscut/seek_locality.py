@@ -1,7 +1,7 @@
 """Bounded sequential decoding for sources with a verified constant frame clock.
 
-This module is not yet wired into the production sampler. Packet timing must
-prove a complete AV1 presentation grid before decoder-index reuse is allowed.
+The production sampler uses this reader. Packet timing must prove a complete
+AV1 or H264 presentation grid before decoder-index reuse is allowed.
 Other codecs, irregular clocks and unsupported decoder backends retain exact
 timestamp seeking. No analysis timestamps or output video pixels are rounded.
 """
@@ -43,8 +43,8 @@ def constant_frame_clock_from_probe(
 
 Reported average FPS alone is not evidence of constant-rate presentation.
 Every packet must occupy one consecutive point of the complete presentation
-grid and its duration must match. This deliberately supports only AV1 until
-other codecs have their own decoder parity coverage.
+grid and its duration must match. Only AV1 and H264 have decoder parity
+coverage; other codecs retain timestamp seeking.
     """
     try:
         streams = payload['streams']
@@ -52,7 +52,7 @@ other codecs have their own decoder parity coverage.
         if not isinstance(streams, list) or len(streams) != 1:
             return None
         stream = streams[0]
-        if stream['codec_name'] != 'av1':
+        if stream['codec_name'] not in {'av1', 'h264'}:
             return None
         rate = Fraction(stream['avg_frame_rate'])
         if rate <= 0 or rate != Fraction(stream['r_frame_rate']):

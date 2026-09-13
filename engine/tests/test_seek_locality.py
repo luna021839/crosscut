@@ -98,7 +98,7 @@ class ConstantFrameClockTests(unittest.TestCase):
 
     def test_bad_stream_metadata_is_not_certified(self):
         for field, value in (
-            ('codec_name', 'h264'), ('start_time', '1.0'),
+            ('codec_name', 'hevc'), ('start_time', '1.0'),
             ('avg_frame_rate', '0/0'), ('r_frame_rate', '30/1'),
             ('time_base', '0/1'), ('nb_frames', 'N/A'), ('nb_frames', 12.5),
         ):
@@ -106,6 +106,13 @@ class ConstantFrameClockTests(unittest.TestCase):
             sample['streams'][0][field] = value
             with self.subTest(field=field):
                 self.assertIsNone(constant_frame_clock_from_probe(sample))
+
+    def test_h264_requires_the_same_complete_presentation_grid(self):
+        sample = payload()
+        sample['streams'][0]['codec_name'] = 'h264'
+        self.assertIsNotNone(constant_frame_clock_from_probe(sample))
+        sample['packets'][1]['pts'] = sample['packets'][0]['pts']
+        self.assertIsNone(constant_frame_clock_from_probe(sample))
 
     def test_missing_source_or_probe_fails_to_optional_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
