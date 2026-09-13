@@ -4245,7 +4245,10 @@ def describe_frame(
             shot_scale_basis = "unknown_no_subject_geometry"
 
     if face_count:
-        if face_count < 4 and shot_scale >= 0.52:
+        # Background faces do not turn a genuinely dominant close face into
+        # a formation wide. _dominant_face already requires 1.8x runner-up
+        # area; four equally sized faces still do not satisfy this override.
+        if shot_scale >= 0.52 and (face_count < 4 or dominant_face is not None):
             shot_type = ShotType.CLOSE_UP
         elif cropped_group_scale is not None:
             shot_scale = max(min(shot_scale, 0.50), cropped_group_scale)

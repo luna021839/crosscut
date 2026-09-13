@@ -56,7 +56,7 @@ from .stage_edit_dynamic_crop_motion_authority_v3 import (
 RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS = (
     "rendered_selected_plan_exact_phrase_and_section_anchor_formation_"
     "role_conditioned_duration_chorus_cadence_close_burst_and_"
-    "interior_geometry_grammar_v5"
+    "interior_geometry_grammar_v6"
 )
 EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT = (
     "serialized_inference_token_section_and_phrase_progress_per_selected_shot_v1"
@@ -1037,8 +1037,12 @@ def _proxy_geometry_shot_class(
             framing_face = (count, float(scale) * 0.42)
     if framing_face is not None:
         face_count, height = framing_face
+        # The production provider's bbox is the uniquely dominant face,
+        # unlike framing_face_scale (largest height without identity). Small
+        # background faces cannot override that observed close-up. A scale
+        # alone still cannot promote an ambiguous four-face composition.
         if (
-            face_count < 4
+            (face_count < 4 or parsed is not None)
             and height >= config.minimum_closeup_proxy_face_height_fraction
         ):
             return "close"
@@ -2029,9 +2033,9 @@ def _review_segment_interior_geometry(
         "classification_policy": {
             "basis": (
                 "decoded_face_then_person_formation_then_silhouette_"
-                "shot_geometry_hierarchy_v2"
+                "shot_geometry_hierarchy_v3"
             ),
-            "four_or_more_faces_is_wide": True,
+            "four_or_more_faces_without_dominant_close_face_is_wide": True,
             "minimum_nonwide_face_height_fraction": (
                 config.minimum_nonwide_proxy_face_height_fraction
             ),

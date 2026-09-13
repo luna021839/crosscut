@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,11 +12,102 @@ from crosscut.joint_observation_reuse import (
     JointObservationBank, ReusingDecodedBoundaryOptionProvider,
 )
 from crosscut.joint_timeline import BoundaryTransformState
+from crosscut.cut_anchored_containment import ContainmentSample
 from crosscut.visual_boundary_repair import BoundaryDescriptorCache
 from engine.tests.test_joint_boundary_provider import _descriptor, _key
 
 
 class JointObservationReuseTests(unittest.TestCase):
+    def containment_arguments(self, provider, **overrides):
+        values = dict(
+            source_index=0, start_master_seconds=10.,
+            sample_times=(10., 10.1), required_master_sample_times=(10.,),
+            entry_transform=BoundaryTransformState("entry", subject_basis="dominant_face"),
+            exit_transform=BoundaryTransformState("exit"),
+            editorial_track=SimpleNamespace(keyframes=((0., 1.2), (.1, 1.))),
+            descriptor_resolver=provider._sample_descriptor,
+        )
+        return {**values, **overrides}
+
+    def test_successful_containment_observations_reuse_without_proof_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mp4'
+            source.touch()
+            options = dict(sources=(source, source), descriptor_provider=None,
+                           transformed_descriptor_provider=None, face_identity_provider=None)
+            samples = {0: ContainmentSample(0, (.4,.2,.2,.2), 'observed_cut_anchor', 0)}
+            with patch.object(DecodedBoundaryOptionProvider, '_cut_handle_containment',
+                              side_effect=lambda **_: (dict(samples), None)) as observe:
+                with self.provider(**options) as first:
+                    actual, failure = first._cut_handle_containment(**self.containment_arguments(first))
+                    self.assertIsNone(failure)
+                    actual.clear()
+                with self.provider(**options) as second:
+                    args = self.containment_arguments(second)
+                    args['entry_transform'] = replace(args['entry_transform'], transform_identity='other-proof')
+                    actual, failure = second._cut_handle_containment(**args)
+                    self.assertEqual(actual, samples)
+                    self.assertIsNone(failure)
+                    self.assertEqual(observe.call_count, 1)
+                    self.assertFalse(second._materialization_by_proof)
+                    # Full proof/custom resolver callbacks must still execute.
+                    args['descriptor_resolver'] = lambda source, seconds: None
+                    second._cut_handle_containment(**args)
+                    self.assertEqual(observe.call_count, 2)
+
+    def test_containment_time_geometry_and_storage_are_bound_on_hits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mp4'
+            source.touch()
+            options = dict(sources=(source, source), descriptor_provider=None,
+                           transformed_descriptor_provider=None, face_identity_provider=None)
+            sample = ContainmentSample(0, (.4,.2,.2,.2), 'observed_cut_anchor', 0)
+            with patch.object(DecodedBoundaryOptionProvider, '_cut_handle_containment',
+                              return_value=({0: sample}, None)) as observe:
+                with self.provider(**options) as provider:
+                    base = self.containment_arguments(provider)
+                    provider._cut_handle_containment(**base)
+                    for changes in (
+                        dict(sample_times=(10.,10.10000001)),
+                        dict(required_master_sample_times=(10.1,)),
+                        dict(start_master_seconds=10.00000001),
+                        dict(source_index=1),
+                        dict(entry_transform=BoundaryTransformState('entry')),
+                        dict(editorial_track=SimpleNamespace(keyframes=((0.,1.3),(.1,1.)))),
+                    ):
+                        provider._cut_handle_containment(**{**base,**changes})
+                    self.assertEqual(observe.call_count, 7)
+                    with patch.object(provider, '_assert_required_persistent_cache_available',
+                                      side_effect=OSError('SSD unavailable')):
+                        with self.assertRaisesRegex(OSError, 'SSD unavailable'):
+                            provider._cut_handle_containment(**base)
+                    source.write_bytes(b'changed')
+                    with self.assertRaisesRegex(RuntimeError, 'source changed'):
+                        provider._cut_handle_containment(**base)
+
+    def test_failed_and_aborted_containment_are_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mp4'
+            source.touch()
+            options = dict(sources=(source, source), descriptor_provider=None,
+                           transformed_descriptor_provider=None, face_identity_provider=None)
+            sample = ContainmentSample(0, (.4,.2,.2,.2), 'observed_cut_anchor', 0)
+            with self.provider(**options) as provider:
+                args = self.containment_arguments(provider)
+                with patch.object(DecodedBoundaryOptionProvider, '_cut_handle_containment',
+                                  return_value=({0: sample}, 'pixel_flow_failed')):
+                    provider._cut_handle_containment(**args)
+                    self.assertEqual(self.bank.diagnostics()['entry_count'], 0)
+                def aborted(_key):
+                    provider._cut_handle_containment(**args)
+                    raise RuntimeError('aborted containment transaction')
+                with patch.object(DecodedBoundaryOptionProvider, '_cut_handle_containment',
+                                  return_value=({0: sample}, None)), patch.object(provider, '_measure', side_effect=aborted):
+                    with self.assertRaisesRegex(RuntimeError, 'aborted containment transaction'):
+                        provider(_key())
+                self.assertEqual(self.bank.diagnostics()['entry_count'], 0)
+                self.assertEqual(provider._pending_observations, {})
+
     def setUp(self):
         self.calls = [0, 0, 0]
         self.bank = JointObservationBank()

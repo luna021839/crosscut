@@ -1982,6 +1982,8 @@ def select_joint_visual_candidates(
     ] = set()
     retry_events: list[dict[str, object]] = []
     profile_audition_events: list[dict[str, object]] = []
+    review_rejection_events: list[dict[str, object]] = []
+    review_rejection_code_counts: dict[str, int] = {}
     coverage_failure_events: list[dict[str, object]] = []
     maximum_exact_no_goods = len(JOINT_BOUNDARY_FRAME_OFFSETS) * sum(
         len(lattice[index]) * len(lattice[index + 1])
@@ -2206,6 +2208,7 @@ def select_joint_visual_candidates(
                 "discarded_candidate_count": discarded_candidate_count,
                 "passing_candidate_count": len(reviewed_variants),
                 "total_round_count": total_round_count,
+                **review_rejection_code_counts,
             },
             profile_failures=profile_failures,
         )
@@ -2453,6 +2456,37 @@ def select_joint_visual_candidates(
                 )
             else:
                 review_failure_count += 1
+                # Retain bounded scalar causes before dropping the expensive
+                # proof bundle. Otherwise a surviving profile hides why the
+                # other representatives failed, forcing a full replay merely
+                # to diagnose a deterministic review rejection.
+                failure_codes = [
+                    str(getattr(issue, "code", issue))
+                    for issue in review.hard_failures
+                ]
+                for code in set(failure_codes):
+                    key_name = "authoritative_review:" + code
+                    review_rejection_code_counts[key_name] = (
+                        review_rejection_code_counts.get(key_name, 0) + 1
+                    )
+                review_rejection_events.append({
+                    "round": total_round_count,
+                    "cadence_profile": selection.cadence_profile,
+                    "pool_index": pool_index,
+                    "global_candidate_attempt_index": global_candidate_attempt_index,
+                    "weighted_score": review.weighted_score,
+                    "hard_failure_codes": failure_codes,
+                    "failure_details": [
+                        {
+                            "code": str(getattr(issue, "code", issue)),
+                            "value": getattr(issue, "value", None),
+                            "threshold": getattr(issue, "threshold", None),
+                            "occurrences": list(getattr(issue, "occurrences", ())),
+                        }
+                        for issue in review.hard_failures
+                    ],
+                    "raw_visual_descriptors_persisted": False,
+                })
                 review_no_goods = _boundary_review_no_goods(
                     selection,
                     review,
@@ -2522,6 +2556,7 @@ def select_joint_visual_candidates(
             ),
             "exact_boundary_no_good_count": len(exact_boundary_no_goods),
             "new_exact_boundary_no_good_count": len(new_no_goods),
+            **review_rejection_code_counts,
             "retry_round": retry_round,
             "proof_materialization_call_count": (
                 proof_materialization_call_count
@@ -2697,6 +2732,8 @@ def select_joint_visual_candidates(
             ),
             "review_call_count": review_call_count,
             "review_failure_count": review_failure_count,
+            "review_rejection_events": review_rejection_events,
+            "review_rejection_code_counts": dict(review_rejection_code_counts),
             "review_cache_hit_count": review_cache_hit_count,
             "reviewed_unique_candidate_count": review_call_count,
             "retained_reviewed_candidate_count": len(reviewed_variants),

@@ -1039,6 +1039,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 self.assertEqual(len({s.cadence_profile for s in selected.selections}), expected)
                 self.assertEqual(selected.selection_retry_audit["proof_materialization_call_count"], expected)
                 self.assertEqual(selected.selection_retry_audit["profile_audition"]["events"][0]["considered_representative_count"], expected)
+                self.assertEqual(selected.selection_retry_audit["review_rejection_events"], ())
 
     def test_professional_audition_does_not_raise_delivery_floor_or_proof_budget(self):
         for proof_budget in (1, 2):
@@ -1083,6 +1084,18 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual({s.cadence_profile for s in selected.selections}, {"balanced", "dense_safe"})
         self.assertTrue(all(r.review.passed for r in selected.candidate_records))
+        rejections = selected.selection_retry_audit["review_rejection_events"]
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(rejections[0]["cadence_profile"], "reference")
+        self.assertEqual(rejections[0]["hard_failure_codes"], ("synthetic_rejection",))
+        self.assertEqual(rejections[0]["failure_details"], ({
+            "code": "synthetic_rejection", "value": None,
+            "threshold": None, "occurrences": (),
+        },))
+        self.assertFalse(rejections[0]["raw_visual_descriptors_persisted"])
+        self.assertEqual(selected.selection_retry_audit["review_rejection_code_counts"], {
+            "authoritative_review:synthetic_rejection": 1,
+        })
 
     def test_single_slot_uses_common_review_after_professional_audition(self):
         candidate_set = _candidate_set(role_conditioned=True)
@@ -2263,6 +2276,9 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(provider.selection_materialization_calls, 8)
         self.assertEqual(selector_mock.call_count, 3)
+        self.assertEqual(caught.exception.rejection_counts[
+            "authoritative_review:synthetic_repeated_review_failure"
+        ], 8)
         self.assertEqual(
             caught.exception.rejection_counts[
                 "proof_materialization_call_count"

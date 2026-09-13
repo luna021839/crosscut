@@ -91,6 +91,8 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         self._pending_observations: dict[tuple, Any] = {}
         self._legacy_scalar_entries_admitted = 0
         self._legacy_scalar_conflicts = 0
+        self._containment_observation_hits = 0
+        self._containment_observation_misses = 0
         self._observation_namespace = (
             self._configuration_identity, self._source_runtime_stat_identities,
         )
@@ -164,6 +166,38 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         self._remember_observation(key, value)
         return value
 
+    def _cut_handle_containment(self, **arguments):
+        resolver = arguments["descriptor_resolver"]
+        # Reuse only the production selector's numeric tracking observations.
+        # Injected observations and full-proof rehydration callbacks retain
+        # their own execution; this is not a renderer-proof cache.
+        if (self._descriptor_provider is not None
+                or self._containment_frame_provider is not None
+                or getattr(resolver, "__self__", None) is not self
+                or getattr(resolver, "__func__", None)
+                is not ReusingDecodedBoundaryOptionProvider._sample_descriptor):
+            return super()._cut_handle_containment(**arguments)
+        key = self._observation_key(
+            "production-cut-handle-numeric-observations-v1",
+            arguments["source_index"], arguments["start_master_seconds"],
+            tuple(arguments["sample_times"]),
+            tuple(arguments["required_master_sample_times"]),
+            arguments["entry_transform"].subject_basis,
+            arguments["exit_transform"].subject_basis,
+            tuple(arguments["editorial_track"].keyframes),
+        )
+        hit, samples = self._observation_bank.lookup(key)
+        if hit:
+            self._containment_observation_hits += 1
+            return dict(samples), None
+        self._containment_observation_misses += 1
+        observations, failure = super()._cut_handle_containment(**arguments)
+        if failure is None and observations:
+            # Freeze the mapping before the caller can mutate it. Samples are
+            # frozen numeric dataclasses; no frames or flow keypoints survive.
+            self._remember_observation(key, tuple(sorted(observations.items())))
+        return observations, failure
+
     def _load_scalar_bridge_persistent_cache(self, segment_index):
         was_loaded = segment_index in self._scalar_bridge_persistent_cache_loaded_segments
         super()._load_scalar_bridge_persistent_cache(segment_index)
@@ -206,6 +240,13 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
 
     def to_dict(self):
         return {**super().to_dict(),
+                "containment_observation_reuse": {
+                    "hit_count": self._containment_observation_hits,
+                    "miss_count": self._containment_observation_misses,
+                    "successful_numeric_tracks_only": True,
+                    "full_proof_callbacks_reused": False,
+                    "raw_pixels_retained": False,
+                },
                 "scalar_bridge_reader_compatibility": {
                     "admitted_entries": self._legacy_scalar_entries_admitted,
                     "conflicting_legacy_entries_ignored": self._legacy_scalar_conflicts,
