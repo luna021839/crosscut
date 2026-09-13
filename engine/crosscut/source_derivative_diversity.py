@@ -1201,11 +1201,12 @@ def _probe_derivative_video_pts(
     original decoded-frame scan. Actual sample pixels always remain decoded.
     """
     clock = probe_constant_frame_clock(path, timeout_seconds=min(10., timeout_seconds))
-    if clock is not None:
+    if clock is not None and 1 <= clock.frame_rate <= 240:
         # Match ffprobe's six-decimal *_timestamp_time serialization exactly.
         values = tuple(round(float(index / clock.frame_rate), 6)
                        for index in range(clock.frame_count))
-        return values, "verified_complete_cfr_packet_presentation_grid"
+        if all(right > left for left, right in zip(values, values[1:])):
+            return values, "verified_complete_cfr_packet_presentation_grid"
     return (_probe_actual_video_pts(path, timeout_seconds=timeout_seconds),
             "ffprobe_best_effort_timestamp_time")
 

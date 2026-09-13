@@ -43,6 +43,17 @@ class SourceDerivativeClockFastpathTests(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, 'corrupt source'):
             _probe_derivative_video_pts(Path('/not-read'), timeout_seconds=5.)
 
+    def test_extreme_rates_keep_the_original_probe_semantics(self):
+        for rate in (Fraction(1, 100), Fraction(2_000_000)):
+            with self.subTest(rate=rate), patch(
+                'crosscut.source_derivative_diversity.probe_constant_frame_clock',
+                return_value=ConstantFrameClock(rate, 3),
+            ), patch('crosscut.source_derivative_diversity._probe_actual_video_pts',
+                     side_effect=RuntimeError('original validation failed')) as decoded:
+                with self.assertRaisesRegex(RuntimeError, 'original validation failed'):
+                    _probe_derivative_video_pts(Path('/not-read'), timeout_seconds=5.)
+                decoded.assert_called_once()
+
     def test_exact_frame_selection_is_identical_around_half_frame_boundaries(self):
         rate = Fraction(30000, 1001)
         with patch('crosscut.source_derivative_diversity.probe_constant_frame_clock',
