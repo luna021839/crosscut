@@ -3966,6 +3966,7 @@ def build_direct_member_editorial_motion_plan(
                 )
             except ValueError:
                 track = None
+            nominal_track = track
             if track is not None:
                 track = _dense_tracking_camera_track(
                     eligible_source_index=source_path[affected_index],
@@ -3982,7 +3983,7 @@ def build_direct_member_editorial_motion_plan(
                     alignment_geometry_basis=review_alignment_basis,
                     diagnostic_callback=dense_rejection_details.add,
                 )
-            if track is not None and _track_is_dense_face_safe(
+            dense_safe = track is not None and _track_is_dense_face_safe(
                 segment_index=affected_index,
                 eligible_source_index=source_path[affected_index],
                 segment=renders[affected_index],
@@ -3998,7 +3999,50 @@ def build_direct_member_editorial_motion_plan(
                 alignment_geometry_basis=review_alignment_basis,
                 rejection_callback=dense_rejection_reasons.add,
                 rejection_detail_callback=dense_rejection_details.add,
-            ):
+            )
+            if not dense_safe and nominal_track is not None:
+                from .visible_hard_ramp import shorten_hard_ramp_to_observations
+
+                shortened = shorten_hard_ramp_to_observations(
+                    nominal_track,
+                    fps=fps,
+                    frame_count=frame_counts[affected_index],
+                    frame_available=lambda frame: geometry_provider(
+                        source_path[affected_index],
+                        common_master_start + renders[affected_index].master_start
+                        + frame / fps,
+                    ) is not None,
+                )
+                if shortened is not None:
+                    track = _dense_tracking_camera_track(
+                        eligible_source_index=source_path[affected_index],
+                        segment=renders[affected_index],
+                        track=shortened,
+                        frame_count=frame_counts[affected_index],
+                        common_master_start=common_master_start,
+                        geometry_provider=geometry_provider,
+                        fps=fps,
+                        config=settings,
+                        source_frame_geometry=source_frame_geometries[source_path[affected_index]],
+                        alignment_geometry_basis=review_alignment_basis,
+                        diagnostic_callback=dense_rejection_details.add,
+                    )
+                    dense_safe = track is not None and _track_is_dense_face_safe(
+                        segment_index=affected_index,
+                        eligible_source_index=source_path[affected_index],
+                        segment=renders[affected_index],
+                        track=track,
+                        frame_count=frame_counts[affected_index],
+                        common_master_start=common_master_start,
+                        geometry_provider=geometry_provider,
+                        fps=fps,
+                        config=settings,
+                        source_frame_geometry=source_frame_geometries[source_path[affected_index]],
+                        alignment_geometry_basis=review_alignment_basis,
+                        rejection_callback=dense_rejection_reasons.add,
+                        rejection_detail_callback=dense_rejection_details.add,
+                    )
+            if dense_safe:
                 accepted_state = state
                 accepted_track = track
                 break
@@ -4173,32 +4217,15 @@ def build_direct_member_editorial_motion_plan(
     for index in range(len(renders)):
         if entry_states[index] is None and exit_states[index] is None:
             continue
-        track = _track_for_states(
-            entry=entry_states[index],
-            exit=exit_states[index],
-            last_frame_time=last_frame_times[index],
-            settings=shared,
-        )
+        # Review the accepted camera, including its observed ramp timing.
+        # Rebuilding from endpoints discards that timing and dense following.
+        # Every accepted entry/exit update already replaces tracks[index].
+        track = tracks[index]
         review_alignment_basis = (
             next(iter(segment_alignment_bases[index]))
             if len(segment_alignment_bases[index]) == 1
             else None
         )
-        if track is not None:
-            track = _dense_tracking_camera_track(
-                eligible_source_index=source_path[index],
-                segment=renders[index],
-                track=track,
-                frame_count=frame_counts[index],
-                common_master_start=common_master_start,
-                geometry_provider=geometry_provider,
-                fps=fps,
-                config=settings,
-                source_frame_geometry=source_frame_geometries[
-                    source_path[index]
-                ],
-                alignment_geometry_basis=review_alignment_basis,
-            )
         if track is None or not _track_is_dense_face_safe(
             segment_index=index,
             eligible_source_index=source_path[index],
