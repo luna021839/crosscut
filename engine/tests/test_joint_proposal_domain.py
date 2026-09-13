@@ -11,6 +11,7 @@ from crosscut.timeline import NoCompleteTimelinePath, TimelineChoice, TimelineMo
 from crosscut.visual_score import VisualTimelineOptimizerWorkspace, VisualDiversityConfig, _safe_cadence_profiles
 from engine.tests.test_joint_timeline import (
     candidate, isolated_score_config, option_set, BatchedBridgeProvider, selection_scalar_option_set,
+    valid_bridge,
 )
 
 
@@ -184,7 +185,8 @@ class JointProposalDomainTests(TestCase):
         self.assertLessEqual(len(pool.paths), 9)
         self.assertTrue(pool.paths)
         self.assertTrue(all(len(path) == len(lattice) for path in pool.paths))
-        self.assertLessEqual(len(pool.domain(3)), 3 * (len(lattice) - 1))
+        continuation_count = (len(lattice) - 1) * len(lattice[0])
+        self.assertLessEqual(len(pool.domain(3)), 3 * (len(lattice) - 1) + continuation_count)
 
     def test_local_failure_opens_adjacent_detours_only(self):
         lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(6))
@@ -222,3 +224,24 @@ class JointProposalDomainTests(TestCase):
         pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 27, lattice)
         self.assertIsNone(add_local_proposal_detour(pool, pool.domain(1),
             NoCompleteTimelinePath('global review', reason_code='test')))
+
+    def test_continuation_reaches_a_later_matched_cut_without_relaxing_hold_cap(self):
+        lattice = tuple(tuple(candidate(i, source, .9 if (source == 'A') == (i < 4) else .6)
+                              for source in ('A', 'B')) for i in range(6))
+        paths = tuple(tuple(lattice[i][s] for i, s in enumerate(path))
+                      for path in ((0,0,1,1,0,0), (1,1,0,0,1,1)))
+        fixed = JointProposalPool(paths, ('balanced', 'reference'), 20)
+        flexible = replace(fixed, candidate_lattice=lattice)
+        config = replace(isolated_score_config(), maximum_same_source_hold_segments=4)
+        def provider(key):
+            matched = key.outgoing.source_id == key.incoming.source_id or key.boundary_index == 3
+            return option_set(key, authorized={0:0.0} if matched else {})
+        def select(domain):
+            return select_joint_timeline_candidates(lattice, option_provider=provider,
+                bridge_provider=valid_bridge, boundary_search_domain=domain,
+                config=config, maximum_results=1)
+        with self.assertRaises(NoCompleteTimelinePath):
+            select(fixed.domain(3))
+        selected = select(flexible.domain(3))[0].timeline.candidates
+        self.assertEqual([c.source_id for c in selected], ['A','A','A','A','B','B'])
+        self.assertFalse(flexible.scalar_audit()['final_media_authority'])

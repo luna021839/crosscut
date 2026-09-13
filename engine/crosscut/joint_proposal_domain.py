@@ -41,11 +41,33 @@ class JointProposalPool:
     def domain(self, maximum_paths: int) -> frozenset[BoundaryMeasurementKey]:
         if isinstance(maximum_paths, bool) or not isinstance(maximum_paths, int) or maximum_paths < 1:
             raise ValueError("proposal path limit must be a positive integer")
-        return frozenset(
+        proposed = frozenset(
             BoundaryMeasurementKey.from_candidates(index, outgoing, incoming)
             for path in self.paths[:maximum_paths]
             for index, (outgoing, incoming) in enumerate(zip(path, path[1:]))
         )
+        # A complete proposal must not force a premature return to its source
+        # sequence. Keeping the current source until a later matched cut is a
+        # real option, still subject to exact proof and existing hold/cadence caps.
+        continuations = frozenset(
+            BoundaryMeasurementKey.from_candidates(index, outgoing, incoming)
+            for index, (left, right) in enumerate(zip(self.candidate_lattice, self.candidate_lattice[1:]))
+            for outgoing in left for incoming in right
+            if outgoing.source_id == incoming.source_id
+        )
+        return proposed | continuations
+
+    def scalar_audit(self) -> dict[str, Any]:
+        return {
+            "contract": CONTRACT,
+            "canonical_spans": [[c.segment_index, c.start_seconds, c.end_seconds] for c in self.paths[0]],
+            "proposal_source_paths": [list(c.source_id for c in path) for path in self.paths],
+            "cadence_profiles": list(self.cadence_profiles),
+            "full_boundary_pair_count": self.full_boundary_pair_count,
+            "source_continuations_included": bool(self.candidate_lattice),
+            "final_media_authority": False,
+            "raw_descriptors_persisted": False,
+        }
 
 
 def proposal_pool_from_results(
@@ -211,6 +233,7 @@ def select_with_joint_proposal_domains(
             "remaining_proof_calls": remaining, "final_media_authority": False,
             "raw_frame_visual_limits_used_as_final_authority": False,
             "local_repair_round_count": len(local_repairs),
+            "source_continuation_pair_count": sum(key.outgoing.source_id == key.incoming.source_id for key in domain),
         }
         if report is not None:
             report({**event, "phase": "proposal_domain_start"})

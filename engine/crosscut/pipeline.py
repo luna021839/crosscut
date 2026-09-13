@@ -28109,6 +28109,7 @@ def analyze(
                         )
                     reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
                     joint_proposal_pool = build_joint_proposal_pool(workspace)
+                    reporter.emit("joint_proposal_pool", **joint_proposal_pool.scalar_audit())
                     reporter.log(
                         f"전체 편집 제안 {len(joint_proposal_pool.paths)}개 확보 · "
                         "제안 연결점만 정밀 분석 · 최종 픽셀/트랙/렌더 게이트 유지"
