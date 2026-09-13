@@ -12,6 +12,7 @@ from typing import Any, Mapping
 H264_READER_ANALYZER = "0d665ac9a9b9ef183e0c666196d63cfd84c77f35fbe3d4c59fac1350c4fa1e8d"
 PREVIOUS_READER_ANALYZER = "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509"
 MEASURED_FACE_ANALYZER = "5a8c720efe6d42869df46685bb2aec9650308a1c42b455e0c1101349e072b048"
+WIDER_WORKING_PIXEL_WINDOW_ANALYZER = "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b"
 NATIVE_TRACKING_READER_PROVIDER = "32cee7eb75221d6075e3ba401fcdcb7a20854f168bd62c70c3693af666edd15b"
 TIMESTAMP_TRACKING_READER_PROVIDER = "944386cf0a3598f6b5370d1ad5798b38987728d2057f94a7737e23f433a65513"
 
@@ -32,6 +33,13 @@ def previous_reader_scalar_analyzer(analyzer: Mapping[str, Any]) -> dict[str, An
         return None
     if len(versions) < 2 or len(versions) != len(sources):
         return None
+    if all(version == WIDER_WORKING_PIXEL_WINDOW_ANALYZER for version in versions):
+        # The only descriptor implementation change is the process-local
+        # 480px pixel-cache capacity. Retain every provider/config/model/source
+        # and transform identity so changed bridge logic still misses normally.
+        result = deepcopy(dict(analyzer))
+        result["visual_analyzer_sha256s"] = [MEASURED_FACE_ANALYZER] * len(versions)
+        return result
     implementation = analyzer.get("implementation_sha256")
     if (all(version == MEASURED_FACE_ANALYZER for version in versions)
             and isinstance(implementation, Mapping)

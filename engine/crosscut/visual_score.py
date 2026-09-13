@@ -5070,6 +5070,10 @@ class _VideoSampler:
                     self.capture,
                     clock=probe_constant_frame_clock(self.path),
                     process_frame=_working_frame,
+                    # Two-beat bridge sweeps routinely revisit >32 frames.
+                    # These are 480px working pixels, not native UHD frames:
+                    # 128 RGB frames cost about 48 MiB per 16:9 source.
+                    maximum_cached_frames=128,
                 )
             self.frame_decode_count += 1
             self.cache[key] = self._seek_locality.frame_at(key.canonical_seconds)

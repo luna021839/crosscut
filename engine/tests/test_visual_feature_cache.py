@@ -518,7 +518,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor_ast,
-            "6eb90fbd314354695712960108f5eb9448546272ac9595f502185cae08c6e763",
+            "25725f7ce28f7d95216a401b22ac1e8ae2ebe199dce5d08c9c5dc73642c0f166",
         )
         # Reader behavior is part of the audited endpoint, even if the import
         # alias and sampler AST remain unchanged. Older constants above retain
@@ -531,15 +531,39 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "d19d38dd50805b619e036a4faeeeb44e0190c2543ed09565c79bb684913011a3",
+            "619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82",
         )
 
     def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
         # This revision changes actual descriptor values. Older decoder-only
         # equivalence edges must not relabel those old measurements as current.
         from crosscut.visual_score import _visual_analyzer_fingerprint
-        self.assertEqual(_decode_equivalent_analyzer_migration_closure(
-            _visual_analyzer_fingerprint().digest), ())
+        previous = "5a8c720efe6d42869df46685bb2aec9650308a1c42b455e0c1101349e072b048"
+        self.assertEqual(_decode_equivalent_analyzer_migration_closure(previous), ())
+        # A later cache-capacity-only change may reuse this corrected numeric
+        # generation, but must still not cross the earlier face-scale change.
+        closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
+        self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (previous,))
+
+    def test_larger_working_pixel_lru_reuses_only_exact_corrected_generation(self):
+        old_components = _audited_active_analyzer_components()
+        new_components = _audited_active_analyzer_components()
+        old_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "d19d38dd50805b619e036a4faeeeb44e0190c2543ed09565c79bb684913011a3")
+        new_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82")
+        previous, current = map(_analyzer_from_components, (old_components,new_components))
+        self.assertEqual(previous.digest, "5a8c720efe6d42869df46685bb2aec9650308a1c42b455e0c1101349e072b048")
+        self.assertEqual(current.digest, "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'source.mp4'; source.write_bytes(b'unchanged-source')
+            request = _request()
+            old = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=previous)
+            self.assertTrue(old.put(request, {'value':.123}))
+            new = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertEqual(new.get_by_locator(request.locator), {'value':.123})
+            self.assertEqual(new.diagnostics()['decode_free_legacy_hit_count'], 1)
 
     def test_h264_locality_exact_forward_migration_preserves_records(self) -> None:
         previous_components = _audited_active_analyzer_components()

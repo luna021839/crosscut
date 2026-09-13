@@ -149,6 +149,23 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Only the 480px process-local pixel LRU grew from 32 to 128 frames.
+    # Source clocks, decoded pixels, feature computation and model/runtime
+    # bindings are unchanged; real UHD repeated-window pixels match exactly.
+    "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "5a8c720efe6d42869df46685bb2aec9650308a1c42b455e0c1101349e072b048"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "d19d38dd50805b619e036a4faeeeb44e0190c2543ed09565c79bb684913011a3"
+            ),
+            current_descriptor_digest=(
+                "619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82"
+            ),
+        ),
+    ),
     # H264 locality has identical decoded pixels on all 1,728 actual XOXZ
     # requests, plus sequential/B-frame/open-GOP regressions. Only this exact
     # reader dependency changed; model/schema/runtime mismatches still fail.

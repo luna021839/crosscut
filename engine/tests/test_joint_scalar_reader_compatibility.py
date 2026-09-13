@@ -7,6 +7,7 @@ from crosscut.joint_scalar_reader_compatibility import (
     H264_READER_ANALYZER, PREVIOUS_READER_ANALYZER, previous_reader_scalar_analyzer,
     MEASURED_FACE_ANALYZER, NATIVE_TRACKING_READER_PROVIDER,
     TIMESTAMP_TRACKING_READER_PROVIDER,
+    WIDER_WORKING_PIXEL_WINDOW_ANALYZER,
 )
 from crosscut.source_scalar_cache import PersistentSourceScalarCache
 from crosscut.joint_observation_reuse import JointObservationBank, ReusingDecodedBoundaryOptionProvider
@@ -147,6 +148,30 @@ class NativeTrackingReaderCompatibilityTests(unittest.TestCase):
         analyzer=self.analyzer()
         analyzer['implementation_sha256']['provider_class_ast']=actual
         self.assertIsNone(previous_reader_scalar_analyzer(analyzer))
+
+
+class WorkingPixelWindowCompatibilityTests(unittest.TestCase):
+    def analyzer(self):
+        original = ScalarReaderCompatibilityTests().analyzer()
+        original['visual_analyzer_sha256s'] = [WIDER_WORKING_PIXEL_WINDOW_ANALYZER]*2
+        return original
+
+    test_production_adapter_reads_legacy_shard_but_fresh_conflict_wins = (
+        ScalarReaderCompatibilityTests.test_production_adapter_reads_legacy_shard_but_fresh_conflict_wins)
+    test_ordinary_loader_still_rejects_nonreader_changes = (
+        ScalarReaderCompatibilityTests.test_ordinary_loader_still_rejects_nonreader_changes)
+
+    def test_only_pixel_capacity_analyzers_change(self):
+        current = self.analyzer()
+        original = deepcopy(current)
+        prior = previous_reader_scalar_analyzer(current)
+        expected = deepcopy(current)
+        expected['visual_analyzer_sha256s'] = [MEASURED_FACE_ANALYZER]*2
+        self.assertEqual(prior, expected)
+        self.assertEqual(current, original)
+        self.assertIsNone(previous_reader_scalar_analyzer(prior))
+        current['visual_analyzer_sha256s'][1] = MEASURED_FACE_ANALYZER
+        self.assertIsNone(previous_reader_scalar_analyzer(current))
 
     def test_other_context_changes_cannot_load_the_previous_shard(self):
         with tempfile.TemporaryDirectory(prefix='tracking-reader-cache-') as directory:
