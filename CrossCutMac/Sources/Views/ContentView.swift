@@ -586,12 +586,24 @@ struct ContentView: View {
                     }
                 }
 
-                ProgressView(value: runner.progress)
-                    .tint(.purple)
-                Text("\(Int(runner.progress * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                if runner.progressIsIndeterminate {
+                    if runner.state.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(runner.state.isRunning
+                         ? "현재 단계의 검사 개수를 표시합니다 · 전체 완료율은 아직 계산할 수 없습니다"
+                         : "작업 종료 · 전체 완료율 미산정")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView(value: runner.progress)
+                        .tint(.purple)
+                    Text("\(Int(runner.progress * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
 
                 Divider()
 

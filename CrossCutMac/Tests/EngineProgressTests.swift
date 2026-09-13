@@ -66,6 +66,20 @@ final class EngineProgressTests: XCTestCase {
     }
 
     @MainActor
+    func testJointSearchDoesNotPresentStaleNinetyEightPercentAsOverallCompletion() throws {
+        let runner = EngineRunner(locateEngine: { nil })
+        runner.handle(try event(#"{"type":"progress","value":0.9824}"#))
+        XCTAssertFalse(runner.progressIsIndeterminate)
+        runner.handle(try event(#"{"type":"joint_visual_selection_progress","contract":"joint_selection_progress_v1","phase":"profile_start","completed_boundary_layers":0,"total_boundary_layers":119,"profile_index":1,"total_profiles":3}"#))
+        XCTAssertTrue(runner.progressIsIndeterminate)
+        XCTAssertEqual(runner.progress, 0.9824)
+        XCTAssertTrue(runner.outputURLs.isEmpty)
+        runner.handle(try event(#"{"type":"progress","value":0.99,"message":"최종 렌더 진행"}"#))
+        XCTAssertFalse(runner.progressIsIndeterminate)
+        XCTAssertEqual(runner.progress, 0.99)
+    }
+
+    @MainActor
     func testRunnerDisplaysWorkWithoutExposingOutputsOrChangingRunState() throws {
         let runner = EngineRunner(locateEngine: { nil })
         let stateBefore = runner.state

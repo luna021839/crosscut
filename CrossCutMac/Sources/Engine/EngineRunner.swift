@@ -1256,6 +1256,7 @@ final class EngineRunner: ObservableObject {
 
     @Published private(set) var state: EngineRunState = .idle
     @Published private(set) var progress: Double = 0
+    @Published private(set) var progressIsIndeterminate = false
     @Published private(set) var statusMessage = "IVE 곡명을 입력하면 음방 10개를 목표로 찾고, 최소 8개부터 편집합니다."
     @Published private(set) var logs: [EngineLogEntry] = []
     @Published private(set) var outputURLs: [URL] = []
@@ -1407,6 +1408,7 @@ final class EngineRunner: ObservableObject {
         activeRunID = nil
         activeRequest = nil
         progress = 0
+        progressIsIndeterminate = false
         logs.removeAll()
         outputURLs.removeAll()
         renderedVideoURL = nil
@@ -1460,6 +1462,7 @@ final class EngineRunner: ObservableObject {
         resultMessage = "외부에서 완성된 교차편집 결과를 불러왔습니다."
         cancellationRequested = false
         progress = 1
+        progressIsIndeterminate = false
         state = .completed
         statusMessage = "교차편집 결과가 준비되었습니다."
         appendLog(
@@ -1679,6 +1682,9 @@ final class EngineRunner: ObservableObject {
         switch type {
         case "joint_visual_selection_progress", "joint_candidate_terminal", "joint_candidate_look_pending":
             if let work = event.workStatus {
+                // A preceding feature-stage value (often 98%) is not an
+                // estimate for search, proof, rendering and QA still to come.
+                progressIsIndeterminate = true
                 statusMessage = work.message
                 if work.shouldLog {
                     appendLog(work.message, level: work.isWarning ? .warning : .info)
@@ -1693,6 +1699,7 @@ final class EngineRunner: ObservableObject {
 
         case "progress":
             if let eventProgress = event.progress {
+                progressIsIndeterminate = false
                 progress = min(max(eventProgress, 0), 1)
             }
             if let message = event.message ?? event.stage {
@@ -1783,6 +1790,7 @@ final class EngineRunner: ObservableObject {
         activeRunID = nil
         activeRequest = nil
         progress = 1
+        progressIsIndeterminate = false
         state = .completed
         statusMessage = "교차편집 결과가 준비되었습니다."
         if let resultMessage { appendLog(resultMessage, level: .info) }
