@@ -79,8 +79,12 @@ class EndpointComponentFrame:
 
 
 def _observed_torso(frame):
-    m=frame.measurement
-    if (frame.component_weight<.90 or m.reason!='observed' or m.pose is None or m.person is None
+    return observed_torso_geometry(frame.measurement) if frame.component_weight>=.90 else None
+
+
+def observed_torso_geometry(m):
+    """The same four measured anatomical points, never detector box padding."""
+    if (not isinstance(m,RenderedBodyMeasurement) or m.reason!='observed' or m.pose is None or m.person is None
             or m.similarity is None or not math.isfinite(m.similarity) or m.similarity<.68
             or (m.margin is not None and (not math.isfinite(m.margin) or m.margin<.06))
             or m.source_output_pose_mismatch is None or not math.isfinite(m.source_output_pose_mismatch)

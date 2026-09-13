@@ -466,6 +466,7 @@ def evaluate_direct_member_rendered_continuity(
     body_window_provider=None,
     effect_endpoint_provider=None,
     focal_body_execution_device: str = 'cpu',
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> DirectMemberRenderedContinuityResult:
     """Evaluate every real hard source switch in the encoded member video."""
 
@@ -753,6 +754,9 @@ def evaluate_direct_member_rendered_continuity(
 
     try:
         for boundary_index, boundary_frame in enumerate(boundary_frames):
+            if progress_callback:
+                progress_callback(dict(stage='decoded_boundary',boundary_index=boundary_index,
+                    boundary_count=len(boundary_frames),output_frame=boundary_frame))
             outgoing_source = source_indices[boundary_index]
             incoming_source = source_indices[boundary_index + 1]
             if outgoing_source == incoming_source:
@@ -1092,6 +1096,16 @@ def evaluate_direct_member_rendered_continuity(
                 endpoint_outgoing.attention,
                 endpoint_incoming.attention,
             )
+            detector_box_position,detector_box_scale=position,scale
+            torso_geometries=None
+            if body_window is not None:
+                from .rendered_endpoint_component import observed_torso_geometry
+                measured=tuple(observed_torso_geometry(m) for m in body_window[1:3])
+                if all(g is not None for g in measured):
+                    torso_geometries=measured
+                    a,b=measured
+                    position=min(1.,math.dist(a['centroid_xy'],b['centroid_xy'])/.42)
+                    scale=min(1.,abs(math.log(a['scale_area_proxy']/b['scale_area_proxy']))/math.log(3.2))
             bbox_scale_mismatch: float | None = None
             landmark_scale_mismatch: float | None = None
             scale_direction_agreement: bool | None = None
@@ -1376,6 +1390,15 @@ def evaluate_direct_member_rendered_continuity(
                     "raw_embeddings_persisted": False,
                 }
             )
+            if torso_geometries is not None:
+                record=records[-1]
+                record['detector_box_attention_geometry_diagnostic']=record['attention_geometry']
+                record['attention_geometry']=dict(outgoing=torso_geometries[0],incoming=torso_geometries[1])
+                record['attention_basis']=dict(outgoing='source_authorized_output_torso_landmarks',incoming='source_authorized_output_torso_landmarks')
+                record['detector_box_position_mismatch_diagnostic']=detector_box_position
+                record['detector_box_scale_mismatch_diagnostic']=detector_box_scale
+                record['attention_landmark_scale_mismatch_diagnostic']=scale
+                record['attention_scale_evidence_direction_agreement']=None
     finally:
         try:
             if owned_body_provider is not None:

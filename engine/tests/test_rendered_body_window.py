@@ -79,6 +79,33 @@ class RenderedBodyIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'typed measurements'):
             self.evaluate(_plan(), Mock(return_value=(None,) * 4))
 
+    def test_detector_padding_does_not_override_the_same_measured_anatomy(self):
+        padded=replace(self.observed,person=replace(self.observed.person,bbox_xywh=(0.,0.,1.,1.)),
+            pose=replace(self.observed.pose,bbox_xywh=(0.,0.,1.,1.)))
+        result=self.evaluate(_plan(),Mock(return_value=(padded,padded,self.observed,self.observed)))
+        self.assertTrue(result.passed,result.failure_reasons)
+        row=result.boundaries[0]
+        self.assertEqual(row['attention_scale_mismatch'],0.)
+        self.assertEqual(row['attention_position_mismatch'],0.)
+        self.assertGreater(row['detector_box_scale_mismatch_diagnostic'],.18)
+        self.assertEqual(row['attention_geometry']['outgoing']['common_joint_indices'],[0,1,6,7])
+        self.assertEqual(row['attention_basis']['outgoing'],'source_authorized_output_torso_landmarks')
+
+    def test_real_anatomical_scale_and_position_jumps_remain_rejected(self):
+        pose=replace(self.observed.pose,upper_body_xyc=tuple(
+            (.5+(x-.5)*1.3+.10,.5+(y-.5)*1.3,c) for x,y,c in self.observed.pose.upper_body_xyc))
+        changed=replace(self.observed,pose=pose,person=pose.as_formation_person(.9))
+        result=self.evaluate(_plan(),Mock(return_value=(self.observed,self.observed,changed,changed)))
+        self.assertIn('rendered_boundary_position_discontinuity',result.failure_reasons)
+        self.assertIn('rendered_boundary_scale_discontinuity',result.failure_reasons)
+
+    def test_progress_reports_real_boundary_work_without_claiming_success(self):
+        events=[];plan=_plan()
+        descriptors={i:_descriptor(position=.3,pose=.2,include_face=False) for i in range(plan['output_frame_count'])}
+        evaluate_direct_member_rendered_continuity(Path('unused.mp4'),plan,descriptor_provider=_provider(descriptors),
+            body_window_provider=Mock(return_value=(self.observed,)*4),progress_callback=events.append)
+        self.assertEqual(events,[dict(stage='decoded_boundary',boundary_index=0,boundary_count=1,output_frame=4)])
+
 
 class BodyWindowClockTests(unittest.TestCase):
     def plan(self):
