@@ -623,6 +623,7 @@ class SegmentTransformPathSample:
             if self.containment_basis not in {
                 "observed_cut_anchor", "pixel_flow_plus_observed_geometry",
                 "bounded_pixel_flow_containment",
+                "observed_face_identity_geometry",
             }:
                 raise ValueError("segment sample containment basis is unsupported")
             if (self.transform.crop_xywh is None or self.subject_basis != "dominant_face"
@@ -3076,6 +3077,7 @@ class DecodedBoundaryOptionProvider:
                 frames=frames, times=[sample_times[i] for i in indices],
                 face_boxes=observations, anchor_box=anchor_descriptor.primary_face_bbox,
                 anchor_index=indices.index(anchor_index), output_fps=self.output_fps,
+                allow_observed_face_recovery=True,
             )
             if not trace.complete:
                 return {}, "segment_cut_containment_" + str(trace.failure)
@@ -5304,6 +5306,9 @@ class DecodedBoundaryOptionProvider:
                 ).hexdigest(),
                 "cut_anchored_containment_sha256": hashlib.sha256(
                     Path(__file__).with_name("cut_anchored_containment.py").read_bytes()
+                ).hexdigest(),
+                "observed_face_containment_sha256": hashlib.sha256(
+                    Path(__file__).with_name("observed_face_containment.py").read_bytes()
                 ).hexdigest(),
                 "cut_containment_pixel_flow_ast": python_symbol_dependency_sha256(
                     Path(__file__).with_name("boundary_subject_alignment.py"),

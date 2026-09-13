@@ -79,6 +79,35 @@ class CutAnchoredContainmentTests(unittest.TestCase):
         frames[3]=None
         self.assertEqual(self.run_case(frames=frames).failure,'frame_unavailable')
 
+    def test_opt_in_observed_recovery_has_its_own_truthful_basis(self):
+        from crosscut.observed_face_containment import ObservedFaceRecovery
+        original = __import__('crosscut.cut_anchored_containment',fromlist=['_optical_flow_box'])._optical_flow_box
+        calls=0
+        def fail_one(before,after,box):
+            nonlocal calls
+            calls+=1
+            return None if calls==1 else original(before,after,box)
+        with patch('crosscut.cut_anchored_containment._optical_flow_box',side_effect=fail_one), patch(
+                'crosscut.observed_face_containment.recover_observed_face_step',
+                return_value=ObservedFaceRecovery(self.boxes[1],.8)) as recover:
+            result=self.run_case(allow_observed_face_recovery=True)
+        self.assertTrue(result.complete,result.failure)
+        self.assertEqual(result.samples[1].basis,'observed_face_identity_geometry')
+        recover.assert_called_once()
+
+    def test_default_and_native_cut_do_not_call_observed_recovery(self):
+        with patch('crosscut.observed_face_containment.recover_observed_face_step') as recover:
+            with patch('crosscut.cut_anchored_containment._optical_flow_box',return_value=None):
+                self.assertEqual(self.run_case().failure,'pixel_flow_failed')
+            self.assertEqual(self.run_case(scene_break_indices=(4,),
+                            allow_observed_face_recovery=True).failure,'native_scene_cut')
+        recover.assert_not_called()
+
+    def test_successful_flow_never_invokes_recovery(self):
+        with patch('crosscut.observed_face_containment.recover_observed_face_step') as recover:
+            self.assertTrue(self.run_case(allow_observed_face_recovery=True).complete)
+        recover.assert_not_called()
+
     def test_middle_cut_anchor_checks_both_directions(self):
         result = track_around_cut_anchor(frames=self.frames,
             times=[i/30 for i in range(9)], face_boxes=[(b,) for b in self.boxes],

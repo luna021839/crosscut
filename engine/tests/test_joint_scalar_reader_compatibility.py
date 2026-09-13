@@ -138,12 +138,15 @@ class NativeTrackingReaderCompatibilityTests(unittest.TestCase):
         ):
             self.assertIsNone(previous_reader_scalar_analyzer({**self.analyzer(), field:value}))
 
-    def test_equivalence_pin_matches_the_integrated_provider_ast(self):
+    def test_reader_only_equivalence_refuses_new_recovery_policy(self):
         from crosscut.visual_feature_cache import python_symbol_dependency_sha256
         actual = python_symbol_dependency_sha256(
             Path(__file__).parents[1] / 'crosscut/joint_boundary_provider.py',
             root_symbols=('DecodedBoundaryOptionProvider',))
-        self.assertEqual(actual, NATIVE_TRACKING_READER_PROVIDER)
+        self.assertNotEqual(actual, NATIVE_TRACKING_READER_PROVIDER)
+        analyzer=self.analyzer()
+        analyzer['implementation_sha256']['provider_class_ast']=actual
+        self.assertIsNone(previous_reader_scalar_analyzer(analyzer))
 
     def test_other_context_changes_cannot_load_the_previous_shard(self):
         with tempfile.TemporaryDirectory(prefix='tracking-reader-cache-') as directory:

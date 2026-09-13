@@ -1,10 +1,12 @@
-"""Short pixel-continuity handles, not face recognition or cut authorization.
+"""Short subject-containment handles, never cross-source cut authorization.
 
 The cut's already selected box is followed through nearby frames. Each step
 needs strict forward/backward optical flow; congruent face geometry refreshes
 the box, with at most two consecutive detector misses. A different face with
 a high recognition cosine cannot replace the tracked box from elsewhere in
 the image. No pixels, keypoints, or identity embeddings are serialized.
+Production may additionally recover a failed rigid-flow step using actual,
+unambiguous nearby face observations and appearance agreement in both frames.
 """
 from __future__ import annotations
 
@@ -55,6 +57,7 @@ def track_cut_handle(
     face_boxes: Sequence[Sequence[Box]], anchor_box: Box, anchor_at_end: bool,
     output_fps: float, scene_break_indices: Sequence[int] = (),
     maximum_handle_seconds: float = .65, maximum_detector_misses: int = 2,
+    allow_observed_face_recovery: bool = False,
 ) -> CutAnchoredContainment:
     """Return measured containment support only inside one short source shot.
 
@@ -65,6 +68,8 @@ The anchor must be an actual observed face; this function never invents one.
     """
     if not frames or len(frames) != len(times) or len(frames) != len(face_boxes):
         raise ValueError('handle frames, times and face boxes must align')
+    if not isinstance(allow_observed_face_recovery, bool):
+        raise ValueError('observed face recovery must be boolean')
     if not isinstance(anchor_at_end, bool) or not _valid_box(anchor_box):
         raise ValueError('handle anchor is invalid')
     if isinstance(output_fps, bool) or not isinstance(output_fps, (int, float)) or not math.isfinite(output_fps) or output_fps <= 0:
@@ -100,7 +105,15 @@ The anchor must be an actual observed face; this function never invents one.
         if previous is None:
             basis = 'observed_cut_anchor'
         else:
-            box = _optical_flow_box(previous, frame, box)
+            previous_box = box
+            box = _optical_flow_box(previous, frame, previous_box)
+            recovered = False
+            if box is None and allow_observed_face_recovery:
+                from .observed_face_containment import recover_observed_face_step
+                recovery = recover_observed_face_step(previous, frame, previous_box, face_boxes[index])
+                if recovery is not None:
+                    box = recovery.box
+                    recovered = True
             if box is None:
                 return CutAnchoredContainment(tuple(samples), False, 'pixel_flow_failed', index)
             ranked = sorted(((_iou(box,b),b) for b in face_boxes[index]), reverse=True)
@@ -109,7 +122,8 @@ The anchor must be an actual observed face; this function never invents one.
                     return CutAnchoredContainment(tuple(samples), False, 'face_geometry_ambiguous', index)
                 box = ranked[0][1]
                 misses = 0
-                basis = 'pixel_flow_plus_observed_geometry'
+                basis = ('observed_face_identity_geometry' if recovered
+                         else 'pixel_flow_plus_observed_geometry')
             else:
                 misses += 1
                 if misses > maximum_detector_misses:
@@ -124,6 +138,7 @@ def track_around_cut_anchor(
     *, frames: Sequence[np.ndarray | None], times: Sequence[float],
     face_boxes: Sequence[Sequence[Box]], anchor_box: Box, anchor_index: int,
     output_fps: float, scene_break_indices: Sequence[int] = (),
+    allow_observed_face_recovery: bool = False,
 ) -> CutAnchoredContainment:
     """Track both ways from the actual measured cut frame, never a new face.
 
@@ -134,6 +149,8 @@ pixel continuity with that same observed anchor. Failure samples are ordered.
     if (isinstance(anchor_index, bool) or not isinstance(anchor_index, int)
             or not 0 <= anchor_index < len(frames)):
         raise ValueError('cut anchor index is outside the handle')
+    if not isinstance(allow_observed_face_recovery, bool):
+        raise ValueError('observed face recovery must be boolean')
     if not times or len(frames) != len(times) or len(frames) != len(face_boxes):
         raise ValueError('handle frames, times and face boxes must align')
     if any(isinstance(t, bool) or not isinstance(t, (int, float))
@@ -147,13 +164,15 @@ pixel continuity with that same observed anchor. Failure samples are ordered.
         # Reuse public validation; this rejects before reading any flow pixels.
         return track_cut_handle(frames=frames, times=times, face_boxes=face_boxes,
             anchor_box=anchor_box, anchor_at_end=False, output_fps=output_fps,
-            scene_break_indices=scene_break_indices)
+            scene_break_indices=scene_break_indices,
+            allow_observed_face_recovery=allow_observed_face_recovery)
     collected: dict[int, ContainmentSample] = {}
     for start, end, backwards in ((0, anchor_index + 1, True),
                                   (anchor_index, len(frames), False)):
         result = track_cut_handle(frames=frames[start:end], times=times[start:end],
             face_boxes=face_boxes[start:end], anchor_box=anchor_box,
-            anchor_at_end=backwards, output_fps=output_fps)
+            anchor_at_end=backwards, output_fps=output_fps,
+            allow_observed_face_recovery=allow_observed_face_recovery)
         for sample in result.samples:
             index = sample.index + start
             collected[index] = ContainmentSample(index, sample.box, sample.basis,

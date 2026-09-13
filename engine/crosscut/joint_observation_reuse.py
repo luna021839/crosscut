@@ -19,6 +19,7 @@ from .joint_boundary_provider import (
     _SCALAR_BRIDGE_CACHE_NAMESPACE, _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD,
 )
 from .joint_scalar_reader_compatibility import previous_reader_scalar_analyzer
+from .joint_complete_containment_compatibility import previous_complete_containment_analyzer
 from .source_scalar_cache import PersistentSourceScalarCache
 
 
@@ -204,7 +205,8 @@ class ReusingDecodedBoundaryOptionProvider(ProgressDecodedBoundaryOptionProvider
         if was_loaded or segment_index not in self._scalar_bridge_persistent_cache_loaded_segments:
             return
         current_cache = self._scalar_bridge_persistent_caches[segment_index]
-        legacy_analyzer = previous_reader_scalar_analyzer(current_cache.analyzer)
+        legacy_analyzer = (previous_complete_containment_analyzer(current_cache.analyzer)
+                           or previous_reader_scalar_analyzer(current_cache.analyzer))
         if legacy_analyzer is None:
             return
         direct_root = self.feature_derived_cache_directory
