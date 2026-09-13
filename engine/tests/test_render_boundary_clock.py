@@ -13,7 +13,7 @@ from crosscut.render import (
     RenderTransition, TransitionKind, render,
 )
 from crosscut.ive import AspectRatio
-from crosscut.render_boundary_clock import hard_source_cut_native_clocks
+from crosscut.render_boundary_clock import hard_source_cut_native_clocks, native_frame_clocks_for_output
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_clock
 
 
@@ -28,6 +28,18 @@ def clocks(fps=Fraction(30000, 1001), count=8000):
 
 
 class RenderBoundaryClockTests(unittest.TestCase):
+    def test_requested_interior_frames_keep_the_coalesced_native_origin(self):
+        p = plan((RenderSegment(0, .0143, .084, 0.),
+                  RenderSegment(0, .0983, .084, .084),
+                  RenderSegment(1, .021, 1., .168)), 30.)
+        actual = native_frame_clocks_for_output(p, clocks(Fraction(60)), [0,1,2,3,4,5])
+        self.assertEqual([actual[i].native_frame_index for i in range(6)], [1,3,5,7,9,1])
+        self.assertEqual(actual[4].unit_first_segment_index, 0)
+        with self.assertRaises(ValueError):
+            native_frame_clocks_for_output(p, clocks(), [True])
+        with self.assertRaises(ValueError):
+            native_frame_clocks_for_output(p, clocks(), [p.output_frame_count])
+
     def test_real_diagnostic_frame_ids_not_half_frame_measurement_ids(self):
         durations = (1.2912101444991322, .9909098441988533, 1.3913102445992251)
         starts = (165.4449617696613, 146.1688541852568, 210.55250905535212)
@@ -116,7 +128,10 @@ class RenderBoundaryClockPixelTests(unittest.TestCase):
                     '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], capture_output=True, check=True).stdout
                 actual = np.frombuffer(raw, np.uint8).reshape((-1, 90, 160, 3))
                 self.assertEqual(len(actual), p.output_frame_count)
-                for sample in (expected.outgoing, expected.incoming):
+                all_samples = native_frame_clocks_for_output(p, {0:clock,1:clock}, range(p.output_frame_count))
+                self.assertEqual(all_samples[expected.outgoing.output_frame_index], expected.outgoing)
+                self.assertEqual(all_samples[expected.incoming.output_frame_index], expected.incoming)
+                for sample in all_samples.values():
                     frame = actual[sample.output_frame_index]
                     observed = sum((frame[40:50, bit*20+8:bit*20+12].mean() > 125) << bit
                                    for bit in range(8))

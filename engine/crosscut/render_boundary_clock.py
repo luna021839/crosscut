@@ -102,3 +102,54 @@ def hard_source_cut_native_clocks(
             incoming=sample(index + 1, 0),
         ))
     return tuple(results)
+
+
+def native_frame_clocks_for_output(
+    plan: RenderPlan,
+    source_clocks: Mapping[int, VerifiedRenderFrameClock],
+    output_frame_indices,
+) -> dict[int, RenderedBoundaryNativeFrame]:
+    """Locate requested pure hard-cut output frames on the real sampler clock.
+
+    This also covers interior frames needed by source-fidelity QA. No legacy
+    ``ceil(source_start) + round(relative_time)`` fallback is silently used.
+    Blended plans require a separate composited-frame contract.
+    """
+    if not isinstance(plan, RenderPlan):
+        raise TypeError('native frame inspection requires a RenderPlan')
+    if any(transition.kind.uses_overlap for transition in plan.transitions):
+        raise ValueError('overlap pixels require a composited boundary clock')
+    indices = tuple(output_frame_indices)
+    if any(type(i) is not int or not 0 <= i < plan.output_frame_count for i in indices):
+        raise ValueError('requested output frame is outside the render plan')
+    wanted = set(indices)
+    counts = segment_frame_counts(plan)
+    cursor = 0
+    result = {}
+    for unit in _video_render_units(plan, counts):
+        first, last = unit.segments[0], unit.segments[-1]
+        clock = source_clocks.get(first.source_index)
+        if not isinstance(clock, VerifiedRenderFrameClock):
+            raise ValueError(f'source {first.source_index} has no verified native clock')
+        selected = sorted(i for i in wanted if cursor <= i < cursor + unit.frame_count)
+        if selected:
+            rate = (unit.coalesced_segment.source_playback_rate
+                    if unit.coalesced_segment is not None else
+                    (last.source_end - first.source_start) / sum(s.duration for s in unit.segments))
+            schedule = sampler_frame_schedule(source_start=first.source_start,
+                source_playback_rate=rate, native_fps=float(clock.frame_rate),
+                output_fps=plan.fps, frame_count=unit.frame_count,
+                source_frame_count=clock.frame_count,
+                maximum_terminal_hold_frames=math.ceil(plan.fps))
+            held = set(schedule.terminal_hold_output_indices)
+            for index in selected:
+                tick = index - cursor
+                native = schedule.source_frame_indices[tick]
+                result[index] = RenderedBoundaryNativeFrame(index, first.source_index,
+                    native, first.source_start + tick / plan.fps * rate,
+                    native / float(clock.frame_rate), tick, unit.first_segment_index,
+                    tick in held)
+        cursor += unit.frame_count
+    if set(result) != wanted:
+        raise RuntimeError('native sample coverage differs from requested output frames')
+    return result
