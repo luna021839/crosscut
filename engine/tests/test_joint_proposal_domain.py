@@ -5,6 +5,7 @@ from crosscut.joint_proposal_domain import (
     JointProposalPool, proposal_pool_from_results, select_with_joint_proposal_domains,
     build_joint_proposal_pool, proposal_only_config,
     add_local_proposal_detour,
+    local_proposal_added_pair_budget,
 )
 from crosscut.joint_timeline import BoundaryMeasurementKey, select_joint_timeline_candidates
 from crosscut.timeline import NoCompleteTimelinePath, TimelineChoice, TimelineMode, TimelineResult
@@ -188,20 +189,85 @@ class JointProposalDomainTests(TestCase):
         continuation_count = (len(lattice) - 1) * len(lattice[0])
         self.assertLessEqual(len(pool.domain(3)), 3 * (len(lattice) - 1) + continuation_count)
 
-    def test_local_failure_opens_adjacent_detours_only(self):
+    def test_local_failure_opens_boundary_then_adjacent_detours_only(self):
         lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(6))
         pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 45, lattice)
         original = pool.domain(1)
         failure = NoCompleteTimelinePath('blocked', reason_code='test', segment_index=3)
         widened, audit = add_local_proposal_detour(pool, original, failure)
         self.assertLess(original, widened)
-        self.assertEqual(audit['touched_boundary_indices'], [1, 2, 3])
+        self.assertEqual(audit['touched_boundary_indices'], [2])
+        self.assertEqual(audit['repair_scope'], 'failed_boundary_only')
+        self.assertEqual({key for key in widened if key.boundary_index != 2},
+                         {key for key in original if key.boundary_index != 2})
+        # If that boundary still cannot connect, a second local attempt can
+        # change its neighbor without opening unrelated parts of the song.
+        widened, audit = add_local_proposal_detour(pool, widened, failure)
+        self.assertEqual(audit['touched_boundary_indices'], [1, 3])
+        self.assertEqual(audit['repair_scope'], 'adjacent_reconnection')
         self.assertEqual({key for key in widened if key.boundary_index in (0, 4)},
                          {key for key in original if key.boundary_index in (0, 4)})
         # A replacement can enter the blocked area and rejoin the original path.
         self.assertIn(BoundaryMeasurementKey(1, lattice[1][0], lattice[2][2]), widened)
         self.assertIn(BoundaryMeasurementKey(2, lattice[2][2], lattice[3][0]), widened)
         self.assertFalse(audit['hard_no_goods_authored'])
+
+    def test_boundary_first_has_same_exact_result_with_fewer_measured_pairs(self):
+        lattice = tuple(tuple(candidate(i,str(s),.9 if s == (0 if i < 3 else 1) else .5)
+                              for s in range(8)) for i in range(6))
+        pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 320, lattice)
+        failure = NoCompleteTimelinePath('hold cap',reason_code='test',segment_index=3)
+        direct, _ = add_local_proposal_detour(pool,pool.domain(1),failure)
+        adjacent, _ = add_local_proposal_detour(pool,direct,failure)
+        counts, results = [], []
+        for domain in (direct,adjacent):
+            measured=[]
+            def provider(key):
+                measured.append(key)
+                matched = key.outgoing.source_id == key.incoming.source_id or key.boundary_index == 2
+                return option_set(key,authorized={0:0.} if matched else {})
+            results.append(select_joint_timeline_candidates(lattice,option_provider=provider,
+                bridge_provider=valid_bridge,maximum_results=1,boundary_search_domain=domain,
+                config=replace(isolated_score_config(),maximum_same_source_hold_seconds=3.01))[0].timeline)
+            counts.append(len(measured))
+        self.assertEqual(results[0],results[1])
+        self.assertEqual([c.source_id for c in results[0].candidates],['0']*3+['1']*3)
+        self.assertEqual(counts,[96,208])
+
+    def test_small_local_repairs_can_reach_later_song_without_more_pair_budget(self):
+        lattice = tuple(tuple(candidate(i,str(s),.5) for s in range(2)) for i in range(30))
+        pool = JointProposalPool((tuple(row[0] for row in lattice),),('balanced',),116,lattice)
+        calls=[]
+        def select(**kwargs):
+            calls.append(kwargs)
+            if len(calls) <= 7:
+                raise NoCompleteTimelinePath('next frontier',reason_code='test',segment_index=len(calls))
+            return Result({'proof_materialization_call_count':1})
+        result = select_with_joint_proposal_domains(pool,maximum_proof_calls=2,select=select)
+        audit = result.selection_retry_audit['proposal_search_domain']
+        self.assertEqual(len(calls),8)
+        self.assertEqual(audit['local_added_boundary_pair_count'],14)
+        self.assertEqual(audit['maximum_local_added_boundary_pairs'],36)
+        self.assertTrue(all(call['maximum_proof_materialization_calls']==2 for call in calls))
+
+    def test_local_pair_budget_cannot_be_replenished_by_more_proposals(self):
+        lattice = tuple(tuple(candidate(i,str(s),.5) for s in range(2)) for i in range(30))
+        # Each larger pool really contributes new complete-path edges near the
+        # end, so this exercises all 3/6/9 sizes rather than identical domains.
+        paths = tuple(tuple(row[int(i == 21+j)] for i,row in enumerate(lattice)) for j in range(9))
+        pool = JointProposalPool(paths,('balanced',)*9,116,lattice)
+        calls=[]
+        def select(**kwargs):
+            calls.append(kwargs)
+            raise NoCompleteTimelinePath('next frontier',reason_code='test',segment_index=len(calls))
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_with_joint_proposal_domains(pool,maximum_proof_calls=2,select=select)
+        self.assertEqual(local_proposal_added_pair_budget(pool),36)
+        self.assertEqual(len(calls),21)
+        self.assertLess(calls[-3]['boundary_search_domain'],calls[-2]['boundary_search_domain'])
+        self.assertLess(calls[-2]['boundary_search_domain'],calls[-1]['boundary_search_domain'])
+        self.assertEqual(caught.exception.rejection_counts['local_added_boundary_pair_count'],36)
+        self.assertEqual(caught.exception.rejection_counts['proof_materialization_call_count'],0)
 
     def test_nested_graph_failure_repairs_before_unrelated_full_paths_expand(self):
         lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(4))

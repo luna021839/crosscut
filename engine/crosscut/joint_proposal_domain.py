@@ -13,9 +13,30 @@ from .joint_timeline import BoundaryMeasurementKey
 from .timeline import NoCompleteTimelinePath, TimelineCandidate, TimelineConfig, TimelineResult, select_timeline_candidates
 from .visual_score import VisualTimelineOptimizerWorkspace, _safe_cadence_profiles, _role_conditioned_visual_controls
 
-CONTRACT = "complete_descriptor_proposal_domain_then_exact_pixel_validation_v1"
+CONTRACT = "complete_descriptor_proposal_domain_then_exact_pixel_validation_v2"
 PROPOSAL_PATH_LIMITS = (3, 6, 9)
+# Historical three-layer work units, now converted to a unique added-pair
+# budget rather than treating every one-boundary repair as three layers.
 MAXIMUM_LOCAL_PROPOSAL_REPAIRS = 6
+
+
+def local_proposal_added_pair_budget(pool: JointProposalPool) -> int:
+    """Retain the old six three-layer expansions' worst-case pair budget.
+
+    Counting *new pairs*, not failed-frontier visits, lets a cheap one-boundary
+    repair leave budget for later parts of a full song. This does not authorize
+    unmeasured edges or grant additional renderer-proof calls.
+    """
+    lattice = pool.candidate_lattice
+    if len(lattice) < 2:
+        return 0
+    cross_counts = [sum(a.source_id != b.source_id for a in left for b in right)
+                    for left, right in zip(lattice,lattice[1:])]
+    largest_old_repair = max(sum(cross_counts[max(0,i-1):i+2])
+                             for i in range(len(cross_counts)))
+    total_pairs = sum(len(a)*len(b) for a,b in zip(lattice,lattice[1:]))
+    remaining = max(0, total_pairs-len(pool.domain(PROPOSAL_PATH_LIMITS[0])))
+    return min(remaining, MAXIMUM_LOCAL_PROPOSAL_REPAIRS * largest_old_repair)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +125,7 @@ def add_local_proposal_detour(
     domain: frozenset[BoundaryMeasurementKey],
     failure: NoCompleteTimelinePath,
 ) -> tuple[frozenset[BoundaryMeasurementKey], dict[str, Any]] | None:
-    """Open only a failed frontier's adjacent substitutions, not the full graph."""
+    """Try the failed boundary first, then its adjacent reconnection edges."""
     lattice = pool.candidate_lattice
     if not lattice:
         return None
@@ -124,6 +145,19 @@ def add_local_proposal_detour(
         additions = set()
         def add(index, left, right):
             additions.update(BoundaryMeasurementKey.from_candidates(index, a, b) for a in left for b in right)
+        # Continuations already exist throughout the lattice. A switch at the
+        # failed boundary can therefore continue without reopening both nearby
+        # layers. Escalate only after that smaller search is also disconnected.
+        add(boundary, lattice[boundary], lattice[boundary+1])
+        additions.difference_update(domain)
+        if additions:
+            return domain | frozenset(additions), {
+                "blocked_boundary_index": boundary,
+                "added_boundary_pair_count": len(additions),
+                "touched_boundary_indices": [boundary],
+                "repair_scope": "failed_boundary_only",
+                "hard_no_goods_authored": False, "final_media_authority": False,
+            }
         # Replacing either side of the failed edge must also allow rejoining
         # the original complete path. No source is declared safe by this.
         add(boundary, lattice[boundary], incoming)
@@ -138,6 +172,7 @@ def add_local_proposal_detour(
                 "blocked_boundary_index": boundary,
                 "added_boundary_pair_count": len(additions),
                 "touched_boundary_indices": sorted({key.boundary_index for key in additions}),
+                "repair_scope": "adjacent_reconnection",
                 "hard_no_goods_authored": False, "final_media_authority": False,
             }
     return None
@@ -207,7 +242,7 @@ def select_with_joint_proposal_domains(
     select: Callable[..., Any],
     report: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
-    """Three proposal sizes plus bounded local detours share one proof budget."""
+    """Proposal sizes and pair-budgeted local detours share one proof budget."""
     if isinstance(maximum_proof_calls, bool) or not isinstance(maximum_proof_calls, int) or maximum_proof_calls < 1:
         raise ValueError("proposal selection needs a positive proof budget")
     charged = 0
@@ -215,6 +250,7 @@ def select_with_joint_proposal_domains(
     seen_domains = set()
     extra_domain: frozenset[BoundaryMeasurementKey] = frozenset()
     local_repairs = []
+    added_pair_budget = local_proposal_added_pair_budget(pool)
     limit_index = 0
     last_failure = None
     while limit_index < len(PROPOSAL_PATH_LIMITS):
@@ -233,6 +269,8 @@ def select_with_joint_proposal_domains(
             "remaining_proof_calls": remaining, "final_media_authority": False,
             "raw_frame_visual_limits_used_as_final_authority": False,
             "local_repair_round_count": len(local_repairs),
+            "local_added_boundary_pair_count": len(extra_domain),
+            "maximum_local_added_boundary_pairs": added_pair_budget,
             "source_continuation_pair_count": sum(key.outgoing.source_id == key.incoming.source_id for key in domain),
         }
         if report is not None:
@@ -251,9 +289,17 @@ def select_with_joint_proposal_domains(
                 report({**event, "phase": "proposal_domain_exhausted"})
             repair = (
                 add_local_proposal_detour(pool, domain, exc)
-                if len(local_repairs) < MAXIMUM_LOCAL_PROPOSAL_REPAIRS
+                if len(extra_domain) < added_pair_budget
                 else None
             )
+            if repair is not None and len(extra_domain) + len(repair[0]-domain) > added_pair_budget:
+                # Never take an arbitrary source-ID prefix of a repair, or
+                # silently replenish the graph-work budget at the next size.
+                repair = None
+                if report is not None:
+                    report({"contract": CONTRACT, "phase": "proposal_local_pair_budget_exhausted",
+                            "used_added_boundary_pairs": len(extra_domain),
+                            "maximum_local_added_boundary_pairs": added_pair_budget})
             if repair is not None:
                 widened, repair_audit = repair
                 extra_domain |= widened - domain
@@ -275,7 +321,9 @@ def select_with_joint_proposal_domains(
             proposal_search_domain={
                 "contract": CONTRACT, "events": events,
                 "local_repairs": local_repairs,
-                "maximum_local_repair_rounds": MAXIMUM_LOCAL_PROPOSAL_REPAIRS,
+                "maximum_local_added_boundary_pairs": added_pair_budget,
+                "local_added_boundary_pair_count": len(extra_domain),
+                "historical_three_layer_repair_work_units": MAXIMUM_LOCAL_PROPOSAL_REPAIRS,
                 "exhaustive_global_optimum_claimed": False,
                 "quality_gates_waived": False, "hard_no_goods_authored": False,
             },
@@ -285,6 +333,8 @@ def select_with_joint_proposal_domains(
         "bounded descriptor proposals have no complete pixel-validated timeline",
         reason_code="joint_proposal_domains_exhausted",
         rejection_counts={"proposal_domain_count": len(events), "local_repair_round_count": len(local_repairs),
+                          "local_added_boundary_pair_count": len(extra_domain),
+                          "maximum_local_added_boundary_pairs": added_pair_budget,
                           "proof_materialization_call_count": charged},
         profile_failures=(("last_proposal_domain", last_failure),) if last_failure is not None else (),
     )
