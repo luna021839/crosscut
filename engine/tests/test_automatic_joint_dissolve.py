@@ -116,6 +116,33 @@ class AutomaticJointDissolveTests(unittest.TestCase):
         self.assertEqual(audit['boundaries'][0]['reason'], 'existing_camera_ownership_preserved')
         self.assertEqual(self.queries, [])
 
+    def test_disjoint_verified_hard_cameras_survive_joint_registration(self):
+        args=self.inputs();original=args['render_segments']
+        left=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.05),EditorialTransformKeyframe(.75,1.),EditorialTransformKeyframe(3.,1.)),
+            reason='confirmed_member_subject_scale_position_match')
+        right=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),EditorialTransformKeyframe(2.25,1.),EditorialTransformKeyframe(3.,1.05)),
+            reason='confirmed_member_subject_scale_position_match_dense_performer_follow')
+        args['render_segments']=(replace(original[0],editorial_transform=left),replace(original[1],editorial_transform=right))
+        segments,effects,audit=register_automatic_member_dissolves(**args)
+        self.assertEqual(audit['applied_count'],1,audit)
+        self.assertTrue(audit['boundaries'][0]['disjoint_hard_camera_preserved'])
+        self.assertTrue(audit['boundaries'][0]['containment']['passed'])
+        for i in range(23):
+            self.assertAlmostEqual(segments[0].editorial_transform.evaluate(i/30).zoom,left.evaluate(i/30).zoom)
+            self.assertAlmostEqual(segments[1].editorial_transform.evaluate(2.25+i/30).zoom,right.evaluate(2.25+i/30).zoom)
+        self.plan(args,segments,effects)
+
+    def test_intersecting_hard_camera_is_not_overwritten_or_retimed(self):
+        args=self.inputs();original=args['render_segments']
+        camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.05),EditorialTransformKeyframe(3.,1.05)),
+            reason='confirmed_member_subject_scale_position_match')
+        args['render_segments']=(original[0],replace(original[1],editorial_transform=camera))
+        segments,effects,audit=register_automatic_member_dissolves(**args)
+        self.assertEqual(audit['applied_count'],0)
+        self.assertEqual(segments,args['render_segments'])
+        self.assertEqual(effects,args['transitions'])
+        self.assertEqual(audit['boundaries'][0]['reason'],'camera_composition_unavailable')
+
     def consecutive_inputs(self, duration=3.):
         args=self.inputs()
         args['render_segments']=tuple(RenderSegment(s,10.+10*i,duration,i*duration,

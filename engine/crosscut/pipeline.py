@@ -9877,6 +9877,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("joint_dissolve_pose.py"),
                 Path(__file__).with_name("focal_pixel_containment_support.py"),
                 Path(__file__).with_name("focal_bracket_containment.py"),
+                Path(__file__).with_name("disjoint_member_cameras.py"),
                 Path(__file__).with_name("rendered_proxy_review.py"),
                 Path(__file__).with_name("render.py"),
                 Path(__file__).with_name("source_first_focal_geometry.py"),

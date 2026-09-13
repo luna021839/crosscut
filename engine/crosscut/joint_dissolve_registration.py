@@ -13,6 +13,7 @@ from scipy.optimize import minimize
 from .direct_member_transform import attention_mismatch, project_box
 from .render import EditorialTransformKeyframe, EditorialTransformTrack
 from .joint_dissolve_pose import paired_overlap_pose_arrays, pose_registration_metrics
+from .disjoint_member_cameras import HARD_CAMERA_REASONS,compose_disjoint_member_cameras
 
 
 @dataclass(frozen=True)
@@ -270,12 +271,19 @@ composed, with its exact transition supplied by the automatic stage.
     if transition.kind is not TransitionKind.FACE_DISSOLVE:
         raise ValueError('joint camera materialization requires a face dissolve')
     previous_camera=left_segment.editorial_transform
+    hard_left=hard_right=None
     if incoming_transition is not None:
         if (incoming_transition.kind is not TransitionKind.FACE_DISSOLVE or
                 incoming_transition.transform_overlap_authority != MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY or
                 previous_camera is None or previous_camera.reason != 'joint_dissolve_incoming_ramp_pending_containment_review'):
             raise ValueError('joint composition lacks previous registered transition')
         left_segment=replace(left_segment,editorial_transform=None)
+    elif previous_camera is not None and previous_camera.reason in HARD_CAMERA_REASONS:
+        hard_left=previous_camera
+        left_segment=replace(left_segment,editorial_transform=None)
+    if right_segment.editorial_transform is not None and right_segment.editorial_transform.reason in HARD_CAMERA_REASONS:
+        hard_right=right_segment.editorial_transform
+        right_segment=replace(right_segment,editorial_transform=None)
     if any(s.editorial_transform is not None or s.outgoing_overlap_transform is not None
            or s.crop is not None or s.pan_crop is not None for s in (left_segment,right_segment)):
         raise ValueError('joint camera materialization cannot overwrite an existing camera')
@@ -311,6 +319,10 @@ composed, with its exact transition supplied by the automatic stage.
     if incoming_transition is not None:
         left_track=compose_joint_dissolve_cameras(previous_camera,left_track,
             incoming_frame_count=incoming_transition.frame_count,fps=fps)
+    if hard_left is not None:
+        left_track=compose_disjoint_member_cameras(hard_left,left_track,duration=left_segment.duration)
+    if hard_right is not None:
+        right_track=compose_disjoint_member_cameras(hard_right,right_track,duration=right_segment.duration)
     return (replace(left_segment,editorial_transform=left_track,outgoing_overlap_transform=tracks[0]),
             replace(right_segment,editorial_transform=right_track),
             replace(transition,transform_overlap_authority=MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY))

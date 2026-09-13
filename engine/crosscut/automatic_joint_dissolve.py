@@ -8,6 +8,7 @@ from .direct_member_target_face import FOCAL_FACE_BASIS
 from .direct_member_transform import map_box_to_portrait_fill
 from .focal_pixel_containment_support import measure_focal_pixel_containment
 from .focal_bracket_containment import measure_bracketed_body_containment
+from .disjoint_member_cameras import HARD_CAMERA_REASONS
 from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_dissolve_registration,
     materialize_joint_dissolve_registration,review_joint_dissolve_containment,shorten_joint_incoming_return,
     joint_pose_anchor_observations)
@@ -60,9 +61,10 @@ All measurement calls use the actual source-local clocks of the render plan.
             row['reason']='unsupported_overlap_frame_count';continue
         if any(s.crop is not None or s.pan_crop is not None or s.outgoing_overlap_transform is not None
                or (s.editorial_transform is not None and not (side==0 and compose_previous)
+                   and s.editorial_transform.reason not in HARD_CAMERA_REASONS
                    and any(abs(p.zoom-1)>1e-9 or abs(p.center_x-.5)>1e-9 or abs(p.center_y-.5)>1e-9 or abs(p.roll_degrees)>1e-9 for p in s.editorial_transform.keyframes)) for side,s in enumerate(pair)):
             row['reason']='existing_camera_ownership_preserved';continue
-        pair=tuple(s if side==0 and compose_previous else replace(s,editorial_transform=None)
+        pair=tuple(s if (side==0 and compose_previous or s.editorial_transform is not None and s.editorial_transform.reason in HARD_CAMERA_REASONS) else replace(s,editorial_transform=None)
                    for side,s in enumerate(pair))
         cut=common_master_start+pair[1].master_start
         native={s.source_index:tuple(sorted({float(t) for span in visual_selection.span_validity[index:index+2]
@@ -225,6 +227,7 @@ All measurement calls use the actual source-local clocks of the render plan.
         segments[index:index+2]=(a,b);effects[index]=registered
         owned_incoming.add(index+1)
         row.update(applied=True,reason='joint_camera_registered_pending_decoded_qa',
+            disjoint_hard_camera_preserved=any(s.editorial_transform is not None and s.editorial_transform.reason in HARD_CAMERA_REASONS for s in pair),
             previous_overlap_camera_preserved=compose_previous,
             nominal_camera_composed=compose_previous)
         if progress_callback:progress_callback(dict(boundary_index=index,applied=True))
