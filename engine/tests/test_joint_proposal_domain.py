@@ -4,6 +4,7 @@ from unittest import TestCase
 from crosscut.joint_proposal_domain import (
     JointProposalPool, proposal_pool_from_results, select_with_joint_proposal_domains,
     build_joint_proposal_pool, proposal_only_config,
+    add_local_proposal_detour,
 )
 from crosscut.joint_timeline import BoundaryMeasurementKey, select_joint_timeline_candidates
 from crosscut.timeline import NoCompleteTimelinePath, TimelineChoice, TimelineMode, TimelineResult
@@ -184,3 +185,40 @@ class JointProposalDomainTests(TestCase):
         self.assertTrue(pool.paths)
         self.assertTrue(all(len(path) == len(lattice) for path in pool.paths))
         self.assertLessEqual(len(pool.domain(3)), 3 * (len(lattice) - 1))
+
+    def test_local_failure_opens_adjacent_detours_only(self):
+        lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(6))
+        pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 45, lattice)
+        original = pool.domain(1)
+        failure = NoCompleteTimelinePath('blocked', reason_code='test', segment_index=3)
+        widened, audit = add_local_proposal_detour(pool, original, failure)
+        self.assertLess(original, widened)
+        self.assertEqual(audit['touched_boundary_indices'], [1, 2, 3])
+        self.assertEqual({key for key in widened if key.boundary_index in (0, 4)},
+                         {key for key in original if key.boundary_index in (0, 4)})
+        # A replacement can enter the blocked area and rejoin the original path.
+        self.assertIn(BoundaryMeasurementKey(1, lattice[1][0], lattice[2][2]), widened)
+        self.assertIn(BoundaryMeasurementKey(2, lattice[2][2], lattice[3][0]), widened)
+        self.assertFalse(audit['hard_no_goods_authored'])
+
+    def test_nested_graph_failure_repairs_before_unrelated_full_paths_expand(self):
+        lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(4))
+        pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 27, lattice)
+        calls = []
+        def select(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                child = NoCompleteTimelinePath('blocked', reason_code='test', segment_index=2)
+                raise NoCompleteTimelinePath('profile failed', reason_code='profile', profile_failures=(('balanced', child),))
+            return Result({'proof_materialization_call_count': 1})
+        result = select_with_joint_proposal_domains(pool, maximum_proof_calls=2, select=select)
+        self.assertEqual(len(calls), 2)
+        self.assertLess(calls[0]['boundary_search_domain'], calls[1]['boundary_search_domain'])
+        self.assertEqual(result.selection_retry_audit['proof_materialization_call_count'], 1)
+        self.assertEqual(len(result.selection_retry_audit['proposal_search_domain']['local_repairs']), 1)
+
+    def test_global_failure_cannot_expand_every_boundary_as_a_detour(self):
+        lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(4))
+        pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 27, lattice)
+        self.assertIsNone(add_local_proposal_detour(pool, pool.domain(1),
+            NoCompleteTimelinePath('global review', reason_code='test')))

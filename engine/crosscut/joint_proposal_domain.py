@@ -15,6 +15,7 @@ from .visual_score import VisualTimelineOptimizerWorkspace, _safe_cadence_profil
 
 CONTRACT = "complete_descriptor_proposal_domain_then_exact_pixel_validation_v1"
 PROPOSAL_PATH_LIMITS = (3, 6, 9)
+MAXIMUM_LOCAL_PROPOSAL_REPAIRS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +23,7 @@ class JointProposalPool:
     paths: tuple[tuple[TimelineCandidate, ...], ...]
     cadence_profiles: tuple[str, ...]
     full_boundary_pair_count: int
+    candidate_lattice: tuple[tuple[TimelineCandidate, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.paths or len(self.paths) != len(self.cadence_profiles):
@@ -72,7 +74,51 @@ def proposal_pool_from_results(
         raise NoCompleteTimelinePath("no complete descriptor proposal", reason_code="joint_descriptor_proposal_pool_empty")
     return JointProposalPool(tuple(paths), tuple(profiles), sum(
         len(a) * len(b) for a, b in zip(segments, segments[1:])
-    ))
+    ), segments)
+
+
+def add_local_proposal_detour(
+    pool: JointProposalPool,
+    domain: frozenset[BoundaryMeasurementKey],
+    failure: NoCompleteTimelinePath,
+) -> tuple[frozenset[BoundaryMeasurementKey], dict[str, Any]] | None:
+    """Open only a failed frontier's adjacent substitutions, not the full graph."""
+    lattice = pool.candidate_lattice
+    if not lattice:
+        return None
+    positions = {row[0].segment_index: index for index, row in enumerate(lattice)}
+    pending, blocked = [failure], set()
+    while pending:
+        item = pending.pop()
+        pending.extend(child for _, child in item.profile_failures)
+        position = positions.get(item.segment_index)
+        if position is not None and position > 0:
+            blocked.add(position - 1)
+    for boundary in sorted(blocked):
+        outgoing = {key.outgoing for key in domain if key.boundary_index == boundary}
+        incoming = {key.incoming for key in domain if key.boundary_index == boundary}
+        before = {key.outgoing for key in domain if key.boundary_index == boundary - 1}
+        after = {key.incoming for key in domain if key.boundary_index == boundary + 1}
+        additions = set()
+        def add(index, left, right):
+            additions.update(BoundaryMeasurementKey.from_candidates(index, a, b) for a in left for b in right)
+        # Replacing either side of the failed edge must also allow rejoining
+        # the original complete path. No source is declared safe by this.
+        add(boundary, lattice[boundary], incoming)
+        add(boundary, outgoing, lattice[boundary + 1])
+        if boundary > 0:
+            add(boundary - 1, before, lattice[boundary])
+        if boundary + 1 < len(lattice) - 1:
+            add(boundary + 1, lattice[boundary + 1], after)
+        additions.difference_update(domain)
+        if additions:
+            return domain | frozenset(additions), {
+                "blocked_boundary_index": boundary,
+                "added_boundary_pair_count": len(additions),
+                "touched_boundary_indices": sorted({key.boundary_index for key in additions}),
+                "hard_no_goods_authored": False, "final_media_authority": False,
+            }
+    return None
 
 
 def proposal_only_config(config: TimelineConfig) -> TimelineConfig:
@@ -139,18 +185,23 @@ def select_with_joint_proposal_domains(
     select: Callable[..., Any],
     report: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
-    """At most three nested domains, sharing the original proof-call budget."""
+    """Three proposal sizes plus bounded local detours share one proof budget."""
     if isinstance(maximum_proof_calls, bool) or not isinstance(maximum_proof_calls, int) or maximum_proof_calls < 1:
         raise ValueError("proposal selection needs a positive proof budget")
     charged = 0
     events: list[dict[str, Any]] = []
-    previous_domain = None
+    seen_domains = set()
+    extra_domain: frozenset[BoundaryMeasurementKey] = frozenset()
+    local_repairs = []
+    limit_index = 0
     last_failure = None
-    for limit in PROPOSAL_PATH_LIMITS:
-        domain = pool.domain(limit)
-        if domain == previous_domain:
+    while limit_index < len(PROPOSAL_PATH_LIMITS):
+        limit = PROPOSAL_PATH_LIMITS[limit_index]
+        domain = pool.domain(limit) | extra_domain
+        if domain in seen_domains:
+            limit_index += 1
             continue
-        previous_domain = domain
+        seen_domains.add(domain)
         remaining = maximum_proof_calls - charged
         if remaining <= 0:
             break
@@ -159,6 +210,7 @@ def select_with_joint_proposal_domains(
             "boundary_pair_count": len(domain), "full_boundary_pair_count": pool.full_boundary_pair_count,
             "remaining_proof_calls": remaining, "final_media_authority": False,
             "raw_frame_visual_limits_used_as_final_authority": False,
+            "local_repair_round_count": len(local_repairs),
         }
         if report is not None:
             report({**event, "phase": "proposal_domain_start"})
@@ -174,6 +226,19 @@ def select_with_joint_proposal_domains(
             events.append(event)
             if report is not None:
                 report({**event, "phase": "proposal_domain_exhausted"})
+            repair = (
+                add_local_proposal_detour(pool, domain, exc)
+                if len(local_repairs) < MAXIMUM_LOCAL_PROPOSAL_REPAIRS
+                else None
+            )
+            if repair is not None:
+                widened, repair_audit = repair
+                extra_domain |= widened - domain
+                local_repairs.append(repair_audit)
+                if report is not None:
+                    report({"contract": CONTRACT, "phase": "proposal_local_detour_added", **repair_audit})
+            else:
+                limit_index += 1
             continue
         audit = dict(result.selection_retry_audit)
         used = audit.get("proof_materialization_call_count")
@@ -186,6 +251,8 @@ def select_with_joint_proposal_domains(
             maximum_proof_materialization_calls=maximum_proof_calls,
             proposal_search_domain={
                 "contract": CONTRACT, "events": events,
+                "local_repairs": local_repairs,
+                "maximum_local_repair_rounds": MAXIMUM_LOCAL_PROPOSAL_REPAIRS,
                 "exhaustive_global_optimum_claimed": False,
                 "quality_gates_waived": False, "hard_no_goods_authored": False,
             },
@@ -194,6 +261,7 @@ def select_with_joint_proposal_domains(
     raise NoCompleteTimelinePath(
         "bounded descriptor proposals have no complete pixel-validated timeline",
         reason_code="joint_proposal_domains_exhausted",
-        rejection_counts={"proposal_domain_count": len(events), "proof_materialization_call_count": charged},
+        rejection_counts={"proposal_domain_count": len(events), "local_repair_round_count": len(local_repairs),
+                          "proof_materialization_call_count": charged},
         profile_failures=(("last_proposal_domain", last_failure),) if last_failure is not None else (),
     )

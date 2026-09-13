@@ -1431,6 +1431,7 @@ class DecodedBoundaryOptionProvider:
         self.selection_option_request_count = 0
         self.selection_option_measurement_count = 0
         self.selection_option_measurement_failure_count = 0
+        self.selection_option_failure_code_counts: dict[str, int] = {}
         self.selection_option_rehydration_count = 0
         self.selection_option_rejection_count = 0
         self.selection_option_parity_failure_count = 0
@@ -1599,6 +1600,7 @@ class DecodedBoundaryOptionProvider:
         self.selection_option_request_count = 0
         self.selection_option_measurement_count = 0
         self.selection_option_measurement_failure_count = 0
+        self.selection_option_failure_code_counts.clear()
         self.selection_option_rehydration_count = 0
         self.selection_option_rejection_count = 0
         self.selection_option_parity_failure_count = 0
@@ -2399,6 +2401,11 @@ class DecodedBoundaryOptionProvider:
         self._active_descriptor_cache_transaction = None
         self._selection_measurement_active = False
         self.selection_option_measurement_count += 1
+        for offset_audit in option_set.offset_audits:
+            for code in offset_audit.failure_codes:
+                self.selection_option_failure_code_counts[code] = (
+                    self.selection_option_failure_code_counts.get(code, 0) + 1
+                )
         self._enforce_transient_cache_limits()
         return option_set
 
@@ -7340,6 +7347,7 @@ class DecodedBoundaryOptionProvider:
                 ),
                 "request_count": self.selection_option_request_count,
                 "measurement_count": self.selection_option_measurement_count,
+                "offset_failure_code_counts": dict(self.selection_option_failure_code_counts),
                 "measurement_failure_count": (
                     self.selection_option_measurement_failure_count
                 ),

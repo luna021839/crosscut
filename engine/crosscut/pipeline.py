@@ -28181,12 +28181,17 @@ def analyze(
                             runtime = JointSelectionRuntime(
                                 provider, batch_index=batch_index,
                             )
+                            def report_proposal_search(event: dict[str, Any]) -> None:
+                                payload = dict(event)
+                                if event.get("phase") == "proposal_domain_exhausted":
+                                    payload["cumulative_measured_offset_failure_counts"] = dict(
+                                        provider.selection_option_failure_code_counts
+                                    )
+                                reporter.emit("joint_proposal_search", **payload)
                             return select_with_joint_proposal_domains(
                                 joint_proposal_pool,
                                 maximum_proof_calls=proof_budget,
-                                report=lambda event: reporter.emit(
-                                    "joint_proposal_search", **event,
-                                ),
+                                report=report_proposal_search,
                                 select=lambda **domain_arguments: (
                                     select_joint_visual_candidates(
                                         visual_candidate_set,

@@ -2263,6 +2263,9 @@ def select_timeline(
         previous_layer = layers[-1]
         current_layer: dict[tuple[int, int, int, int], _Node] = {}
         rejection_counts: dict[str, int] = {}
+        # Source-run/history states can share this identical visual edge.
+        # The score depends only on the fixed pair, shot-run and config.
+        transition_cache: dict[tuple[int, int, int], tuple[float, int] | None] = {}
 
         def record_rejection(reason: str) -> None:
             rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -2289,12 +2292,15 @@ def select_timeline(
                 ) in no_goods:
                     record_rejection("exact_boundary_no_good")
                     continue
-                transition_result = _transition_score(
-                    previous_candidate,
-                    current_candidate,
-                    previous_shot_run,
-                    settings,
-                )
+                transition_key = (previous_index, current_index, previous_shot_run)
+                if transition_key not in transition_cache:
+                    transition_cache[transition_key] = _transition_score(
+                        previous_candidate,
+                        current_candidate,
+                        previous_shot_run,
+                        settings,
+                    )
+                transition_result = transition_cache[transition_key]
                 if transition_result is None:
                     for reason in _cross_source_transition_rejection_reasons(
                         previous_candidate,
