@@ -1018,6 +1018,96 @@ def _limited_profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_professional_single_delivery_auditions_available_profiles(self):
+        for pool_size in (1, 2, 7):
+            with self.subTest(pool_size=pool_size):
+                candidate_set = _candidate_set(role_conditioned=True)
+                pools = _limited_profile_pools(
+                    candidate_set, unique_path_count=pool_size, alternate_paths=(),
+                )
+                with patch(
+                    "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+                    side_effect=pools,
+                ):
+                    selected = select_joint_visual_candidates(
+                        candidate_set, provider=StubMaterializingProvider(fps=10.0),
+                        fps=10.0, minimum_unique_paths=1,
+                        minimum_required_candidates=1, maximum_candidates=8,
+                    )
+                expected = min(3, pool_size)
+                self.assertEqual(len(selected.candidate_records), expected)
+                self.assertEqual(len({s.cadence_profile for s in selected.selections}), expected)
+                self.assertEqual(selected.selection_retry_audit["proof_materialization_call_count"], expected)
+                self.assertEqual(selected.selection_retry_audit["profile_audition"]["events"][0]["considered_representative_count"], expected)
+
+    def test_professional_audition_does_not_raise_delivery_floor_or_proof_budget(self):
+        for proof_budget in (1, 2):
+            with self.subTest(proof_budget=proof_budget):
+                candidate_set = _candidate_set(role_conditioned=True)
+                pools = _limited_profile_pools(
+                    candidate_set, unique_path_count=3, alternate_paths=(),
+                )
+                with patch(
+                    "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+                    side_effect=pools,
+                ):
+                    selected = select_joint_visual_candidates(
+                        candidate_set, provider=StubMaterializingProvider(fps=10.0),
+                        fps=10.0, minimum_unique_paths=1,
+                        minimum_required_candidates=1, maximum_candidates=8,
+                        maximum_proof_materialization_calls=proof_budget,
+                    )
+                self.assertEqual(len(selected.candidate_records), proof_budget)
+                self.assertEqual(selected.minimum_required_candidates, 1)
+                self.assertEqual(selected.selection_retry_audit["proof_materialization_call_count"], proof_budget)
+
+    def test_failed_professional_representative_does_not_discard_other_passing_profiles(self):
+        candidate_set = _candidate_set(role_conditioned=True)
+        pools = _limited_profile_pools(
+            candidate_set, unique_path_count=3, alternate_paths=(),
+        )
+        calls = []
+        def review(plan, *, available_source_count=None):
+            calls.append(plan)
+            result = _synthetic_review(plan, available_source_count=available_source_count)
+            return replace(result, hard_failures=("synthetic_rejection",)) if len(calls) == 2 else result
+        with patch(
+            "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+            side_effect=pools,
+        ), patch("crosscut.joint_visual_candidate_adapter.review_timeline", side_effect=review):
+            selected = _production_select_joint_visual_candidates(
+                candidate_set, provider=StubMaterializingProvider(fps=10.0),
+                fps=10.0, minimum_unique_paths=1,
+                minimum_required_candidates=1, maximum_candidates=8,
+            )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual({s.cadence_profile for s in selected.selections}, {"balanced", "dense_safe"})
+        self.assertTrue(all(r.review.passed for r in selected.candidate_records))
+
+    def test_single_slot_uses_common_review_after_professional_audition(self):
+        candidate_set = _candidate_set(role_conditioned=True)
+        pools = _limited_profile_pools(
+            candidate_set, unique_path_count=3, alternate_paths=(),
+        )
+        scores = iter((70.0, 95.0, 80.0))
+        def review(plan, *, available_source_count=None):
+            return replace(
+                _synthetic_review(plan, available_source_count=available_source_count),
+                weighted_score=next(scores),
+            )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+            side_effect=pools,
+        ), patch("crosscut.joint_visual_candidate_adapter.review_timeline", side_effect=review):
+            selected = _production_select_joint_visual_candidates(
+                candidate_set, provider=StubMaterializingProvider(fps=10.0),
+                fps=10.0, minimum_unique_paths=1,
+                minimum_required_candidates=1, maximum_candidates=1,
+            )
+        self.assertEqual(len(selected.selections), 1)
+        self.assertEqual(selected.selections[0].cadence_profile, "reference")
+        self.assertEqual(selected.selection_retry_audit["proof_materialization_call_count"], 3)
+
     def test_one_to_seven_candidates_can_reach_materialization_under_delivery_policy(self):
         for pool_size in (1, 2, 7):
             with self.subTest(pool_size=pool_size):

@@ -1485,6 +1485,28 @@ class _ReviewedJointCandidate:
     global_candidate_attempt_index: int
 
 
+def _profile_audition_order(
+    pool: Sequence[tuple[str, JointTimelineResult]],
+) -> tuple[tuple[tuple[str, JointTimelineResult], ...], int]:
+    """Audition one existing variant per profile without comparing DP scales.
+
+    Profiles can have different objective bonuses. Keep their own ranking and
+    let the common authoritative review rank their representatives. This is a
+    comparison opportunity, not a new minimum number of passing deliverables.
+    Identical variants already removed by coalescing are never fabricated.
+    """
+    seen: set[str] = set()
+    representatives: list[tuple[str, JointTimelineResult]] = []
+    remainder: list[tuple[str, JointTimelineResult]] = []
+    for item in pool:
+        if item[0] not in seen:
+            seen.add(item[0])
+            representatives.append(item)
+        else:
+            remainder.append(item)
+    return tuple((*representatives, *remainder)), len(representatives)
+
+
 def _boundary_review_no_goods(
     selection: JointVisualSelectionRecord,
     review: TimelineReview,
@@ -1959,6 +1981,7 @@ def select_joint_visual_candidates(
         ]
     ] = set()
     retry_events: list[dict[str, object]] = []
+    profile_audition_events: list[dict[str, object]] = []
     coverage_failure_events: list[dict[str, object]] = []
     maximum_exact_no_goods = len(JOINT_BOUNDARY_FRAME_OFFSETS) * sum(
         len(lattice[index]) * len(lattice[index + 1])
@@ -2192,6 +2215,20 @@ def select_joint_visual_candidates(
         total_round_count += 1
         profile_results, role_audit_by_profile = run_profile_round()
         ordered_pool = _ordered_profile_candidate_pool(profile_results)
+        audition_count = 0
+        if workspace.professional_montage_policy is not None:
+            ordered_pool, audition_count = _profile_audition_order(ordered_pool)
+        audition_event = {
+            "round": total_round_count,
+            "representative_profiles": [
+                profile for profile, _result in ordered_pool[:audition_count]
+            ],
+            "considered_representative_count": 0,
+            "remaining_proof_budget_at_start": (
+                maximum_proof_materialization_calls - proof_materialization_call_count
+            ),
+        }
+        profile_audition_events.append(audition_event)
         if (
             not ordered_pool
             and len(profile_failures) == len(profiles)
@@ -2218,6 +2255,9 @@ def select_joint_visual_candidates(
             )
         round_new_no_goods: set[tuple[BoundaryMeasurementKey, int]] = set()
         for pool_index, (profile, result) in enumerate(ordered_pool):
+            audition_event["considered_representative_count"] = min(
+                pool_index + 1, audition_count
+            )
             variant_key = (
                 _source_shot_path_signature(result),
                 _proof_variant_signature(result),
@@ -2232,7 +2272,10 @@ def select_joint_visual_candidates(
                     minimum_unique_paths=minimum_unique_paths,
                     minimum_required_candidates=minimum_required_candidates,
                 )
-                if len(final_reviewed) >= minimum_required_candidates:
+                if (
+                    len(final_reviewed) >= minimum_required_candidates
+                    and pool_index + 1 >= audition_count
+                ):
                     break
                 continue
             rejected_no_good = rejected_variant_no_goods.get(variant_key)
@@ -2242,6 +2285,8 @@ def select_joint_visual_candidates(
             if proof_materialization_call_count >= (
                 maximum_proof_materialization_calls
             ):
+                if len(final_reviewed) >= minimum_required_candidates:
+                    break
                 raise proof_budget_exhaustion()
             if variant_key not in attempted_variant_keys:
                 attempted_variant_keys.add(variant_key)
@@ -2387,6 +2432,8 @@ def select_joint_visual_candidates(
                 if proof_materialization_call_count >= (
                     maximum_proof_materialization_calls
                 ):
+                    if len(final_reviewed) >= minimum_required_candidates:
+                        break
                     raise proof_budget_exhaustion()
                 del proof_bundle
                 continue
@@ -2433,7 +2480,13 @@ def select_joint_visual_candidates(
                 minimum_unique_paths=minimum_unique_paths,
                 minimum_required_candidates=minimum_required_candidates,
             )
-            if len(final_reviewed) >= minimum_required_candidates:
+            if (
+                len(final_reviewed) >= minimum_required_candidates
+                and (
+                    pool_index + 1 >= audition_count
+                    or proof_materialization_call_count >= maximum_proof_materialization_calls
+                )
+            ):
                 break
             if proof_materialization_call_count >= (
                 maximum_proof_materialization_calls
@@ -2620,6 +2673,14 @@ def select_joint_visual_candidates(
         ),
         selection_retry_audit={
             "contract": "joint_visual_authoritative_passing_retry_v2",
+            "profile_audition": {
+                "contract": "professional_profile_representative_comparison_v1",
+                "active": workspace.professional_montage_policy is not None,
+                "additional_passing_deliverables_required": False,
+                "proof_budget_increased": False,
+                "ranking_authority": "common_authoritative_timeline_review",
+                "events": profile_audition_events,
+            },
             "production_review_floor_required": True,
             "total_round_count": total_round_count,
             "retry_round_count": retry_round,
