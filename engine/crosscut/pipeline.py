@@ -26883,8 +26883,8 @@ def analyze(
     elif automatic_group_editorial_authority is not None:
         reporter.log(
             "검증된 Transformer production bundle 없음 · "
-            "일반 시각 최적화 후보 8개를 primary authority로 전수 렌더·"
-            "디코딩하고 최종 MP4 post-render QA까지 통과해야 결과 노출"
+            "구도·동작 기반 전체 편집 제안을 제한된 연결점 탐색으로 정밀 검증 · "
+            "선택 후보 렌더·디코딩과 최종 MP4 post-render QA까지 통과해야 결과 노출"
         )
 
     reporter.status("영상 메타데이터를 읽는 중…")
