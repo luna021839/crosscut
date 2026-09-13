@@ -781,7 +781,7 @@ def _freeze_json_audit(value: object) -> object:
 def _thaw_json_audit(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _thaw_json_audit(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (list, tuple)):
         return [_thaw_json_audit(item) for item in value]
     return value
 
@@ -1100,7 +1100,7 @@ class JointVisualSelectionSet:
             _freeze_json_audit(
                 json.loads(
                     json.dumps(
-                        dict(self.selection_retry_audit),
+                        _thaw_json_audit(self.selection_retry_audit),
                         allow_nan=False,
                     )
                 )
