@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 CONTRACT = "all_observations_joint_constant_source_phase_crop_lattice_v1"
@@ -117,6 +117,9 @@ class MonotoneCropPhaseProposal:
 
 def resolve_monotone_source_phase(
     observations: Sequence[CropPhaseObservation],
+    *,
+    edge_allowed: Callable[[CropPhaseObservation, CropPhaseCandidate,
+                            CropPhaseObservation, CropPhaseCandidate], bool] | None = None,
 ) -> MonotoneCropPhaseProposal | None:
     """Best existing measured path that never runs backward in source time.
 
@@ -125,6 +128,9 @@ def resolve_monotone_source_phase(
     repeated frames, phase variation and actual geometry still require review.
     Every observation and its SAME measured candidate geometry are retained.
     There is no synthesis of missing or rejected candidate evidence.
+    An optional deterministic adjacent-edge predicate participates in the DP,
+    rather than vetoing its winner after discarding alternative paths. It must
+    depend only on the supplied adjacent observations/candidates, not history.
     """
     rows = tuple(observations)
     if not rows:
@@ -156,6 +162,8 @@ def resolve_monotone_source_phase(
                 last = path[-1]
                 if candidate.source_frame_index < last.source_frame_index:
                     continue
+                if edge_allowed is not None and edge_allowed(previous, last, row, candidate) is not True:
+                    continue
                 old_phase = last.source_frame_index - previous.canonical_frame_position
                 choices.append((score + candidate.warped_structure_ncc,
                                 variation + abs(phase - old_phase),
@@ -173,3 +181,44 @@ def resolve_monotone_source_phase(
         path, phases, score / len(rows), independent, variation,
         sum(a.source_frame_index == b.source_frame_index for a, b in zip(path, path[1:])),
     )
+
+
+def resolve_renderer_monotone_source_phase(
+    observations: Sequence[CropPhaseObservation],
+) -> MonotoneCropPhaseProposal | None:
+    """Jointly preserve every observed time, measured geometry and legal edge.
+
+    Pairwise interpolation is the renderer's own validation, not a new pose or
+    NCC threshold. This remains a sparse candidate proposal: it does not approve
+    source playback rates, dense pixels, a learned head or a released video.
+    """
+    from dataclasses import replace
+    from .render import EditorialTransformKeyframe, EditorialTransformTrack
+
+    rows = tuple(observations)
+    if rows and rows[0].time_seconds != 0:
+        raise ValueError("renderer phase path must preserve a real time-zero observation")
+    for row in rows:
+        for candidate in row.candidates:
+            # Accepted candidate evidence with invalid geometry is a corrupt
+            # input, not permission to silently drop the candidate.
+            EditorialTransformKeyframe(row.time_seconds, *candidate.geometry)
+
+    def renderer_edge(a, ca, b, cb):
+        try:
+            EditorialTransformTrack((
+                EditorialTransformKeyframe(0., *ca.geometry),
+                EditorialTransformKeyframe(b.time_seconds-a.time_seconds, *cb.geometry),
+            ), reason="measured_source_phase_adjacent_geometry")
+        except ValueError:
+            return False
+        return True
+
+    proposal = resolve_monotone_source_phase(rows, edge_allowed=renderer_edge)
+    if proposal is None:
+        return None
+    # Verify equivalence of all admitted adjacent edges to the complete track.
+    EditorialTransformTrack(tuple(EditorialTransformKeyframe(row.time_seconds, *c.geometry)
+                                  for row, c in zip(rows, proposal.candidates)),
+                            reason="measured_source_phase_complete_geometry")
+    return replace(proposal, contract="accepted_renderer_interpolable_monotone_source_frame_crop_lattice_diagnostic_v1")
