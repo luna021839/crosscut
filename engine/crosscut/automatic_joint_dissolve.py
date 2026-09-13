@@ -8,7 +8,7 @@ from .direct_member_target_face import FOCAL_FACE_BASIS
 from .direct_member_transform import map_box_to_portrait_fill
 from .focal_pixel_containment_support import measure_focal_pixel_containment
 from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_dissolve_registration,
-    materialize_joint_dissolve_registration,review_joint_dissolve_containment)
+    materialize_joint_dissolve_registration,review_joint_dissolve_containment,shorten_joint_incoming_return)
 from .joint_dissolve_pose import source_focal_overlap_pose
 from .render import TransitionKind,DIRECT_MEMBER_POSE_DISSOLVE_REASON,quantized_segment_frame_counts
 
@@ -147,6 +147,21 @@ All measurement calls use the actual source-local clocks of the render plan.
             legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
             legacy_face_only_maximum_center_shift=settings.legacy_face_only_maximum_center_shift)
         row['containment']=containment
+        if not containment['passed']:
+            alternate,return_audit=shorten_joint_incoming_return(b.editorial_transform,registered,containment,fps=fps)
+            row['visibility_timed_return']=return_audit
+            if alternate is not None:
+                row['initial_containment']=containment
+                alternate_b=replace(b,editorial_transform=alternate)
+                revised=review_joint_dissolve_containment(segments=(a,alternate_b),transitions=(registered,),
+                    source_geometries=geometry_by_request,geometry_provider=sample,pixel_containment_provider=pixels,
+                    fps=fps,frame_counts=counts[index:index+2],minimum_face_visible=settings.minimum_dense_face_visible_fraction,
+                    minimum_body_visible=settings.minimum_face_associated_subject_visible_fraction,
+                    legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
+                    legacy_face_only_maximum_center_shift=settings.legacy_face_only_maximum_center_shift)
+                row['containment']=revised
+                containment=revised
+                if revised['passed']:b=alternate_b
         if not containment['passed']:
             row['reason']='joint_camera_containment_not_verified';continue
         segments[index:index+2]=(a,b);effects[index]=registered

@@ -255,6 +255,60 @@ composed, with its exact transition supplied by the automatic stage.
             replace(transition,transform_overlap_authority=MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY))
 
 
+def shorten_joint_incoming_return(camera, transition, containment, *, fps,
+        minimum_return_frames=4, maximum_zoom_rate=1.0, maximum_center_speed=.50):
+    """End a return ramp before unsafe footage, preserving the entire overlap.
+
+    A fixed .75-second return is not an editing requirement. This constructs
+    one bounded alternate camera from already-measured failure times; it does
+    not waive containment, retry registration or change the source/cut. The
+    caller must review every transformed frame of the alternate camera again.
+    """
+    audit=dict(contract='joint_incoming_visibility_timed_return_v1',
+        adjusted=False,quality_approval=False,overlap_states_preserved=False)
+    from .render import TransitionKind
+    if (not isinstance(camera,EditorialTransformTrack)
+            or camera.reason!='joint_dissolve_incoming_ramp_pending_containment_review'
+            or transition.kind is not TransitionKind.FACE_DISSOLVE
+            or isinstance(fps,bool) or not math.isfinite(fps) or fps<=0
+            or isinstance(minimum_return_frames,bool) or not isinstance(minimum_return_frames,int)
+            or minimum_return_frames<4
+            or not all(math.isfinite(v) and v>0 for v in (maximum_zoom_rate,maximum_center_speed))
+            or (camera.final_keyframe.zoom,camera.final_keyframe.center_x,
+                camera.final_keyframe.center_y,camera.final_keyframe.roll_degrees)!=(1.,.5,.5,0.)):
+        return None,dict(audit,reason='unsupported_camera_return_domain')
+    count=transition.frame_count
+    failures=[row for row in containment.get('frames',()) if not row.get('passed',False)]
+    if (not failures or any(row.get('segment_index')!=1 or row.get('scope')!='nominal'
+                           for row in failures)
+            or len(camera.keyframes)<count+2
+            or abs(camera.keyframes[count].time_seconds-count/fps)>1e-9):
+        return None,dict(audit,reason='failure_not_confined_to_owned_incoming_return')
+    first_unsafe=min(row['output_local_seconds'] for row in failures)
+    return_time=(math.ceil(first_unsafe*fps-1e-9)-1)/fps
+    pinned=camera.keyframes[count]
+    duration=return_time-pinned.time_seconds
+    if (duration<minimum_return_frames/fps-1e-9
+            or return_time>=camera.keyframes[count+1].time_seconds-1e-9
+            or return_time>=camera.final_keyframe.time_seconds):
+        return None,dict(audit,reason='insufficient_verified_return_frames')
+    zoom_rate=abs(pinned.zoom-1.)/duration
+    center_speed=math.hypot(pinned.center_x-.5,pinned.center_y-.5)/duration
+    if (zoom_rate>maximum_zoom_rate+1e-9 or center_speed>maximum_center_speed+1e-9
+            or abs(pinned.roll_degrees)>1e-9):
+        return None,dict(audit,reason='short_return_would_exceed_camera_speed')
+    try:
+        track=EditorialTransformTrack((*camera.keyframes[:count+1],
+            EditorialTransformKeyframe(return_time,1.),camera.final_keyframe),reason=camera.reason)
+    except ValueError:
+        return None,dict(audit,reason='short_return_renderer_invalid')
+    return track,dict(audit,adjusted=True,overlap_states_preserved=True,
+        reason='visibility_timed_return_pending_containment',
+        first_unsafe_output_seconds=first_unsafe,return_end_seconds=return_time,
+        previous_return_end_seconds=camera.keyframes[count+1].time_seconds,
+        return_frame_count=int(round(duration*fps)),zoom_rate=zoom_rate,center_speed=center_speed)
+
+
 def review_joint_dissolve_containment(*, segments, transitions, source_geometries,
         geometry_provider, fps, minimum_face_visible=.98, minimum_body_visible=.72,
         pixel_containment_provider=None, legacy_face_only_maximum_zoom=1.12,
