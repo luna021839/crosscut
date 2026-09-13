@@ -467,7 +467,7 @@ def decode_target_frames_sequential(
     *,
     config: ReferenceMatchConfig | None = None,
 ) -> DecodedTargetFrames:
-    """Decode requested indices in one forward-only pass with no random seeks."""
+    """Decode forward, retrieving BGR pixels only for requested native frames."""
 
     settings = config or ReferenceMatchConfig()
     requested = _requested_indices(target_indices)
@@ -498,10 +498,12 @@ def decode_target_frames_sequential(
     index = 0
     try:
         while index <= final_index:
-            ok, frame = capture.read()
-            if not ok or frame is None:
+            if not capture.grab():
                 break
             if index in target_set:
+                ok, frame = capture.retrieve()
+                if not ok or frame is None:
+                    break
                 frames[index] = _working_frame(frame, settings.working_width)
                 if len(frames) == len(requested):
                     break

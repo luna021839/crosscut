@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -146,6 +146,8 @@ class SequentialTargetDecoderTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.position = 0
                 self.read_count = 0
+                self.grab_count = 0
+                self.retrieve_count = 0
                 self.released = False
 
             @staticmethod
@@ -162,11 +164,16 @@ class SequentialTargetDecoderTests(unittest.TestCase):
 
             def read(self):  # type: ignore[no-untyped-def]
                 self.read_count += 1
-                if self.position >= len(frames):
-                    return False, None
-                frame = frames[self.position]
+                raise AssertionError("unrequested BGR retrieval")
+
+            def grab(self):  # type: ignore[no-untyped-def]
+                self.grab_count += 1
                 self.position += 1
-                return True, frame.copy()
+                return self.position <= len(frames)
+
+            def retrieve(self):  # type: ignore[no-untyped-def]
+                self.retrieve_count += 1
+                return True, frames[self.position - 1].copy()
 
             def release(self) -> None:
                 self.released = True
@@ -186,8 +193,39 @@ class SequentialTargetDecoderTests(unittest.TestCase):
         self.assertEqual(set(batch.frames), {1, 4})
         self.assertEqual(batch.frames[1].shape[1], 384)
         self.assertEqual(int(batch.frames[4][0, 0, 0]), 4)
-        self.assertEqual(capture.read_count, 5)
+        self.assertEqual(capture.read_count, 0)
+        self.assertEqual(capture.grab_count, 5)
+        self.assertEqual(capture.retrieve_count, 2)
         self.assertTrue(capture.released)
+
+    def test_eof_and_retrieve_failure_keep_exact_missing_indices(self) -> None:
+        for fail_retrieve in (False, True):
+            capture = Mock()
+            capture.isOpened.return_value = True
+            capture.get.side_effect = [30.0, 2.0]
+            capture.grab.side_effect = [True, True, False]
+            capture.retrieve.return_value = (
+                (False, None) if fail_retrieve else
+                (True, np.zeros((20, 30, 3), dtype=np.uint8))
+            )
+            with patch("crosscut.reference_match.cv2.VideoCapture", return_value=capture):
+                batch = decode_target_frames_sequential(Path("source.mp4"), (0, 3))
+            self.assertEqual(batch.decoded_indices, () if fail_retrieve else (0,))
+            self.assertEqual(batch.missing_indices, (0, 3) if fail_retrieve else (3,))
+            capture.release.assert_called_once()
+            capture.read.assert_not_called()
+            capture.set.assert_not_called()
+
+    def test_retrieve_exception_releases_capture(self) -> None:
+        capture = Mock()
+        capture.isOpened.return_value = True
+        capture.get.side_effect = [30.0, 6.0]
+        capture.grab.return_value = True
+        capture.retrieve.side_effect = RuntimeError("backend failed")
+        with patch("crosscut.reference_match.cv2.VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(RuntimeError, "backend failed"):
+                decode_target_frames_sequential(Path("source.mp4"), (0,))
+        capture.release.assert_called_once()
 
     def test_invalid_index_and_invalid_video_metadata_fail_explicitly(self) -> None:
         with self.assertRaisesRegex(ValueError, "indices"):
