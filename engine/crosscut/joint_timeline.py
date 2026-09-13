@@ -43,6 +43,7 @@ from .timeline_no_good import (
     build_timeline_no_good_edge_key,
 )
 from .vision import IVEMember
+from .joint_highlight_opportunity import exact_nonwide_pair
 
 
 JOINT_BOUNDARY_FRAME_OFFSETS = tuple(range(-8, 9))
@@ -1787,6 +1788,7 @@ def _select_joint_timeline_candidates_core(
     maximum_results: int,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    nonwide_source_switch_bonus_by_segment: Mapping[int, float] | None = None,
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
@@ -1936,10 +1938,13 @@ def _select_joint_timeline_candidates_core(
                 "emission adjustments must be finite non-positive values"
             )
     switch_bonus_overrides = dict(source_switch_bonus_by_segment or {})
+    nonwide_switch_bonuses = dict(nonwide_source_switch_bonus_by_segment or {})
     valid_segment_indices = {
         segment[0].segment_index for segment in segments
     }
-    for segment_index, value in switch_bonus_overrides.items():
+    for segment_index, value in (
+        tuple(switch_bonus_overrides.items()) + tuple(nonwide_switch_bonuses.items())
+    ):
         if (
             isinstance(segment_index, bool)
             or not isinstance(segment_index, int)
@@ -2832,6 +2837,16 @@ def _select_joint_timeline_candidates_core(
                     if not same_source
                     else 0.0
                 )
+                option = extension.boundary_option
+                if (
+                    not same_source
+                    and option.scoring_outgoing is not None
+                    and option.scoring_incoming is not None
+                    and exact_nonwide_pair(option.scoring_outgoing, option.scoring_incoming)
+                ):
+                    cadence_score += nonwide_switch_bonuses.get(
+                        current_candidate.segment_index, 0.0
+                    )
                 if (
                     same_source
                     and settings.preferred_max_source_hold_segments is not None
@@ -3259,6 +3274,7 @@ def select_joint_timeline(
     preferred_source_ids: Sequence[str | None] | None = None,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    nonwide_source_switch_bonus_by_segment: Mapping[int, float] | None = None,
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
@@ -3285,6 +3301,7 @@ def select_joint_timeline(
         maximum_results=1,
         emission_adjustments=emission_adjustments,
         source_switch_bonus_by_segment=source_switch_bonus_by_segment,
+        nonwide_source_switch_bonus_by_segment=nonwide_source_switch_bonus_by_segment,
         forbidden_boundary_edges=forbidden_boundary_edges,
         progress_callback=progress_callback,
         shared_bridge_evidence_cache=shared_bridge_evidence_cache,
@@ -3311,6 +3328,7 @@ def select_joint_timeline_candidates(
     maximum_results: int = 8,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    nonwide_source_switch_bonus_by_segment: Mapping[int, float] | None = None,
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
@@ -3390,6 +3408,9 @@ def select_joint_timeline_candidates(
                 emission_adjustments=emission_adjustments,
                 source_switch_bonus_by_segment=(
                     source_switch_bonus_by_segment
+                ),
+                nonwide_source_switch_bonus_by_segment=(
+                    nonwide_source_switch_bonus_by_segment
                 ),
                 forbidden_boundary_edges=forbidden_boundary_edges,
                 progress_callback=(

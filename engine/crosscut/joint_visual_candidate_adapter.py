@@ -56,6 +56,7 @@ from .timeline import (
     TimelineResult,
 )
 from .timeline_no_good import TimelineNoGoodSet
+from .joint_highlight_opportunity import redistribute_highlight_switch_budget
 from .timeline_review import (
     JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
     JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
@@ -103,7 +104,8 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "same_source_exact_renderer_clock_continuity_projection_v2+"
     "authoritative_passing_cohort_retry_v2+"
     "bounded_exact_proof_materialization_v1+"
-    "exact_decoded_montage_soft_role_feedback_v1"
+    "exact_decoded_montage_soft_role_feedback_v1+"
+    "exact_transformed_nonwide_highlight_opportunity_v1"
 )
 JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
@@ -2050,8 +2052,25 @@ def select_joint_visual_candidates(
                         "role-control emission adjustments must be finite and "
                         "non-positive"
                     )
+                nonwide_switch_bonus: dict[int, float] = {}
+                opportunity_audit = None
+                if profile.name in {"reference", "dense_safe"}:
+                    switch_bonus, nonwide_switch_bonus, opportunity_audit = (
+                        redistribute_highlight_switch_budget(
+                            lattice,
+                            existing_bonuses=switch_bonus,
+                            section_targets=raw_role_audit.get(
+                                "highlight_source_switch_targets", ()
+                            ),
+                            section_index_at=lambda time: workspace.section_plan.directive_at(time).section_index,
+                            # Search preference only; decoded visible-run
+                            # duration and burst gates remain independent.
+                            maximum_nominal_shot_seconds=1.5,
+                        )
+                    )
                 role_audit = {
                     **dict(raw_role_audit),
+                    "exact_nonwide_highlight_opportunities": opportunity_audit,
                     "single_variant_decoded_feedback": single_variant_audit,
                     "decoded_montage_feedback": dict(
                         decoded_montage_feedback_audit
@@ -2068,6 +2087,7 @@ def select_joint_visual_candidates(
                 selection_kwargs = {
                     "emission_adjustments": adjustments,
                     "source_switch_bonus_by_segment": switch_bonus,
+                    "nonwide_source_switch_bonus_by_segment": nonwide_switch_bonus,
                 }
                 round_role_audit_by_profile[profile.name] = role_audit
                 role_audits.append(role_audit)
