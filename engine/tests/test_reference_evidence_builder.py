@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -110,6 +111,82 @@ def _all_mapping_keys(value: object) -> set[str]:
 
 
 class ReferenceEvidenceBuilderIntegrationTests(unittest.TestCase):
+    def test_uniform_source_grid_has_bounded_gaps_without_detected_cuts(self) -> None:
+        for fps in (2.0, 12.0, 29.97, 59.94):
+            with self.subTest(fps=fps):
+                count = int(fps * 20.0)
+                samples = _plan_samples(
+                    (),
+                    frame_count=count,
+                    frame_rate=fps,
+                    master_start_seconds=0.0,
+                    reference_clock=ReferenceSourceClock.scalar(0.0),
+                    boundary_offsets_frames=(-2, -1, 0, 1, 2),
+                )
+                grid = [
+                    sample.frame_index for sample in samples
+                    if "temporal_source_grid" in sample.reasons
+                ]
+                self.assertEqual(grid[0], 0)
+                self.assertEqual(grid[-1], count - 1)
+                self.assertEqual(grid, sorted(set(grid)))
+                self.assertLessEqual(
+                    max(b - a for a, b in zip(grid, grid[1:])), math.ceil(fps / 4.0)
+                )
+                self.assertFalse(any(
+                    reason.startswith("hard_cut_boundary:")
+                    for sample in samples for reason in sample.reasons
+                ))
+
+    def test_source_grid_configuration_is_validated_and_serialized(self) -> None:
+        for value in (0, -1, 61, True, float("nan"), float("inf"), "4"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ReferenceEvidenceConfig(temporal_sample_rate_hz=value)
+        base = ReferenceEvidenceConfig().to_dict()
+        changed = ReferenceEvidenceConfig(temporal_sample_rate_hz=8).to_dict()
+        self.assertNotEqual(base, changed)
+        self.assertTrue(
+            base["temporal_source_sampling"]["grid_samples_are_not_cut_targets"]
+        )
+
+    def test_source_changes_are_observed_when_scene_detector_has_no_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = _textured_frame(101, "A", (12, 25, 125))
+            b = _textured_frame(909, "B", (20, 145, 25))
+            reference = root / "reference.mp4"
+            source_a = root / "a.mp4"
+            source_b = root / "b.mp4"
+            _write_video(
+                reference, [a.copy() for _ in range(12)] + [b.copy() for _ in range(12)]
+            )
+            _write_video(source_a, [a.copy() for _ in range(24)])
+            _write_video(source_b, [b.copy() for _ in range(24)])
+            with patch(
+                "crosscut.reference_evidence_builder.detect_scene_changes_in_video",
+                return_value=(),
+            ):
+                evidence = build_reference_evidence(
+                    reference,
+                    (
+                        ReferenceSourceCatalogEntry("a", source_a, ReferenceSourceClock.scalar(0.0)),
+                        ReferenceSourceCatalogEntry("b", source_b, ReferenceSourceClock.scalar(0.0)),
+                    ),
+                    config=_builder_config(),
+                )
+            payload = evidence.payload
+            self.assertEqual(payload["detected_reference_cuts"], [])
+            self.assertEqual(payload["boundary_requests"], [])
+            self.assertGreater(payload["sampling_policy"]["temporal_grid_sample_count"], 1)
+            for sample in payload["samples"]:
+                self.assertEqual(
+                    sample["conservative_decision"]["accepted_video_id"],
+                    "a" if sample["reference_frame_index"] < 12 else "b",
+                )
+            resolved = resolve_reference_attribution_payload(payload)
+            self.assertEqual(resolved["detected_boundaries"], [])
+            self.assertEqual(len(resolved["source_runs"]), 2)
+
     def test_builds_cut_samples_with_one_sequential_decode_per_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -190,7 +267,8 @@ class ReferenceEvidenceBuilderIntegrationTests(unittest.TestCase):
             self.assertEqual(cut_indices, [12])
             self.assertEqual(payload["statistics"]["shot_midpoint_count"], 2)
             self.assertEqual(payload["statistics"]["boundary_sample_count"], 5)
-            self.assertEqual(payload["statistics"]["sample_count"], 7)
+            self.assertEqual(payload["statistics"]["sample_count"], 14)
+            self.assertEqual(payload["sampling_policy"]["temporal_grid_sample_count"], 8)
             self.assertAlmostEqual(
                 payload["detected_reference_cuts"][0]["master_seconds"],
                 0.75,
@@ -308,7 +386,7 @@ class ReferenceEvidenceBuilderIntegrationTests(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(evidence.sample_count, 1)
+            self.assertEqual(evidence.sample_count, 6)
             sample = evidence.payload["samples"][0]
             self.assertEqual(
                 {item["video_id"] for item in sample["ranked_candidates"]},

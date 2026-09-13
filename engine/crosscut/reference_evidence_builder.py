@@ -419,7 +419,7 @@ class WatermarkMaskPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceEvidenceConfig:
-    """Hard-cut sampling and reverse-match policy."""
+    """Source-observation grid, hard-cut windows and reverse-match policy."""
 
     scene_detection: SceneDetectionConfig = field(
         default_factory=SceneDetectionConfig
@@ -431,11 +431,19 @@ class ReferenceEvidenceConfig:
         default_factory=ReferenceAcceptanceConfig
     )
     boundary_offsets_frames: tuple[int, ...] = (-2, -1, 0, 1, 2)
+    temporal_sample_rate_hz: float = 4.0
     watermark_mask: WatermarkMaskPolicy = field(
         default_factory=WatermarkMaskPolicy.broadcast_safe_default
     )
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.temporal_sample_rate_hz, bool)
+            or not isinstance(self.temporal_sample_rate_hz, (int, float))
+            or not math.isfinite(self.temporal_sample_rate_hz)
+            or not 0.0 < self.temporal_sample_rate_hz <= 60.0
+        ):
+            raise ValueError("temporal source sampling rate must be in (0, 60]")
         if not isinstance(self.scene_detection, SceneDetectionConfig):
             raise TypeError("scene_detection must be a SceneDetectionConfig")
         if not isinstance(self.reference_match, ReferenceMatchConfig):
@@ -479,6 +487,12 @@ class ReferenceEvidenceConfig:
             "reference_match": self.reference_match.to_dict(),
             "acceptance": self.acceptance.to_dict(),
             "boundary_offsets_frames": list(self.boundary_offsets_frames),
+            "temporal_source_sampling": {
+                "contract": "reference_frame_clock_uniform_source_observation_grid_v1",
+                "sample_rate_hz": self.temporal_sample_rate_hz,
+                "first_and_last_reference_frames_requested": True,
+                "grid_samples_are_not_cut_targets": True,
+            },
             "watermark_mask": self.watermark_mask.to_dict(),
         }
 
@@ -569,7 +583,17 @@ def _plan_samples(
     master_end_seconds: float | None = None,
     reference_clock: ReferenceSourceClock,
     boundary_offsets_frames: Sequence[int],
+    temporal_sample_rate_hz: float = 4.0,
 ) -> tuple[_SamplePoint, ...]:
+    if (
+        isinstance(temporal_sample_rate_hz, bool)
+        or not isinstance(temporal_sample_rate_hz, (int, float))
+        or not math.isfinite(temporal_sample_rate_hz)
+        or not 0.0 < temporal_sample_rate_hz <= 60.0
+    ):
+        raise ValueError("temporal source sampling rate must be in (0, 60]")
+    if frame_count < 1 or not math.isfinite(frame_rate) or frame_rate <= 0.0:
+        raise ValueError("source sampling requires positive frame count and fps")
     cut_indices = tuple(
         sorted(
             {
@@ -584,6 +608,16 @@ def _plan_samples(
     def add(frame_index: int, reason: str) -> None:
         if 0 <= frame_index < frame_count:
             reasons.setdefault(frame_index, set()).add(reason)
+
+    # Detector shots can contain matched edits/dissolves which are not hard
+    # scene changes. Observe the source throughout them, rather than treating
+    # a single midpoint as the only identity evidence for a long interval.
+    # This grid supplies observations only; it never creates a cut or label.
+    effective_rate = min(float(temporal_sample_rate_hz), frame_rate)
+    grid_count = int(math.floor((frame_count - 1) * effective_rate / frame_rate)) + 1
+    for grid_index in range(grid_count):
+        add(int(round(grid_index * frame_rate / effective_rate)), "temporal_source_grid")
+    add(frame_count - 1, "temporal_source_grid")
 
     boundaries = (0, *cut_indices, frame_count)
     for shot_index, (start, end) in enumerate(
@@ -814,6 +848,7 @@ def build_reference_evidence(
         master_end_seconds=checked_master_end,
         reference_clock=checked_reference_clock,
         boundary_offsets_frames=settings.boundary_offsets_frames,
+        temporal_sample_rate_hz=settings.temporal_sample_rate_hz,
     )
     if not samples:
         raise ValueError("reference sampling produced no frame targets")
@@ -1015,6 +1050,10 @@ def build_reference_evidence(
         ],
         "sampling_policy": {
             "shot_midpoint_sampled": True,
+            "temporal_source_sampling": settings.to_dict()["temporal_source_sampling"],
+            "temporal_grid_sample_count": sum(
+                "temporal_source_grid" in sample.reasons for sample in samples
+            ),
             "boundary_offsets_frames": list(settings.boundary_offsets_frames),
             "duplicate_frame_targets_merged": True,
             "attribution_sample_master_end_seconds": checked_master_end,

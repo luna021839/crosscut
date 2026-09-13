@@ -392,6 +392,27 @@ class ReferenceAttributionTests(unittest.TestCase):
         self.assertFalse(resolved["shots"][0]["accepted"])
         self.assertIsNone(resolved["shots"][0]["attributed_video_id"])
 
+    def test_source_run_honors_sample_end_without_shortening_detector_partition(self) -> None:
+        evidence = _canonical_detected_evidence()
+        evidence["clock_policy"] = {"attribution_sample_master_end_seconds": 1.45}
+        resolved = resolve_reference_attribution_payload(evidence)
+        self.assertEqual(resolved["source_runs"][-1]["end_master_seconds"], 1.45)
+        self.assertEqual(resolved["shots"][-1]["reference_end_seconds"], 1.6)
+        self.assertEqual(len(resolved["detected_boundaries"]), 1)
+        self.assertFalse(resolved["source_run_coverage"]["unobserved_outro_attribution_authorized"])
+
+    def test_source_run_rejects_observations_beyond_declared_sample_end(self) -> None:
+        evidence = _canonical_detected_evidence()
+        evidence["clock_policy"] = {"attribution_sample_master_end_seconds": 1.0}
+        with self.assertRaisesRegex(ValueError, "contain every path sample"):
+            resolve_reference_attribution_payload(evidence)
+
+    def test_source_run_sample_end_cannot_extend_past_reference_media(self) -> None:
+        evidence = _canonical_detected_evidence()
+        evidence["clock_policy"] = {"attribution_sample_master_end_seconds": 10.0}
+        resolved = resolve_reference_attribution_payload(evidence)
+        self.assertEqual(resolved["source_runs"][-1]["end_master_seconds"], 1.6)
+
     def test_detector_partition_preserves_same_source_native_cut(self) -> None:
         resolved = resolve_reference_attribution_payload(
             _canonical_detected_evidence()

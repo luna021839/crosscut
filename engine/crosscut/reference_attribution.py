@@ -1551,10 +1551,24 @@ def resolve_reference_attribution_payload(
     path = solve_reference_source_path(samples, config=settings)
     master_start = evidence.get("master_start_seconds")
     master_end = evidence.get("master_end_seconds")
+    run_master_end = master_end
+    clock_policy = evidence.get("clock_policy", {})
+    if not isinstance(clock_policy, Mapping):
+        raise ValueError("reference clock_policy must be an object")
+    sample_end = clock_policy.get("attribution_sample_master_end_seconds")
+    if sample_end is not None:
+        sample_end = _finite(sample_end, "attribution sample master end")
+        run_master_end = (
+            min(sample_end, _finite(master_end, "master end"))
+            if master_end is not None else sample_end
+        )
+    # Detector ownership can include an unsampled outro. It must not make the
+    # final observed source run extend beyond the caller's observation window.
+    # Keep the detector partition unchanged; these are attribution-only runs.
     runs = collapse_reference_source_runs(
         path,
         master_start_seconds=master_start,
-        master_end_seconds=master_end,
+        master_end_seconds=run_master_end,
     )
     canonical_partition = _canonical_detected_shot_partition(
         evidence,
@@ -1779,6 +1793,13 @@ def resolve_reference_attribution_payload(
             for state in path
         ],
         "source_runs": [run.to_dict() for run in runs],
+        "source_run_coverage": {
+            "contract": "caller_bounded_source_attribution_runs_v1",
+            "requested_sample_master_end_seconds": sample_end,
+            "effective_run_master_end_seconds": runs[-1].end_master_seconds,
+            "canonical_detector_partition_unchanged": True,
+            "unobserved_outro_attribution_authorized": False,
+        },
         "boundary_refinements": refinements,
         "shots": shots,
     }
