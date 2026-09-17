@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .ive import AspectRatio, EditMode, IVEMember, SourceMode
+from .derived_cache_location import resolve_migrated_derived_cache
 
 
 DEFAULT_AUTOMATIC_SOURCE_COUNT = 10
@@ -137,6 +138,13 @@ class AnalysisRequest:
         return self.desired_source_count
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "visual_feature_derived_cache_directory",
+            resolve_migrated_derived_cache(
+                self.source_cache_directory,
+                self.visual_feature_derived_cache_directory,
+            ),
+        )
         if not isinstance(self.member_pose_dissolve_enabled, bool):
             raise ValueError("member_pose_dissolve_enabled must be a boolean")
         render_range = (
