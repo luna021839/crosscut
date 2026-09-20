@@ -212,6 +212,10 @@ from .review_first_runtime import (
     ReviewFirstStatus,
     classify_review_first_qa,
 )
+from .review_first_selection_contract import (
+    REVIEW_FIRST_CANDIDATE_POOL,
+    review_first_release_policy_payload,
+)
 from .rendered_candidate_selection import (
     RenderedCandidate,
     RenderedCandidateRankMetadata,
@@ -20513,6 +20517,116 @@ def _apply_stage_edit_candidate_render_contract(
     )
 
 
+def _dynamic_crop_render_application_audit(
+    bundle: _GroupRenderCandidateBundle,
+    materialized: StageEditMaterializedVisualCandidate,
+) -> dict[str, Any]:
+    """Describe what learned framing actually survived in the final plan.
+
+    Successful execution is not evidence that a learned crop reached the
+    renderer: deterministic face geometry and verified dissolves may override
+    it.  This audit records one disposition per segment and binds the summary
+    to the exact final RenderPlan.
+    """
+
+    if not isinstance(bundle, _GroupRenderCandidateBundle):
+        raise TypeError("bundle must be a complete group render candidate")
+    if not isinstance(materialized, StageEditMaterializedVisualCandidate):
+        raise TypeError("materialized must be a StageEdit visual candidate")
+    version = bundle.stage_edit_dynamic_crop_version
+    if version not in (2, 3):
+        raise RuntimeError("dynamic crop application audit needs v2 or v3")
+    segment_dispositions: list[dict[str, Any]] = []
+    if version == 3:
+        evidence = bundle.dynamic_crop_motion_timeline_v3
+        if not isinstance(evidence, DynamicCropMotionTimelineEvidenceV3):
+            raise RuntimeError("Dynamic Crop v3 application audit lacks evidence")
+        for item in evidence.segment_evidence:
+            segment_dispositions.append(
+                {
+                    "segment_index": item.segment_index,
+                    "disposition": item.overlay_disposition,
+                    "learned_framing_applied": item.framing_track_applied,
+                    "learned_motion_event_applied": item.motion_event_applied,
+                    "deterministic_geometry_override": (
+                        item.overlay_disposition
+                        == DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION
+                    ),
+                    "verified_face_dissolve_suppressed": (
+                        item.face_dissolve_suppressed
+                    ),
+                }
+            )
+    else:
+        original_segments = tuple(
+            shot.segment for shot in materialized.retained_candidate.edit.shots
+        )
+        if len(original_segments) != len(bundle.render_plan.segments):
+            raise RuntimeError("Dynamic Crop v2 application audit segment mismatch")
+        dissolve_segments = {
+            segment_index
+            for boundary_index, transition in enumerate(
+                bundle.render_plan.transitions
+            )
+            if transition.kind is TransitionKind.FACE_DISSOLVE
+            for segment_index in (boundary_index, boundary_index + 1)
+        }
+        for index, (original, rendered) in enumerate(
+            zip(original_segments, bundle.render_plan.segments, strict=True)
+        ):
+            requested = original.editorial_transform is not None
+            applied = rendered.editorial_transform is not None
+            suppressed = index in dissolve_segments
+            disposition = (
+                "verified_face_dissolve_suppressed"
+                if suppressed
+                else "learned_track_applied"
+                if applied
+                else "decode_rejected_no_track"
+            )
+            segment_dispositions.append(
+                {
+                    "segment_index": index,
+                    "disposition": disposition,
+                    "learned_track_requested": requested,
+                    "learned_framing_applied": applied,
+                    "learned_motion_event_applied": applied,
+                    "deterministic_geometry_override": False,
+                    "verified_face_dissolve_suppressed": suppressed,
+                }
+            )
+    applied_count = sum(
+        item["learned_framing_applied"] for item in segment_dispositions
+    )
+    override_count = sum(
+        item["deterministic_geometry_override"] for item in segment_dispositions
+    )
+    dissolve_suppressed_count = sum(
+        item["verified_face_dissolve_suppressed"]
+        for item in segment_dispositions
+    )
+    plan_sha256 = hashlib.sha256(
+        json.dumps(
+            bundle.render_plan.to_json(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "contract": "stage_edit_dynamic_crop_final_render_application_v1",
+        "dynamic_crop_version": version,
+        "segment_count": len(segment_dispositions),
+        "learned_framing_applied_count": applied_count,
+        "deterministic_geometry_override_count": override_count,
+        "verified_face_dissolve_suppressed_count": dissolve_suppressed_count,
+        "learned_framing_applied_to_final_render": applied_count > 0,
+        "final_render_plan_content_sha256": plan_sha256,
+        "segment_dispositions": segment_dispositions,
+    }
+
+
 def _refresh_stage_edit_dynamic_crop_motion_evidence_v3(
     bundle: _GroupRenderCandidateBundle,
 ) -> _GroupRenderCandidateBundle:
@@ -26754,6 +26868,7 @@ def analyze(
     *,
     allow_failed_comparison_render: bool = False,
     review_rendered_proxies: bool = False,
+    review_first_deadline_monotonic_seconds: float | None = None,
     acquisition_identity_authority: (
         VerifiedMemberAcquisitionIdentityAuthority | None
     ) = None,
@@ -26763,7 +26878,10 @@ def analyze(
     if not isinstance(review_rendered_proxies, bool):
         raise TypeError("review_rendered_proxies must be a boolean")
     review_first_runtime = ReviewFirstRuntime(
-        enabled=bool(getattr(request, "review_first_enabled", False))
+        enabled=bool(getattr(request, "review_first_enabled", False)),
+        absolute_deadline_monotonic_seconds=(
+            review_first_deadline_monotonic_seconds
+        ),
     )
     if acquisition_identity_authority is not None and not (
         request.source_mode is SourceMode.AUTOMATIC
@@ -28226,6 +28344,8 @@ def analyze(
                         workspace,
                         source_switch_requirements=joint_switch_requirements,
                         source_switch_families=joint_switch_families,
+                        fps=29.97,
+                        maximum_offset_frames=8,
                     )
                     if visual_candidate_checkpoint_input_identity is not None:
                         from .joint_proposal_checkpoint import find_joint_proposal_restart
@@ -28353,7 +28473,8 @@ def analyze(
                                 deadline_monotonic_seconds=(
                                     joint_selection_deadline
                                 ),
-                                select=lambda **domain_arguments: (
+                                select=lambda *, boundary_search_domain,
+                                maximum_proof_materialization_calls: (
                                     select_joint_visual_candidates(
                                         visual_candidate_set,
                                         provider=provider,
@@ -28365,7 +28486,12 @@ def analyze(
                                         source_switch_families=joint_switch_families,
                                         forbidden_boundary_selections=boundary_feedback,
                                         forbidden_complete_paths=complete_path_feedback,
-                                        **domain_arguments,
+                                        boundary_search_domain=(
+                                            boundary_search_domain
+                                        ),
+                                        maximum_proof_materialization_calls=(
+                                            maximum_proof_materialization_calls
+                                        ),
                                         decoded_montage_feedback=(
                                             JointDecodedMontageFeedback(
                                                 observations=joint_decoded_montage_observations,
@@ -34159,22 +34285,100 @@ def analyze(
                 height=height,
                 transitions=group_transition_plan.transitions,
             )
-            if review_first_stage_edit_materialized is not None:
-                try:
-                    plan = apply_stage_edit_dynamic_crop_to_render_plan(
+            review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
+            if bool(getattr(request, "review_first_enabled", False)):
+                if visual_timeline is None or timeline_review is None:
+                    raise RuntimeError(
+                        "review-first GROUP render requires one complete reviewed "
+                        "visual timeline"
+                    )
+                selected_path_authority = (
+                    str(
+                        review_first_visual_selection_payload.get(
+                            "authority",
+                            "deterministic_full_song_visual_selector",
+                        )
+                    )
+                    if isinstance(review_first_visual_selection_payload, Mapping)
+                    else "deterministic_full_song_visual_selector"
+                )
+                final_montage_section_plan = (
+                    stage_edit_generation_result.learned_section_director.section_plan
+                    if stage_edit_generation_result is not None
+                    and stage_edit_generation_result.learned_section_director
+                    is not None
+                    else visual_section_plan
+                    if visual_section_plan is not None
+                    else section_plan
+                )
+                if final_montage_section_plan is None:
+                    raise RuntimeError(
+                        "review-first GROUP render lacks an exact section plan"
+                    )
+                review_first_singleton_bundle = _GroupRenderCandidateBundle(
+                    candidate_index=0,
+                    review_rank=(
+                        review_first_stage_edit_materialized.review_rank
+                        if review_first_stage_edit_materialized is not None
+                        else 0
+                    ),
+                    cadence_profile=(
+                        review_first_stage_edit_materialized.cadence_profile
+                        if review_first_stage_edit_materialized is not None
+                        else selected_path_authority
+                    ),
+                    pre_render_score=float(timeline_review.weighted_score),
+                    visual_timeline=visual_timeline,
+                    boundary_repairs=visual_boundary_repairs,
+                    timeline_review=timeline_review,
+                    face_match_plan=face_match_plan,
+                    group_transition_plan=group_transition_plan,
+                    boundary_affine_plan=boundary_affine_plan,
+                    editorial_motion_plan=editorial_motion_plan,
+                    render_plan=plan,
+                    boundary_look_match=boundary_look_match_result,
+                    diagnostics=("bounded_review_first_singleton_finalization",),
+                    candidate_origin="ordinary_visual_baseline",
+                    candidate_lineage=(
+                        {
+                            "stage": "bounded_review_first_singleton_finalization",
+                            "selected_path_authority": selected_path_authority,
+                            "complete_full_song_candidate": True,
+                        },
+                    ),
+                    stage_edit_exact_shot_clock=(
+                        _deterministic_exact_shot_clock_from_timeline(
+                            visual_timeline,
+                            section_plan=final_montage_section_plan,
+                            phrase_times=phrase_times,
+                        )
+                    ),
+                )
+                if review_first_stage_edit_materialized is not None:
+                    review_first_singleton_bundle = (
+                        _apply_stage_edit_candidate_render_contract(
+                            review_first_singleton_bundle,
+                            review_first_stage_edit_materialized,
+                            motion_authority_v3=(
+                                registered_stage_edit_motion_authority_v3
+                            ),
+                        )
+                    )
+                    application_audit = _dynamic_crop_render_application_audit(
+                        review_first_singleton_bundle,
                         review_first_stage_edit_materialized,
-                        plan,
                     )
                     if isinstance(review_first_visual_selection_payload, dict):
                         review_first_visual_selection_payload[
+                            "dynamic_crop_application"
+                        ] = application_audit
+                        review_first_visual_selection_payload[
                             "dynamic_crop_applied_to_render"
-                        ] = True
-                except (TypeError, ValueError) as exc:
-                    warnings.append(
-                        "StageEdit Dynamic Crop 구간을 렌더 계획에 "
-                        "재결합하지 못해 실프레임 얼굴·피사체 "
-                        f"보정을 유지했습니다: {exc}"
-                    )
+                        ] = application_audit[
+                            "learned_framing_applied_to_final_render"
+                        ]
+                plan = review_first_singleton_bundle.render_plan
+                segments = plan.segments
             if review_rendered_proxies:
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
@@ -34190,7 +34394,10 @@ def analyze(
                             professional_reference_profile
                         ),
                         maximum_runtime_seconds=(
-                            420.0
+                            review_first_runtime.bounded_timeout(
+                                420.0,
+                                "decoded proxy render",
+                            )
                             if getattr(
                                 request,
                                 "review_first_enabled",
@@ -34204,6 +34411,94 @@ def analyze(
                 if isinstance(proxy_metadata, dict):
                     proxy_metadata["path"] = None
                     proxy_metadata["temporary_proxy_removed_after_review"] = True
+                if bool(getattr(request, "review_first_enabled", False)):
+                    if (
+                        review_first_singleton_bundle is None
+                        or source_derivative_diversity_result is None
+                        or rendered_montage_config is None
+                        or stage_edit_montage_policy is None
+                    ):
+                        raise RuntimeError(
+                            "review-first GROUP candidate lacks mandatory decoded "
+                            "montage evidence"
+                        )
+                    technical_proxy_passed = bool(
+                        rendered_proxy_review_payload.get("passed")
+                    )
+                    (
+                        rendered_montage_grammar_review_payload,
+                        final_montage_analysis,
+                    ) = _review_stage_edit_bundle_montage(
+                        bundle=review_first_singleton_bundle,
+                        proxy_review_payload=rendered_proxy_review_payload,
+                        section_plan=final_montage_section_plan,
+                        source_derivative_diversity=(
+                            source_derivative_diversity_result
+                        ),
+                        source_index_mapping=_source_index_mapping(
+                            request.sources,
+                            eligible_indices,
+                        ),
+                        source_scene_cut_times=tuple(
+                            tuple(
+                                float(change["timestamp_seconds"])
+                                for change in payload["changes"]
+                            )
+                            for payload in scene_payloads
+                        ),
+                        config=rendered_montage_config,
+                        reference_profile=stage_edit_montage_policy.profile_identity,
+                    )
+                    stage_edit_exact_shot_clock_payload = deepcopy(
+                        final_montage_analysis["stage_edit_exact_shot_clock"]
+                    )
+                    raw_dynamic_crop_version = final_montage_analysis[
+                        "dynamic_crop_version"
+                    ]
+                    stage_edit_dynamic_crop_version_payload = (
+                        int(raw_dynamic_crop_version)
+                        if raw_dynamic_crop_version in (2, 3)
+                        else None
+                    )
+                    raw_decodes_v3 = final_montage_analysis[
+                        "dynamic_crop_v3_decodes"
+                    ]
+                    raw_motion_v3 = final_montage_analysis[
+                        "dynamic_crop_motion_v3"
+                    ]
+                    dynamic_crop_v3_decodes_payload = (
+                        deepcopy(raw_decodes_v3)
+                        if isinstance(raw_decodes_v3, list)
+                        else None
+                    )
+                    dynamic_crop_motion_v3_payload = (
+                        deepcopy(raw_motion_v3)
+                        if isinstance(raw_motion_v3, Mapping)
+                        else None
+                    )
+                    if stage_edit_dynamic_crop_version_payload == 3 and (
+                        dynamic_crop_v3_decodes_payload is None
+                        or dynamic_crop_motion_v3_payload is None
+                    ):
+                        raise RuntimeError(
+                            "review-first Dynamic Crop v3 lost strict replay evidence"
+                        )
+                    rendered_proxy_review_payload[
+                        "technical_proxy_passed_before_montage_grammar"
+                    ] = technical_proxy_passed
+                    rendered_proxy_review_payload[
+                        "rendered_montage_grammar_review"
+                    ] = deepcopy(rendered_montage_grammar_review_payload)
+                    rendered_proxy_review_payload["passed"] = bool(
+                        technical_proxy_passed
+                        and rendered_montage_grammar_review_payload.get("passed")
+                        is True
+                    )
+                    _apply_bounded_human_target_proxy_rank(
+                        rendered_proxy_review_payload,
+                        rendered_montage_grammar_review_payload,
+                        technical_passed=technical_proxy_passed,
+                    )
                 rendered_proxy_review_path = request.output_directory / (
                     f"{base_filename}-rendered-proxy-review.json"
                 )
@@ -34237,27 +34532,52 @@ def analyze(
                         "검토본 우선 정책으로 최종 화질 QA까지 계속했습니다."
                     )
                 if bool(getattr(request, "review_first_enabled", False)):
-                    rendered_candidate_selection_payload = {
-                        "analysis_basis": "bounded_review_first_single_full_song_v1",
-                        "candidate_pool": (
-                            review_first_visual_selection_payload.get(
-                                "authority",
-                                "deterministic_full_song_visual_selector",
-                            )
-                            if isinstance(
-                                review_first_visual_selection_payload,
-                                Mapping,
-                            )
-                            else "deterministic_full_song_visual_selector"
+                    assert review_first_singleton_bundle is not None
+                    singleton_candidate = RenderedCandidate(
+                        candidate_index=0,
+                        render_plan=review_first_singleton_bundle.render_plan,
+                        pre_render_score=(
+                            review_first_singleton_bundle.pre_render_score
                         ),
-                        "requested_review_count": 1,
-                        "reviewed_candidate_count": 1,
-                        "minimum_required_candidate_count": 1,
-                        "minimum_candidate_count_satisfied": True,
-                        "selected_candidate_index": 0,
+                        payload=review_first_singleton_bundle,
+                    )
+                    singleton_review = RenderedCandidateReview(
+                        candidate=singleton_candidate,
+                        review_payload=deepcopy(rendered_proxy_review_payload),
+                    )
+                    singleton_selection = RenderedCandidateSelection(
+                        reviews=(singleton_review,),
+                        selected_candidate_index=0,
+                        requested_review_count=1,
+                        minimum_required_candidate_count=1,
+                        analysis_basis=(
+                            "bounded_review_first_single_full_song_v1"
+                        ),
+                    )
+                    rendered_candidate_selection_payload = (
+                        singleton_selection.to_dict()
+                    )
+                    rendered_candidate_selection_payload.update({
+                        "release_policy": review_first_release_policy_payload(),
+                        "candidate_pool": REVIEW_FIRST_CANDIDATE_POOL,
+                        "selected_path_authority": selected_path_authority,
+                        "complete_candidates": [
+                            review_first_singleton_bundle.to_dict()
+                        ],
+                        "complete_candidate_count": 1,
+                        "exact_successful_decoded_review_count_satisfied": True,
+                        "exact_complete_candidate_count_satisfied": True,
                         "final_selected_review": deepcopy(
                             rendered_proxy_review_payload
                         ),
+                        "final_selected_version": "original",
+                        "proxy_triggered_partial_reedit": {
+                            "attempted": False,
+                            "improved": False,
+                            "selected_version": "original",
+                            "changed_boundary_indices": [],
+                            "reason": "bounded_review_first_singleton",
+                        },
                         "review_first_visual_selection": deepcopy(
                             review_first_visual_selection_payload
                         ),
@@ -34271,9 +34591,6 @@ def analyze(
                             if crop_aware_candidate_rerank_result is not None
                             else None
                         ),
-                        "passed": bool(
-                            rendered_proxy_review_payload.get("passed")
-                        ),
                         "approval_deferred_to_final_post_render_qa": True,
                         "delivery_completion_message_allowed": False,
                         "source_index_mapping": _source_index_mapping(
@@ -34283,7 +34600,7 @@ def analyze(
                         "nested_index_domains": (
                             _rendered_candidate_selection_index_domains()
                         ),
-                    }
+                    })
                     rendered_candidate_selection_path = (
                         request.output_directory
                         / f"{base_filename}-rendered-candidate-selection.json"
@@ -34369,7 +34686,14 @@ def analyze(
                 total_frames=plan.output_frame_count,
             ),
             **(
-                {"maximum_runtime_seconds": 900.0}
+                {
+                    "maximum_runtime_seconds": (
+                        review_first_runtime.bounded_timeout(
+                            900.0,
+                            "group full render",
+                        )
+                    )
+                }
                 if getattr(request, "review_first_enabled", False)
                 else {}
             ),
@@ -34387,7 +34711,23 @@ def analyze(
                 if joint_visual_selection_active
                 else stage_edit_release_policy_payload()
                 if stage_edit_visual_candidate_batch is not None
-                and stage_edit_visual_candidate_batch.quality_gated_single_delivery else None
+                and stage_edit_visual_candidate_batch.quality_gated_single_delivery
+                else review_first_release_policy_payload()
+                if bool(getattr(request, "review_first_enabled", False))
+                and rendered_candidate_selection_payload is not None
+                and visual_candidate_set is None
+                and stage_edit_visual_candidate_batch is None
+                and not joint_visual_selection_active
+                else None
+            ),
+            "candidate_pool": (
+                REVIEW_FIRST_CANDIDATE_POOL
+                if bool(getattr(request, "review_first_enabled", False))
+                and rendered_candidate_selection_payload is not None
+                and visual_candidate_set is None
+                and stage_edit_visual_candidate_batch is None
+                and not joint_visual_selection_active
+                else None
             ),
             "video_path": str(rendered_video_path),
             "plan_path": str(render_plan_path),
@@ -37876,7 +38216,14 @@ def analyze(
                     total_frames=plan.output_frame_count,
                 ),
                 **(
-                    {"maximum_runtime_seconds": 900.0}
+                    {
+                        "maximum_runtime_seconds": (
+                            review_first_runtime.bounded_timeout(
+                                900.0,
+                                "member full render",
+                            )
+                        )
+                    }
                     if getattr(request, "review_first_enabled", False)
                     else {}
                 ),

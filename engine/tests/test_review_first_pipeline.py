@@ -47,6 +47,104 @@ class ReviewFirstPipelineTests(unittest.TestCase):
 
         self.assertTrue(crosscut_cli._result_contains_exposable_video(artifact))
 
+    def test_cli_exposes_group_review_ready_only_with_bound_group_contract(self) -> None:
+        artifact = SimpleNamespace(
+            output_paths=(Path("/tmp/group-review.mp4"),),
+            manifest={
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "review_ready",
+                "render": {"artifact_role": "review_ready"},
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": True,
+                    "delivery_completion_message_allowed": False,
+                },
+                "post_render_qa": {
+                    "contract": (
+                        "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
+                    ),
+                    "passed": False,
+                    "promotion_binding": {"passed": True},
+                    "review_first_disposition": {"status": "REVIEW_READY"},
+                },
+            },
+        )
+
+        self.assertTrue(crosscut_cli._result_contains_exposable_video(artifact))
+
+    def test_cli_blocks_rejected_group_mp4(self) -> None:
+        artifact = SimpleNamespace(
+            output_paths=(Path("/tmp/group-rejected.mp4"),),
+            manifest={
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "rejected",
+                "render": {"artifact_role": "rejected"},
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": False,
+                    "delivery_completion_message_allowed": False,
+                },
+                "post_render_qa": {
+                    "contract": (
+                        "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
+                    ),
+                    "passed": False,
+                    "promotion_binding": {"passed": True},
+                    "review_first_disposition": {"status": "INPUT_UNUSABLE"},
+                },
+            },
+        )
+
+        with self.assertRaises(RuntimeError):
+            crosscut_cli._result_contains_exposable_video(artifact)
+
+    def test_cli_blocks_mp4_without_manifest(self) -> None:
+        artifact = SimpleNamespace(
+            output_paths=(Path("/tmp/unbound.mp4"),),
+            manifest=None,
+        )
+
+        with self.assertRaises(RuntimeError):
+            crosscut_cli._result_contains_exposable_video(artifact)
+
+    def test_cli_blocks_contradictory_group_review_status(self) -> None:
+        artifact = SimpleNamespace(
+            output_paths=(Path("/tmp/group-contradiction.mp4"),),
+            manifest={
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "review_ready",
+                "render": {"artifact_role": "review_ready"},
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": True,
+                    "delivery_completion_message_allowed": False,
+                },
+                "post_render_qa": {
+                    "contract": (
+                        "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
+                    ),
+                    "passed": True,
+                    "promotion_binding": {"passed": True},
+                    "review_first_disposition": {"status": "REVIEW_READY"},
+                },
+            },
+        )
+
+        with self.assertRaises(RuntimeError):
+            crosscut_cli._result_contains_exposable_video(artifact)
+
     def test_content_bound_quality_failure_returns_review_ready_video(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

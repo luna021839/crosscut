@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+from time import monotonic
 import traceback
 
 # Random-access analysis intentionally seeks between non-keyframes. OpenCV's
@@ -25,7 +26,11 @@ from crosscut.member_post_render_qa import (
     AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
     AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
 )
-from crosscut.pipeline import analyze
+from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
+from crosscut.pipeline import (
+    AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
+    analyze,
+)
 from crosscut.post_render_qa import (
     PostRenderArtifactSet,
     PostRenderQAVerdict,
@@ -42,6 +47,11 @@ from crosscut.reference_boundary_supervision import (
 )
 from crosscut.reference_dataset import build_reference_dataset_file
 from crosscut.request import AnalysisRequest
+from crosscut.review_first_runtime import (
+    REVIEW_FIRST_TOTAL_BUDGET_SECONDS,
+    ReviewFirstDeadlineExceeded,
+    enforce_review_first_deadline,
+)
 
 
 def _raise_analysis_cancellation(_signum: int, _frame: object) -> None:
@@ -74,57 +84,77 @@ def _result_contains_exposable_video(artifact: object) -> bool:
     has_mp4 = any(Path(path).suffix.lower() == ".mp4" for path in output_paths)
     manifest = getattr(artifact, "manifest", None)
     if not isinstance(manifest, dict):
-        return has_mp4
+        if has_mp4:
+            raise RuntimeError(
+                "MP4 is not exposed because its result manifest is missing"
+            )
+        return False
     request = manifest.get("request")
     render = manifest.get("render")
-    automatic_member_scope = bool(
+    automatic_ive_scope = bool(
         isinstance(request, dict)
         and str(request.get("group", "")).strip().upper() == "IVE"
         and str(request.get("source_mode", "")).strip().lower()
         == "automatic"
-        and str(request.get("edit_mode", "")).strip().lower() == "member"
+        and str(request.get("edit_mode", "")).strip().lower()
+        in {"group", "member"}
     )
-    if not automatic_member_scope:
+    if not automatic_ive_scope:
         return has_mp4
+    edit_mode = str(request.get("edit_mode", "")).strip().lower()
+    member = edit_mode == "member"
     exposure = manifest.get("app_result_exposure")
     qa = manifest.get("post_render_qa")
     artifact_role = manifest.get("artifact_role")
-    delivery_allowed = bool(
-        artifact_role == "delivery"
-        and isinstance(render, dict)
-        and render.get("direct_full_frame") is True
-        and render.get("artifact_role") == "delivery"
-        and isinstance(exposure, dict)
-        and exposure.get("contract")
-        == AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
-        and exposure.get("video_output_exposed") is True
-        and exposure.get("delivery_completion_message_allowed") is True
-        and isinstance(qa, dict)
-        and qa.get("contract") == AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
-        and qa.get("passed") is True
+    expected_exposure_contract = (
+        AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
+        if member
+        else APP_RESULT_EXPOSURE_CONTRACT
+    )
+    expected_qa_contract = (
+        AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
+        if member
+        else AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT
     )
     disposition = qa.get("review_first_disposition") if isinstance(qa, dict) else None
+    promotion_binding = qa.get("promotion_binding") if isinstance(qa, dict) else None
+    content_binding_passed = bool(
+        qa.get("content_binding_passed") is True
+        if member and isinstance(qa, dict)
+        else isinstance(promotion_binding, dict)
+        and promotion_binding.get("passed") is True
+    )
+    shared_contract = bool(
+        isinstance(render, dict)
+        and render.get("artifact_role") == artifact_role
+        and (not member or render.get("direct_full_frame") is True)
+        and isinstance(exposure, dict)
+        and exposure.get("contract") == expected_exposure_contract
+        and exposure.get("video_output_exposed") is True
+        and isinstance(qa, dict)
+        and qa.get("contract") == expected_qa_contract
+        and content_binding_passed
+        and isinstance(disposition, dict)
+    )
+    delivery_allowed = bool(
+        artifact_role == "delivery"
+        and shared_contract
+        and exposure.get("delivery_completion_message_allowed") is True
+        and qa.get("passed") is True
+        and disposition.get("status") == "APPROVED"
+    )
     review_ready_allowed = bool(
         artifact_role == "review_ready"
-        and isinstance(render, dict)
-        and render.get("direct_full_frame") is True
-        and render.get("artifact_role") == "review_ready"
-        and isinstance(exposure, dict)
-        and exposure.get("contract")
-        == AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
-        and exposure.get("video_output_exposed") is True
+        and shared_contract
         and exposure.get("delivery_completion_message_allowed") is False
-        and isinstance(qa, dict)
-        and qa.get("contract") == AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
-        and qa.get("content_binding_passed") is True
-        and isinstance(disposition, dict)
+        and qa.get("passed") is False
         and disposition.get("status") == "REVIEW_READY"
     )
     allowed = bool(delivery_allowed or review_ready_allowed)
     if has_mp4 and not allowed:
         raise RuntimeError(
-            "automatic IVE MEMBER MP4 is not exposed because mandatory "
-            "post-render QA did not reach delivery"
+            "automatic IVE MP4 is not exposed because mandatory post-render "
+            "QA did not authorize delivery or review-ready output"
         )
     return bool(has_mp4 and allowed)
 
@@ -439,52 +469,64 @@ def main(argv: list[str] | None = None) -> int:
         reporter.status(
             f"IVE {request.song} · {request.edit_mode.value} · {request.aspect_ratio.value}"
         )
-        acquisition = None
-        if request.source_mode is SourceMode.AUTOMATIC:
-            acquisition = acquire_sources(request, reporter)
-            if request.acquire_only:
-                reporter.progress(1.0, "IVE 소스 수집을 완료했습니다.")
-                source_paths = [str(path) for path in acquisition.source_paths]
-                reporter.result(
-                    outputs=source_paths,
-                    source_paths=source_paths,
-                    acquisition_manifest=str(acquisition.manifest_path),
-                    member_anchors=[
-                        anchor.as_dict() for anchor in acquisition.member_anchors
-                    ],
-                    message=(
-                        f"IVE {request.song} 소스 {len(source_paths)}개를 "
-                        "로컬 캐시에 준비했습니다."
-                    ),
-                )
-                return 0
-            request = request.with_materialized_sources(
-                acquisition.source_paths,
-                member_anchors=acquisition.member_anchors,
-            )
-            pipeline_reporter = ProgressRangeReporter(
-                reporter,
-                start=0.20,
-                end=1.0,
-            )
-        else:
-            pipeline_reporter = reporter
-        artifact = analyze(
-            request,
-            pipeline_reporter,
-            allow_failed_comparison_render=(
-                arguments.allow_failed_comparison_render
-            ),
-            review_rendered_proxies=(
-                request.source_mode is SourceMode.AUTOMATIC
-                and request.edit_mode.value == "group"
-            ),
-            acquisition_identity_authority=(
-                acquisition.member_identity_authority
-                if acquisition is not None
-                else None
-            ),
+        review_first_deadline = (
+            monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
+            if bool(getattr(request, "review_first_enabled", False))
+            else None
         )
+        with enforce_review_first_deadline(
+            review_first_deadline,
+            stage="source acquisition, analysis, render, and final QA",
+        ):
+            acquisition = None
+            if request.source_mode is SourceMode.AUTOMATIC:
+                acquisition = acquire_sources(request, reporter)
+                if request.acquire_only:
+                    reporter.progress(1.0, "IVE 소스 수집을 완료했습니다.")
+                    source_paths = [str(path) for path in acquisition.source_paths]
+                    reporter.result(
+                        outputs=source_paths,
+                        source_paths=source_paths,
+                        acquisition_manifest=str(acquisition.manifest_path),
+                        member_anchors=[
+                            anchor.as_dict() for anchor in acquisition.member_anchors
+                        ],
+                        message=(
+                            f"IVE {request.song} 소스 {len(source_paths)}개를 "
+                            "로컬 캐시에 준비했습니다."
+                        ),
+                    )
+                    return 0
+                request = request.with_materialized_sources(
+                    acquisition.source_paths,
+                    member_anchors=acquisition.member_anchors,
+                )
+                pipeline_reporter = ProgressRangeReporter(
+                    reporter,
+                    start=0.20,
+                    end=1.0,
+                )
+            else:
+                pipeline_reporter = reporter
+            artifact = analyze(
+                request,
+                pipeline_reporter,
+                allow_failed_comparison_render=(
+                    arguments.allow_failed_comparison_render
+                ),
+                review_rendered_proxies=(
+                    request.source_mode is SourceMode.AUTOMATIC
+                    and request.edit_mode.value == "group"
+                ),
+                review_first_deadline_monotonic_seconds=(
+                    review_first_deadline
+                ),
+                acquisition_identity_authority=(
+                    acquisition.member_identity_authority
+                    if acquisition is not None
+                    else None
+                ),
+            )
         warnings = artifact.manifest.get("warnings") or []
         for warning in warnings:
             reporter.emit("log", level="warning", message=warning)
@@ -518,6 +560,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         return 0
+    except ReviewFirstDeadlineExceeded as exc:
+        reporter.error(str(exc))
+        return 1
     except KeyboardInterrupt:
         reporter.error("작업이 취소되었습니다.")
         return 130

@@ -2,6 +2,10 @@ import io
 from pathlib import Path
 import tempfile
 import shutil
+import os
+import subprocess
+import threading
+from time import monotonic
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -51,6 +55,54 @@ class RenderProcessTests(unittest.TestCase):
                 run_observed_render(['ffmpeg'],stderr_path=Path(tmp)/'stderr',progress_callback=cancel)
         self.assertTrue(fake.terminated)
         self.assertTrue(fake.stdout.closed)
+
+    def test_stalled_callback_cannot_defeat_total_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "progress-child"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "print('frame=1', flush=True)\n"
+                "print('progress=continue', flush=True)\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            blocker = threading.Event()
+            started = monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_observed_render(
+                    [str(executable)],
+                    stderr_path=root / "stderr",
+                    progress_callback=lambda _event: blocker.wait(),
+                    timeout_seconds=0.2,
+                )
+            self.assertLess(monotonic() - started, 3.0)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups required")
+    def test_exited_parent_is_not_held_by_grandchild_progress_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "inherited-pipe-parent"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
+                "print('frame=1', flush=True)\n"
+                "print('progress=end', flush=True)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            started = monotonic()
+            result = run_observed_render(
+                [str(executable)],
+                stderr_path=root / "stderr",
+                progress_callback=lambda _event: None,
+                timeout_seconds=2.0,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertLess(monotonic() - started, 1.0)
 
     def test_app_log_uses_encoder_counts_not_quality_approval(self):
         logs=[];callback=render_log_callback(SimpleNamespace(log=logs.append),total_frames=100)

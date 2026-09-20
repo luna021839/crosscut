@@ -12,7 +12,11 @@ from time import monotonic
 from typing import Any, Callable, Mapping, Sequence
 
 from .joint_timeline import BoundaryMeasurementKey
-from .joint_switch_requirements import SourceSwitchRequirement
+from .joint_switch_requirements import (
+    MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES,
+    SourceSwitchCounter,
+    SourceSwitchRequirement,
+)
 from .timeline import NoCompleteTimelinePath, TimelineCandidate, TimelineConfig, TimelineResult, select_timeline_candidates
 from .visual_score import VisualTimelineOptimizerWorkspace, _safe_cadence_profiles, _role_conditioned_visual_controls
 
@@ -219,16 +223,22 @@ def _requirement_covering_path(
     lattice: Sequence[Sequence[TimelineCandidate]],
     requirements: Sequence[SourceSwitchRequirement],
     source_families: Mapping[str, str] | None,
+    *,
+    fps: float,
+    maximum_offset_frames: int,
 ) -> tuple[TimelineCandidate, ...] | None:
-    """Return one connected descriptor path satisfying section switch floors."""
+    """Return a connected path with a concrete frame-offset solution."""
 
     windows = tuple(requirements)
     if not windows:
         return None
-    families = dict(source_families or {})
-
-    def different(left: str, right: str) -> bool:
-        return families.get(left, left) != families.get(right, right)
+    counter = SourceSwitchCounter(
+        windows,
+        lattice,
+        fps=fps,
+        maximum_offset_frames=maximum_offset_frames,
+        source_families=source_families,
+    )
 
     def emission(candidate: TimelineCandidate) -> float:
         return (
@@ -246,27 +256,93 @@ def _requirement_covering_path(
         (candidate, initial_counts): (emission(candidate), (candidate,))
         for candidate in lattice[0]
     }
-    for right_row in lattice[1:]:
-        next_states: dict[
-            tuple[TimelineCandidate, tuple[int, ...]],
-            tuple[float, tuple[TimelineCandidate, ...]],
+    for boundary_index, right_row in enumerate(lattice[1:]):
+        next_by_candidate: dict[
+            TimelineCandidate,
+            dict[
+                tuple[int, ...],
+                tuple[float, tuple[TimelineCandidate, ...]],
+            ],
         ] = {}
         for (left, counts), (score, path) in states.items():
             for right in right_row:
-                switched = different(left.source_id, right.source_id)
-                next_counts = tuple(
-                    min(
-                        window.minimum_count,
-                        count
-                        + int(switched and window.contains(right.start_seconds)),
+                switched = counter.different(left.source_id, right.source_id)
+                for increments in counter.potential_increment_vectors(
+                    boundary_index,
+                    left,
+                    right,
+                ):
+                    next_counts = tuple(
+                        min(window.minimum_count, count + increment)
+                        for window, count, increment in zip(
+                            windows,
+                            counts,
+                            increments,
+                            strict=True,
+                        )
                     )
-                    for window, count in zip(windows, counts, strict=True)
-                )
-                next_score = score + emission(right) - (0.02 if switched else 0.0)
-                key = (right, next_counts)
-                previous = next_states.get(key)
-                if previous is None or next_score > previous[0]:
-                    next_states[key] = (next_score, path + (right,))
+                    if not counter.feasible(next_counts, boundary_index + 1):
+                        continue
+                    next_score = (
+                        score + emission(right) - (0.02 if switched else 0.0)
+                    )
+                    value = (next_score, path + (right,))
+                    frontier = next_by_candidate.setdefault(right, {})
+                    previous = frontier.get(next_counts)
+                    if previous is not None and previous[0] >= next_score:
+                        continue
+                    if any(
+                        existing_score >= next_score
+                        and all(
+                            existing >= current
+                            for existing, current in zip(
+                                existing_counts,
+                                next_counts,
+                                strict=True,
+                            )
+                        )
+                        for existing_counts, (
+                            existing_score,
+                            _existing_path,
+                        ) in frontier.items()
+                    ):
+                        continue
+                    dominated = [
+                        existing_counts
+                        for existing_counts, (
+                            existing_score,
+                            _existing_path,
+                        ) in frontier.items()
+                        if next_score >= existing_score
+                        and all(
+                            current >= existing
+                            for current, existing in zip(
+                                next_counts,
+                                existing_counts,
+                                strict=True,
+                            )
+                        )
+                    ]
+                    for existing_counts in dominated:
+                        del frontier[existing_counts]
+                    frontier[next_counts] = value
+        next_states = {
+            (candidate, counts): value
+            for candidate, frontier in next_by_candidate.items()
+            for counts, value in frontier.items()
+        }
+        if len(next_states) > MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES:
+            raise NoCompleteTimelinePath(
+                "descriptor requirement path exceeded its deterministic state budget",
+                reason_code="joint_descriptor_switch_requirement_state_budget_exhausted",
+                segment_index=right_row[0].segment_index,
+                rejection_counts={
+                    "joint_descriptor_switch_requirement_state_budget_exhausted": 1,
+                    "capacity_state_count": len(next_states),
+                    "capacity_state_limit": MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES,
+                    "proof_materialization_call_count": 0,
+                },
+            )
         states = next_states
         if not states:
             break
@@ -297,6 +373,8 @@ def build_joint_proposal_pool(
     *,
     source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
     source_switch_families: Mapping[str, str] | None = None,
+    fps: float = 29.97,
+    maximum_offset_frames: int = 8,
 ) -> JointProposalPool:
     lattice = workspace.candidates_by_segment
     if workspace.prescribed_source_ids is not None:
@@ -339,6 +417,8 @@ def build_joint_proposal_pool(
         lattice,
         source_switch_requirements,
         source_switch_families,
+        fps=fps,
+        maximum_offset_frames=maximum_offset_frames,
     )
     if requirement_path is None:
         return pool

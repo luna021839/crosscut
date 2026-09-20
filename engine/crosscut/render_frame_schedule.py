@@ -94,14 +94,27 @@ def render_frame_clock_from_probe(payload: dict) -> VerifiedRenderFrameClock | N
         return None
 
 
-def probe_render_frame_clock(path: Path, *, ffprobe: str = 'ffprobe') -> VerifiedRenderFrameClock | None:
+def probe_render_frame_clock(
+    path: Path,
+    *,
+    ffprobe: str = 'ffprobe',
+    timeout_seconds: float = 10.0,
+) -> VerifiedRenderFrameClock | None:
     """Inspect only a requested render source, without changing its media."""
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("frame-clock probe timeout must be positive and finite")
     try:
         before = path.stat()
         result = subprocess.run([ffprobe, '-v', 'error', '-select_streams', 'v:0',
             '-show_streams', '-show_packets', '-show_entries',
             'stream=codec_name,avg_frame_rate,r_frame_rate,time_base,start_time,nb_frames:packet=pts,duration',
-            '-of', 'json', str(path)], check=True, capture_output=True, timeout=10.)
+            '-of', 'json', str(path)], check=True, capture_output=True,
+            timeout=float(timeout_seconds))
         after = path.stat()
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             return None

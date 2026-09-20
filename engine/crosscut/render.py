@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import subprocess
 import tempfile
+from time import monotonic
 from typing import Callable, Iterable
 
 from .ive import AspectRatio
@@ -2684,15 +2685,38 @@ def render(
         or maximum_runtime_seconds <= 0
     ):
         raise ValueError("maximum_runtime_seconds must be positive and finite")
+    render_deadline = (
+        monotonic() + float(maximum_runtime_seconds)
+        if maximum_runtime_seconds is not None
+        else None
+    )
+
+    def remaining_runtime(stage: str) -> float | None:
+        if render_deadline is None:
+            return None
+        remaining = render_deadline - monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError(
+                "video render exceeded its bounded runtime during " + stage
+            )
+        return remaining
+
     source_clocks: dict[int, VerifiedRenderFrameClock] = {}
     if use_verified_frame_schedule:
         for index in sorted({segment.source_index for segment in plan.segments}):
+            probe_budget = remaining_runtime("source frame-clock probes")
             clock = probe_render_frame_clock(
                 plan.sources[index], ffprobe=str(Path(ffmpeg).with_name("ffprobe")),
+                timeout_seconds=(
+                    min(10.0, probe_budget)
+                    if probe_budget is not None
+                    else 10.0
+                ),
             )
             if clock is not None:
                 source_clocks[index] = clock
     filter_graph = build_filter_graph(plan, source_clocks=source_clocks)
+    remaining_runtime("filter graph construction")
     plan.output.parent.mkdir(parents=True, exist_ok=True)
     # Keep the temporary output on the destination volume so the final replace
     # is atomic even when the user renders to an external SSD.
@@ -2772,22 +2796,15 @@ def render(
                 )
             )
             try:
-                if progress_callback is None:
-                    completed = subprocess.run(
-                        command,
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=maximum_runtime_seconds,
-                    )
-                else:
-                    from .render_process import run_observed_render
-                    completed = run_observed_render(
-                        command,
-                        stderr_path=root/'encoder-stderr.log',
-                        progress_callback=progress_callback,
-                        timeout_seconds=maximum_runtime_seconds,
-                    )
+                from .render_process import run_observed_render
+                completed = run_observed_render(
+                    command,
+                    stderr_path=root/'encoder-stderr.log',
+                    progress_callback=(progress_callback or (lambda _event: None)),
+                    timeout_seconds=remaining_runtime(
+                        f"{codec} encoder attempt"
+                    ),
+                )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     "video render exceeded its bounded runtime: "

@@ -235,6 +235,35 @@ class JointProposalDomainTests(TestCase):
             self.assertIn(BoundaryMeasurementKey.from_candidates(
                 boundary, left, right), domain)
 
+    def test_requirement_covering_path_uses_the_exact_output_frame_offset_domain(self):
+        lattice = tuple(tuple(
+            candidate(i, source, .95 if source == 'A' else .45)
+            for source in ('A', 'B')) for i in range(4))
+        workspace = VisualTimelineOptimizerWorkspace(lattice, 'a' * 64)
+        requirement = SourceSwitchRequirement(1.02, 1.05, 1)
+        self.assertFalse(requirement.contains(1.0))
+
+        pool = build_joint_proposal_pool(
+            workspace,
+            source_switch_requirements=(requirement,),
+            source_switch_families={'A': 'A', 'B': 'B'},
+            fps=30.0,
+            maximum_offset_frames=8,
+        )
+
+        path = pool.paths[0]
+        self.assertEqual(pool.cadence_profiles[0], 'section_switch_requirement')
+        self.assertTrue(any(
+            left.source_id != right.source_id
+            and any(
+                requirement.contains(
+                    round(right.start_seconds * 30.0 + offset) / 30.0
+                )
+                for offset in range(-8, 9)
+            )
+            for left, right in zip(path, path[1:])
+        ))
+
     def test_local_failure_opens_boundary_then_adjacent_detours_only(self):
         lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(6))
         pool = JointProposalPool((tuple(row[0] for row in lattice),), ('balanced',), 45, lattice)

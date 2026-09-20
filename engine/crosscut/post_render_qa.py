@@ -55,6 +55,11 @@ from .joint_release_policy import (
 from .stage_edit_release_policy import (
     stage_edit_release_binding_valid, stage_edit_release_policy_payload,
 )
+from .review_first_selection_contract import (
+    REVIEW_FIRST_RELEASE_CANDIDATE_COUNT,
+    review_first_release_binding_valid,
+    review_first_release_policy_payload,
+)
 from .render import (
     BoundaryLookKeyframe,
     BoundaryLookTrack,
@@ -2102,6 +2107,8 @@ def _validate_selection(
     selection: Mapping[str, Any],
     config: PostRenderQAConfig,
     collector: _IssueCollector,
+    *,
+    allow_failed_review: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     required = config.required_complete_candidate_count
     final_review = _mapping(selection.get("final_selected_review")) or {}
@@ -2129,7 +2136,11 @@ def _validate_selection(
         plan_transitions,
     )
     checks = {
-        "selection_passed": selection.get("passed") is True,
+        "selection_passed": (
+            isinstance(selection.get("passed"), bool)
+            if allow_failed_review
+            else selection.get("passed") is True
+        ),
         "requested_review_count": selection.get("requested_review_count") == required,
         "reviewed_candidate_count_field": (
             selection.get("reviewed_candidate_count") == required
@@ -2277,7 +2288,11 @@ def _validate_selection(
         and storage_policy.get("temporary_proxy_removed_after_each_review") is True
         and storage_policy.get("decoded_frames_persisted") is False
     )
-    checks["final_selected_review_passed"] = final_review.get("passed") is True
+    checks["final_selected_review_passed"] = (
+        isinstance(final_review.get("passed"), bool)
+        if allow_failed_review
+        else final_review.get("passed") is True
+    )
     checks["final_selected_decoded_review_contract_valid"] = (
         _decoded_candidate_review_contract_valid(
             final_review,
@@ -2310,7 +2325,8 @@ def _validate_selection(
     )
     if version == "original" and selected_entries:
         checks["original_final_review_matches_selected_candidate"] = (
-            selected_entries[0].get("passed") is True
+            isinstance(selected_entries[0].get("passed"), bool)
+            and selected_entries[0].get("passed") is final_review.get("passed")
             and selected_entries[0].get("review") == final_review
         )
     else:
@@ -7432,6 +7448,7 @@ def evaluate_post_render_qa(
     # an arbitrary serialized candidate count to weaken the decoded QA gates.
     render_payload = _mapping(analysis.get("render")) or {}
     release_policy = selection.get("release_policy")
+    review_first_release_active = False
     if release_policy is not None or render_payload.get("release_policy") is not None:
         if (
             release_policy == joint_release_policy_payload()
@@ -7445,20 +7462,34 @@ def evaluate_post_render_qa(
             )
         elif stage_edit_release_binding_valid(selection, render_payload):
             settings = replace(settings, required_complete_candidate_count=1)
+        elif review_first_release_binding_valid(selection, render_payload):
+            review_first_release_active = True
+            settings = replace(
+                settings,
+                required_complete_candidate_count=(
+                    REVIEW_FIRST_RELEASE_CANDIDATE_COUNT
+                ),
+            )
         else:
             collector.add(
                 "candidate_release_policy_mismatch", QAIssueSeverity.FAIL,
                 "Candidate release policy is invalid or differs across artifacts.",
                 path="selection.release_policy", value=release_policy,
                 threshold={"joint": joint_release_policy_payload(),
-                           "stage_edit": stage_edit_release_policy_payload()},
+                           "stage_edit": stage_edit_release_policy_payload(),
+                           "review_first": review_first_release_policy_payload()},
             )
 
     metrics["artifact_binding"] = _validate_artifact_binding(
         artifact_set, analysis, plan, selection, collector
     )
     selection_metrics, final_review = _validate_selection(
-        analysis, plan, selection, settings, collector
+        analysis,
+        plan,
+        selection,
+        settings,
+        collector,
+        allow_failed_review=review_first_release_active,
     )
     metrics["selection"] = selection_metrics
     metrics["plan_invariants"] = _validate_plan_invariants(

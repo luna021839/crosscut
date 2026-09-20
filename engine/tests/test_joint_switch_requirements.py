@@ -88,6 +88,42 @@ class JointSwitchRequirementsTests(TestCase):
         outside=counter.advance((0,),left='A',right='B',nominal_boundary_seconds=1.,frame_offset=4)
         self.assertEqual(inside,(1,));self.assertEqual(outside,(0,))
 
+    def test_one_frame_shift_can_make_an_otherwise_nominally_outside_cut_feasible(self):
+        rows=self.rows[:2]
+        requirement=SourceSwitchRequirement(1.02,1.05,1)
+        self.assertFalse(requirement.contains(rows[1][0].start_seconds))
+        result=select_joint_timeline_candidates(
+            rows,
+            option_provider=lambda key:option_set(key,authorized={1:0.}),
+            config=replace(isolated_score_config(),source_switch_bonus=0.),
+            maximum_results=1,
+            fps=30.,
+            source_switch_requirements=(requirement,),
+        )[0]
+        self.assertNotEqual(
+            result.timeline.candidates[0].source_id,
+            result.timeline.candidates[1].source_id,
+        )
+        self.assertEqual(result.boundary_options[0].frame_offset,1)
+
+    def test_one_boundary_cannot_satisfy_two_windows_with_different_offsets(self):
+        rows=self.rows[:2]
+        requirements=(
+            SourceSwitchRequirement(.95,.99,1),
+            SourceSwitchRequirement(1.01,1.05,1),
+        )
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            SourceSwitchCounter(
+                requirements,
+                rows,
+                fps=30.,
+                maximum_offset_frames=8,
+            )
+        self.assertEqual(
+            caught.exception.reason_code,
+            'section_source_switch_capacity_insufficient',
+        )
+
     def test_exact_section_edge_does_not_count_as_two_overlapping_runs(self):
         window=SourceSwitchRequirement(1.,2.,1)
         self.assertFalse(window.contains(1.));self.assertFalse(window.contains(2.))

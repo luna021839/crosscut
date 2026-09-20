@@ -3008,7 +3008,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         self.assertEqual(second["distinct_exact_path_count"], 2)
         self.assertFalse(second["aggregate_aesthetic_failure_used"])
 
-    def test_joint_final_cohort_caps_two_variants_per_path(self) -> None:
+    def test_joint_final_delivery_selects_the_best_passing_variant(self) -> None:
         bundles = []
         reviews = []
         path_names = ("a", "a", "a", "b", "b", "c", "c", "d", "d")
@@ -3036,15 +3036,19 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             for bundle, _review in cohort
         ]
 
-        self.assertEqual(len(cohort), 8)
-        self.assertGreaterEqual(len(set(paths)), 4)
-        self.assertLessEqual(max(paths.count(path) for path in set(paths)), 2)
-        self.assertNotIn(2, [bundle.candidate_index for bundle, _ in cohort])
+        self.assertEqual(len(cohort), 1)
+        self.assertEqual(len(set(paths)), 1)
+        self.assertEqual(
+            [bundle.candidate_index for bundle, _ in cohort],
+            [0],
+        )
 
     def test_joint_proof_accounting_is_bounded_by_remaining_session_budget(
         self,
     ) -> None:
         selection_set = Mock(spec=JointVisualSelectionSet)
+        selection_set.minimum_required_candidates = 1
+        selection_set.candidate_records = tuple(range(8))
         selection_set.selection_retry_audit = {
             "proof_materialization_call_count": 12
         }
@@ -3731,6 +3735,8 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         selection_sets = []
         for _batch_index in range(2):
             selection_set = Mock(spec=JointVisualSelectionSet)
+            selection_set.minimum_required_candidates = 1
+            selection_set.candidate_records = tuple(range(8))
             selection_set.selection_retry_audit = {
                 "proof_materialization_call_count": 8
             }
@@ -3929,12 +3935,12 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             decoded_budget.remaining_look_refinement_render_count,
             0,
         )
-        self.assertEqual(len(cohort), 8)
+        self.assertEqual(len(cohort), 1)
         cohort_paths = {
             _exact_source_shot_path(bundle)
             for bundle, _review in cohort
         }
-        self.assertGreaterEqual(len(cohort_paths), 4)
+        self.assertEqual(len(cohort_paths), 1)
 
     def test_pipeline_joint_selector_forwards_closed_loop_feedback(self) -> None:
         tree = ast.parse(Path(pipeline_module.__file__).read_text(encoding="utf-8"))
