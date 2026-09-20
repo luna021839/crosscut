@@ -2848,6 +2848,7 @@ def render_and_review_proxy(
     geometry_provider: GeometryProvider | None = None,
     ffmpeg: str = "ffmpeg",
     video_codec: str = "libx264",
+    maximum_runtime_seconds: float | None = None,
     professional_reference_profile: (
         "ProfessionalReferenceProfile | Path | None"
     ) = None,
@@ -2855,6 +2856,11 @@ def render_and_review_proxy(
     """Render a 480p derivative with production FFmpeg logic, then review it."""
 
     proxy_plan = derive_proxy_render_plan(plan, proxy_output)
+    runtime_arguments = (
+        {"maximum_runtime_seconds": maximum_runtime_seconds}
+        if maximum_runtime_seconds is not None
+        else {}
+    )
     codec = render(
         proxy_plan,
         ffmpeg=ffmpeg,
@@ -2863,6 +2869,7 @@ def render_and_review_proxy(
         video_maxrate="12M",
         video_buffer_size="16M",
         audio_bitrate="128k",
+        **runtime_arguments,
     )
     review = review_rendered_proxy(
         proxy_plan,

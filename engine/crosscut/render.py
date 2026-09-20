@@ -2665,6 +2665,7 @@ def render(
     audio_bitrate: str = "320k",
     use_verified_frame_schedule: bool = True,
     progress_callback: Callable[[dict], None] | None = None,
+    maximum_runtime_seconds: float | None = None,
 ) -> str:
     for label, value in (
         ("video_bitrate", video_bitrate),
@@ -2676,6 +2677,13 @@ def render(
             raise ValueError(f"{label} must be a non-empty FFmpeg rate")
     if not isinstance(use_verified_frame_schedule, bool):
         raise TypeError("frame schedule mode must be a boolean")
+    if maximum_runtime_seconds is not None and (
+        isinstance(maximum_runtime_seconds, bool)
+        or not isinstance(maximum_runtime_seconds, (int, float))
+        or not math.isfinite(float(maximum_runtime_seconds))
+        or maximum_runtime_seconds <= 0
+    ):
+        raise ValueError("maximum_runtime_seconds must be positive and finite")
     source_clocks: dict[int, VerifiedRenderFrameClock] = {}
     if use_verified_frame_schedule:
         for index in sorted({segment.source_index for segment in plan.segments}):
@@ -2763,12 +2771,28 @@ def render(
                     str(temporary_output),
                 )
             )
-            if progress_callback is None:
-                completed = subprocess.run(command,check=False,capture_output=True,text=True)
-            else:
-                from .render_process import run_observed_render
-                completed = run_observed_render(command,stderr_path=root/'encoder-stderr.log',
-                    progress_callback=progress_callback)
+            try:
+                if progress_callback is None:
+                    completed = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=maximum_runtime_seconds,
+                    )
+                else:
+                    from .render_process import run_observed_render
+                    completed = run_observed_render(
+                        command,
+                        stderr_path=root/'encoder-stderr.log',
+                        progress_callback=progress_callback,
+                        timeout_seconds=maximum_runtime_seconds,
+                    )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "video render exceeded its bounded runtime: "
+                    f"{maximum_runtime_seconds} seconds"
+                ) from exc
             if completed.returncode == 0:
                 temporary_output.replace(plan.output)
                 clock_evidence.replace(plan.output.with_suffix(plan.output.suffix + ".frame-clock.json"))

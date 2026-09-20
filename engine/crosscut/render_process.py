@@ -1,13 +1,44 @@
 """Observe actual FFmpeg output progress without buffering stderr in memory."""
 from pathlib import Path
 import subprocess
+import threading
 
 
-def run_observed_render(command, *, stderr_path: Path, progress_callback):
+def run_observed_render(
+    command,
+    *,
+    stderr_path: Path,
+    progress_callback,
+    timeout_seconds: float | None = None,
+):
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("render timeout_seconds must be positive")
     command=list(command)
     command[1:1]=['-progress','pipe:1','-nostats']
     with stderr_path.open('w+b') as errors:
         process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=errors,text=True)
+        timed_out = threading.Event()
+        timer = None
+        if timeout_seconds is not None:
+            def stop_timed_out_render() -> None:
+                timed_out.set()
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+
+            timer = threading.Timer(
+                float(timeout_seconds),
+                stop_timed_out_render,
+            )
+            timer.daemon = True
+            timer.start()
         try:
             record={}
             assert process.stdout is not None
@@ -25,6 +56,8 @@ def run_observed_render(command, *, stderr_path: Path, progress_callback):
                     progress_callback(payload)
                     record={}
             code=process.wait()
+            if timed_out.is_set():
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
         except BaseException:
             # A cancelled observation must not leave its renderer orphaned.
             if process.poll() is None:
@@ -33,6 +66,8 @@ def run_observed_render(command, *, stderr_path: Path, progress_callback):
                 except subprocess.TimeoutExpired:process.kill();process.wait()
             raise
         finally:
+            if timer is not None:
+                timer.cancel()
             if process.stdout is not None:process.stdout.close()
         errors.flush();errors.seek(0,2);size=errors.tell()
         errors.seek(max(0,size-65536))

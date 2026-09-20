@@ -7,9 +7,12 @@ The search is not claimed to find the exhaustive graph's global optimum.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Sequence
+import math
+from time import monotonic
+from typing import Any, Callable, Mapping, Sequence
 
 from .joint_timeline import BoundaryMeasurementKey
+from .joint_switch_requirements import SourceSwitchRequirement
 from .timeline import NoCompleteTimelinePath, TimelineCandidate, TimelineConfig, TimelineResult, select_timeline_candidates
 from .visual_score import VisualTimelineOptimizerWorkspace, _safe_cadence_profiles, _role_conditioned_visual_controls
 
@@ -91,6 +94,10 @@ class JointProposalPool:
             "canonical_spans": [[c.segment_index, c.start_seconds, c.end_seconds] for c in self.paths[0]],
             "proposal_source_paths": [list(c.source_id for c in path) for path in self.paths],
             "cadence_profiles": list(self.cadence_profiles),
+            "requirement_covering_path_count": sum(
+                profile == "section_switch_requirement"
+                for profile in self.cadence_profiles
+            ),
             "full_boundary_pair_count": self.full_boundary_pair_count,
             "source_continuations_included": bool(self.candidate_lattice),
             "warm_start_proposal_count": len(self.warm_start_paths),
@@ -208,7 +215,89 @@ def proposal_only_config(config: TimelineConfig) -> TimelineConfig:
     )
 
 
-def build_joint_proposal_pool(workspace: VisualTimelineOptimizerWorkspace) -> JointProposalPool:
+def _requirement_covering_path(
+    lattice: Sequence[Sequence[TimelineCandidate]],
+    requirements: Sequence[SourceSwitchRequirement],
+    source_families: Mapping[str, str] | None,
+) -> tuple[TimelineCandidate, ...] | None:
+    """Return one connected descriptor path satisfying section switch floors."""
+
+    windows = tuple(requirements)
+    if not windows:
+        return None
+    families = dict(source_families or {})
+
+    def different(left: str, right: str) -> bool:
+        return families.get(left, left) != families.get(right, right)
+
+    def emission(candidate: TimelineCandidate) -> float:
+        return (
+            candidate.quality_score
+            + candidate.sync_score
+            + candidate.composition_score
+            + candidate.boundary_score
+        )
+
+    initial_counts = (0,) * len(windows)
+    states: dict[
+        tuple[TimelineCandidate, tuple[int, ...]],
+        tuple[float, tuple[TimelineCandidate, ...]],
+    ] = {
+        (candidate, initial_counts): (emission(candidate), (candidate,))
+        for candidate in lattice[0]
+    }
+    for right_row in lattice[1:]:
+        next_states: dict[
+            tuple[TimelineCandidate, tuple[int, ...]],
+            tuple[float, tuple[TimelineCandidate, ...]],
+        ] = {}
+        for (left, counts), (score, path) in states.items():
+            for right in right_row:
+                switched = different(left.source_id, right.source_id)
+                next_counts = tuple(
+                    min(
+                        window.minimum_count,
+                        count
+                        + int(switched and window.contains(right.start_seconds)),
+                    )
+                    for window, count in zip(windows, counts, strict=True)
+                )
+                next_score = score + emission(right) - (0.02 if switched else 0.0)
+                key = (right, next_counts)
+                previous = next_states.get(key)
+                if previous is None or next_score > previous[0]:
+                    next_states[key] = (next_score, path + (right,))
+        states = next_states
+        if not states:
+            break
+    eligible = [
+        value
+        for (_candidate, counts), value in states.items()
+        if all(
+            count >= window.minimum_count
+            for count, window in zip(counts, windows, strict=True)
+        )
+    ]
+    if not eligible:
+        raise NoCompleteTimelinePath(
+            "descriptor proposal graph has no connected path satisfying "
+            "section source-switch requirements",
+            reason_code="joint_descriptor_switch_requirement_unreachable",
+            segment_index=lattice[-1][0].segment_index,
+            rejection_counts={
+                "joint_descriptor_switch_requirement_unreachable": 1,
+                "proof_materialization_call_count": 0,
+            },
+        )
+    return max(eligible, key=lambda item: item[0])[1]
+
+
+def build_joint_proposal_pool(
+    workspace: VisualTimelineOptimizerWorkspace,
+    *,
+    source_switch_requirements: Sequence[SourceSwitchRequirement] = (),
+    source_switch_families: Mapping[str, str] | None = None,
+) -> JointProposalPool:
     lattice = workspace.candidates_by_segment
     if workspace.prescribed_source_ids is not None:
         lattice = tuple(tuple(c for c in row if c.source_id == source_id)
@@ -241,7 +330,40 @@ def build_joint_proposal_pool(workspace: VisualTimelineOptimizerWorkspace) -> Jo
         raise NoCompleteTimelinePath("descriptor proposal cadence graph is empty",
             reason_code="joint_descriptor_proposal_pool_empty", profile_failures=failures)
     profiles, results = zip(*interleaved)
-    return proposal_pool_from_results(workspace.candidates_by_segment, results, profiles)
+    pool = proposal_pool_from_results(
+        workspace.candidates_by_segment,
+        results,
+        profiles,
+    )
+    requirement_path = _requirement_covering_path(
+        lattice,
+        source_switch_requirements,
+        source_switch_families,
+    )
+    if requirement_path is None:
+        return pool
+    if requirement_path in pool.paths:
+        matched_index = pool.paths.index(requirement_path)
+        retained_paths = (requirement_path,) + tuple(
+            path
+            for index, path in enumerate(pool.paths)
+            if index != matched_index
+        )
+        retained_profiles = ("section_switch_requirement",) + tuple(
+            profile
+            for index, profile in enumerate(pool.cadence_profiles)
+            if index != matched_index
+        )
+    else:
+        retained_paths = (requirement_path,) + pool.paths
+        retained_profiles = (
+            "section_switch_requirement",
+        ) + pool.cadence_profiles
+    return replace(
+        pool,
+        paths=retained_paths[: PROPOSAL_PATH_LIMITS[-1]],
+        cadence_profiles=retained_profiles[: PROPOSAL_PATH_LIMITS[-1]],
+    )
 
 
 def select_with_joint_proposal_domains(
@@ -250,10 +372,35 @@ def select_with_joint_proposal_domains(
     maximum_proof_calls: int,
     select: Callable[..., Any],
     report: Callable[[dict[str, Any]], None] | None = None,
+    deadline_monotonic_seconds: float | None = None,
+    clock: Callable[[], float] = monotonic,
 ) -> Any:
     """Proposal sizes and pair-budgeted local detours share one proof budget."""
     if isinstance(maximum_proof_calls, bool) or not isinstance(maximum_proof_calls, int) or maximum_proof_calls < 1:
         raise ValueError("proposal selection needs a positive proof budget")
+    if deadline_monotonic_seconds is not None and (
+        isinstance(deadline_monotonic_seconds, bool)
+        or not isinstance(deadline_monotonic_seconds, (int, float))
+        or not math.isfinite(float(deadline_monotonic_seconds))
+    ):
+        raise ValueError("proposal selection deadline must be finite")
+    if not callable(clock):
+        raise TypeError("proposal selection clock must be callable")
+
+    def require_wall_clock_budget() -> None:
+        if (
+            deadline_monotonic_seconds is not None
+            and float(clock()) >= float(deadline_monotonic_seconds)
+        ):
+            raise NoCompleteTimelinePath(
+                "joint proposal selection exceeded its wall-clock budget",
+                reason_code="joint_proposal_wall_clock_budget_exhausted",
+                rejection_counts={
+                    "joint_proposal_wall_clock_budget_exhausted": 1,
+                    "proof_materialization_call_count": charged,
+                },
+            )
+
     charged = 0
     events: list[dict[str, Any]] = []
     seen_domains = set()
@@ -264,6 +411,7 @@ def select_with_joint_proposal_domains(
     limits = ((0,) + PROPOSAL_PATH_LIMITS) if pool.warm_start_paths else PROPOSAL_PATH_LIMITS
     last_failure = None
     while limit_index < len(limits):
+        require_wall_clock_budget()
         limit = limits[limit_index]
         domain = pool.domain(limit) | extra_domain
         if domain in seen_domains:
@@ -289,6 +437,8 @@ def select_with_joint_proposal_domains(
         try:
             result = select(boundary_search_domain=domain, maximum_proof_materialization_calls=remaining)
         except NoCompleteTimelinePath as exc:
+            if exc.reason_code == "joint_proposal_wall_clock_budget_exhausted":
+                raise
             used = exc.rejection_counts.get("proof_materialization_call_count", 0)
             if isinstance(used, bool) or not isinstance(used, int) or not 0 <= used <= remaining:
                 raise RuntimeError("failed proposal selection lost its proof budget") from exc
@@ -325,6 +475,7 @@ def select_with_joint_proposal_domains(
             else:
                 limit_index += 1
             continue
+        require_wall_clock_budget()
         audit = dict(result.selection_retry_audit)
         used = audit.get("proof_materialization_call_count")
         if isinstance(used, bool) or not isinstance(used, int) or not 0 <= used <= remaining:

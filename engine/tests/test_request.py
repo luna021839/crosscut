@@ -9,6 +9,42 @@ from crosscut.request import AnalysisRequest, MemberAnchorRequest
 
 
 class RequestTests(unittest.TestCase):
+    def test_app_json_defaults_review_first_on_and_round_trips_override(self) -> None:
+        automatic = AnalysisRequest.from_dict(
+            {
+                "song": "ATTITUDE",
+                "edit_mode": "group",
+                "aspect_ratio": "16:9",
+                "source_mode": "automatic",
+                "sources": [],
+            }
+        )
+        self.assertTrue(automatic.review_first_enabled)
+        self.assertTrue(automatic.as_dict()["review_first_enabled"])
+
+        strict = AnalysisRequest.from_dict(
+            {
+                "song": "ATTITUDE",
+                "edit_mode": "group",
+                "aspect_ratio": "16:9",
+                "source_mode": "automatic",
+                "sources": [],
+                "review_first_enabled": False,
+            }
+        )
+        self.assertFalse(strict.review_first_enabled)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            AnalysisRequest.from_dict(
+                {
+                    "song": "ATTITUDE",
+                    "edit_mode": "group",
+                    "aspect_ratio": "16:9",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "review_first_enabled": "yes",
+                }
+            )
+
     def test_automatic_member_render_range_round_trips_and_materializes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

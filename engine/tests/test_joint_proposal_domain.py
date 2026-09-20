@@ -7,6 +7,7 @@ from crosscut.joint_proposal_domain import (
     add_local_proposal_detour,
     local_proposal_added_pair_budget,
 )
+from crosscut.joint_switch_requirements import SourceSwitchRequirement
 from crosscut.joint_timeline import BoundaryMeasurementKey, select_joint_timeline_candidates
 from crosscut.timeline import NoCompleteTimelinePath, TimelineChoice, TimelineMode, TimelineResult
 from crosscut.visual_score import VisualTimelineOptimizerWorkspace, VisualDiversityConfig, _safe_cadence_profiles
@@ -111,6 +112,28 @@ class JointProposalDomainTests(TestCase):
             select_with_joint_proposal_domains(pool, maximum_proof_calls=4, select=select)
         self.assertEqual(len(calls), 1)
 
+    def test_wall_clock_deadline_stops_domain_retries(self):
+        _, pool = pool_fixture()
+        now = [10.0]
+        calls = []
+        def select(**kwargs):
+            calls.append(kwargs)
+            now[0] = 12.0
+            return Result({'proof_materialization_call_count': 0})
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_with_joint_proposal_domains(
+                pool,
+                maximum_proof_calls=4,
+                select=select,
+                deadline_monotonic_seconds=11.0,
+                clock=lambda: now[0],
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            caught.exception.reason_code,
+            'joint_proposal_wall_clock_budget_exhausted',
+        )
+
     def test_proposals_must_cover_every_original_segment(self):
         lattice, _ = pool_fixture()
         def result(path):
@@ -188,6 +211,29 @@ class JointProposalDomainTests(TestCase):
         self.assertTrue(all(len(path) == len(lattice) for path in pool.paths))
         continuation_count = (len(lattice) - 1) * len(lattice[0])
         self.assertLessEqual(len(pool.domain(3)), 3 * (len(lattice) - 1) + continuation_count)
+
+    def test_requirement_covering_path_is_in_initial_proposal_domain(self):
+        lattice = tuple(tuple(
+            candidate(i, source, .95 if source == 'A' else .45)
+            for source in ('A', 'B')) for i in range(5))
+        workspace = VisualTimelineOptimizerWorkspace(lattice, 'a' * 64)
+        requirement = SourceSwitchRequirement(0., 5., 2)
+        pool = build_joint_proposal_pool(
+            workspace,
+            source_switch_requirements=(requirement,),
+            source_switch_families={'A': 'A', 'B': 'B'},
+        )
+        self.assertEqual(pool.cadence_profiles[0],
+                         'section_switch_requirement')
+        path = pool.paths[0]
+        self.assertGreaterEqual(sum(
+            left.source_id != right.source_id
+            and requirement.contains(right.start_seconds)
+            for left, right in zip(path, path[1:])), 2)
+        domain = pool.domain(3)
+        for boundary, (left, right) in enumerate(zip(path, path[1:])):
+            self.assertIn(BoundaryMeasurementKey.from_candidates(
+                boundary, left, right), domain)
 
     def test_local_failure_opens_boundary_then_adjacent_detours_only(self):
         lattice = tuple(tuple(candidate(i, str(s), .5) for s in range(3)) for i in range(6))

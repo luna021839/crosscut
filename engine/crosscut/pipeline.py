@@ -207,6 +207,11 @@ from .request import (
     MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT,
     MINIMUM_AUTOMATIC_SOURCE_COUNT,
 )
+from .review_first_runtime import (
+    ReviewFirstRuntime,
+    ReviewFirstStatus,
+    classify_review_first_qa,
+)
 from .rendered_candidate_selection import (
     RenderedCandidate,
     RenderedCandidateRankMetadata,
@@ -4894,7 +4899,20 @@ def _complete_automatic_stage_edit_post_render_qa(
         and report_stable_through_promotion
     )
     effective_passed = bool(report.passed and promotion_binding_passed)
-    delivery_gate_verdict = "PASS" if effective_passed else "FAIL"
+    request_payload = manifest.get("request")
+    review_first_enabled = bool(
+        isinstance(request_payload, Mapping)
+        and request_payload.get("review_first_enabled") is True
+    )
+    qa_disposition = classify_review_first_qa(
+        {**report_payload, "passed": bool(report.passed)},
+        content_binding_passed=promotion_binding_passed,
+        review_first_enabled=review_first_enabled,
+        member=False,
+    )
+    delivery_gate_verdict = (
+        "PASS" if effective_passed else qa_disposition.status.value
+    )
     delivery_materialization: dict[str, Any] = {
         "contract": "post_render_qa_verified_snapshot_materialization_v1",
         "performed": False,
@@ -5004,6 +5022,7 @@ def _complete_automatic_stage_edit_post_render_qa(
         "report_path": report_audit_path,
         "verdict": report.verdict.value,
         "passed": effective_passed,
+        "review_first_disposition": qa_disposition.to_dict(),
         "delivery_gate_verdict": delivery_gate_verdict,
         "report_verdict": report.verdict.value,
         "report_passed": report.passed,
@@ -5017,7 +5036,9 @@ def _complete_automatic_stage_edit_post_render_qa(
             "final_mp4_preserved": True,
             "qa_report_preserved": True,
             "analysis_manifest_preserved": True,
-            "app_result_exposure_blocked": not effective_passed,
+            "app_result_exposure_blocked": (
+                not qa_disposition.video_output_exposed
+            ),
         },
         "promotion_binding": promotion_binding,
     }
@@ -5025,11 +5046,13 @@ def _complete_automatic_stage_edit_post_render_qa(
     # including a fallback full video copy, has been removed. The outer
     # ``finally`` repeats this idempotently for evaluator and promotion errors.
     cleanup_post_render_qa_snapshot(evaluation_snapshot)
-    final_role = "delivery" if effective_passed else "rejected"
+    final_role = qa_disposition.artifact_role
     exposure = {
         "contract": APP_RESULT_EXPOSURE_CONTRACT,
-        "video_output_exposed": effective_passed,
-        "delivery_completion_message_allowed": effective_passed,
+        "video_output_exposed": qa_disposition.video_output_exposed,
+        "delivery_completion_message_allowed": (
+            qa_disposition.delivery_completion_message_allowed
+        ),
     }
     if (
         not in_memory_manifest_matches_evaluated_analysis
@@ -5040,6 +5063,9 @@ def _complete_automatic_stage_edit_post_render_qa(
     manifest["artifact_role"] = final_role
     manifest["app_result_exposure"] = dict(exposure)
     manifest["post_render_qa"] = dict(provenance)
+    review_runtime_payload = manifest.get("review_first_runtime")
+    if isinstance(review_runtime_payload, dict):
+        review_runtime_payload["status"] = qa_disposition.status.value
     render_payload = manifest.get("render")
     if isinstance(render_payload, dict):
         render_payload["artifact_role"] = final_role
@@ -5053,7 +5079,12 @@ def _complete_automatic_stage_edit_post_render_qa(
         "IVE GROUP 최종 후처리 QA "
         f"{report.verdict.value} · 보고서 {report_audit_path}"
     )
-    if not effective_passed:
+    if qa_disposition.status is ReviewFirstStatus.REVIEW_READY:
+        reporter.log(
+            "IVE GROUP 최종 파일은 기술 무결성을 유지했으나 "
+            "편집 품질 QA는 통과하지 못해 검토본으로 공개합니다."
+        )
+    elif not effective_passed:
         failure_reason = (
             f"post-render QA verdict {report.verdict.value}"
             if not report.passed
@@ -5152,11 +5183,22 @@ def _enforce_automatic_member_post_render_qa(
         == pre_exposure_fingerprints
     )
     effective_passed = bool(report.passed and content_binding_passed)
-    final_role = "delivery" if effective_passed else "rejected"
+    qa_disposition = classify_review_first_qa(
+        {**report_payload, "passed": bool(report.passed)},
+        content_binding_passed=content_binding_passed,
+        review_first_enabled=(
+            isinstance(request_payload, Mapping)
+            and request_payload.get("review_first_enabled") is True
+        ),
+        member=True,
+    )
+    final_role = qa_disposition.artifact_role
     final_exposure = {
         "contract": AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
-        "video_output_exposed": effective_passed,
-        "delivery_completion_message_allowed": effective_passed,
+        "video_output_exposed": qa_disposition.video_output_exposed,
+        "delivery_completion_message_allowed": (
+            qa_disposition.delivery_completion_message_allowed
+        ),
     }
     provenance = {
         "contract": AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
@@ -5170,6 +5212,7 @@ def _enforce_automatic_member_post_render_qa(
         "report_passed": report.passed,
         "content_binding_passed": content_binding_passed,
         "passed": effective_passed,
+        "review_first_disposition": qa_disposition.to_dict(),
         "issue_count": report_payload.get("issue_count"),
         "input_artifact_fingerprints": dict(
             report.input_artifact_fingerprints
@@ -5180,12 +5223,17 @@ def _enforce_automatic_member_post_render_qa(
             "final_mp4_preserved": True,
             "qa_report_preserved": True,
             "analysis_manifest_preserved": True,
-            "app_result_exposure_blocked": not effective_passed,
+            "app_result_exposure_blocked": (
+                not qa_disposition.video_output_exposed
+            ),
         },
     }
     manifest["artifact_role"] = final_role
     manifest["app_result_exposure"] = dict(final_exposure)
     manifest["post_render_qa"] = dict(provenance)
+    review_runtime_payload = manifest.get("review_first_runtime")
+    if isinstance(review_runtime_payload, dict):
+        review_runtime_payload["status"] = qa_disposition.status.value
     mutable_render = manifest.get("render")
     if isinstance(mutable_render, dict):
         mutable_render["artifact_role"] = final_role
@@ -5196,7 +5244,12 @@ def _enforce_automatic_member_post_render_qa(
         "IVE MEMBER 최종 후처리 QA "
         f"{report.verdict} · 보고서 {Path(report_path).resolve()}"
     )
-    if not effective_passed:
+    if qa_disposition.status is ReviewFirstStatus.REVIEW_READY:
+        reporter.log(
+            "IVE MEMBER 최종 파일은 기술 무결성을 유지했으나 "
+            "편집 품질 QA는 통과하지 못해 검토본으로 공개합니다."
+        )
+    elif not effective_passed:
         reason = (
             f"verdict {report.verdict}"
             if not report.passed
@@ -5845,6 +5898,7 @@ def _require_reviewed_automatic_group_timeline(
         request.edit_mode is not EditMode.GROUP
         or request.source_mode is not SourceMode.AUTOMATIC
         or allow_failed_comparison_render
+        or bool(getattr(request, "review_first_enabled", False))
     ):
         return
     if visual_timeline is None:
@@ -26627,27 +26681,44 @@ def _enforce_automatic_group_stage_edit_requirement(
         "stage_edit_generation_checkpoint_directory",
         None,
     )
+    review_first_enabled = bool(
+        getattr(request, "review_first_enabled", False)
+    )
     if registered_bundle is not None:
         return {
             "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
             "mode": "registered_stage_edit_production",
             "transformer_authority": True,
-            "candidate_pool": "registered_stage_edit_generation",
-            "decoded_proxy_candidate_count_required": 8,
+            "candidate_pool": (
+                "registered_stage_edit_review_first"
+                if review_first_enabled
+                else "registered_stage_edit_generation"
+            ),
+            "decoded_proxy_candidate_count_required": (
+                1 if review_first_enabled else 8
+            ),
             "decoded_proxy_review_required": True,
             "final_post_render_qa_required": True,
             "silent_fallback_allowed": False,
+            "review_first_enabled": review_first_enabled,
         }
     if explicit_checkpoint is not None:
         return {
             "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
             "mode": "explicit_stage_edit_request",
             "transformer_authority": True,
-            "candidate_pool": "explicit_stage_edit_generation",
-            "decoded_proxy_candidate_count_required": 8,
+            "candidate_pool": (
+                "explicit_stage_edit_review_first"
+                if review_first_enabled
+                else "explicit_stage_edit_generation"
+            ),
+            "decoded_proxy_candidate_count_required": (
+                1 if review_first_enabled else 8
+            ),
             "decoded_proxy_review_required": True,
             "final_post_render_qa_required": True,
             "silent_fallback_allowed": False,
+            "review_first_enabled": review_first_enabled,
         }
     if not review_rendered_proxies:
         raise RuntimeError(
@@ -26659,12 +26730,21 @@ def _enforce_automatic_group_stage_edit_requirement(
         "mode": "deterministic_professional_visual",
         "transformer_authority": False,
         "transformer_status": "inactive_no_verified_production_bundle",
-        "candidate_pool": "joint_decoded_visual_selector",
-        "joint_decoded_visual_candidate_is_primary_not_fallback": True,
-        "decoded_proxy_candidate_count_required": 8,
+        "candidate_pool": (
+            "bounded_review_first_visual_selector"
+            if review_first_enabled
+            else "joint_decoded_visual_selector"
+        ),
+        "joint_decoded_visual_candidate_is_primary_not_fallback": (
+            not review_first_enabled
+        ),
+        "decoded_proxy_candidate_count_required": (
+            1 if review_first_enabled else 8
+        ),
         "decoded_proxy_review_required": True,
         "final_post_render_qa_required": True,
         "silent_fallback_allowed": False,
+        "review_first_enabled": review_first_enabled,
     }
 
 
@@ -26682,6 +26762,9 @@ def analyze(
         raise TypeError("allow_failed_comparison_render must be a boolean")
     if not isinstance(review_rendered_proxies, bool):
         raise TypeError("review_rendered_proxies must be a boolean")
+    review_first_runtime = ReviewFirstRuntime(
+        enabled=bool(getattr(request, "review_first_enabled", False))
+    )
     if acquisition_identity_authority is not None and not (
         request.source_mode is SourceMode.AUTOMATIC
         and request.edit_mode is EditMode.MEMBER
@@ -27336,6 +27419,10 @@ def analyze(
     crop_aware_candidate_rerank_result: (
         CropAwareCandidateRerankResult | None
     ) = None
+    review_first_visual_selection_payload: dict[str, Any] | None = None
+    review_first_stage_edit_materialized: (
+        StageEditMaterializedVisualCandidate | None
+    ) = None
     stage_edit_inference_snapshot_result: (
         StageEditInferenceSnapshotResult | None
     ) = None
@@ -27847,6 +27934,18 @@ def analyze(
                 is not None
                 else section_plan
             )
+            def report_visual_selection_progress(
+                completed: int,
+                total: int,
+            ) -> None:
+                review_first_runtime.require_first_render_budget(
+                    "full_song_visual_selection"
+                )
+                reporter.progress(
+                    0.96 + 0.018 * completed / max(1, total),
+                    f"컷 전후 대형을 비교하는 중… {completed}/{total}",
+                )
+
             visual_builder_arguments = {
                 "sources": tuple(
                     request.sources[index] for index in eligible_indices
@@ -27874,10 +27973,7 @@ def analyze(
                 "professional_montage_selection_policy": (
                     visual_montage_selection_policy
                 ),
-                "progress_callback": lambda completed, total: reporter.progress(
-                    0.96 + 0.018 * completed / max(1, total),
-                    f"컷 전후 대형을 비교하는 중… {completed}/{total}",
-                ),
+                "progress_callback": report_visual_selection_progress,
             }
             visual_candidate_checkpoint_input_identity: dict[str, Any] | None = (
                 None
@@ -27887,6 +27983,7 @@ def analyze(
             if (
                 request.source_mode is SourceMode.AUTOMATIC
                 and review_rendered_proxies
+                and not bool(getattr(request, "review_first_enabled", False))
             ):
                 if stage_edit_generation_result is not None:
                     reporter.status(
@@ -28107,24 +28204,6 @@ def analyze(
                             "joint visual selection could not recover its "
                             "transient optimizer workspace"
                         )
-                    reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
-                    joint_proposal_pool = build_joint_proposal_pool(workspace)
-                    if visual_candidate_checkpoint_input_identity is not None:
-                        from .joint_proposal_checkpoint import find_joint_proposal_restart
-                        joint_proposal_restart = find_joint_proposal_restart(
-                            request.output_directory,
-                            expected_input_identity=visual_candidate_checkpoint_input_identity,
-                            lattice=workspace.candidates_by_segment,
-                        )
-                        if joint_proposal_restart is not None:
-                            joint_proposal_pool = replace(joint_proposal_pool,
-                                warm_start_paths=joint_proposal_restart.paths)
-                            reporter.emit("joint_proposal_restart", **joint_proposal_restart.scalar_audit())
-                            reporter.log(
-                                f"입력·시계가 같은 이전 경로 {len(joint_proposal_restart.paths)}개를 탐색 제안으로 복원 · "
-                                "컷·트랙 증명 및 렌더 검증은 전부 다시 수행"
-                            )
-                    reporter.emit("joint_proposal_pool", **joint_proposal_pool.scalar_audit())
                     from .joint_switch_requirements import SourceSwitchRequirement
                     joint_switch_requirements = ()
                     joint_switch_families = None
@@ -28142,6 +28221,28 @@ def analyze(
                             count_basis="quantized_cross_derivative_family_cuts_inside_section",
                             derived_from_existing_decoded_montage_minimum=True,
                             quality_gates_waived=False)
+                    reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
+                    joint_proposal_pool = build_joint_proposal_pool(
+                        workspace,
+                        source_switch_requirements=joint_switch_requirements,
+                        source_switch_families=joint_switch_families,
+                    )
+                    if visual_candidate_checkpoint_input_identity is not None:
+                        from .joint_proposal_checkpoint import find_joint_proposal_restart
+                        joint_proposal_restart = find_joint_proposal_restart(
+                            request.output_directory,
+                            expected_input_identity=visual_candidate_checkpoint_input_identity,
+                            lattice=workspace.candidates_by_segment,
+                        )
+                        if joint_proposal_restart is not None:
+                            joint_proposal_pool = replace(joint_proposal_pool,
+                                warm_start_paths=joint_proposal_restart.paths)
+                            reporter.emit("joint_proposal_restart", **joint_proposal_restart.scalar_audit())
+                            reporter.log(
+                                f"입력·시계가 같은 이전 경로 {len(joint_proposal_restart.paths)}개를 탐색 제안으로 복원 · "
+                                "컷·트랙 증명 및 렌더 검증은 전부 다시 수행"
+                            )
+                    reporter.emit("joint_proposal_pool", **joint_proposal_pool.scalar_audit())
                     reporter.log(
                         f"전체 편집 제안 {len(joint_proposal_pool.paths)}개 확보 · "
                         "제안 연결점만 정밀 분석 · 최종 픽셀/트랙/렌더 게이트 유지"
@@ -28214,6 +28315,7 @@ def analyze(
                             runtime = JointSelectionRuntime(
                                 provider, batch_index=batch_index,
                             )
+                            joint_selection_deadline = monotonic() + 600.0
                             def report_proposal_search(event: dict[str, Any]) -> None:
                                 payload = dict(event)
                                 if event.get("phase") == "proposal_domain_exhausted":
@@ -28221,10 +28323,36 @@ def analyze(
                                         provider.selection_option_failure_code_counts
                                     )
                                 reporter.emit("joint_proposal_search", **payload)
+
+                            def report_bounded_joint_progress(
+                                progress: JointTimelineProgress,
+                            ) -> None:
+                                if monotonic() >= joint_selection_deadline:
+                                    raise NoCompleteTimelinePath(
+                                        "joint selection exceeded its "
+                                        "600-second batch wall-clock budget",
+                                        reason_code=(
+                                            "joint_proposal_wall_clock_"
+                                            "budget_exhausted"
+                                        ),
+                                        rejection_counts={
+                                            "joint_proposal_wall_clock_"
+                                            "budget_exhausted": 1,
+                                            "proof_materialization_call_count": 0,
+                                        },
+                                    )
+                                report_joint_visual_selection_progress(
+                                    progress,
+                                    runtime=runtime,
+                                )
+
                             return select_with_joint_proposal_domains(
                                 joint_proposal_pool,
                                 maximum_proof_calls=proof_budget,
                                 report=report_proposal_search,
+                                deadline_monotonic_seconds=(
+                                    joint_selection_deadline
+                                ),
                                 select=lambda **domain_arguments: (
                                     select_joint_visual_candidates(
                                         visual_candidate_set,
@@ -28246,9 +28374,7 @@ def analyze(
                                             else None
                                         ),
                                         progress_callback=(
-                                            lambda progress: report_joint_visual_selection_progress(
-                                                progress, runtime=runtime,
-                                            )
+                                            report_bounded_joint_progress
                                         )
                                     )
                                 ),
@@ -32831,9 +32957,148 @@ def analyze(
                     f"디코딩 QA 후보 {len(complete_group_candidates)}개 확보"
                 )
             else:
-                visual_timeline = build_visual_timeline(
-                    **visual_builder_arguments,
-                )
+                review_first_runtime.checkpoint("visual_selection_started")
+                review_first_rejections: list[dict[str, Any]] = []
+                if (
+                    bool(getattr(request, "review_first_enabled", False))
+                    and stage_edit_generation_result is not None
+                ):
+                    reporter.status(
+                        "StageEdit가 제안한 전곡 경로 중 첫 검토 가능 경로를 "
+                        "실프레임 하드 게이트로 확인하는 중…"
+                    )
+                    for retained_candidate in (
+                        stage_edit_generation_result.retained_candidates
+                    ):
+                        try:
+                            materialized_review_candidate = (
+                                materialize_stage_edit_visual_candidate(
+                                    retained_candidate,
+                                    candidate_index=0,
+                                    review_rank=retained_candidate.rank,
+                                    sources=tuple(
+                                        request.sources[index]
+                                        for index in eligible_indices
+                                    ),
+                                    audio_offsets=offsets,
+                                    sync_scores=sync_scores,
+                                    scene_cut_times=scene_cut_times,
+                                    source_timewarps=eligible_timewarps,
+                                    **_visual_feature_cache_arguments(request),
+                                    progress_callback=(
+                                        visual_builder_arguments[
+                                            "progress_callback"
+                                        ]
+                                    ),
+                                )
+                            )
+                        except (
+                            StageEditVisualCandidateError,
+                            ValueError,
+                            cv2.error,
+                        ) as exc:
+                            review_first_rejections.append(
+                                {
+                                    "stage_edit_candidate_rank": (
+                                        retained_candidate.rank
+                                    ),
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                            continue
+                        visual_timeline = (
+                            materialized_review_candidate.visual_plan
+                        )
+                        review_first_stage_edit_materialized = (
+                            materialized_review_candidate
+                        )
+                        stage_edit_dynamic_crop_version_payload = (
+                            materialized_review_candidate.dynamic_crop_version
+                        )
+                        review_first_visual_selection_payload = {
+                            "contract": "review_first_visual_selection_v1",
+                            "authority": "stage_edit_generation",
+                            "selected_stage_edit_candidate_rank": (
+                                retained_candidate.rank
+                            ),
+                            "source_path_authority_used": True,
+                            "dynamic_crop_version": (
+                                materialized_review_candidate.dynamic_crop_version
+                            ),
+                            "dynamic_crop_applied_to_render": False,
+                            "deterministic_face_crop_and_editorial_motion_applied_later": (
+                                True
+                            ),
+                            "rejections_before_selection": list(
+                                review_first_rejections
+                            ),
+                            "passed": True,
+                        }
+                        break
+                    if visual_timeline is None:
+                        warnings.append(
+                            "StageEdit 전곡 경로가 시각 하드 게이트를 통과하지 "
+                            "못해 기록을 남기고 결정론적 전곡 선택기로 전환했습니다."
+                        )
+                elif (
+                    bool(getattr(request, "review_first_enabled", False))
+                    and request.stage_edit_checkpoint_directory is not None
+                ):
+                    reporter.status(
+                        "StageEdit Transformer로 제한된 전곡 후보를 재순위하는 중…"
+                    )
+                    bounded_candidate_set = build_visual_timeline_candidate_set(
+                        **visual_builder_arguments,
+                        maximum_results=8,
+                    )
+                    (
+                        ranked_review_candidates,
+                        stage_edit_candidate_rerank_result,
+                        crop_aware_candidate_rerank_result,
+                    ) = _materialize_crop_aware_ranked_visual_proxy_candidates(
+                        bounded_candidate_set,
+                        request=request,
+                        rhythm_analysis=rhythm_analysis,
+                        section_plan=visual_section_plan,
+                        source_aspect_ratios=source_aspect_ratios,
+                        visual_montage_selection_policy=(
+                            visual_montage_selection_policy
+                        ),
+                        rendered_montage_config=rendered_montage_config,
+                        reporter=reporter,
+                    )
+                    if ranked_review_candidates:
+                        visual_timeline = ranked_review_candidates[0].visual_plan
+                        review_first_visual_selection_payload = {
+                            "contract": "review_first_visual_selection_v1",
+                            "authority": "stage_edit_candidate_reranker",
+                            "candidate_set": bounded_candidate_set.to_dict(),
+                            "selected_candidate_index": (
+                                ranked_review_candidates[0].candidate_index
+                            ),
+                            "transformer_rerank": (
+                                stage_edit_candidate_rerank_result.to_dict()
+                                if stage_edit_candidate_rerank_result is not None
+                                else None
+                            ),
+                            "crop_aware_rerank": (
+                                crop_aware_candidate_rerank_result.to_dict()
+                                if crop_aware_candidate_rerank_result is not None
+                                else None
+                            ),
+                            "passed": True,
+                        }
+                if visual_timeline is None:
+                    visual_timeline = build_visual_timeline(
+                        **visual_builder_arguments,
+                    )
+                    review_first_visual_selection_payload = {
+                        "contract": "review_first_visual_selection_v1",
+                        "authority": "deterministic_full_song_visual_selector",
+                        "stage_edit_rejections": review_first_rejections,
+                        "passed": True,
+                    }
+                review_first_runtime.checkpoint("visual_selection_complete")
                 reporter.log(
                     f"프레임 품질·구도·움직임 전역 선택 점수 "
                     f"{visual_timeline.optimizer_score:.3f}"
@@ -32886,6 +33151,7 @@ def analyze(
                 comparison_render_allowed=(
                     request.source_mode is not SourceMode.AUTOMATIC
                     or allow_failed_comparison_render
+                    or bool(getattr(request, "review_first_enabled", False))
                 ),
             )
         if (
@@ -32978,6 +33244,7 @@ def analyze(
             ) and len(source_aspect_ratios) == len(eligible_indices)
             timeline_is_editorial_safe = bool(
                 timeline_review is not None and timeline_review.passed
+                or getattr(request, "review_first_enabled", False)
             )
             if (
                 request.aspect_ratio is AspectRatio.LANDSCAPE
@@ -33892,6 +34159,22 @@ def analyze(
                 height=height,
                 transitions=group_transition_plan.transitions,
             )
+            if review_first_stage_edit_materialized is not None:
+                try:
+                    plan = apply_stage_edit_dynamic_crop_to_render_plan(
+                        review_first_stage_edit_materialized,
+                        plan,
+                    )
+                    if isinstance(review_first_visual_selection_payload, dict):
+                        review_first_visual_selection_payload[
+                            "dynamic_crop_applied_to_render"
+                        ] = True
+                except (TypeError, ValueError) as exc:
+                    warnings.append(
+                        "StageEdit Dynamic Crop 구간을 렌더 계획에 "
+                        "재결합하지 못해 실프레임 얼굴·피사체 "
+                        f"보정을 유지했습니다: {exc}"
+                    )
             if review_rendered_proxies:
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
@@ -33905,6 +34188,15 @@ def analyze(
                         Path(temporary_directory) / "candidate-00.mp4",
                         professional_reference_profile=(
                             professional_reference_profile
+                        ),
+                        maximum_runtime_seconds=(
+                            420.0
+                            if getattr(
+                                request,
+                                "review_first_enabled",
+                                False,
+                            )
+                            else None
                         ),
                     )
                     rendered_proxy_review_payload = deepcopy(proxy_review.payload)
@@ -33930,14 +34222,75 @@ def analyze(
                     f"{len(rendered_proxy_review_payload['boundary_issue_indices'])}개"
                 )
                 if not bool(rendered_proxy_review_payload["passed"]):
-                    if not allow_failed_comparison_render:
+                    if (
+                        not allow_failed_comparison_render
+                        and not bool(
+                            getattr(request, "review_first_enabled", False)
+                        )
+                    ):
                         raise RuntimeError(
                             "automatic GROUP full render blocked by decoded proxy review; "
                             f"report: {rendered_proxy_review_path}"
                         )
                     warnings.append(
-                        "실렌더 프록시 검수는 통과하지 못했지만 명시적인 비교용 "
-                        "렌더 옵션으로 계속했습니다."
+                        "실렌더 프록시 검수는 통과하지 못했지만 "
+                        "검토본 우선 정책으로 최종 화질 QA까지 계속했습니다."
+                    )
+                if bool(getattr(request, "review_first_enabled", False)):
+                    rendered_candidate_selection_payload = {
+                        "analysis_basis": "bounded_review_first_single_full_song_v1",
+                        "candidate_pool": (
+                            review_first_visual_selection_payload.get(
+                                "authority",
+                                "deterministic_full_song_visual_selector",
+                            )
+                            if isinstance(
+                                review_first_visual_selection_payload,
+                                Mapping,
+                            )
+                            else "deterministic_full_song_visual_selector"
+                        ),
+                        "requested_review_count": 1,
+                        "reviewed_candidate_count": 1,
+                        "minimum_required_candidate_count": 1,
+                        "minimum_candidate_count_satisfied": True,
+                        "selected_candidate_index": 0,
+                        "final_selected_review": deepcopy(
+                            rendered_proxy_review_payload
+                        ),
+                        "review_first_visual_selection": deepcopy(
+                            review_first_visual_selection_payload
+                        ),
+                        "stage_edit_candidate_rerank": (
+                            stage_edit_candidate_rerank_result.to_dict()
+                            if stage_edit_candidate_rerank_result is not None
+                            else None
+                        ),
+                        "crop_aware_candidate_rerank": (
+                            crop_aware_candidate_rerank_result.to_dict()
+                            if crop_aware_candidate_rerank_result is not None
+                            else None
+                        ),
+                        "passed": bool(
+                            rendered_proxy_review_payload.get("passed")
+                        ),
+                        "approval_deferred_to_final_post_render_qa": True,
+                        "delivery_completion_message_allowed": False,
+                        "source_index_mapping": _source_index_mapping(
+                            request.sources,
+                            eligible_indices,
+                        ),
+                        "nested_index_domains": (
+                            _rendered_candidate_selection_index_domains()
+                        ),
+                    }
+                    rendered_candidate_selection_path = (
+                        request.output_directory
+                        / f"{base_filename}-rendered-candidate-selection.json"
+                    )
+                    _write_analysis_manifest_atomically(
+                        rendered_candidate_selection_path,
+                        rendered_candidate_selection_payload,
                     )
         if registered_stage_edit_bundle is not None:
             reporter.status(
@@ -34008,7 +34361,20 @@ def analyze(
         write_plan(plan, render_plan_path)
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
         from .render_process import render_log_callback
-        codec = render(plan,progress_callback=render_log_callback(reporter,total_frames=plan.output_frame_count))
+        review_first_runtime.checkpoint("full_render_started")
+        codec = render(
+            plan,
+            progress_callback=render_log_callback(
+                reporter,
+                total_frames=plan.output_frame_count,
+            ),
+            **(
+                {"maximum_runtime_seconds": 900.0}
+                if getattr(request, "review_first_enabled", False)
+                else {}
+            ),
+        )
+        review_first_runtime.checkpoint("full_render_complete")
         timeline_interchange_paths = write_timeline_interchange_bundle(
             plan,
             output_directory=request.output_directory,
@@ -34042,6 +34408,10 @@ def analyze(
             "candidate_origin": (
                 "explicit_stage_edit_generation"
                 if stage_edit_visual_candidate_batch is not None
+                else str(
+                    review_first_visual_selection_payload.get("authority")
+                )
+                if isinstance(review_first_visual_selection_payload, Mapping)
                 else (
                     "joint_decoded_visual_selector"
                     if joint_visual_selection_active
@@ -37498,7 +37868,20 @@ def analyze(
                 f"{request.target_member.value} 멤버 교차직캠을 합성하는 중…"
             )
             from .render_process import render_log_callback
-            codec = render(plan,progress_callback=render_log_callback(reporter,total_frames=plan.output_frame_count))
+            review_first_runtime.checkpoint("full_render_started")
+            codec = render(
+                plan,
+                progress_callback=render_log_callback(
+                    reporter,
+                    total_frames=plan.output_frame_count,
+                ),
+                **(
+                    {"maximum_runtime_seconds": 900.0}
+                    if getattr(request, "review_first_enabled", False)
+                    else {}
+                ),
+            )
+            review_first_runtime.checkpoint("full_render_complete")
             timeline_interchange_paths = write_timeline_interchange_bundle(
                 plan,
                 output_directory=request.output_directory,
@@ -37772,6 +38155,12 @@ def analyze(
             else None
         ),
         "rendered_candidate_selection": rendered_candidate_selection_payload,
+        "review_first_visual_selection": (
+            deepcopy(review_first_visual_selection_payload)
+            if review_first_visual_selection_payload is not None
+            else None
+        ),
+        "review_first_runtime": review_first_runtime.to_dict(),
         "stage_edit_generation": (
             {
                 **stage_edit_generation_result.to_dict(),
@@ -37980,6 +38369,7 @@ def analyze(
         if promoted_role not in {
             "diagnostic",
             "comparison",
+            "review_ready",
             "delivery",
         }:
             raise RuntimeError(
@@ -37989,7 +38379,12 @@ def analyze(
         artifact_role = str(promoted_role)
     elif automatic_ive_member_artifact:
         promoted_role = manifest.get("artifact_role")
-        if promoted_role not in {"diagnostic", "rejected", "delivery"}:
+        if promoted_role not in {
+            "diagnostic",
+            "rejected",
+            "review_ready",
+            "delivery",
+        }:
             raise RuntimeError(
                 "automatic IVE MEMBER artifact did not reach a terminal "
                 "exposure state"
@@ -38019,7 +38414,8 @@ def analyze(
     if mandatory_post_render_qa_path is not None:
         output_paths.append(mandatory_post_render_qa_path)
     if rendered_video_path is not None and (
-        not automatic_ive_product_artifact or artifact_role == "delivery"
+        not automatic_ive_product_artifact
+        or artifact_role in {"review_ready", "delivery"}
     ):
         output_paths.append(rendered_video_path)
     output_paths.extend(timeline_interchange_paths)

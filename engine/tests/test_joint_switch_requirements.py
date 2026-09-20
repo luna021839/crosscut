@@ -44,6 +44,34 @@ class JointSwitchRequirementsTests(TestCase):
                 option_provider=lambda key:self.fail('impossible cadence must not decode pixels'))
         self.assertEqual(caught.exception.reason_code,'section_source_switch_capacity_insufficient')
 
+    def test_disconnected_switch_edges_cannot_fake_two_switches(self):
+        rows=self.rows[:3]
+        domain=set()
+        for boundary,(left,right) in enumerate(zip(rows,rows[1:])):
+            a_left=next(item for item in left if item.source_id=='A')
+            b_left=next(item for item in left if item.source_id=='B')
+            a_right=next(item for item in right if item.source_id=='A')
+            b_right=next(item for item in right if item.source_id=='B')
+            # Both positions contain an A->B switch, but no complete path can
+            # use both because the second position cannot reconnect B to A.
+            domain.add(BoundaryMeasurementKey.from_candidates(
+                boundary,a_left,b_right))
+            domain.add(BoundaryMeasurementKey.from_candidates(
+                boundary,b_left,b_right))
+            domain.add(BoundaryMeasurementKey.from_candidates(
+                boundary,a_left,a_right))
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_timeline_candidates(rows,
+                option_provider=lambda key:self.fail('disconnected capacity must not decode'),
+                bridge_provider=valid_bridge,
+                config=replace(isolated_score_config(),source_switch_bonus=0.),
+                maximum_results=1,
+                boundary_search_domain=frozenset(domain),
+                source_switch_requirements=(SourceSwitchRequirement(0.,3.,2),))
+        self.assertEqual(caught.exception.reason_code,
+                         'section_source_switch_capacity_insufficient')
+        self.assertIsNotNone(caught.exception.segment_index)
+
     def test_duplicate_camera_family_does_not_fake_a_source_switch(self):
         with self.assertRaises(NoCompleteTimelinePath):
             self.select((SourceSwitchRequirement(0.,6.,1),),source_switch_families={'A':'same','B':'same'})

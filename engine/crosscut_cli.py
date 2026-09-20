@@ -21,6 +21,10 @@ from crosscut.doctor import runtime_report
 from crosscut.acquisition import acquire_sources
 from crosscut.events import EventReporter, ProgressRangeReporter
 from crosscut.ive import SourceMode
+from crosscut.member_post_render_qa import (
+    AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
+    AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
+)
 from crosscut.pipeline import analyze
 from crosscut.post_render_qa import (
     PostRenderArtifactSet,
@@ -61,6 +65,68 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _result_contains_exposable_video(artifact: object) -> bool:
+    """Expose only QA-bound delivery or review-ready product video."""
+
+    output_paths = tuple(getattr(artifact, "output_paths", ()))
+    has_mp4 = any(Path(path).suffix.lower() == ".mp4" for path in output_paths)
+    manifest = getattr(artifact, "manifest", None)
+    if not isinstance(manifest, dict):
+        return has_mp4
+    request = manifest.get("request")
+    render = manifest.get("render")
+    automatic_member_scope = bool(
+        isinstance(request, dict)
+        and str(request.get("group", "")).strip().upper() == "IVE"
+        and str(request.get("source_mode", "")).strip().lower()
+        == "automatic"
+        and str(request.get("edit_mode", "")).strip().lower() == "member"
+    )
+    if not automatic_member_scope:
+        return has_mp4
+    exposure = manifest.get("app_result_exposure")
+    qa = manifest.get("post_render_qa")
+    artifact_role = manifest.get("artifact_role")
+    delivery_allowed = bool(
+        artifact_role == "delivery"
+        and isinstance(render, dict)
+        and render.get("direct_full_frame") is True
+        and render.get("artifact_role") == "delivery"
+        and isinstance(exposure, dict)
+        and exposure.get("contract")
+        == AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
+        and exposure.get("video_output_exposed") is True
+        and exposure.get("delivery_completion_message_allowed") is True
+        and isinstance(qa, dict)
+        and qa.get("contract") == AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
+        and qa.get("passed") is True
+    )
+    disposition = qa.get("review_first_disposition") if isinstance(qa, dict) else None
+    review_ready_allowed = bool(
+        artifact_role == "review_ready"
+        and isinstance(render, dict)
+        and render.get("direct_full_frame") is True
+        and render.get("artifact_role") == "review_ready"
+        and isinstance(exposure, dict)
+        and exposure.get("contract")
+        == AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
+        and exposure.get("video_output_exposed") is True
+        and exposure.get("delivery_completion_message_allowed") is False
+        and isinstance(qa, dict)
+        and qa.get("contract") == AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
+        and qa.get("content_binding_passed") is True
+        and isinstance(disposition, dict)
+        and disposition.get("status") == "REVIEW_READY"
+    )
+    allowed = bool(delivery_allowed or review_ready_allowed)
+    if has_mp4 and not allowed:
+        raise RuntimeError(
+            "automatic IVE MEMBER MP4 is not exposed because mandatory "
+            "post-render QA did not reach delivery"
+        )
+    return bool(has_mp4 and allowed)
 
 
 def _decoded_proxy_review_from_document(
@@ -413,10 +479,17 @@ def main(argv: list[str] | None = None) -> int:
                 request.source_mode is SourceMode.AUTOMATIC
                 and request.edit_mode.value == "group"
             ),
+            acquisition_identity_authority=(
+                acquisition.member_identity_authority
+                if acquisition is not None
+                else None
+            ),
         )
         warnings = artifact.manifest.get("warnings") or []
         for warning in warnings:
             reporter.emit("log", level="warning", message=warning)
+        video_exposed = _result_contains_exposable_video(artifact)
+        artifact_role = artifact.manifest.get("artifact_role")
         reporter.result(
             outputs=[str(path) for path in artifact.output_paths],
             source_paths=(
@@ -433,12 +506,14 @@ def main(argv: list[str] | None = None) -> int:
                 else [anchor.as_dict() for anchor in request.member_anchors]
             ),
             message=(
-                (
+                "QA 통과 전 확인할 검토용 교차편집 초안이 생성되었습니다."
+                if video_exposed and artifact_role == "review_ready"
+                else (
                     "IVE 멤버 교차직캠이 완성되었습니다."
                     if request.edit_mode.value == "member"
                     else "IVE 그룹 교차편집이 완성되었습니다."
                 )
-                if any(path.suffix.lower() == ".mp4" for path in artifact.output_paths)
+                if video_exposed
                 else "IVE 분석은 완료됐지만 안전 게이트 때문에 영상은 만들지 않았습니다."
             ),
         )
