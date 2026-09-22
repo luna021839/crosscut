@@ -112,7 +112,7 @@ while not (root / 'release-engine').exists() and time.monotonic() < deadline:
     private func assertInheritedPipeFails(requestCancellation: Bool) async throws {
         var fixtureRoot: URL?
         let runner = try await runFixture(#"""
-import json, pathlib, subprocess, sys
+import json, pathlib, subprocess, sys, time
 root = pathlib.Path(__file__).parent
 request_path = sys.argv[sys.argv.index('--request') + 1]
 with open(request_path) as source:
@@ -120,8 +120,13 @@ with open(request_path) as source:
 print('REQUEST_FILE:' + request_path, flush=True)
 video = pathlib.Path(request['output_directory']) / 'child-held-result.mp4'
 video.write_bytes(b'x')
-child_code = "import pathlib, sys, time; time.sleep(0.8); pathlib.Path(sys.argv[1]).write_text('done')"
-subprocess.Popen([sys.executable, '-c', child_code, str(root / 'child-finished')])
+child_code = "import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(0.8); pathlib.Path(sys.argv[2]).write_text('done')"
+subprocess.Popen([sys.executable, '-c', child_code, str(root / 'child-ready'), str(root / 'child-finished')])
+deadline = time.monotonic() + 2
+while not (root / 'child-ready').exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('Inherited-pipe fixture child did not become ready')
+    time.sleep(0.005)
 print(json.dumps({'type': 'result', 'output': str(video)}), flush=True)
 (root / 'ready-to-cancel').write_text('ready')
 """#, mode: .group, outputDrainGraceNanoseconds: 150_000_000,
@@ -137,6 +142,10 @@ print(json.dumps({'type': 'result', 'output': str(video)}), flush=True)
         let root = try XCTUnwrap(fixtureRoot)
         let childFinished = root.appendingPathComponent("child-finished")
         XCTAssertFalse(FileManager.default.fileExists(atPath: childFinished.path), "Runner must stop waiting before the inherited pipe's child exits")
+        // The child's ready handshake proves its TERM-ignore handler is active
+        // before cancellation can race the parent exit. Otherwise legitimate
+        // group cancellation kills the child, closes both pipes and invalidates
+        // this test's deliberately unclosed-stream premise.
         // The disposable child exits naturally; do not signal a dead parent's
         // process group or remove the fixture directory while the child uses it.
         let deadline = Date().addingTimeInterval(2)
