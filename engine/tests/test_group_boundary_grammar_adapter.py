@@ -91,7 +91,8 @@ def _domain_summary(
         "issue_indices": issues,
         "score": {
             "distribution": _distribution(scores),
-            "p10": 100.0 if p10 is None else p10,
+            "p10": p10,
+            "evidence_status": "OBSERVED" if records else "NOT_APPLICABLE",
         },
         "pass_policy": (
             "editorial_boundary_p10_and_issue_fraction_gate"
@@ -843,7 +844,9 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
             with self.subTest(domain=domain):
                 bundle = self._bundle()
                 proxy = deepcopy(bundle["rendered_proxy_review"].payload)  # type: ignore[union-attr]
-                proxy["boundary_domains"][domain]["score"]["p10"] += 1.0
+                proxy["boundary_domains"][domain]["score"]["p10"] = (
+                    proxy["boundary_domains"][domain]["score"]["p10"] or 0.0
+                ) + 1.0
                 bundle["rendered_proxy_review"] = proxy
                 with self.assertRaises(GroupBoundaryGrammarAdapterError):
                     self._adapt(bundle)

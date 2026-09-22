@@ -751,14 +751,14 @@ def _validate_domain_summary(
     *,
     summary: object,
     domain: str,
-    records: Sequence[tuple[int, float, bool]],
+    records: Sequence[tuple[int, float | None, bool]],
 ) -> None:
     value = _mapping(summary, f"rendered_proxy_review.boundary_domains.{domain}")
     if str(_required(value, "domain", f"proxy domain {domain}")) != domain:
         raise GroupBoundaryGrammarAdapterError(f"proxy {domain} domain label mismatch")
     if str(_required(value, "count_basis", f"proxy domain {domain}")) != domain:
         raise GroupBoundaryGrammarAdapterError(f"proxy {domain} count basis mismatch")
-    issues = [index for index, _score, passed in records if not passed]
+    issues = [index for index, score, passed in records if not passed or score is None]
     if _integer(
         _required(value, "boundary_count", f"proxy domain {domain}"),
         f"proxy domain {domain}.boundary_count",
@@ -794,7 +794,7 @@ def _validate_domain_summary(
         _required(score, "distribution", f"proxy domain {domain}.score"),
         f"proxy domain {domain}.score.distribution",
     )
-    scores = [item[1] for item in records]
+    scores = [item[1] for item in records if item[1] is not None]
     expected_distribution: dict[str, float | int | None] = {
         "count": len(scores),
         "minimum": min(scores) if scores else None,
@@ -826,15 +826,18 @@ def _validate_domain_summary(
                 f"proxy {domain} score distribution.{key}",
                 tolerance=_SCALAR_ABS_TOLERANCE,
             )
-    expected_p10 = _percentile([item[1] for item in records], 0.10)
+    expected_p10 = _percentile(scores, 0.10)
+    observed_p10 = _required(score, "p10", f"proxy domain {domain}.score")
     if expected_p10 is None:
-        expected_p10 = 100.0
-    _close(
-        _required(score, "p10", f"proxy domain {domain}.score"),
-        expected_p10,
-        f"proxy domain {domain}.score.p10",
-        tolerance=_SCALAR_ABS_TOLERANCE,
-    )
+        if observed_p10 is not None:
+            raise GroupBoundaryGrammarAdapterError(f"proxy {domain} unknown score must be null")
+    else:
+        _close(observed_p10, expected_p10, f"proxy domain {domain}.score.p10",
+               tolerance=_SCALAR_ABS_TOLERANCE)
+    expected_status = ("NOT_APPLICABLE" if not records else
+                       "OBSERVED" if len(scores) == len(records) else "INCOMPLETE")
+    if score.get("evidence_status") != expected_status:
+        raise GroupBoundaryGrammarAdapterError(f"proxy {domain} evidence status mismatch")
     _boolean(_required(value, "passed", f"proxy domain {domain}"), f"proxy domain {domain}.passed")
     expected_policy = (
         "editorial_boundary_p10_and_issue_fraction_gate"
@@ -881,7 +884,7 @@ def _validated_proxy_continuity(
 
     frame_counts = segment_frame_counts(plan)
     cumulative_frames = 0
-    classified: dict[str, list[tuple[int, float, bool]]] = {
+    classified: dict[str, list[tuple[int, float | None, bool]]] = {
         domain: [] for domain in _PROXY_DOMAINS
     }
     for index, raw_record in enumerate(records):
@@ -956,16 +959,22 @@ def _validated_proxy_continuity(
             raise GroupBoundaryGrammarAdapterError(
                 f"proxy boundary[{index}] source clock continuity mismatch"
             )
-        score = _finite(
-            _required(record, "weighted_score", f"proxy boundary[{index}]"),
-            f"proxy boundary[{index}].weighted_score",
-        )
-        if not 0.0 <= score <= 100.0:
-            raise GroupBoundaryGrammarAdapterError("proxy boundary score is outside [0, 100]")
         passed = _boolean(
             _required(record, "passed", f"proxy boundary[{index}]"),
             f"proxy boundary[{index}].passed",
         )
+        raw_score = _required(record, "weighted_score", f"proxy boundary[{index}]")
+        score = None if raw_score is None else _finite(raw_score, f"proxy boundary[{index}].weighted_score")
+        if score is None:
+            coverage = _mapping(record.get("evidence_coverage"), f"proxy boundary[{index}].evidence_coverage")
+            if (passed or expected_domain != INTRODUCED_CROSS_SOURCE_DOMAIN
+                or coverage.get("contract") != "boundary_observation_coverage_v1"
+                or coverage.get("status") != "UNKNOWN_SUBJECT_CONTINUITY"
+                or coverage.get("subject_geometry_observed") is not False
+                or "quality_score" not in coverage or coverage["quality_score"] is not None):
+                raise GroupBoundaryGrammarAdapterError("proxy unknown boundary score lacks missing-evidence contract")
+        elif not 0.0 <= score <= 100.0:
+            raise GroupBoundaryGrammarAdapterError("proxy boundary score is outside [0, 100]")
         classified[expected_domain].append((index, score, passed))
 
     domain_payload = _mapping(
@@ -1012,7 +1021,7 @@ def _validated_proxy_continuity(
         raise GroupBoundaryGrammarAdapterError(
             "proxy introduced issue-index compatibility view is inconsistent"
         )
-    p10 = _percentile([score for _index, score, _passed in introduced], 0.10)
+    p10 = _percentile([score for _index, score, _passed in introduced if score is not None], 0.10)
     return IntroducedBoundaryContinuityEvidence.from_counts(
         boundary_count=len(introduced),
         issue_count=len(issue_indices),

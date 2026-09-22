@@ -76,7 +76,9 @@ class ProAuditRegressionTests(unittest.TestCase):
         segment = RenderSegment(0, 10., 2., 0., editorial_transform=track)
         sampler = PrescribedGeometrySampler(SimpleNamespace(frame_at=lambda _: frame, frame_rate=30),
             segment, master_start=0.)
-        np.testing.assert_array_equal(sampler.frame_at(10.), frame)
+        # The renderer uses the track's maximum-zoom canvas even at neutral
+        # keyframes; its upscale/downscale has one-level integer resampling.
+        self.assertLessEqual(np.abs(sampler.frame_at(10.).astype(int) - frame.astype(int)).max(), 1)
         zoomed = sampler.frame_at(12.)
         self.assertEqual(zoomed.shape, frame.shape)
         self.assertGreater(int(zoomed[45, 0, 0]), 15)

@@ -528,6 +528,7 @@ def _promote_review_to_domain_aware_v3(
                             "maximum": 82.0,
                         },
                         "p10": 82.0,
+                        "evidence_status": "OBSERVED",
                     },
                     "pass_policy": (
                         "editorial_boundary_p10_and_issue_fraction_gate"
@@ -550,7 +551,8 @@ def _promote_review_to_domain_aware_v3(
                             "p90": None,
                             "maximum": None,
                         },
-                        "p10": 100.0,
+                        "p10": None,
+                        "evidence_status": "NOT_APPLICABLE",
                     },
                     "pass_policy": "zero_technical_integrity_issues",
                     "passed": True,
@@ -571,7 +573,8 @@ def _promote_review_to_domain_aware_v3(
                             "p90": None,
                             "maximum": None,
                         },
-                        "p10": 100.0,
+                        "p10": None,
+                        "evidence_status": "NOT_APPLICABLE",
                     },
                     "pass_policy": "zero_technical_integrity_issues",
                     "passed": True,

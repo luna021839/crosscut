@@ -1894,6 +1894,34 @@ def _expected_review_boundaries(
     return expected
 
 
+def _nullable_measurement_matches(serialized: Any, expected: float | None) -> bool:
+    """Unknown is an explicit null, never a fabricated perfect measurement."""
+    if expected is None:
+        return serialized is None
+    value = _number(serialized)
+    return value is not None and math.isclose(
+        value, expected, rel_tol=0.0, abs_tol=1e-6,
+    )
+
+
+def _boundary_measurement_valid(boundary: Mapping[str, Any], *, nullable: bool) -> bool:
+    if _number(boundary.get("weighted_score")) is not None:
+        return True
+    coverage = _mapping(boundary.get("evidence_coverage")) or {}
+    return bool(
+        nullable
+        and "weighted_score" in boundary
+        and boundary["weighted_score"] is None
+        and boundary.get("passed") is False
+        and boundary.get("review_domain") == _INTRODUCED_CROSS_SOURCE_DOMAIN
+        and coverage.get("contract") == "boundary_observation_coverage_v1"
+        and coverage.get("status") == "UNKNOWN_SUBJECT_CONTINUITY"
+        and coverage.get("subject_geometry_observed") is False
+        and "quality_score" in coverage
+        and coverage["quality_score"] is None
+    )
+
+
 def _domain_aware_boundary_contract_valid(
     review: Mapping[str, Any],
     *,
@@ -1954,7 +1982,16 @@ def _domain_aware_boundary_contract_valid(
         issue_fraction = _number(payload.get("issue_fraction"))
         score = _mapping(payload.get("score")) or {}
         distribution = _mapping(score.get("distribution")) or {}
-        score_p10 = _number(score.get("p10"))
+        domain_boundaries = [item for item in boundaries if item.get("review_domain") == domain]
+        scores = [value for item in domain_boundaries
+                  if (value := _number(item.get("weighted_score"))) is not None]
+        expected_issue_indices = [item["boundary_index"] for item in domain_boundaries
+                                  if item.get("passed") is not True
+                                  or _number(item.get("weighted_score")) is None]
+        expected_evidence_status = (
+            "NOT_APPLICABLE" if not count else
+            "OBSERVED" if len(scores) == count else "INCOMPLETE"
+        )
         expected_pass_policy = (
             "editorial_boundary_p10_and_issue_fraction_gate"
             if domain == _INTRODUCED_CROSS_SOURCE_DOMAIN
@@ -1973,6 +2010,7 @@ def _domain_aware_boundary_contract_valid(
                 for value in issue_indices
             )
             and len(set(issue_indices)) == len(issue_indices)
+            and issue_indices == expected_issue_indices
             and issue_count == len(issue_indices)
             and issue_fraction is not None
             and math.isclose(
@@ -1981,17 +2019,14 @@ def _domain_aware_boundary_contract_valid(
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
-            and _integer(distribution.get("count")) == count
-            and score_p10 is not None
-            and (
-                count > 0
-                or math.isclose(
-                    score_p10,
-                    100.0,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-            )
+            and _integer(distribution.get("count")) == len(scores)
+            and "p10" in score
+            and _nullable_measurement_matches(score["p10"], _quantile(scores, 0.10))
+            and all(key in distribution and _nullable_measurement_matches(
+                distribution[key], _quantile(scores, fraction),
+            ) for key, fraction in (("minimum", 0.0), ("p10", 0.1),
+                                   ("median", 0.5), ("p90", 0.9), ("maximum", 1.0)))
+            and score.get("evidence_status") == expected_evidence_status
             and payload.get("pass_policy") == expected_pass_policy
             and isinstance(payload.get("passed"), bool)
         ):
@@ -2101,7 +2136,7 @@ def _decoded_candidate_review_contract_valid(
         and all(
             (_mapping(item) or {}).get("boundary_index") == index
             and isinstance((_mapping(item) or {}).get("passed"), bool)
-            and _number((_mapping(item) or {}).get("weighted_score")) is not None
+            and _boundary_measurement_valid(_mapping(item) or {}, nullable=schema_version == 3)
             for index, item in enumerate(boundaries)
         )
         and _integer(overall.get("count")) == expected_decoded_frames
@@ -2128,7 +2163,11 @@ def _decoded_candidate_review_contract_valid(
             rel_tol=0.0,
             abs_tol=1e-9,
         )
-        and _number(boundary_score.get("p10")) is not None
+        and "p10" in boundary_score
+        and _nullable_measurement_matches(boundary_score["p10"], _quantile([
+            value for raw in boundaries
+            if (value := _number((_mapping(raw) or {}).get("weighted_score"))) is not None
+        ], 0.10))
         and _integer(boundary_score.get("issue_count")) is not None
         and _number(review.get("weighted_score")) is not None
         and _integer(review.get("geometry_provider_failure_count")) is not None
@@ -4078,16 +4117,12 @@ def _proxy_quality_and_geometry_metrics(
     boundary_distribution = _mapping(boundary_score.get("distribution")) or {}
     derived_boundary_p10 = _quantile(boundary_scores, 0.10)
     if not (
-        len(boundary_scores) == len(boundaries)
-        and boundary_distribution.get("count") == len(boundaries)
-        and derived_boundary_p10 is not None
-        and boundary_p10 is not None
-        and math.isclose(
-            derived_boundary_p10,
-            boundary_p10,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        )
+        all(_boundary_measurement_valid(
+            _mapping(raw) or {}, nullable=final_review.get("schema_version") == 3,
+        ) for raw in boundaries)
+        and boundary_distribution.get("count") == len(boundary_scores)
+        and "p10" in boundary_score
+        and _nullable_measurement_matches(boundary_score["p10"], derived_boundary_p10)
     ):
         collector.add(
             "proxy_boundary_score_distribution_mismatch",
