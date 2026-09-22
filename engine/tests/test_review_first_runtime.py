@@ -130,11 +130,12 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
                 "metrics": {
                     "perceptual_quality": {
                         "schema_version": 2,
-                        "analysis": "fixture_member_perceptual_v2",
+                        "analysis": "full_final_decode_temporal_pumping_exact_source_retention_and_structure_binding_v2",
                         "verdict": "FAIL",
                         "passed": False,
-                        "issues": [{"code": "quality_floor"}],
-                        "metrics": {},
+                        "issues": [{"code": "perceptual_detail_retention_p10"}],
+                        "metrics": {"video": {"full_frame_coverage": True, "dimensions_match_plan": True,
+                            "fps_matches_plan": True, "decoded_frame_count": 30, "expected_frame_count": 30}},
                     }
                 },
             },
@@ -158,6 +159,53 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(disposition.status, ReviewFirstStatus.INPUT_UNUSABLE)
+        self.assertFalse(disposition.video_output_exposed)
+
+    def test_member_look_provenance_aliases_must_agree_and_have_measurements(self):
+        for fields, expected in (
+            ({"provenance_valid": True}, True),
+            ({"cache_only_provenance_valid": True}, True),
+            ({"provenance_valid": True, "cache_only_provenance_valid": True}, True),
+            ({"provenance_valid": True, "cache_only_provenance_valid": False}, False),
+            ({"provenance_valid": 1}, False),
+            ({"provenance_valid": True, "predicted_evidence_valid": False}, False),
+            ({}, False),
+        ):
+            with self.subTest(fields=fields):
+                disposition = classify_review_first_qa(
+                    {"passed": False,
+                     "issues": [{"code": "member_look_calibration_predicted_quality_not_pass"}],
+                     "metrics": {"member_look_calibration": {
+                         "locations_bound": True, "segment_binding_valid": True,
+                         "predicted_evidence_valid": True, "predicted_quality_valid": False,
+                         **fields,
+                     }}},
+                    content_binding_passed=True, review_first_enabled=True, member=True,
+                )
+                self.assertEqual(disposition.video_output_exposed, expected)
+
+    def test_nested_member_technical_failure_cannot_be_relabelled_editorial(self):
+        for nested_code in ("perceptual_final_video_unavailable", "perceptual_render_source_clock_invalid",
+                            "perceptual_exact_structure_segment_binding_failed", "new_unknown_failure"):
+            with self.subTest(code=nested_code):
+                disposition = classify_review_first_qa({"passed": False,
+                    "issues": [{"code": "member_perceptual_quality_not_pass"}], "metrics": {
+                        "perceptual_quality": {"schema_version": 2,
+                            "analysis": "full_final_decode_temporal_pumping_exact_source_retention_and_structure_binding_v2",
+                            "passed": False, "verdict": "FAIL", "issues": [{"code": nested_code}],
+                            "metrics": {"video": {"full_frame_coverage": True, "dimensions_match_plan": True,
+                                "fps_matches_plan": True, "decoded_frame_count": 30, "expected_frame_count": 30}}}}},
+                    content_binding_passed=True, review_first_enabled=True, member=True)
+                self.assertFalse(disposition.video_output_exposed)
+
+    def test_named_but_empty_member_continuity_report_is_not_quality_evidence(self):
+        disposition = classify_review_first_qa({"passed": False,
+            "issues": [{"code": "member_rendered_continuity_not_pass"}], "metrics": {
+                "rendered_continuity": {"schema_version": 1,
+                    "analysis": "automatic_member_exact_rendered_boundary_continuity_v1",
+                    "passed": False, "failure_reasons": [], "failure_boundary_indices": {},
+                    "metrics": {}, "boundaries": []}}},
+            content_binding_passed=True, review_first_enabled=True, member=True)
         self.assertFalse(disposition.video_output_exposed)
 
     def test_success_is_approved_delivery(self) -> None:

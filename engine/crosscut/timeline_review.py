@@ -29,15 +29,29 @@ from .timeline import (
     BOUNDARY_SIDE_MAX_SCALE_DELTA,
     BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH,
     BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH,
+    PRODUCTION_MAX_FOCUS_MISMATCH,
+    PRODUCTION_MAX_FORMATION_MISMATCH,
+    PRODUCTION_MAX_LAYOUT_MISMATCH,
+    PRODUCTION_MAX_POSE_MISMATCH,
+    PRODUCTION_MAX_SCALE_MISMATCH,
+    PRODUCTION_MAX_SILHOUETTE_MISMATCH,
     BoundarySideStability,
     ShotType,
     boundary_side_stability_exceeded,
     comparable_group_formation_mismatch,
+    intentional_phrase_anchor_authorized_mismatches,
     screen_layout_mismatch,
 )
 
 
 _MISSING = object()
+JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT = (
+    "joint_decoded_post_transform_boundary_result_evidence_v1"
+)
+# Deliberately process-local and omitted from every serialized plan.  A JSON
+# mapping can repeat the public contract label for audit, but cannot acquire
+# authority to suppress fallback evidence.
+JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY = object()
 
 
 def _finite_non_negative(value: float, name: str) -> float:
@@ -91,12 +105,12 @@ class TimelineReviewConfig:
     dominant_source_share_hard: float = 0.45
     continuity_tolerance_seconds: float = 0.050
 
-    maximum_scale_mismatch: float = 0.20
-    maximum_focus_mismatch: float = 0.24
-    maximum_layout_mismatch: float = 0.32
-    maximum_silhouette_mismatch: float = 0.36
-    maximum_formation_mismatch: float = 0.30
-    maximum_pose_mismatch: float = 0.42
+    maximum_scale_mismatch: float = PRODUCTION_MAX_SCALE_MISMATCH
+    maximum_focus_mismatch: float = PRODUCTION_MAX_FOCUS_MISMATCH
+    maximum_layout_mismatch: float = PRODUCTION_MAX_LAYOUT_MISMATCH
+    maximum_silhouette_mismatch: float = PRODUCTION_MAX_SILHOUETTE_MISMATCH
+    maximum_formation_mismatch: float = PRODUCTION_MAX_FORMATION_MISMATCH
+    maximum_pose_mismatch: float = PRODUCTION_MAX_POSE_MISMATCH
     maximum_boundary_side_scale_delta: float = BOUNDARY_SIDE_MAX_SCALE_DELTA
     maximum_boundary_side_structure_mismatch: float = (
         BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH
@@ -319,6 +333,8 @@ class BoundaryDiagnostic:
     silhouette_mismatch: float | None = None
     formation_mismatch: float | None = None
     pose_mismatch: float | None = None
+    intentional_transition_anchor_basis: str | None = None
+    authorized_mismatch_metrics: tuple[str, ...] = ()
     exceeded_metrics: tuple[str, ...] = ()
 
     @property
@@ -373,6 +389,13 @@ class BoundaryDiagnostic:
             "mismatches": {
                 name: getattr(self, f"{name}_mismatch")
                 for name in self.available_metrics
+            },
+            "intentional_transition_authority": {
+                "anchor_basis": self.intentional_transition_anchor_basis,
+                "authorized_mismatch_metrics": list(
+                    self.authorized_mismatch_metrics
+                ),
+                "applied": bool(self.authorized_mismatch_metrics),
             },
             "exceeded_metrics": list(self.exceeded_metrics),
         }
@@ -726,7 +749,63 @@ def _precomputed_mismatch(incoming: Any, name: str) -> float | None:
     return min(1.0, max(0.0, numeric)) if isfinite(numeric) else None
 
 
+def _authoritative_transition_mismatch(
+    incoming: Any,
+    name: str,
+) -> tuple[bool, float | None]:
+    """Read an exact joint-boundary scalar without legacy fallback.
+
+    ``None`` is meaningful for the provider contract: it says the exact
+    post-transform metric was unavailable while the provider's professional
+    evidence-coverage gate still passed.  Treating that value like a missing
+    field would reintroduce midpoint/HOG fallback evidence from another clock.
+    """
+
+    contract = _get(
+        incoming,
+        "transition_evidence_contract_from_previous",
+        None,
+    )
+    authority = _get(
+        incoming,
+        "transition_evidence_authority_from_previous",
+        None,
+    )
+    if authority is not JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY:
+        return False, None
+    if contract != JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT:
+        raise ValueError(
+            "joint boundary authority is missing its exact evidence contract"
+        )
+    field_name = f"{name}_transition_mismatch_from_previous"
+    raw = _get(incoming, field_name, _MISSING)
+    if raw is _MISSING:
+        raise ValueError(
+            "joint boundary evidence contract omitted authoritative "
+            f"{name} scalar"
+        )
+    if raw is None:
+        return True, None
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"joint boundary authoritative {name} scalar is invalid"
+        ) from exc
+    if not isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ValueError(
+            f"joint boundary authoritative {name} scalar is outside [0, 1]"
+        )
+    return True, numeric
+
+
 def _scale_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "scale",
+    )
+    if authoritative:
+        return value
     left = _boundary_value(
         outgoing,
         boundary_name="exit_shot_scale",
@@ -747,6 +826,12 @@ def _scale_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _focus_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "focus",
+    )
+    if authoritative:
+        return value
     left = _boundary_value(
         outgoing,
         boundary_name="exit_focus_bbox_xywh",
@@ -768,6 +853,12 @@ def _focus_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _layout_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "layout",
+    )
+    if authoritative:
+        return value
     precomputed = _precomputed_mismatch(incoming, "layout")
     if precomputed is not None:
         return precomputed
@@ -828,6 +919,12 @@ def _layout_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _silhouette_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "silhouette",
+    )
+    if authoritative:
+        return value
     precomputed = _precomputed_mismatch(incoming, "silhouette")
     if precomputed is not None:
         return precomputed
@@ -845,6 +942,12 @@ def _silhouette_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _formation_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "formation",
+    )
+    if authoritative:
+        return value
     left_shot_type = _boundary_value(
         outgoing,
         boundary_name="exit_shot_type",
@@ -890,6 +993,12 @@ def _formation_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _pose_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    authoritative, value = _authoritative_transition_mismatch(
+        incoming,
+        "pose",
+    )
+    if authoritative:
+        return value
     precomputed = _precomputed_mismatch(incoming, "pose")
     if precomputed is not None:
         return precomputed
@@ -987,6 +1096,8 @@ def _build_boundaries(
         incoming_stability: BoundarySideStability | None = None
         outgoing_stability_exceeded: tuple[str, ...] = ()
         incoming_stability_exceeded: tuple[str, ...] = ()
+        anchor_basis: str | None = None
+        authorized_mismatches: tuple[str, ...] = ()
         if source_switch:
             metrics = {
                 "scale": _scale_mismatch(outgoing.original, incoming.original),
@@ -1040,10 +1151,75 @@ def _build_boundaries(
                     outgoing_stability_exceeded = exceeded_side
                 else:
                     incoming_stability_exceeded = exceeded_side
+            raw_anchor_basis = _get(
+                incoming.original,
+                "intentional_transition_anchor_basis",
+                None,
+            )
+            anchor_basis = (
+                raw_anchor_basis if isinstance(raw_anchor_basis, str) else None
+            )
+            production_gate_contract = all(
+                abs(left - right) <= 1e-12
+                for left, right in (
+                    (
+                        config.maximum_scale_mismatch,
+                        PRODUCTION_MAX_SCALE_MISMATCH,
+                    ),
+                    (
+                        config.maximum_focus_mismatch,
+                        PRODUCTION_MAX_FOCUS_MISMATCH,
+                    ),
+                    (
+                        config.maximum_layout_mismatch,
+                        PRODUCTION_MAX_LAYOUT_MISMATCH,
+                    ),
+                    (
+                        config.maximum_silhouette_mismatch,
+                        PRODUCTION_MAX_SILHOUETTE_MISMATCH,
+                    ),
+                    (
+                        config.maximum_formation_mismatch,
+                        PRODUCTION_MAX_FORMATION_MISMATCH,
+                    ),
+                    (
+                        config.maximum_pose_mismatch,
+                        PRODUCTION_MAX_POSE_MISMATCH,
+                    ),
+                )
+            )
+            trusted_joint_boundary_evidence = (
+                _get(
+                    incoming.original,
+                    "transition_evidence_authority_from_previous",
+                    None,
+                )
+                is JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY
+                and _get(
+                    incoming.original,
+                    "transition_evidence_contract_from_previous",
+                    None,
+                )
+                == JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT
+            )
+            if production_gate_contract and trusted_joint_boundary_evidence:
+                authorized_mismatches = (
+                    intentional_phrase_anchor_authorized_mismatches(
+                        anchor_basis=anchor_basis,
+                        scale_mismatch=metrics["scale"],
+                        focus_mismatch=metrics["focus"],
+                        layout_mismatch=metrics["layout"],
+                        silhouette_mismatch=metrics["silhouette"],
+                        formation_mismatch=metrics["formation"],
+                        pose_mismatch=metrics["pose"],
+                    )
+                )
         exceeded = tuple(
             name
             for name, value in metrics.items()
-            if value is not None and value > thresholds[name]
+            if value is not None
+            and value > thresholds[name]
+            and name not in authorized_mismatches
         )
         boundaries.append(
             BoundaryDiagnostic(
@@ -1070,6 +1246,8 @@ def _build_boundaries(
                 silhouette_mismatch=metrics["silhouette"],
                 formation_mismatch=metrics["formation"],
                 pose_mismatch=metrics["pose"],
+                intentional_transition_anchor_basis=anchor_basis,
+                authorized_mismatch_metrics=authorized_mismatches,
                 exceeded_metrics=exceeded,
             )
         )
@@ -1204,7 +1382,12 @@ def _mismatch_summaries(
                 available_count=len(values),
                 mean=(sum(values) / len(values) if values else None),
                 maximum=(max(values) if values else None),
-                exceeded_count=sum(value > threshold for value in values),
+                exceeded_count=sum(
+                    metric in boundary.exceeded_metrics
+                    for boundary in boundaries
+                    if boundary.source_switch
+                    and getattr(boundary, f"{metric}_mismatch") is not None
+                ),
             )
         )
     return tuple(summaries)
@@ -1909,6 +2092,7 @@ def review_timeline(
 
 __all__ = [
     "BoundaryDiagnostic",
+    "JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT",
     "MismatchSummary",
     "PingPongDiagnostic",
     "ReviewIssue",

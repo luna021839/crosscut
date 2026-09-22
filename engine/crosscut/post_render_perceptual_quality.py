@@ -260,6 +260,7 @@ def _identity_adjustment(value: Any) -> bool:
         "contrast": 1.0,
         "saturation": 1.0,
         "temperature_balance": 0.0,
+        "tint_balance": 0.0,
     }
     return all(
         (numeric := _finite(payload.get(name, target))) is not None
@@ -1261,6 +1262,7 @@ def evaluate_post_render_perceptual_quality(
             }
         )
     rapid_shocks: list[float] = []
+    rapid_boundary_evidence: list[dict[str, Any]] = []
     rapid_high_count = 0
     for left, right in zip(run_meta, run_meta[1:]):
         if (
@@ -1282,8 +1284,31 @@ def evaluate_post_render_perceptual_quality(
             luma_step / settings.temporal_luma_step,
             chroma_step / settings.temporal_chroma_step,
         )
+        normalized_axes = {
+            "sharpness": detail_step / settings.temporal_sharpness_log_step,
+            "luma": luma_step / settings.temporal_luma_step,
+            "chroma": chroma_step / settings.temporal_chroma_step,
+        }
+        dominant_axis = max(normalized_axes, key=normalized_axes.__getitem__)
         rapid_shocks.append(normalized)
         rapid_high_count += normalized > 1.0
+        rapid_boundary_evidence.append(
+            {
+                "outgoing_run_index": left["run_index"],
+                "incoming_run_index": right["run_index"],
+                "outgoing_source_index": left["source_index"],
+                "incoming_source_index": right["source_index"],
+                "outgoing_duration_seconds": left["duration_seconds"],
+                "incoming_duration_seconds": right["duration_seconds"],
+                "sharpness_log_step": detail_step,
+                "luma_step": luma_step,
+                "chroma_step": chroma_step,
+                "normalized_axes": normalized_axes,
+                "normalized_shock": normalized,
+                "dominant_axis": dominant_axis,
+                "above_threshold": normalized > 1.0,
+            }
+        )
     aba_count = 0
     strong_aba_count = 0
     for first, middle, last in zip(run_meta, run_meta[1:], run_meta[2:]):
@@ -1310,12 +1335,14 @@ def evaluate_post_render_perceptual_quality(
     )
     metrics["rapid_quality_alternation"] = {
         "source_run_count": len(run_meta),
+        "per_run": run_meta,
         "rapid_source_switch_boundary_count": len(rapid_shocks),
         "high_quality_shock_count": rapid_high_count,
         "high_quality_shock_fraction": rapid_fraction,
         "normalized_shock": _distribution(rapid_shocks),
         "rapid_aba_count": aba_count,
         "strong_sharpness_aba_count": strong_aba_count,
+        "per_boundary": rapid_boundary_evidence,
     }
     if (
         rapid_fraction is not None

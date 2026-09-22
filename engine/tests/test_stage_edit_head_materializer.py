@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+import crosscut.stage_edit_head_materializer as head_materializer_module
 from crosscut.stage_edit_dynamic_crop_head_v2 import (
     StageEditDynamicCropModelOutputV2,
     new_stage_edit_dynamic_crop_checkpoint_metadata_v2,
@@ -31,6 +32,7 @@ from crosscut.stage_edit_head_materializer import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
     STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
     SourceCandidateToken,
@@ -51,10 +53,14 @@ except ImportError:  # pragma: no cover
 
 def _candidate(source_id: str, value: float, *, hard_gate: bool = True):
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     return SourceCandidateToken(
         source_id=source_id,
-        features=(value,) * schema.raw_source_dimension,
-        missing_mask=(False,) * schema.raw_source_dimension,
+        features=tuple(0.0 if missing else value for missing in missing_mask),
+        missing_mask=missing_mask,
         available=True,
         hard_gate_passed=hard_gate,
     )
@@ -70,6 +76,11 @@ def _candidate_with_pose(
     schema = DEFAULT_STAGE_EDIT_SCHEMA
     features = [value] * schema.raw_source_dimension
     missing = [False] * schema.raw_source_dimension
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    for index, name in enumerate(schema.source_feature_names):
+        if name in causal_sensing_names:
+            features[index] = 0.0
+            missing[index] = True
     pose_indices = tuple(
         schema.source_feature_names.index(name)
         for name in STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES
@@ -617,16 +628,48 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
                 dynamic_crop_version=3,
                 checkpoint_metadata_filename="dynamic-crop-v3-metadata.json",
             )
+            materialization_events: list[str] = []
+            original_contextual_materializer = (
+                head_materializer_module
+                .materialize_stage_edit_contextual_runtime_frame_v2
+            )
+            original_tensorizer = head_materializer_module.tensorize_stage_edit_batch
+
+            def contextual_materializer(*args, **kwargs):
+                self.assertNotIn("tensorize", materialization_events)
+                materialization_events.append("sidecar")
+                return original_contextual_materializer(*args, **kwargs)
+
+            def tensorizer(*args, **kwargs):
+                self.assertEqual(
+                    len(self.sequence.tokens),
+                    materialization_events.count("sidecar"),
+                )
+                materialization_events.append("tensorize")
+                return original_tensorizer(*args, **kwargs)
+
             with patch(
                 "crosscut.stage_edit_head_materializer.stage_edit_readiness_report",
                 return_value=readiness,
+            ), patch(
+                "crosscut.stage_edit_head_materializer."
+                "materialize_stage_edit_contextual_runtime_frame_v2",
+                side_effect=contextual_materializer,
+            ), patch(
+                "crosscut.stage_edit_head_materializer.tensorize_stage_edit_batch",
+                side_effect=tensorizer,
             ):
                 result = materialize_stage_edit_head_frames_v3(
                     checkpoint_directory=checkpoint,
                     sequence=self.sequence,
                     canonical_source_ids=("A", "B"),
                     schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                    derivative_family_id_by_source={"A": 0, "B": 1},
                 )
+            self.assertEqual(
+                ["sidecar"] * len(self.sequence.tokens) + ["tensorize"],
+                materialization_events,
+            )
 
             self.assertEqual(
                 STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION,
@@ -661,6 +704,43 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             self.assertTrue(
                 all(frame.dynamic_crop_v2 is None for frame in result.frames)
             )
+            self.assertTrue(
+                all(
+                    frame.contextual_source_pair_runtime_v2 is not None
+                    for frame in result.frames
+                )
+            )
+            for token, frame in zip(
+                self.sequence.tokens,
+                result.frames,
+                strict=True,
+            ):
+                runtime = frame.contextual_source_pair_runtime_v2
+                assert runtime is not None
+                self.assertEqual(
+                    token.master_time_seconds,
+                    runtime.master_time_seconds,
+                )
+                self.assertEqual(
+                    DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+                    runtime.token_schema_fingerprint,
+                )
+                self.assertEqual(
+                    {"A": 0, "B": 1},
+                    {
+                        source.source_id: source.derivative_family_id
+                        for source in runtime.sources
+                    },
+                )
+                self.assertEqual(
+                    ("A", "B"),
+                    tuple(source.source_id for source in runtime.sources),
+                )
+                identity = frame.to_dict()[
+                    "contextual_source_pair_runtime_v2"
+                ]
+                self.assertNotIn("context_values", identity)
+                self.assertNotIn("values", json.dumps(identity))
 
     def test_v3_checkpoint_namespace_and_schema_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mx.stream(mx.cpu):
@@ -716,6 +796,32 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
                     sequence=self.sequence,
                     canonical_source_ids=("A", "B"),
                     schema=incompatible_schema,
+                )
+            with patch(
+                "crosscut.stage_edit_head_materializer.stage_edit_readiness_report",
+                return_value=readiness,
+            ), self.assertRaisesRegex(
+                StageEditHeadMaterializerInputError,
+                "cover canonical source ids exactly",
+            ):
+                materialize_stage_edit_head_frames_v3(
+                    checkpoint_directory=checkpoint,
+                    sequence=self.sequence,
+                    canonical_source_ids=("A", "B"),
+                    derivative_family_id_by_source={"A": 0},
+                )
+            with patch(
+                "crosscut.stage_edit_head_materializer.stage_edit_readiness_report",
+                return_value=readiness,
+            ), self.assertRaisesRegex(
+                StageEditHeadMaterializerInputError,
+                "not first-seen canonical",
+            ):
+                materialize_stage_edit_head_frames_v3(
+                    checkpoint_directory=checkpoint,
+                    sequence=self.sequence,
+                    canonical_source_ids=("A", "B"),
+                    derivative_family_id_by_source={"A": 1, "B": 2},
                 )
 
 

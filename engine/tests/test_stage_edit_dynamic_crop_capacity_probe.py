@@ -469,8 +469,15 @@ def _smoke(
         "max_sources": 32,
         "actual_observed_source_max": 10,
         "context_feature_dimension": candidate.model_config.context_input_dimension,
-        "source_feature_dimension": 720,
-        "source_tensor_shape": [2, 2048, 32, 720],
+        "source_feature_dimension": (
+            DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension
+        ),
+        "source_tensor_shape": [
+            2,
+            2048,
+            32,
+            DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+        ],
         "context_tensor_shape": [
             2,
             2048,

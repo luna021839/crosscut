@@ -1010,6 +1010,7 @@ struct ContentView: View {
         case .preparing: "준비 중"
         case .running: "편집 중"
         case .completed: "완료"
+        case .reviewReady: "검토용 초안"
         case .failed: "오류"
         case .cancelled: "취소됨"
         }
@@ -1021,6 +1022,7 @@ struct ContentView: View {
         case .preparing: "gearshape.2"
         case .running: "waveform"
         case .completed: "checkmark.circle.fill"
+        case .reviewReady: "eye.circle.fill"
         case .failed: "exclamationmark.octagon.fill"
         case .cancelled: "xmark.circle.fill"
         }
@@ -1031,6 +1033,7 @@ struct ContentView: View {
         case .idle: .secondary
         case .preparing, .running: .purple
         case .completed: .green
+        case .reviewReady: .orange
         case .failed: .red
         case .cancelled: .orange
         }

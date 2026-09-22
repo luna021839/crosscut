@@ -47,6 +47,7 @@ from crosscut.visual_score import (
     VisualTimelineCandidateSet,
     _review_ranked_candidate_indices,
 )
+from tests.stage_edit_causal_sensing_test_support import synthetic_production_gate
 
 try:
     import mlx.core as mx
@@ -166,6 +167,15 @@ class StageEditCandidateRerankTests(unittest.TestCase):
                 allow_nan=False,
             ).encode("utf-8")
         ).hexdigest()
+        sensing_gate = synthetic_production_gate()
+        reference_ids = (
+            "a-train",
+            "b-train",
+            "a-validation",
+            "b-validation",
+            "c-heldout-1",
+            "c-heldout-2",
+        )
         report = {
             "schema_version": PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
             "run_kind": PRODUCTION_TRAINING_RUN_KIND,
@@ -227,6 +237,19 @@ class StageEditCandidateRerankTests(unittest.TestCase):
                     "b-validation": "d" * 64,
                     "c-heldout-1": "e" * 64,
                     "c-heldout-2": "f" * 64,
+                },
+                "production_causal_sensing_gate_by_reference": {
+                    reference_id: sensing_gate for reference_id in reference_ids
+                },
+                "production_causal_sensing_scope": {
+                    key: sensing_gate[key]
+                    for key in (
+                        "edit_mode",
+                        "target_member",
+                        "member_feature_mode",
+                        "feature_snapshot_schema_version",
+                        "token_schema_fingerprint",
+                    )
                 },
                 "reference_match_or_current_choice_features_present": False,
                 "missing_reference_ids": [],

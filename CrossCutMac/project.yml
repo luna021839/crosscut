@@ -69,6 +69,7 @@ targets:
           /bin/mkdir -p "${engine_destination}/crosscut"
           /bin/cp "${engine_source}/crosscut_cli.py" "${engine_destination}/crosscut_cli.py"
           /bin/cp "${engine_source}/crosscut/"*.py "${engine_destination}/crosscut/"
+          /bin/cp -R "${engine_source}/crosscut/licenses" "${engine_destination}/crosscut/"
           /bin/cp -R "${engine_source}/crosscut/models" "${engine_destination}/crosscut/"
 
   CrossCutMacTests:

@@ -37,6 +37,7 @@ from crosscut.stage_edit_dynamic_crop_mlx_smoke_cli import (
 from crosscut.stage_edit_reference_adapter import ReferenceTrainingExample
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     SourceCandidateToken,
     StageEditSequence,
     StageEditTarget,
@@ -53,11 +54,18 @@ BUDGET = DeviceMemoryBudget(
 
 def _token(value: float) -> StageEditToken:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     sources = tuple(
         SourceCandidateToken(
             source_id=f"source-{index}",
-            features=(value + index,) * schema.raw_source_dimension,
-            missing_mask=(False,) * schema.raw_source_dimension,
+            features=tuple(
+                0.0 if missing else value + index
+                for missing in missing_mask
+            ),
+            missing_mask=missing_mask,
         )
         for index in range(2)
     )

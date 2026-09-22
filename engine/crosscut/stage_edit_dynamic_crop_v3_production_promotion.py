@@ -1251,6 +1251,8 @@ def _build_evaluation_corpus(
             manifests.PRODUCTION_SAMPLING_CONTRACT["boundary_guard_seconds"]
         ),
         max_sources=int(manifests.PRODUCTION_SAMPLING_CONTRACT["max_sources"]),
+        production_edit_mode="group",
+        production_target_member=None,
     )
     v2_corpus = build_stage_edit_dynamic_crop_training_corpus_v2(
         corpus.examples,
@@ -1304,6 +1306,8 @@ def _build_final_fit_training_corpus(plan: Mapping[str, Any]) -> ReferenceTraini
             manifests.PRODUCTION_SAMPLING_CONTRACT["boundary_guard_seconds"]
         ),
         max_sources=int(manifests.PRODUCTION_SAMPLING_CONTRACT["max_sources"]),
+        production_edit_mode="group",
+        production_target_member=None,
     )
 
 

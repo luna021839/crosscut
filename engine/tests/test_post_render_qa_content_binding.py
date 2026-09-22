@@ -74,6 +74,8 @@ def _report(
     fingerprints: dict[str, object],
 ) -> SimpleNamespace:
     payload = {
+        "passed": True,
+        "issues": [],
         "issue_count": 0,
         "fail_issue_count": 0,
         "conditional_issue_count": 0,

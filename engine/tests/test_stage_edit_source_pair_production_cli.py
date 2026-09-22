@@ -8,13 +8,59 @@ import unittest
 from unittest.mock import patch
 
 from crosscut.stage_edit_source_pair_production_cli import (
+    _snapshot_map,
     _song_map,
     build_parser,
     main,
 )
+from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
+from crosscut.stage_edit_transformer import (
+    DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
+    SourceCandidateToken,
+    StageEditSequence,
+    StageEditToken,
+)
 
 
 class StageEditSourcePairProductionCliTests(unittest.TestCase):
+    def test_snapshot_map_rejects_inspection_only_snapshot(self) -> None:
+        schema = DEFAULT_STAGE_EDIT_SCHEMA
+        causal_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+        missing = tuple(
+            name in causal_names for name in schema.source_feature_names
+        )
+        sequence = StageEditSequence(
+            "inspection",
+            (
+                StageEditToken(
+                    master_time_seconds=0.0,
+                    music_features=(0.0,) * len(schema.music_feature_names),
+                    section_features=(0.0,) * len(schema.section_feature_names),
+                    source_candidates=(
+                        SourceCandidateToken(
+                            source_id="source-a",
+                            features=(0.0,) * len(schema.source_feature_names),
+                            missing_mask=missing,
+                        ),
+                    ),
+                    recent_edit_features=(0.0,)
+                    * len(schema.recent_edit_feature_names),
+                    style_features=(0.0,) * len(schema.style_feature_names),
+                    missing_mask=(False,) * schema.raw_context_dimension,
+                ),
+            ),
+        )
+        snapshot = StageEditFeatureSnapshot.build(
+            sequence,
+            inspection_only_without_causal_sensing=True,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw).resolve() / "inspection.json"
+            path.write_text(json.dumps(snapshot.to_dict()), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires the hash-bound"):
+                _snapshot_map((f"ref-a={path}",))
+
     def test_song_map_is_exact_and_rejects_duplicates(self) -> None:
         self.assertEqual(
             {"ref-a": "IVE-A", "ref-b": "IVE-B"},
@@ -100,6 +146,8 @@ class StageEditSourcePairProductionCliTests(unittest.TestCase):
 
             self.assertEqual(0, code)
             self.assertEqual({"ref-a": "IVE-A"}, load.call_args.kwargs["song_id_by_reference"])
+            self.assertEqual("group", load.call_args.kwargs["production_edit_mode"])
+            self.assertIsNone(load.call_args.kwargs["production_target_member"])
             produce.assert_called_once_with(
                 corpus,
                 destination,

@@ -10,6 +10,7 @@ struct EngineEvent: Decodable, Equatable {
     let sourcePaths: [String]
     let acquisitionManifestPath: String?
     let workStatus: EngineWorkStatus?
+    let artifactResult: EngineArtifactDisposition?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -24,6 +25,7 @@ struct EngineEvent: Decodable, Equatable {
         case outputs
         case sourcePaths = "source_paths"
         case acquisitionManifest = "acquisition_manifest"
+        case artifactResult = "artifact_result"
     }
 
     init(from decoder: Decoder) throws {
@@ -54,6 +56,40 @@ struct EngineEvent: Decodable, Equatable {
             forKey: .acquisitionManifest
         )
         workStatus = try EngineWorkStatus.decode(type: type.lowercased(), from: decoder)
+        artifactResult = try container.decodeIfPresent(EngineArtifactDisposition.self, forKey: .artifactResult)
+    }
+}
+
+/// A draft is playable, but it never grants an approved/delivery UI state.
+struct EngineArtifactDisposition: Decodable, Equatable, Sendable {
+    let contract: String
+    let status: String
+    let artifactRole: String
+    let videoOutputExposed: Bool
+    let deliveryCompletionMessageAllowed: Bool
+    let technicalIssueCodes: [String]
+    let editorialIssueCodes: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case contract, status
+        case artifactRole = "artifact_role"
+        case videoOutputExposed = "video_output_exposed"
+        case deliveryCompletionMessageAllowed = "delivery_completion_message_allowed"
+        case technicalIssueCodes = "technical_issue_codes"
+        case editorialIssueCodes = "editorial_issue_codes"
+    }
+
+    func authorizes(role: String) -> Bool {
+        guard contract == "ive_review_first_runtime_v1", artifactRole == role,
+              videoOutputExposed, technicalIssueCodes.isEmpty,
+              editorialIssueCodes.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { return false }
+        switch role {
+        case "delivery":
+            return status == "APPROVED" && deliveryCompletionMessageAllowed && editorialIssueCodes.isEmpty
+        case "review_ready":
+            return status == "REVIEW_READY" && !deliveryCompletionMessageAllowed && !editorialIssueCodes.isEmpty
+        default: return false
+        }
     }
 }
 

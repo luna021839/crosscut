@@ -482,8 +482,10 @@ class VisualScoreTests(unittest.TestCase):
                 subject_metadata_by_candidate={},
             )
         )
-        self.assertEqual(dense_audit["penalty_strength"], 128.0)
-        self.assertGreater(min(dense_switch_bonus.values()), 60.0)
+        self.assertEqual(dense_audit["penalty_strength"], 2 * dense_audit["source_emission_range"])
+        self.assertFalse(dense_audit["lexicographic_role_override"])
+        self.assertLessEqual(max(dense_switch_bonus.values()), dense_audit["penalty_strength"])
+        self.assertGreater(min(dense_switch_bonus.values()), min(switch_bonus.values()))
 
         close_only_at_seven = [
             segment if index == 7 else [segment[0]]

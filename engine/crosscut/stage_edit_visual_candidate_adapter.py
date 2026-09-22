@@ -22,7 +22,9 @@ from .render import (
     RenderPlan,
     RenderTransition,
     TransitionKind,
+    _editorial_transform_track_is_identity,
 )
+from .prescribed_render_geometry import PRESCRIBED_RENDER_GEOMETRY
 from .stage_edit import StageBoundary, StageEdit, StageShot
 from .stage_edit_release_policy import (
     STAGE_EDIT_SINGLE_DELIVERY_VISUAL_CONTRACT,
@@ -1085,6 +1087,12 @@ def materialize_stage_edit_visual_candidate(
             sources=normalized_sources,
             canonical_spans=spans,
             prescribed_source_indices=source_path,
+            # Match the learned overlay's actual policy: its editorial track
+            # replaces base crop/pan, rather than being composed with them.
+            prescribed_render_segments=tuple(
+                replace(shot.segment, crop=None, pan_crop=None)
+                for shot in candidate.edit.shots
+            ),
             audio_offsets=audio_offsets,
             sync_scores=sync_scores,
             scene_cut_times=scene_cut_times,
@@ -1146,6 +1154,7 @@ def materialize_stage_edit_visual_candidate(
         selected_candidate_index=candidate_index,
         candidate_generation_basis=STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
         candidate_review_summaries=(global_record.to_dict(),),
+        geometry_basis=PRESCRIBED_RENDER_GEOMETRY,
     )
     return StageEditMaterializedVisualCandidate(
         candidate_record=global_record,
@@ -1208,14 +1217,18 @@ def dynamic_crop_v3_deterministic_geometry_override_indices(
         if transition.kind is TransitionKind.FACE_DISSOLVE
         for segment_index in (boundary_index, boundary_index + 1)
     }
+    def has_nonidentity_crop(crop):
+        return crop is not None and any(not math.isclose(value, expected, abs_tol=1e-9)
+            for value, expected in zip((crop.x, crop.y, crop.width, crop.height), (0., 0., 1., 1.)))
+
     return tuple(
         index
         for index, segment in enumerate(render_plan.segments)
         if index not in face_dissolve_segments
         and (
-            segment.crop is not None
-            or segment.pan_crop is not None
-            or segment.editorial_transform is not None
+            has_nonidentity_crop(segment.crop)
+            or (segment.pan_crop is not None and any(has_nonidentity_crop(point.crop) for point in segment.pan_crop.keyframes))
+            or not _editorial_transform_track_is_identity(segment.editorial_transform)
         )
     )
 
@@ -1257,7 +1270,8 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
     for index, (original, current) in enumerate(
         zip(original_segments, render_plan.segments, strict=True)
     ):
-        if original.source_index != current.source_index:
+        if (materialized.retained_candidate.edit.sources[original.source_index].resolve()
+                != render_plan.sources[current.source_index].resolve()):
             raise StageEditVisualCandidateError(
                 "Dynamic Crop overlay source path changed at segment "
                 f"{index}"

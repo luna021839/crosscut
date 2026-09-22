@@ -196,6 +196,47 @@ class VisualCandidateMaterializationTests(unittest.TestCase):
         )
         self.assertIn("rank-01", plans[0].output.name)
 
+    def test_role_conditioned_floor_candidate_precedes_generic_review_rank(
+        self,
+    ) -> None:
+        base = self.candidate_set()
+        conditioned = VisualTimelineCandidateSet(
+            candidates=base.candidates,
+            selected_candidate_index=base.selected_candidate_index,
+            sources=base.sources,
+            audio_offsets=base.audio_offsets,
+            source_timewarps=base.source_timewarps,
+            source_clock_basis=base.source_clock_basis,
+            requested_maximum_results=base.requested_maximum_results,
+            role_conditioned_selection={
+                "candidate_outcomes": [
+                    {
+                        "candidate_index": record.candidate_index,
+                        "metadata_role_attainment_score": (
+                            0.99 if record.candidate_index == 7 else 0.50
+                        ),
+                        "minimum_highlight_metadata_attainment_score": (
+                            0.99 if record.candidate_index == 7 else 0.40
+                        ),
+                        "all_highlight_metadata_floors_passed": (
+                            record.candidate_index == 7
+                        ),
+                    }
+                    for record in base.candidates
+                ]
+            },
+        )
+
+        self.assertEqual(
+            conditioned.role_conditioned_ranked_candidates[0].candidate_index,
+            7,
+        )
+        materialized = materialize_visual_timeline_candidates(
+            conditioned,
+            maximum_candidates=1,
+        )
+        self.assertEqual(materialized[0].candidate_index, 7)
+
     def test_candidate_set_rejects_duplicate_paths(self) -> None:
         candidate_set = self.candidate_set()
         duplicate_result = candidate_set.candidates[0].timeline_result

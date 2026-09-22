@@ -162,7 +162,12 @@ class RenderedCandidateReview:
             summary = self.review_payload.get("boundary_score")
         if not isinstance(summary, dict):
             return -math.inf
-        return float(summary.get("p10", -math.inf))
+        value = summary.get("p10")
+        return (
+            float(value)
+            if type(value) in (int, float) and math.isfinite(value)
+            else -math.inf
+        )
 
     def to_dict(self, *, selected: bool) -> dict[str, Any]:
         return {

@@ -818,6 +818,28 @@ def _member_look_calibration_metrics(
     payload = top_level or {}
     calibration = _mapping(payload.get("calibration")) or {}
     privacy = _mapping(payload.get("privacy")) or {}
+    output_proxy_refinement_applied = payload.get(
+        "output_proxy_refinement_applied"
+    )
+    output_proxy_refinement_iteration = _integer(
+        payload.get("output_proxy_refinement_iteration")
+    )
+    proxy_refinement_provenance_valid = bool(
+        type(output_proxy_refinement_applied) is bool
+        and output_proxy_refinement_iteration is not None
+        and output_proxy_refinement_iteration >= 0
+        and output_proxy_refinement_applied
+        == (output_proxy_refinement_iteration > 0)
+        and all(
+            type(calibration.get(name)) is bool
+            and calibration.get(name) is output_proxy_refinement_applied
+            for name in (
+                "full_song_proxy_rendered",
+                "additional_source_frames_decoded",
+                "output_domain_residual_composed_with_cached_grade",
+            )
+        )
+    )
     provenance_valid = bool(
         payload.get("analysis_basis") == MEMBER_LOOK_ANALYSIS_BASIS
         and _structured_numbers_close(payload.get("config"), settings.to_dict())
@@ -827,8 +849,7 @@ def _member_look_calibration_metrics(
         == "eight_real_ive_member_sources_exact_ffmpeg_central_difference_v2"
         and calibration.get("cached_descriptor_fields")
         == "lab_mean_gray_mean_gray_contrast"
-        and calibration.get("full_song_proxy_rendered") is False
-        and calibration.get("additional_source_frames_decoded") is False
+        and proxy_refinement_provenance_valid
         and privacy.get("raw_frames_persisted") is False
         and privacy.get("raw_descriptor_embeddings_persisted") is False
         and privacy.get("scalar_aggregate_only") is True
@@ -836,7 +857,10 @@ def _member_look_calibration_metrics(
     if not provenance_valid:
         issues.add(
             "member_look_calibration_provenance_invalid",
-            "Member look calibration must use the declared cache-only evidence path.",
+            (
+                "Member look calibration must bind its cached source evidence "
+                "and any decoded-output residual refinement to one declared path."
+            ),
             path="member_look_calibration.calibration",
         )
 
@@ -905,9 +929,31 @@ def _member_look_calibration_metrics(
     sharpness_span = _number(source_spans.get("sharpness_log"))
     luma_span = _number(source_spans.get("luma"))
     chroma_span = _number(source_spans.get("chroma"))
-    predicted_quality_valid = bool(
+    predicted_evidence_valid = bool(
         fraction_consistent
         and diagnostics_valid
+        and all(
+            value is not None and value >= 0.0
+            for value in (sharpness_span, luma_span, chroma_span)
+        )
+        and selected_regularization is not None
+        and any(
+            _numbers_close(
+                selected_regularization,
+                regularization,
+                tolerance=1e-12,
+            )
+            for regularization in settings.graph_regularizations
+        )
+    )
+    if not predicted_evidence_valid:
+        issues.add(
+            "member_look_calibration_prediction_evidence_invalid",
+            "Member look prediction measurements are missing or inconsistent.",
+            path="member_look_calibration.predicted_quality",
+        )
+    predicted_quality_valid = bool(
+        predicted_evidence_valid
         and (
             rapid_count is not None
             and (
@@ -925,15 +971,6 @@ def _member_look_calibration_metrics(
         and luma_span <= settings.source_luma_span + 1e-12
         and chroma_span is not None
         and chroma_span <= settings.source_chroma_span + 1e-12
-        and selected_regularization is not None
-        and any(
-            _numbers_close(
-                selected_regularization,
-                regularization,
-                tolerance=1e-12,
-            )
-            for regularization in settings.graph_regularizations
-        )
     )
     if not predicted_quality_valid:
         issues.add(
@@ -995,7 +1032,18 @@ def _member_look_calibration_metrics(
     return {
         "analysis_basis": payload.get("analysis_basis"),
         "locations_bound": locations_bound,
+        "provenance_valid": provenance_valid,
         "cache_only_provenance_valid": provenance_valid,
+        "output_proxy_refinement_applied": (
+            output_proxy_refinement_applied
+        ),
+        "output_proxy_refinement_iteration": (
+            output_proxy_refinement_iteration
+        ),
+        "proxy_refinement_provenance_valid": (
+            proxy_refinement_provenance_valid
+        ),
+        "predicted_evidence_valid": predicted_evidence_valid,
         "predicted_quality_valid": predicted_quality_valid,
         "segment_binding_valid": segment_binding_valid,
         "segment_adjustment_count": (

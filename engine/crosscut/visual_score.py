@@ -289,7 +289,7 @@ PROFESSIONAL_QUALITY_SOFT_FLOOR = 0.84
 PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY = 0.65
 # Keep selector cadence inside the independent production review envelope.
 # At the current decision-span quantization, 5.2 seconds yields a 4.90-second
-# observed run ceiling and 12.8--14.1 switches/minute on the XOXZ holdout,
+# observed run ceiling and 12.8--14.1 switches/minute on the XOXZ development sample,
 # versus the reviewer's 12.5 hard minimum and 13.5--17.5 preferred band.
 PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS = 5.2
 
@@ -306,6 +306,8 @@ def _quality_soft_floor_policy() -> dict[str, Any]:
         ),
         "above_floor_emission_unchanged": True,
         "hard_rejection": False,
+        "evidence_scope": "observed_development_songs_not_blind_system_holdout",
+        "blind_holdout_claim_authorized": False,
     }
 
 
@@ -1002,16 +1004,14 @@ def _role_conditioned_visual_controls(
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         reachable_candidate_keys=reachable_candidate_keys,
     )
-    # A complete source-local emission spans roughly 0...2.3, while the sum of
-    # all admitted transition terms can still exceed 16.  Wide separation is
-    # intentional: balanced preserves aesthetics-first exploration, reference
-    # makes the human motif decisive, and dense_safe is a lexicographic grammar
-    # exploration inside the unchanged visual hard-gate graph.
-    strength = {
-        "balanced": 8.00,
-        "reference": 32.00,
-        "dense_safe": 128.00,
-    }[cadence_profile]
+    # Shot-role intent is a soft editorial preference, not a lexicographic
+    # replacement for pose/motion continuity. Keep all profiles on the same
+    # score scale as source quality; 8/32/128 could overwhelm every admitted
+    # visual transition cost even when the shot role was merely a heuristic.
+    settings = timeline_config or TimelineConfig()
+    emission_range = sum((settings.quality_weight, settings.sync_weight,
+                          settings.composition_weight, settings.boundary_weight))
+    strength = emission_range * {"balanced": .5, "reference": 1., "dense_safe": 2.}[cadence_profile]
     adjustments: dict[tuple[int, str], float] = {}
     penalized = 0
     availability: dict[int, dict[str, float | int]] = {}
@@ -1093,7 +1093,7 @@ def _role_conditioned_visual_controls(
                 raise RuntimeError("role-conditioned shot target is unknown")
             if penalty > 1e-12:
                 adjustments[(candidate.segment_index, candidate.source_id)] = (
-                    -float(penalty)
+                    -min(strength, float(penalty))
                 )
                 penalized += 1
 
@@ -1174,6 +1174,7 @@ def _role_conditioned_visual_controls(
             72.0,
             2.40 * highlight_rate,
         )
+    highlight_bonus = min(highlight_bonus, strength)
     highlight_segments_by_section: dict[int, list[TimelineCandidate]] = {}
     for segment in candidates_by_segment:
         reference = segment[0]
@@ -1219,6 +1220,9 @@ def _role_conditioned_visual_controls(
     return adjustments, switch_bonus, {
         **audit,
         "penalty_strength": strength,
+        "penalty_strength_basis": "bounded_source_emission_range_v1",
+        "source_emission_range": emission_range,
+        "lexicographic_role_override": False,
         "penalized_candidate_count": penalized,
         "emission_adjustment_count": len(adjustments),
         "highlight_source_switch_bonus": highlight_bonus,
@@ -2280,6 +2284,7 @@ class VisualTimelineCandidateSet:
     source_timewarps: tuple[TimeWarpMap | None, ...]
     source_clock_basis: str
     requested_maximum_results: int
+    prescribed_render_segments: tuple[Any, ...] | None = None
     scene_cut_times: tuple[tuple[float, ...], ...] = ()
     face_metadata_by_candidate: Mapping[str, _CandidateFaceMetadata] = field(
         default_factory=dict,
@@ -2392,6 +2397,20 @@ class VisualTimelineCandidateSet:
             raise ValueError("requested_maximum_results must be between 8 and 32")
         if not records:
             raise ValueError("visual timeline candidate set cannot be empty")
+        if self.prescribed_render_segments is not None:
+            from .render import RenderSegment
+            segments = tuple(self.prescribed_render_segments)
+            for record in records:
+                path = record.timeline_result.candidates
+                if len(segments) != len(path) or any(
+                    not isinstance(segment, RenderSegment)
+                    or segment.source_index != int(choice.source_id)
+                    or choice.segment_index != position
+                    or not math.isclose(segment.duration, choice.end_seconds - choice.start_seconds, abs_tol=1e-6)
+                    for position, (segment, choice) in enumerate(zip(segments, path))
+                ):
+                    raise ValueError("prescribed render geometry must bind the complete retained path")
+            object.__setattr__(self, "prescribed_render_segments", segments)
         if len(records) > self.requested_maximum_results:
             raise ValueError("candidate set exceeds requested_maximum_results")
         if len(sources) < 2:
@@ -3164,6 +3183,7 @@ class VisualTimelinePlan:
     )
     candidate_review_summaries: tuple[dict[str, Any], ...] = ()
     source_clock_basis: str = "global_scalar_offset"
+    geometry_basis: str = "source_pixels"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3174,6 +3194,7 @@ class VisualTimelinePlan:
             "candidate_count": len(self.candidate_review_summaries) or 1,
             "candidate_review_summaries": list(self.candidate_review_summaries),
             "source_clock_basis": self.source_clock_basis,
+            "geometry_basis": self.geometry_basis,
             "per_shot_quality_soft_floor": _quality_soft_floor_policy(),
             "face_transition_policy": {
                 "detector": "opencv_zoo_yunet_2023mar",
@@ -6100,7 +6121,11 @@ def materialize_visual_timeline_candidate(
         if candidate_set.scene_cut_times
         else ((),) * len(candidate_set.sources)
     )
+    # Source-coordinate dissolve observations must never be mixed with the
+    # prescribed rendered-coordinate observations. Final decoded QA owns this
+    # path's transition evidence; no raw-source dissolve authority is invented.
     dissolve_entry_evidence, dissolve_exit_evidence = (
+        ({}, {}) if candidate_set.prescribed_render_segments is not None else
         _selected_dissolve_evidence(
             sources=candidate_set.sources,
             optimized=optimized,
@@ -6132,6 +6157,12 @@ def materialize_visual_timeline_candidate(
             audio_offsets=candidate_set.audio_offsets,
             source_timewarps=candidate_set.source_timewarps,
         )
+        if candidate_set.prescribed_render_segments is not None:
+            segment = candidate_set.prescribed_render_segments[choice.segment_index]
+            if segment.source_index != source_index:
+                raise ValueError("prescribed render source changed during materialization")
+            source_local_start = segment.source_start
+            source_local_end = segment.source_start + (segment.source_duration or segment.duration)
         face_metadata = candidate_set.face_metadata_by_candidate.get(
             choice.candidate_id,
             _missing_candidate_face_metadata(),
@@ -6345,6 +6376,8 @@ def materialize_visual_timeline_candidate(
         candidate_generation_basis=candidate_set.candidate_generation_basis,
         candidate_review_summaries=candidate_review_summaries,
         source_clock_basis=candidate_set.source_clock_basis,
+        geometry_basis=("prescribed_render_geometry_v1"
+                        if candidate_set.prescribed_render_segments is not None else "source_pixels"),
     )
 
 
@@ -6435,6 +6468,7 @@ def _build_visual_timeline(
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
     prescribed_source_indices: Sequence[int] | None = None,
+    prescribed_render_segments: Sequence[Any] | None = None,
     maximum_candidate_results: int,
     candidate_set_only: bool,
     optimizer_seed_only: bool = False,
@@ -6466,6 +6500,13 @@ def _build_visual_timeline(
             "optimizer_seed_only requires candidate_set_only output mode"
         )
     source_count = len(sources)
+    if prescribed_render_segments is not None:
+        from .render import RenderSegment
+        if prescribed_source_indices is None or len(prescribed_render_segments) != len(canonical_spans):
+            raise ValueError("prescribed render geometry must bind every prescribed span")
+        for segment, source_index, (start, end) in zip(prescribed_render_segments, prescribed_source_indices, canonical_spans, strict=True):
+            if not isinstance(segment, RenderSegment) or segment.source_index != source_index or not math.isclose(segment.duration, end - start, abs_tol=1e-6):
+                raise ValueError("prescribed render geometry source/time mismatch")
     if source_count < 2:
         raise ValueError("visual timeline needs at least two sources")
     if not (
@@ -6554,17 +6595,30 @@ def _build_visual_timeline(
             )
             candidates: list[TimelineCandidate] = []
             for source_index, sampler in enumerate(samplers):
+                observation_clocks = clock_maps
+                if prescribed_render_segments is not None:
+                    if source_index != prescribed_indices[segment_index]:
+                        continue
+                    from .prescribed_render_geometry import PrescribedGeometrySampler
+                    sampler = PrescribedGeometrySampler(
+                        sampler, prescribed_render_segments[segment_index],
+                        master_start=master_start,
+                    )
+                    observation_clocks = tuple(
+                        sampler.source_clock if index == source_index else clock
+                        for index, clock in enumerate(clock_maps)
+                    )
                 source_start = _source_clock_time(
                     master_start,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 source_end = _source_clock_time(
                     master_end,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 inset = min(0.05, duration * 0.12)
                 entry_master = master_start + inset
@@ -6574,32 +6628,32 @@ def _build_visual_timeline(
                     entry_master,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 exit_time = _source_clock_time(
                     exit_master,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 middle_time = _source_clock_time(
                     middle_master,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 entry_following_master = min(master_end, entry_master + 0.08)
                 entry_following_time = _source_clock_time(
                     entry_following_master,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 middle_following_time = _source_clock_time(
                     min(master_end, middle_master + 0.08),
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 # Outgoing motion must end before the rendered cut. Sampling
                 # exit -> exit+80ms looked into footage the viewer never sees
@@ -6610,7 +6664,7 @@ def _build_visual_timeline(
                     exit_preceding_master,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 entry = _describe_sampler_frame(
                     sampler,
@@ -6684,7 +6738,7 @@ def _build_visual_timeline(
                             source_cut,
                             source_index=source_index,
                             audio_offsets=audio_offsets,
-                            source_timewarps=clock_maps,
+                            source_timewarps=observation_clocks,
                         ),
                     )
                     if master_start + 1e-6 < master_cut < master_end - 1e-6
@@ -6695,25 +6749,25 @@ def _build_visual_timeline(
                     master_start + boundary_risk_window,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 exit_risk_start = _source_clock_time(
                     master_end - boundary_risk_window,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 entry_safe_start = _source_clock_time(
                     master_start - tolerance,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 exit_safe_end = _source_clock_time(
                     master_end + tolerance,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 # Camera cuts have a direction at an edit boundary. A source
                 # cut just *before* an incoming segment or just *after* an
@@ -6754,13 +6808,13 @@ def _build_visual_timeline(
                     master_start + tolerance,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 internal_end = _source_clock_time(
                     master_end - tolerance,
                     source_index=source_index,
                     audio_offsets=audio_offsets,
-                    source_timewarps=clock_maps,
+                    source_timewarps=observation_clocks,
                 )
                 has_internal_camera_cut = any(
                     internal_start < cut < internal_end
@@ -7021,6 +7075,8 @@ def _build_visual_timeline(
             "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
         )
     source_clock_basis = (
+        "prescribed_render_segment_clock_v1"
+        if prescribed_render_segments is not None else
         "local_monotonic_timewarp_with_per_source_scalar_fallback"
         if any(
             timewarp is not None and not timewarp.scalar_fallback
@@ -7112,6 +7168,8 @@ def _build_visual_timeline(
         source_timewarps=clock_maps,
         source_clock_basis=source_clock_basis,
         requested_maximum_results=maximum_candidate_results,
+        prescribed_render_segments=(tuple(prescribed_render_segments)
+                                    if prescribed_render_segments is not None else None),
         scene_cut_times=workspace_scene_cut_times,
         face_metadata_by_candidate=face_metadata_by_candidate,
         subject_metadata_by_candidate=subject_metadata_by_candidate,
@@ -7307,6 +7365,7 @@ def build_prescribed_visual_timeline_candidate_set(
     feature_cache_directory: Path | None = None,
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
+    prescribed_render_segments: Sequence[Any] | None = None,
 ) -> VisualTimelineCandidateSet:
     """Materialize one externally proposed path through existing visual gates.
 
@@ -7329,6 +7388,7 @@ def build_prescribed_visual_timeline_candidate_set(
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache,
         prescribed_source_indices=prescribed_source_indices,
+        prescribed_render_segments=prescribed_render_segments,
         maximum_candidate_results=8,
         candidate_set_only=True,
     )

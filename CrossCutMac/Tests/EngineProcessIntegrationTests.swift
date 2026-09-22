@@ -299,6 +299,26 @@ print(json.dumps({'type': 'result', 'outputs': files}), flush=True)
     }
 
     @MainActor
+    func testAutomaticReviewResultRetainsDraftStateAcrossTheRealProcessPipe() async throws {
+        let fixtures = EngineContractTests(selector: NSSelectorFromString("testReviewReadyGroupAndMemberArePlayableButNeverApproved"))
+        for mode in [EditMode.group, .member] {
+            let runner = try await runFixture(#"""
+import json, pathlib, sys
+request_path = sys.argv[sys.argv.index('--request') + 1]
+print('REQUEST_FILE:' + request_path, flush=True)
+files = json.loads(pathlib.Path(__file__).with_name('fixture-outputs.json').read_text())
+analysis = json.loads(pathlib.Path(files[0]).read_text())
+print(json.dumps({'type': 'result', 'outputs': files, 'artifact_result': analysis['post_render_qa']['review_first_disposition']}), flush=True)
+"""#, mode: mode, sourceMode: .automatic, prepareOutputs: { directory in
+                try fixtures.makeReviewReadyOutputSet(in: directory, mode: mode)
+            })
+            XCTAssertEqual(runner.state, .reviewReady)
+            XCTAssertNotNil(runner.renderedVideoURL)
+            XCTAssertTrue(runner.statusMessage.contains("최종 승인 아님"))
+        }
+    }
+
+    @MainActor
     func testFragmentedPipeEventsDoNotCompletePreflightOnlyGroupRun() async throws {
         let runner = try await runFixture(#"""
 import json, os, sys, time

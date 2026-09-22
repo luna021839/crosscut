@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -11,10 +12,21 @@ import unittest
 from unittest.mock import Mock, patch
 
 from crosscut.auto_anchor import AutoAnchorResult
-from crosscut.direct_member_visual import DirectMemberVisualSelectionError
+from crosscut.acquisition import _build_acquisition_artifact
+from crosscut.cut_local_sync import (
+    MEMBER_ACTIVATION as MEMBER_CUT_LOCAL_SYNC_ACTIVATION,
+)
+from crosscut.direct_member_visual import (
+    DirectMemberVisualConfig,
+    DirectMemberVisualSelectionError,
+)
 from crosscut.direct_member_transition import (
     OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT,
 )
+from crosscut.direct_member_rendered_proxy import (
+    DirectMemberRenderedProxyPreflight,
+)
+from crosscut.direct_member_transform import direct_member_source_frame_geometry
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from crosscut.group_transition import GroupTransitionPlan
@@ -27,13 +39,20 @@ from crosscut.member_draft import (
     SegmentCropSample,
     SegmentSubjectSample,
 )
+from crosscut.member_post_render_qa import (
+    AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
+    AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
+    RENDER_RECEIPT_CONTRACT as MEMBER_RENDER_RECEIPT_CONTRACT,
+)
 from crosscut.pipeline import (
+    _BoundarySearchBudget,
     DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH,
     DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256,
     DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
     ELIGIBLE_SOURCE_INDEX_DOMAIN,
     OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,
     REQUEST_SOURCE_INDEX_DOMAIN,
+    _DirectFullFrameSpan,
     _GroupRenderCandidateBundle,
     _apply_bounded_human_target_proxy_rank,
     _alignment_eligibility,
@@ -44,8 +63,17 @@ from crosscut.pipeline import (
     _capabilities_payload,
     _common_master_range,
     _direct_full_frame_base_partition_profile,
+    _direct_full_frame_proof_directed_child_profiles,
     _direct_full_frame_shifted_partition_profiles,
+    _direct_full_frame_visual_frontier_split_child_profiles,
     _direct_partition_failure_bottlenecks,
+    _direct_partition_future_operation_state_key,
+    _direct_partition_queue_signature_digest,
+    _direct_strict_extra_quota_assignment_candidates,
+    _direct_strict_extra_quota_assignment_failure_is_proven,
+    _DIRECT_MEMBER_FAILURE_REPORT_MAX_BYTES,
+    _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE,
+    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND,
     _derive_complete_group_candidate,
     _enforce_automatic_stage_edit_post_render_qa,
     _official_target_fancam_direct_full_frame_segments,
@@ -68,6 +96,7 @@ from crosscut.pipeline import (
     _report_stage_edit_motion_cut_profile,
     _rendered_montage_config_from_policy,
     _strip_superseded_exact_stage_edit_shot_clocks,
+    _verify_automatic_member_borderline_alignments,
     _with_index_domain,
     analyze,
 )
@@ -96,7 +125,7 @@ from crosscut.source_derivative_diversity import (
     SourceDerivativeConfig,
     SourceDerivativeDiversityResult,
 )
-from crosscut.audio import AlignmentResult, SourceAlignment
+from crosscut.audio import AlignmentResult, OffsetEstimate, SourceAlignment
 from crosscut.media import AudioStreamInfo, MediaInfo, VideoStreamInfo
 from crosscut.render import (
     RENDER_PLAN_SOURCE_INDEX_DOMAIN,
@@ -170,6 +199,54 @@ def _source_derivative_diversity_fixture(
         audit_sha256="a" * 64,
         config=SourceDerivativeConfig(),
     )
+
+
+def _professional_direct_partition_profile(
+    timing: GroupDraftTimeline,
+):
+    duration = timing.common_master_end - timing.common_master_start
+    minimum_span_count = (
+        math.ceil(
+            duration * _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE / 60.0 - 1e-9
+        )
+        + 1
+    )
+    return _direct_full_frame_base_partition_profile(
+        timing.segments,
+        minimum_span_count=minimum_span_count,
+    )
+
+
+def _current_motion_cut_profile_fixture(
+    root: Path,
+    montage_policy,
+):
+    """Write and strict-load a current-schema profile for pipeline tests only."""
+
+    from engine.tests.test_professional_motion_cut_profile import (
+        _reseal,
+        _valid_payload,
+    )
+
+    payload = _valid_payload()
+    payload["provenance"]["source_montage_profile"] = dict(
+        montage_policy.profile_identity
+    )
+    _reseal(payload)
+    from crosscut.professional_motion_cut_profile import (
+        ProfessionalMotionCutProfile,
+    )
+
+    path = ProfessionalMotionCutProfile.from_mapping(payload).write_json(
+        root / "current-motion-cut-profile.json"
+    )
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    profile = load_professional_motion_cut_profile(
+        path,
+        expected_file_sha256=file_sha256,
+        verify_source_inputs=False,
+    )
+    return profile, path, file_sha256
 
 
 def _current_montage_policy_fixture(root: Path):
@@ -370,6 +447,197 @@ def _rotating_timing_draft(
     )
 
 
+def _direct_partition_failure_fixture(
+    *,
+    span_count: int = 50,
+    failed_segment_index: int,
+    frontier_boundary_index: int,
+    zero_local_boundary_indices: tuple[int, ...] = (),
+    empty_valid_side_boundary_index: int | None = None,
+) -> dict[str, object]:
+    boundaries = []
+    for boundary_index in range(span_count - 1):
+        left_valid = list(range(10))
+        right_valid = list(range(10))
+        if boundary_index == empty_valid_side_boundary_index:
+            right_valid = []
+        boundaries.append(
+            {
+                "boundary_index": boundary_index,
+                "left_valid_source_indices": left_valid,
+                "right_valid_source_indices": right_valid,
+                "forward_reachable_left_source_indices": (
+                    [2] if boundary_index <= frontier_boundary_index else []
+                ),
+                "backward_reachable_right_source_indices": [],
+                "content_valid_cross_source_edge_count": (
+                    90 if left_valid and right_valid else 0
+                ),
+                "nonsevere_cross_source_edge_count": (
+                    0
+                    if boundary_index in zero_local_boundary_indices
+                    else 2
+                ),
+                "reachable_nonsevere_transition_count": 0,
+            }
+        )
+    return {
+        "failure": "validity_quota_path_exhausted",
+        "constraint_infeasibility_proven": True,
+        "failed_at_segment_index": failed_segment_index,
+        "hard_boundary_connectivity": {
+            "analysis_basis": (
+                "content_valid_nonsevere_no_repeat_reachability_v1"
+            ),
+            "quota_and_duration_considered": False,
+            "boundaries": boundaries,
+            "zero_local_nonsevere_transition_boundary_indices": list(
+                zero_local_boundary_indices
+            ),
+        },
+    }
+
+
+def _visual_frontier_span_diagnostic(
+    span: object,
+    *,
+    segment_index: int,
+    source_count: int = 10,
+    native_cut_master_seconds: float | None = None,
+    sample_safety_change: bool = False,
+) -> dict[str, object]:
+    start = float(getattr(span, "canonical_master_start"))
+    end = float(getattr(span, "canonical_master_end"))
+    duration = end - start
+    sample_times = (
+        start + min(1.0 / 29.97, duration * 0.08),
+        start + min(0.20, duration * 0.18),
+        start + duration * 0.25,
+        start + duration * 0.50,
+        start + duration * 0.75,
+        end - min(0.18, duration * 0.20),
+    )
+    sources: list[dict[str, object]] = []
+    for source_index in range(source_count):
+        changing = sample_safety_change and source_index == 0
+        quality = [0.10, 0.10, 0.10, 0.90, 0.90, 0.90] if changing else [0.90] * 6
+        samples = []
+        for sample_index, master_seconds in enumerate(sample_times):
+            safe = not changing or sample_index >= 3
+            samples.append(
+                {
+                    "canonical_master_seconds": master_seconds,
+                    "descriptor_available": True,
+                    "attention_basis": "aggregate_human_silhouette" if safe else None,
+                    "face_count": 1 if safe else 0,
+                    "detected_person_count": 1 if safe else 0,
+                    "formation_person_count": 1 if safe else 0,
+                    "silhouette_confidence": 0.95 if safe else 0.0,
+                    "foreground_obstruction_score": 0.0,
+                }
+            )
+        sources.append(
+            {
+                "eligible_source_index": source_index,
+                "valid": not changing and not (
+                    source_index == 0 and native_cut_master_seconds is not None
+                ),
+                "rejection_reasons": (
+                    ["persistent_low_visual_quality_or_foreground_obstruction"]
+                    if changing
+                    else ["source_native_scene_cut_inside_rendered_span"]
+                    if source_index == 0 and native_cut_master_seconds is not None
+                    else []
+                ),
+                "native_scene_cut_master_seconds": (
+                    [native_cut_master_seconds]
+                    if source_index == 0 and native_cut_master_seconds is not None
+                    else []
+                ),
+                "quality_sample_scores": quality,
+                "portrait_fancam_lighting_quality_rescue_applied": False,
+                "samples": samples,
+            }
+        )
+    return {
+        "segment_index": segment_index,
+        "canonical_master_start": start,
+        "canonical_master_end": end,
+        "sources": sources,
+    }
+
+
+def _direct_partition_exact_capacity_failure_fixture(
+    *,
+    state_limit: int,
+) -> dict[str, object]:
+    return {
+        "failure": "search_capacity_exhausted",
+        "constraint_infeasibility_proven": False,
+        "visual_gates_relaxed": False,
+        "search": {
+            "exact_lifeline": {
+                "invoked": True,
+                "explored_state_count": state_limit,
+                "memoized_failed_state_count": state_limit - 1,
+                "state_capacity_exhausted": True,
+                "duration_state_quantization_applied": False,
+                "root_candidate_diagnostics": [
+                    {
+                        "eligible_source_index": 3,
+                        "search_outcome": "search_capacity_exhausted",
+                    }
+                ],
+            }
+        },
+    }
+
+
+def _direct_partition_exact_hard_quota_failure_fixture(
+    *,
+    span_count: int,
+    valid_counts: tuple[int, ...],
+    explored_state_count: int = 275_414,
+) -> dict[str, object]:
+    source_count = len(valid_counts)
+    base_quota, extra_quota_count = divmod(span_count, source_count)
+    return {
+        "failure": "validity_quota_path_exhausted",
+        "constraint_infeasibility_proven": True,
+        "failed_at_segment_index": span_count - 2,
+        "source_quotas": [
+            base_quota + int(index < extra_quota_count)
+            for index in range(source_count)
+        ],
+        "valid_count_by_source": [
+            {
+                "eligible_source_index": index,
+                "quota": base_quota + int(index < extra_quota_count),
+                "valid_span_count": count,
+                "invalid_span_count": span_count - count,
+            }
+            for index, count in enumerate(valid_counts)
+        ],
+        "visual_gates_relaxed": False,
+        "search": {
+            "exact_lifeline": {
+                "invoked": True,
+                "explored_state_count": explored_state_count,
+                "memoized_failed_state_count": explored_state_count,
+                "state_capacity_exhausted": False,
+                "duration_state_quantization_applied": False,
+                "root_candidate_diagnostics": [
+                    {
+                        "eligible_source_index": index,
+                        "search_outcome": "subtree_infeasible",
+                    }
+                    for index in range(source_count)
+                ],
+            }
+        },
+    }
+
+
 class _MemoryReporter:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, object]]] = []
@@ -399,6 +667,19 @@ def _persist_mock_bound_qa_report(
         "issue_count": 0 if passed else 1,
         "fail_issue_count": 0,
         "conditional_issue_count": 0 if passed else 1,
+        "issues": (
+            []
+            if passed
+            else [
+                {
+                    "code": "fixture_conditional_review_failure",
+                    "severity": "conditional",
+                }
+            ]
+        ),
+        "hard_failures": [],
+        "warnings": [],
+        "passed": passed,
         "input_artifact_fingerprints": fingerprints,
     }
     report = SimpleNamespace(
@@ -433,11 +714,102 @@ def _persist_post_render_artifact_shell(
 
 
 class _VisualSelectionStub:
-    def __init__(self, source_indices: tuple[int, ...], source_count: int) -> None:
+    def __init__(
+        self,
+        source_indices: tuple[int, ...],
+        source_count: int,
+        *,
+        usage_policy: str = "heterogeneous_role_aware_safe_hold_v1",
+    ) -> None:
         self.source_indices = source_indices
+        self.usage_policy = usage_policy
+        self.optimizer_search_diagnostics: dict[str, object] = {}
         self.source_counts = tuple(
             source_indices.count(index) for index in range(source_count)
         )
+
+    def bind(
+        self,
+        canonical_spans: tuple[tuple[float, float], ...],
+        config: DirectMemberVisualConfig,
+    ) -> "_VisualSelectionStub":
+        self.selected_boundary_master_seconds = tuple(
+            float(end) for _start, end in canonical_spans[:-1]
+        )
+        self.config = config
+        source_durations = [0.0] * len(self.source_counts)
+        for source_index, (start, end) in zip(
+            self.source_indices,
+            canonical_spans,
+            strict=True,
+        ):
+            source_durations[source_index] += float(end) - float(start)
+        self.source_durations_seconds = tuple(source_durations)
+        self.source_target_durations_seconds = tuple(source_durations)
+        self.source_duration_relative_deviations = tuple(
+            0.0 for _ in source_durations
+        )
+        self.source_count_minimums = self.source_counts
+        self.source_count_maximums = self.source_counts
+        self.source_duration_minimums_seconds = tuple(source_durations)
+        self.source_duration_maximums_seconds = tuple(source_durations)
+        source_geometry = direct_member_source_frame_geometry((1080, 1920))
+        self.source_frame_geometries = tuple(
+            source_geometry for _ in self.source_counts
+        )
+        validity_sources = tuple(
+            SimpleNamespace(
+                eligible_source_index=source_index,
+                native_scene_cut_source_seconds=(),
+                samples=tuple(
+                    SimpleNamespace(
+                        descriptor=SimpleNamespace(
+                            color_embedding=(
+                                0.5,
+                                128.0 / 255.0,
+                                128.0 / 255.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.45,
+                                0.15,
+                            )
+                        )
+                    )
+                    for _ in range(3)
+                ),
+            )
+            for source_index in range(len(self.source_counts))
+        )
+        self.span_validity = tuple(
+            SimpleNamespace(sources=validity_sources)
+            for _ in canonical_spans
+        )
+        self.boundaries = tuple(
+            SimpleNamespace(
+                boundary_index=boundary_index,
+                cut_applied=(outgoing != incoming),
+                mismatch=SimpleNamespace(
+                    cinematic_bridge=None,
+                    transform_repair=None,
+                    dense_attention_validation_required=False,
+                    warning_flags=(),
+                    severe_flags=(),
+                    evidence_component_count=0,
+                    motion_connection=SimpleNamespace(
+                        both_moving=True,
+                        timestamp_bound_adjacent=False,
+                    ),
+                ),
+            )
+            for boundary_index, (outgoing, incoming) in enumerate(
+                zip(
+                    self.source_indices,
+                    self.source_indices[1:],
+                )
+            )
+        )
+        return self
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -494,6 +866,19 @@ class _VisualSelectionStub:
         }
 
 
+def _bound_visual_selection(
+    selection: _VisualSelectionStub,
+):
+    def choose(**kwargs: object) -> _VisualSelectionStub:
+        spans = kwargs["canonical_spans"]
+        config = kwargs["config"]
+        assert isinstance(spans, tuple)
+        assert isinstance(config, DirectMemberVisualConfig)
+        return selection.bind(spans, config)
+
+    return choose
+
+
 def _visual_choice(
     index: int,
     source: int,
@@ -529,8 +914,10 @@ class PipelineTests(unittest.TestCase):
     def test_rendered_montage_config_binds_hash_bound_role_policy_and_cadence(
         self,
     ) -> None:
-        policy = load_professional_montage_policy(
-            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        policy, _profile_path = _current_montage_policy_fixture(
+            Path(temporary.name)
         )
         roles = {
             item.role: item
@@ -784,9 +1171,30 @@ class PipelineTests(unittest.TestCase):
     def test_stage_edit_motion_cut_profile_binds_soft_runtime_and_manifest(
         self,
     ) -> None:
-        montage_policy = load_professional_montage_policy(
-            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        montage_policy, _montage_path = _current_montage_policy_fixture(
+            Path(temporary.name)
         )
+        expected_profile, profile_path, profile_file_sha256 = (
+            _current_motion_cut_profile_fixture(
+                Path(temporary.name),
+                montage_policy,
+            )
+        )
+        path_patch = patch(
+            "crosscut.pipeline.DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH",
+            profile_path,
+        )
+        sha_patch = patch(
+            "crosscut.pipeline."
+            "DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256",
+            profile_file_sha256,
+        )
+        path_patch.start()
+        sha_patch.start()
+        self.addCleanup(path_patch.stop)
+        self.addCleanup(sha_patch.stop)
         with patch(
             "crosscut.pipeline.load_professional_motion_cut_profile",
             wraps=load_professional_motion_cut_profile,
@@ -797,10 +1205,8 @@ class PipelineTests(unittest.TestCase):
                 montage_policy=montage_policy,
             )
         loader.assert_called_once_with(
-            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
-            expected_file_sha256=(
-                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
-            ),
+            profile_path,
+            expected_file_sha256=profile_file_sha256,
             verify_source_inputs=False,
         )
         self.assertIsNotNone(profile)
@@ -810,15 +1216,15 @@ class PipelineTests(unittest.TestCase):
             montage_policy,
         )
         self.assertEqual(
-            str(DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH),
+            str(profile_path.resolve()),
             payload["path"],
         )
         self.assertEqual(
-            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256,
+            profile_file_sha256,
             payload["file_sha256"],
         )
         self.assertEqual(
-            "9f70c549acbda2e80f3497b57c189ddbb5df4e4bbd4f5eda9095c5af699ae680",
+            expected_profile.profile_content_sha256,
             payload["content_sha256"],
         )
         self.assertEqual(
@@ -832,16 +1238,17 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(payload["source_identity_binding_passed"])
         self.assertFalse(payload["direction_or_velocity_proven"])
         runtime = payload["runtime_binding"]
+        expected_recommendation = expected_profile.recommendation
         self.assertAlmostEqual(
-            0.0002705025925969218,
+            expected_recommendation.both_moving_minimum_pose_motion,
             runtime["both_motion_minimum_pose_motion_p10"],
         )
         self.assertAlmostEqual(
-            -0.49213925079872173,
+            expected_recommendation.continuity_compatible_minimum_score,
             runtime["continuity_minimum_score_p10"],
         )
         self.assertAlmostEqual(
-            0.8486102174679628,
+            expected_recommendation.pose_phase_compatible_preferred_cosine,
             runtime["same_time_pose_cosine_soft_bonus_qualifier_p50"],
         )
         self.assertTrue(runtime["soft_bonus_only"])
@@ -868,15 +1275,15 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIsNotNone(config.highlight_motion_calibration)
         self.assertAlmostEqual(
-            0.0002705025925969218,
+            expected_recommendation.both_moving_minimum_pose_motion,
             config.highlight_motion_boundary_minimum_pose_motion,
         )
         self.assertAlmostEqual(
-            -0.49213925079872173,
+            expected_recommendation.continuity_compatible_minimum_score,
             config.highlight_motion_boundary_minimum_continuity_score,
         )
         self.assertAlmostEqual(
-            0.8486102174679628,
+            expected_recommendation.pose_phase_compatible_preferred_cosine,
             config.highlight_motion_boundary_minimum_pose_phase_cosine,
         )
         self.assertIsNone(
@@ -903,8 +1310,10 @@ class PipelineTests(unittest.TestCase):
     def test_stage_edit_motion_cut_profile_fails_closed_on_file_or_source_change(
         self,
     ) -> None:
-        montage_policy = load_professional_montage_policy(
-            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        montage_policy, _montage_path = _current_montage_policy_fixture(
+            Path(temporary.name)
         )
         for error in (
             FileNotFoundError("profile missing"),
@@ -921,13 +1330,25 @@ class PipelineTests(unittest.TestCase):
                         montage_policy=montage_policy,
                     )
 
-        profile = load_professional_motion_cut_profile(
-            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
-            expected_file_sha256=(
-                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
-            ),
-            verify_source_inputs=False,
+        profile, profile_path, profile_file_sha256 = (
+            _current_motion_cut_profile_fixture(
+                Path(temporary.name),
+                montage_policy,
+            )
         )
+        path_patch = patch(
+            "crosscut.pipeline.DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH",
+            profile_path,
+        )
+        sha_patch = patch(
+            "crosscut.pipeline."
+            "DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256",
+            profile_file_sha256,
+        )
+        path_patch.start()
+        sha_patch.start()
+        self.addCleanup(path_patch.stop)
+        self.addCleanup(sha_patch.stop)
         changed_policy = replace(
             montage_policy,
             identity=replace(
@@ -951,16 +1372,30 @@ class PipelineTests(unittest.TestCase):
     def test_active_learned_continuity_keeps_independent_handcrafted_motion_qualifier(
         self,
     ) -> None:
-        montage_policy = load_professional_montage_policy(
-            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        montage_policy, _montage_path = _current_montage_policy_fixture(
+            Path(temporary.name)
         )
-        profile = load_professional_motion_cut_profile(
-            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
-            expected_file_sha256=(
-                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
-            ),
-            verify_source_inputs=False,
+        profile, profile_path, profile_file_sha256 = (
+            _current_motion_cut_profile_fixture(
+                Path(temporary.name),
+                montage_policy,
+            )
         )
+        path_patch = patch(
+            "crosscut.pipeline.DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH",
+            profile_path,
+        )
+        sha_patch = patch(
+            "crosscut.pipeline."
+            "DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256",
+            profile_file_sha256,
+        )
+        path_patch.start()
+        sha_patch.start()
+        self.addCleanup(path_patch.stop)
+        self.addCleanup(sha_patch.stop)
         config = _stage_edit_semimarkov_config_from_montage_policy(
             montage_policy,
             motion_cut_profile=profile,
@@ -1103,8 +1538,13 @@ class PipelineTests(unittest.TestCase):
                 review_rank=2,
                 cadence_profile="synthetic-cadence",
             )
-            repaired = VisualBoundaryRepairPlan(visual, (), 0, ())
-            timeline_review = SimpleNamespace(weighted_score=81.5)
+            repaired = VisualBoundaryRepairPlan(visual, (visual,), (), 0, ())
+            timeline_review = SimpleNamespace(
+                weighted_score=81.5,
+                passed=True,
+                hard_failures=(),
+                warnings=(),
+            )
             face_match = SimpleNamespace(
                 pan_crop_for=lambda _segment_index: None,
             )
@@ -1113,6 +1553,7 @@ class PipelineTests(unittest.TestCase):
                 analysis_basis="synthetic_complete_candidate",
             )
             affine = SimpleNamespace()
+            boundary_subject = SimpleNamespace()
             editorial = SimpleNamespace(
                 track_for=lambda _segment_index: None,
             )
@@ -1150,6 +1591,9 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.build_boundary_affine_plan",
                 return_value=affine,
             ) as boundary_affine, patch(
+                "crosscut.pipeline.build_boundary_subject_alignment_plan",
+                return_value=boundary_subject,
+            ) as subject_alignment, patch(
                 "crosscut.pipeline.build_editorial_motion_plan",
                 return_value=editorial,
             ) as motion:
@@ -1184,6 +1628,7 @@ class PipelineTests(unittest.TestCase):
             face.assert_called_once()
             transition.assert_called_once()
             boundary_affine.assert_called_once()
+            subject_alignment.assert_called_once()
             motion.assert_called_once()
             boundary_color.assert_called_once()
             boundary_color_verify.assert_called_once()
@@ -1298,6 +1743,9 @@ class PipelineTests(unittest.TestCase):
                     ),
                     editorial_motion_plan=None,
                     candidate_origin="explicit_stage_edit_generation",
+                    stage_edit_dynamic_crop_version=2,
+                    stage_edit_dynamic_crop_v3_decodes=None,
+                    dynamic_crop_motion_timeline_v3=None,
                     candidate_lineage=(
                         {
                             "exact_music_structure_shot_clock": {
@@ -1342,6 +1790,30 @@ class PipelineTests(unittest.TestCase):
             }
             reviewed_payloads: list[dict[str, object]] = []
             sentinel = object()
+            boundary_evidence = SimpleNamespace(
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "evidence_sha256": "c" * 64,
+                }
+            )
+            boundary_assessment_passed = SimpleNamespace(
+                passed=True,
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "passed": True,
+                    "failure_reasons": [],
+                },
+            )
+            boundary_assessment_failed = SimpleNamespace(
+                passed=False,
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "passed": False,
+                    "failure_reasons": [
+                        "highlight_no_switch_gap_above_maximum"
+                    ],
+                },
+            )
 
             def review_batch(rendered, **kwargs):
                 for item in rendered:
@@ -1377,21 +1849,36 @@ class PipelineTests(unittest.TestCase):
                         }
                     },
                 },
-            ) as montage_review:
+            ) as montage_review, patch(
+                "crosscut.pipeline.adapt_group_boundary_grammar_evidence",
+                return_value=boundary_evidence,
+            ) as boundary_adapter, patch(
+                "crosscut.pipeline.assess_professional_boundary_grammar",
+                side_effect=(
+                    boundary_assessment_failed,
+                    *([boundary_assessment_passed] * 7),
+                ),
+            ) as boundary_gate:
                 result = _review_complete_group_candidates(
                     bundles,  # type: ignore[arg-type]
                     scratch_directory=root,
                     stage_edit_montage_section_plan=section_plan,  # type: ignore[arg-type]
                     stage_edit_source_derivative_diversity=diversity,  # type: ignore[arg-type]
                     stage_edit_source_index_mapping={"bound": True},
+                    stage_edit_source_scene_cut_times=((),),
                     stage_edit_montage_config=RenderedMontageGrammarConfig(),
                     stage_edit_montage_reference_profile=identity,
                 )
 
             self.assertIs(result, sentinel)
             self.assertEqual(montage_review.call_count, 8)
+            self.assertEqual(boundary_adapter.call_count, 8)
+            self.assertEqual(boundary_gate.call_count, 8)
             self.assertEqual(len(reviewed_payloads), 8)
-            self.assertTrue(all(item["passed"] for item in reviewed_payloads))
+            self.assertFalse(reviewed_payloads[0]["passed"])
+            self.assertTrue(
+                all(item["passed"] for item in reviewed_payloads[1:])
+            )
             self.assertTrue(
                 all(
                     item["rendered_montage_grammar_review"][
@@ -1399,6 +1886,19 @@ class PipelineTests(unittest.TestCase):
                     ]
                     == identity
                     for item in reviewed_payloads
+                )
+            )
+            self.assertFalse(
+                reviewed_payloads[0]["rendered_montage_grammar_review"][
+                    "professional_boundary_grammar_assessment"
+                ]["passed"]
+            )
+            self.assertTrue(
+                all(
+                    item["rendered_montage_grammar_review"][
+                        "professional_boundary_grammar_assessment"
+                    ]["passed"]
+                    for item in reviewed_payloads[1:]
                 )
             )
 
@@ -1653,6 +2153,10 @@ class PipelineTests(unittest.TestCase):
             candidate_lineage=lineage,
             visual_timeline=SimpleNamespace(to_dict=lambda: {"choices": []}),
             editorial_motion_plan=None,
+            candidate_origin="ordinary_visual_baseline",
+            stage_edit_dynamic_crop_version=None,
+            stage_edit_dynamic_crop_v3_decodes=None,
+            dynamic_crop_motion_timeline_v3=None,
             stage_edit_exact_shot_clock=final_clock,
         )
 
@@ -1934,13 +2438,14 @@ class PipelineTests(unittest.TestCase):
                 cadence_profile="synthetic",
                 pre_render_score=90.0,
                 visual_timeline=original_visual,
-                boundary_repairs=None,
+                boundary_repairs=SimpleNamespace(),
                 timeline_review=None,
                 face_match_plan=None,
                 group_transition_plan=transitions,
                 boundary_affine_plan=None,
                 editorial_motion_plan=None,
                 render_plan=original_plan,
+                splice_graph_authorization={"proxy_eligible": True},
             )
             partial_bundle = _GroupRenderCandidateBundle(
                 candidate_index=3,
@@ -1949,7 +2454,7 @@ class PipelineTests(unittest.TestCase):
                 pre_render_score=89.0,
                 visual_timeline=repaired_visual,
                 boundary_repairs=None,
-                timeline_review=None,
+                timeline_review=SimpleNamespace(passed=True),
                 face_match_plan=None,
                 group_transition_plan=transitions,
                 boundary_affine_plan=None,
@@ -1981,7 +2486,7 @@ class PipelineTests(unittest.TestCase):
                 pre_render_score=999.0,
                 visual_timeline=polluted_visual,
                 boundary_repairs=None,
-                timeline_review=None,
+                timeline_review=SimpleNamespace(passed=True),
                 face_match_plan=None,
                 group_transition_plan=transitions,
                 boundary_affine_plan=None,
@@ -2022,9 +2527,20 @@ class PipelineTests(unittest.TestCase):
             materialized = SimpleNamespace(candidate_index=3)
 
             with patch(
-                "crosscut.pipeline.repair_visual_timeline_boundaries",
+                "crosscut.pipeline._budgeted_repair_visual_timeline_boundaries",
                 return_value=targeted,
             ) as repair, patch(
+                "crosscut.pipeline._record_boundary_repair_assessments",
+            ), patch(
+                "crosscut.pipeline._authorize_partial_reedit_splice_lineage",
+                return_value=(
+                    targeted,
+                    {
+                        "proxy_eligible": True,
+                        "geometry_proof_boundary_indices": [],
+                    },
+                ),
+            ), patch(
                 "crosscut.pipeline._derive_complete_group_candidate",
                 return_value=partial_bundle,
             ) as derive, patch(
@@ -2051,6 +2567,11 @@ class PipelineTests(unittest.TestCase):
                     width=1920,
                     height=1080,
                     scratch_directory=root,
+                    boundary_descriptor_cache=SimpleNamespace(),
+                    splice_feasibility_graph=SimpleNamespace(),
+                    boundary_search_budget=_BoundarySearchBudget(
+                        structural_edge_bound=4
+                    ),
                 )
                 after_review["weighted_score"] = 60.0
                 after_review["boundary_score"] = {
@@ -2075,6 +2596,11 @@ class PipelineTests(unittest.TestCase):
                     width=1920,
                     height=1080,
                     scratch_directory=root,
+                    boundary_descriptor_cache=SimpleNamespace(),
+                    splice_feasibility_graph=SimpleNamespace(),
+                    boundary_search_budget=_BoundarySearchBudget(
+                        structural_edge_bound=4
+                    ),
                 )
                 successful_review_kwargs = dict(proxy_review.call_args.kwargs)
                 self.assertEqual(proxy_review.call_count, 2)
@@ -2098,6 +2624,11 @@ class PipelineTests(unittest.TestCase):
                     width=1920,
                     height=1080,
                     scratch_directory=root,
+                    boundary_descriptor_cache=SimpleNamespace(),
+                    splice_feasibility_graph=SimpleNamespace(),
+                    boundary_search_budget=_BoundarySearchBudget(
+                        structural_edge_bound=4
+                    ),
                 )
                 proxy_review.assert_not_called()
                 derive.return_value = partial_bundle
@@ -2125,9 +2656,25 @@ class PipelineTests(unittest.TestCase):
                     width=1920,
                     height=1080,
                     scratch_directory=root,
+                    boundary_descriptor_cache=SimpleNamespace(),
+                    splice_feasibility_graph=SimpleNamespace(),
+                    boundary_search_budget=_BoundarySearchBudget(
+                        structural_edge_bound=4
+                    ),
                 )
 
-            self.assertIs(result.selected_bundle, partial_bundle)
+            self.assertEqual(
+                result.selected_bundle.render_plan,
+                partial_bundle.render_plan,
+            )
+            self.assertIs(result.selected_bundle.boundary_repairs, targeted)
+            self.assertEqual(
+                result.selected_bundle.splice_graph_authorization,
+                {
+                    "proxy_eligible": True,
+                    "geometry_proof_boundary_indices": [],
+                },
+            )
             self.assertEqual(
                 result.selected_review_payload["weighted_score"],
                 80.0,
@@ -2256,13 +2803,14 @@ class PipelineTests(unittest.TestCase):
                 cadence_profile="synthetic",
                 pre_render_score=90.0,
                 visual_timeline=visual,
-                boundary_repairs=None,
+                boundary_repairs=SimpleNamespace(),
                 timeline_review=None,
                 face_match_plan=None,
                 group_transition_plan=transitions,
                 boundary_affine_plan=None,
                 editorial_motion_plan=None,
                 render_plan=plan,
+                splice_graph_authorization={"proxy_eligible": True},
             )
             targeted = SimpleNamespace(
                 timeline=visual,
@@ -2291,9 +2839,11 @@ class PipelineTests(unittest.TestCase):
             )
 
             with patch(
-                "crosscut.pipeline.repair_visual_timeline_boundaries",
+                "crosscut.pipeline._budgeted_repair_visual_timeline_boundaries",
                 return_value=targeted,
-            ) as repair:
+            ) as repair, patch(
+                "crosscut.pipeline._record_boundary_repair_assessments",
+            ):
                 result = _attempt_proxy_triggered_partial_reedit(
                     bundle,
                     SimpleNamespace(candidate_index=4),  # type: ignore[arg-type]
@@ -2313,6 +2863,11 @@ class PipelineTests(unittest.TestCase):
                     height=1080,
                     scratch_directory=root,
                     learned_issue_boundary_indices=(1,),
+                    boundary_descriptor_cache=SimpleNamespace(),
+                    splice_feasibility_graph=SimpleNamespace(),
+                    boundary_search_budget=_BoundarySearchBudget(
+                        structural_edge_bound=1
+                    ),
                 )
 
             self.assertIs(result.selected_bundle, bundle)
@@ -2822,6 +3377,9 @@ class PipelineTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            montage_policy, _montage_path = _current_montage_policy_fixture(
+                root
+            )
             sources = tuple(root / f"source-{index}.mp4" for index in range(9))
             for source in sources:
                 source.touch()
@@ -2830,6 +3388,7 @@ class PipelineTests(unittest.TestCase):
                     "song": "I AM",
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
+                    "review_first_enabled": False,
                     "sources": [str(source) for source in sources],
                     "output_directory": str(root / "out"),
                 }
@@ -2840,6 +3399,7 @@ class PipelineTests(unittest.TestCase):
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
                     "source_mode": "automatic",
+                    "review_first_enabled": False,
                     "sources": [str(source) for source in sources],
                     "output_directory": str(root / "automatic-out"),
                 }
@@ -2910,6 +3470,7 @@ class PipelineTests(unittest.TestCase):
             )
             repairs = VisualBoundaryRepairPlan(
                 timeline=visual_timeline,
+                attempt_input_timelines=(visual_timeline,),
                 repairs=(),
                 skipped_same_source_boundaries=1,
                 failures=(),
@@ -2935,7 +3496,11 @@ class PipelineTests(unittest.TestCase):
 
             reporter = _MemoryReporter()
             with patch(
-                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+                "crosscut.pipeline._load_stage_edit_montage_policy",
+                return_value=montage_policy,
+            ), patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement",
+                return_value=None,
             ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
@@ -2946,8 +3511,11 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                return_value=(),
+                "crosscut.pipeline.analyze_source_derivative_diversity",
+                return_value=_source_derivative_diversity_fixture(len(sources)),
+            ), patch(
+                "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                return_value=((), {"detection_policy": "synthetic_test"}),
             ), patch(
                 "crosscut.pipeline.build_group_draft",
                 return_value=group_draft,
@@ -2971,14 +3539,20 @@ class PipelineTests(unittest.TestCase):
                     RuntimeError,
                     "automatic GROUP render blocked by timeline review failures",
                 ):
-                    analyze(automatic_request, reporter)  # type: ignore[arg-type]
+                    analyze(
+                        automatic_request,
+                        reporter,  # type: ignore[arg-type]
+                    )
                 render_video.assert_not_called()
                 automatic_artifact = analyze(
                     automatic_request,
                     reporter,  # type: ignore[arg-type]
                     allow_failed_comparison_render=True,
                 )
-                artifact = analyze(request, reporter)  # type: ignore[arg-type]
+                artifact = analyze(
+                    request,
+                    reporter,  # type: ignore[arg-type]
+                )
 
             self.assertEqual(render_video.call_count, 2)
             self.assertTrue(
@@ -3052,6 +3626,9 @@ class PipelineTests(unittest.TestCase):
     def test_automatic_group_visual_failure_requires_comparison_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            montage_policy, _montage_path = _current_montage_policy_fixture(
+                root
+            )
             sources = tuple(root / f"source-{index}.mp4" for index in range(9))
             for source in sources:
                 source.touch()
@@ -3061,6 +3638,7 @@ class PipelineTests(unittest.TestCase):
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
                     "source_mode": "automatic",
+                    "review_first_enabled": False,
                     "sources": [str(source) for source in sources],
                     "output_directory": str(root / "out"),
                 }
@@ -3142,7 +3720,11 @@ class PipelineTests(unittest.TestCase):
                     }
 
             with patch(
-                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+                "crosscut.pipeline._load_stage_edit_montage_policy",
+                return_value=montage_policy,
+            ), patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement",
+                return_value=None,
             ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
@@ -3156,8 +3738,11 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                return_value=(),
+                "crosscut.pipeline.analyze_source_derivative_diversity",
+                return_value=_source_derivative_diversity_fixture(len(sources)),
+            ), patch(
+                "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                return_value=((), {"detection_policy": "synthetic_test"}),
             ), patch(
                 "crosscut.pipeline.estimate_shared_performance_range",
                 return_value=PerformanceRangeStub(),
@@ -3175,7 +3760,10 @@ class PipelineTests(unittest.TestCase):
                     RuntimeError,
                     "automatic GROUP render requires a visual timeline",
                 ):
-                    analyze(request, _MemoryReporter())  # type: ignore[arg-type]
+                    analyze(
+                        request,
+                        _MemoryReporter(),  # type: ignore[arg-type]
+                    )
                 render_video.assert_not_called()
                 artifact = analyze(
                     request,
@@ -3230,6 +3818,9 @@ class PipelineTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            montage_policy, _montage_path = _current_montage_policy_fixture(
+                root
+            )
             sources = tuple(root / f"source-{index}.mp4" for index in range(9))
             for source in sources:
                 source.touch()
@@ -3240,6 +3831,7 @@ class PipelineTests(unittest.TestCase):
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
                     "source_mode": "automatic",
+                    "review_first_enabled": False,
                     "sources": [str(source) for source in sources],
                     "reference_source": reference_index,
                     "output_directory": str(root / "out"),
@@ -3348,7 +3940,11 @@ class PipelineTests(unittest.TestCase):
                 return (SceneChange(frame_index, 0.9, 0.8, 0.7),)
 
             with patch(
-                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+                "crosscut.pipeline._load_stage_edit_montage_policy",
+                return_value=montage_policy,
+            ), patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement",
+                return_value=None,
             ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
@@ -3362,8 +3958,14 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                side_effect=scene_changes,
+                "crosscut.pipeline.analyze_source_derivative_diversity",
+                return_value=_source_derivative_diversity_fixture(len(sources)),
+            ), patch(
+                "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                side_effect=lambda source, **kwargs: (
+                    scene_changes(source, **kwargs),
+                    {"detection_policy": "synthetic_test"},
+                ),
             ), patch(
                 "crosscut.pipeline.estimate_shared_performance_range",
                 side_effect=estimate_performance,
@@ -3378,7 +3980,10 @@ class PipelineTests(unittest.TestCase):
                     RuntimeError,
                     "automatic GROUP render requires a visual timeline",
                 ):
-                    analyze(request, _MemoryReporter())  # type: ignore[arg-type]
+                    analyze(
+                        request,
+                        _MemoryReporter(),  # type: ignore[arg-type]
+                    )
 
             render_video.assert_not_called()
             estimate_performance_range.assert_called_once()
@@ -3888,8 +4493,11 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                side_effect=scene_changes,
+                "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                side_effect=lambda source, **kwargs: (
+                    scene_changes(source, **kwargs),
+                    {"detection_policy": "synthetic_test"},
+                ),
             ), patch(
                 "crosscut.pipeline.track_anchored_member",
                 return_value=_tracking("synthetic", 1.0),
@@ -4376,6 +4984,364 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(group[1]["render_eligible"])
         self.assertTrue(member[1]["render_eligible"])
 
+    def test_member_fancam_alignment_rejects_unsealed_peer_claim(self) -> None:
+        alignment = AlignmentResult(
+            reference="reference",
+            sample_rate=4_000,
+            alignments=(
+                SourceAlignment(
+                    "reference", True, 0, 0.0, 1.0, 876_000, 219.0,
+                    backend="reference",
+                ),
+                SourceAlignment(
+                    "mbc-gaeul", False, 7_218, 1.8045977011494252,
+                    0.2977856872655474, 875_724, 218.93103448275863,
+                    second_best_score=0.19159423832693445,
+                    score_margin=0.10619144893861293,
+                    overlap_ratio=1.0,
+                    backend="spectral_flux_ncc",
+                ),
+            ),
+        )
+
+        peer_consensus = {
+            "contract": (
+                "automatic_member_borderline_multi_peer_"
+                "alignment_consensus_v1"
+            ),
+            "sources": [
+                {
+                    "source_index": 1,
+                    "authorized": True,
+                    "direct_alignment": {
+                        "offset_seconds": 1.8045977011494252,
+                        "score": 0.2977856872655474,
+                        "score_margin": 0.10619144893861293,
+                        "overlap_ratio": 1.0,
+                        "backend": "spectral_flux_ncc",
+                    },
+                }
+            ],
+        }
+        group = _alignment_eligibility(alignment, edit_mode=EditMode.GROUP)
+        member_without_peers = _alignment_eligibility(
+            alignment,
+            edit_mode=EditMode.MEMBER,
+        )
+        member = _alignment_eligibility(
+            alignment,
+            edit_mode=EditMode.MEMBER,
+            member_peer_consensus=peer_consensus,
+        )
+
+        self.assertFalse(group[1]["render_eligible"])
+        self.assertFalse(member_without_peers[1]["render_eligible"])
+        self.assertFalse(member[1]["render_eligible"])
+        self.assertNotEqual(member[1]["reasons"], [])
+        self.assertEqual(
+            member[1]["policy"],
+            "member_fancam_multi_peer_consensus_v3",
+        )
+        self.assertFalse(
+            member[1]["measured"]["peer_consensus_acceptance_applied"]
+        )
+        self.assertEqual(
+            member[1]["thresholds"][
+                "peer_consensus_candidate_score_floor"
+            ],
+            0.18,
+        )
+
+    def test_member_fancam_near_floor_still_rejects_ambiguous_peak(self) -> None:
+        alignment = AlignmentResult(
+            reference="reference",
+            sample_rate=4_000,
+            alignments=(
+                SourceAlignment(
+                    "reference", True, 0, 0.0, 1.0, 800_000, 200.0,
+                    backend="reference",
+                ),
+                SourceAlignment(
+                    "ambiguous-fancam", False, 7_000, 1.75, 0.295,
+                    780_000, 195.0,
+                    second_best_score=0.215,
+                    score_margin=0.08,
+                    overlap_ratio=1.0,
+                    backend="spectral_flux_ncc",
+                ),
+            ),
+        )
+
+        member = _alignment_eligibility(alignment, edit_mode=EditMode.MEMBER)
+
+        self.assertFalse(member[1]["render_eligible"])
+        self.assertFalse(
+            member[1]["measured"]["peer_consensus_acceptance_applied"]
+        )
+
+    def test_member_peer_candidate_covers_margin_only_baseline_failure(self) -> None:
+        alignment = AlignmentResult(
+            reference="reference",
+            sample_rate=4_000,
+            alignments=(
+                SourceAlignment(
+                    "reference", True, 0, 0.0, 1.0, 800_000, 200.0,
+                    backend="reference",
+                ),
+                SourceAlignment(
+                    "low-margin-fancam", False, 7_000, 1.75, 0.40,
+                    780_000, 195.0, second_best_score=0.37,
+                    score_margin=0.03, overlap_ratio=1.0,
+                    backend="spectral_flux_ncc",
+                ),
+            ),
+        )
+
+        member = _alignment_eligibility(alignment, edit_mode=EditMode.MEMBER)
+
+        self.assertFalse(member[1]["render_eligible"])
+        self.assertTrue(member[1]["measured"]["peer_consensus_candidate"])
+
+    def test_member_borderline_alignment_uses_two_independent_peer_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            sources = tuple(root / f"source-{index}.mp4" for index in range(4))
+            selected = []
+            for index, source in enumerate(sources):
+                content = f"verified member source {index}\n".encode()
+                source.write_bytes(content)
+                selected.append(
+                    {
+                        "source_index": index,
+                        "video_id": f"video{index:06d}",
+                        "title": (
+                            "IVE GAEUL fancam Music Bank "
+                            f"2026-03-{index + 1:02d}"
+                        ),
+                        "local_path": str(source),
+                        "broadcast_date": f"2026-03-{index + 1:02d}",
+                        "broadcast_program": "music_bank",
+                        "channel_id": f"channel-{index}",
+                        "media_validation": {"passed": True},
+                        "aspect_validation": {"passed": True},
+                        "content_integrity": {
+                            "contract_version": 1,
+                            "algorithm": "sha256",
+                            "size_bytes": len(content),
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                        },
+                    }
+                )
+            manifest = {
+                "schema_version": 1,
+                "selection_policy_version": 4,
+                "content_integrity_contract_version": 1,
+                "automatic_media_quality_contract_version": 1,
+                "member_portrait_aspect_contract_version": 2,
+                "group": "IVE",
+                "song": "BLACKHOLE",
+                "edit_mode": "member",
+                "target_member": "가을",
+                "selected": selected,
+                "summary": {"status": "complete"},
+            }
+            manifest_path = cache / "acquisition-manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            acquisition = _build_acquisition_artifact(
+                source_paths=sources,
+                manifest_path=manifest_path,
+                manifest=manifest,
+            )
+            request = AnalysisRequest(
+                song="BLACKHOLE",
+                edit_mode=EditMode.MEMBER,
+                aspect_ratio=AspectRatio.PORTRAIT,
+                sources=sources,
+                output_directory=root / "output",
+                target_member=IVEMember.GAEUL,
+                source_mode=SourceMode.AUTOMATIC,
+                source_cache_directory=cache,
+            )
+            alignment = AlignmentResult(
+                reference=str(sources[0]),
+                sample_rate=4_000,
+                alignments=(
+                    SourceAlignment(
+                        str(sources[0]), True, 0, 0.0, 1.0, 880_000, 220.0,
+                        backend="reference",
+                    ),
+                    SourceAlignment(
+                        str(sources[1]), False, 8_000, 2.0, 0.42,
+                        876_000, 219.0, second_best_score=0.20,
+                        score_margin=0.22, overlap_ratio=1.0,
+                        backend="spectral_flux_ncc",
+                    ),
+                    SourceAlignment(
+                        str(sources[2]), False, 4_000, 1.0, 0.40,
+                        876_000, 219.0, second_best_score=0.19,
+                        score_margin=0.21, overlap_ratio=1.0,
+                        backend="spectral_flux_ncc",
+                    ),
+                    SourceAlignment(
+                        str(sources[3]), False, 7_200, 1.8, 0.2978,
+                        876_000, 219.0, second_best_score=0.19,
+                        score_margin=0.1078, overlap_ratio=1.0,
+                        backend="spectral_flux_ncc",
+                    ),
+                ),
+            )
+            estimates = iter(
+                (
+                    OffsetEstimate(
+                        -800, -0.2, 0.31, 870_000, 217.5, 4_000,
+                        0.19, 0.12, 0.99, "spectral_flux_ncc",
+                    ),
+                    OffsetEstimate(
+                        3_200, 0.8, 0.35, 870_000, 217.5, 4_000,
+                        0.20, 0.15, 0.99, "spectral_flux_ncc",
+                    ),
+                )
+            )
+
+            with patch(
+                "crosscut.pipeline.extract_mono_pcm",
+                side_effect=lambda source, sample_rate: [
+                    float(sources.index(Path(source)) + 1)
+                ]
+                * 8_000,
+            ), patch(
+                "crosscut.pipeline.spectral_flux_alignment_offset",
+                side_effect=lambda *args, **kwargs: next(estimates),
+            ):
+                evidence = _verify_automatic_member_borderline_alignments(
+                    request,
+                    alignment,
+                    reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                    acquisition_identity_authority=(
+                        acquisition.member_identity_authority
+                    ),
+                )
+                original_manifest_bytes = manifest_path.read_bytes()
+                same_slot_manifest = deepcopy(manifest)
+                same_slot_manifest["selected"][2]["broadcast_date"] = (
+                    same_slot_manifest["selected"][1]["broadcast_date"]
+                )
+                same_slot_manifest["selected"][2]["title"] = (
+                    "IVE GAEUL fancam Music Bank "
+                    + same_slot_manifest["selected"][1]["broadcast_date"]
+                )
+                same_slot_manifest["selected"][2]["broadcast_program"] = (
+                    same_slot_manifest["selected"][1]["broadcast_program"]
+                )
+                manifest_path.write_text(
+                    json.dumps(
+                        same_slot_manifest,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                same_slot_acquisition = _build_acquisition_artifact(
+                    source_paths=sources,
+                    manifest_path=manifest_path,
+                    manifest=same_slot_manifest,
+                )
+                estimates = iter(
+                    (
+                        OffsetEstimate(
+                            -800, -0.2, 0.31, 870_000, 217.5, 4_000,
+                            0.19, 0.12, 0.99, "spectral_flux_ncc",
+                        ),
+                    )
+                )
+                same_slot_evidence = (
+                    _verify_automatic_member_borderline_alignments(
+                        request,
+                        alignment,
+                        reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                        acquisition_identity_authority=(
+                            same_slot_acquisition.member_identity_authority
+                        ),
+                    )
+                )
+                manifest_path.write_bytes(original_manifest_bytes)
+                manifest["selected"][1]["broadcast_date"] = "2026-04-01"
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                manifest_tamper = (
+                    _verify_automatic_member_borderline_alignments(
+                        request,
+                        alignment,
+                        reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                        acquisition_identity_authority=(
+                            acquisition.member_identity_authority
+                        ),
+                    )
+                )
+                manifest_path.write_bytes(original_manifest_bytes)
+                sources[1].write_bytes(b"mutated after acquisition authority\n")
+                source_tamper = (
+                    _verify_automatic_member_borderline_alignments(
+                        request,
+                        alignment,
+                        reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                        acquisition_identity_authority=(
+                            acquisition.member_identity_authority
+                        ),
+                    )
+                )
+
+        self.assertEqual(evidence["attempted_source_count"], 1)
+        self.assertEqual(evidence["authorized_source_count"], 1)
+        self.assertEqual(evidence["sources"][0]["source_index"], 3)
+        self.assertTrue(evidence["sources"][0]["authorized"])
+        self.assertAlmostEqual(
+            evidence["sources"][0]["consensus_offset_seconds"],
+            1.8,
+        )
+        eligible = _alignment_eligibility(
+            alignment,
+            edit_mode=EditMode.MEMBER,
+            member_peer_consensus=evidence,
+        )
+        self.assertTrue(all(item["render_eligible"] for item in eligible))
+        self.assertEqual(manifest_tamper["authorized_source_count"], 0)
+        self.assertFalse(
+            manifest_tamper["broadcast_identity_verification"]["verified"]
+        )
+        self.assertEqual(source_tamper["authorized_source_count"], 0)
+        self.assertFalse(
+            source_tamper["broadcast_identity_verification"]["verified"]
+        )
+        self.assertEqual(same_slot_evidence["authorized_source_count"], 0)
+        self.assertEqual(
+            same_slot_evidence["sources"][0]["reason"],
+            "fewer_than_two_reliable_peer_predictions",
+        )
+        changed_alignments = list(alignment.alignments)
+        changed_alignments[3] = replace(
+            changed_alignments[3],
+            score=changed_alignments[3].score + 1e-6,
+        )
+        stale_replay = _alignment_eligibility(
+            replace(alignment, alignments=tuple(changed_alignments)),
+            edit_mode=EditMode.MEMBER,
+            member_peer_consensus=evidence,
+        )
+        self.assertFalse(stale_replay[3]["render_eligible"])
+        self.assertFalse(
+            stale_replay[3]["measured"][
+                "peer_consensus_acceptance_applied"
+            ]
+        )
+
     def test_common_range_respects_positive_and_negative_offsets(self) -> None:
         media = [_media("a", 10.0), _media("b", 12.0), _media("c", 9.0)]
         alignment = AlignmentResult(
@@ -4429,10 +5395,13 @@ class PipelineTests(unittest.TestCase):
             for source_index in range(10)
         )
 
-        selection = _VisualSelectionStub(tuple(range(10)), 10)
+        selection = _VisualSelectionStub(
+            (*tuple(range(10)), 0, 1),
+            10,
+        )
         with patch(
             "crosscut.pipeline.select_balanced_direct_member_sources",
-            return_value=selection,
+            side_effect=_bound_visual_selection(selection),
         ) as select_visual:
             segments, transitions, details, cadence, visual_selection = (
                 _official_target_fancam_direct_full_frame_segments(
@@ -4461,20 +5430,31 @@ class PipelineTests(unittest.TestCase):
             select_visual.call_args.kwargs["source_scene_cut_times"],
             scene_cut_times,
         )
+        self.assertTrue(
+            select_visual.call_args.kwargs[
+                "continuous_official_portrait_fancam_contract"
+            ]
+        )
         self.assertEqual(
             len(select_visual.call_args.kwargs["canonical_spans"]),
-            10,
+            12,
         )
 
-        self.assertEqual(len(segments), 10)
-        self.assertEqual([item.source_index for item in segments], list(range(10)))
-        self.assertTrue(all(math.isclose(item.duration, 4.0) for item in segments))
+        self.assertEqual(len(segments), 12)
+        self.assertEqual(
+            [item.source_index for item in segments],
+            [*range(10), 0, 1],
+        )
+        self.assertEqual(
+            [item.duration for item in segments],
+            [2.0, 2.0, 2.0, 2.0, *([4.0] * 8)],
+        )
         self.assertTrue(all(item.crop is None for item in segments))
         self.assertTrue(all(item.pan_crop is None for item in segments))
         self.assertTrue(all(item.source_duration is not None for item in segments))
         self.assertAlmostEqual(segments[0].source_start, 0.0)
-        self.assertAlmostEqual(segments[0].source_end, 4.016)
-        self.assertEqual(len(transitions), 9)
+        self.assertAlmostEqual(segments[0].source_end, 2.008)
+        self.assertEqual(len(transitions), 11)
         self.assertTrue(
             all(
                 item.kind is TransitionKind.HARD_CUT
@@ -4483,11 +5463,11 @@ class PipelineTests(unittest.TestCase):
                 for item in transitions
             )
         )
-        self.assertEqual(details[0]["timing_segment_count"], 4)
+        self.assertEqual(details[0]["timing_segment_count"], 2)
         self.assertEqual(details[0]["source_clock_basis"], "local_monotonic_timewarp")
-        self.assertAlmostEqual(details[0]["source_local_end"], 4.016)
+        self.assertAlmostEqual(details[0]["source_local_end"], 2.008)
         self.assertTrue(cadence["passed"])
-        self.assertAlmostEqual(cadence["source_switches_per_minute"], 13.5)
+        self.assertAlmostEqual(cadence["source_switches_per_minute"], 16.5)
         self.assertAlmostEqual(cadence["source_run_median_seconds"], 4.0)
         self.assertAlmostEqual(cadence["longest_source_run_seconds"], 4.0)
         self.assertFalse(cadence["member_pose_dissolve_requested"])
@@ -4497,9 +5477,12 @@ class PipelineTests(unittest.TestCase):
             cadence["pose_matched_dissolves"]["rejection_reason_counts"][
                 "effect_disabled_by_request"
             ],
-            9,
+            11,
         )
-        self.assertEqual(visual_selection.source_counts, (1,) * 10)
+        self.assertEqual(
+            visual_selection.source_counts,
+            (2, 2, 1, 1, 1, 1, 1, 1, 1, 1),
+        )
 
     def test_direct_full_frame_reference_length_avoids_the_200_cut_path(self) -> None:
         duration = 196.4835616941711
@@ -4509,12 +5492,12 @@ class PipelineTests(unittest.TestCase):
         )
 
         selection = _VisualSelectionStub(
-            tuple(index % 10 for index in range(50)),
+            tuple(index % 10 for index in range(51)),
             10,
         )
         with patch(
             "crosscut.pipeline.select_balanced_direct_member_sources",
-            return_value=selection,
+            side_effect=_bound_visual_selection(selection),
         ):
             segments, _transitions, _details, cadence, visual_selection = (
                 _official_target_fancam_direct_full_frame_segments(
@@ -4531,18 +5514,22 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(segments), 50)
+        self.assertEqual(len(segments), 51)
         self.assertEqual(
             [sum(item.source_index == source for item in segments) for source in range(10)],
-            [5] * 10,
+            [6, *([5] * 9)],
         )
-        self.assertAlmostEqual(cadence["source_switches_per_minute"], 14.9631, places=3)
+        self.assertAlmostEqual(
+            cadence["source_switches_per_minute"],
+            50 * 60.0 / duration,
+            places=3,
+        )
         self.assertAlmostEqual(
             cadence["source_run_median_seconds"],
             duration / 50.0,
         )
         self.assertLessEqual(cadence["longest_source_run_seconds"], 7.2)
-        self.assertEqual(visual_selection.source_counts, (5,) * 10)
+        self.assertEqual(visual_selection.source_counts, (6, *([5] * 9)))
 
     def test_direct_full_frame_fifty_spans_supports_eight_balanced_sources(
         self,
@@ -4552,12 +5539,12 @@ class PipelineTests(unittest.TestCase):
             duration_seconds=200.0,
             unit_seconds=1.0,
         )
-        path = tuple(range(8)) * 6 + (0, 1)
+        path = tuple(range(8)) * 6 + (0, 1, 2)
         selection = _VisualSelectionStub(path, 8)
 
         with patch(
             "crosscut.pipeline.select_balanced_direct_member_sources",
-            return_value=selection,
+            side_effect=_bound_visual_selection(selection),
         ):
             segments, _transitions, _details, cadence, visual_selection = (
                 _official_target_fancam_direct_full_frame_segments(
@@ -4574,8 +5561,11 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(segments), 50)
-        self.assertEqual(visual_selection.source_counts, (7, 7, 6, 6, 6, 6, 6, 6))
+        self.assertEqual(len(segments), 51)
+        self.assertEqual(
+            visual_selection.source_counts,
+            (7, 7, 7, 6, 6, 6, 6, 6),
+        )
         self.assertEqual(len({segment.source_index for segment in segments}), 8)
         self.assertTrue(cadence["passed"])
         self.assertLessEqual(
@@ -4592,12 +5582,12 @@ class PipelineTests(unittest.TestCase):
             duration_seconds=duration,
             unit_seconds=1.0,
         )
-        path = tuple(range(4)) * 12 + (0, 1)
+        path = tuple(range(4)) * 12 + (0, 1, 2)
         selection = _VisualSelectionStub(path, 4)
 
         with patch(
             "crosscut.pipeline.select_balanced_direct_member_sources",
-            return_value=selection,
+            side_effect=_bound_visual_selection(selection),
         ):
             segments, _transitions, _details, cadence, visual_selection = (
                 _official_target_fancam_direct_full_frame_segments(
@@ -4614,16 +5604,16 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(segments), 50)
-        self.assertEqual(cadence["source_switch_count"], 49)
+        self.assertEqual(len(segments), 51)
+        self.assertEqual(cadence["source_switch_count"], 50)
         self.assertAlmostEqual(
             cadence["source_switches_per_minute"],
-            49 * 60.0 / duration,
+            50 * 60.0 / duration,
         )
         self.assertTrue(cadence["passed"])
         self.assertEqual(
             visual_selection.source_counts,
-            (13, 13, 12, 12),
+            (13, 13, 13, 12),
         )
         self.assertTrue(
             all(
@@ -4641,8 +5631,9 @@ class PipelineTests(unittest.TestCase):
             duration_seconds=duration,
             unit_seconds=unit_seconds,
         )
+        base_profile = _professional_direct_partition_profile(timing)
         selection = _VisualSelectionStub(
-            tuple(index % 10 for index in range(50)),
+            tuple(index % 10 for index in range(len(base_profile.spans))),
             10,
         )
         base_failure = {
@@ -4677,7 +5668,7 @@ class PipelineTests(unittest.TestCase):
             )
             calls.append(unit_counts)
             if unit_counts[-2:] == (5, 3):
-                return selection
+                return selection.bind(spans, kwargs["config"])
             raise DirectMemberVisualSelectionError(
                 "synthetic hard-infeasible partition",
                 base_failure,
@@ -4703,13 +5694,13 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0], (4,) * 50)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[0], base_profile.unit_counts)
         self.assertEqual(calls[1][-2:], (5, 3))
         self.assertEqual(calls[2][-2:], (3, 5))
         self.assertEqual([item["timing_segment_count"] for item in details[-2:]], [5, 3])
-        self.assertEqual(len(segments), 50)
-        self.assertEqual(visual_selection.source_counts, (5,) * 10)
+        self.assertEqual(len(segments), len(base_profile.spans))
+        self.assertEqual(visual_selection.source_counts, (6, *([5] * 9)))
         self.assertFalse(
             any(
                 left.source_index == right.source_index
@@ -4724,11 +5715,11 @@ class PipelineTests(unittest.TestCase):
         partition = cadence["partition_search"]
         self.assertEqual(
             partition["selected_profile_id"],
-            "boundary-48-5-plus-3",
+            "boundary-49-5-plus-3",
         )
         self.assertTrue(partition["fallback_used"])
         self.assertFalse(partition["visual_gates_relaxed"])
-        self.assertEqual(len(partition["profiles_attempted"]), 3)
+        self.assertEqual(len(partition["profiles_attempted"]), 5)
         self.assertTrue(
             all(
                 call.kwargs["descriptor_provider"] is shared_provider
@@ -4738,12 +5729,1093 @@ class PipelineTests(unittest.TestCase):
         frozen_config = select_visual.call_args_list[0].kwargs["config"]
         self.assertTrue(
             all(
-                call.kwargs["config"] is frozen_config
+                call.kwargs["config"] == frozen_config
                 for call in select_visual.call_args_list
             )
         )
 
-    def test_direct_partition_fallback_all_fail_is_atomic_and_keeps_full_evidence(
+    def test_official_portrait_partition_repairs_one_proven_forward_frontier(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        base_profile = _professional_direct_partition_profile(timing)
+        selection = _VisualSelectionStub(
+            tuple(index % 10 for index in range(len(base_profile.spans))),
+            10,
+        )
+        base_failure = _direct_partition_failure_fixture(
+            span_count=len(base_profile.spans),
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        primary_failure = _direct_partition_failure_fixture(
+            span_count=len(base_profile.spans),
+            failed_segment_index=12,
+            frontier_boundary_index=11,
+        )
+        calls: list[tuple[int, ...]] = []
+        progress_events: list[dict[str, object]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            unit_counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            calls.append(unit_counts)
+            if unit_counts == base_profile.unit_counts:
+                raise DirectMemberVisualSelectionError(
+                    "synthetic local hard bottleneck",
+                    base_failure,
+                )
+            if unit_counts[3:5] not in ((5, 3), (3, 5)):
+                self.fail("primary repair did not stay at the proven boundary")
+            if (
+                unit_counts[3:5] == (5, 3)
+                and unit_counts[11:13] == (5, 3)
+            ):
+                return selection.bind(spans, kwargs["config"])
+            raise DirectMemberVisualSelectionError(
+                "synthetic global forward-frontier bottleneck",
+                primary_failure,
+            )
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ) as select_visual:
+            segments, _transitions, details, cadence, visual_selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                    partition_progress_callback=progress_events.append,
+                )
+            )
+
+        self.assertEqual(select_visual.call_count, 7)
+        self.assertEqual(calls[0], base_profile.unit_counts)
+        self.assertEqual(
+            {calls[1][3:5], calls[3][3:5]},
+            {(5, 3), (3, 5)},
+        )
+        self.assertEqual(
+            {
+                (counts[3:5], counts[11:13])
+                for counts in calls[2:]
+                if counts[11:13] != (4, 4)
+            },
+            {
+                ((5, 3), (5, 3)),
+                ((5, 3), (3, 5)),
+                ((3, 5), (5, 3)),
+                ((3, 5), (3, 5)),
+            },
+        )
+        self.assertEqual(
+            [details[index]["timing_segment_count"] for index in (3, 4, 11, 12)],
+            [5, 3, 5, 3],
+        )
+        self.assertEqual(len(segments), len(base_profile.spans))
+        self.assertEqual(visual_selection.source_counts, (6, *([5] * 9)))
+        self.assertTrue(cadence["passed"])
+        self.assertLessEqual(cadence["longest_source_run_seconds"], 7.2)
+        partition = cadence["partition_search"]
+        self.assertEqual(
+            partition["selected_profile_id"],
+            "boundary-3-5-plus-3__frontier-11-5-plus-3",
+        )
+        selected_profile = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["status"] == "feasible"
+        )
+        self.assertEqual(selected_profile["changed_span_count"], 4)
+        self.assertEqual(selected_profile["shifted_boundary_count"], 2)
+        self.assertEqual(selected_profile["secondary_shifted_boundary_index"], 11)
+        self.assertEqual(selected_profile["secondary_boundary_shift_units"], 1)
+        self.assertEqual(
+            selected_profile["secondary_shift_trigger"],
+            "proven_forward_connectivity_frontier_exhaustion",
+        )
+        self.assertFalse(partition["visual_gates_relaxed"])
+        self.assertFalse(partition["profile_cap_reached"])
+        self.assertEqual(partition["generated_profile_count"], 11)
+        shifts = selected_profile["proof_directed_boundary_shifts"]
+        self.assertEqual([item["boundary_index"] for item in shifts], [3, 11])
+        self.assertEqual(shifts[1]["parent_profile_id"], "boundary-3-5-plus-3")
+        parent_profile = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == shifts[1]["parent_profile_id"]
+        )
+        self.assertEqual(
+            shifts[1]["parent_partition_signature_sha256"],
+            parent_profile["partition_signature_sha256"],
+        )
+        self.assertEqual(shifts[1]["proof"]["failure"], "validity_quota_path_exhausted")
+        self.assertEqual(shifts[1]["proof"]["failed_segment_index"], 12)
+        self.assertEqual(
+            shifts[1]["proof"]["local_nonsevere_cross_source_edge_count"],
+            2,
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["continuous_official_portrait_fancam_contract"]
+                for call in select_visual.call_args_list
+            )
+        )
+        profile_events = [
+            item
+            for item in progress_events
+            if item["event"] == "direct_member_partition_profile_evaluation"
+        ]
+        self.assertEqual(len(profile_events), 14)
+        self.assertEqual(
+            [
+                item["evaluation_index"]
+                for item in profile_events
+                if item["phase"] == "started"
+            ],
+            list(range(1, 8)),
+        )
+        self.assertTrue(
+            all(item["evaluation_limit"] == 64 for item in profile_events)
+        )
+        final_progress = progress_events[-1]
+        self.assertEqual(
+            final_progress["event"],
+            "direct_member_partition_search_completed",
+        )
+        self.assertEqual(final_progress["result"], "feasible")
+        self.assertEqual(final_progress["evaluated_profile_count"], 7)
+        self.assertEqual(final_progress["generated_profile_count"], 11)
+        self.assertFalse(final_progress["profile_cap_reached"])
+
+    def test_official_portrait_partition_chains_three_independent_proofs(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        base_profile = _professional_direct_partition_profile(timing)
+        selection = _VisualSelectionStub(
+            tuple(index % 10 for index in range(len(base_profile.spans))),
+            10,
+        )
+        failures = {
+            0: _direct_partition_failure_fixture(
+                span_count=len(base_profile.spans),
+                failed_segment_index=4,
+                frontier_boundary_index=3,
+                zero_local_boundary_indices=(3,),
+            ),
+            1: _direct_partition_failure_fixture(
+                span_count=len(base_profile.spans),
+                failed_segment_index=12,
+                frontier_boundary_index=11,
+            ),
+            2: _direct_partition_failure_fixture(
+                span_count=len(base_profile.spans),
+                failed_segment_index=28,
+                frontier_boundary_index=27,
+            ),
+        }
+        calls: list[tuple[int, ...]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            unit_counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            calls.append(unit_counts)
+            shifted = sum(
+                unit_counts[index : index + 2] != (4, 4)
+                for index in (3, 11, 27)
+            )
+            if shifted >= 3:
+                return selection.bind(spans, kwargs["config"])
+            raise DirectMemberVisualSelectionError(
+                "synthetic sequential hard bottleneck",
+                failures[shifted],
+            )
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            segments, _transitions, _details, cadence, _visual_selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        self.assertEqual(len(calls), 19)
+        self.assertEqual(
+            sorted(
+                sum(
+                    counts[index : index + 2] != (4, 4)
+                    for index in (3, 11, 27)
+                )
+                for counts in calls
+            ),
+            [0] + [1] * 2 + [2] * 8 + [3] * 8,
+        )
+        partition = cadence["partition_search"]
+        attempted_ids = [item["profile_id"] for item in partition["profiles_attempted"]]
+        attempted_signatures = [
+            item["partition_signature_sha256"]
+            for item in partition["profiles_attempted"]
+        ]
+        self.assertEqual(
+            len(attempted_signatures),
+            len(set(attempted_signatures)),
+        )
+        self.assertEqual(attempted_ids[0], base_profile.profile_id)
+        self.assertTrue(any("frontier-27" in item for item in attempted_ids))
+        selected = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == partition["selected_profile_id"]
+        )
+        self.assertEqual(selected["shifted_boundary_count"], 3)
+        self.assertEqual(
+            [
+                item["boundary_index"]
+                for item in selected["proof_directed_boundary_shifts"]
+            ],
+            [3, 11, 27],
+        )
+        self.assertEqual(partition["generated_profile_count"], 43)
+        self.assertFalse(partition["profile_cap_reached"])
+        self.assertEqual(len(segments), len(base_profile.spans))
+        self.assertTrue(cadence["passed"])
+
+    def test_official_partition_feasible_pruning_ignores_proof_progress_tie_breaker(
+        self,
+    ) -> None:
+        duration = 192.0
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        base_profile = _professional_direct_partition_profile(timing)
+        source_path = tuple(
+            index % 10 for index in range(len(base_profile.spans))
+        )
+        high_cost_selection = _VisualSelectionStub(source_path, 10)
+        high_cost_selection.optimizer_cost = 10.0
+        low_cost_selection = _VisualSelectionStub(source_path, 10)
+        low_cost_selection.optimizer_cost = 1.0
+        base_failure = _direct_partition_failure_fixture(
+            span_count=len(base_profile.spans),
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        farther_failure = _direct_partition_failure_fixture(
+            span_count=len(base_profile.spans),
+            failed_segment_index=28,
+            frontier_boundary_index=27,
+        )
+        nearer_failure = _direct_partition_failure_fixture(
+            span_count=len(base_profile.spans),
+            failed_segment_index=12,
+            frontier_boundary_index=11,
+        )
+        calls: list[tuple[int, ...]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            calls.append(counts)
+            if counts == base_profile.unit_counts:
+                raise DirectMemberVisualSelectionError("base", base_failure)
+            if counts[27:29] != (4, 4):
+                return high_cost_selection.bind(spans, kwargs["config"])
+            if counts[11:13] != (4, 4):
+                return low_cost_selection.bind(spans, kwargs["config"])
+            if counts[3:5] == (5, 3):
+                raise DirectMemberVisualSelectionError(
+                    "farther proof progress",
+                    farther_failure,
+                )
+            raise DirectMemberVisualSelectionError(
+                "nearer proof progress",
+                nearer_failure,
+            )
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        # Both depth-two structural peers are evaluated even though the b27
+        # parent carries a farther proof-progress tie-breaker.  Selection then
+        # uses the real optimizer rank and chooses the lower-cost b11 repair.
+        attempted = cadence["partition_search"]["profiles_attempted"]
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(len(attempted), 7)
+        self.assertTrue(any(counts[27:29] != (4, 4) for counts in calls))
+        self.assertTrue(any(counts[11:13] != (4, 4) for counts in calls))
+        self.assertIn(
+            "frontier-11",
+            cadence["partition_search"]["selected_profile_id"],
+        )
+        self.assertIs(selection, low_cost_selection)
+
+    def test_official_partition_allows_exact_adjacent_forward_compensation(
+        self,
+    ) -> None:
+        duration = 192.0
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        selection = _VisualSelectionStub(tuple(range(10)) * 5, 10)
+        base_failure = _direct_partition_failure_fixture(
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        adjacent_failure = _direct_partition_failure_fixture(
+            failed_segment_index=5,
+            frontier_boundary_index=4,
+        )
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            if counts == (4,) * 50:
+                raise DirectMemberVisualSelectionError(
+                    "synthetic local bottleneck",
+                    base_failure,
+                )
+            if counts[3:6] == (5, 4, 3):
+                return selection.bind(spans, kwargs["config"])
+            raise DirectMemberVisualSelectionError(
+                "synthetic immediately adjacent frontier",
+                adjacent_failure,
+            )
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        partition = cadence["partition_search"]
+        selected = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == partition["selected_profile_id"]
+        )
+        self.assertEqual(
+            selected["selected_partition_unit_counts"]
+            if "selected_partition_unit_counts" in selected
+            else selected["partition_unit_counts"][3:6],
+            [5, 4, 3],
+        )
+        shifts = selected["proof_directed_boundary_shifts"]
+        self.assertEqual(
+            [(item["boundary_index"], item["shift_units"]) for item in shifts],
+            [(3, 1), (4, 1)],
+        )
+        parent_profile = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == shifts[1]["parent_profile_id"]
+        )
+        self.assertEqual(
+            shifts[1]["parent_partition_signature_sha256"],
+            parent_profile["partition_signature_sha256"],
+        )
+        self.assertEqual(shifts[1]["proof"]["failed_segment_index"], 5)
+        self.assertEqual(
+            shifts[1]["trigger"],
+            "proven_forward_connectivity_frontier_exhaustion",
+        )
+        self.assertTrue(cadence["passed"])
+
+    def test_official_partition_uses_proven_two_unit_single_boundary_move(
+        self,
+    ) -> None:
+        duration = 192.0
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        # Keep the synthetic selector faithful to the production duration
+        # quota gate.  The +2/-2 move at boundary 11 is offset by the already
+        # proven +1/-1 move at boundary 3 while every source still owns five
+        # non-adjacent spans.
+        source_indices = list(tuple(range(10)) * 5)
+        source_indices[2], source_indices[23] = (
+            source_indices[23],
+            source_indices[2],
+        )
+        source_indices[3], source_indices[22] = (
+            source_indices[22],
+            source_indices[3],
+        )
+        source_indices[4], source_indices[21] = (
+            source_indices[21],
+            source_indices[4],
+        )
+        selection = _VisualSelectionStub(tuple(source_indices), 10)
+        base_failure = _direct_partition_failure_fixture(
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        frontier_failure = _direct_partition_failure_fixture(
+            failed_segment_index=12,
+            frontier_boundary_index=11,
+        )
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            if counts == (4,) * 50:
+                raise DirectMemberVisualSelectionError("base", base_failure)
+            if counts[3:5] == (5, 3) and counts[11:13] == (6, 2):
+                return selection.bind(spans, kwargs["config"])
+            raise DirectMemberVisualSelectionError(
+                "needs a two-unit compensation",
+                frontier_failure,
+            )
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        partition = cadence["partition_search"]
+        selected = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == partition["selected_profile_id"]
+        )
+        self.assertEqual(selected["partition_unit_counts"][11:13], [6, 2])
+        shifts = selected["proof_directed_boundary_shifts"]
+        self.assertEqual(shifts[-1]["boundary_index"], 11)
+        self.assertEqual(shifts[-1]["shift_units"], 2)
+        parent_profile = next(
+            item
+            for item in partition["profiles_attempted"]
+            if item["profile_id"] == shifts[-1]["parent_profile_id"]
+        )
+        self.assertEqual(
+            shifts[-1]["parent_partition_signature_sha256"],
+            parent_profile["partition_signature_sha256"],
+        )
+        self.assertEqual(shifts[-1]["proof"]["failed_segment_index"], 12)
+        self.assertLessEqual(selected["maximum_span_seconds"], 7.2)
+        self.assertTrue(cadence["passed"])
+
+    def test_official_partition_does_not_shift_an_empty_content_side(self) -> None:
+        timing = _rotating_timing_draft(
+            duration_seconds=192.0,
+            unit_seconds=0.96,
+        )
+        failure = DirectMemberVisualSelectionError(
+            "synthetic empty right content side",
+            _direct_partition_failure_fixture(
+                failed_segment_index=4,
+                frontier_boundary_index=3,
+                zero_local_boundary_indices=(3,),
+                empty_valid_side_boundary_index=3,
+            ),
+        )
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=failure,
+        ) as select_visual, self.assertRaises(
+            DirectMemberVisualSelectionError
+        ) as raised:
+            _official_target_fancam_direct_full_frame_segments(
+                timing_draft=timing,
+                eligible_indices=tuple(range(10)),
+                eligible_sources=tuple(
+                    Path(f"official-gaeul-{index}.mp4") for index in range(10)
+                ),
+                common_master_start=0.0,
+                source_timewarps=None,
+                scene_cut_times=((),) * 10,
+                source_metadata_contract=(
+                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                ),
+                descriptor_provider=lambda *_args: None,
+            )
+
+        self.assertEqual(select_visual.call_count, 2)
+        search = raised.exception.diagnostics["partition_search"]
+        self.assertEqual(search["generated_profile_count"], 1)
+        self.assertFalse(search["profile_cap_reached"])
+        self.assertEqual(len(search["profiles_attempted"]), 1)
+
+    def test_official_partition_profile_cap_is_atomic_fail_closed(self) -> None:
+        timing = _rotating_timing_draft(
+            duration_seconds=192.0,
+            unit_seconds=0.96,
+        )
+        failures = [
+            _direct_partition_failure_fixture(
+                failed_segment_index=4,
+                frontier_boundary_index=3,
+                zero_local_boundary_indices=(3,),
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=12,
+                frontier_boundary_index=11,
+            ),
+        ]
+        call_count = 0
+        progress_events: list[dict[str, object]] = []
+
+        def always_fail(**_kwargs: object) -> _VisualSelectionStub:
+            nonlocal call_count
+            diagnostics = failures[min(call_count, 1)]
+            call_count += 1
+            raise DirectMemberVisualSelectionError(
+                "synthetic bounded search failure",
+                diagnostics,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT",
+            2,
+        ), patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND",
+            2,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=always_fail,
+        ) as select_visual, self.assertRaises(
+            DirectMemberVisualSelectionError
+        ) as raised:
+            _official_target_fancam_direct_full_frame_segments(
+                timing_draft=timing,
+                eligible_indices=tuple(range(10)),
+                eligible_sources=tuple(
+                    Path(f"official-gaeul-{index}.mp4") for index in range(10)
+                ),
+                common_master_start=0.0,
+                source_timewarps=None,
+                scene_cut_times=((),) * 10,
+                source_metadata_contract=(
+                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                ),
+                descriptor_provider=lambda *_args: None,
+                partition_progress_callback=progress_events.append,
+            )
+
+        self.assertEqual(select_visual.call_count, 2)
+        self.assertEqual(
+            raised.exception.diagnostics["failure"],
+            "direct_partition_search_capacity_exhausted",
+        )
+        self.assertFalse(
+            raised.exception.diagnostics["constraint_infeasibility_proven"]
+        )
+        search = raised.exception.diagnostics["partition_search"]
+        self.assertTrue(search["profile_cap_reached"])
+        self.assertEqual(search["maximum_profile_count"], 2)
+        self.assertEqual(search["profile_limit_expansions"], [])
+        self.assertFalse(search["render_started"])
+        final_progress = progress_events[-1]
+        self.assertEqual(final_progress["result"], "profile_cap_reached")
+        self.assertEqual(final_progress["evaluated_profile_count"], 2)
+        self.assertEqual(final_progress["evaluation_limit"], 2)
+        self.assertTrue(final_progress["profile_cap_reached"])
+
+    def test_official_partition_static_upper_bound_is_atomic_fail_closed(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND,
+            4_163,
+        )
+        timing = _rotating_timing_draft(
+            duration_seconds=192.0,
+            unit_seconds=0.96,
+        )
+        failures = (
+            _direct_partition_failure_fixture(
+                failed_segment_index=4,
+                frontier_boundary_index=3,
+                zero_local_boundary_indices=(3,),
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=12,
+                frontier_boundary_index=11,
+            ),
+        )
+        call_count = 0
+
+        def always_fail(**_kwargs: object) -> _VisualSelectionStub:
+            nonlocal call_count
+            diagnostics = failures[min(call_count, 1)]
+            call_count += 1
+            raise DirectMemberVisualSelectionError(
+                "synthetic static-bound failure",
+                diagnostics,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT",
+            2,
+        ), patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND",
+            3,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=always_fail,
+        ), self.assertRaises(DirectMemberVisualSelectionError) as raised:
+            _official_target_fancam_direct_full_frame_segments(
+                timing_draft=timing,
+                eligible_indices=tuple(range(10)),
+                eligible_sources=tuple(
+                    Path(f"official-gaeul-{index}.mp4") for index in range(10)
+                ),
+                common_master_start=0.0,
+                source_timewarps=None,
+                scene_cut_times=((),) * 10,
+                source_metadata_contract=(
+                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                ),
+                descriptor_provider=lambda *_args: None,
+            )
+
+        self.assertEqual(call_count, 3)
+        search = raised.exception.diagnostics["partition_search"]
+        self.assertTrue(search["profile_cap_reached"])
+        self.assertEqual(search["maximum_profile_count"], 3)
+        self.assertEqual(search["static_profile_upper_bound"], 3)
+        self.assertEqual(len(search["profile_limit_expansions"]), 1)
+        expansion = search["profile_limit_expansions"][0]
+        self.assertGreater(
+            expansion["exact_frontier_continuation_upper_bound"],
+            3,
+        )
+        self.assertEqual(expansion["new_limit"], 3)
+        self.assertTrue(expansion["truncated_by_static_upper_bound"])
+
+    def test_official_partition_limit_expands_to_exact_queue_snapshot(
+        self,
+    ) -> None:
+        duration = 192.0
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        selection = _VisualSelectionStub(tuple(range(10)) * 5, 10)
+        base_failure = _direct_partition_failure_fixture(
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        frontier_failure = _direct_partition_failure_fixture(
+            failed_segment_index=12,
+            frontier_boundary_index=11,
+        )
+        calls: list[tuple[int, ...]] = []
+        progress_events: list[dict[str, object]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            calls.append(counts)
+            if counts == (4,) * 50:
+                raise DirectMemberVisualSelectionError("base", base_failure)
+            if counts[11:13] != (4, 4):
+                return selection.bind(spans, kwargs["config"])
+            raise DirectMemberVisualSelectionError(
+                "proof-bound frontier",
+                frontier_failure,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT",
+            3,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                    partition_progress_callback=progress_events.append,
+                )
+            )
+
+        self.assertEqual(len(calls), 7)
+        search = cadence["partition_search"]
+        self.assertEqual(search["initial_profile_count"], 3)
+        self.assertEqual(search["maximum_profile_count"], 7)
+        self.assertEqual(search["generated_profile_count"], 11)
+        self.assertFalse(search["profile_cap_reached"])
+        self.assertEqual(len(search["profile_limit_expansions"]), 2)
+        expansion = search["profile_limit_expansions"][0]
+        self.assertEqual(expansion["epoch"], 1)
+        self.assertEqual(expansion["evaluated_at_expansion"], 3)
+        self.assertEqual(expansion["queued_unique_profile_count"], 2)
+        self.assertEqual(expansion["exact_frontier_continuation_upper_bound"], 5)
+        self.assertEqual(len(expansion["queue_signature_digest_sha256"]), 64)
+        progress_expansion = next(
+            item
+            for item in progress_events
+            if item["event"]
+            == "direct_member_partition_search_limit_extended"
+        )
+        self.assertEqual(progress_expansion["new_limit"], 5)
+        self.assertEqual(progress_expansion["queued_unique_profile_count"], 2)
+        self.assertEqual(progress_events[-1]["evaluation_limit"], 7)
+        self.assertEqual(progress_events[-1]["result"], "feasible")
+
+    def test_direct_partition_future_domain_and_queue_digest_are_deterministic(
+        self,
+    ) -> None:
+        timing = _rotating_timing_draft(
+            duration_seconds=192.0,
+            unit_seconds=0.96,
+        )
+        base = _direct_full_frame_base_partition_profile(timing.segments)
+        base_failure = _direct_partition_failure_fixture(
+            failed_segment_index=4,
+            frontier_boundary_index=3,
+            zero_local_boundary_indices=(3,),
+        )
+        children = _direct_full_frame_proof_directed_child_profiles(
+            timing.segments,
+            base,
+            base_failure,
+        )
+        self.assertEqual(len(children), 2)
+        self.assertEqual(
+            _direct_partition_queue_signature_digest(children),
+            _direct_partition_queue_signature_digest(tuple(reversed(children))),
+        )
+        key = _direct_partition_future_operation_state_key(
+            base,
+            base_failure,
+            children,
+        )
+        permuted_key = _direct_partition_future_operation_state_key(
+            base,
+            base_failure,
+            tuple(reversed(children)),
+        )
+        self.assertEqual(key, permuted_key)
+        self.assertEqual(key[1], ())
+
+        frontier_failure = _direct_partition_failure_fixture(
+            failed_segment_index=12,
+            frontier_boundary_index=11,
+        )
+        grandchildren = _direct_full_frame_proof_directed_child_profiles(
+            timing.segments,
+            children[0],
+            frontier_failure,
+        )
+        child_key = _direct_partition_future_operation_state_key(
+            children[0],
+            frontier_failure,
+            grandchildren,
+        )
+        self.assertEqual(child_key[1], (3,))
+        self.assertEqual(child_key[2], 3)
+        self.assertNotEqual(key, child_key)
+
+    def test_official_partition_allows_exact_seventh_proof_then_fails_closed(
+        self,
+    ) -> None:
+        timing = _rotating_timing_draft(
+            duration_seconds=192.0,
+            unit_seconds=0.96,
+        )
+        profile = _direct_full_frame_base_partition_profile(timing.segments)
+        proof_boundaries = (3, 11, 27, 34, 39, 40, 45)
+        for depth, boundary_index in enumerate(proof_boundaries, start=1):
+            diagnostics = _direct_partition_failure_fixture(
+                failed_segment_index=boundary_index + 1,
+                frontier_boundary_index=boundary_index,
+                zero_local_boundary_indices=(boundary_index,) if depth == 1 else (),
+            )
+            children = _direct_full_frame_proof_directed_child_profiles(
+                timing.segments,
+                profile,
+                diagnostics,
+            )
+            matching = tuple(
+                child
+                for child in children
+                if child.boundary_shifts[-1].boundary_index == boundary_index
+                and child.boundary_shifts[-1].shift_units == 1
+            )
+            self.assertEqual(len(matching), 1)
+            child = matching[0]
+            last_shift = child.boundary_shifts[-1]
+            self.assertEqual(
+                last_shift.parent_partition_signature_sha256,
+                hashlib.sha256(
+                    json.dumps(
+                        list(profile.unit_counts),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                last_shift.proof_failed_segment_index,
+                boundary_index + 1,
+            )
+            self.assertEqual(len(child.boundary_shifts), depth)
+            profile = child
+
+        self.assertEqual(
+            [shift.boundary_index for shift in profile.boundary_shifts],
+            list(proof_boundaries),
+        )
+        self.assertEqual(profile.unit_counts[39:42], (5, 4, 3))
+        exhausted = _direct_partition_failure_fixture(
+            failed_segment_index=48,
+            frontier_boundary_index=47,
+        )
+        self.assertEqual(
+            _direct_full_frame_proof_directed_child_profiles(
+                timing.segments,
+                profile,
+                exhausted,
+            ),
+            (),
+        )
+
+    def test_official_partition_adaptive_frontier_reaches_adjacent_fifth_proof(
+        self,
+    ) -> None:
+        duration = 192.0
+        unit_seconds = duration / 200.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=unit_seconds,
+        )
+        selection = _VisualSelectionStub(tuple(range(10)) * 5, 10)
+        failures = (
+            _direct_partition_failure_fixture(
+                failed_segment_index=4,
+                frontier_boundary_index=3,
+                zero_local_boundary_indices=(3,),
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=12,
+                frontier_boundary_index=11,
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=28,
+                frontier_boundary_index=27,
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=35,
+                frontier_boundary_index=34,
+            ),
+            _direct_partition_failure_fixture(
+                failed_segment_index=36,
+                frontier_boundary_index=35,
+            ),
+        )
+        calls: list[tuple[int, ...]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            counts = tuple(
+                int(round((end - start) / unit_seconds))
+                for start, end in spans
+            )
+            calls.append(counts)
+            if counts[3:5] == (4, 4):
+                failure = failures[0]
+            elif counts[11:13] == (4, 4):
+                failure = failures[1]
+            elif counts[27:29] == (4, 4):
+                failure = failures[2]
+            elif counts[34:36] == (4, 4):
+                failure = failures[3]
+            elif (
+                counts[3:5] == (5, 3)
+                and counts[11:13] == (5, 3)
+                and counts[27:29] == (5, 3)
+                and counts[34:37] == (5, 4, 3)
+            ):
+                return selection.bind(spans, kwargs["config"])
+            else:
+                failure = failures[4]
+            raise DirectMemberVisualSelectionError(
+                "synthetic five-proof frontier",
+                failure,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT",
+            16,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(10)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(10)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        search = cadence["partition_search"]
+        self.assertGreater(len(calls), 16)
+        self.assertGreater(len(search["profile_limit_expansions"]), 0)
+        selected = next(
+            item
+            for item in search["profiles_attempted"]
+            if item["profile_id"] == search["selected_profile_id"]
+        )
+        shifts = selected["proof_directed_boundary_shifts"]
+        self.assertEqual(
+            [item["boundary_index"] for item in shifts],
+            [3, 11, 27, 34, 35],
+        )
+        self.assertEqual(len({item["boundary_index"] for item in shifts}), 5)
+        self.assertEqual(selected["partition_unit_counts"][34:37], [5, 4, 3])
+        self.assertFalse(search["profile_cap_reached"])
+        self.assertTrue(cadence["passed"])
+
+    def test_visual_frontier_split_uses_one_hard_valid_bridge_boundary(
         self,
     ) -> None:
         duration = 196.4835616941711
@@ -4751,6 +6823,848 @@ class PipelineTests(unittest.TestCase):
             duration_seconds=duration,
             unit_seconds=duration / 200.0,
         )
+        base = _direct_full_frame_base_partition_profile(timing.segments)
+        diagnostics = _direct_partition_failure_fixture(
+            span_count=len(base.spans),
+            failed_segment_index=46,
+            frontier_boundary_index=45,
+        )
+        diagnostics["span_content_validity"] = [
+            _visual_frontier_span_diagnostic(
+                base.spans[46],
+                segment_index=46,
+            )
+        ]
+
+        children = _direct_full_frame_visual_frontier_split_child_profiles(
+            timing.segments,
+            base,
+            diagnostics,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual(sum(child.unit_counts), sum(base.unit_counts))
+        self.assertEqual(len(child.unit_counts), len(base.unit_counts) + 1)
+        self.assertEqual(child.unit_counts[46:48], (2, 2))
+        self.assertEqual(len(child.visual_frontier_splits), 1)
+        split = child.visual_frontier_splits[0]
+        self.assertEqual(split.parent_span_index, 46)
+        self.assertEqual(
+            split.evidence_contract,
+            "visual_bracket_bound_existing_timing_boundary_v1",
+        )
+        self.assertEqual(
+            split.evidence_kind,
+            "hard_valid_bridge_source_entry_exit_bracket",
+        )
+        self.assertEqual(split.proof_frontier_boundary_index, 45)
+        self.assertEqual(split.proof_failed_segment_index, 46)
+        self.assertEqual(
+            len(child.visual_frontier_splits),
+            1,
+            "one profile may receive only one micro split",
+        )
+        self.assertEqual(
+            _direct_full_frame_visual_frontier_split_child_profiles(
+                timing.segments,
+                child,
+                diagnostics,
+                config=DirectMemberVisualConfig(),
+            ),
+            (),
+        )
+
+    def test_visual_frontier_split_prefers_exact_native_cut_snap(self) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        base = _direct_full_frame_base_partition_profile(timing.segments)
+        target = base.spans[46]
+        target_unit_cursor = sum(base.unit_counts[:46])
+        exact_timing_boundary = timing.segments[
+            target_unit_cursor + 1
+        ].canonical_master_end
+        native_cut = exact_timing_boundary + 0.10
+        diagnostics = _direct_partition_failure_fixture(
+            span_count=len(base.spans),
+            failed_segment_index=46,
+            frontier_boundary_index=45,
+        )
+        diagnostics["span_content_validity"] = [
+            _visual_frontier_span_diagnostic(
+                target,
+                segment_index=46,
+                native_cut_master_seconds=native_cut,
+            )
+        ]
+
+        child = _direct_full_frame_visual_frontier_split_child_profiles(
+            timing.segments,
+            base,
+            diagnostics,
+            config=DirectMemberVisualConfig(),
+        )[0]
+        split = child.visual_frontier_splits[0]
+        self.assertEqual(
+            split.evidence_kind,
+            "confirmed_source_native_cut_master_time_snap",
+        )
+        self.assertAlmostEqual(split.canonical_master_seconds, exact_timing_boundary)
+        self.assertEqual(split.evidence_master_seconds, (native_cut,))
+        self.assertIsNone(split.evidence_bracket_master_seconds)
+
+    def test_visual_frontier_split_records_sample_change_as_bracket_only(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        base = _direct_full_frame_base_partition_profile(timing.segments)
+        diagnostics = _direct_partition_failure_fixture(
+            span_count=len(base.spans),
+            failed_segment_index=46,
+            frontier_boundary_index=45,
+        )
+        diagnostics["span_content_validity"] = [
+            _visual_frontier_span_diagnostic(
+                base.spans[46],
+                segment_index=46,
+                sample_safety_change=True,
+            )
+        ]
+
+        child = _direct_full_frame_visual_frontier_split_child_profiles(
+            timing.segments,
+            base,
+            diagnostics,
+            config=DirectMemberVisualConfig(),
+        )[0]
+        split = child.visual_frontier_splits[0]
+        self.assertEqual(
+            split.evidence_kind,
+            "sample_hard_safety_change_bracket",
+        )
+        self.assertEqual(split.evidence_master_seconds, ())
+        self.assertIsNotNone(split.evidence_bracket_master_seconds)
+        assert split.evidence_bracket_master_seconds is not None
+        self.assertLessEqual(
+            split.evidence_bracket_master_seconds[0],
+            split.canonical_master_seconds,
+        )
+        self.assertLessEqual(
+            split.canonical_master_seconds,
+            split.evidence_bracket_master_seconds[1],
+        )
+
+    def test_visual_frontier_split_requires_exact_forward_exhaustion_proof(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        base = _direct_full_frame_base_partition_profile(timing.segments)
+        diagnostics = _direct_partition_failure_fixture(
+            span_count=len(base.spans),
+            failed_segment_index=46,
+            frontier_boundary_index=45,
+            zero_local_boundary_indices=(45,),
+        )
+        diagnostics["span_content_validity"] = [
+            _visual_frontier_span_diagnostic(
+                base.spans[46],
+                segment_index=46,
+            )
+        ]
+
+        self.assertEqual(
+            _direct_full_frame_visual_frontier_split_child_profiles(
+                timing.segments,
+                base,
+                diagnostics,
+                config=DirectMemberVisualConfig(),
+            ),
+            (),
+        )
+
+    def test_official_partition_visual_frontier_split_is_fully_reevaluated(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            source_count=6,
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        selection = _VisualSelectionStub(
+            tuple(index % 6 for index in range(52)),
+            6,
+        )
+        calls: list[tuple[tuple[float, float], ...]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            assert isinstance(spans, tuple)
+            calls.append(spans)
+            if len(spans) == 52:
+                return selection.bind(spans, kwargs["config"])
+            diagnostics = _direct_partition_failure_fixture(
+                span_count=len(spans),
+                failed_segment_index=46,
+                frontier_boundary_index=45,
+            )
+            span = SimpleNamespace(
+                canonical_master_start=spans[46][0],
+                canonical_master_end=spans[46][1],
+            )
+            diagnostics["span_content_validity"] = [
+                _visual_frontier_span_diagnostic(
+                    span,
+                    segment_index=46,
+                    source_count=6,
+                )
+            ]
+            raise DirectMemberVisualSelectionError(
+                "synthetic frontier requiring an intermediate bridge",
+                diagnostics,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT",
+            0,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ) as select_visual:
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(6)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(6)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 6,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        self.assertEqual(select_visual.call_count, 2)
+        self.assertEqual([len(spans) for spans in calls], [51, 52])
+        search = cadence["partition_search"]
+        self.assertTrue(cadence["passed"])
+        self.assertFalse(search["profile_cap_reached"])
+        selected = next(
+            item
+            for item in search["profiles_attempted"]
+            if item["profile_id"] == search["selected_profile_id"]
+        )
+        self.assertEqual(selected["visual_frontier_split_count"], 1)
+        self.assertEqual(selected["structural_change_count"], 1)
+        self.assertEqual(
+            selected["proof_directed_visual_frontier_splits"][0][
+                "proposal_evidence"
+            ]["contract"],
+            "visual_bracket_bound_existing_timing_boundary_v1",
+        )
+
+    def test_visual_split_exact_capacity_gets_one_gate_preserving_retry(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            source_count=6,
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        selection = _VisualSelectionStub(
+            tuple(index % 6 for index in range(52)),
+            6,
+        )
+        calls: list[tuple[int, DirectMemberVisualConfig]] = []
+        progress_events: list[dict[str, object]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            config = kwargs["config"]
+            assert isinstance(spans, tuple)
+            assert isinstance(config, DirectMemberVisualConfig)
+            calls.append((len(spans), config))
+            if len(spans) == 51:
+                diagnostics = _direct_partition_failure_fixture(
+                    span_count=51,
+                    failed_segment_index=46,
+                    frontier_boundary_index=45,
+                )
+                span = SimpleNamespace(
+                    canonical_master_start=spans[46][0],
+                    canonical_master_end=spans[46][1],
+                )
+                diagnostics["span_content_validity"] = [
+                    _visual_frontier_span_diagnostic(
+                        span,
+                        segment_index=46,
+                        source_count=6,
+                    )
+                ]
+                raise DirectMemberVisualSelectionError("base", diagnostics)
+            if (
+                config.feasibility_lifeline_state_limit
+                == DirectMemberVisualConfig().feasibility_lifeline_state_limit
+            ):
+                raise DirectMemberVisualSelectionError(
+                    "exact lifeline initial capacity",
+                    _direct_partition_exact_capacity_failure_fixture(
+                        state_limit=config.feasibility_lifeline_state_limit,
+                    ),
+                )
+            return selection.bind(spans, config)
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT",
+            0,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ) as select_visual:
+            _segments, _transitions, _details, cadence, _selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(6)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(6)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 6,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                    partition_progress_callback=progress_events.append,
+                )
+            )
+
+        self.assertEqual(select_visual.call_count, 3)
+        self.assertEqual([count for count, _config in calls], [51, 52, 52])
+        self.assertEqual(
+            [
+                config.feasibility_lifeline_state_limit
+                for _count, config in calls
+            ],
+            [250_000, 250_000, 1_000_000],
+        )
+        self.assertEqual(calls[1][1], calls[0][1])
+        self.assertEqual(
+            calls[2][1],
+            replace(
+                calls[1][1],
+                feasibility_lifeline_state_limit=1_000_000,
+            ),
+        )
+        search = cadence["partition_search"]
+        retry = search["exact_lifeline_capacity_retry"]
+        self.assertEqual(retry["retry_count"], 1)
+        self.assertEqual(retry["success_count"], 1)
+        self.assertEqual(retry["capacity_exhausted_count"], 0)
+        self.assertFalse(retry["visual_gates_relaxed"])
+        selected = next(
+            item
+            for item in search["profiles_attempted"]
+            if item["profile_id"] == search["selected_profile_id"]
+        )
+        self.assertEqual(
+            selected["exact_lifeline_retry"]["result"],
+            "feasible",
+        )
+        retry_events = [
+            item
+            for item in progress_events
+            if item["event"]
+            == "direct_member_visual_split_exact_lifeline_retry"
+        ]
+        self.assertEqual(
+            [item["phase"] for item in retry_events],
+            ["exact_lifeline_retry_started", "exact_lifeline_retry_completed"],
+        )
+        self.assertEqual(retry_events[-1]["result"], "feasible")
+        self.assertEqual(
+            progress_events[-1]["exact_lifeline_capacity_retry_success_count"],
+            1,
+        )
+
+    def test_extra_quota_candidates_are_complete_and_validity_slack_ordered(
+        self,
+    ) -> None:
+        diagnostics = {
+            "valid_count_by_source": [
+                {
+                    "eligible_source_index": index,
+                    "valid_span_count": count,
+                }
+                for index, count in enumerate((49, 53, 48, 55, 48, 54))
+            ]
+        }
+
+        self.assertEqual(
+            _direct_strict_extra_quota_assignment_candidates(
+                span_count=55,
+                source_count=6,
+                source_order=tuple(range(6)),
+                diagnostics=diagnostics,
+            ),
+            ((3,), (5,), (1,), (2,), (4,)),
+        )
+        self.assertEqual(
+            _direct_strict_extra_quota_assignment_candidates(
+                span_count=55,
+                source_count=6,
+                source_order=(5, 4, 3, 2, 1, 0),
+                diagnostics=diagnostics,
+            ),
+            ((3,), (1,), (0,), (4,), (2,)),
+        )
+        complete_domain = _direct_strict_extra_quota_assignment_candidates(
+            span_count=12,
+            source_count=8,
+            source_order=tuple(range(8)),
+            diagnostics={
+                "valid_count_by_source": [
+                    {
+                        "eligible_source_index": index,
+                        "valid_span_count": 12,
+                    }
+                    for index in range(8)
+                ]
+            },
+        )
+        self.assertEqual(len(complete_domain), math.comb(8, 4) - 1)
+        self.assertNotIn((0, 1, 2, 3), complete_domain)
+        self.assertEqual(len(set(complete_domain)), len(complete_domain))
+        self.assertTrue(
+            all(
+                len(assignment) == 4
+                and len(set(assignment)) == 4
+                and set(assignment) <= set(range(8))
+                for assignment in complete_domain
+            )
+        )
+
+    def test_extra_quota_failure_certificate_rejects_capacity_or_quantization(
+        self,
+    ) -> None:
+        proven = _direct_partition_exact_hard_quota_failure_fixture(
+            span_count=55,
+            valid_counts=(49, 53, 48, 55, 48, 54),
+        )
+        self.assertTrue(
+            _direct_strict_extra_quota_assignment_failure_is_proven(proven)
+        )
+
+        capacity = deepcopy(proven)
+        capacity["search"]["exact_lifeline"]["state_capacity_exhausted"] = True
+        self.assertFalse(
+            _direct_strict_extra_quota_assignment_failure_is_proven(capacity)
+        )
+
+        quantized = deepcopy(proven)
+        quantized["search"]["exact_lifeline"][
+            "duration_state_quantization_applied"
+        ] = True
+        self.assertFalse(
+            _direct_strict_extra_quota_assignment_failure_is_proven(quantized)
+        )
+
+        unproven = deepcopy(proven)
+        unproven["constraint_infeasibility_proven"] = False
+        self.assertFalse(
+            _direct_strict_extra_quota_assignment_failure_is_proven(unproven)
+        )
+
+    def test_retry_qualified_split_completely_evaluates_extra_quota_owners(
+        self,
+    ) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            source_count=6,
+            duration_seconds=duration,
+            unit_seconds=duration / 216.0,
+        )
+        valid_counts = (49, 53, 48, 55, 48, 54)
+        hard = _direct_partition_exact_hard_quota_failure_fixture(
+            span_count=55,
+            valid_counts=valid_counts,
+        )
+        calls: list[tuple[int, int, tuple[int, ...] | None, tuple[int, ...]]] = []
+        progress_events: list[dict[str, object]] = []
+
+        def selected_for(owner: int, cost: float) -> _VisualSelectionStub:
+            selected = _VisualSelectionStub(
+                tuple((owner + index) % 6 for index in range(55)),
+                6,
+            )
+            selected.optimizer_cost = cost
+            return selected
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            config = kwargs["config"]
+            assignment = kwargs.get("extra_quota_source_indices")
+            order = kwargs["preferred_source_order"]
+            assert isinstance(spans, tuple)
+            assert isinstance(config, DirectMemberVisualConfig)
+            assert assignment is None or isinstance(assignment, tuple)
+            assert isinstance(order, tuple)
+            calls.append(
+                (
+                    len(spans),
+                    config.feasibility_lifeline_state_limit,
+                    assignment,
+                    order,
+                )
+            )
+            if len(spans) == 54:
+                diagnostics = _direct_partition_failure_fixture(
+                    span_count=54,
+                    failed_segment_index=50,
+                    frontier_boundary_index=49,
+                )
+                span = SimpleNamespace(
+                    canonical_master_start=spans[50][0],
+                    canonical_master_end=spans[50][1],
+                )
+                diagnostics["span_content_validity"] = [
+                    _visual_frontier_span_diagnostic(
+                        span,
+                        segment_index=50,
+                        source_count=6,
+                    )
+                ]
+                raise DirectMemberVisualSelectionError("base", diagnostics)
+            if config.feasibility_lifeline_state_limit == 250_000:
+                raise DirectMemberVisualSelectionError(
+                    "initial exact capacity",
+                    _direct_partition_exact_capacity_failure_fixture(
+                        state_limit=250_000
+                    ),
+                )
+            if assignment is None:
+                raise DirectMemberVisualSelectionError("default quota", hard)
+            if assignment == (3,):
+                return selected_for(3, 2.0).bind(spans, config)
+            if assignment == (5,):
+                return selected_for(5, 1.0).bind(spans, config)
+            alternate_hard = deepcopy(hard)
+            alternate_hard["source_quotas"] = [
+                10 if index in assignment else 9 for index in range(6)
+            ]
+            raise DirectMemberVisualSelectionError(
+                "alternate quota",
+                alternate_hard,
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT",
+            0,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ):
+            _segments, _transitions, _details, cadence, selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(6)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(6)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 6,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    descriptor_provider=lambda *_args: None,
+                    partition_progress_callback=progress_events.append,
+                )
+            )
+
+        self.assertEqual([item[0] for item in calls], [54] + [55] * 7)
+        self.assertEqual([item[1] for item in calls], [250_000, 250_000] + [1_000_000] * 6)
+        self.assertEqual(
+            [item[2] for item in calls[3:]],
+            [(3,), (5,), (1,), (2,), (4,)],
+        )
+        self.assertTrue(all(item[3] == tuple(range(6)) for item in calls))
+        self.assertEqual(selection.source_counts, (9, 9, 9, 9, 9, 10))
+        search = cadence["partition_search"]
+        quota_search = search["strict_extra_quota_assignment_search"]
+        self.assertEqual(quota_search["qualified_profile_count"], 1)
+        self.assertEqual(quota_search["assignment_evaluation_count"], 5)
+        self.assertEqual(quota_search["feasible_profile_count"], 1)
+        self.assertFalse(quota_search["source_search_order_changed"])
+        self.assertTrue(quota_search["counts_differ_by_at_most_one"])
+        selected_attempt = next(
+            item
+            for item in search["profiles_attempted"]
+            if item["profile_id"] == search["selected_profile_id"]
+        )
+        certificate = selected_attempt["strict_extra_quota_assignment_search"]
+        self.assertTrue(certificate["complete_assignment_domain_evaluated"])
+        self.assertEqual(certificate["total_assignment_domain_count"], 6)
+        self.assertEqual(certificate["selected_extra_quota_source_indices"], [5])
+        self.assertEqual(len(certificate["assignment_certificate_sha256"]), 64)
+        evaluated_events = [
+            item
+            for item in progress_events
+            if item["phase"] == "extra_quota_assignment_evaluated"
+        ]
+        self.assertEqual(len(evaluated_events), 5)
+        self.assertEqual(
+            progress_events[-1][
+                "strict_extra_quota_assignment_evaluation_count"
+            ],
+            5,
+        )
+
+    def test_extra_quota_assignment_domain_exhaustion_fails_closed(self) -> None:
+        duration = 196.4835616941711
+        timing = _rotating_timing_draft(
+            source_count=6,
+            duration_seconds=duration,
+            unit_seconds=duration / 216.0,
+        )
+        hard = _direct_partition_exact_hard_quota_failure_fixture(
+            span_count=55,
+            valid_counts=(49, 53, 48, 55, 48, 54),
+        )
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            config = kwargs["config"]
+            assignment = kwargs.get("extra_quota_source_indices")
+            assert isinstance(spans, tuple)
+            assert isinstance(config, DirectMemberVisualConfig)
+            if len(spans) == 54:
+                diagnostics = _direct_partition_failure_fixture(
+                    span_count=54,
+                    failed_segment_index=50,
+                    frontier_boundary_index=49,
+                )
+                span = SimpleNamespace(
+                    canonical_master_start=spans[50][0],
+                    canonical_master_end=spans[50][1],
+                )
+                diagnostics["span_content_validity"] = [
+                    _visual_frontier_span_diagnostic(
+                        span,
+                        segment_index=50,
+                        source_count=6,
+                    )
+                ]
+                raise DirectMemberVisualSelectionError("base", diagnostics)
+            if config.feasibility_lifeline_state_limit == 250_000:
+                raise DirectMemberVisualSelectionError(
+                    "initial exact capacity",
+                    _direct_partition_exact_capacity_failure_fixture(
+                        state_limit=250_000
+                    ),
+                )
+            alternate_hard = deepcopy(hard)
+            if isinstance(assignment, tuple):
+                alternate_hard["source_quotas"] = [
+                    10 if index in assignment else 9 for index in range(6)
+                ]
+            raise DirectMemberVisualSelectionError("hard quota", alternate_hard)
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT",
+            0,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ), self.assertRaises(DirectMemberVisualSelectionError) as raised:
+            _official_target_fancam_direct_full_frame_segments(
+                timing_draft=timing,
+                eligible_indices=tuple(range(6)),
+                eligible_sources=tuple(
+                    Path(f"official-gaeul-{index}.mp4")
+                    for index in range(6)
+                ),
+                common_master_start=0.0,
+                source_timewarps=None,
+                scene_cut_times=((),) * 6,
+                source_metadata_contract=(
+                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                ),
+                descriptor_provider=lambda *_args: None,
+            )
+
+        diagnostics = raised.exception.diagnostics
+        self.assertFalse(diagnostics["constraint_infeasibility_proven"])
+        search = diagnostics["partition_search"]
+        self.assertEqual(
+            search["strict_extra_quota_assignment_search"][
+                "exhausted_profile_count"
+            ],
+            1,
+        )
+        attempt = next(
+            item
+            for item in search["profiles_attempted"]
+            if "strict_extra_quota_assignment_search" in item
+        )
+        certificate = attempt["strict_extra_quota_assignment_search"]
+        self.assertTrue(certificate["complete_assignment_domain_evaluated"])
+        self.assertTrue(certificate["all_alternatives_proven_hard_infeasible"])
+        self.assertEqual(certificate["total_assignment_domain_count"], 6)
+        self.assertEqual(
+            [item["result"] for item in certificate["assignments_evaluated"]],
+            ["hard_infeasible"] * 5,
+        )
+
+    def test_visual_split_exact_capacity_retry_is_once_then_fail_closed(
+        self,
+    ) -> None:
+        duration = 192.0
+        timing = _rotating_timing_draft(
+            source_count=6,
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        calls: list[tuple[int, int]] = []
+        progress_events: list[dict[str, object]] = []
+
+        def choose_profile(**kwargs: object) -> _VisualSelectionStub:
+            spans = kwargs["canonical_spans"]
+            config = kwargs["config"]
+            assert isinstance(spans, tuple)
+            assert isinstance(config, DirectMemberVisualConfig)
+            calls.append(
+                (len(spans), config.feasibility_lifeline_state_limit)
+            )
+            if len(spans) == 50:
+                diagnostics = _direct_partition_failure_fixture(
+                    span_count=50,
+                    failed_segment_index=46,
+                    frontier_boundary_index=45,
+                )
+                span = SimpleNamespace(
+                    canonical_master_start=spans[46][0],
+                    canonical_master_end=spans[46][1],
+                )
+                diagnostics["span_content_validity"] = [
+                    _visual_frontier_span_diagnostic(
+                        span,
+                        segment_index=46,
+                        source_count=6,
+                    )
+                ]
+                raise DirectMemberVisualSelectionError("base", diagnostics)
+            raise DirectMemberVisualSelectionError(
+                "exact lifeline remains capacity bounded",
+                _direct_partition_exact_capacity_failure_fixture(
+                    state_limit=config.feasibility_lifeline_state_limit,
+                ),
+            )
+
+        with patch(
+            "crosscut.pipeline._DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT",
+            0,
+        ), patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            side_effect=choose_profile,
+        ) as select_visual, self.assertRaises(
+            DirectMemberVisualSelectionError
+        ) as raised:
+            _official_target_fancam_direct_full_frame_segments(
+                timing_draft=timing,
+                eligible_indices=tuple(range(6)),
+                eligible_sources=tuple(
+                    Path(f"official-gaeul-{index}.mp4")
+                    for index in range(6)
+                ),
+                common_master_start=0.0,
+                source_timewarps=None,
+                scene_cut_times=((),) * 6,
+                source_metadata_contract=(
+                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                ),
+                descriptor_provider=lambda *_args: None,
+                partition_progress_callback=progress_events.append,
+            )
+
+        self.assertEqual(select_visual.call_count, 4, calls)
+        self.assertEqual(
+            calls,
+            [
+                (50, 250_000),
+                (51, 250_000),
+                (51, 1_000_000),
+                (50, 250_000),
+            ],
+        )
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(
+            diagnostics["failure"],
+            "direct_partition_selector_capacity_exhausted",
+        )
+        self.assertFalse(diagnostics["constraint_infeasibility_proven"])
+        retry = diagnostics["partition_search"][
+            "exact_lifeline_capacity_retry"
+        ]
+        self.assertEqual(retry["retry_count"], 1)
+        self.assertEqual(retry["success_count"], 0)
+        self.assertEqual(retry["capacity_exhausted_count"], 1)
+        retried_attempt = next(
+            item
+            for item in diagnostics["partition_search"]["profiles_attempted"]
+            if "exact_lifeline_retry" in item
+        )
+        self.assertEqual(
+            retried_attempt["exact_lifeline_retry"]["result"],
+            "capacity_exhausted",
+        )
+        retry_events = [
+            item
+            for item in progress_events
+            if item["event"]
+            == "direct_member_visual_split_exact_lifeline_retry"
+        ]
+        self.assertEqual(len(retry_events), 2)
+        self.assertEqual(
+            retry_events[-1]["final_explored_state_count"],
+            1_000_000,
+        )
+        self.assertEqual(
+            progress_events[-1][
+                "exact_lifeline_capacity_retry_capacity_exhausted_count"
+            ],
+            1,
+        )
+
+    def test_direct_partition_fallback_all_fail_is_atomic_and_hash_compacted(
+        self,
+    ) -> None:
+        duration = 192.0
+        timing = _rotating_timing_draft(
+            duration_seconds=duration,
+            unit_seconds=duration / 200.0,
+        )
+        large_runtime_only_sentinel = "runtime-only-selector-evidence-" * 400
         failure = DirectMemberVisualSelectionError(
             "synthetic terminal hard conflict",
             {
@@ -4784,6 +7698,16 @@ class PipelineTests(unittest.TestCase):
                         ]
                     }
                 },
+                "valid_count_by_source": [
+                    {
+                        "eligible_source_index": 3,
+                        "quota": 5,
+                        "valid_span_count": 44,
+                        "invalid_span_count": 6,
+                        "valid_segment_indices": list(range(44)),
+                    }
+                ],
+                "large_runtime_only_sentinel": large_runtime_only_sentinel,
             },
         )
         with patch(
@@ -4818,12 +7742,37 @@ class PipelineTests(unittest.TestCase):
         search = diagnostics["partition_search"]
         self.assertFalse(search["render_started"])
         self.assertEqual(len(search["profiles_attempted"]), 3)
+        compact = search["profiles_attempted"][0]["diagnostics"]
         self.assertEqual(
-            search["profiles_attempted"][0]["diagnostics"][
-                "span_content_validity"
-            ][0]["sources"][0]["rejection_reasons"],
-            ["foreground_camera_equipment_or_subject_obstruction"],
+            compact["storage_contract"],
+            "hash_bound_scalar_partition_failure_v1",
         )
+        self.assertFalse(compact["full_diagnostics_persisted"])
+        self.assertNotIn("span_content_validity", compact)
+        self.assertEqual(
+            compact["valid_count_by_source"],
+            [
+                {
+                    "eligible_source_index": 3,
+                    "quota": 5,
+                    "valid_span_count": 44,
+                    "invalid_span_count": 6,
+                }
+            ],
+        )
+        self.assertNotIn(
+            "valid_segment_indices",
+            json.dumps(compact, ensure_ascii=False),
+        )
+        self.assertEqual(
+            compact["summary"]["rejection_reason_counts"],
+            {"foreground_camera_equipment_or_subject_obstruction": 1},
+        )
+        fingerprint = compact["diagnostics_content_fingerprint"]
+        self.assertEqual(len(fingerprint["sha256"]), 64)
+        self.assertGreater(fingerprint["canonical_size_bytes"], 0)
+        encoded_search = json.dumps(search, ensure_ascii=False)
+        self.assertNotIn(large_runtime_only_sentinel, encoded_search)
 
     def test_direct_partition_does_not_retry_unproven_capacity_exhaustion(self) -> None:
         timing = _rotating_timing_draft(
@@ -4865,7 +7814,7 @@ class PipelineTests(unittest.TestCase):
     def test_partition_profiles_are_bounded_final_first_and_never_combined(
         self,
     ) -> None:
-        duration = 196.4835616941711
+        duration = 192.0
         timing = _rotating_timing_draft(
             duration_seconds=duration,
             unit_seconds=duration / 200.0,
@@ -4927,27 +7876,47 @@ class PipelineTests(unittest.TestCase):
         durations = (6.0,) + (34.0 / 9.0,) * 9
         cursor = 0.0
         spans = []
-        for duration in durations:
+        for index, duration in enumerate(durations):
             spans.append(
-                SimpleNamespace(
+                _DirectFullFrameSpan(
                     canonical_master_start=cursor,
                     canonical_master_end=cursor + duration,
-                    duration_seconds=duration,
                     timing_segment_count=1,
                     estimated_beat_count=duration * 2.0,
-                    start_boundary_reasons=("strong_beat",),
-                    end_boundary_reasons=("strong_beat",),
+                    start_boundary_reasons=(
+                        "range_edge" if index == 0 else "strong_beat",
+                    ),
+                    end_boundary_reasons=(
+                        "range_edge"
+                        if index == len(durations) - 1
+                        else "strong_beat",
+                    ),
                 )
             )
             cursor += duration
-        selection = _VisualSelectionStub(tuple(range(10)), 10)
+        selection = _VisualSelectionStub(
+            tuple(range(10)),
+            10,
+            usage_policy="exact_balanced_quota_v1",
+        )
 
+        bound_selection = selection.bind(
+            tuple(
+                (
+                    span.canonical_master_start,
+                    span.canonical_master_end,
+                )
+                for span in spans
+            ),
+            DirectMemberVisualConfig(),
+        )
         with patch(
-            "crosscut.pipeline._coarsen_direct_full_frame_spans",
-            return_value=tuple(spans),
-        ), patch(
-            "crosscut.pipeline.select_balanced_direct_member_sources",
-            return_value=selection,
+            "crosscut.pipeline._select_direct_member_partition_profile",
+            return_value=(
+                SimpleNamespace(spans=tuple(spans)),
+                bound_selection,
+                {},
+            ),
         ), self.assertRaisesRegex(RuntimeError, "source-duration balance"):
             _official_target_fancam_direct_full_frame_segments(
                 timing_draft=timing,
@@ -5035,6 +8004,81 @@ class PipelineTests(unittest.TestCase):
             persisted["privacy"]["face_appearance_embeddings_persisted"]
         )
 
+    def test_direct_selection_failure_report_hard_cap_uses_hash_bound_fallback(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _DIRECT_MEMBER_FAILURE_REPORT_MAX_BYTES,
+            64 * 1024 * 1024,
+        )
+        sentinel = "runtime-only-oversized-selector-diagnostics-" * 8_000
+        diagnostics = {
+            "failure": "validity_quota_path_exhausted",
+            "constraint_infeasibility_proven": True,
+            "failed_at_segment_index": 41,
+            "span_content_validity": [
+                {
+                    "segment_index": 41,
+                    "sources": [
+                        {
+                            "eligible_source_index": 2,
+                            "valid": False,
+                            "rejection_reasons": [
+                                "foreground_camera_equipment_or_subject_obstruction"
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "runtime_only_payload": sentinel,
+        }
+        error = DirectMemberVisualSelectionError(
+            "synthetic oversized selector evidence",
+            diagnostics,
+        )
+        reporter = _MemoryReporter()
+        hard_cap = 32 * 1024
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "crosscut.pipeline._DIRECT_MEMBER_FAILURE_REPORT_MAX_BYTES",
+            hard_cap,
+        ):
+            output = Path(temp)
+            _report_direct_member_selection_failure(
+                error,
+                output_directory=output,
+                base_filename="IVE-BLACKHOLE-test",
+                target_member="가을",
+                eligible_indices=(1, 2, 3, 4, 5, 6),
+                reporter=reporter,  # type: ignore[arg-type]
+            )
+            report_path = next(output.glob("*-direct-selection-failure.json"))
+            report_bytes = report_path.read_bytes()
+            persisted = json.loads(report_bytes)
+            self.assertLessEqual(len(report_bytes), hard_cap)
+            self.assertEqual(tuple(output.glob(".*.tmp")), ())
+
+        self.assertNotIn(sentinel.encode("utf-8"), report_bytes)
+        storage = persisted["report_storage"]
+        self.assertTrue(storage["bounded_fallback_used"])
+        self.assertEqual(storage["hard_cap_bytes"], hard_cap)
+        oversized = storage["oversized_report_fingerprint"]
+        self.assertGreater(oversized["serialized_size_bytes"], hard_cap)
+        self.assertEqual(len(oversized["sha256"]), 64)
+        persisted_diagnostics = persisted["diagnostics"]
+        self.assertNotIn("span_content_validity", persisted_diagnostics)
+        self.assertEqual(
+            persisted_diagnostics["latest_failure_summary"][
+                "rejection_reason_counts"
+            ],
+            {"foreground_camera_equipment_or_subject_obstruction": 1},
+        )
+        fingerprint = persisted_diagnostics[
+            "original_diagnostics_content_fingerprint"
+        ]
+        self.assertEqual(len(fingerprint["sha256"]), 64)
+        self.assertGreater(fingerprint["canonical_size_bytes"], hard_cap)
+
     def test_local_explicit_member_anchors_preserve_tracking_for_portrait_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -5105,7 +8149,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_automatic_portrait_member_bad_aspect_fails_closed_before_fallback(self) -> None:
         cases = (
-            ("landscape", 1920, 1080, "outside 9:16"),
+            ("landscape", 1920, 1080, "lossless-fill contract failed"),
             ("dimensions", None, 1920, "dimensions unavailable"),
         )
         for label, bad_width, bad_height, expected_error in cases:
@@ -5189,6 +8233,7 @@ class PipelineTests(unittest.TestCase):
                     "target_member": "가을",
                     "source_mode": "automatic",
                     "sources": [],
+                    "member_pose_dissolve_enabled": False,
                     "output_directory": str(root / "out"),
                 }
             ).with_materialized_sources(sources, member_anchors=())
@@ -5214,7 +8259,10 @@ class PipelineTests(unittest.TestCase):
             timewarps = tuple(
                 _linear_timewarp(duration=40.0, rate=0.996) for _ in sources
             )
-            visual_selection = _VisualSelectionStub(tuple(range(10)), 10)
+            visual_selection = _VisualSelectionStub(
+                (*tuple(range(10)), 0, 1),
+                10,
+            )
 
             class DescriptorProviderStub:
                 def __call__(self, *_args: object) -> None:
@@ -5236,6 +8284,9 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self) -> None:
                     self.sample_calls: list[tuple[int, float]] = []
                     self.closed = False
+                    self.pose = SimpleNamespace(model_path=root / "pose.onnx")
+                    self.encoder = SimpleNamespace(model_path=root / "body.onnx")
+                    self.body_execution_device = "cpu"
 
                 def sample(
                     self,
@@ -5245,6 +8296,44 @@ class PipelineTests(unittest.TestCase):
                     self.sample_calls.append(
                         (source_index, source_local_seconds)
                     )
+                    return None
+
+                def paired_samples(
+                    self,
+                    outgoing_source_index: int,
+                    outgoing_source_local_seconds: float,
+                    incoming_source_index: int,
+                    incoming_source_local_seconds: float,
+                ) -> tuple[None, None]:
+                    self.sample(
+                        outgoing_source_index,
+                        outgoing_source_local_seconds,
+                    )
+                    self.sample(
+                        incoming_source_index,
+                        incoming_source_local_seconds,
+                    )
+                    return None, None
+
+                def begin_focal_boundary_reference_capture(self) -> None:
+                    return None
+
+                def focal_boundary_reference_capture(
+                    self,
+                ) -> tuple[tuple[int, int, None, None], ...]:
+                    return tuple(
+                        (left, right, None, None)
+                        for left, right in zip(
+                            visual_selection.source_indices,
+                            visual_selection.source_indices[1:],
+                        )
+                        if left != right
+                    )
+
+                def recover_exact_focal_pair_from_registered_references(
+                    self,
+                    *_args: object,
+                ) -> None:
                     return None
 
                 def diagnostics(self) -> dict[str, int | bool | str]:
@@ -5271,11 +8360,13 @@ class PipelineTests(unittest.TestCase):
             direct_motion_plan = EditorialMotionPlan(
                 segments=tuple(
                     EditorialMotionSegment(
-                        index,
-                        index,
-                        direct_track if index == 0 else None,
+                        segment_index,
+                        source_index,
+                        direct_track if segment_index == 0 else None,
                     )
-                    for index in range(10)
+                    for segment_index, source_index in enumerate(
+                        visual_selection.source_indices
+                    )
                 ),
                 boundary_match_count=1,
                 zoom_event_count=1,
@@ -5288,6 +8379,15 @@ class PipelineTests(unittest.TestCase):
                 ),
             )
             dense_face_provider = DenseFaceProviderStub()
+            member_cut_local_sync_payload = {
+                "activation": MEMBER_CUT_LOCAL_SYNC_ACTIVATION,
+                "required": True,
+                "retained_cross_source_boundary_count": 9,
+                "measured_boundary_count": 9,
+                "unknown_boundary_count": 0,
+                "residual_p95_frames": 0.1,
+                "passed": True,
+            }
 
             def build_direct_motion(**kwargs: object) -> EditorialMotionPlan:
                 geometry_provider = kwargs["geometry_provider"]
@@ -5305,6 +8405,130 @@ class PipelineTests(unittest.TestCase):
                 def to_dict() -> dict[str, object]:
                     return {}
 
+            def pass_member_delivery_gate(**kwargs: object) -> Path:
+                manifest = kwargs["manifest"]
+                manifest_path = kwargs["manifest_path"]
+                assert isinstance(manifest, dict)
+                assert isinstance(manifest_path, Path)
+                render_payload = manifest["render"]
+                direct_payload = manifest["member_direct_full_frame"]
+                assert isinstance(render_payload, dict)
+                assert isinstance(direct_payload, dict)
+                assert manifest["artifact_role"] == "pending_qa"
+                assert render_payload["artifact_role"] == "pending_qa"
+                assert render_payload["direct_full_frame"] is True
+                assert render_payload["cut_local_sync"] == (
+                    member_cut_local_sync_payload
+                )
+                eligible = direct_payload["eligible_request_source_indices"]
+                assert eligible == list(range(10))
+                receipt = {
+                    "contract": MEMBER_RENDER_RECEIPT_CONTRACT,
+                    "eligible_source_indices": eligible,
+                    "sources": [
+                        {
+                            "request_source_index": source_index,
+                            "safe_interior_structure_sample_count": 1,
+                            "passed": True,
+                        }
+                        for source_index in eligible
+                    ],
+                    "all_eligible_sources_pixel_proven": True,
+                    "artifact_content_stable": True,
+                    "source_file_identities_stable": True,
+                    "passed": True,
+                }
+                qa = {
+                    "contract": AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
+                    "required": True,
+                    "verdict": "PASS",
+                    "report_passed": True,
+                    "content_binding_passed": True,
+                    "render_receipt": receipt,
+                    "passed": True,
+                }
+                exposure = {
+                    "contract": AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
+                    "video_output_exposed": True,
+                    "delivery_completion_message_allowed": True,
+                }
+                manifest["artifact_role"] = "delivery"
+                manifest["app_result_exposure"] = exposure
+                manifest["post_render_qa"] = qa
+                render_payload["artifact_role"] = "delivery"
+                render_payload["app_result_exposure"] = exposure
+                render_payload["post_render_qa"] = qa
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+                )
+                report_path = manifest_path.with_name(
+                    manifest_path.name.replace(
+                        "-analysis.json", "-gaeul-member-post-render-qa.json"
+                    )
+                )
+                report_path.write_text(
+                    json.dumps({"verdict": "PASS", "render_receipt": receipt}),
+                    encoding="utf-8",
+                )
+                return report_path
+
+            def pass_member_proxy(
+                plan: RenderPlan,
+                _output_path: Path,
+                **_kwargs: object,
+            ) -> tuple[RenderPlan, DirectMemberRenderedProxyPreflight]:
+                return plan, DirectMemberRenderedProxyPreflight(
+                    {
+                        "schema_version": 1,
+                        "passed": True,
+                        "member_output_quality_passed": True,
+                        "member_output_quality_failure_reasons": [],
+                        "direct_member_rendered_continuity_passed": True,
+                        "repair_target_boundary_indices": [],
+                        "generic_repair_target_boundary_indices": [],
+                        "continuity_repair_target_boundary_indices": [],
+                        "rendered_proxy_review": {
+                            "passed": True,
+                            "weighted_score": 1.0,
+                        },
+                        "rendered_continuity": {
+                            "passed": True,
+                            "failure_boundary_indices": {},
+                            "boundaries": [],
+                            "metrics": {
+                                "attention_position_mismatch_p95": 0.0,
+                                "attention_scale_mismatch_p95": 0.0,
+                                "pose_mismatch_p95": 0.0,
+                                "silhouette_mismatch_p95": 0.0,
+                            },
+                            "thresholds": {
+                                "maximum_attention_position_mismatch_p95": 1.0,
+                                "maximum_attention_scale_mismatch_p95": 1.0,
+                                "maximum_pose_mismatch_p95": 1.0,
+                                "maximum_silhouette_mismatch_p95": 1.0,
+                            },
+                        },
+                    }
+                )
+
+            professional_gate_metrics = {
+                "visible_switches_per_minute": 16.5,
+                "pose_mismatch_p95": 0.0,
+                "silhouette_mismatch_p95": 0.0,
+                "editorial_transform_segment_count": 1,
+            }
+            professional_gate = SimpleNamespace(
+                passed=True,
+                failure_reasons=(),
+                metrics=professional_gate_metrics,
+                to_dict=lambda: {
+                    "contract": "synthetic_direct_member_professional_gate",
+                    "passed": True,
+                    "failure_reasons": [],
+                    "metrics": dict(professional_gate_metrics),
+                },
+            )
+
             with patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _portrait_analysis_media(source),
@@ -5318,42 +8542,59 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                return_value=(),
+                "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                return_value=((), {"detection_policy": "synthetic_test"}),
             ), patch(
                 "crosscut.pipeline.build_group_draft",
                 return_value=timing,
             ), patch(
                 "crosscut.pipeline.select_balanced_direct_member_sources",
-                return_value=visual_selection,
+                side_effect=_bound_visual_selection(visual_selection),
             ), patch(
                 "crosscut.pipeline._VideoDescriptorProvider",
                 return_value=DescriptorProviderStub(),
             ), patch(
-                "crosscut.pipeline.DirectMemberDenseFaceProvider",
-                return_value=dense_face_provider,
-            ) as dense_provider_factory, patch(
+                "crosscut.source_first_member_session."
+                "open_source_first_member_session",
+                return_value=(dense_face_provider, DescriptorProviderStub()),
+            ) as source_first_session, patch(
                 "crosscut.pipeline.build_direct_member_editorial_motion_plan",
                 side_effect=build_direct_motion,
             ) as build_direct_motion_mock, patch(
+                "crosscut.pipeline.render_and_review_direct_member_proxy",
+                side_effect=pass_member_proxy,
+            ), patch(
+                "crosscut.pipeline."
+                "evaluate_direct_member_professional_pre_render_gate",
+                return_value=professional_gate,
+            ), patch(
                 "crosscut.pipeline.build_member_editorial_motion_plan"
             ) as build_member_motion, patch(
                 "crosscut.pipeline.track_anchored_member"
             ) as track_member, patch(
                 "crosscut.pipeline.build_member_draft"
             ) as build_cropped_member, patch(
+                "crosscut.pipeline.analyze_cut_local_sync",
+                return_value=member_cut_local_sync_payload,
+            ) as analyze_member_cut_local_sync, patch(
                 "crosscut.pipeline.write_plan"
             ), patch(
                 "crosscut.pipeline.render",
                 return_value="h264_videotoolbox",
-            ) as render_video:
-                artifact = analyze(request, _MemoryReporter())  # type: ignore[arg-type]
+            ) as render_video, patch(
+                "crosscut.pipeline._enforce_automatic_member_post_render_qa",
+                side_effect=pass_member_delivery_gate,
+            ) as member_delivery_gate:
+                reporter = _MemoryReporter()
+                artifact = analyze(request, reporter)  # type: ignore[arg-type]
 
             track_member.assert_not_called()
             build_cropped_member.assert_not_called()
             build_member_motion.assert_not_called()
             build_direct_motion_mock.assert_called_once()
-            dense_provider_factory.assert_called_once_with(request.sources)
+            source_first_session.assert_called_once()
+            member_delivery_gate.assert_called_once()
+            analyze_member_cut_local_sync.assert_called_once()
             self.assertEqual(len(dense_face_provider.sample_calls), 1)
             self.assertEqual(dense_face_provider.sample_calls[0][0], 1)
             self.assertAlmostEqual(
@@ -5361,14 +8602,36 @@ class PipelineTests(unittest.TestCase):
                 timewarps[1].master_to_source(4.0),
             )
             self.assertTrue(dense_face_provider.closed)
+            partition_events = [
+                payload
+                for event_type, payload in reporter.events
+                if event_type == "direct_member_partition_profile"
+            ]
+            self.assertEqual(
+                [payload["phase"] for payload in partition_events],
+                ["started", "completed", "search_completed"],
+            )
+            self.assertEqual(
+                partition_events[-1]["event"],
+                "direct_member_partition_search_completed",
+            )
+            self.assertEqual(partition_events[-1]["result"], "feasible")
             plan = render_video.call_args.args[0]
-            self.assertTrue(plan.member_pose_dissolve_requested)
+            cut_local_call = analyze_member_cut_local_sync.call_args
+            self.assertIs(cut_local_call.args[0], plan)
+            self.assertEqual(
+                cut_local_call.kwargs["activation"],
+                MEMBER_CUT_LOCAL_SYNC_ACTIVATION,
+            )
+            self.assertIs(cut_local_call.kwargs["source_timewarps"], timewarps)
+            self.assertEqual(cut_local_call.kwargs["timewarp_payloads"], ())
+            self.assertFalse(plan.member_pose_dissolve_requested)
             self.assertFalse(plan.member_pose_dissolve_effective)
             self.assertEqual(plan.member_pose_dissolve_count, 0)
-            self.assertEqual(len(plan.segments), 10)
+            self.assertEqual(len(plan.segments), 12)
             self.assertEqual(
                 [item.source_index for item in plan.segments],
-                list(range(10)),
+                [*range(10), 0, 1],
             )
             self.assertTrue(all(item.pan_crop is None for item in plan.segments))
             self.assertTrue(all(item.crop is None for item in plan.segments))
@@ -5379,21 +8642,52 @@ class PipelineTests(unittest.TestCase):
                     for item in plan.segments[1:]
                 )
             )
-            self.assertAlmostEqual(plan.segments[0].source_end, 3.984)
+            self.assertAlmostEqual(plan.segments[0].source_end, 1.992)
 
             manifest = artifact.manifest
+            self.assertEqual(
+                manifest["render"]["cut_local_sync"],
+                member_cut_local_sync_payload,
+            )
+            self.assertEqual(manifest["artifact_role"], "delivery")
+            self.assertTrue(
+                manifest["app_result_exposure"]["video_output_exposed"]
+            )
+            self.assertTrue(manifest["post_render_qa"]["passed"])
+            self.assertTrue(
+                manifest["post_render_qa"]["render_receipt"][
+                    "all_eligible_sources_pixel_proven"
+                ]
+            )
+            self.assertTrue(
+                any(path.suffix.lower() == ".mp4" for path in artifact.output_paths)
+            )
+            self.assertTrue(
+                any(
+                    path.name.endswith("-member-post-render-qa.json")
+                    for path in artifact.output_paths
+                )
+            )
             self.assertEqual(manifest["member_tracking"], [])
             self.assertEqual(manifest["member_auto_anchors"], [])
             self.assertIsNone(manifest["member_anchor_trim"])
             self.assertIsNone(manifest["member_draft"])
             direct = manifest["member_direct_full_frame"]
             self.assertTrue(direct["enabled"])
-            self.assertTrue(direct["member_pose_dissolve_requested"])
+            self.assertEqual(
+                direct["minimum_required_distinct_source_count"],
+                10,
+            )
+            self.assertEqual(
+                direct["required_used_request_source_indices"],
+                list(range(10)),
+            )
+            self.assertFalse(direct["member_pose_dissolve_requested"])
             self.assertFalse(direct["member_pose_dissolve_effective"])
             self.assertEqual(direct["member_pose_dissolve_count"], 0)
             self.assertEqual(
                 direct["pose_matched_dissolves"]["hard_cut_count"],
-                9,
+                11,
             )
             self.assertTrue(
                 direct["pose_matched_dissolves"][
@@ -5415,7 +8709,8 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(
                 direct["identity_policy"],
-                "no_geometry_identity_claim_no_tracking_no_crop",
+                "official_target_member_provenance_no_identity_inference_"
+                "with_lossless_portrait_fill",
             )
             self.assertEqual(
                 direct["visual_selection"]["analysis_basis"],
@@ -5465,13 +8760,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(direct["final_source_usage"]["distinct_source_count"], 10)
             self.assertEqual(
                 [item["segment_count"] for item in direct["final_source_usage"]["sources"]],
-                [1] * 10,
+                [2, 2, *([1] * 8)],
             )
             self.assertEqual(
                 [item["duration_seconds"] for item in direct["final_source_usage"]["sources"]],
-                [4.0] * 10,
+                [6.0, 6.0, 2.0, 2.0, *([4.0] * 6)],
             )
-            self.assertAlmostEqual(direct["segments"][0]["source_local_end"], 3.984)
+            self.assertAlmostEqual(direct["segments"][0]["source_local_end"], 1.992)
             self.assertEqual(
                 direct["segments"][0]["source_clock_basis"],
                 "local_monotonic_timewarp",
@@ -5487,7 +8782,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(render_payload["final_source_usage"]["distinct_source_count"], 10)
             self.assertAlmostEqual(
                 render_payload["final_segments"][0]["source_local_end"],
-                3.984,
+                1.992,
             )
             self.assertTrue(render_payload["cadence"]["passed"])
             self.assertEqual(

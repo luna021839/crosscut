@@ -92,6 +92,9 @@ def _motion(
         incoming_motion_component_count=3 if both_moving else 2,
         both_moving=both_moving,
         endpoint_pose_shape_mismatch=endpoint_mismatch,
+        direction_cosine_audit_only=0.82 if both_moving else None,
+        motion_speed_ratio_mismatch=0.12 if both_moving else None,
+        pose_phase_continuation_mismatch=0.10 if both_moving else None,
     )
 
 
@@ -643,6 +646,69 @@ class DirectMemberTransitionTests(unittest.TestCase):
                     member_pose_dissolve_count=0,
                 )
                 self.assertIn(filter_token, build_filter_graph(render_plan))
+
+    def test_required_pose_dissolve_bridge_materializes_logistic_overlap(self) -> None:
+        transition_plan = _plan(
+            (0, 1),
+            selection=_cinematic_selection(style="pose_dissolve"),
+            highlight_intervals=((3.5, 4.5),),
+        )
+
+        self.assertEqual(transition_plan.selected_count, 1)
+        self.assertEqual(transition_plan.cinematic_bridge_count, 1)
+        self.assertEqual(transition_plan.to_dict()["hard_cut_count"], 0)
+        self.assertIs(
+            transition_plan.transitions[0].kind,
+            TransitionKind.FACE_DISSOLVE,
+        )
+        render_plan = RenderPlan(
+            sources=(Path("0.mp4"), Path("1.mp4")),
+            segments=_segments((0, 1)),
+            reference_source=0,
+            aspect_ratio=AspectRatio.PORTRAIT,
+            output=Path("out.mp4"),
+            width=1080,
+            height=1920,
+            fps=30.0,
+            transitions=transition_plan.transitions,
+            member_pose_dissolve_requested=True,
+            member_pose_dissolve_effective=True,
+            member_pose_dissolve_count=1,
+        )
+        graph = build_filter_graph(render_plan)
+        self.assertIn("xfade=transition=custom", graph)
+        self.assertIn("exp(-12*(P-0.5))", graph)
+
+    def test_required_pose_dissolve_uses_selected_cut_exact_handle_samples(
+        self,
+    ) -> None:
+        selection = _cinematic_selection(style="pose_dissolve")
+        boundary = selection.boundaries[0]
+        boundary.outgoing_handle_samples = (
+            _sample(4.0 + 1.0 / 30.0, 0.10),
+            _sample(4.20, 0.11),
+        )
+        boundary.incoming_handle_samples = (
+            _sample(4.0 + 1.0 / 30.0, 0.11),
+            _sample(4.20, 0.12),
+        )
+        for source in selection.span_validity[1].sources:
+            source.samples = (
+                _sample(4.45, 20.0),
+                _sample(4.80, 20.0),
+            )
+
+        transition_plan = _plan(
+            (0, 1),
+            selection=selection,
+            highlight_intervals=((3.5, 4.5),),
+        )
+
+        self.assertEqual(transition_plan.selected_count, 1)
+        self.assertIs(
+            transition_plan.transitions[0].kind,
+            TransitionKind.FACE_DISSOLVE,
+        )
 
     def test_required_bridge_accepts_verified_cross_attention_basis(self) -> None:
         transition_plan = _plan(

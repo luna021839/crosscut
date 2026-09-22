@@ -1,12 +1,55 @@
 """Exact section switch counts carried by the joint selector, not a QA waiver."""
 from dataclasses import dataclass
 import math
+from time import monotonic
 from typing import Mapping, Sequence
 
 from .timeline import NoCompleteTimelinePath
 
 
 MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES = 50_000
+MAXIMUM_SOURCE_SWITCH_EXPANSIONS = 2_000_000
+
+
+@dataclass(slots=True)
+class SourceSwitchSearchBudget:
+    """Bound intermediate work too, not only the final Pareto frontier."""
+
+    deadline_monotonic_seconds: float | None = None
+    maximum_states: int = MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES
+    maximum_expansions: int = MAXIMUM_SOURCE_SWITCH_EXPANSIONS
+    expansions: int = 0
+    peak_states: int = 0
+
+    def __post_init__(self):
+        for limit in (self.maximum_states, self.maximum_expansions):
+            if type(limit) is not int or limit < 1:
+                raise ValueError('source-switch search limits must be positive integers')
+        deadline = self.deadline_monotonic_seconds
+        if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)):
+            raise ValueError('source-switch deadline must be finite')
+        self.check()
+
+    def check(self, *, states: int = 0, segment_index: int | None = None):
+        self.expansions += 1
+        self.peak_states = max(self.peak_states, states)
+        reason = (
+            'section_source_switch_wall_clock_budget_exhausted'
+            if self.deadline_monotonic_seconds is not None and monotonic() >= self.deadline_monotonic_seconds
+            else 'section_source_switch_capacity_state_budget_exhausted'
+            if states > self.maximum_states
+            else 'section_source_switch_work_budget_exhausted'
+            if self.expansions > self.maximum_expansions
+            else None
+        )
+        if reason:
+            raise NoCompleteTimelinePath(
+                'source-switch search exceeded its bounded descriptor budget',
+                reason_code=reason, segment_index=segment_index,
+                rejection_counts={reason: 1, 'proof_materialization_call_count': 0,
+                                  'capacity_state_count': states,
+                                  'descriptor_expansion_count': self.expansions},
+            )
 
 
 def quantized_boundary_seconds(
@@ -89,7 +132,7 @@ def source_switch_increment_vectors(
     return tuple(sorted(vectors))
 
 
-def _pareto_capacity_states(states):
+def _pareto_capacity_states(states, budget):
     """Drop count vectors dominated for the same current candidate."""
 
     by_candidate = {}
@@ -103,14 +146,20 @@ def _pareto_capacity_states(states):
             key=lambda item: (sum(item), item),
             reverse=True,
         ):
+            budget.check(states=len(states))
             if any(
-                all(existing >= current for existing, current in zip(kept, counts))
+                _dominates(kept, counts, budget)
                 for kept in frontier
             ):
                 continue
             frontier.append(counts)
         retained.update((candidate, counts) for counts in frontier)
     return retained
+
+
+def _dominates(left, right, budget):
+    budget.check()
+    return all(a >= b for a, b in zip(left, right))
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +184,10 @@ class SourceSwitchRequirement:
 class SourceSwitchCounter:
     def __init__(self, requirements: Sequence[SourceSwitchRequirement], lattice,
                  *, fps: float, maximum_offset_frames: int, domain=None,
-                 source_families: Mapping[str,str] | None = None):
+                 source_families: Mapping[str,str] | None = None,
+                 budget: SourceSwitchSearchBudget | None = None):
+        self.budget = budget or SourceSwitchSearchBudget()
+        self._increment_vectors = {}
         self.requirements=tuple(requirements)
         if len(self.requirements)>32 or any(not isinstance(w,SourceSwitchRequirement) for w in self.requirements):
             raise ValueError('source-switch requirements must be at most 32 typed windows')
@@ -171,6 +223,7 @@ class SourceSwitchCounter:
             if self.different(k.outgoing.source_id,k.incoming.source_id)})
         potential=[]
         for boundary,(left,right) in enumerate(zip(lattice,lattice[1:])):
+            self.budget.check(segment_index=right[0].segment_index)
             has_pair=(boundary in allowed_positions if allowed_positions is not None else
                       any(self.different(a.source_id,b.source_id) for a in left for b in right))
             vectors = (
@@ -210,13 +263,17 @@ class SourceSwitchCounter:
             raise ValueError("source-switch boundary candidates do not match lattice")
         if not self.different(left.source_id,right.source_id):
             return (self.initial_counts,)
-        return source_switch_increment_vectors(
+        cache_key = (boundary, right.start_seconds)
+        if cache_key not in self._increment_vectors:
+            self.budget.check(segment_index=right.segment_index)
+            self._increment_vectors[cache_key] = source_switch_increment_vectors(
             self.requirements,
             origin_seconds=self.origin,
             nominal_boundary_seconds=right.start_seconds,
             fps=self.fps,
             maximum_offset_frames=self.maximum_offset_frames,
-        )
+            )
+        return self._increment_vectors[cache_key]
 
     def _connected_capacity(self,domain):
         """Prove one connected source/candidate path can meet every count.
@@ -232,11 +289,13 @@ class SourceSwitchCounter:
             (key.boundary_index,key.outgoing,key.incoming) for key in domain
         })
         states={(candidate,self.initial_counts) for candidate in self.lattice[0]}
+        self.budget.check(states=len(states))
         potential_boundaries=[[] for _ in self.requirements]
         for boundary,(left_row,right_row) in enumerate(zip(self.lattice,self.lattice[1:])):
             next_states=set()
             for left,counts in states:
                 for right in right_row:
+                    self.budget.check(states=len(next_states), segment_index=right.segment_index)
                     if allowed is not None and (boundary,left,right) not in allowed:
                         continue
                     for increments in self.potential_increment_vectors(
@@ -254,7 +313,8 @@ class SourceSwitchCounter:
                     potential_boundaries[index].append(boundary)
             if not next_states:
                 return False,right_row[0].segment_index
-            states=_pareto_capacity_states(next_states)
+            self.budget.check(states=len(next_states), segment_index=right_row[0].segment_index)
+            states=_pareto_capacity_states(next_states, self.budget)
             if len(states) > MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES:
                 raise NoCompleteTimelinePath(
                     'source-switch capacity search exceeded its deterministic state budget',

@@ -581,6 +581,7 @@ def materialize_stage_edit_rerank_snapshots(
                 performance_start_seconds=path[0].start_seconds,
                 performance_end_seconds=path[-1].end_seconds,
                 provenance=provenance,
+                inspection_only_without_causal_sensing=True,
             )
         )
     return tuple(snapshots)

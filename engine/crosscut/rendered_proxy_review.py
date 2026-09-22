@@ -1779,14 +1779,14 @@ def _boundary_score(
     discontinuities: Mapping[str, float | None],
     *,
     effective_severity_divisor: float = 1.0,
-) -> float:
+) -> float | None:
     active = tuple(
         (name, weight, discontinuities.get(name))
         for name, weight in _BOUNDARY_WEIGHTS.items()
-        if discontinuities.get(name) is not None
+        if discontinuities.get(name) is not None and math.isfinite(float(discontinuities[name]))
     )
     if not active:
-        return 100.0
+        return None
     weight_sum = sum(weight for _name, weight, _value in active)
     severity = sum(
         weight * _unit(float(value) / effective_severity_divisor)
@@ -1796,9 +1796,32 @@ def _boundary_score(
     return 100.0 * (1.0 - severity)
 
 
+def _boundary_evidence(discontinuities: Mapping[str, float | None]) -> dict[str, Any]:
+    available = [name for name in _BOUNDARY_WEIGHTS
+                 if discontinuities.get(name) is not None
+                 and math.isfinite(float(discontinuities[name]))]
+    subject_observed = any(all(name in available for name in pair) for pair in (
+        ("face_scale_discontinuity", "face_position_discontinuity"),
+        ("silhouette_scale_discontinuity", "silhouette_position_discontinuity"),
+    ))
+    observed_score = _boundary_score(discontinuities)
+    return {
+        "contract": "boundary_observation_coverage_v1",
+        "available_metrics": available,
+        "missing_metrics": [name for name in _BOUNDARY_WEIGHTS if name not in available],
+        "weighted_coverage": sum(_BOUNDARY_WEIGHTS[name] for name in available) / sum(_BOUNDARY_WEIGHTS.values()),
+        "subject_geometry_observed": subject_observed,
+        "motion_direction_observed": "motion_direction_discontinuity" in available,
+        "quality_score": observed_score if subject_observed else None,
+        "observed_feature_score": observed_score,
+        "status": "OBSERVED" if subject_observed else "UNKNOWN_SUBJECT_CONTINUITY",
+        "missing_evidence_policy": "unknown_not_a_perfect_match_or_a_maximum_mismatch",
+    }
+
+
 def _issue_reasons(
     discontinuities: Mapping[str, float | None],
-    score: float,
+    score: float | None,
     config: ProxyReviewConfig,
     threshold_multiplier: float = 1.0,
 ) -> list[str]:
@@ -1825,7 +1848,12 @@ def _issue_reasons(
         if discontinuities.get(name) is not None
         and float(discontinuities[name]) > threshold * threshold_multiplier
     ]
-    if score < config.minimum_boundary_score_p10:
+    evidence = _boundary_evidence(discontinuities)
+    if not evidence["subject_geometry_observed"]:
+        reasons.append("subject_continuity_unobserved")
+    if score is None:
+        reasons.append("boundary_measurements_unavailable")
+    elif score < config.minimum_boundary_score_p10:
         reasons.append("weighted_boundary_score")
     return reasons
 
@@ -2056,6 +2084,7 @@ def _review_boundary(
                 "unavailable_policy": "not_comparable_never_maximum_mismatch",
             },
             "discontinuities": discontinuities,
+            "evidence_coverage": _boundary_evidence(discontinuities),
             "editorial_continuity_applicable": (
                 window.review_domain == INTRODUCED_CROSS_SOURCE_DOMAIN
             ),
@@ -2228,6 +2257,7 @@ def review_hard_cut_frame_window(
             "unavailable_policy": "not_comparable_never_maximum_mismatch",
         },
         "discontinuities": discontinuities,
+        "evidence_coverage": _boundary_evidence(discontinuities),
         "weighted_score": score,
         "issue_reasons": issue_reasons,
         "temporal_integrity": temporal_integrity,
@@ -2315,19 +2345,18 @@ def _boundary_domain_summary(
     selected = [
         item for item in boundary_reviews if item.get("review_domain") == domain
     ]
-    scores = [float(item["weighted_score"]) for item in selected]
+    scores = _observed_boundary_scores(selected)
     issue_indices = [
         int(item["boundary_index"])
         for item in selected
-        if not bool(item["passed"])
+        if not bool(item["passed"]) or not _observed_boundary_scores((item,))
     ]
     score_p10 = _quantile(scores, 0.10)
-    if score_p10 is None:
-        score_p10 = 100.0
     issue_fraction = len(issue_indices) / len(selected) if selected else 0.0
     if domain == INTRODUCED_CROSS_SOURCE_DOMAIN:
         passed = (
-            score_p10 >= config.minimum_boundary_score_p10
+            score_p10 is not None
+            and score_p10 >= config.minimum_boundary_score_p10
             and issue_fraction <= config.maximum_boundary_issue_fraction
         )
         pass_policy = (
@@ -2346,10 +2375,26 @@ def _boundary_domain_summary(
         "score": {
             "distribution": _distribution(scores),
             "p10": score_p10,
+            "evidence_status": (
+                "NOT_APPLICABLE" if not selected else
+                "OBSERVED" if len(scores) == len(selected) else "INCOMPLETE"
+            ),
         },
         "pass_policy": pass_policy,
         "passed": passed,
     }
+
+
+def _observed_boundary_scores(
+    boundaries: Sequence[Mapping[str, Any]],
+) -> list[float]:
+    """Keep missing measurements out of numeric summaries, including empty paths."""
+    return [
+        float(value)
+        for item in boundaries
+        if type(value := item.get("weighted_score")) in (int, float)
+        and math.isfinite(value)
+    ]
 
 
 def review_rendered_proxy(
@@ -2652,10 +2697,8 @@ def review_rendered_proxy(
         run_incoming_boundary_indices=run_incoming_boundary_indices,
         config=settings,
     )
-    boundary_scores = [float(item["weighted_score"]) for item in boundary_reviews]
+    boundary_scores = _observed_boundary_scores(boundary_reviews)
     boundary_score_p10 = _quantile(boundary_scores, 0.10)
-    if boundary_score_p10 is None:
-        boundary_score_p10 = 100.0
     issue_indices = [
         int(item["boundary_index"])
         for item in boundary_reviews
@@ -2672,7 +2715,10 @@ def review_rendered_proxy(
     }
     visible_summary = domain_summaries[INTRODUCED_CROSS_SOURCE_DOMAIN]
     visible_score = visible_summary["score"]
-    visible_boundary_score_p10 = float(visible_score["p10"])
+    visible_boundary_score_p10 = visible_score["p10"]
+    # A numeric rank is needed by selection, but zero rank credit is not an
+    # observed zero-quality measurement. Keep the serialized measurement null.
+    boundary_rank_credit = visible_boundary_score_p10 or 0.0
     visible_issue_fraction = float(visible_summary["issue_fraction"])
     visible_issue_indices = list(visible_summary["issue_indices"])
     quality_p10 = float(overall_quality["p10"] or 0.0)
@@ -2680,7 +2726,7 @@ def review_rendered_proxy(
         median_span / max(1e-9, settings.maximum_source_quality_median_span)
     )
     weighted_score_before_perceptual_source_admission = 100.0 * (
-        0.65 * (visible_boundary_score_p10 / 100.0)
+        0.65 * (boundary_rank_credit / 100.0)
         + 0.20 * quality_p10
         + 0.15 * consistency
     )
@@ -2738,10 +2784,11 @@ def review_rendered_proxy(
         bool(professional_gate_payload["passed"])
         if professional_gate_payload is not None
         else bool(visible_summary["passed"])
+        if visible_summary["boundary_count"] else True
     )
     weighted_score_gate_passed = (
         True
-        if professional_gate_payload is not None
+        if professional_gate_payload is not None or not visible_summary["boundary_count"]
         else weighted_score >= settings.minimum_weighted_score
     )
     passed = (
@@ -2814,7 +2861,12 @@ def review_rendered_proxy(
             "issue_fraction": visible_issue_fraction,
             "count_basis": INTRODUCED_CROSS_SOURCE_DOMAIN,
             "selection_gate": professional_gate_payload is None,
+            "evidence_status": visible_score["evidence_status"],
+            "unobserved_selection_credit": 0.0,
         },
+        "cross_source_continuity_verified": bool(
+            visible_summary["boundary_count"] and visible_summary["passed"]
+        ),
         "boundary_domains": deepcopy(domain_summaries),
         "boundary_issue_indices": issue_indices,
         "all_boundary_issue_indices": issue_indices,

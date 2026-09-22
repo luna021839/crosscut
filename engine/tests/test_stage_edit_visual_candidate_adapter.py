@@ -16,12 +16,17 @@ from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
     AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
     _GroupRenderCandidateBundle,
+    _BoundarySearchBudget,
     _apply_stage_edit_candidate_render_contract,
     _attempt_proxy_triggered_partial_reedit,
     _enforce_automatic_stage_edit_post_render_qa,
     analyze,
 )
 from crosscut.post_render_qa import fingerprint_post_render_artifacts
+from crosscut.rendered_candidate_selection import (
+    RenderedCandidate,
+    RenderedCandidateReview,
+)
 from crosscut.render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -46,9 +51,16 @@ from crosscut.stage_edit_pipeline_bridge import (
     RetainedStageEditCandidate,
     StageEditPipelineBridgePreflight,
     StageEditPipelineBridgeResult,
+    load_stage_edit_production_snapshot_identity,
 )
 from crosscut.stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_dynamic_crop_motion_authority_v3 import (
+    DynamicCropMotionAuthorityV3,
+)
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
 )
 from crosscut.stage_edit_semimarkov_beam import (
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
@@ -57,6 +69,7 @@ from crosscut.stage_edit_semimarkov_beam import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     SourceCandidateToken,
     StageEditReadinessReport,
     StageEditSequence,
@@ -69,23 +82,30 @@ from crosscut.stage_edit_visual_candidate_adapter import (
     StageEditVisualCandidateError,
     _retained_dynamic_crop_version,
     apply_stage_edit_dynamic_crop_to_render_plan,
+    materialize_stage_edit_visual_candidate,
     materialize_stage_edit_visual_candidates,
 )
 from crosscut.timeline import ShotType
 from crosscut.visual_score import (
     FrameVisualDescriptor,
+    PersistentVisualFeatureCacheInitializationError,
     VisualTimelinePlan,
     build_prescribed_visual_timeline_candidate_set,
 )
 from engine.tests.test_pipeline import (
     _MemoryReporter,
     _analysis_media,
+    _current_montage_policy_fixture,
+    _current_motion_cut_profile_fixture,
     _visual_choice,
 )
 from engine.tests.test_stage_edit_pipeline_bridge import (
     _typed_decode_result,
     _typed_head_result,
     _typed_timelines,
+)
+from engine.tests.stage_edit_causal_sensing_test_support import (
+    synthetic_production_snapshot,
 )
 
 
@@ -113,17 +133,24 @@ def _section_plan() -> SectionPlan:
 
 def _snapshot() -> StageEditFeatureSnapshot:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     source_candidates = tuple(
         SourceCandidateToken(
             source_id=source_id,
-            features=(0.2 + index * 0.1,) * schema.raw_source_dimension,
-            missing_mask=(False,) * schema.raw_source_dimension,
+            features=tuple(
+                0.0 if missing else 0.2 + index * 0.1
+                for missing in missing_mask
+            ),
+            missing_mask=missing_mask,
             available=True,
             hard_gate_passed=True,
         )
         for index, source_id in enumerate(("source-a", "source-b"))
     )
-    return StageEditFeatureSnapshot.build(
+    return synthetic_production_snapshot(
         StageEditSequence(
             "ive:visual-promotion-test",
             (
@@ -201,9 +228,19 @@ def _bridge_result(count: int = 8) -> StageEditPipelineBridgeResult:
         Path("/tmp/stage-edit-visual-b.mp4").resolve(),
     )
     snapshot = _snapshot()
+    snapshot_path = Path("/tmp/stage-edit-visual-snapshot.json").resolve()
+    snapshot_path.write_text(
+        json.dumps(snapshot.to_dict(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_identity = load_stage_edit_production_snapshot_identity(
+        snapshot_path,
+        edit_mode="group",
+        target_member=None,
+    )
     checkpoint = Path("/tmp/stage-edit-visual-checkpoint").resolve()
     preflight = StageEditPipelineBridgePreflight(
-        snapshot_path=Path("/tmp/stage-edit-visual-snapshot.json").resolve(),
+        snapshot_path=snapshot_path,
         checkpoint_directory=checkpoint,
         source_ids=("source-a", "source-b"),
         snapshot=snapshot,
@@ -219,6 +256,9 @@ def _bridge_result(count: int = 8) -> StageEditPipelineBridgeResult:
             dynamic_crop_version=2,
             checkpoint_metadata_filename="dynamic-crop-v2-metadata.json",
         ),
+        snapshot_identity=snapshot_identity,
+        edit_mode="group",
+        target_member=None,
     )
     retained = tuple(
         RetainedStageEditCandidate(
@@ -307,7 +347,13 @@ def _visual_fixture(*, passed: bool = True):
             "review": review.to_dict(),
         },
     )
-    candidate_set = SimpleNamespace(candidates=(record,))
+    candidate_set = SimpleNamespace(
+        candidates=(record,),
+        to_dict=lambda: {
+            "candidate_count": 1,
+            "selected_candidate_index": 0,
+        },
+    )
     base_materialized = SimpleNamespace(
         visual_plan=VisualTimelinePlan(choices=(), optimizer_score=4.0),
         segments=(
@@ -318,7 +364,10 @@ def _visual_fixture(*, passed: bool = True):
     return candidate_set, base_materialized
 
 
-def _typed_visual_batch() -> StageEditVisualCandidateBatch:
+def _typed_visual_batch(
+    *,
+    quality_gated_single_delivery: bool = False,
+) -> StageEditVisualCandidateBatch:
     bridge = _bridge_result()
     candidate_set, base_materialized = _visual_fixture()
     with (
@@ -340,6 +389,7 @@ def _typed_visual_batch() -> StageEditVisualCandidateBatch:
             sync_scores=(0.9, 0.8),
             scene_cut_times=((), ()),
             source_timewarps=(None, None),
+            quality_gated_single_delivery=quality_gated_single_delivery,
         )
 
 
@@ -471,6 +521,18 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             "issue_count": 0 if passed else 1,
             "fail_issue_count": 0,
             "conditional_issue_count": 0 if passed else 1,
+            "issues": (
+                []
+                if passed
+                else [
+                    {
+                        "code": "timeline_review_failed",
+                        "severity": "conditional",
+                    }
+                ]
+            ),
+            "hard_failures": [],
+            "warnings": [] if passed else [{"code": "fixture_conditional"}],
             "input_artifact_fingerprints": (
                 input_artifact_fingerprints or {}
             ),
@@ -777,6 +839,11 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 sync_scores=(0.9, 0.8),
                 scene_cut_times=((), ()),
                 source_timewarps=(None, None),
+                feature_cache_directory=Path("/legacy/source-cache"),
+                feature_derived_cache_directory=Path(
+                    "/direct/visual-derived-cache"
+                ),
+                require_persistent_feature_cache=True,
             )
 
         self.assertEqual(8, prescribed.call_count)
@@ -788,10 +855,53 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 ((0.0, 2.0), (2.0, 4.0)),
                 call.kwargs["canonical_spans"],
             )
+            self.assertEqual(
+                call.kwargs["feature_cache_directory"],
+                Path("/legacy/source-cache"),
+            )
+            self.assertEqual(
+                call.kwargs["feature_derived_cache_directory"],
+                Path("/direct/visual-derived-cache"),
+            )
+            self.assertIs(
+                call.kwargs["require_persistent_feature_cache"],
+                True,
+            )
         payload = batch.to_dict()
         self.assertEqual("stage_edit_generation_only", payload["candidate_pool"])
         self.assertFalse(payload["ordinary_visual_baseline_candidate_pool_eligible"])
         self.assertFalse(payload["silent_baseline_fallback_allowed"])
+
+    def test_required_direct_cache_failure_propagates_before_classification(
+        self,
+    ) -> None:
+        bridge = _bridge_result()
+        with patch(
+            "crosscut.stage_edit_visual_candidate_adapter."
+            "build_prescribed_visual_timeline_candidate_set",
+            side_effect=PersistentVisualFeatureCacheInitializationError(
+                "required persistent visual feature cache initialization failed"
+            ),
+        ) as prescribed:
+            with self.assertRaises(
+                PersistentVisualFeatureCacheInitializationError
+            ):
+                materialize_stage_edit_visual_candidate(
+                    bridge.retained_candidates[0],
+                    candidate_index=0,
+                    review_rank=0,
+                    sources=bridge.retained_candidates[0].edit.sources,
+                    audio_offsets=(0.0, 0.0),
+                    sync_scores=(0.9, 0.8),
+                    scene_cut_times=((), ()),
+                    source_timewarps=(None, None),
+                    feature_derived_cache_directory=Path(
+                        "/direct/visual-derived-cache"
+                    ),
+                    require_persistent_feature_cache=True,
+                )
+
+        prescribed.assert_called_once()
 
     def test_short_batch_and_failed_visual_review_fail_closed(self) -> None:
         with self.assertRaisesRegex(StageEditVisualCandidateError, "exactly 8"):
@@ -1000,8 +1110,38 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 scene_cut_times=((), ()),
                 source_timewarps=(None, None),
             ).candidates[0]
+        v3_shots = []
+        for index, shot in enumerate(candidate.retained_candidate.edit.shots):
+            track = EditorialTransformTrack(
+                (
+                    EditorialTransformKeyframe(0.0, 1.04, 0.50, 0.50, 0.0),
+                    EditorialTransformKeyframe(2.0, 1.10, 0.52, 0.49, 0.0),
+                ),
+                reason="stage_edit_dynamic_crop_head_v3",
+            )
+            decode = DynamicCropTrackDecodeV3(
+                source_id=("source-a", "source-b")[index],
+                source_index=shot.segment.source_index,
+                eligible=True,
+                loss_masked=False,
+                track=track,
+                predicted_keyframe_count=2,
+                applied_keyframe_count=2,
+                minimum_safe_zoom_projection_count=0,
+                rejection_reasons=(),
+                motion_logit=20.0,
+                shot_duration_seconds=shot.segment.duration,
+            )
+            v3_shots.append(
+                replace(
+                    shot,
+                    segment=replace(shot.segment, editorial_transform=track),
+                    dynamic_crop_decode_v3=decode,
+                )
+            )
         v3_edit = replace(
             candidate.retained_candidate.edit,
+            shots=tuple(v3_shots),
             candidate_history=(
                 *candidate.retained_candidate.edit.candidate_history[:-1],
                 {
@@ -1052,12 +1192,37 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             editorial_motion_plan=None,
             render_plan=plan,
         )
-        with patch(
-            "crosscut.pipeline._stage_edit_exact_shot_clock_from_edit",
-            return_value={"contract": "test-exact-clock"},
+        motion_timeline = SimpleNamespace(
+            authority=SimpleNamespace(
+                authority_content_sha256="d" * 64,
+            ),
+            timeline_evidence_content_sha256="e" * 64,
+            framing_track_applied_count=0,
+            motion_event_applied_count=0,
+            motion_event_applied_fraction=0.0,
+            motion_budget_within_range=True,
+            static_or_cut_time_reframe_excluded_count=2,
+        )
+        with (
+            patch(
+                "crosscut.pipeline._stage_edit_exact_shot_clock_from_edit",
+                return_value={"contract": "test-exact-clock"},
+            ),
+            patch(
+                "crosscut.pipeline."
+                "corroborate_dynamic_crop_motion_timeline_v3",
+                return_value=motion_timeline,
+            ),
         ):
             promoted = _apply_stage_edit_candidate_render_contract(
-                bundle, v3_candidate
+                bundle,
+                v3_candidate,
+                motion_authority_v3=DynamicCropMotionAuthorityV3.create(
+                    release_freeze_content_sha256="a" * 64,
+                    release_freeze_file_sha256="b" * 64,
+                    source_commit_oid="c" * 40,
+                    candidate_id="production-balanced-test",
+                ),
             )
         event = promoted.candidate_lineage[-1]
         self.assertEqual(event["stage"], "dynamic_crop_v3_render_plan_overlay")
@@ -1230,7 +1395,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             cadence_profile="stage_edit",
             pre_render_score=90.0,
             visual_timeline=original_visual,
-            boundary_repairs=None,
+            boundary_repairs=SimpleNamespace(),
             timeline_review=None,
             face_match_plan=None,
             group_transition_plan=transitions,
@@ -1239,6 +1404,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             render_plan=original_plan,
             candidate_origin="explicit_stage_edit_generation",
             candidate_lineage=({"stage": "initial"},),
+            splice_graph_authorization={"proxy_eligible": True},
         )
         partial_bundle = _GroupRenderCandidateBundle(
             candidate_index=2,
@@ -1261,7 +1427,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             pre_render_score=89.0,
             visual_timeline=repaired_visual,
             boundary_repairs=None,
-            timeline_review=None,
+            timeline_review=SimpleNamespace(passed=True),
             face_match_plan=None,
             group_transition_plan=transitions,
             boundary_affine_plan=None,
@@ -1299,8 +1465,19 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
         postprocessor = Mock(return_value=promoted_bundle)
         with (
             patch(
-                "crosscut.pipeline.repair_visual_timeline_boundaries",
+                "crosscut.pipeline._budgeted_repair_visual_timeline_boundaries",
                 return_value=targeted,
+            ),
+            patch("crosscut.pipeline._record_boundary_repair_assessments"),
+            patch(
+                "crosscut.pipeline._authorize_partial_reedit_splice_lineage",
+                return_value=(
+                    targeted,
+                    {
+                        "proxy_eligible": True,
+                        "geometry_proof_boundary_indices": [],
+                    },
+                ),
             ),
             patch(
                 "crosscut.pipeline._derive_complete_group_candidate",
@@ -1335,14 +1512,28 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 width=1920,
                 height=1080,
                 scratch_directory=Path("/tmp"),
+                boundary_descriptor_cache=SimpleNamespace(),
+                splice_feasibility_graph=SimpleNamespace(),
+                boundary_search_budget=_BoundarySearchBudget(
+                    structural_edge_bound=1
+                ),
                 learned_issue_boundary_indices=(0,),
                 candidate_bundle_postprocessor=postprocessor,
             )
 
-        postprocessor.assert_called_once_with(
-            partial_bundle,
-            unittest.mock.ANY,
+        postprocessor.assert_called_once()
+        postprocessed_bundle, postprocessed_candidate = (
+            postprocessor.call_args.args
         )
+        self.assertIs(targeted, postprocessed_bundle.boundary_repairs)
+        self.assertEqual(
+            {
+                "proxy_eligible": True,
+                "geometry_proof_boundary_indices": [],
+            },
+            postprocessed_bundle.splice_graph_authorization,
+        )
+        self.assertEqual(2, postprocessed_candidate.candidate_index)
         self.assertEqual(
             promoted_bundle.render_plan,
             result.selected_bundle.render_plan,
@@ -1385,6 +1576,12 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             reviewer_checkpoint.mkdir()
             reviewer_report = root / "reviewer-report.json"
             reviewer_report.write_text("{}", encoding="utf-8")
+            montage_policy, montage_profile_path = _current_montage_policy_fixture(root)
+            (
+                _motion_profile,
+                motion_profile_path,
+                motion_profile_file_sha256,
+            ) = _current_motion_cut_profile_fixture(root, montage_policy)
             request = AnalysisRequest.from_dict(
                 {
                     "group": "IVE",
@@ -1392,6 +1589,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
                     "source_mode": "automatic",
+                    "review_first_enabled": False,
                     "desired_source_count": 8,
                     "sources": [str(source) for source in sources],
                     "output_directory": str(root / "out"),
@@ -1560,7 +1758,9 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                         },
                     )
                 )
-            batch = _typed_visual_batch()
+            batch = _typed_visual_batch(quality_gated_single_delivery=True)
+            hybrid_candidate_set, hybrid_materialized = _visual_fixture()
+            materialize_hybrid = Mock(return_value=(hybrid_materialized,))
 
             def _write_generation(path: Path):
                 path.write_text("{}", encoding="utf-8")
@@ -1590,40 +1790,105 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             )
 
             class _Selection:
-                selected_candidate_index = 6
-                reviews = tuple(object() for _ in range(8))
-                successful_review_count = 8
-                minimum_candidate_count_satisfied = True
-                learned_reviewer_rerank = {
-                    "selected_repair_issue_boundary_indices": [0],
-                    "selected_repair_issues": [
-                        {
-                            "issue_id": "learned-boundary-0",
-                            "start_seconds": 3.8,
-                            "end_seconds": 4.2,
-                            "causes": ["learned_editorial_discontinuity"],
-                            "severity": "error",
-                        }
-                    ],
-                    "selection_mode": (
-                        "learned_quality_within_deterministic_hard_safe_pool"
-                    ),
-                }
-                selected = SimpleNamespace(
+                def __init__(
+                    self,
+                    reviews: tuple[RenderedCandidateReview, ...],
+                ) -> None:
+                    self.reviews = reviews
+                    self.selected = next(
+                        (
+                            item
+                            for item in reviews
+                            if item.candidate.candidate_index == 6
+                        ),
+                        reviews[0],
+                    )
+                    self.selected_candidate_index = (
+                        self.selected.candidate.candidate_index
+                    )
+                    self.successful_review_count = len(reviews)
+                    self.passing_candidate_count = sum(
+                        item.passed for item in reviews
+                    )
+                    self.minimum_required_candidate_count = 1
+                    self.minimum_candidate_count_satisfied = True
+                    self.learned_reviewer_rerank = {
+                        "selected_repair_issue_boundary_indices": [0],
+                        "selected_repair_issues": [
+                            {
+                                "issue_id": "learned-boundary-0",
+                                "start_seconds": 3.8,
+                                "end_seconds": 4.2,
+                                "causes": [
+                                    "learned_editorial_discontinuity"
+                                ],
+                                "severity": "error",
+                            }
+                        ],
+                        "selection_mode": (
+                            "learned_quality_within_deterministic_hard_safe_pool"
+                        ),
+                    }
+
+                def to_dict(self):
+                    return {
+                        "selected_candidate_index": (
+                            self.selected_candidate_index
+                        ),
+                        "reviewed_candidate_count": len(self.reviews),
+                        "passed": True,
+                    }
+
+            def _review_single_candidate(
+                candidates,
+                **_kwargs,
+            ):
+                bundle = tuple(candidates)[0]
+                candidate = RenderedCandidate(
+                    candidate_index=bundle.candidate_index,
+                    render_plan=bundle.render_plan,
+                    pre_render_score=bundle.pre_render_score,
+                    payload=bundle,
+                )
+                review = RenderedCandidateReview(
+                    candidate=candidate,
                     review_payload={
                         "passed": True,
-                        "weighted_score": 96.0,
+                        "weighted_score": 90.0,
+                        "ranking_weighted_score": 90.0,
                         "partial_reedit_boundary_issue_indices": [],
-                    }
+                        "visible_boundary_score": {
+                            "issue_fraction": 0.0,
+                            "p10": 90.0,
+                        },
+                    },
                 )
+                return SimpleNamespace(reviews=(review,))
 
-                @staticmethod
-                def to_dict():
-                    return {
-                        "selected_candidate_index": 6,
-                        "reviewed_candidate_count": 8,
-                        "passed": True,
-                    }
+            def _select_reviewed_candidates(reviews, **_kwargs):
+                return _Selection(tuple(reviews))
+
+            def _select_stage_edit_cohort(bundles, reviews, **_kwargs):
+                bundle_items = tuple(bundles)
+                selection = _Selection(tuple(reviews))
+                selected_index = selection.selected_candidate_index
+                selected_bundle = next(
+                    item
+                    for item in bundle_items
+                    if item.candidate_index == selected_index
+                )
+                return (
+                    ((selected_bundle, selection.selected),),
+                    {
+                        "contract": (
+                            "stage_edit_best_available_decoded_delivery_v1"
+                        ),
+                        "comparison_candidate_count": len(bundle_items),
+                        "required_delivery_count": 1,
+                        "selected_candidate_index": selected_index,
+                        "comparison": selection.to_dict(),
+                    },
+                )
 
             reviewer_session = SimpleNamespace(
                 metadata=SimpleNamespace(checkpoint_id="reviewer-v1"),
@@ -1668,7 +1933,12 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     {
                         "stage_edit_exact_shot_clock": (
                             bundle.stage_edit_exact_shot_clock
-                        )
+                        ),
+                        "dynamic_crop_version": (
+                            bundle.stage_edit_dynamic_crop_version
+                        ),
+                        "dynamic_crop_v3_decodes": None,
+                        "dynamic_crop_motion_v3": None,
                     },
                 )
 
@@ -1690,7 +1960,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             def _write_final_plan(_plan, output_path: Path) -> None:
                 output_path.write_text("{}", encoding="utf-8")
 
-            def _render_final(plan: RenderPlan) -> str:
+            def _render_final(plan: RenderPlan, **_kwargs) -> str:
                 plan.output.write_bytes(b"fixture final mp4")
                 return "h264_videotoolbox"
 
@@ -1735,8 +2005,14 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 ),
                 patch("crosscut.pipeline.analyze_rhythm", return_value=_Rhythm()),
                 patch(
-                    "crosscut.pipeline.detect_scene_changes_in_video",
-                    return_value=(),
+                    "crosscut.pipeline.detect_scene_changes_in_video_cached",
+                    return_value=(
+                        (),
+                        {
+                            "analysis_reused": False,
+                            "detection_policy": "synthetic_test",
+                        },
+                    ),
                 ),
                 patch(
                     "crosscut.pipeline.estimate_shared_performance_range",
@@ -1745,12 +2021,28 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 patch("crosscut.pipeline.build_section_plan", return_value=section_plan),
                 patch.multiple(
                     "crosscut.pipeline",
+                    DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH=montage_profile_path,
+                    DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH=(
+                        motion_profile_path
+                    ),
+                    DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256=(
+                        motion_profile_file_sha256
+                    ),
                     build_group_draft=lambda *_args, **_kwargs: group_draft,
                     analyze_source_derivative_diversity=(
                         lambda *_args, **_kwargs: derivative_metadata
                     ),
+                    materialize_visual_timeline_candidates=(
+                        materialize_hybrid
+                    ),
                     _review_stage_edit_bundle_montage=montage_review,
                     evaluate_and_write_post_render_qa=_pass_post_render_qa,
+                    select_rendered_candidate_reviews=(
+                        _select_reviewed_candidates
+                    ),
+                    select_stage_edit_delivery_cohort=(
+                        _select_stage_edit_cohort
+                    ),
                 ),
                 patch(
                     "crosscut.pipeline.run_stage_edit_pipeline_bridge",
@@ -1765,7 +2057,8 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     return_value=batch,
                 ) as materialize_stage,
                 patch(
-                    "crosscut.pipeline.build_visual_timeline_candidate_set"
+                    "crosscut.pipeline.build_visual_timeline_candidate_set",
+                    return_value=hybrid_candidate_set,
                 ) as build_baseline,
                 patch(
                     "crosscut.pipeline._derive_complete_group_candidate",
@@ -1775,13 +2068,13 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 ),
                 patch(
                     "crosscut.pipeline._apply_stage_edit_candidate_render_contract",
-                    side_effect=lambda _bundle, item: promoted_bundles[
+                    side_effect=lambda _bundle, item, **_kwargs: promoted_bundles[
                         item.candidate_index
                     ],
                 ) as apply_contract,
                 patch(
                     "crosscut.pipeline._review_complete_group_candidates",
-                    return_value=_Selection(),
+                    side_effect=_review_single_candidate,
                 ) as review_candidates,
                 patch(
                     "crosscut.pipeline._attempt_stage_edit_windowed_beam_reedit",
@@ -1812,16 +2105,31 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             self.assertIsNotNone(
                 run_stage_bridge.call_args.kwargs["source_derivative_metadata"]
             )
-            build_baseline.assert_not_called()
+            build_baseline.assert_called_once()
+            self.assertEqual(
+                8,
+                build_baseline.call_args.kwargs["maximum_results"],
+            )
+            materialize_hybrid.assert_called_once_with(
+                hybrid_candidate_set,
+                maximum_candidates=1,
+                passed_only=True,
+            )
             self.assertEqual(8, apply_contract.call_count)
-            review_candidates.assert_called_once()
+            self.assertEqual(8, review_candidates.call_count)
             stage_beam_repair.assert_called_once()
             montage_review.assert_called_once()
-            reviewed = review_candidates.call_args.args[0]
+            reviewed = tuple(
+                call.args[0][0]
+                for call in review_candidates.call_args_list
+            )
             self.assertEqual(8, len(reviewed))
-            self.assertIs(
-                reviewer_session,
-                review_candidates.call_args.kwargs["learned_reviewer_session"],
+            self.assertTrue(
+                all(
+                    call.kwargs["learned_reviewer_session"]
+                    is reviewer_session
+                    for call in review_candidates.call_args_list
+                )
             )
             self.assertTrue(
                 all(

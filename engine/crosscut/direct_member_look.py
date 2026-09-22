@@ -40,6 +40,8 @@ class DirectMemberLookConfig:
     maximum_saturation: float = 1.20
     maximum_temperature_balance: float = 0.18
     maximum_tint_balance: float = 0.10
+    maximum_detail_enhancement: float = 0.90
+    detail_enhancement_log_response: float = 1.05
     maximum_source_luma_shift: float = 0.18
     maximum_source_chroma_shift: float = 0.14
     target_rapid_high_shock_fraction: float = 0.20
@@ -51,6 +53,7 @@ class DirectMemberLookConfig:
     source_luma_span: float = 0.18
     source_chroma_span: float = 0.12
     gate_rapid_chroma: bool = False
+    enable_detail_enhancement: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -71,6 +74,7 @@ class DirectMemberLookConfig:
                 "minimum_descriptor_samples_per_segment",
                 "graph_regularizations",
                 "gate_rapid_chroma",
+                "enable_detail_enhancement",
             }
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in finite):
@@ -93,6 +97,8 @@ class DirectMemberLookConfig:
             raise ValueError("member look saturation bounds are invalid")
         if not isinstance(self.gate_rapid_chroma, bool):
             raise TypeError("member look rapid chroma policy must be boolean")
+        if not isinstance(self.enable_detail_enhancement, bool):
+            raise TypeError("member look detail enhancement policy must be boolean")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +178,8 @@ class DirectMemberLookPlan:
     predicted_high_shock_count: int
     predicted_high_shock_fraction: float | None
     predicted_source_spans: tuple[tuple[str, float | None], ...]
+    source_span_policy_enforced: bool
+    source_span_repeated_source_fraction: float
     diagnostics: tuple[dict[str, Any], ...]
     config: DirectMemberLookConfig
     output_proxy_refinement_applied: bool = False
@@ -184,6 +192,13 @@ class DirectMemberLookPlan:
             raise ValueError("member look plan cannot be empty")
         if not math.isfinite(self.selected_graph_regularization):
             raise ValueError("member look selected regularization is invalid")
+        if not isinstance(self.source_span_policy_enforced, bool):
+            raise TypeError("member look source-span policy flag must be boolean")
+        if (
+            not math.isfinite(self.source_span_repeated_source_fraction)
+            or not 0.0 <= self.source_span_repeated_source_fraction <= 1.0
+        ):
+            raise ValueError("member look repeated-source fraction is invalid")
         if not isinstance(self.output_proxy_refinement_applied, bool):
             raise TypeError("member look proxy refinement flag must be boolean")
         if (
@@ -218,6 +233,16 @@ class DirectMemberLookPlan:
             "predicted_high_shock_count": self.predicted_high_shock_count,
             "predicted_high_shock_fraction": self.predicted_high_shock_fraction,
             "predicted_source_spans": dict(self.predicted_source_spans),
+            "source_span_policy": {
+                "enforced": self.source_span_policy_enforced,
+                "repeated_source_fraction": (
+                    self.source_span_repeated_source_fraction
+                ),
+                "minimum_repeated_source_fraction": 0.50,
+                "underidentified_initial_cache_requires_decoded_proxy_qa": (
+                    not self.source_span_policy_enforced
+                ),
+            },
             "output_proxy_refinement_applied": (
                 self.output_proxy_refinement_applied
             ),
@@ -233,6 +258,7 @@ class DirectMemberLookPlan:
                     "saturation": adjustment.saturation,
                     "temperature_balance": adjustment.temperature_balance,
                     "tint_balance": adjustment.tint_balance,
+                    "detail_enhancement": adjustment.detail_enhancement,
                     "identity": adjustment.is_identity,
                 }
                 for observation, adjustment in zip(
@@ -376,6 +402,22 @@ def solve_direct_member_look_adjustments(
     raw_a = np.asarray([run.chroma_a for run in runs], dtype=np.float64)
     raw_b = np.asarray([run.chroma_b for run in runs], dtype=np.float64)
     source_indices = sorted({run.source_index for run in runs})
+    source_run_counts = {
+        source_index: sum(
+            run.source_index == source_index for run in runs
+        )
+        for source_index in source_indices
+    }
+    repeated_source_fraction = (
+        sum(count >= 2 for count in source_run_counts.values())
+        / len(source_run_counts)
+    )
+    # With one retained run for most cameras, a source median is inseparable
+    # from that moment's intentional LED/stage-light cue.  Keep the bounded
+    # first-pass grade and adjacent shock gate, but defer the global source-span
+    # decision to the mandatory decoded proxy.  Full edits with repeated camera
+    # observations retain the strict cached source-span gate.
+    source_span_policy_enforced = repeated_source_fraction >= 0.50 - 1e-12
 
     source_medians: dict[int, tuple[float, float, float, float]] = {}
     for source_index in source_indices:
@@ -472,6 +514,21 @@ def solve_direct_member_look_adjustments(
                 settings.minimum_contrast,
                 settings.maximum_contrast,
             )
+            remaining_detail_log = float(
+                targets[index, 0]
+                - raw_log_detail[index]
+                - math.log(contrast)
+            )
+            detail_enhancement = (
+                _clip(
+                    max(0.0, remaining_detail_log)
+                    / settings.detail_enhancement_log_response,
+                    0.0,
+                    settings.maximum_detail_enhancement,
+                )
+                if settings.enable_detail_enhancement
+                else 0.0
+            )
             raw_chroma = np.asarray(
                 (raw_a[index], raw_b[index]),
                 dtype=np.float64,
@@ -522,11 +579,15 @@ def solve_direct_member_look_adjustments(
                 saturation=saturation,
                 temperature_balance=temperature,
                 tint_balance=tint,
+                detail_enhancement=detail_enhancement,
             )
             run_adjustments.append(adjustment)
             corrected.append(
                 (
-                    raw_log_detail[index] + math.log(contrast),
+                    raw_log_detail[index]
+                    + math.log(contrast)
+                    + settings.detail_enhancement_log_response
+                    * detail_enhancement,
                     predicted_without_brightness + brightness,
                     raw_a[index] * saturation
                     + chroma_response[0, 0] * temperature
@@ -593,10 +654,15 @@ def solve_direct_member_look_adjustments(
             or high_fraction <= settings.target_rapid_high_shock_fraction + 1e-12
         )
         source_ok = bool(
-            (spans["sharpness_log"] or 0.0)
-            <= settings.source_sharpness_log_span + 1e-12
-            and (spans["luma"] or 0.0) <= settings.source_luma_span + 1e-12
-            and (spans["chroma"] or 0.0) <= settings.source_chroma_span + 1e-12
+            not source_span_policy_enforced
+            or (
+                (spans["sharpness_log"] or 0.0)
+                <= settings.source_sharpness_log_span + 1e-12
+                and (spans["luma"] or 0.0)
+                <= settings.source_luma_span + 1e-12
+                and (spans["chroma"] or 0.0)
+                <= settings.source_chroma_span + 1e-12
+            )
         )
         if source_ok:
             source_compliant_candidates.append(candidate)
@@ -622,10 +688,14 @@ def solve_direct_member_look_adjustments(
         and fraction > settings.maximum_rapid_high_shock_fraction + 1e-12
     )
     source_policy_failed = bool(
-        (spans["sharpness_log"] or 0.0)
-        > settings.source_sharpness_log_span + 1e-12
-        or (spans["luma"] or 0.0) > settings.source_luma_span + 1e-12
-        or (spans["chroma"] or 0.0) > settings.source_chroma_span + 1e-12
+        source_span_policy_enforced
+        and (
+            (spans["sharpness_log"] or 0.0)
+            > settings.source_sharpness_log_span + 1e-12
+            or (spans["luma"] or 0.0) > settings.source_luma_span + 1e-12
+            or (spans["chroma"] or 0.0)
+            > settings.source_chroma_span + 1e-12
+        )
     )
     if require_predicted_pass and (
         rapid_policy_failed or source_policy_failed
@@ -684,6 +754,8 @@ def solve_direct_member_look_adjustments(
         ),
         predicted_high_shock_fraction=fraction,
         predicted_source_spans=tuple(sorted(spans.items())),
+        source_span_policy_enforced=source_span_policy_enforced,
+        source_span_repeated_source_fraction=repeated_source_fraction,
         diagnostics=diagnostics,
         config=settings,
     )
@@ -745,6 +817,11 @@ def _compose_source_look_adjustments(
             float(combined_parameters[1]),
             -config.maximum_tint_balance,
             config.maximum_tint_balance,
+        ),
+        detail_enhancement=_clip(
+            base.detail_enhancement + residual.detail_enhancement,
+            0.0,
+            config.maximum_detail_enhancement,
         ),
     )
 
@@ -842,6 +919,7 @@ def refine_direct_member_look_plan_from_rendered_proxy(
     refinement_config = replace(
         base_plan.config,
         gate_rapid_chroma=True,
+        enable_detail_enhancement=True,
     )
     residual_plan = solve_direct_member_look_adjustments(
         checked_observations,
@@ -874,6 +952,12 @@ def refine_direct_member_look_plan_from_rendered_proxy(
             residual_plan.predicted_high_shock_fraction
         ),
         predicted_source_spans=residual_plan.predicted_source_spans,
+        source_span_policy_enforced=(
+            residual_plan.source_span_policy_enforced
+        ),
+        source_span_repeated_source_fraction=(
+            residual_plan.source_span_repeated_source_fraction
+        ),
         diagnostics=tuple(
             {
                 **item,

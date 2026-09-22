@@ -81,6 +81,53 @@ class DirectMemberLookTests(unittest.TestCase):
             )
         )
 
+    def test_sparse_source_spans_defer_global_luma_range_to_decoded_proxy(self) -> None:
+        observations = tuple(
+            DirectMemberLookObservation(
+                segment_index=index,
+                source_index=index,
+                duration_seconds=4.0,
+                luma=0.08 + index * 0.16,
+                chroma_a=0.02,
+                chroma_b=-0.02,
+                detail_proxy=0.14,
+                sample_count=6,
+            )
+            for index in range(6)
+        )
+
+        plan = solve_direct_member_look_adjustments(observations)
+
+        self.assertFalse(plan.source_span_policy_enforced)
+        self.assertEqual(plan.source_span_repeated_source_fraction, 0.0)
+        self.assertGreater(
+            dict(plan.predicted_source_spans)["luma"],
+            plan.config.source_luma_span,
+        )
+        self.assertTrue(
+            plan.to_dict()["source_span_policy"][
+                "underidentified_initial_cache_requires_decoded_proxy_qa"
+            ]
+        )
+
+    def test_repeated_source_spans_retain_strict_global_luma_gate(self) -> None:
+        observations = tuple(
+            DirectMemberLookObservation(
+                segment_index=index,
+                source_index=index % 2,
+                duration_seconds=4.0,
+                luma=0.05 if index % 2 == 0 else 0.95,
+                chroma_a=0.02,
+                chroma_b=-0.02,
+                detail_proxy=0.14,
+                sample_count=6,
+            )
+            for index in range(6)
+        )
+
+        with self.assertRaisesRegex(ValueError, "source-span"):
+            solve_direct_member_look_adjustments(observations)
+
     def test_observations_must_retain_exact_segment_order(self) -> None:
         observations = (
             DirectMemberLookObservation(1, 0, 1.0, 0.4, 0.0, 0.0, 0.1, 3),
@@ -136,6 +183,13 @@ class DirectMemberLookTests(unittest.TestCase):
         self.assertTrue(refined.output_proxy_refinement_applied)
         self.assertEqual(refined.output_proxy_refinement_iteration, 1)
         self.assertTrue(refined.config.gate_rapid_chroma)
+        self.assertTrue(refined.config.enable_detail_enhancement)
+        self.assertTrue(
+            any(
+                adjustment.detail_enhancement > 0.0
+                for adjustment in refined.segment_adjustments
+            )
+        )
         self.assertNotEqual(
             refined.segment_adjustments,
             base.segment_adjustments,

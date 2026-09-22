@@ -634,6 +634,10 @@ def _feature_snapshot_records(
         )
         try:
             snapshot = legacy.StageEditFeatureSnapshot.from_dict(snapshot_payload)
+            snapshot.require_production_causal_sensing(
+                edit_mode="group",
+                target_member=None,
+            )
         except (TypeError, ValueError) as exc:
             raise CapacityFoldLauncherError(
                 f"{song_id}:{reference_id} feature snapshot is invalid: {exc}"

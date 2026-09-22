@@ -2403,11 +2403,10 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 "deterministic_professional_visual",
                 authority["mode"],
             )
-            self.assertEqual("ordinary_visual_primary", authority["candidate_pool"])
+            self.assertEqual("bounded_review_first_visual_selector", authority["candidate_pool"])
             self.assertFalse(authority["transformer_authority"])
-            self.assertTrue(
-                authority["ordinary_visual_candidate_is_primary_not_fallback"]
-            )
+            self.assertTrue(authority["review_first_enabled"])
+            self.assertEqual(authority["decoded_proxy_candidate_count_required"], 1)
             self.assertTrue(authority["final_post_render_qa_required"])
             self.assertFalse(authority["silent_fallback_allowed"])
             with self.assertRaisesRegex(RuntimeError, "decoded review"):
@@ -2550,6 +2549,8 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                     / "stage-edit-inference-v1"
                 ),
                 feature_cache_directory=request.source_cache_directory,
+                feature_derived_cache_directory=request.visual_feature_derived_cache_directory,
+                require_persistent_feature_cache=False,
                 maximum_sequence_length=2048,
                 maximum_sources=32,
                 causal_sensing=causal_artifacts,

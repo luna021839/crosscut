@@ -151,6 +151,7 @@ class PipelineDynamicCropV3MotionContractTests(unittest.TestCase):
             fps=30.0,
         )
         edit = SimpleNamespace(
+            sources=plan.sources,
             shots=tuple(shots),
             candidate_history=({"dynamic_crop_version": 3},),
         )

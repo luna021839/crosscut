@@ -201,7 +201,7 @@ def materialize_visual_timeline_candidates(
         raise TypeError("passed_only must be a bool")
     materialized: list[MaterializedVisualTimelineCandidate] = []
     signatures: set[tuple[str, ...]] = set()
-    for record in candidate_set.ranked_candidates:
+    for record in candidate_set.role_conditioned_ranked_candidates:
         if passed_only and not record.review.passed:
             continue
         if record.path_signature in signatures:

@@ -32,6 +32,7 @@ from crosscut.stage_edit_source_pair_training import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     SourceCandidateToken,
     StageEditSequence,
     StageEditTarget,
@@ -44,10 +45,14 @@ def _candidate(source_id: str, face_scale: float) -> SourceCandidateToken:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
     values = [0.0] * schema.raw_source_dimension
     values[schema.source_feature_names.index("face_scale")] = face_scale
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     return SourceCandidateToken(
         source_id=source_id,
         features=tuple(values),
-        missing_mask=(False,) * schema.raw_source_dimension,
+        missing_mask=missing_mask,
         available=True,
         hard_gate_passed=True,
     )

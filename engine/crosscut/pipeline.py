@@ -211,11 +211,14 @@ from .review_first_runtime import (
     ReviewFirstRuntime,
     ReviewFirstStatus,
     classify_review_first_qa,
+    finalize_review_first_runtime_payload,
 )
 from .review_first_selection_contract import (
     REVIEW_FIRST_CANDIDATE_POOL,
     review_first_release_policy_payload,
+    build_review_first_selection_payload,
 )
+from .render_coverage import render_coverage_payload
 from .rendered_candidate_selection import (
     RenderedCandidate,
     RenderedCandidateRankMetadata,
@@ -5068,8 +5071,7 @@ def _complete_automatic_stage_edit_post_render_qa(
     manifest["app_result_exposure"] = dict(exposure)
     manifest["post_render_qa"] = dict(provenance)
     review_runtime_payload = manifest.get("review_first_runtime")
-    if isinstance(review_runtime_payload, dict):
-        review_runtime_payload["status"] = qa_disposition.status.value
+    finalize_review_first_runtime_payload(review_runtime_payload, qa_disposition.status)
     render_payload = manifest.get("render")
     if isinstance(render_payload, dict):
         render_payload["artifact_role"] = final_role
@@ -5236,8 +5238,7 @@ def _enforce_automatic_member_post_render_qa(
     manifest["app_result_exposure"] = dict(final_exposure)
     manifest["post_render_qa"] = dict(provenance)
     review_runtime_payload = manifest.get("review_first_runtime")
-    if isinstance(review_runtime_payload, dict):
-        review_runtime_payload["status"] = qa_disposition.status.value
+    finalize_review_first_runtime_payload(review_runtime_payload, qa_disposition.status)
     mutable_render = manifest.get("render")
     if isinstance(mutable_render, dict):
         mutable_render["artifact_role"] = final_role
@@ -21908,6 +21909,9 @@ def _derive_complete_group_candidate(
         else materialized.visual_plan
     )
     record = materialized.candidate_record
+    prescribed_geometry = visual_timeline.geometry_basis == "prescribed_render_geometry_v1"
+    if prescribed_geometry and precomputed_boundary_repairs is not None:
+        raise ValueError("source-pixel boundary repairs cannot replace prescribed rendered geometry")
     boundary_repairs: VisualBoundaryRepairPlan | None = None
     precomputed_boundary_indices: frozenset[int] = frozenset()
     if precomputed_boundary_repairs is not None:
@@ -21981,7 +21985,7 @@ def _derive_complete_group_candidate(
                     "remaining boundary repair failed after constrained "
                     "preflight"
                 ) from exc
-    else:
+    elif not prescribed_geometry:
         try:
             boundary_repairs = run_boundary_repair(
                 phase="candidate_default",
@@ -22028,7 +22032,7 @@ def _derive_complete_group_candidate(
     adaptive_boundary_indices = tuple(
         boundary_index
         for boundary_index in adaptive_boundary_indices
-        if boundary_index not in precomputed_boundary_indices
+        if boundary_index not in precomputed_boundary_indices and not prescribed_geometry
     )
     if unresolved_local_splice_boundary_indices:
         diagnostics.append(
@@ -22366,7 +22370,7 @@ def _derive_complete_group_candidate(
 
     face_match_plan: FaceMatchPlan | None = None
     try:
-        face_match_plan = build_face_match_plan(
+        face_match_plan = None if prescribed_geometry else build_face_match_plan(
             visual_timeline=visual_timeline,
             source_aspect_ratios=source_aspect_ratios,
             section_plan=section_plan,
@@ -22421,6 +22425,7 @@ def _derive_complete_group_candidate(
     if (
         request.aspect_ratio is AspectRatio.LANDSCAPE
         and source_aspects_are_editorial_safe
+        and not prescribed_geometry
     ):
         try:
             boundary_affine_plan = build_boundary_affine_plan(
@@ -23274,7 +23279,12 @@ def _decoded_proxy_rank(
     boundary_payload = boundary if isinstance(boundary, dict) else {}
     weighted_score = float(payload.get("weighted_score", -math.inf))
     issue_fraction = float(boundary_payload.get("issue_fraction", 1.0))
-    boundary_p10 = float(boundary_payload.get("p10", -math.inf))
+    boundary_value = boundary_payload.get("p10")
+    boundary_p10 = (
+        float(boundary_value)
+        if type(boundary_value) in (int, float) and math.isfinite(boundary_value)
+        else -math.inf
+    )
     return (
         bool(payload.get("passed")),
         True,
@@ -26831,8 +26841,9 @@ def _enforce_automatic_group_stage_edit_requirement(
     """Resolve an explicit authority for every automatic IVE GROUP render.
 
     A missing learned bundle is not permission to claim learned editing, but it
-    also must not prevent the independently decoded eight-candidate visual
-    pipeline from producing a QA-gated result.  The deterministic path is a
+    also must not prevent the independently decoded visual pipeline from
+    producing a QA-gated result. Alternative search breadth is not a minimum
+    deliverable count. The deterministic path is a
     declared primary authority, never a post-failure fallback from StageEdit.
     """
 
@@ -26861,9 +26872,8 @@ def _enforce_automatic_group_stage_edit_requirement(
                 if review_first_enabled
                 else "registered_stage_edit_generation"
             ),
-            "decoded_proxy_candidate_count_required": (
-                1 if review_first_enabled else 8
-            ),
+            "decoded_proxy_candidate_count_required": 1,
+            "comparison_candidate_budget": 1 if review_first_enabled else 8,
             "decoded_proxy_review_required": True,
             "final_post_render_qa_required": True,
             "silent_fallback_allowed": False,
@@ -26879,9 +26889,8 @@ def _enforce_automatic_group_stage_edit_requirement(
                 if review_first_enabled
                 else "explicit_stage_edit_generation"
             ),
-            "decoded_proxy_candidate_count_required": (
-                1 if review_first_enabled else 8
-            ),
+            "decoded_proxy_candidate_count_required": 1,
+            "comparison_candidate_budget": 1 if review_first_enabled else 8,
             "decoded_proxy_review_required": True,
             "final_post_render_qa_required": True,
             "silent_fallback_allowed": False,
@@ -26890,7 +26899,7 @@ def _enforce_automatic_group_stage_edit_requirement(
     if not review_rendered_proxies:
         raise RuntimeError(
             "automatic IVE group deterministic production requires decoded "
-            "review of eight complete visual candidates"
+            "review of a complete visual candidate"
         )
     return {
         "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
@@ -26905,9 +26914,8 @@ def _enforce_automatic_group_stage_edit_requirement(
         "joint_decoded_visual_candidate_is_primary_not_fallback": (
             not review_first_enabled
         ),
-        "decoded_proxy_candidate_count_required": (
-            1 if review_first_enabled else 8
-        ),
+        "decoded_proxy_candidate_count_required": 1,
+        "comparison_candidate_budget": 1 if review_first_enabled else 8,
         "decoded_proxy_review_required": True,
         "final_post_render_qa_required": True,
         "silent_fallback_allowed": False,
@@ -28393,12 +28401,14 @@ def analyze(
                             derived_from_existing_decoded_montage_minimum=True,
                             quality_gates_waived=False)
                     reporter.status("전체 편집안의 구도·동작 후보를 먼저 추리는 중…")
+                    joint_selection_deadline = monotonic() + 600.0
                     joint_proposal_pool = build_joint_proposal_pool(
                         workspace,
                         source_switch_requirements=joint_switch_requirements,
                         source_switch_families=joint_switch_families,
                         fps=29.97,
                         maximum_offset_frames=8,
+                        deadline_monotonic_seconds=joint_selection_deadline,
                     )
                     if visual_candidate_checkpoint_input_identity is not None:
                         from .joint_proposal_checkpoint import find_joint_proposal_restart
@@ -28488,7 +28498,6 @@ def analyze(
                             runtime = JointSelectionRuntime(
                                 provider, batch_index=batch_index,
                             )
-                            joint_selection_deadline = monotonic() + 600.0
                             def report_proposal_search(event: dict[str, Any]) -> None:
                                 payload = dict(event)
                                 if event.get("phase") == "proposal_domain_exhausted":
@@ -33143,7 +33152,7 @@ def analyze(
                     and stage_edit_generation_result is not None
                 ):
                     reporter.status(
-                        "StageEdit가 제안한 전곡 경로 중 첫 검토 가능 경로를 "
+                        "StageEdit가 제안한 전체 선택 구간 중 첫 검토 가능 경로를 "
                         "실프레임 하드 게이트로 확인하는 중…"
                     )
                     for retained_candidate in (
@@ -33216,15 +33225,15 @@ def analyze(
                         break
                     if visual_timeline is None:
                         warnings.append(
-                            "StageEdit 전곡 경로가 시각 하드 게이트를 통과하지 "
-                            "못해 기록을 남기고 결정론적 전곡 선택기로 전환했습니다."
+                            "StageEdit 경로가 시각 하드 게이트를 통과하지 "
+                            "못해 기록을 남기고 결정론적 전체 구간 선택기로 전환했습니다."
                         )
                 elif (
                     bool(getattr(request, "review_first_enabled", False))
                     and request.stage_edit_checkpoint_directory is not None
                 ):
                     reporter.status(
-                        "StageEdit Transformer로 제한된 전곡 후보를 재순위하는 중…"
+                        "StageEdit Transformer로 전체 선택 구간 후보를 재순위하는 중…"
                     )
                     bounded_candidate_set = build_visual_timeline_candidate_set(
                         **visual_builder_arguments,
@@ -33295,7 +33304,7 @@ def analyze(
                 materialized_candidate_count=len(materialized_group_candidates),
                 warnings=warnings,
             )
-        if visual_timeline is not None:
+        if visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels":
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
             try:
                 visual_boundary_repairs = repair_visual_timeline_boundaries(
@@ -33343,7 +33352,13 @@ def analyze(
                 timeline_review=timeline_review,
                 allow_failed_comparison_render=allow_failed_comparison_render,
             )
-        if visual_timeline is not None:
+        if visual_timeline is not None and visual_timeline.geometry_basis == "prescribed_render_geometry_v1":
+            group_transition_plan = GroupTransitionPlan(
+                tuple(RenderTransition(tier="C", reason="prescribed_learned_geometry_pending_decoded_review")
+                      for _ in range(max(0, len(visual_timeline.choices) - 1))),
+                analysis_basis="prescribed_render_geometry_single_authority_v1",
+            )
+        if visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels":
             try:
                 if any(value <= 0.0 for value in source_aspect_ratios):
                     raise ValueError(
@@ -34396,7 +34411,8 @@ def analyze(
                         {
                             "stage": "bounded_review_first_singleton_finalization",
                             "selected_path_authority": selected_path_authority,
-                            "complete_full_song_candidate": True,
+                            "complete_selected_interval_candidate": True,
+                            "canonical_song_coverage_verified": False,
                         },
                     ),
                     stage_edit_exact_shot_clock=(
@@ -34608,29 +34624,13 @@ def analyze(
                         ),
                     )
                     rendered_candidate_selection_payload = (
-                        singleton_selection.to_dict()
+                        build_review_first_selection_payload(
+                            singleton_selection.to_dict(),
+                            complete_candidate=review_first_singleton_bundle.to_dict(),
+                            selected_path_authority=selected_path_authority,
+                        )
                     )
                     rendered_candidate_selection_payload.update({
-                        "release_policy": review_first_release_policy_payload(),
-                        "candidate_pool": REVIEW_FIRST_CANDIDATE_POOL,
-                        "selected_path_authority": selected_path_authority,
-                        "complete_candidates": [
-                            review_first_singleton_bundle.to_dict()
-                        ],
-                        "complete_candidate_count": 1,
-                        "exact_successful_decoded_review_count_satisfied": True,
-                        "exact_complete_candidate_count_satisfied": True,
-                        "final_selected_review": deepcopy(
-                            rendered_proxy_review_payload
-                        ),
-                        "final_selected_version": "original",
-                        "proxy_triggered_partial_reedit": {
-                            "attempted": False,
-                            "improved": False,
-                            "selected_version": "original",
-                            "changed_boundary_indices": [],
-                            "reason": "bounded_review_first_singleton",
-                        },
                         "review_first_visual_selection": deepcopy(
                             review_first_visual_selection_payload
                         ),
@@ -34759,6 +34759,7 @@ def analyze(
             project_name=f"IVE {request.song} group crosscut",
         )
         render_payload = {
+            "coverage": render_coverage_payload(plan, common_start=common_start, common_end=common_end),
             "release_policy": (
                 joint_release_policy_payload()
                 if joint_visual_selection_active
@@ -38361,6 +38362,7 @@ def analyze(
                     "segments": list(direct_segment_details),
                 }
             render_payload = {
+                "coverage": render_coverage_payload(plan, common_start=common_start, common_end=common_end),
                 "video_path": str(rendered_video_path),
                 "plan_path": str(render_plan_path),
                 "video_codec": codec,
@@ -38488,6 +38490,7 @@ def analyze(
         "local_timewarps": list(local_timewarp_payloads),
         "performance_range_trim": performance_range_trim_payload,
         "requested_render_range": requested_render_range_payload,
+        "render_coverage": deepcopy(render_payload.get("coverage")) if render_payload is not None else None,
         "common_master_range": {
             "start_seconds": common_start,
             "end_seconds": common_end,

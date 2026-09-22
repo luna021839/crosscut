@@ -6,15 +6,24 @@ import tempfile
 import unittest
 
 from crosscut.draft import DraftSegment, GroupDraftTimeline
+from crosscut.direct_member_editorial_motion import (
+    DirectMemberEditorialMotionError,
+)
 from crosscut.pipeline import (
     _DirectFullFrameBoundaryShift,
     _DirectFullFramePartitionProfile,
     _DirectFullFrameVisualFrontierSplit,
+    _accumulate_direct_member_proxy_feedback_penalties,
     _direct_member_dense_render_feedback_binding,
+    _direct_member_dense_motion_feedback_boundary_indices,
     _direct_member_minimum_hold_feedback_boundary_indices,
     _direct_member_minimum_hold_feedback_partition_profiles,
     _direct_member_render_feedback_partition_profiles,
     _direct_member_partition_restart_frontier_profiles,
+    _direct_member_proxy_look_refinement_is_eligible,
+    _direct_member_proxy_look_refinement_can_share_camera_iteration,
+    _direct_member_focal_boundary_reference_mapping,
+    _direct_member_required_transform_resolution,
     _direct_partition_signature_sha256,
     _direct_partition_queue_priority,
     _direct_partition_terminal_audition_due,
@@ -23,15 +32,49 @@ from crosscut.pipeline import (
     _direct_full_frame_proof_directed_child_profiles,
     _direct_full_frame_spans_from_partition,
     _load_direct_member_dense_render_feedback_edges,
+    _load_direct_member_proxy_feedback_penalties,
     _load_direct_member_partition_warm_start_profiles,
     _normalize_direct_member_dense_render_feedback_edges,
     _persist_direct_member_dense_render_feedback_edges,
+    _persist_direct_member_proxy_feedback_penalties,
     _persist_direct_member_partition_failure_frontier_profiles,
 )
 from crosscut.direct_member_visual import DirectMemberVisualConfig
+from crosscut.direct_member_target_face import FocalFaceCandidate
 
 
 class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
+    def test_focal_capture_is_bound_to_exact_cross_source_boundary(self) -> None:
+        left = FocalFaceCandidate((0.3, 0.2, 0.1, 0.1), (1.0, 0.0))
+        right = FocalFaceCandidate((0.4, 0.2, 0.1, 0.1), (0.9, 0.1))
+
+        mapping = _direct_member_focal_boundary_reference_mapping(
+            (2, 0, 0, 1),
+            (
+                (2, 0, left, right),
+                (0, 1, None, None),
+            ),
+        )
+
+        self.assertEqual(mapping, {0: (left, right)})
+        with self.assertRaisesRegex(ValueError, "does not cover"):
+            _direct_member_focal_boundary_reference_mapping(
+                (2, 0, 1),
+                ((2, 0, left, right),),
+            )
+
+    def test_partial_camera_resolution_does_not_promote_unresolved_cut_to_failure(
+        self,
+    ) -> None:
+        resolved, unresolved = _direct_member_required_transform_resolution(
+            (0, 2, 4, 6),
+            (2, 5),
+            (0, 3),
+        )
+
+        self.assertEqual(resolved, (0, 2))
+        self.assertEqual(unresolved, (4, 6))
+
     @staticmethod
     def _timeline() -> GroupDraftTimeline:
         return GroupDraftTimeline(
@@ -126,6 +169,91 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
         assert binding is not None
         return binding
 
+    def test_look_refinement_requires_rendered_continuity_success(self) -> None:
+        self.assertFalse(
+            _direct_member_proxy_look_refinement_is_eligible(
+                {
+                    "direct_member_rendered_continuity_passed": False,
+                    "member_output_quality_passed": False,
+                }
+            )
+        )
+        self.assertTrue(
+            _direct_member_proxy_look_refinement_is_eligible(
+                {
+                    "direct_member_rendered_continuity_passed": True,
+                    "member_output_quality_passed": False,
+                }
+            )
+        )
+        self.assertFalse(
+            _direct_member_proxy_look_refinement_is_eligible(
+                {
+                    "direct_member_rendered_continuity_passed": True,
+                    "member_output_quality_passed": True,
+                }
+            )
+        )
+
+    def test_repairable_look_can_share_required_second_camera_rerender(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _direct_member_proxy_look_refinement_can_share_camera_iteration(
+                {
+                    "member_output_quality_passed": False,
+                    "member_output_quality_failure_reasons": [
+                        "member_proxy_source_quality_median_span",
+                    ],
+                }
+            )
+        )
+        self.assertFalse(
+            _direct_member_proxy_look_refinement_can_share_camera_iteration(
+                {
+                    "member_output_quality_passed": False,
+                    "member_output_quality_failure_reasons": [
+                        "member_proxy_source_quality_median_span",
+                        "member_proxy_native_source_cut_technical_integrity",
+                    ],
+                }
+            )
+        )
+        self.assertFalse(
+            _direct_member_proxy_look_refinement_can_share_camera_iteration(
+                {
+                    "member_output_quality_passed": True,
+                    "member_output_quality_failure_reasons": [],
+                }
+            )
+        )
+    def test_dense_feedback_adds_only_the_strongest_lazy_constraint(self) -> None:
+        error = DirectMemberEditorialMotionError(
+            "dense failure",
+            missing_boundary_indices=(2, 4, 7),
+            rejection_reasons={
+                2: {"dense_widened_subject_evidence_missing"},
+                4: {"dense_face_geometry_jump"},
+                7: {
+                    "no_improving_contained_transform",
+                    "dense_subject_track_gap_unresolved",
+                },
+            },
+            rejection_context={},
+        )
+
+        self.assertEqual(
+            _direct_member_dense_motion_feedback_boundary_indices(error),
+            (7,),
+        )
+        self.assertEqual(
+            _direct_member_dense_motion_feedback_boundary_indices(
+                error,
+                maximum_count=2,
+            ),
+            (7, 4),
+        )
+
     def test_checkpoint_round_trip_is_bound_and_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -181,6 +309,84 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 "no_matching_binding",
             )
 
+    def test_decoded_proxy_penalties_accumulate_and_round_trip_softly(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write_acquisition_manifest(directory)
+            binding = self._binding(directory)
+            accumulated = (
+                _accumulate_direct_member_proxy_feedback_penalties(
+                    ((1.0, 0, 1, 2.5),),
+                    (
+                        (1.0, 0, 1, 1.75),
+                        (1.5, 1, 0, 1.25),
+                    ),
+                    source_count=2,
+                    range_start=0.0,
+                    range_end=2.0,
+                )
+            )
+            self.assertEqual(
+                accumulated,
+                (
+                    (1.0, 0, 1, 4.25),
+                    (1.5, 1, 0, 1.25),
+                ),
+            )
+
+            persisted = _persist_direct_member_proxy_feedback_penalties(
+                directory,
+                binding,
+                accumulated,
+                rejected_source_paths_by_partition_unit_counts={
+                    (1, 1): ((0, 1),),
+                },
+            )
+            loaded, diagnostics = (
+                _load_direct_member_proxy_feedback_penalties(
+                    directory,
+                    binding,
+                )
+            )
+
+            self.assertTrue(persisted["persisted"])
+            self.assertFalse(persisted["hard_exclusions_added"])
+            self.assertEqual(loaded, accumulated)
+            self.assertEqual(diagnostics["status"], "penalties_loaded")
+            self.assertFalse(diagnostics["hard_exclusions_added"])
+            self.assertAlmostEqual(diagnostics["loaded_total_penalty"], 5.5)
+            self.assertEqual(persisted["rejected_path_count"], 1)
+            self.assertEqual(diagnostics["loaded_rejected_path_count"], 1)
+            self.assertEqual(
+                diagnostics[
+                    "rejected_source_paths_by_partition_unit_counts"
+                ],
+                [
+                    {
+                        "partition_unit_counts": [1, 1],
+                        "source_indices": [0, 1],
+                    }
+                ],
+            )
+
+            changed_binding = self._binding(
+                directory,
+                dissolve_enabled=False,
+            )
+            changed_loaded, changed_diagnostics = (
+                _load_direct_member_proxy_feedback_penalties(
+                    directory,
+                    changed_binding,
+                )
+            )
+            self.assertEqual(changed_loaded, ())
+            self.assertEqual(
+                changed_diagnostics["status"],
+                "no_matching_binding",
+            )
+
     def test_invalid_feedback_edges_fail_closed(self) -> None:
         for edge in (
             (-0.1, 0, 1),
@@ -196,7 +402,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                     range_end=2.0,
                 )
 
-    def test_selector_only_hash_transition_reuses_exact_edge_certificates(
+    def test_semantic_proxy_feedback_change_rejects_legacy_hard_certificates(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -224,57 +430,10 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             compatible = binding_diagnostics[
                 "compatible_predecessor_bindings"
             ]
-            self.assertEqual(len(compatible), 2)
-            predecessor_binding = compatible[-1]["binding"]
-            edge = (1.0, 0, 1)
-            persisted = _persist_direct_member_dense_render_feedback_edges(
-                directory,
-                predecessor_binding,
-                (edge,),
-                preferred_partition_unit_counts=(1, 1),
-            )
-
-            without_migration, without_diagnostics = (
-                _load_direct_member_dense_render_feedback_edges(
-                    directory,
-                    current_binding,
-                )
-            )
-            loaded, diagnostics = (
-                _load_direct_member_dense_render_feedback_edges(
-                    directory,
-                    current_binding,
-                    compatible_predecessor_bindings=compatible,
-                )
-            )
-
-        self.assertTrue(persisted["persisted"])
-        self.assertEqual(without_migration, ())
-        self.assertEqual(
-            without_diagnostics["status"],
-            "no_matching_binding",
-        )
-        self.assertEqual(loaded, (edge,))
-        self.assertEqual(
-            diagnostics["status"],
-            "certificates_loaded_via_selector_only_migration",
-        )
-        self.assertEqual(
-            diagnostics["migrated_from_binding_sha256"],
-            predecessor_binding["binding_sha256"],
-        )
-        self.assertEqual(
-            diagnostics["migrated_to_binding_sha256"],
-            current_binding["binding_sha256"],
-        )
-        self.assertTrue(
-            diagnostics[
-                "edge_measurement_implementation_hashes_unchanged"
-            ]
-        )
-        self.assertTrue(diagnostics["full_selector_recheck_required"])
-        self.assertTrue(diagnostics["certified_edges_remain_forbidden"])
-        self.assertFalse(diagnostics["visual_thresholds_relaxed"])
+            # The preceding implementation stored decoded-proxy quality
+            # failures as hard dense-camera exclusions.  This semantic change
+            # must fail closed instead of migrating those mixed certificates.
+            self.assertEqual(compatible, [])
 
     def test_failure_frontier_checkpoint_restores_exact_shift_lineage(
         self,
@@ -889,6 +1048,28 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 {
                     "failure": "validity_quota_path_exhausted",
                     "constraint_infeasibility_proven": True,
+                }
+            )
+        )
+        self.assertTrue(
+            _direct_partition_terminal_hold_failure_is_eligible(
+                {
+                    "failure": "role_aware_safe_hold_path_infeasible",
+                    "constraint_infeasibility_proven": True,
+                    "role_constraints": {
+                        "maximum_same_source_hold_count": 0,
+                    },
+                }
+            )
+        )
+        self.assertFalse(
+            _direct_partition_terminal_hold_failure_is_eligible(
+                {
+                    "failure": "role_aware_safe_hold_path_infeasible",
+                    "constraint_infeasibility_proven": True,
+                    "role_constraints": {
+                        "maximum_same_source_hold_count": 1,
+                    },
                 }
             )
         )

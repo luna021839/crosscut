@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+import errno
 import hashlib
 import json
 import math
@@ -852,14 +853,31 @@ def cleanup_post_render_qa_snapshot(
         return
     if not stat.S_ISDIR(directory_state.st_mode):
         raise RuntimeError("QA snapshot cleanup target lost directory identity")
-    for child in tuple(directory.iterdir()):
-        state = child.lstat()
-        if stat.S_ISDIR(state.st_mode) and not stat.S_ISLNK(state.st_mode):
-            raise RuntimeError(
-                f"unexpected directory inside QA snapshot: {child.name}"
-            )
-        child.unlink()
-    directory.rmdir()
+    # ExFAT AppleDouble sidecars can disappear as their primary file is
+    # removed.  Treat a child that vanishes between iterdir(), lstat(), and
+    # unlink() as an already-completed cleanup operation.  Repeat the bounded
+    # scan because macOS can also materialize a sidecar immediately before the
+    # first rmdir().  Nested real directories remain a hard failure.
+    for _attempt in range(8):
+        for child in tuple(directory.iterdir()):
+            try:
+                state = child.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(state.st_mode) and not stat.S_ISLNK(state.st_mode):
+                raise RuntimeError(
+                    f"unexpected directory inside QA snapshot: {child.name}"
+                )
+            child.unlink(missing_ok=True)
+        try:
+            directory.rmdir()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                raise
+    raise RuntimeError("QA snapshot cleanup could not remove transient sidecars")
 
 
 def _reject_nonfinite_json(token: str) -> Any:
@@ -1226,11 +1244,27 @@ def _source_look_from_serialized(
 ) -> SourceLookAdjustment | None:
     if value is None:
         return None
+    payload = _mapping(value)
+    if payload is None:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} must be an object"
+        )
+    legacy_keys = frozenset(
+        {"brightness", "contrast", "saturation", "temperature_balance"}
+    )
+    keys = frozenset(payload)
+    optional_keys = frozenset({"tint_balance", "detail_enhancement"})
+    if not legacy_keys.issubset(keys) or not keys.issubset(
+        legacy_keys | optional_keys
+    ):
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} keys are not exact"
+        )
+    payload.setdefault("tint_balance", 0.0)
+    payload.setdefault("detail_enhancement", 0.0)
     values = _exact_numeric_mapping(
-        value,
-        keys=frozenset(
-            {"brightness", "contrast", "saturation", "temperature_balance"}
-        ),
+        payload,
+        keys=legacy_keys | {"tint_balance", "detail_enhancement"},
         label=label,
     )
     return SourceLookAdjustment(**values)
@@ -7398,6 +7432,7 @@ def _ive_product_quality_floor_metrics(
 def evaluate_post_render_qa(
     artifact_set: PostRenderArtifactSet,
     *,
+    declared_artifact_set: PostRenderArtifactSet | None = None,
     config: PostRenderQAConfig | None = None,
     runner: RunCommand = _run_command,
     perceptual_evaluator: PerceptualEvaluator | None = None,
@@ -7481,7 +7516,11 @@ def evaluate_post_render_qa(
             )
 
     metrics["artifact_binding"] = _validate_artifact_binding(
-        artifact_set, analysis, plan, selection, collector
+        declared_artifact_set or artifact_set,
+        analysis,
+        plan,
+        selection,
+        collector,
     )
     selection_metrics, final_review = _validate_selection(
         analysis,
@@ -7622,6 +7661,7 @@ def evaluate_and_write_post_render_qa(
 ) -> tuple[PostRenderQAReport, Path]:
     report = evaluate_post_render_qa(
         artifact_set,
+        declared_artifact_set=declared_artifact_set,
         config=config,
         runner=runner,
         created_at=created_at,

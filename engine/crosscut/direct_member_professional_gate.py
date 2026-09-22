@@ -35,6 +35,71 @@ def _p95(values: Sequence[float]) -> float | None:
     return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
 
 
+def _finite_scalar(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _verified_decoded_proxy_continuity(
+    payload: Mapping[str, Any] | None,
+    *,
+    selected_boundary_indices: Sequence[int],
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]] | None:
+    """Return exact-output evidence only after its complete contract passes."""
+
+    if not isinstance(payload, Mapping) or any(
+        payload.get(name) is not True
+        for name in (
+            "passed",
+            "member_output_quality_passed",
+            "direct_member_rendered_continuity_passed",
+        )
+    ):
+        return None
+    continuity = payload.get("rendered_continuity")
+    if not isinstance(continuity, Mapping) or continuity.get("passed") is not True:
+        return None
+    if continuity.get("failure_reasons") not in ([], ()):
+        return None
+    metrics = continuity.get("metrics")
+    boundaries = continuity.get("boundaries")
+    if not isinstance(metrics, Mapping) or not isinstance(boundaries, list):
+        return None
+    expected = tuple(int(value) for value in selected_boundary_indices)
+    observed_records: list[dict[str, Any]] = []
+    observed_indices: list[int] = []
+    for item in boundaries:
+        if not isinstance(item, Mapping):
+            return None
+        boundary_index = item.get("boundary_index")
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+        ):
+            return None
+        observed_indices.append(boundary_index)
+        observed_records.append(dict(item))
+    if tuple(observed_indices) != expected:
+        return None
+    if (
+        metrics.get("source_switch_boundary_count") != len(expected)
+        or metrics.get("exact_incoming_first_frame_evaluated") is not True
+        or metrics.get("final_render_transform_domain_evaluated") is not True
+    ):
+        return None
+    for name in (
+        "attention_position_mismatch_p95",
+        "attention_scale_mismatch_p95",
+        "pose_mismatch_p95",
+    ):
+        if _finite_scalar(metrics.get(name)) is None:
+            return None
+    return (dict(metrics), tuple(observed_records))
+
+
 @dataclass(frozen=True, slots=True)
 class DirectMemberProfessionalGateConfig:
     """Whole-song quality floors calibrated above the accepted I AM baseline."""
@@ -165,6 +230,9 @@ class DirectMemberProfessionalGateResult:
                 "evaluates_transition_materialization": True,
                 "raw_frames_persisted": False,
                 "identity_inference_used": False,
+                "decoded_output_proxy_authority_active": bool(
+                    self.metrics.get("decoded_output_proxy_authority_active")
+                ),
                 "failure_effect": "stop_before_render",
             },
         }
@@ -178,6 +246,8 @@ def evaluate_direct_member_professional_pre_render_gate(
     transitions: Sequence[RenderTransition],
     duration_seconds: float,
     dense_geometry_review_completed: bool,
+    decoded_proxy_preflight: Mapping[str, Any] | None = None,
+    materialized_editorial_transform_segment_count: int | None = None,
     config: DirectMemberProfessionalGateConfig | None = None,
 ) -> DirectMemberProfessionalGateResult:
     """Audit one automatic-member plan and fail on any weak global contract."""
@@ -193,6 +263,19 @@ def evaluate_direct_member_professional_pre_render_gate(
     selected = tuple(boundary for boundary in boundaries if boundary.cut_applied)
     selected_indices = tuple(boundary.boundary_index for boundary in selected)
     switch_count = len(selected)
+    decoded_proxy = _verified_decoded_proxy_continuity(
+        decoded_proxy_preflight,
+        selected_boundary_indices=selected_indices,
+    )
+    decoded_proxy_metrics = decoded_proxy[0] if decoded_proxy is not None else {}
+    decoded_proxy_records = decoded_proxy[1] if decoded_proxy is not None else ()
+    decoded_proxy_authority_active = decoded_proxy is not None
+    if materialized_editorial_transform_segment_count is not None and (
+        isinstance(materialized_editorial_transform_segment_count, bool)
+        or not isinstance(materialized_editorial_transform_segment_count, int)
+        or materialized_editorial_transform_segment_count < 0
+    ):
+        raise ValueError("materialized editorial transform count is invalid")
     switches_per_minute = switch_count * 60.0 / duration_seconds
     failures: list[str] = []
     failure_indices: dict[str, tuple[int, ...]] = {}
@@ -429,10 +512,15 @@ def evaluate_direct_member_professional_pre_render_gate(
     missing_dense_repairs = tuple(
         index for index in required_repairs if index not in accepted_repairs
     )
-    applied_motion_count = (
+    planner_applied_motion_count = (
         editorial_motion_plan.applied_count
         if editorial_motion_plan is not None
         else 0
+    )
+    applied_motion_count = (
+        materialized_editorial_transform_segment_count
+        if materialized_editorial_transform_segment_count is not None
+        else planner_applied_motion_count
     )
     applied_motion_per_minute = applied_motion_count * 60.0 / duration_seconds
     required_motion_count = max(
@@ -458,22 +546,34 @@ def evaluate_direct_member_professional_pre_render_gate(
     reported_effect_count = int(
         cadence.get("member_pose_dissolve_count", 0)
     ) + int(cadence.get("member_cinematic_bridge_count", 0))
+    requested_effect_floor = max(
+        cfg.minimum_selected_effect_count_when_requested,
+        math.ceil(
+            cfg.minimum_selected_effects_per_minute_when_requested
+            * duration_seconds
+            / 60.0
+            - 1e-12
+        ),
+    )
     required_effect_count = (
-        min(
-            eligible_effect_count,
-            max(
-                cfg.minimum_selected_effect_count_when_requested,
-                math.ceil(
-                    cfg.minimum_selected_effects_per_minute_when_requested
-                    * duration_seconds
-                    / 60.0
-                    - 1e-12
-                ),
-            ),
-        )
-        if effect_requested
+        max(1, min(eligible_effect_count, requested_effect_floor))
+        if effect_requested and switch_count
         else 0
     )
+
+    if decoded_proxy_authority_active:
+        missing_pose = ()
+        pose_over_limit = ()
+        missing_silhouette = ()
+        silhouette_over_limit = ()
+        missing_attention_geometry = []
+        incompatible_attention_geometry = []
+        unrepaired_attention_geometry = []
+        opposed_motion = []
+        incompatible_motion_shape = []
+        incompatible_motion_speed = []
+        incompatible_pose_phase = []
+        missing_dense_repairs = ()
 
     index_failures = {
         "missing_actual_pose": missing_pose,
@@ -499,7 +599,7 @@ def evaluate_direct_member_professional_pre_render_gate(
             failures.append(reason)
             failure_indices[reason] = indices
 
-    pose_p95 = _p95(
+    source_pose_p95 = _p95(
         [
             boundary.mismatch.dominant_pose_mismatch
             for boundary in selected
@@ -507,7 +607,7 @@ def evaluate_direct_member_professional_pre_render_gate(
             if boundary.mismatch.dominant_pose_mismatch is not None
         ]
     )
-    silhouette_p95 = _p95(
+    source_silhouette_p95 = _p95(
         [
             boundary.mismatch.silhouette_mismatch
             for boundary in selected
@@ -515,10 +615,36 @@ def evaluate_direct_member_professional_pre_render_gate(
             if boundary.mismatch.silhouette_mismatch is not None
         ]
     )
-    attention_position_p95 = _p95(effective_positions)
-    attention_scale_p95 = _p95(effective_scales)
-    motion_speed_p95 = _p95(motion_speed_mismatches)
-    pose_phase_p95 = _p95(pose_phase_mismatches)
+    source_attention_position_p95 = _p95(effective_positions)
+    source_attention_scale_p95 = _p95(effective_scales)
+    source_motion_speed_p95 = _p95(motion_speed_mismatches)
+    source_pose_phase_p95 = _p95(pose_phase_mismatches)
+    pose_p95 = (
+        _finite_scalar(decoded_proxy_metrics.get("pose_mismatch_p95"))
+        if decoded_proxy_authority_active
+        else source_pose_p95
+    )
+    silhouette_p95 = source_silhouette_p95
+    attention_position_p95 = (
+        _finite_scalar(
+            decoded_proxy_metrics.get("attention_position_mismatch_p95")
+        )
+        if decoded_proxy_authority_active
+        else source_attention_position_p95
+    )
+    attention_scale_p95 = (
+        _finite_scalar(
+            decoded_proxy_metrics.get("attention_scale_mismatch_p95")
+        )
+        if decoded_proxy_authority_active
+        else source_attention_scale_p95
+    )
+    motion_speed_p95 = (
+        None if decoded_proxy_authority_active else source_motion_speed_p95
+    )
+    pose_phase_p95 = (
+        None if decoded_proxy_authority_active else source_pose_phase_p95
+    )
     if pose_p95 is None or pose_p95 > cfg.maximum_pose_mismatch_p95 + 1e-9:
         failures.append("pose_mismatch_p95_above_professional_floor")
     if (
@@ -638,11 +764,31 @@ def evaluate_direct_member_professional_pre_render_gate(
         "effective_attention_scale_mismatch_p95": attention_scale_p95,
         "motion_speed_ratio_mismatch_p95": motion_speed_p95,
         "pose_phase_continuation_mismatch_p95": pose_phase_p95,
+        "source_domain_pose_mismatch_p95_diagnostic": source_pose_p95,
+        "source_domain_attention_position_mismatch_p95_diagnostic": (
+            source_attention_position_p95
+        ),
+        "source_domain_attention_scale_mismatch_p95_diagnostic": (
+            source_attention_scale_p95
+        ),
+        "source_domain_motion_speed_ratio_mismatch_p95_diagnostic": (
+            source_motion_speed_p95
+        ),
+        "source_domain_pose_phase_mismatch_p95_diagnostic": (
+            source_pose_phase_p95
+        ),
+        "decoded_output_proxy_authority_active": (
+            decoded_proxy_authority_active
+        ),
+        "decoded_output_proxy_boundary_count": len(decoded_proxy_records),
         "required_dense_transform_boundary_count": len(required_repairs),
         "accepted_dense_transform_boundary_count": sum(
             index in accepted_repairs for index in required_repairs
         ),
         "editorial_transform_segment_count": applied_motion_count,
+        "planner_editorial_transform_segment_count": (
+            planner_applied_motion_count
+        ),
         "editorial_transform_segments_per_minute": applied_motion_per_minute,
         "required_editorial_transform_segment_count": required_motion_count,
         "effect_requested": effect_requested,

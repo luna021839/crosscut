@@ -554,6 +554,7 @@ class DynamicCropCapacityFoldLauncherTests(unittest.TestCase):
                         f"stageedit-features:{launcher.BLACKHOLE}:{reference}"
                     )
                 ),
+                require_production_causal_sensing=lambda **_kwargs: {},
             )
             with patch.object(
                 launcher.legacy.StageEditFeatureSnapshot,

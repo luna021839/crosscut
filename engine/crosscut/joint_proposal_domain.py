@@ -16,7 +16,9 @@ from .joint_switch_requirements import (
     MAXIMUM_SOURCE_SWITCH_CAPACITY_STATES,
     SourceSwitchCounter,
     SourceSwitchRequirement,
+    SourceSwitchSearchBudget,
 )
+from .review_first_runtime import enforce_review_first_deadline
 from .timeline import NoCompleteTimelinePath, TimelineCandidate, TimelineConfig, TimelineResult, select_timeline_candidates
 from .visual_score import VisualTimelineOptimizerWorkspace, _safe_cadence_profiles, _role_conditioned_visual_controls
 
@@ -219,6 +221,20 @@ def proposal_only_config(config: TimelineConfig) -> TimelineConfig:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _RequirementPathNode:
+    candidate: TimelineCandidate
+    parent: "_RequirementPathNode | None"
+
+    def path(self) -> tuple[TimelineCandidate, ...]:
+        path = []
+        node = self
+        while node is not None:
+            path.append(node.candidate)
+            node = node.parent
+        return tuple(reversed(path))
+
+
 def _requirement_covering_path(
     lattice: Sequence[Sequence[TimelineCandidate]],
     requirements: Sequence[SourceSwitchRequirement],
@@ -226,18 +242,21 @@ def _requirement_covering_path(
     *,
     fps: float,
     maximum_offset_frames: int,
+    budget: SourceSwitchSearchBudget | None = None,
 ) -> tuple[TimelineCandidate, ...] | None:
     """Return a connected path with a concrete frame-offset solution."""
 
     windows = tuple(requirements)
     if not windows:
         return None
+    budget = budget or SourceSwitchSearchBudget()
     counter = SourceSwitchCounter(
         windows,
         lattice,
         fps=fps,
         maximum_offset_frames=maximum_offset_frames,
         source_families=source_families,
+        budget=budget,
     )
 
     def emission(candidate: TimelineCandidate) -> float:
@@ -251,9 +270,9 @@ def _requirement_covering_path(
     initial_counts = (0,) * len(windows)
     states: dict[
         tuple[TimelineCandidate, tuple[int, ...]],
-        tuple[float, tuple[TimelineCandidate, ...]],
+        tuple[float, _RequirementPathNode],
     ] = {
-        (candidate, initial_counts): (emission(candidate), (candidate,))
+        (candidate, initial_counts): (emission(candidate), _RequirementPathNode(candidate, None))
         for candidate in lattice[0]
     }
     for boundary_index, right_row in enumerate(lattice[1:]):
@@ -261,11 +280,13 @@ def _requirement_covering_path(
             TimelineCandidate,
             dict[
                 tuple[int, ...],
-                tuple[float, tuple[TimelineCandidate, ...]],
+                tuple[float, _RequirementPathNode],
             ],
         ] = {}
+        state_count = 0
         for (left, counts), (score, path) in states.items():
             for right in right_row:
+                budget.check(states=state_count, segment_index=right.segment_index)
                 switched = counter.different(left.source_id, right.source_id)
                 for increments in counter.potential_increment_vectors(
                     boundary_index,
@@ -286,21 +307,18 @@ def _requirement_covering_path(
                     next_score = (
                         score + emission(right) - (0.02 if switched else 0.0)
                     )
-                    value = (next_score, path + (right,))
+                    value = (next_score, _RequirementPathNode(right, path))
                     frontier = next_by_candidate.setdefault(right, {})
                     previous = frontier.get(next_counts)
                     if previous is not None and previous[0] >= next_score:
                         continue
-                    if any(
-                        existing_score >= next_score
-                        and all(
-                            existing >= current
-                            for existing, current in zip(
-                                existing_counts,
-                                next_counts,
-                                strict=True,
-                            )
+                    def dominates(existing_counts, existing_score):
+                        budget.check(states=state_count, segment_index=right.segment_index)
+                        return existing_score >= next_score and all(
+                            a >= b for a, b in zip(existing_counts, next_counts, strict=True)
                         )
+                    if any(
+                        dominates(existing_counts, existing_score)
                         for existing_counts, (
                             existing_score,
                             _existing_path,
@@ -325,6 +343,10 @@ def _requirement_covering_path(
                     ]
                     for existing_counts in dominated:
                         del frontier[existing_counts]
+                        state_count -= 1
+                    if next_counts not in frontier:
+                        state_count += 1
+                    budget.check(states=state_count, segment_index=right.segment_index)
                     frontier[next_counts] = value
         next_states = {
             (candidate, counts): value
@@ -365,7 +387,7 @@ def _requirement_covering_path(
                 "proof_materialization_call_count": 0,
             },
         )
-    return max(eligible, key=lambda item: item[0])[1]
+    return max(eligible, key=lambda item: item[0])[1].path()
 
 
 def build_joint_proposal_pool(
@@ -375,7 +397,9 @@ def build_joint_proposal_pool(
     source_switch_families: Mapping[str, str] | None = None,
     fps: float = 29.97,
     maximum_offset_frames: int = 8,
+    deadline_monotonic_seconds: float | None = None,
 ) -> JointProposalPool:
+    budget = SourceSwitchSearchBudget(deadline_monotonic_seconds=deadline_monotonic_seconds)
     lattice = workspace.candidates_by_segment
     if workspace.prescribed_source_ids is not None:
         lattice = tuple(tuple(c for c in row if c.source_id == source_id)
@@ -384,6 +408,7 @@ def build_joint_proposal_pool(
             raise ValueError("prescribed proposal path is not readable")
     pools, failures = [], []
     for profile in _safe_cadence_profiles(workspace.diversity):
+        budget.check()
         config = proposal_only_config(profile.config)
         kwargs = {}
         if workspace.professional_montage_policy is not None:
@@ -395,10 +420,11 @@ def build_joint_proposal_pool(
             )
             kwargs.update(emission_adjustments=adjustments, source_switch_bonus_by_segment=bonus)
         try:
-            paths = select_timeline_candidates(
-                lattice, config=config, preferred_source_ids=workspace.preferred_source_ids,
-                maximum_results=3, diversity_penalty=.12, minimum_hamming_fraction=.02, **kwargs,
-            )
+            with enforce_review_first_deadline(deadline_monotonic_seconds, stage="descriptor proposals"):
+                paths = select_timeline_candidates(
+                    lattice, config=config, preferred_source_ids=workspace.preferred_source_ids,
+                    maximum_results=3, diversity_penalty=.12, minimum_hamming_fraction=.02, **kwargs,
+                )
         except NoCompleteTimelinePath as exc:
             failures.append((profile.name, exc))
             paths = ()
@@ -419,6 +445,7 @@ def build_joint_proposal_pool(
         source_switch_families,
         fps=fps,
         maximum_offset_frames=maximum_offset_frames,
+        budget=budget,
     )
     if requirement_path is None:
         return pool
@@ -515,7 +542,13 @@ def select_with_joint_proposal_domains(
         if report is not None:
             report({**event, "phase": "proposal_domain_start"})
         try:
-            result = select(boundary_search_domain=domain, maximum_proof_materialization_calls=remaining)
+            # The independent CLI supervisor is the native-call backstop. This
+            # alarm also interrupts blocking Python providers in direct use.
+            with enforce_review_first_deadline(
+                deadline_monotonic_seconds if clock is monotonic else None,
+                stage="exact joint proposal selection",
+            ):
+                result = select(boundary_search_domain=domain, maximum_proof_materialization_calls=remaining)
         except NoCompleteTimelinePath as exc:
             if exc.reason_code == "joint_proposal_wall_clock_budget_exhausted":
                 raise

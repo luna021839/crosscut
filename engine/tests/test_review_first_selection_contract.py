@@ -4,18 +4,22 @@ from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
+import shutil
+import subprocess
 
 from crosscut.post_render_qa import (
     PostRenderQAConfig,
     _IssueCollector,
     _validate_selection,
+    evaluate_post_render_qa,
 )
 from crosscut.review_first_selection_contract import (
     REVIEW_FIRST_CANDIDATE_POOL,
     review_first_release_binding_valid,
     review_first_release_policy_payload,
+    build_review_first_selection_payload,
 )
-from engine.tests.test_post_render_qa import _fixture_payloads
+from engine.tests.test_post_render_qa import _fixture_payloads, _persist_fixture, _perceptual_pass_payload
 
 
 def _install_review_first_contract(
@@ -58,6 +62,11 @@ def _install_review_first_contract(
             "complete_candidates": [complete],
         }
     )
+    # Exercise the production producer, not just a hand-copied approximation.
+    selection.update(build_review_first_selection_payload(
+        selection, complete_candidate=complete,
+        selected_path_authority="deterministic_full_song_visual_selector",
+    ))
     render = analysis["render"]
     render.update(
         {
@@ -74,6 +83,22 @@ def _install_review_first_contract(
 
 
 class ReviewFirstSelectionContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
+    def test_actual_singleton_producer_to_full_qa_with_real_decodable_media(self):
+        # Continuity/appearance is fixture evidence here, NOT a real quality
+        # claim. JSON loading, release validation, ffprobe and decoding are real.
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, analysis, plan, selection = _persist_fixture(Path(directory),
+                mutate=lambda analysis, plan, selection: _install_review_first_contract(analysis, selection))
+            subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i",
+                f"color=blue:s={plan['width']}x{plan['height']}:r={plan['fps']}:d={plan['render_duration']}",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", str(plan["render_duration"]),
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(artifacts.video_path)],
+                check=True, timeout=30)
+            report = evaluate_post_render_qa(artifacts,
+                perceptual_evaluator=lambda *args, **kwargs: _perceptual_pass_payload())
+            self.assertTrue(report.passed, [(issue.code, issue.message) for issue in report.issues])
+
     def test_real_selection_validator_accepts_genuine_singleton_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _artifacts, analysis, plan, selection = _fixture_payloads(
@@ -134,6 +159,16 @@ class ReviewFirstSelectionContractTests(unittest.TestCase):
             selection["complete_candidate_count"] = 8
 
             self.assertFalse(review_first_release_binding_valid(selection, render))
+
+    def test_boolean_count_is_not_an_integer_candidate_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, analysis, _, selection = _fixture_payloads(Path(directory))
+            render = _install_review_first_contract(analysis, selection)
+            selection["reviewed_candidate_count"] = True
+            self.assertFalse(review_first_release_binding_valid(selection, render))
+            with self.assertRaises(ValueError):
+                build_review_first_selection_payload(selection, complete_candidate=selection["complete_candidates"][0],
+                    selected_path_authority="deterministic_full_song_visual_selector")
 
 
 if __name__ == "__main__":

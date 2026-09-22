@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */; };
 		BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8314CA79E417414399736965 /* EngineProgressTests.swift */; };
 		3542E216A753B615C38AA1A3 /* EditConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058354DD2B1876E0B582A3B /* EditConfiguration.swift */; };
 		3C2AB4E5CE835B22E4D66BB3 /* EngineLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92C8043F6391380DC44260C /* EngineLocator.swift */; };
@@ -30,6 +31,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		8314CA79E417414399736965 /* EngineProgressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProgressTests.swift; sourceTree = "<group>"; };
 		0BC05A356C48CF84522C559B /* EngineContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineContractTests.swift; sourceTree = "<group>"; };
 		1C3A3264DA982BBBCC932417 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
@@ -48,6 +50,7 @@
 		24B9DF779CA6FD1CA5D90FD9 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
+				3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */,
 				0BC05A356C48CF84522C559B /* EngineContractTests.swift */,
 				8314CA79E417414399736965 /* EngineProgressTests.swift */,
 			);
@@ -214,6 +217,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */,
 				EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */,
 				BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */,
 			);

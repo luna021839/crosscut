@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -63,6 +64,120 @@ def _sha(path: Path) -> str:
 
 
 class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
+    def test_evaluation_corpus_loader_is_explicitly_group_scoped(self) -> None:
+        evidence = {
+            song: SimpleNamespace(
+                reference_ids=(f"{song}-ref",),
+                supervision_paths={
+                    f"{song}-ref": Path(f"/tmp/{song}-reference.json")
+                },
+                snapshot_paths={
+                    f"{song}-ref": Path(f"/tmp/{song}-snapshot.json")
+                },
+                dynamic_crop_manifest_path=Path(f"/tmp/{song}-dynamic.json"),
+            )
+            for song in promotion.EVALUATION_SONG_IDS
+        }
+        preflight = SimpleNamespace(song_evidence=evidence)
+        corpus = SimpleNamespace(examples=())
+        expected_dynamic = object()
+        with (
+            patch.object(promotion, "_snapshot_map", return_value={}),
+            patch.object(
+                promotion,
+                "load_reference_training_corpus",
+                return_value=corpus,
+            ) as load_corpus,
+            patch.object(
+                promotion,
+                "_dynamic_artifact_map",
+                return_value={},
+            ),
+            patch.object(
+                promotion,
+                "build_stage_edit_dynamic_crop_training_corpus_v2",
+                return_value=object(),
+            ),
+            patch.object(
+                promotion,
+                "build_stage_edit_dynamic_crop_training_corpus_v3",
+                return_value=expected_dynamic,
+            ),
+        ):
+            result_corpus, result_dynamic = promotion._build_evaluation_corpus(
+                preflight
+            )
+        self.assertIs(corpus, result_corpus)
+        self.assertIs(expected_dynamic, result_dynamic)
+        self.assertEqual(
+            "group",
+            load_corpus.call_args.kwargs["production_edit_mode"],
+        )
+        self.assertIsNone(
+            load_corpus.call_args.kwargs["production_target_member"]
+        )
+
+    def test_final_fit_training_corpus_loader_is_explicitly_group_scoped(
+        self,
+    ) -> None:
+        reference_ids_by_song = {
+            song: (f"{song}-ref",)
+            for song in promotion.final_release.SELECTION_SONG_IDS
+        }
+        validated = SimpleNamespace(
+            reference_ids_by_song=reference_ids_by_song,
+            supervision_paths_by_song={
+                song: {
+                    f"{song}-ref": Path(f"/tmp/{song}-reference.json")
+                }
+                for song in promotion.final_release.SELECTION_SONG_IDS
+            },
+            snapshot_paths_by_song={
+                song: {f"{song}-ref": Path(f"/tmp/{song}-snapshot.json")}
+                for song in promotion.final_release.SELECTION_SONG_IDS
+            },
+        )
+        corpus = object()
+        with (
+            patch.object(
+                promotion,
+                "_verify_pointer",
+                return_value=Path("/tmp/pointer.json"),
+            ),
+            patch.object(
+                promotion.final_release,
+                "_strict_final_fit_plan",
+                return_value={"songs": {}, "selection_dataset_manifest": {}},
+            ),
+            patch.object(
+                promotion.final_release,
+                "_manifest_maps_from_plan",
+                return_value=({}, {}, {}),
+            ),
+            patch.object(
+                promotion.final_release,
+                "_validate_manifest_set",
+                return_value=validated,
+            ),
+            patch.object(promotion, "_snapshot_map", return_value={}),
+            patch.object(
+                promotion,
+                "load_reference_training_corpus",
+                return_value=corpus,
+            ) as load_corpus,
+        ):
+            result = promotion._build_final_fit_training_corpus(
+                {"lineage": {"final_fit_plan": {}}}
+            )
+        self.assertIs(corpus, result)
+        self.assertEqual(
+            "group",
+            load_corpus.call_args.kwargs["production_edit_mode"],
+        )
+        self.assertIsNone(
+            load_corpus.call_args.kwargs["production_target_member"]
+        )
+
     def _pointer(self, path: Path) -> dict[str, str]:
         return {"path": str(path.resolve()), "file_sha256": _sha(path)}
 
@@ -1689,6 +1804,15 @@ class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
             try:
                 with (
                     self._patched_plan_replay(),
+                    patch(
+                        "crosscut.stage_edit_dynamic_crop_v3_final_release_launcher."
+                        "load_dynamic_crop_v3_release_freeze",
+                        return_value={
+                            "freeze_content_sha256": "2" * 64,
+                            "source_provenance": {"head_commit_oid": "a" * 40},
+                            "candidate_id": "production-balanced-test",
+                        },
+                    ),
                     patch.object(
                         promotion,
                         "stage_edit_readiness_report",

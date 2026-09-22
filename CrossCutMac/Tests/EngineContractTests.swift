@@ -422,6 +422,157 @@ final class EngineContractTests: XCTestCase {
         analysis["render"] = render
     }
 
+    func makeReviewReadyOutputSet(in directory: URL, mode: EditMode) throws -> [URL] {
+        let files = try mode == .group
+            ? makeCompletedAutomaticGroupOutputSet(in: directory, timestamp: "20260908-120002", song: "XOXZ")
+            : makeCompletedAutomaticMemberOutputSet(in: directory, timestamp: "20260908-120002", song: "XOXZ")
+        func read(_ url: URL) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        }
+        func write(_ object: [String: Any], _ url: URL) throws {
+            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: url, options: .atomic)
+        }
+        var analysis = try read(files[0])
+        var render = try XCTUnwrap(analysis["render"] as? [String: Any])
+        var exposure = try XCTUnwrap(analysis["app_result_exposure"] as? [String: Any])
+        var qa = try XCTUnwrap(analysis["post_render_qa"] as? [String: Any])
+        exposure["delivery_completion_message_allowed"] = false
+        qa["passed"] = false
+        qa["verdict"] = "FAIL"
+        qa["report_passed"] = false
+        qa["content_binding_passed"] = true
+        qa["promotion_binding"] = ["passed": true]
+        qa["review_first_disposition"] = [
+            "contract": "ive_review_first_runtime_v1", "status": "REVIEW_READY",
+            "artifact_role": "review_ready", "video_output_exposed": true,
+            "delivery_completion_message_allowed": false, "technical_issue_codes": [],
+            "editorial_issue_codes": ["source_switch_density_below_hard_minimum"],
+        ] as [String: Any]
+        analysis["artifact_role"] = "review_ready"
+        render["artifact_role"] = "review_ready"
+        analysis["app_result_exposure"] = exposure
+        render["app_result_exposure"] = exposure
+        analysis["post_render_qa"] = qa
+        render["post_render_qa"] = qa
+        if mode == .group {
+            var selection = try read(files[2])
+            let policy: [String: Any] = [
+                "contract": "bounded_review_first_single_delivery_v1",
+                "required_complete_candidate_count": 1, "required_decoded_review_count": 1,
+                "candidate_pool": "bounded_review_first_single_full_song_v1",
+                "selection_mode": "one_complete_full_song_candidate_then_final_qa",
+                "source_coverage_requirements_changed": false,
+                "individual_candidate_quality_requirements_changed": false,
+                "silent_unreviewed_fallback_allowed": false,
+            ]
+            var review = try XCTUnwrap(selection["final_selected_review"] as? [String: Any])
+            review["passed"] = false
+            for key in ["requested_review_count", "reviewed_candidate_count", "minimum_required_candidate_count", "successful_review_count", "complete_candidate_count"] {
+                selection[key] = 1
+            }
+            selection.removeValue(forKey: "structure_passing_materialized_count")
+            selection["analysis_basis"] = "bounded_review_first_single_full_song_v1"
+            selection["release_policy"] = policy
+            selection["candidate_pool"] = "bounded_review_first_single_full_song_v1"
+            selection["selected_path_authority"] = "deterministic_full_song_visual_selector"
+            selection["selected_candidate_index"] = 0
+            selection["passed"] = false
+            selection["candidates"] = [["candidate_index": 0, "selected": true, "review": review]]
+            selection["final_selected_review"] = review
+            analysis["rendered_candidate_selection"] = selection
+            render["rendered_candidate_selection"] = selection
+            analysis["rendered_proxy_review"] = review
+            render["rendered_proxy_review"] = review
+            render["release_policy"] = policy
+            render["candidate_pool"] = "bounded_review_first_single_full_song_v1"
+            render["candidate_origin"] = "deterministic_full_song_visual_selector"
+            try write(selection, files[2])
+        } else {
+            var report = try read(files[2])
+            report["passed"] = false
+            report["verdict"] = "FAIL"
+            report["issue_count"] = 1
+            try write(report, files[2])
+        }
+        analysis["render"] = render
+        try write(analysis, files[0])
+        return files
+    }
+
+    func testReviewReadyGroupAndMemberArePlayableButNeverApproved() throws {
+        for mode in [EditMode.group, .member] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let files = try makeReviewReadyOutputSet(in: directory, mode: mode)
+            let request = EditRequest(song: "XOXZ", targetMember: .gaeul, editMode: mode,
+                aspectRatio: mode == .member ? .portrait : .landscape,
+                sources: [], outputDirectory: directory, sourceMode: .automatic)
+            let accepted = try XCTUnwrap(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+            XCTAssertEqual(accepted.artifactRole, "review_ready")
+            var analysis = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[0])) as? [String: Any])
+            var qa = analysis["post_render_qa"] as! [String: Any]
+            var disposition = qa["review_first_disposition"] as! [String: Any]
+            disposition["technical_issue_codes"] = ["unclassified_technical_failure"]
+            qa["review_first_disposition"] = disposition
+            analysis["post_render_qa"] = qa
+            var render = analysis["render"] as! [String: Any]
+            render["post_render_qa"] = qa
+            analysis["render"] = render
+            try JSONSerialization.data(withJSONObject: analysis).write(to: files[0], options: .atomic)
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+        }
+    }
+
+    func testApprovedSingleDeliveryCohortsDoNotRequireEightFinalists() throws {
+        for learned in [false, true] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let files = try makeCompletedAutomaticGroupOutputSet(in: directory, timestamp: "20260908-120003", song: "XOXZ")
+            var analysis = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[0])) as? [String: Any])
+            var selection = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[2])) as? [String: Any])
+            var render = try XCTUnwrap(analysis["render"] as? [String: Any])
+            var policy: [String: Any] = [
+                "contract": learned ? "stage_edit_quality_gated_single_delivery_v1" : "joint_quality_gated_single_delivery_v1",
+                "minimum_passing_candidate_count": 1, "comparison_candidate_budget": 8,
+                "source_coverage_requirements_changed": false, "individual_candidate_quality_requirements_changed": false,
+            ]
+            if learned {
+                policy["minimum_visual_passing_learned_candidate_count"] = 1
+                policy["comparison_selection"] = "rank_all_available_decoded_passing_candidates"
+                policy["silent_baseline_fallback_allowed"] = false
+            }
+            let review = try XCTUnwrap(selection["final_selected_review"] as? [String: Any])
+            for key in ["requested_review_count", "reviewed_candidate_count", "minimum_required_candidate_count", "successful_review_count", "complete_candidate_count"] {
+                selection[key] = 1
+            }
+            selection["structure_passing_materialized_count"] = 7
+            selection["selected_candidate_index"] = 6
+            selection["candidates"] = [["candidate_index": 6, "selected": true, "review": review]]
+            selection["release_policy"] = policy
+            selection["candidate_pool"] = learned ? "stage_edit_generation_only" : "joint_decoded_visual_selector"
+            render["candidate_origin"] = learned ? "explicit_stage_edit_generation" : "joint_decoded_visual_selector"
+            render["release_policy"] = policy
+            var qa = try XCTUnwrap(analysis["post_render_qa"] as? [String: Any])
+            qa["promotion_binding"] = ["passed": true]
+            qa["review_first_disposition"] = [
+                "contract": "ive_review_first_runtime_v1", "status": "APPROVED", "artifact_role": "delivery",
+                "video_output_exposed": true, "delivery_completion_message_allowed": true,
+                "technical_issue_codes": [], "editorial_issue_codes": [],
+            ] as [String: Any]
+            analysis["post_render_qa"] = qa
+            render["post_render_qa"] = qa
+            analysis["rendered_candidate_selection"] = selection
+            render["rendered_candidate_selection"] = selection
+            analysis["render"] = render
+            try JSONSerialization.data(withJSONObject: selection).write(to: files[2], options: .atomic)
+            try JSONSerialization.data(withJSONObject: analysis).write(to: files[0], options: .atomic)
+            let request = EditRequest(song: "XOXZ", targetMember: .gaeul, editMode: .group, aspectRatio: .landscape,
+                sources: [], outputDirectory: directory, sourceMode: .automatic)
+            let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+            XCTAssertEqual(result.artifactRole, "delivery")
+        }
+    }
+
     func testReportedDeliveryUsesOnlyTheExplicitArtifactSet() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ive-crosscut-reported-set-\(UUID().uuidString)")
@@ -1667,6 +1818,7 @@ final class EngineContractTests: XCTestCase {
         )
     }
 
+    @MainActor
     func testAutomaticAcquisitionFailureMessageHasActionableFallback() {
         let message = EngineRunner.automaticAcquisitionUnavailableMessage
         XCTAssertTrue(message.contains("yt-dlp"))
@@ -1674,6 +1826,7 @@ final class EngineContractTests: XCTestCase {
         XCTAssertTrue(message.contains("내 영상 선택"))
     }
 
+    @MainActor
     func testLocalMemberFailureMessageNamesConfirmedAnchorTracking() {
         let message = EngineRunner.localMemberTrackingUnavailableMessage
         XCTAssertTrue(message.contains("확인 앵커"))
@@ -2045,6 +2198,8 @@ except KeyboardInterrupt:
                     || $0 == "crosscut"
                     || ($0.hasPrefix("crosscut/") && $0.hasSuffix(".py"))
                     || $0 == "crosscut/models"
+                    || $0 == "crosscut/licenses"
+                    || ["crosscut/licenses/OSNet-MIT.txt", "crosscut/licenses/RTMPose-Apache-2.0.txt", "crosscut/licenses/TransNetV2-MIT.txt"].contains($0)
                     || $0 == "crosscut/models/face_detection_yunet_2023mar.onnx"
                     || $0 == "crosscut/models/LICENSE.yunet"
                     || sfaceAssetPaths.contains($0)

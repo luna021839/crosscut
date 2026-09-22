@@ -43,6 +43,10 @@ from .stage_edit_semimarkov_beam import (
     StageEditHeadFrame,
     StageEditSourceContinuity,
 )
+from .stage_edit_source_pair_contextual_v2 import (
+    StageEditContextualSourcePairV2Error,
+    materialize_stage_edit_contextual_runtime_frame_v2,
+)
 from .stage_edit_temporal_pose_motion import (
     require_scalar_stage_edit_pose_payload,
 )
@@ -543,6 +547,58 @@ def _sequence_payload(sequence: StageEditSequence) -> dict[str, Any]:
             for token in sequence.tokens
         ],
     }
+
+
+def _verified_contextual_family_mapping(
+    canonical_source_ids: Sequence[str],
+    derivative_family_id_by_source: Mapping[str, int] | None,
+) -> tuple[tuple[str, ...], dict[str, int] | None]:
+    """Normalize the optional verified source/family identity exactly once."""
+
+    source_ids = tuple(str(value).strip() for value in canonical_source_ids)
+    if (
+        not source_ids
+        or any(not value for value in source_ids)
+        or len(source_ids) != len(set(source_ids))
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "canonical source ids must be non-empty and unique"
+        )
+    if derivative_family_id_by_source is None:
+        return source_ids, None
+    if not isinstance(derivative_family_id_by_source, Mapping):
+        raise StageEditHeadMaterializerInputError(
+            "contextual derivative family identity must be a verified mapping"
+        )
+    mapping = dict(derivative_family_id_by_source)
+    if set(mapping) != set(source_ids) or any(
+        not isinstance(key, str) or not key.strip() or key != key.strip()
+        for key in mapping
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "contextual derivative family mapping must cover canonical source ids exactly"
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in mapping.values()
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "contextual derivative family ids must be non-negative integers"
+        )
+    # Verified derivative metadata uses first-seen canonical family ids.
+    ordered: list[int] = []
+    for source_id in source_ids:
+        value = mapping[source_id]
+        if value not in ordered:
+            ordered.append(value)
+    remap = {value: index for index, value in enumerate(ordered)}
+    if tuple(remap[mapping[value]] for value in source_ids) != tuple(
+        mapping[value] for value in source_ids
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "contextual derivative family ids are not first-seen canonical"
+        )
+    return source_ids, mapping
 
 
 def _strict_token_source_mapping(
@@ -1183,6 +1239,7 @@ def materialize_stage_edit_head_frames_v3(
     canonical_source_ids: Sequence[str],
     schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
     source_shot_sizes_by_token: Sequence[Mapping[str, str]] = (),
+    derivative_family_id_by_source: Mapping[str, int] | None = None,
 ) -> StageEditHeadMaterializationResult:
     """Run one verified source-conditioned Dynamic Crop v3 checkpoint."""
 
@@ -1222,6 +1279,12 @@ def materialize_stage_edit_head_frames_v3(
         raise StageEditHeadMaterializerInputError(
             "requested token schema differs from production checkpoint"
         )
+    canonical_ids, contextual_family_mapping = (
+        _verified_contextual_family_mapping(
+            canonical_source_ids,
+            derivative_family_id_by_source,
+        )
+    )
     weight_path = checkpoint / metadata.weight_filename
     before = {
         "metadata": _sha256_file(dynamic_metadata_path),
@@ -1232,6 +1295,63 @@ def materialize_stage_edit_head_frames_v3(
         sequence, schema
     )
     history_contract = stage_edit_recent_history_mask_contract(schema)
+    contextual_runtime_frames = ()
+    if contextual_family_mapping is not None:
+        try:
+            # Materialize causal evidence immediately after global history
+            # masking and before tensorization/model forward.  This ordering
+            # proves that logits cannot leak into the contextual scorer.
+            contextual_runtime_frames = tuple(
+                materialize_stage_edit_contextual_runtime_frame_v2(
+                    token,
+                    canonical_source_ids=canonical_ids,
+                    derivative_family_id_by_source=(
+                        contextual_family_mapping
+                    ),
+                    schema=schema,
+                )
+                for token in model_sequence.tokens
+            )
+        except StageEditContextualSourcePairV2Error as exc:
+            raise StageEditHeadMaterializerInputError(
+                f"contextual-v2 runtime sidecar materialization failed: {exc}"
+            ) from exc
+        if len(contextual_runtime_frames) != len(model_sequence.tokens):
+            raise AssertionError(
+                "internal contextual runtime sidecar count mismatch"
+            )
+        expected_mask_sha256 = history_contract["contract_sha256"]
+        for token_index, (token, runtime) in enumerate(
+            zip(
+                model_sequence.tokens,
+                contextual_runtime_frames,
+                strict=True,
+            )
+        ):
+            if runtime.master_time_seconds != float(token.master_time_seconds):
+                raise StageEditHeadMaterializerInputError(
+                    f"contextual runtime token {token_index} time changed"
+                )
+            if runtime.token_schema_fingerprint != schema.fingerprint:
+                raise StageEditHeadMaterializerInputError(
+                    f"contextual runtime token {token_index} schema changed"
+                )
+            if (
+                runtime.recent_history_mask_contract_sha256
+                != expected_mask_sha256
+            ):
+                raise StageEditHeadMaterializerInputError(
+                    f"contextual runtime token {token_index} mask contract changed"
+                )
+            runtime_sources = runtime.source_by_id
+            if set(runtime_sources) != set(canonical_ids) or any(
+                runtime_sources[source_id].derivative_family_id
+                != contextual_family_mapping[source_id]
+                for source_id in canonical_ids
+            ):
+                raise StageEditHeadMaterializerInputError(
+                    f"contextual runtime token {token_index} source/family identity changed"
+                )
     try:
         model, loaded_metadata = load_stage_edit_dynamic_crop_checkpoint_v3(
             checkpoint,
@@ -1264,11 +1384,21 @@ def materialize_stage_edit_head_frames_v3(
             sequence=model_sequence,
             batch=batch,
             output=output,
-            canonical_source_ids=canonical_source_ids,
+            canonical_source_ids=canonical_ids,
             schema=schema,
             metadata=metadata,
             source_shot_sizes_by_token=source_shot_sizes_by_token,
         )
+        if contextual_runtime_frames:
+            frames = tuple(
+                replace(
+                    frame,
+                    contextual_source_pair_runtime_v2=(
+                        contextual_runtime_frames[token_index]
+                    ),
+                )
+                for token_index, frame in enumerate(frames)
+            )
     except StageEditHeadMaterializerError:
         raise
     except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -1288,9 +1418,7 @@ def materialize_stage_edit_head_frames_v3(
     return StageEditHeadMaterializationResult(
         frames=frames,
         sequence_id=sequence.sequence_id,
-        canonical_source_ids=tuple(
-            str(value).strip() for value in canonical_source_ids
-        ),
+        canonical_source_ids=canonical_ids,
         checkpoint_directory=str(checkpoint),
         checkpoint_id=metadata.checkpoint_id,
         training_steps=metadata.training_steps,

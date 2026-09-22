@@ -5,11 +5,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import selectors
-import signal
 import subprocess
 import threading
+import math
 from time import monotonic
 from typing import Any, Callable, Mapping, Sequence
+
+from .workflow_supervisor import (
+    SUPERVISED_WORKFLOW_ENV,
+    terminate_owned_process_group,
+)
 
 
 _TERMINATE_GRACE_SECONDS = 2.0
@@ -27,27 +32,18 @@ def _terminate_process_tree(
 ) -> None:
     """Terminate and reap FFmpeg plus descendants from its private session."""
 
+    if process_group_owned:
+        terminate_owned_process_group(process)
+        return
     if process.poll() is not None:
         return
-    if process_group_owned:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    else:
-        process.terminate()
+    process.terminate()
     try:
         process.wait(timeout=_TERMINATE_GRACE_SECONDS)
         return
     except subprocess.TimeoutExpired:
         pass
-    if process_group_owned:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    else:
-        process.kill()
+    process.kill()
     process.wait()
 
 
@@ -121,6 +117,7 @@ def run_observed_render(
     if timeout_seconds is not None and (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
         or timeout_seconds <= 0
     ):
         raise ValueError("render timeout_seconds must be positive")
@@ -138,11 +135,12 @@ def run_observed_render(
             "text": True,
             "bufsize": 1,
         }
-        if os.name == "posix":
+        isolated_group = os.name == "posix" and os.environ.get(SUPERVISED_WORKFLOW_ENV) != "1"
+        if isolated_group:
             popen_arguments["start_new_session"] = True
         process = subprocess.Popen(launched_command, **popen_arguments)
         process_group_owned = bool(
-            os.name == "posix" and isinstance(process, _POPEN_TYPE)
+            isolated_group and isinstance(process, _POPEN_TYPE)
         )
         try:
             assert process.stdout is not None
@@ -187,7 +185,9 @@ def run_observed_render(
             else:
                 selector = selectors.DefaultSelector()
                 try:
+                    os.set_blocking(stdout_fd, False)
                     selector.register(process.stdout, selectors.EVENT_READ)
+                    pending = b""
                     while True:
                         remaining = _remaining(deadline)
                         if remaining is not None and remaining <= 0.0:
@@ -198,11 +198,18 @@ def run_observed_render(
                             0.1 if remaining is None else min(0.1, remaining)
                         )
                         if events:
-                            line = process.stdout.readline()
-                            if line:
-                                consume(line)
+                            chunk = os.read(stdout_fd, 65536)
+                            if chunk:
+                                pending += chunk
+                                if len(pending) > 1024 * 1024:
+                                    raise RuntimeError("render progress line exceeds bounded buffer")
+                                while b"\n" in pending:
+                                    line, pending = pending.split(b"\n", 1)
+                                    consume(line.decode("utf-8", errors="replace"))
                                 continue
                             if process.poll() is not None:
+                                if pending:
+                                    consume(pending.decode("utf-8", errors="replace"))
                                 break
                         elif process.poll() is not None:
                             # Do not wait for an unrelated grandchild that kept
@@ -219,10 +226,7 @@ def run_observed_render(
                     launched_command, timeout_seconds
                 ) from None
             if process_group_owned:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                terminate_owned_process_group(process)
         except BaseException:
             _terminate_process_tree(
                 process,

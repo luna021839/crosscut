@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 from time import monotonic
 import traceback
@@ -51,6 +52,7 @@ from crosscut.review_first_runtime import (
     REVIEW_FIRST_TOTAL_BUDGET_SECONDS,
     ReviewFirstDeadlineExceeded,
     enforce_review_first_deadline,
+    artifact_disposition_payload_valid,
 )
 
 
@@ -91,6 +93,13 @@ def _result_contains_exposable_video(artifact: object) -> bool:
         return False
     request = manifest.get("request")
     render = manifest.get("render")
+    if has_mp4 and (
+        not isinstance(request, dict)
+        or request.get("source_mode") not in {"automatic", "local"}
+        or request.get("edit_mode") not in {"group", "member"}
+        or str(request.get("group", "")).strip().upper() != "IVE"
+    ):
+        raise RuntimeError("MP4 is not exposed because its request scope is missing or invalid")
     automatic_ive_scope = bool(
         isinstance(request, dict)
         and str(request.get("group", "")).strip().upper() == "IVE"
@@ -101,6 +110,13 @@ def _result_contains_exposable_video(artifact: object) -> bool:
     )
     if not automatic_ive_scope:
         return has_mp4
+    if has_mp4:
+        video_paths = [Path(path) for path in output_paths if Path(path).suffix.lower() == ".mp4"]
+        declared_video = render.get("video_path") if isinstance(render, dict) else None
+        if (not isinstance(declared_video, str) or not Path(declared_video).is_absolute()
+                or len(video_paths) != 1
+                or video_paths[0].resolve() != Path(declared_video).resolve()):
+            raise RuntimeError("automatic IVE MP4 output is not the unique QA-bound render path")
     edit_mode = str(request.get("edit_mode", "")).strip().lower()
     member = edit_mode == "member"
     exposure = manifest.get("app_result_exposure")
@@ -135,6 +151,7 @@ def _result_contains_exposable_video(artifact: object) -> bool:
         and qa.get("contract") == expected_qa_contract
         and content_binding_passed
         and isinstance(disposition, dict)
+        and artifact_disposition_payload_valid(disposition, role=artifact_role)
     )
     delivery_allowed = bool(
         artifact_role == "delivery"
@@ -183,6 +200,9 @@ def _parser() -> argparse.ArgumentParser:
     analyze_parser = subcommands.add_parser("analyze", help="analyze IVE music-show sources")
     analyze_parser.add_argument("--request", required=True, type=Path)
     analyze_parser.add_argument("--debug", action="store_true")
+    analyze_parser.add_argument(
+        "--workflow-worker-deadline", type=float, help=argparse.SUPPRESS,
+    )
     analyze_parser.add_argument(
         "--allow-failed-comparison-render",
         action="store_true",
@@ -470,7 +490,9 @@ def main(argv: list[str] | None = None) -> int:
             f"IVE {request.song} · {request.edit_mode.value} · {request.aspect_ratio.value}"
         )
         review_first_deadline = (
-            monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
+            arguments.workflow_worker_deadline
+            if arguments.workflow_worker_deadline is not None
+            else monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
             if bool(getattr(request, "review_first_enabled", False))
             else None
         )
@@ -534,6 +556,12 @@ def main(argv: list[str] | None = None) -> int:
         artifact_role = artifact.manifest.get("artifact_role")
         reporter.result(
             outputs=[str(path) for path in artifact.output_paths],
+            artifact_result=(
+                artifact.manifest.get("post_render_qa", {}).get(
+                    "review_first_disposition"
+                )
+                if video_exposed else None
+            ),
             source_paths=(
                 [str(path) for path in acquisition.source_paths]
                 if acquisition is not None
@@ -573,5 +601,38 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def supervised_main(argv: list[str] | None = None) -> int:
+    """The native app entry point, including non-interruptible native calls."""
+    from crosscut.workflow_supervisor import run_supervised_workflow
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    parsed = _parser().parse_args(args)
+    if parsed.command != "analyze" or parsed.workflow_worker_deadline is not None:
+        return main(args)
+    # Both the default review path and opt-in strict comparison path own one
+    # acquisition-to-QA budget. The worker cannot restart it per candidate.
+    _prepare_analysis_process_group()
+    deadline = monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
+    try:
+        AnalysisRequest.from_json_file(parsed.request)
+        return run_supervised_workflow(
+            [sys.executable, str(Path(__file__).resolve()), *args,
+             "--workflow-worker-deadline", str(deadline)],
+            absolute_deadline_monotonic_seconds=deadline,
+        )
+    except subprocess.TimeoutExpired:
+        EventReporter().error(
+            "작업 전체 시간 제한을 초과해 하위 작업을 종료했습니다. "
+            "검증되지 않은 영상은 결과로 공개하지 않습니다."
+        )
+        return 1
+    except KeyboardInterrupt:
+        EventReporter().error("작업이 취소되었습니다.")
+        return 130
+    except Exception as exc:
+        EventReporter().error(str(exc))
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(supervised_main())

@@ -454,7 +454,10 @@ class RenderedProxyReviewTests(unittest.TestCase):
                 )
             )
 
-        review = self._review_frames(plan, frames)
+        # A quality-pass fixture must actually provide subject observations;
+        # missing subject evidence is no longer a perfect continuity match.
+        review = self._review_frames(plan, frames, geometry_provider=lambda _: OutputSubjectGeometry(
+            face_count=1, face_bbox_xywh=(.4, .2, .2, .3)))
 
         admission = review.payload["perceptual_source_admission"]
         self.assertTrue(admission["admission"]["passed"])
@@ -762,6 +765,8 @@ class RenderedProxyReviewTests(unittest.TestCase):
             review.payload["visible_boundary_score"]["distribution"]["count"],
             0,
         )
+        self.assertIsNone(review.payload["visible_boundary_score"]["p10"])
+        self.assertEqual(review.payload["visible_boundary_score"]["evidence_status"], "NOT_APPLICABLE")
         self.assertEqual(
             review.payload["boundary_domains"][TIER_D_CONTINUITY_DOMAIN][
                 "issue_count"

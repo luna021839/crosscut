@@ -14,6 +14,15 @@ from crosscut.pipeline import _enforce_automatic_stage_edit_post_render_qa
 from crosscut.post_render_qa import fingerprint_post_render_artifacts
 
 
+def _disposition(status="REVIEW_READY"):
+    review = status == "REVIEW_READY"
+    return {"contract": "ive_review_first_runtime_v1", "status": status,
+            "artifact_role": "review_ready" if review else "rejected",
+            "video_output_exposed": review, "delivery_completion_message_allowed": False,
+            "technical_issue_codes": [] if review else ["fixture_failure"],
+            "editorial_issue_codes": ["source_switch_density_below_hard_minimum"] if review else []}
+
+
 class ReviewFirstPipelineTests(unittest.TestCase):
     def test_cli_exposes_member_review_ready_without_claiming_delivery(self) -> None:
         artifact = SimpleNamespace(
@@ -26,6 +35,7 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                 },
                 "artifact_role": "review_ready",
                 "render": {
+                    "video_path": "/tmp/member-review.mp4",
                     "direct_full_frame": True,
                     "artifact_role": "review_ready",
                 },
@@ -38,9 +48,7 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                     "contract": "automatic_ive_member_mandatory_post_render_qa_v1",
                     "passed": False,
                     "content_binding_passed": True,
-                    "review_first_disposition": {
-                        "status": "REVIEW_READY",
-                    },
+                    "review_first_disposition": _disposition(),
                 },
             },
         )
@@ -57,7 +65,7 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                     "source_mode": "automatic",
                 },
                 "artifact_role": "review_ready",
-                "render": {"artifact_role": "review_ready"},
+                "render": {"artifact_role": "review_ready", "video_path": "/tmp/group-review.mp4"},
                 "app_result_exposure": {
                     "contract": "automatic_ive_group_app_result_exposure_v1",
                     "video_output_exposed": True,
@@ -69,12 +77,19 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                     ),
                     "passed": False,
                     "promotion_binding": {"passed": True},
-                    "review_first_disposition": {"status": "REVIEW_READY"},
+                    "review_first_disposition": _disposition(),
                 },
             },
         )
 
         self.assertTrue(crosscut_cli._result_contains_exposable_video(artifact))
+
+        artifact.output_paths = (Path("/tmp/different-unreviewed.mp4"),)
+        with self.assertRaisesRegex(RuntimeError, "unique QA-bound render path"):
+            crosscut_cli._result_contains_exposable_video(artifact)
+        artifact.output_paths = (Path("/tmp/group-review.mp4"), Path("/tmp/unreviewed-extra.mp4"))
+        with self.assertRaisesRegex(RuntimeError, "unique QA-bound render path"):
+            crosscut_cli._result_contains_exposable_video(artifact)
 
     def test_cli_blocks_rejected_group_mp4(self) -> None:
         artifact = SimpleNamespace(

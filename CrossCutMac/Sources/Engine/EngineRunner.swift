@@ -58,6 +58,7 @@ enum EngineRunState: Equatable {
     case preparing
     case running
     case completed
+    case reviewReady
     case failed(String)
     case cancelled
 
@@ -288,6 +289,7 @@ struct CompletedEngineOutputSet: Equatable, Sendable {
     let editMode: CompletedEngineOutputMode
     let timestamp: String
     let outputURLs: [URL]
+    let artifactRole: String
 }
 
 enum RenderedVideoOutputDiscovery {
@@ -424,7 +426,10 @@ enum CompletedEngineOutputSetDiscovery {
         let passed: Bool
         let candidates: [CandidateReview]
         let completeCandidateCount: Int
-        let structurePassingMaterializedCount: Int
+        let structurePassingMaterializedCount: Int?
+        let releasePolicy: ReviewFirstReleasePolicy?
+        let candidatePool: String?
+        let selectedPathAuthority: String?
         let exactSuccessfulDecodedReviewCountSatisfied: Bool
         let exactCompleteCandidateCountSatisfied: Bool
         let finalSelectedReview: ProxyReview
@@ -452,36 +457,94 @@ enum CompletedEngineOutputSetDiscovery {
                 "exact_complete_candidate_count_satisfied"
             case finalSelectedReview = "final_selected_review"
             case finalSelectedVersion = "final_selected_version"
+            case releasePolicy = "release_policy"
+            case candidatePool = "candidate_pool"
+            case selectedPathAuthority = "selected_path_authority"
         }
 
-        var isComplete: Bool {
+        func isComplete(allowQualityFailure: Bool) -> Bool {
             let indices = candidates.map(\.candidateIndex)
             let selected = candidates.filter(\.selected)
-            return analysisBasis == CompletedEngineOutputSetDiscovery.selectionAnalysisBasis
+            let singleton = releasePolicy?.isReviewFirst == true
+                && candidatePool == "bounded_review_first_single_full_song_v1"
+                && ["stage_edit_generation", "stage_edit_candidate_reranker", "deterministic_full_song_visual_selector"].contains(selectedPathAuthority ?? "")
+            let qualitySingle = releasePolicy?.isQualitySingle == true
+            let count = singleton || qualitySingle ? 1 : 8
+            return analysisBasis == (singleton ? "bounded_review_first_single_full_song_v1" : CompletedEngineOutputSetDiscovery.selectionAnalysisBasis)
                 && storagePolicy.oneProxyAtATime
                 && storagePolicy.temporaryProxyRemovedAfterEachReview
                 && !storagePolicy.decodedFramesPersisted
-                && requestedReviewCount == 8
-                && reviewedCandidateCount == 8
-                && minimumRequiredCandidateCount == 8
+                && requestedReviewCount == count
+                && reviewedCandidateCount == count
+                && minimumRequiredCandidateCount == count
                 && minimumCandidateCountSatisfied
-                && successfulReviewCount == 8
-                && completeCandidateCount == 8
-                && structurePassingMaterializedCount == 8
+                && successfulReviewCount == count
+                && completeCandidateCount == count
+                && (singleton || (qualitySingle ? (structurePassingMaterializedCount ?? 0) >= 1 : structurePassingMaterializedCount == count))
                 && exactSuccessfulDecodedReviewCountSatisfied
                 && exactCompleteCandidateCountSatisfied
-                && passed
-                && candidates.count == 8
-                && Set(indices).count == 8
+                && (passed || (singleton && allowQualityFailure))
+                && passed == finalSelectedReview.passed
+                && candidates.count == count
+                && Set(indices).count == count && indices.allSatisfy { $0 >= 0 }
+                && (!singleton || indices == [0])
                 && selected.count == 1
                 && selected[0].candidateIndex == selectedCandidateIndex
                 && candidates.allSatisfy {
                     $0.error == nil
                         && ($0.review?.isCompleteAndSanitized == true)
                 }
-                && finalSelectedReview.passed
+                && (finalSelectedReview.passed || (singleton && allowQualityFailure))
                 && finalSelectedReview.isCompleteAndSanitized
-                && ["original", "partial_reedit"].contains(finalSelectedVersion)
+                && ["original", "partial_reedit", "windowed_semimarkov_redecode"].contains(finalSelectedVersion)
+        }
+    }
+
+    private struct ReviewFirstReleasePolicy: Decodable, Equatable {
+        let contract: String
+        let requiredCompleteCandidateCount: Int?
+        let requiredDecodedReviewCount: Int?
+        let candidatePool: String?
+        let selectionMode: String?
+        let sourceCoverageRequirementsChanged: Bool
+        let individualCandidateQualityRequirementsChanged: Bool
+        let silentUnreviewedFallbackAllowed: Bool?
+        let minimumPassingCandidateCount: Int?
+        let comparisonCandidateBudget: Int?
+        let minimumVisualPassingLearnedCandidateCount: Int?
+        let comparisonSelection: String?
+        let silentBaselineFallbackAllowed: Bool?
+        enum CodingKeys: String, CodingKey {
+            case contract
+            case requiredCompleteCandidateCount = "required_complete_candidate_count"
+            case requiredDecodedReviewCount = "required_decoded_review_count"
+            case candidatePool = "candidate_pool"
+            case selectionMode = "selection_mode"
+            case sourceCoverageRequirementsChanged = "source_coverage_requirements_changed"
+            case individualCandidateQualityRequirementsChanged = "individual_candidate_quality_requirements_changed"
+            case silentUnreviewedFallbackAllowed = "silent_unreviewed_fallback_allowed"
+            case minimumPassingCandidateCount = "minimum_passing_candidate_count"
+            case comparisonCandidateBudget = "comparison_candidate_budget"
+            case minimumVisualPassingLearnedCandidateCount = "minimum_visual_passing_learned_candidate_count"
+            case comparisonSelection = "comparison_selection"
+            case silentBaselineFallbackAllowed = "silent_baseline_fallback_allowed"
+        }
+        var isReviewFirst: Bool {
+            contract == "bounded_review_first_single_delivery_v1"
+                && requiredCompleteCandidateCount == 1 && requiredDecodedReviewCount == 1
+                && candidatePool == "bounded_review_first_single_full_song_v1"
+                && selectionMode == "one_complete_full_song_candidate_then_final_qa"
+                && !sourceCoverageRequirementsChanged && !individualCandidateQualityRequirementsChanged
+                && silentUnreviewedFallbackAllowed == false
+        }
+        var isQualitySingle: Bool {
+            guard minimumPassingCandidateCount == 1, comparisonCandidateBudget == 8,
+                  !sourceCoverageRequirementsChanged, !individualCandidateQualityRequirementsChanged else { return false }
+            return contract == "joint_quality_gated_single_delivery_v1"
+                || (contract == "stage_edit_quality_gated_single_delivery_v1"
+                    && minimumVisualPassingLearnedCandidateCount == 1
+                    && comparisonSelection == "rank_all_available_decoded_passing_candidates"
+                    && silentBaselineFallbackAllowed == false)
         }
     }
 
@@ -517,7 +580,7 @@ enum CompletedEngineOutputSetDiscovery {
                 "delivery_completion_message_allowed"
         }
 
-        func authorizesDelivery(for editMode: CompletedEngineOutputMode) -> Bool {
+        func authorizes(role: String, for editMode: CompletedEngineOutputMode) -> Bool {
             let expectedContract = switch editMode {
             case .group:
                 CompletedEngineOutputSetDiscovery
@@ -528,7 +591,8 @@ enum CompletedEngineOutputSetDiscovery {
             }
             return contract == expectedContract
                 && videoOutputExposed
-                && deliveryCompletionMessageAllowed
+                && ["delivery", "review_ready"].contains(role)
+                && deliveryCompletionMessageAllowed == (role == "delivery")
         }
     }
 
@@ -540,6 +604,10 @@ enum CompletedEngineOutputSetDiscovery {
         let reportPath: String?
         let reportPassed: Bool?
         let contentBindingPassed: Bool?
+        let reviewFirstDisposition: EngineArtifactDisposition?
+        let promotionBinding: PromotionBinding?
+
+        struct PromotionBinding: Decodable, Equatable { let passed: Bool }
 
         enum CodingKeys: String, CodingKey {
             case contract
@@ -549,9 +617,11 @@ enum CompletedEngineOutputSetDiscovery {
             case reportPath = "report_path"
             case reportPassed = "report_passed"
             case contentBindingPassed = "content_binding_passed"
+            case reviewFirstDisposition = "review_first_disposition"
+            case promotionBinding = "promotion_binding"
         }
 
-        func authorizesDelivery(for editMode: CompletedEngineOutputMode) -> Bool {
+        func authorizes(role: String, for editMode: CompletedEngineOutputMode) -> Bool {
             let expectedContract = switch editMode {
             case .group:
                 CompletedEngineOutputSetDiscovery
@@ -560,12 +630,18 @@ enum CompletedEngineOutputSetDiscovery {
                 CompletedEngineOutputSetDiscovery
                     .automaticIVEMemberPostRenderQAContract
             }
-            return contract == expectedContract
-                && required
-                && verdict == "PASS"
-                && passed
-                && (editMode != .member || reportPassed == true)
-                && (editMode != .member || contentBindingPassed == true)
+            guard contract == expectedContract, required else { return false }
+            if let disposition = reviewFirstDisposition {
+                guard disposition.authorizes(role: role),
+                      (editMode == .member ? contentBindingPassed == true : promotionBinding?.passed == true)
+                else { return false }
+            } else if role != "delivery" { return false }
+            if role == "review_ready" {
+                return !passed && ["FAIL", "CONDITIONAL"].contains(verdict)
+                    && (editMode != .member || reportPassed == false)
+            }
+            return role == "delivery" && verdict == "PASS" && passed
+                && (editMode != .member || (reportPassed == true && contentBindingPassed == true))
         }
     }
 
@@ -607,6 +683,9 @@ enum CompletedEngineOutputSetDiscovery {
         let artifactRole: String
         let appResultExposure: AppResultExposure
         let postRenderQA: PostRenderQAEvidence
+        let releasePolicy: ReviewFirstReleasePolicy?
+        let candidatePool: String?
+        let candidateOrigin: String?
 
         enum CodingKeys: String, CodingKey {
             case videoPath = "video_path"
@@ -618,6 +697,9 @@ enum CompletedEngineOutputSetDiscovery {
             case artifactRole = "artifact_role"
             case appResultExposure = "app_result_exposure"
             case postRenderQA = "post_render_qa"
+            case releasePolicy = "release_policy"
+            case candidatePool = "candidate_pool"
+            case candidateOrigin = "candidate_origin"
         }
     }
 
@@ -939,10 +1021,12 @@ enum CompletedEngineOutputSetDiscovery {
               ) else {
             return nil
         }
+        guard let validatedAnalysis = decode(GroupAnalysisManifest.self, from: urls[0]) else { return nil }
         return CompletedEngineOutputSet(
             editMode: .group,
             timestamp: timestamp,
-            outputURLs: urls
+            outputURLs: urls,
+            artifactRole: validatedAnalysis.artifactRole
         )
     }
 
@@ -991,7 +1075,8 @@ enum CompletedEngineOutputSetDiscovery {
         return CompletedEngineOutputSet(
             editMode: .member,
             timestamp: timestamp,
-            outputURLs: urls
+            outputURLs: urls,
+            artifactRole: analysis.artifactRole
         )
     }
 
@@ -1091,14 +1176,11 @@ enum CompletedEngineOutputSetDiscovery {
               analysis.request.editMode == "group",
               analysis.request.sourceMode == "automatic",
               samePath(analysis.request.outputDirectory, outputDirectory),
-              analysis.artifactRole == "delivery",
-              analysis.appResultExposure.authorizesDelivery(for: .group),
-              analysis.postRenderQA.authorizesDelivery(for: .group),
+              analysis.appResultExposure.authorizes(role: analysis.artifactRole, for: .group),
+              analysis.postRenderQA.authorizes(role: analysis.artifactRole, for: .group),
               analysis.render.artifactRole == analysis.artifactRole,
               analysis.render.appResultExposure == analysis.appResultExposure,
-              analysis.render.appResultExposure.authorizesDelivery(for: .group),
               analysis.render.postRenderQA == analysis.postRenderQA,
-              analysis.render.postRenderQA.authorizesDelivery(for: .group),
               analysis.capabilities.groupVideoRendered == true,
               analysis.render.videoCodec == "h264_videotoolbox"
                 || analysis.render.videoCodec == "libx264",
@@ -1125,7 +1207,19 @@ enum CompletedEngineOutputSetDiscovery {
               interchangeAudit.artifacts.values.allSatisfy({
                 $0.sizeBytes > 0 && isSHA256($0.sha256)
               }),
-              selection.isComplete,
+              selection.isComplete(allowQualityFailure: analysis.artifactRole == "review_ready"),
+              selection.releasePolicy == analysis.render.releasePolicy,
+              (selection.releasePolicy == nil || analysis.postRenderQA.reviewFirstDisposition != nil),
+              (selection.releasePolicy?.isReviewFirst != true
+                || (selection.candidatePool == analysis.render.candidatePool
+                    && selection.selectedPathAuthority == analysis.render.candidateOrigin)),
+              (selection.releasePolicy?.isQualitySingle != true
+                || ((selection.releasePolicy?.contract == "joint_quality_gated_single_delivery_v1"
+                    && selection.candidatePool == "joint_decoded_visual_selector"
+                    && analysis.render.candidateOrigin == "joint_decoded_visual_selector")
+                    || (selection.releasePolicy?.contract == "stage_edit_quality_gated_single_delivery_v1"
+                        && ["stage_edit_generation_only", "stage_edit_generation_plus_typed_visual_floor_v1"].contains(selection.candidatePool ?? "")
+                        && analysis.render.candidateOrigin == "explicit_stage_edit_generation"))),
               analysis.renderedCandidateSelection == selection,
               analysis.render.renderedCandidateSelection == selection,
               analysis.renderedProxyReview == selection.finalSelectedReview,
@@ -1177,15 +1271,12 @@ enum CompletedEngineOutputSetDiscovery {
               analysis.request.targetMember.flatMap(IVEMember.init(rawValue:)) != nil,
               samePath(analysis.request.outputDirectory, outputDirectory),
               analysis.memberDirectFullFrame.enabled,
-              analysis.artifactRole == "delivery",
-              analysis.appResultExposure.authorizesDelivery(for: .member),
-              analysis.postRenderQA.authorizesDelivery(for: .member),
+              analysis.appResultExposure.authorizes(role: analysis.artifactRole, for: .member),
+              analysis.postRenderQA.authorizes(role: analysis.artifactRole, for: .member),
               samePath(analysis.postRenderQA.reportPath ?? "", postRenderQAURL),
               analysis.render.artifactRole == analysis.artifactRole,
               analysis.render.appResultExposure == analysis.appResultExposure,
-              analysis.render.appResultExposure.authorizesDelivery(for: .member),
               analysis.render.postRenderQA == analysis.postRenderQA,
-              analysis.render.postRenderQA.authorizesDelivery(for: .member),
               analysis.render.directFullFrame,
               analysis.capabilities.memberVideoRendered == true,
               analysis.capabilities.memberDirectFullFrameReady == true,
@@ -1213,9 +1304,9 @@ enum CompletedEngineOutputSetDiscovery {
               }),
               postRenderQA.schemaVersion == 1,
               postRenderQA.analysis == automaticIVEMemberPostRenderQAAnalysis,
-              postRenderQA.verdict == "PASS",
-              postRenderQA.passed,
-              postRenderQA.issueCount == 0,
+              postRenderQA.verdict == analysis.postRenderQA.verdict,
+              postRenderQA.passed == analysis.postRenderQA.passed,
+              (analysis.artifactRole == "delivery" ? postRenderQA.issueCount == 0 : postRenderQA.issueCount > 0),
               samePath(postRenderQA.artifactSet.analysisPath, analysisURL),
               samePath(postRenderQA.artifactSet.renderPlanPath, planURL),
               samePath(postRenderQA.artifactSet.videoPath, videoURL),
@@ -1272,6 +1363,7 @@ final class EngineRunner: ObservableObject {
     private var requestFileURL: URL?
     private var reportedError: String?
     private var resultMessage: String?
+    private var pendingArtifactResult: EngineArtifactDisposition?
     private var preparationTask: Task<Void, Never>?
     private var activePreparationID: UUID?
     private var completedOutputDiscoveryTask: Task<Void, Never>?
@@ -1416,6 +1508,7 @@ final class EngineRunner: ObservableObject {
         cancellationRequested = false
         reportedError = nil
         resultMessage = nil
+        pendingArtifactResult = nil
     }
 
     private func completeCompletedOutputDiscovery(
@@ -1435,7 +1528,7 @@ final class EngineRunner: ObservableObject {
             if clearExistingOutputsOnMissing {
                 outputURLs.removeAll()
                 renderedVideoURL = nil
-                if state == .completed {
+                if state == .completed || state == .reviewReady {
                     progress = 0
                     state = .idle
                     statusMessage = "선택한 저장 위치에 완성 결과가 아직 없습니다."
@@ -1459,12 +1552,14 @@ final class EngineRunner: ObservableObject {
             in: result.outputURLs
         )
         reportedError = nil
-        resultMessage = "외부에서 완성된 교차편집 결과를 불러왔습니다."
+        resultMessage = result.artifactRole == "review_ready"
+            ? "편집 품질 QA 미통과 검토본을 불러왔습니다."
+            : "외부에서 완성된 교차편집 결과를 불러왔습니다."
         cancellationRequested = false
         progress = 1
         progressIsIndeterminate = false
-        state = .completed
-        statusMessage = "교차편집 결과가 준비되었습니다."
+        state = result.artifactRole == "review_ready" ? .reviewReady : .completed
+        statusMessage = result.artifactRole == "review_ready" ? "검토용 초안 · 최종 승인 아님" : "교차편집 결과가 준비되었습니다."
         appendLog(
             "완성 결과 복원: \(result.outputURLs.last?.lastPathComponent ?? result.timestamp)",
             level: .info
@@ -1715,6 +1810,7 @@ final class EngineRunner: ObservableObject {
         case "result":
             guard state.isRunning, !cancellationRequested, reportedError == nil else { return }
             pendingOutputURLs = event.outputPaths.map { URL(fileURLWithPath: $0) }
+            pendingArtifactResult = event.artifactResult
             if let message = event.message {
                 resultMessage = message
             }
@@ -1763,6 +1859,7 @@ final class EngineRunner: ObservableObject {
         }
         let reported = pendingOutputURLs
         let accepted: [URL]
+        var finalRole = "delivery"
         if request.sourceMode == SourceMode.automatic.rawValue {
             statusMessage = "최종 결과와 QA 기록을 확인하는 중…"
             let validated = await Task.detached(priority: .utility) {
@@ -1774,6 +1871,11 @@ final class EngineRunner: ObservableObject {
                 return
             }
             accepted = validated.outputURLs
+            finalRole = validated.artifactRole
+            if let disposition = pendingArtifactResult, !disposition.authorizes(role: finalRole) {
+                fail("엔진 결과 상태와 최종 QA의 공개 권한이 일치하지 않습니다.")
+                return
+            }
         } else {
             accepted = reported
         }
@@ -1791,8 +1893,8 @@ final class EngineRunner: ObservableObject {
         activeRequest = nil
         progress = 1
         progressIsIndeterminate = false
-        state = .completed
-        statusMessage = "교차편집 결과가 준비되었습니다."
+        state = finalRole == "review_ready" ? .reviewReady : .completed
+        statusMessage = finalRole == "review_ready" ? "검토용 초안 · 최종 승인 아님" : "교차편집 결과가 준비되었습니다."
         if let resultMessage { appendLog(resultMessage, level: .info) }
         appendLog(statusMessage, level: .info)
     }
@@ -1811,6 +1913,7 @@ final class EngineRunner: ObservableObject {
         outputURLs.removeAll()
         renderedVideoURL = nil
         resultMessage = nil
+        pendingArtifactResult = nil
     }
 
     private func cleanupRequestFile() {

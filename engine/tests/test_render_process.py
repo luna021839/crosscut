@@ -112,5 +112,18 @@ class RenderProcessTests(unittest.TestCase):
         callback(dict(pid=2,frame=0,phase='continue'))
         self.assertEqual(len(logs),4)
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX process supervision required')
+    def test_unterminated_progress_line_cannot_block_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / 'partial-progress'
+            executable.write_text('#!/usr/bin/env python3\nimport sys,time\nsys.stdout.write("frame=1");sys.stdout.flush();time.sleep(20)\n')
+            executable.chmod(0o755)
+            started = monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_observed_render([str(executable)], stderr_path=root / 'stderr',
+                    progress_callback=lambda event: None, timeout_seconds=.2)
+            self.assertLess(monotonic() - started, 1.5)
+
 
 if __name__=='__main__':unittest.main()

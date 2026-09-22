@@ -10,6 +10,7 @@ required cohort size when both artifacts agree on every invariant below.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 
 
 REVIEW_FIRST_RELEASE_CANDIDATE_COUNT = 1
@@ -46,6 +47,48 @@ def _sequence(value: object) -> Sequence[object] | None:
     return None
 
 
+def build_review_first_selection_payload(
+    decoded_selection: Mapping[str, object],
+    *,
+    complete_candidate: Mapping[str, object],
+    selected_path_authority: str,
+) -> dict[str, object]:
+    """The actual singleton producer, shared by pipeline and contract tests."""
+    payload = deepcopy(dict(decoded_selection))
+    candidates = _sequence(payload.get("candidates"))
+    candidate = candidates[0] if candidates and len(candidates) == 1 else None
+    review = candidate.get("review") if isinstance(candidate, Mapping) else None
+    if (selected_path_authority not in REVIEW_FIRST_ALLOWED_AUTHORITIES
+            or not isinstance(candidate, Mapping) or not isinstance(review, Mapping)
+            or type(candidate.get("candidate_index")) is not int or candidate.get("candidate_index") != 0
+            or candidate.get("selected") is not True or candidate.get("error") is not None
+            or type(complete_candidate.get("candidate_index")) is not int or complete_candidate.get("candidate_index") != 0
+            or not isinstance(review.get("passed"), bool)
+            or payload.get("passed") is not review.get("passed")
+            or any(type(payload.get(key)) is not int or payload.get(key) != 1
+                   for key in ("requested_review_count", "reviewed_candidate_count", "minimum_required_candidate_count", "successful_review_count"))):
+        raise ValueError("review-first producer needs exactly one complete decoded candidate")
+    payload.update({
+        "analysis_basis": REVIEW_FIRST_CANDIDATE_POOL,
+        "release_policy": review_first_release_policy_payload(),
+        "candidate_pool": REVIEW_FIRST_CANDIDATE_POOL,
+        "selected_path_authority": selected_path_authority,
+        "complete_candidates": [deepcopy(dict(complete_candidate))],
+        "complete_candidate_count": 1,
+        "exact_successful_decoded_review_count_satisfied": True,
+        "exact_complete_candidate_count_satisfied": True,
+        "final_selected_review": deepcopy(dict(review)),
+        "final_selected_version": "original",
+        "proxy_triggered_partial_reedit": {
+            "attempted": False, "improved": False, "selected_version": "original",
+            "changed_boundary_indices": [], "reason": "bounded_review_first_singleton",
+        },
+        "approval_deferred_to_final_post_render_qa": True,
+        "delivery_completion_message_allowed": False,
+    })
+    return payload
+
+
 def review_first_release_binding_valid(
     selection: Mapping[str, object],
     render: Mapping[str, object],
@@ -76,6 +119,10 @@ def review_first_release_binding_valid(
         else None
     )
     return bool(
+        all(type(selection.get(key)) is int for key in (
+            "requested_review_count", "reviewed_candidate_count", "minimum_required_candidate_count",
+            "complete_candidate_count", "successful_review_count", "selected_candidate_index"))
+        and
         selection.get("release_policy") == policy
         and render.get("release_policy") == policy
         and selection.get("candidate_pool") == REVIEW_FIRST_CANDIDATE_POOL
@@ -96,9 +143,11 @@ def review_first_release_binding_valid(
         and selection.get("exact_complete_candidate_count_satisfied") is True
         and selection.get("exact_successful_decoded_review_count_satisfied") is True
         and candidate is not None
+        and type(candidate.get("candidate_index")) is int
         and candidate.get("candidate_index") == 0
         and candidate.get("selected") is True
         and complete is not None
+        and type(complete.get("candidate_index")) is int
         and complete.get("candidate_index") == 0
         and selection.get("selected_candidate_index") == 0
         and selection.get("final_selected_version") == "original"
@@ -112,4 +161,5 @@ __all__ = [
     "REVIEW_FIRST_RELEASE_CANDIDATE_COUNT",
     "review_first_release_binding_valid",
     "review_first_release_policy_payload",
+    "build_review_first_selection_payload",
 ]

@@ -31,15 +31,21 @@ from crosscut.post_render_qa import (
     PostRenderQAConfig,
     PostRenderQAReport,
     PostRenderQAVerdict,
-    _cadence_and_repetition_metrics,
     _IssueCollector,
+    _boundary_render_plan_from_serialized,
+    _cadence_and_repetition_metrics,
     _selected_boundary_repair_contracts,
     _sync_quality_metrics,
     _transform_metrics,
     _validate_selection,
     _validate_plan_invariants,
+    cleanup_post_render_qa_snapshot,
     discover_completed_artifact_sets,
     evaluate_post_render_qa,
+    materialize_post_render_qa_snapshot,
+)
+from crosscut.group_boundary_grammar_adapter import (
+    adapt_group_boundary_grammar_evidence,
 )
 from crosscut.ive_product_quality_floor import (
     APP_RESULT_EXPOSURE_CONTRACT,
@@ -48,15 +54,25 @@ from crosscut.pipeline import _source_index_mapping
 from crosscut.professional_montage_grammar import (
     PROFILE_ANALYSIS_BASIS as MONTAGE_PROFILE_ANALYSIS_BASIS,
     PROFILE_SCHEMA_VERSION as MONTAGE_PROFILE_SCHEMA_VERSION,
+    EditorialTransformEvidence,
+    IntroducedBoundaryContinuityEvidence,
+    MontageSectionWindow,
+    ProfessionalBoundaryGrammarEvidence,
+    assess_professional_boundary_grammar,
 )
 from crosscut.rendered_montage_grammar_review import (
     RenderedMontageGrammarConfig,
     review_rendered_montage_grammar,
 )
 from crosscut.render import (
+    DIRECT_MEMBER_POSE_DISSOLVE_REASON,
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
     RenderPlan,
     RenderSegment,
     RenderTransition,
+    TransitionKind,
     segment_frame_counts,
 )
 from crosscut.rendered_proxy_review import (
@@ -491,6 +507,7 @@ def _promote_review_to_domain_aware_v3(
             "schema_version": 3,
             "analysis": "decoded_output_proxy_domain_aware_quality_review_v3",
             "introduced_cross_source_count": len(boundaries),
+            "introduced_cross_source_boundary_issue_indices": [],
             "tier_d_continuity_count": 0,
             "native_source_cut_count": 0,
             "boundary_domains": {
@@ -504,10 +521,17 @@ def _promote_review_to_domain_aware_v3(
                     "score": {
                         "distribution": {
                             "count": len(boundaries),
+                            "minimum": 82.0,
                             "p10": 82.0,
+                            "median": 82.0,
+                            "p90": 82.0,
+                            "maximum": 82.0,
                         },
                         "p10": 82.0,
                     },
+                    "pass_policy": (
+                        "editorial_boundary_p10_and_issue_fraction_gate"
+                    ),
                     "passed": True,
                 },
                 "tier_d_continuity": {
@@ -517,7 +541,18 @@ def _promote_review_to_domain_aware_v3(
                     "issue_count": 0,
                     "issue_fraction": 0.0,
                     "issue_indices": [],
-                    "score": {"distribution": {"count": 0}, "p10": None},
+                    "score": {
+                        "distribution": {
+                            "count": 0,
+                            "minimum": None,
+                            "p10": None,
+                            "median": None,
+                            "p90": None,
+                            "maximum": None,
+                        },
+                        "p10": 100.0,
+                    },
+                    "pass_policy": "zero_technical_integrity_issues",
                     "passed": True,
                 },
                 "native_source_cut": {
@@ -527,7 +562,18 @@ def _promote_review_to_domain_aware_v3(
                     "issue_count": 0,
                     "issue_fraction": 0.0,
                     "issue_indices": [],
-                    "score": {"distribution": {"count": 0}, "p10": None},
+                    "score": {
+                        "distribution": {
+                            "count": 0,
+                            "minimum": None,
+                            "p10": None,
+                            "median": None,
+                            "p90": None,
+                            "maximum": None,
+                        },
+                        "p10": 100.0,
+                    },
+                    "pass_policy": "zero_technical_integrity_issues",
                     "passed": True,
                 },
             },
@@ -708,7 +754,7 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
         "sources": [str(source_path) for source_path in source_paths],
         "segments": segments,
         "reference_source": 0,
-        "aspect_ratio": "landscape",
+        "aspect_ratio": AspectRatio.LANDSCAPE.value,
         "output": str(artifacts.video_path),
         "master_audio_start": 0.0,
         "width": 1920,
@@ -1113,11 +1159,160 @@ def _install_valid_registered_montage_evidence(
                 "source_local_end": plan["segments"][index][
                     "source_local_end"
                 ],
+                "internal_scene_cut_master_seconds": [],
                 "detected_person_counts": [6, 6, 6],
                 "formation_person_counts": [6, 6, 6],
                 "formation_upper_body_counts": [6, 6, 6],
             }
         )
+    # The independent professional-boundary QA must be able to derive every
+    # evidence field from its original authorities.  Keep this registered
+    # fixture small, but give it one genuinely visible output-frame transform
+    # rather than a hand-authored evidence count.
+    transform_keyframes = [
+        {
+            "time_seconds": 0.0,
+            "zoom": 1.0,
+            "center_x": 0.5,
+            "center_y": 0.5,
+            "roll_degrees": 0.0,
+        },
+        {
+            "time_seconds": 0.75,
+            "zoom": 1.04,
+            "center_x": 0.5,
+            "center_y": 0.5,
+            "roll_degrees": 0.0,
+        },
+    ]
+    transform_reasons = {
+        0: "reference_calibrated_same_source_interior_zoom_pulse",
+        3: "reference_calibrated_push_in",
+        6: "reference_calibrated_pull_out",
+    }
+    for segment_index, reason in transform_reasons.items():
+        plan["segments"][segment_index]["editorial_transform"] = {
+            "keyframes": deepcopy(transform_keyframes),
+            "reason": reason,
+        }
+    motion_segments = []
+    for index, segment in enumerate(plan["segments"]):
+        applied = index in transform_reasons
+        motion_segments.append(
+            {
+                "segment_index": index,
+                "source_index": segment["source_index"],
+                "applied": applied,
+                "reasons": (
+                    [transform_reasons[index]] if applied else []
+                ),
+                "keyframes": (
+                    deepcopy(transform_keyframes) if applied else []
+                ),
+            }
+        )
+    analysis["editorial_motion"] = {
+        "analysis_basis": "fixture_output_frame_visible_motion_v2",
+        "applied_segment_count": 3,
+        "boundary_match_count": 0,
+        "affine_boundary_match_count": 0,
+        "zoom_event_count": 3,
+        "pan_event_count": 0,
+        "roll_event_count": 0,
+        "interior_zoom_pulse_count": 1,
+        "section_directed": True,
+        "blocked_dissolve_segment_count": 0,
+        "skipped_boundary_reasons": [],
+        "segments": motion_segments,
+    }
+    source_scene_frames: list[list[int]] = [
+        [] for _source in plan["sources"]
+    ]
+    for index, (choice, segment) in enumerate(
+        zip(choices, plan["segments"], strict=True)
+    ):
+        offsets = (1.0, 2.0) if index < 6 else (1.5,)
+        source_frames = [
+            int(round((segment["source_start"] + offset) * _FPS))
+            for offset in offsets
+        ]
+        source_scene_frames[segment["source_index"]].extend(source_frames)
+        choice["internal_scene_cut_master_seconds"] = [
+            segment["master_start"]
+            + frame_index / _FPS
+            - segment["source_start"]
+            for frame_index in source_frames
+        ]
+    analysis["scene_analysis"] = []
+    for source_index, source in enumerate(plan["sources"]):
+        frames = sorted(source_scene_frames[source_index])
+        analysis["scene_analysis"].append(
+            {
+                "index_domain": "request_source_index",
+                "source_index": source_index,
+                "source": source,
+                "frame_rate": _FPS,
+                "changes": [
+                    {
+                        "frame_index": frame_index,
+                        "timestamp_seconds": frame_index / _FPS,
+                    }
+                    for frame_index in frames
+                ],
+            }
+        )
+    request_payload = analysis.get("request")
+    automatic_ive_product_fixture = bool(
+        isinstance(request_payload, dict)
+        and str(request_payload.get("group") or "").strip().upper() == "IVE"
+        and str(request_payload.get("edit_mode") or "").strip().lower()
+        == "group"
+        and str(request_payload.get("source_mode") or "").strip().lower()
+        == "automatic"
+    )
+    base_section = deepcopy(analysis["section_plan"]["sections"][0])
+
+    def fixture_section(
+        section_index: int,
+        role: str,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> dict[str, object]:
+        item = deepcopy(base_section)
+        item.update(
+            {
+                "section_index": section_index,
+                "role": role,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "duration_seconds": end_seconds - start_seconds,
+                "target_source_switches_per_minute": (
+                    20.0 if role == "chorus_like" else 15.0
+                ),
+                "camera_motion_budget": 0.2,
+                "establish_with_wide_shot": section_index == 0,
+            }
+        )
+        return item
+
+    if automatic_ive_product_fixture:
+        fixture_sections = [
+            fixture_section(0, "verse_like", 0.0, 2.5),
+            fixture_section(1, "chorus_like", 2.5, 5.5),
+            fixture_section(2, "verse_like", 5.5, _DURATION),
+        ]
+    else:
+        fixture_sections = [
+            fixture_section(0, "verse_like", 0.0, _DURATION)
+        ]
+    analysis["section_plan"].update(
+        {
+            "start_seconds": 0.0,
+            "end_seconds": _DURATION,
+            "section_count": len(fixture_sections),
+            "sections": fixture_sections,
+        }
+    )
     analysis["stage_edit_exact_shot_clock"] = {
         "contract": (
             "serialized_inference_token_section_and_phrase_progress_"
@@ -1128,8 +1323,21 @@ def _install_valid_registered_montage_evidence(
             {
                 "shot_index": index,
                 "source_index": choice["source_index"],
-                "section_role": "chorus_like",
-                "section_progress": index / max(1, len(choices) - 1),
+                "section_role": (
+                    "chorus_like"
+                    if automatic_ive_product_fixture and index == 1
+                    else "verse_like"
+                ),
+                "section_progress": (
+                    (choice["canonical_master_start"] - 2.5) / 3.0
+                    if automatic_ive_product_fixture and index == 1
+                    else choice["canonical_master_start"] / _DURATION
+                    if not automatic_ive_product_fixture or index == 0
+                    else (
+                        choice["canonical_master_start"] - 5.5
+                    )
+                    / (_DURATION - 5.5)
+                ),
                 # Phrase entries at shots 0, 3 and 6 are all wide in this
                 # production fixture.
                 "phrase_progress": (index % 3) / 3.0,
@@ -1174,14 +1382,7 @@ def _install_valid_registered_montage_evidence(
             "transitions": deepcopy(plan["transitions"])
         }
         _promote_review_to_domain_aware_v3(candidate["review"], plan)
-    request = analysis.get("request")
-    if (
-        isinstance(request, dict)
-        and str(request.get("group") or "").strip().upper() == "IVE"
-        and str(request.get("edit_mode") or "").strip().lower() == "group"
-        and str(request.get("source_mode") or "").strip().lower()
-        == "automatic"
-    ):
+    if automatic_ive_product_fixture:
         _attach_valid_segment_interior_geometry(analysis, plan, selection)
     analysis["rendered_proxy_review"] = deepcopy(
         selection["final_selected_review"]
@@ -1190,6 +1391,97 @@ def _install_valid_registered_montage_evidence(
         analysis,
         render_plan=plan,
         config=_MONTAGE_TEST_CONFIG,
+    )
+    canonical_plan_sha256 = hashlib.sha256(
+        json.dumps(
+            plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    typed_plan = RenderPlan(
+        sources=tuple(Path(source) for source in plan["sources"]),
+        segments=tuple(
+            RenderSegment(
+                source_index=segment["source_index"],
+                source_start=segment["source_start"],
+                duration=segment["duration"],
+                master_start=segment["master_start"],
+                source_duration=segment["source_duration"],
+                editorial_transform=(
+                    EditorialTransformTrack(
+                        keyframes=tuple(
+                            EditorialTransformKeyframe(**keyframe)
+                            for keyframe in segment[
+                                "editorial_transform"
+                            ]["keyframes"]
+                        ),
+                        reason=segment["editorial_transform"]["reason"],
+                    )
+                    if segment["editorial_transform"] is not None
+                    else None
+                ),
+            )
+            for segment in plan["segments"]
+        ),
+        reference_source=plan["reference_source"],
+        aspect_ratio=AspectRatio.LANDSCAPE,
+        output=Path(plan["output"]),
+        master_audio_start=plan["master_audio_start"],
+        width=plan["width"],
+        height=plan["height"],
+        fps=plan["fps"],
+        transitions=tuple(
+            RenderTransition(
+                kind=transition["kind"],
+                frame_count=transition["frame_count"],
+                reason=transition["reason"],
+                face_mismatch=transition["face_mismatch"],
+                tier=transition["tier"],
+                appearance_min_cosine_similarity=transition[
+                    "appearance_min_cosine_similarity"
+                ],
+                future_pose_max_mismatch=transition[
+                    "future_pose_max_mismatch"
+                ],
+                future_silhouette_max_mismatch=transition[
+                    "future_silhouette_max_mismatch"
+                ],
+            )
+            for transition in plan["transitions"]
+        ),
+    )
+    boundary_evidence = adapt_group_boundary_grammar_evidence(
+        performance_id=f"ive-group-{canonical_plan_sha256[:20]}",
+        render_plan=typed_plan,
+        source_index_mapping=analysis["source_index_mapping"],
+        selected_timeline=analysis["visual_timeline"],
+        source_scene_cut_times=tuple(
+            tuple(frame_index / _FPS for frame_index in frames)
+            for frames in source_scene_frames
+        ),
+        timeline_review=analysis["timeline_review"],
+        section_plan=analysis["section_plan"],
+        rendered_proxy_review=analysis["rendered_proxy_review"],
+        editorial_motion=analysis["editorial_motion"],
+    )
+    boundary_assessment = assess_professional_boundary_grammar(
+        boundary_evidence
+    )
+    assert boundary_assessment.passed
+    review["professional_boundary_grammar_evidence"] = (
+        boundary_evidence.to_dict()
+    )
+    review["professional_boundary_grammar_assessment"] = (
+        boundary_assessment.to_dict()
+    )
+    review["passed_before_professional_boundary_grammar"] = bool(
+        review.get("passed") is True
+    )
+    review["passed"] = bool(
+        review.get("passed") is True and boundary_assessment.passed
     )
     review["reference_profile"] = {
         **profile_identity,
@@ -1214,6 +1506,19 @@ def _attach_valid_segment_interior_geometry(
                 duration=segment["duration"],
                 master_start=segment["master_start"],
                 source_duration=segment["source_duration"],
+                editorial_transform=(
+                    EditorialTransformTrack(
+                        keyframes=tuple(
+                            EditorialTransformKeyframe(**keyframe)
+                            for keyframe in segment[
+                                "editorial_transform"
+                            ]["keyframes"]
+                        ),
+                        reason=segment["editorial_transform"]["reason"],
+                    )
+                    if segment["editorial_transform"] is not None
+                    else None
+                ),
             )
             for segment in plan["segments"]
         ),
@@ -1290,6 +1595,15 @@ def _activate_registered_cut_local_sync(
     residual_frames: float = 0.10,
     unknown_boundary_index: int | None = None,
 ) -> None:
+    # Install the final montage plan before hashing cut-local evidence.  The
+    # production contract binds the delivered plan, never a pre-transform
+    # fixture that is mutated after its proof is serialized.
+    analysis["stage_edit_generation"] = {
+        "activation": {
+            "activation": "automatic_registered_production_bundle",
+        }
+    }
+    _install_valid_registered_montage_evidence(analysis, plan, selection)
     plan["source_index_domains"] = {
         "sources[]": "render_plan_sources_array_index",
         "reference_source": "render_plan_sources_array_index",
@@ -1451,6 +1765,8 @@ def _activate_registered_cut_local_sync(
                     },
                     "outgoing_motion_sample_count": 14,
                     "incoming_motion_sample_count": 14,
+                    "measurement_mode": "correlated_motion_phase_v1",
+                    "measurement_lag_frames": 0,
                     "best_lag_frames": 0,
                     "subframe_peak_offset_frames": 0.0,
                     "actual_pts_phase_frames": residual_frames,
@@ -1485,10 +1801,8 @@ def _activate_registered_cut_local_sync(
         and p95 is not None
         and p95 <= 0.5
     )
-    analysis["stage_edit_generation"] = {
-        "activation": {
-            "activation": "automatic_registered_production_bundle",
-        }
+    analysis["stage_edit_generation"]["activation"] = {
+        "activation": "automatic_registered_production_bundle",
     }
     selection["stage_edit_render_promotion"] = {
         "activation": "automatic_registered_production_bundle",
@@ -1557,7 +1871,6 @@ def _activate_registered_cut_local_sync(
     }
     payload["proof_sha256"] = _canonical_sha256(payload)
     analysis["render"]["cut_local_sync"] = payload
-    _install_valid_registered_montage_evidence(analysis, plan, selection)
 
 
 class _FakeRunner:
@@ -1609,6 +1922,60 @@ class PostRenderQATests(unittest.TestCase):
         )
         self._perceptual_patcher.start()
         self.addCleanup(self._perceptual_patcher.stop)
+
+    def test_serialized_plan_replay_preserves_verified_transform_overlap_authority(
+        self,
+    ) -> None:
+        incoming = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.02),
+                EditorialTransformKeyframe(0.2, 1.06),
+                EditorialTransformKeyframe(1.0, 1.06),
+            ),
+            reason="decoded_output_face_match",
+        )
+        plan = RenderPlan(
+            sources=(Path("zero.mp4"), Path("one.mp4")),
+            segments=(
+                RenderSegment(0, 0.0, 1.0, 0.0),
+                RenderSegment(
+                    1,
+                    1.0,
+                    1.0,
+                    1.0,
+                    editorial_transform=incoming,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(
+                    TransitionKind.FACE_DISSOLVE,
+                    7,
+                    DIRECT_MEMBER_POSE_DISSOLVE_REASON,
+                    tier="A",
+                    transform_overlap_authority=(
+                        MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
+                    ),
+                ),
+            ),
+            member_pose_dissolve_requested=True,
+            member_pose_dissolve_effective=True,
+            member_pose_dissolve_count=1,
+        )
+
+        serialized = json.loads(
+            json.dumps(plan.to_json(), allow_nan=False)
+        )
+        rebuilt = _boundary_render_plan_from_serialized(serialized)
+
+        self.assertEqual(
+            rebuilt.transitions[0].transform_overlap_authority,
+            MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
+        )
+        self.assertEqual(rebuilt.member_pose_dissolve_count, 1)
 
     def test_automatic_ive_whole_song_band_accepts_profile_preferred_cadence(
         self,
@@ -1684,6 +2051,54 @@ class PostRenderQATests(unittest.TestCase):
             discovered = discover_completed_artifact_sets(root)
 
         self.assertEqual(discovered, (complete,))
+
+    def test_snapshot_reads_use_declared_paths_for_artifact_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory)
+            )
+            snapshot = materialize_post_render_qa_snapshot(artifacts)
+            try:
+                report = evaluate_post_render_qa(
+                    snapshot.artifact_set,
+                    declared_artifact_set=artifacts,
+                    runner=_FakeRunner(),
+                )
+            finally:
+                cleanup_post_render_qa_snapshot(snapshot)
+
+        self.assertTrue(
+            all(report.metrics["artifact_binding"]["checks"].values())
+        )
+        self.assertNotIn(
+            "artifact_binding_analysis_video_path_matches",
+            {issue.code for issue in report.issues},
+        )
+
+    def test_snapshot_cleanup_tolerates_vanishing_appledouble_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory)
+            )
+            snapshot = materialize_post_render_qa_snapshot(artifacts)
+            transient = snapshot.directory / "._transient"
+            transient.write_bytes(b"appledouble")
+            original_lstat = Path.lstat
+            vanished = False
+
+            def racing_lstat(path: Path):
+                nonlocal vanished
+                if path == transient and not vanished:
+                    vanished = True
+                    transient.unlink(missing_ok=True)
+                    raise FileNotFoundError(transient)
+                return original_lstat(path)
+
+            with patch("pathlib.Path.lstat", new=racing_lstat):
+                cleanup_post_render_qa_snapshot(snapshot)
+
+            self.assertTrue(vanished)
+            self.assertFalse(snapshot.directory.exists())
 
     def test_relative_declaration_cannot_escape_timestamp_set_directory(self) -> None:
         def mutate(_analysis: dict, plan: dict, _selection: dict) -> None:
@@ -2157,6 +2572,18 @@ class PostRenderQATests(unittest.TestCase):
         self.assertTrue(montage["passed"])
         self.assertTrue(montage["configuration_matches"])
         self.assertTrue(montage["reference_profile_identity_matches"])
+        self.assertTrue(montage["professional_boundary_evidence_valid"])
+        self.assertTrue(
+            montage[
+                "professional_boundary_assessment_matches_recomputation"
+            ]
+        )
+        self.assertTrue(
+            montage["professional_boundary_render_plan_binding_matches"]
+        )
+        self.assertTrue(
+            montage["professional_boundary_legacy_pass_binding_matches"]
+        )
         self.assertNotEqual(
             montage["generation_reference_profile"]["path"],
             montage["persisted_reference_profile"]["path"],
@@ -2197,7 +2624,7 @@ class PostRenderQATests(unittest.TestCase):
             )
         )
 
-    def test_explicit_automatic_ive_group_still_requires_product_montage_floor(
+    def test_explicit_automatic_ive_group_rejects_underqualified_synthetic_highlight(
         self,
     ) -> None:
         def mutate(analysis: dict, plan: dict, selection: dict) -> None:
@@ -2245,28 +2672,23 @@ class PostRenderQATests(unittest.TestCase):
                 runner=_FakeRunner(),
             )
 
-        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
         montage = report.metrics["rendered_montage_grammar"]
         product = report.metrics["ive_product_quality_floor"]
         self.assertTrue(montage["ive_product_scope_required"])
-        self.assertTrue(montage["passed"])
+        self.assertFalse(montage["passed"])
         self.assertTrue(product["required"])
-        self.assertTrue(product["passed"])
+        self.assertFalse(product["passed"])
         self.assertEqual(
             product["evaluation_mode"],
             "modern_role_conditioned_profile_gate",
         )
-        self.assertTrue(
-            product["metrics"]["whole_song_i_am_absolute_floor"]["passed"]
-        )
-        self.assertGreaterEqual(
-            product["metrics"]["whole_song_i_am_absolute_floor"][
-                "close_duration_fraction"
-            ],
-            product["baseline"]["thresholds"]["close_duration_fraction"],
-        )
         self.assertFalse(
             product["metrics"]["legacy_whole_song_fallback_applied"]
+        )
+        self.assertIn(
+            "modern_role_conditioned_montage_review_failed",
+            product["failure_codes"],
         )
 
     def test_explicit_new_ive_generation_missing_role_evidence_fails_not_legacy(
@@ -2365,6 +2787,11 @@ class PostRenderQATests(unittest.TestCase):
                         "exit_shot_type": "wide",
                     }
                 )
+            analysis["section_plan"]["sections"][0]["role"] = (
+                "chorus_like"
+            )
+            for shot in analysis["stage_edit_exact_shot_clock"]["shots"]:
+                shot["section_role"] = "chorus_like"
 
         with tempfile.TemporaryDirectory() as directory:
             artifacts, _analysis, _plan, _selection = _persist_fixture(
@@ -2415,6 +2842,217 @@ class PostRenderQATests(unittest.TestCase):
         )
         self.assertIn(
             "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_missing_professional_boundary_evidence_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["rendered_montage_grammar_review"].pop(
+                "professional_boundary_grammar_evidence"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertFalse(montage["professional_boundary_evidence_valid"])
+        self.assertIn(
+            "production_professional_boundary_grammar_evidence_missing_or_invalid",
+            codes,
+        )
+
+    def test_registered_stage_edit_professional_boundary_assessment_tamper_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["rendered_montage_grammar_review"][
+                "professional_boundary_grammar_assessment"
+            ]["passed"] = False
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertFalse(
+            montage[
+                "professional_boundary_assessment_matches_recomputation"
+            ]
+        )
+        self.assertIn(
+            "production_professional_boundary_grammar_assessment_mismatch",
+            codes,
+        )
+
+    def test_registered_stage_edit_professional_boundary_plan_identity_tamper_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            review = analysis["rendered_montage_grammar_review"]
+            original = ProfessionalBoundaryGrammarEvidence.from_mapping(
+                review["professional_boundary_grammar_evidence"]
+            )
+            tampered = ProfessionalBoundaryGrammarEvidence(
+                performance_id=f"{original.performance_id}-tampered",
+                duration_seconds=original.duration_seconds,
+                source_switch_times_seconds=(
+                    original.source_switch_times_seconds
+                ),
+                native_internal_cut_times_seconds=(
+                    original.native_internal_cut_times_seconds
+                ),
+                sections=original.sections,
+                introduced_boundary_continuity=(
+                    original.introduced_boundary_continuity
+                ),
+                editorial_transforms=original.editorial_transforms,
+            )
+            review["professional_boundary_grammar_evidence"] = (
+                tampered.to_dict()
+            )
+            review["professional_boundary_grammar_assessment"] = (
+                assess_professional_boundary_grammar(tampered).to_dict()
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertFalse(
+            montage["professional_boundary_render_plan_binding_matches"]
+        )
+        self.assertIn(
+            "production_professional_boundary_grammar_render_plan_binding_mismatch",
+            codes,
+        )
+
+    def test_registered_stage_edit_self_hashed_transform_evidence_tamper_fails_authority_reconstruction(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            review = analysis["rendered_montage_grammar_review"]
+            original = ProfessionalBoundaryGrammarEvidence.from_mapping(
+                review["professional_boundary_grammar_evidence"]
+            )
+            transform = original.editorial_transforms
+            tampered = ProfessionalBoundaryGrammarEvidence(
+                performance_id=original.performance_id,
+                duration_seconds=original.duration_seconds,
+                source_switch_times_seconds=(
+                    original.source_switch_times_seconds
+                ),
+                native_internal_cut_times_seconds=(
+                    original.native_internal_cut_times_seconds
+                ),
+                sections=original.sections,
+                introduced_boundary_continuity=(
+                    original.introduced_boundary_continuity
+                ),
+                editorial_transforms=EditorialTransformEvidence(
+                    segment_count=transform.segment_count,
+                    applied_segment_count=2,
+                    zoom_event_times_seconds=(
+                        transform.zoom_event_times_seconds
+                    ),
+                    pan_event_times_seconds=transform.pan_event_times_seconds,
+                    roll_event_times_seconds=(
+                        transform.roll_event_times_seconds
+                    ),
+                ),
+            )
+            # Re-hash both evidence and assessment exactly as a self-consistent
+            # producer would.  Independent QA must still reject it because the
+            # final typed RenderPlan has three output-visible motion segments.
+            review["professional_boundary_grammar_evidence"] = (
+                tampered.to_dict()
+            )
+            review["professional_boundary_grammar_assessment"] = (
+                assess_professional_boundary_grammar(tampered).to_dict()
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertTrue(montage["professional_boundary_evidence_valid"])
+        self.assertFalse(
+            montage[
+                "professional_boundary_authority_reconstruction_matches"
+            ]
+        )
+        self.assertIn(
+            "production_professional_boundary_grammar_authority_reconstruction_mismatch",
+            codes,
+        )
+
+    def test_registered_stage_edit_professional_boundary_legacy_pass_tamper_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["rendered_montage_grammar_review"][
+                "passed_before_professional_boundary_grammar"
+            ] = False
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertFalse(
+            montage["professional_boundary_legacy_pass_binding_matches"]
+        )
+        self.assertIn(
+            "production_professional_boundary_grammar_legacy_pass_binding_mismatch",
             codes,
         )
 
@@ -2823,6 +3461,94 @@ class PostRenderQATests(unittest.TestCase):
                 issue.code
                 == "plan_invariant_renderer_owned_transition_authority_exact"
                 for issue in tampered.issues
+            )
+        )
+
+    def test_member_direct_plan_requires_every_eligible_fancam(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _artifacts, analysis, plan, selection = _fixture_payloads(
+                Path(directory)
+            )
+        used = list(range(8))
+        analysis["alignment_eligibility"] = [
+            {
+                "index_domain": "request_source_index",
+                "source_index": source_index,
+                "render_eligible": True,
+            }
+            for source_index in used
+        ]
+        analysis["member_direct_full_frame"] = {
+            "enabled": True,
+            "eligible_request_source_indices": used,
+            "minimum_required_distinct_source_count": len(used),
+            "required_used_request_source_indices": used,
+            "final_source_usage": deepcopy(plan["source_usage"]),
+        }
+
+        clean = _IssueCollector()
+        metrics = _validate_plan_invariants(
+            analysis,
+            plan,
+            selection["final_selected_review"],
+            clean,
+        )
+
+        self.assertTrue(
+            metrics["checks"]["member_direct_all_eligible_sources_used"]
+        )
+        self.assertFalse(
+            any(
+                issue.code
+                == "plan_invariant_member_direct_all_eligible_sources_used"
+                for issue in clean.issues
+            )
+        )
+
+        analysis["member_direct_full_frame"][
+            "required_used_request_source_indices"
+        ] = used[:-1]
+        tampered = _IssueCollector()
+        metrics = _validate_plan_invariants(
+            analysis,
+            plan,
+            selection["final_selected_review"],
+            tampered,
+        )
+
+        self.assertFalse(
+            metrics["checks"]["member_direct_all_eligible_sources_used"]
+        )
+        self.assertTrue(
+            any(
+                issue.code
+                == "plan_invariant_member_direct_all_eligible_sources_used"
+                for issue in tampered.issues
+            )
+        )
+
+        analysis["request"] = {
+            "group": "IVE",
+            "source_mode": "automatic",
+            "edit_mode": "member",
+        }
+        analysis["render"] = {"direct_full_frame": True}
+        del analysis["member_direct_full_frame"]
+        missing_block = _IssueCollector()
+        metrics = _validate_plan_invariants(
+            analysis,
+            plan,
+            selection["final_selected_review"],
+            missing_block,
+        )
+        self.assertFalse(
+            metrics["checks"]["member_direct_all_eligible_sources_used"]
+        )
+        self.assertTrue(
+            any(
+                issue.code
+                == "plan_invariant_member_direct_all_eligible_sources_used"
+                for issue in missing_block.issues
             )
         )
 

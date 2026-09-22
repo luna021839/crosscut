@@ -55,10 +55,10 @@ def enforce_review_first_deadline(
 ) -> Iterator[None]:
     """Interrupt a synchronous review-first workflow at one absolute deadline.
 
-    On the POSIX main thread this uses a process alarm, so a stalled acquisition,
-    model call, callback, or subprocess wait cannot silently turn the nominal
-    budget into an advisory value.  Other environments retain fail-closed
-    before/after checks.
+    POSIX main-thread alarms interrupt Python execution and interruptible
+    waits. Native extensions may defer a signal indefinitely; the CLI's
+    independent workflow supervisor supplies the actual process-level ceiling.
+    Other environments here have before/after checks, not a hard native limit.
     """
 
     if absolute_deadline_monotonic_seconds is None:
@@ -228,6 +228,21 @@ _MEMBER_EDITORIAL_CODES = frozenset(
         "member_rendered_continuity_not_pass",
     }
 )
+_MEMBER_CONTINUITY_EDITORIAL_REASONS = frozenset({
+    "no_rendered_source_switch_boundaries",
+    "rendered_actual_pose_coverage_below_floor", "rendered_attention_coverage_below_floor",
+    "rendered_focal_reference_coverage_below_floor",
+    "rendered_attention_position_p95_above_floor", "rendered_attention_scale_p95_above_floor",
+    "rendered_pose_p95_above_floor", "rendered_silhouette_p95_above_floor",
+    "rendered_boundary_attention_missing", "rendered_boundary_shape_evidence_missing",
+    "rendered_boundary_position_discontinuity", "rendered_boundary_scale_discontinuity",
+    "rendered_boundary_pose_discontinuity", "rendered_boundary_silhouette_discontinuity",
+    "rendered_boundary_motion_direction_opposed", "rendered_boundary_motion_speed_discontinuity",
+    "rendered_boundary_pose_phase_discontinuity", "rendered_effect_endpoint_attention_missing",
+    "rendered_effect_endpoint_shape_evidence_missing", "rendered_effect_endpoint_position_discontinuity",
+    "rendered_effect_endpoint_scale_discontinuity", "rendered_effect_endpoint_pose_discontinuity",
+    "rendered_effect_endpoint_silhouette_discontinuity",
+})
 
 
 def _issue_codes(
@@ -265,36 +280,58 @@ def _member_editorial_evidence_valid(
         return False
     if code == "member_look_calibration_predicted_quality_not_pass":
         look = _mapping(metrics.get("member_look_calibration"))
+        provenance = tuple(
+            look[name]
+            for name in ("provenance_valid", "cache_only_provenance_valid")
+            if look is not None and name in look
+        )
         return bool(
             look is not None
             and look.get("locations_bound") is True
-            and look.get("provenance_valid") is True
+            and provenance
+            and all(value is True for value in provenance)
             and look.get("segment_binding_valid") is True
+            and look.get("predicted_evidence_valid") is True
             and look.get("predicted_quality_valid") is False
         )
     if code == "member_rendered_continuity_not_pass":
         continuity = _mapping(metrics.get("rendered_continuity"))
+        measurements = _mapping(continuity.get("metrics")) if continuity is not None else None
+        reasons = continuity.get("failure_reasons") if continuity is not None else None
         return bool(
             continuity is not None
             and continuity.get("schema_version") == 1
-            and isinstance(continuity.get("analysis"), str)
+            and continuity.get("analysis") == "automatic_member_exact_rendered_boundary_continuity_v1"
             and continuity.get("passed") is False
-            and isinstance(continuity.get("failure_reasons"), list)
+            and isinstance(reasons, list) and reasons
+            and all(isinstance(reason, str) and reason in _MEMBER_CONTINUITY_EDITORIAL_REASONS for reason in reasons)
             and isinstance(continuity.get("failure_boundary_indices"), Mapping)
-            and isinstance(continuity.get("metrics"), Mapping)
+            and measurements is not None
+            and type(measurements.get("output_frame_count")) is int
+            and measurements["output_frame_count"] > 0
+            and measurements.get("exact_incoming_first_frame_evaluated") is True
+            and measurements.get("final_render_transform_domain_evaluated") is True
             and isinstance(continuity.get("boundaries"), list)
         )
     if code == "member_perceptual_quality_not_pass":
         perceptual = _mapping(metrics.get("perceptual_quality"))
+        measurements = _mapping(perceptual.get("metrics")) if perceptual is not None else None
+        video = _mapping(measurements.get("video")) if measurements is not None else None
+        nested_codes, malformed = _issue_codes(perceptual) if perceptual is not None else ((), ("missing",))
         return bool(
             perceptual is not None
             and perceptual.get("schema_version") == 2
-            and isinstance(perceptual.get("analysis"), str)
+            and perceptual.get("analysis") == "full_final_decode_temporal_pumping_exact_source_retention_and_structure_binding_v2"
             and perceptual.get("verdict") in {"CONDITIONAL", "FAIL"}
             and perceptual.get("passed") is False
             and isinstance(perceptual.get("issues"), list)
             and bool(perceptual.get("issues"))
-            and isinstance(perceptual.get("metrics"), Mapping)
+            and nested_codes and not malformed
+            and all(nested_code in _GROUP_EDITORIAL_CODES and nested_code.startswith("perceptual_") for nested_code in nested_codes)
+            and video is not None and video.get("full_frame_coverage") is True
+            and video.get("dimensions_match_plan") is True and video.get("fps_matches_plan") is True
+            and type(video.get("decoded_frame_count")) is int and video["decoded_frame_count"] > 0
+            and video["decoded_frame_count"] == video.get("expected_frame_count")
         )
     return False
 
@@ -322,6 +359,42 @@ class ReviewFirstQADisposition:
         }
 
 
+def artifact_disposition_payload_valid(payload: object, *, role: str) -> bool:
+    """Shared Python/native wire contract; a status label alone grants nothing."""
+    if not isinstance(payload, Mapping):
+        return False
+    technical, editorial = payload.get("technical_issue_codes"), payload.get("editorial_issue_codes")
+    if (payload.get("contract") != REVIEW_FIRST_RUNTIME_CONTRACT
+            or payload.get("artifact_role") != role
+            or payload.get("video_output_exposed") is not True
+            or not isinstance(technical, list) or technical
+            or not isinstance(editorial, list)
+            or any(not isinstance(code, str) or not code.strip() for code in editorial)):
+        return False
+    if role == "delivery":
+        return (payload.get("status") == "APPROVED"
+                and payload.get("delivery_completion_message_allowed") is True and not editorial)
+    if role == "review_ready":
+        return (payload.get("status") == "REVIEW_READY"
+                and payload.get("delivery_completion_message_allowed") is False and bool(editorial))
+    return False
+
+
+def finalize_review_first_runtime_payload(payload: object, status: ReviewFirstStatus) -> None:
+    """Record end-to-end elapsed time, including mandatory final QA."""
+    if not isinstance(payload, dict):
+        return
+    payload["status"] = status.value
+    deadline = payload.get("absolute_deadline_monotonic_seconds")
+    budgets = payload.get("editorial_search_budget_seconds")
+    total = budgets.get("absolute_search_ceiling") if isinstance(budgets, Mapping) else None
+    if isinstance(deadline, (int, float)) and isinstance(total, (int, float)):
+        now = monotonic()
+        payload["elapsed_seconds"] = max(0.0, now - (deadline - total))
+        payload["remaining_total_seconds"] = max(0.0, deadline - now)
+        payload["elapsed_includes_final_qa"] = True
+
+
 def classify_review_first_qa(
     report_payload: Mapping[str, Any],
     *,
@@ -341,6 +414,8 @@ def classify_review_first_qa(
         for value in (content_binding_passed, review_first_enabled, member)
     ):
         raise TypeError("review-first QA flags must be booleans")
+    if not isinstance(report_payload, Mapping):
+        report_payload = {}
     codes, malformed_codes = _issue_codes(report_payload)
     passed_value = report_payload.get("passed")
     passed_contract_valid = isinstance(passed_value, bool)

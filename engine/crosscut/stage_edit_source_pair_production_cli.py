@@ -50,10 +50,16 @@ def _snapshot_map(values: Sequence[str]) -> dict[str, StageEditFeatureSnapshot]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError(f"feature snapshot root must be an object: {path}")
-        result[reference_id] = StageEditFeatureSnapshot.from_dict(
+        snapshot = StageEditFeatureSnapshot.from_dict(
             payload,
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
         )
+        snapshot.require_production_causal_sensing(
+            edit_mode="group",
+            target_member=None,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+        result[reference_id] = snapshot
     return result
 
 
@@ -100,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         negative_samples_per_hold=args.negative_samples_per_hold,
         boundary_guard_seconds=args.boundary_guard_seconds,
         max_sources=args.max_sources,
+        production_edit_mode="group",
+        production_target_member=None,
     )
     checkpoint_id = str(args.checkpoint_id or "").strip()
     if not checkpoint_id:

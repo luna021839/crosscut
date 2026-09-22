@@ -111,7 +111,96 @@ def _cadence(*, switch_count: int = 20, effects: int = 0, requested=False):
     }
 
 
+def _decoded_proxy(*, count: int = 20) -> dict[str, object]:
+    return {
+        "passed": True,
+        "generic_rendered_proxy_passed": True,
+        "member_output_quality_passed": True,
+        "direct_member_rendered_continuity_passed": True,
+        "rendered_continuity": {
+            "passed": True,
+            "failure_reasons": [],
+            "metrics": {
+                "source_switch_boundary_count": count,
+                "attention_position_mismatch_p95": 0.05,
+                "attention_scale_mismatch_p95": 0.04,
+                "pose_mismatch_p95": 0.10,
+                "exact_incoming_first_frame_evaluated": True,
+                "final_render_transform_domain_evaluated": True,
+            },
+            "boundaries": [
+                {"boundary_index": index} for index in range(count)
+            ],
+        },
+    }
+
+
 class DirectMemberProfessionalGateTests(unittest.TestCase):
+    def test_exact_output_proxy_supersedes_stale_source_continuity(
+        self,
+    ) -> None:
+        proxy = _decoded_proxy()
+        # The generic GROUP editorial score is explicitly diagnostic-only for
+        # a member fancam; member output quality and exact continuity are the
+        # production authorities.
+        proxy["generic_rendered_proxy_passed"] = False
+        result = evaluate_direct_member_professional_pre_render_gate(
+            visual_selection=_selection(
+                repair_index=5,
+                speed_discontinuity_index=4,
+            ),
+            cadence=_cadence(),
+            editorial_motion_plan=_MotionPlan(applied_count=3),
+            transitions=tuple(RenderTransition() for _ in range(20)),
+            duration_seconds=80.0,
+            dense_geometry_review_completed=True,
+            decoded_proxy_preflight=proxy,
+            materialized_editorial_transform_segment_count=8,
+        )
+
+        self.assertTrue(result.passed, result.to_dict())
+        self.assertTrue(
+            result.metrics["decoded_output_proxy_authority_active"]
+        )
+        self.assertEqual(
+            result.metrics["effective_attention_position_mismatch_p95"],
+            0.05,
+        )
+        self.assertEqual(
+            result.metrics["editorial_transform_segment_count"],
+            8,
+        )
+        self.assertEqual(
+            result.metrics["planner_editorial_transform_segment_count"],
+            3,
+        )
+        self.assertNotIn(
+            "required_dense_transform_not_accepted",
+            result.failure_reasons,
+        )
+
+    def test_incomplete_proxy_cannot_override_source_gate(self) -> None:
+        proxy = _decoded_proxy()
+        proxy["member_output_quality_passed"] = False
+        result = evaluate_direct_member_professional_pre_render_gate(
+            visual_selection=_selection(repair_index=5),
+            cadence=_cadence(),
+            editorial_motion_plan=_MotionPlan(applied_count=8),
+            transitions=tuple(RenderTransition() for _ in range(20)),
+            duration_seconds=80.0,
+            dense_geometry_review_completed=True,
+            decoded_proxy_preflight=proxy,
+        )
+
+        self.assertFalse(result.passed)
+        self.assertFalse(
+            result.metrics["decoded_output_proxy_authority_active"]
+        )
+        self.assertIn(
+            "required_dense_transform_not_accepted",
+            result.failure_reasons,
+        )
+
     def test_professional_plan_passes_joint_gate(self) -> None:
         result = evaluate_direct_member_professional_pre_render_gate(
             visual_selection=_selection(),
@@ -293,6 +382,24 @@ class DirectMemberProfessionalGateTests(unittest.TestCase):
             rejected.failure_reasons,
         )
         self.assertTrue(accepted.passed, accepted.to_dict())
+
+    def test_enabled_effect_cannot_silently_report_zero_candidates(self) -> None:
+        result = evaluate_direct_member_professional_pre_render_gate(
+            visual_selection=_selection(),
+            cadence=_cadence(effects=0, requested=True),
+            editorial_motion_plan=_MotionPlan(applied_count=8),
+            transitions=tuple(RenderTransition() for _ in range(20)),
+            duration_seconds=80.0,
+            dense_geometry_review_completed=True,
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.metrics["eligible_optional_effect_count"], 0)
+        self.assertEqual(result.metrics["required_effect_count"], 1)
+        self.assertIn(
+            "requested_safe_transition_effect_not_materialized",
+            result.failure_reasons,
+        )
 
     def test_sparse_editorial_camera_fails_even_when_cuts_are_safe(self) -> None:
         result = evaluate_direct_member_professional_pre_render_gate(

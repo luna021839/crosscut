@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import unittest
 
 from crosscut.pose import FormationPersonDescriptor
 from crosscut.timeline import (
     BoundarySideStability,
+    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
     ShotType,
     TimelineCandidate,
     TimelineChoice,
@@ -13,7 +15,12 @@ from crosscut.timeline import (
     TimelineResult,
     cross_source_layout_mismatch,
 )
-from crosscut.timeline_review import TimelineReviewConfig, review_timeline
+from crosscut.timeline_review import (
+    JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
+    JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
+    TimelineReviewConfig,
+    review_timeline,
+)
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
@@ -616,6 +623,123 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
         self.assertEqual(boundary.silhouette_mismatch, 0.22)
         self.assertEqual(boundary.formation_mismatch, 0.18)
         self.assertEqual(boundary.pose_mismatch, 0.16)
+
+    def test_highlight_phrase_anchor_audits_bounded_scale_and_focus_contrast(
+        self,
+    ) -> None:
+        outgoing_face = (0.20, 0.20, 0.20, 0.30)
+        incoming_face = (0.41, 0.20, 0.20, 0.30)
+        outgoing = visual_choice(
+            0,
+            0,
+            duration=2.4,
+            exit_shot_scale=0.10,
+            face_samples_xywh=(None, None, outgoing_face),
+        )
+        incoming = visual_choice(
+            1,
+            1,
+            duration=2.4,
+            entry_shot_scale=0.68,
+            face_samples_xywh=(incoming_face, None, None),
+            intentional_transition_anchor_basis=(
+                INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
+            ),
+            transition_evidence_authority_from_previous=(
+                JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY
+            ),
+            transition_evidence_contract_from_previous=(
+                JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT
+            ),
+            scale_transition_mismatch_from_previous=0.58,
+            focus_transition_mismatch_from_previous=0.26,
+            layout_transition_mismatch_from_previous=0.20,
+            silhouette_transition_mismatch_from_previous=0.20,
+            pose_transition_mismatch_from_previous=0.10,
+        )
+        tail = visual_choice(2, 2, duration=2.4)
+        plan = VisualTimelinePlan((outgoing, incoming, tail), 8.5)
+
+        review = review_timeline(plan)
+        serialized_review = review_timeline(
+            json.loads(json.dumps(plan.to_dict()))
+        )
+        boundary = review.boundaries[0]
+
+        self.assertEqual(
+            boundary.authorized_mismatch_metrics,
+            ("scale", "focus"),
+        )
+        self.assertEqual(boundary.exceeded_metrics, ())
+        self.assertNotIn(
+            "scale_mismatch_exceeded",
+            {failure.code for failure in review.hard_failures},
+        )
+        self.assertNotIn(
+            "focus_mismatch_exceeded",
+            {failure.code for failure in review.hard_failures},
+        )
+        self.assertEqual(
+            review.mismatch_summaries[0].exceeded_count,
+            0,
+        )
+        authority = boundary.to_dict()["intentional_transition_authority"]
+        self.assertTrue(authority["applied"])
+        self.assertEqual(
+            authority["authorized_mismatch_metrics"],
+            ["scale", "focus"],
+        )
+        serialized_boundary = serialized_review.boundaries[0]
+        self.assertEqual(serialized_boundary.authorized_mismatch_metrics, ())
+        self.assertEqual(
+            serialized_boundary.exceeded_metrics,
+            ("scale", "focus"),
+        )
+        self.assertIn(
+            "scale_mismatch_exceeded",
+            {failure.code for failure in serialized_review.hard_failures},
+        )
+        self.assertIn(
+            "focus_mismatch_exceeded",
+            {failure.code for failure in serialized_review.hard_failures},
+        )
+
+        unmarked_review = review_timeline(
+            VisualTimelinePlan(
+                (outgoing, replace(incoming, intentional_transition_anchor_basis=None), tail),
+                8.5,
+            )
+        )
+        self.assertIn(
+            "scale_mismatch_exceeded",
+            {failure.code for failure in unmarked_review.hard_failures},
+        )
+        self.assertIn(
+            "focus_mismatch_exceeded",
+            {failure.code for failure in unmarked_review.hard_failures},
+        )
+
+        weak_pose_review = review_timeline(
+            VisualTimelinePlan(
+                (
+                    outgoing,
+                    replace(
+                        incoming,
+                        pose_transition_mismatch_from_previous=0.25,
+                    ),
+                    tail,
+                ),
+                8.5,
+            )
+        )
+        self.assertEqual(
+            weak_pose_review.boundaries[0].authorized_mismatch_metrics,
+            (),
+        )
+        self.assertIn(
+            "scale_mismatch_exceeded",
+            {failure.code for failure in weak_pose_review.hard_failures},
+        )
 
     def test_visual_plan_json_round_trip_has_same_boundary_diagnostics(self) -> None:
         plan = VisualTimelinePlan(

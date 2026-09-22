@@ -185,6 +185,17 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
         self.assertFalse(
             payload["serialization_policy"]["per_frame_descriptors_serialized"]
         )
+        rapid = metrics["rapid_quality_alternation"]
+        self.assertEqual(len(rapid["per_run"]), 3)
+        self.assertEqual(len(rapid["per_boundary"]), 2)
+        self.assertEqual(
+            set(rapid["per_boundary"][0]["normalized_axes"]),
+            {"sharpness", "luma", "chroma"},
+        )
+        self.assertIn(
+            rapid["per_boundary"][0]["dominant_axis"],
+            {"sharpness", "luma", "chroma"},
+        )
 
     def test_blurred_final_render_fails_exact_source_retention(self) -> None:
         frame = _texture()
