@@ -7,6 +7,7 @@ the actual outgoing and incoming frames.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from bisect import bisect_right
 from collections import OrderedDict
@@ -5830,6 +5831,7 @@ def _choice_can_enter_dissolve_postpass(
     )
 
 
+@isolated_optional()
 def rehydrate_visual_timeline_dissolve_evidence(
     visual_timeline: VisualTimelinePlan,
     *,

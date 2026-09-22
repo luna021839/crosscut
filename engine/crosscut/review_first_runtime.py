@@ -13,6 +13,7 @@ two decisions explicit:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 import math
@@ -25,6 +26,26 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 REVIEW_FIRST_RUNTIME_CONTRACT = "ive_review_first_runtime_v1"
 REVIEW_FIRST_TOTAL_BUDGET_SECONDS = 600.0
+_owned_native_deadline_deferral = ContextVar("owned_native_deadline_deferral", default=None)
+
+
+@contextmanager
+def defer_deadline_during_owned_native_wait():
+    """Our alarm may not interrupt the independently bounded worker's cleanup.
+
+    This only defers this module's deadline exception, not user cancellation
+    or foreign signal handlers. Native wait/guardian still enforce their own
+    absolute cutoff, and the CLI supervisor still enforces the total ceiling.
+    The deferred exception is re-raised after owned pipes/processes are closed.
+    """
+    pending = []
+    token = _owned_native_deadline_deferral.set(pending)
+    try:
+        yield
+    finally:
+        _owned_native_deadline_deferral.reset(token)
+        if pending:
+            raise ReviewFirstDeadlineExceeded(pending[0])
 
 
 class ReviewFirstStatus(str, Enum):
@@ -43,8 +64,12 @@ class ReviewFirstDeadlineExceeded(BaseException):
     """
 
 
-class ReviewFirstSearchCutoff(Exception):
-    """Recoverable optional-search cutoff; keep the incumbent for render/QA."""
+class ReviewFirstSearchCutoff(BaseException):
+    """Control flow, not a per-candidate model error.
+
+    Broad adapter/cache ``except Exception`` blocks must not hide the cutoff
+    and start the next candidate. Only the first-result controller handles it.
+    """
 
 
 def _deadline_stage(stage: str) -> str:
@@ -119,6 +144,10 @@ def enforce_review_first_deadline(
             or previous_due is None
             or deadline <= previous_due + 1e-6
         ):
+            pending = _owned_native_deadline_deferral.get()
+            if pending is not None:
+                pending.append("review-first workflow deadline exceeded during " + stage_name)
+                return
             raise ReviewFirstDeadlineExceeded(
                 "review-first total workflow deadline exceeded during "
                 f"{stage_name}"
@@ -288,19 +317,8 @@ def _mapping(value: object) -> Mapping[str, Any] | None:
 
 
 def _member_continuity_measurements_valid(continuity: Mapping[str, Any]) -> bool:
-    measurements = _mapping(continuity.get("metrics"))
-    return bool(
-        type(continuity.get("schema_version")) is int
-        and continuity["schema_version"] == 1
-        and continuity.get("analysis") == "automatic_member_exact_rendered_boundary_continuity_v1"
-        and isinstance(continuity.get("failure_boundary_indices"), Mapping)
-        and measurements is not None
-        and type(measurements.get("output_frame_count")) is int
-        and measurements["output_frame_count"] > 0
-        and measurements.get("exact_incoming_first_frame_evaluated") is True
-        and measurements.get("final_render_transform_domain_evaluated") is True
-        and isinstance(continuity.get("boundaries"), list)
-    )
+    from .member_continuity_contract import member_continuity_measurements_valid
+    return member_continuity_measurements_valid(continuity)
 
 
 def _member_editorial_evidence_valid(
@@ -482,6 +500,9 @@ def classify_review_first_qa(
     proxy_codes = {"decoded_proxy_review_failed", "proxy_boundary_issues_require_manual_review"}
     proxy_integrity_valid = bool(proxy_metrics is not None and
         proxy_integrity_evidence_valid(proxy_metrics.get("technical_integrity")))
+    member_continuity = (_mapping(report_payload.get("metrics")) or {}).get("rendered_continuity")
+    member_continuity_valid = bool(isinstance(member_continuity, Mapping)
+        and _member_continuity_measurements_valid(member_continuity))
     editorial = tuple(
         code
         for code in codes
@@ -501,6 +522,11 @@ def classify_review_first_qa(
                 *(() if content_binding_passed else ("content_binding_failed",)),
                 *(("proxy_nested_technical_integrity_invalid",)
                   if not member and not proxy_integrity_valid else ()),
+                *(("member_continuity_measurements_invalid",)
+                  if member and not member_continuity_valid else ()),
+                *(("member_continuity_failure_not_reported",)
+                  if member and member_continuity_valid and member_continuity.get("passed") is False
+                  and "member_rendered_continuity_not_pass" not in codes else ()),
                 *(
                     ("qa_passed_with_issues",)
                     if report_passed and codes

@@ -2008,6 +2008,13 @@ def _domain_aware_boundary_contract_valid(
             if domain == _INTRODUCED_CROSS_SOURCE_DOMAIN
             else "zero_technical_integrity_issues"
         )
+        from .proxy_review_contract import boundary_domain_passed
+        try:
+            expected_passed = boundary_domain_passed(domain=domain, score_p10=_quantile(scores, .10),
+                issue_fraction=len(expected_issue_indices) / count if count else 0.,
+                issue_count=len(expected_issue_indices), review_policy=review.get("review_policy"))
+        except ValueError:
+            return False
         if not (
             payload.get("domain") == domain
             and payload.get("count_basis") == domain
@@ -2039,7 +2046,7 @@ def _domain_aware_boundary_contract_valid(
                                    ("median", 0.5), ("p90", 0.9), ("maximum", 1.0)))
             and score.get("evidence_status") == expected_evidence_status
             and payload.get("pass_policy") == expected_pass_policy
-            and isinstance(payload.get("passed"), bool)
+            and payload.get("passed") is expected_passed
         ):
             return False
     return True

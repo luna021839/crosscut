@@ -33,7 +33,6 @@ from .direct_member_look import (
     DirectMemberLookConfig,
 )
 from .direct_member_rendered_continuity import (
-    ANALYSIS_BASIS as RENDERED_CONTINUITY_ANALYSIS_BASIS,
     DirectMemberRenderedContinuityConfig,
     evaluate_direct_member_rendered_continuity,
 )
@@ -1383,15 +1382,15 @@ def _rendered_continuity_payload(
             path="rendered_continuity",
             value=f"{type(exc).__name__}: {exc}",
         )
-    contract_valid = bool(
-        payload.get("schema_version") == 1
-        and payload.get("analysis") == RENDERED_CONTINUITY_ANALYSIS_BASIS
-        and isinstance(payload.get("passed"), bool)
-        and isinstance(payload.get("failure_reasons"), list)
-        and isinstance(payload.get("failure_boundary_indices"), Mapping)
-        and isinstance(payload.get("metrics"), Mapping)
-        and isinstance(payload.get("boundaries"), list)
-    )
+    from .member_continuity_contract import member_continuity_measurements_valid
+    contract_valid = member_continuity_measurements_valid(payload, plan=plan)
+    if not contract_valid:
+        issues.add(
+            "member_rendered_continuity_contract_invalid",
+            "Continuity measurements must cover the exact final plan, including every source switch.",
+            path="rendered_continuity",
+            value={"contract_valid": False},
+        )
     if not contract_valid or payload.get("passed") is not True:
         issues.add(
             "member_rendered_continuity_not_pass",

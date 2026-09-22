@@ -5079,6 +5079,8 @@ def _complete_automatic_stage_edit_post_render_qa(
     manifest["post_render_qa"] = dict(provenance)
     review_runtime_payload = manifest.get("review_first_runtime")
     finalize_review_first_runtime_payload(review_runtime_payload, qa_disposition.status)
+    from .first_result_controller import finalize_first_result_manifest
+    finalize_first_result_manifest(manifest, qa_disposition)
     render_payload = manifest.get("render")
     if isinstance(render_payload, dict):
         render_payload["artifact_role"] = final_role
@@ -5249,6 +5251,8 @@ def _enforce_automatic_member_post_render_qa(
     manifest["post_render_qa"] = dict(provenance)
     review_runtime_payload = manifest.get("review_first_runtime")
     finalize_review_first_runtime_payload(review_runtime_payload, qa_disposition.status)
+    from .first_result_controller import finalize_first_result_manifest
+    finalize_first_result_manifest(manifest, qa_disposition)
     mutable_render = manifest.get("render")
     if isinstance(mutable_render, dict):
         mutable_render["artifact_role"] = final_role
@@ -25713,9 +25717,9 @@ def _discover_automatic_stage_edit_production_bundle(
     """Resolve machine-installed learned generation for the simple app path.
 
     Explicit advanced requests retain their exact supplied snapshot.  Otherwise
-    only automatic GROUP mode is eligible for registry discovery.  Once an
-    active record exists, registry/checkpoint failures propagate and cannot
-    silently demote the request to the ordinary visual editor.
+    only automatic GROUP mode is eligible for registry discovery. This resolver
+    stays strict; the review-first controller catches optional installation
+    errors only after retaining a complete plan. Explicit models remain strict.
     """
 
     explicit_learned_fields = (
@@ -26935,6 +26939,75 @@ def _enforce_automatic_group_stage_edit_requirement(
     }
 
 
+def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, timewarps,
+                               common_start, section_plan, phrase_times, output, reporter, warnings):
+    """Freeze source clocks, geometry and exact shot IDs before optional work."""
+    width, height = output_size(request.aspect_ratio)
+    segments = tuple(aligned_render_segment(source_index=eligible_indices[item.source_index],
+        reference_start=item.canonical_master_start, common_master_start=common_start,
+        source_offset=offsets[item.source_index], duration=item.duration_seconds,
+        timewarp=timewarps[item.source_index]) for item in timeline.choices)
+    transitions = GroupTransitionPlan(tuple(RenderTransition(tier="C",
+        reason="review_first_clock_verified_primitive") for _ in range(len(segments)-1)),
+        analysis_basis="review_first_complete_primitive_v1")
+    plan = RenderPlan(sources=request.sources, segments=segments, reference_source=request.reference_source,
+        aspect_ratio=request.aspect_ratio, output=output, master_audio_start=common_start,
+        width=width, height=height, transitions=transitions.transitions)
+    review = _review_visual_timeline_for_render(timeline, available_source_count=len(eligible_indices),
+        reporter=reporter, warnings=warnings, comparison_render_allowed=True)
+    clock = _deterministic_exact_shot_clock_from_timeline(timeline,
+        section_plan=section_plan, phrase_times=phrase_times)
+    return _GroupRenderCandidateBundle(candidate_index=0, review_rank=0,
+        cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
+        visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
+        group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=None,
+        render_plan=plan, stage_edit_exact_shot_clock=clock)
+
+
+def _review_first_registered_group_generation(*, request, alignment, alignment_eligibility,
+        source_timewarps, scene_cut_times, group_draft, rhythm, section_plan, local_durations,
+        offsets, eligible_timewarps, eligible_indices, source_derivatives, output):
+    """An optional transaction: no caller model authority is changed on failure."""
+    bundle = _discover_automatic_stage_edit_production_bundle(request)
+    if bundle is None:
+        return None
+    if tuple(eligible_indices) != tuple(range(len(request.sources))):
+        raise ValueError("optional learned snapshot requires every configured source clock")
+    motion = _registered_dynamic_crop_motion_authority_v3(bundle)
+    policy = _load_stage_edit_montage_policy(request=request, registered_bundle=bundle, explicit_preflight=None)
+    profile = _load_stage_edit_motion_cut_profile(registered_bundle=bundle, explicit_preflight=None, montage_policy=policy)
+    authority, contract, fingerprint = _stage_edit_continuity_config_identity(registered_bundle=bundle, explicit_preflight=None)
+    config = _stage_edit_semimarkov_config_from_montage_policy(policy, motion_cut_profile=profile,
+        require_motion_cut_calibration=True, minimum_unique_sources=MINIMUM_AUTOMATIC_SOURCE_COUNT,
+        maximum_source_occupancy_fraction=.45, continuity_authority=authority,
+        continuity_scorer_contract=contract, continuity_scorer_fingerprint=fingerprint)
+    snapshot, preflight, causal_audit = _materialize_registered_stage_edit_preflight(
+        bundle=bundle, request=request, alignment=alignment, alignment_eligibility=alignment_eligibility,
+        source_timewarps=source_timewarps, source_scene_cut_times=scene_cut_times,
+        timing_draft=group_draft, rhythm=rhythm, section_plan=section_plan)
+    width, height = output_size(request.aspect_ratio)
+    generated = run_stage_edit_pipeline_bridge(preflight=preflight, sources=request.sources,
+        source_durations_seconds=local_durations, source_start_offsets_seconds=offsets,
+        internal_cut_times_seconds=scene_cut_times, source_timewarps=eligible_timewarps,
+        source_quality_log_priors=(0.,)*len(request.sources),
+        source_derivative_metadata=source_derivatives.decoder_metadata(),
+        require_verified_source_derivative_metadata=True, section_plan=section_plan, output=output,
+        reference_source=request.reference_source, aspect_ratio=request.aspect_ratio,
+        width=width, height=height, fps=29.97, config=config, quality_gated_single_delivery=True)
+    if generated.learned_section_director is None:
+        raise ValueError("optional learned generation has no bound Section Director")
+    # Validate and persist the proposal before publishing *any* caller state.
+    # A bad policy or an unwritable audit is an optional transaction failure.
+    profile_payload = _stage_edit_motion_cut_profile_manifest_payload(profile, policy)
+    montage_config = _rendered_montage_config_from_policy(
+        policy, require_complete_role_duration_policy=True)
+    audit_path = output.with_name(output.stem + "-generation-audit.json")
+    generated.write_json(audit_path)
+    return dict(bundle=bundle, motion=motion, policy=policy, motion_profile=profile,
+        snapshot=snapshot, causal_audit=causal_audit, generation=generated,
+        profile_payload=profile_payload, montage_config=montage_config, audit_path=audit_path)
+
+
 def analyze(
     request: AnalysisRequest,
     reporter: EventReporter,
@@ -26966,9 +27039,17 @@ def analyze(
         raise TypeError(
             "acquisition identity authority is valid only for automatic member requests"
         )
-    registered_stage_edit_bundle = (
-        _discover_automatic_stage_edit_production_bundle(request)
-    )
+    from .stage_edit_production_registry import STAGE_EDIT_PRODUCTION_REGISTRY_ENV
+    defer_automatic_models = (review_first_runtime.enabled
+        and request.source_mode is SourceMode.AUTOMATIC and request.edit_mode is EditMode.GROUP
+        and STAGE_EDIT_PRODUCTION_REGISTRY_ENV not in os.environ
+        and not any(getattr(request, field, None) is not None for field in (
+            "stage_edit_checkpoint_directory", "stage_edit_generation_checkpoint_directory",
+            "stage_edit_learned_reviewer_checkpoint_directory")))
+    # Explicit model requirements retain strict failure semantics. The normal
+    # app's optional installation is resolved only after a complete baseline.
+    registered_stage_edit_bundle = (None if defer_automatic_models else
+        _discover_automatic_stage_edit_production_bundle(request))
     registered_stage_edit_motion_authority_v3 = (
         _registered_dynamic_crop_motion_authority_v3(
             registered_stage_edit_bundle
@@ -27154,6 +27235,8 @@ def analyze(
             "현재 동기화 원본에서 feature snapshot을 새로 생성한 뒤 "
             "후보 8개 전수 시각·프록시 QA를 적용"
         )
+    elif defer_automatic_models:
+        reporter.log("Transformer 설치·모델 검증은 기본 렌더 계획 확보 후 별도 후보 단계에서 수행")
     elif automatic_group_editorial_authority is not None:
         reporter.log(
             "검증된 Transformer production bundle 없음 · "
@@ -27655,6 +27738,8 @@ def analyze(
     candidate_stream_progress_path: Path | None = None
     materialized_group_candidates: tuple[Any, ...] = ()
     complete_group_candidates: tuple[_GroupRenderCandidateBundle, ...] = ()
+    group_first = None
+    review_first_verified_candidate_bundle = None
     candidate_derivation_failures: list[dict[str, Any]] = []
     candidate_post_repair_review_rejections: list[dict[str, Any]] = []
     candidate_decoded_review_failures: list[dict[str, Any]] = []
@@ -28085,7 +28170,7 @@ def analyze(
                 "별도 감사 자료로 보존 · 시각 하드 게이트와 "
                 "실렌더 프록시 QA 전에는 선택하지 않음"
             )
-        if request.source_mode is SourceMode.AUTOMATIC:
+        if request.source_mode is SourceMode.AUTOMATIC and not review_first_runtime.enabled:
             reporter.status("방송 원본 사이의 안정적인 색감 차이를 맞추는 중…")
             try:
                 source_look_match_result = analyze_source_look_match(
@@ -33173,6 +33258,47 @@ def analyze(
                         "incumbent_retained_before_optional_search": True,
                         "passed": True,
                     }
+                    from .first_result_controller import FirstResultController
+                    baseline_bundle = _review_first_group_bundle(timeline=visual_timeline, request=request,
+                        eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                        common_start=common_start, section_plan=section_plan, phrase_times=phrase_times,
+                        output=request.output_directory / f"{base_filename}-group-crosscut.mp4",
+                        reporter=reporter, warnings=warnings)
+                    group_first = FirstResultController(review_first_runtime, sources=request.sources,
+                        source_durations=tuple(float(info.video_streams[0].duration_seconds or
+                            info.duration_seconds or 0.) for info in media),
+                        master_start=common_start, duration=baseline_bundle.render_plan.duration,
+                        allowed_source_indices=eligible_indices)
+                    group_first.install_baseline(baseline_bundle, plan=baseline_bundle.render_plan,
+                        authority="deterministic_full_song_visual_selector")
+                    if request.source_mode is SourceMode.AUTOMATIC:
+                        source_look_match_result = group_first.run_optional("source_look_match", lambda:
+                            analyze_source_look_match(tuple(request.sources[index] for index in eligible_indices),
+                                source_offsets_seconds=offsets, common_master_start=common_start,
+                                common_master_end=common_end, reference_source=None,
+                                source_timewarps=eligible_timewarps))
+                    baseline_model_policy = (stage_edit_montage_policy, rendered_montage_config,
+                        stage_edit_motion_cut_profile, stage_edit_motion_cut_profile_payload)
+                    if defer_automatic_models:
+                        model_context = group_first.run_optional("default_registered_models", lambda:
+                            _review_first_registered_group_generation(request=request, alignment=alignment,
+                                alignment_eligibility=alignment_eligibility, source_timewarps=source_timewarps,
+                                scene_cut_times=scene_cut_times, group_draft=group_draft, rhythm=rhythm_analysis,
+                                section_plan=section_plan, local_durations=local_durations, offsets=offsets,
+                                eligible_timewarps=eligible_timewarps, eligible_indices=eligible_indices,
+                                source_derivatives=source_derivative_diversity_result,
+                                output=request.output_directory / f".{base_filename}-stageedit-retained-candidate.mp4"))
+                        if model_context is not None:
+                            registered_stage_edit_bundle = model_context["bundle"]
+                            registered_stage_edit_motion_authority_v3 = model_context["motion"]
+                            stage_edit_generation_result = model_context["generation"]
+                            stage_edit_inference_snapshot_result = model_context["snapshot"]
+                            stage_edit_causal_sensing_pipeline_audit = model_context["causal_audit"]
+                            stage_edit_montage_policy = model_context["policy"]
+                            stage_edit_motion_cut_profile = model_context["motion_profile"]
+                            stage_edit_motion_cut_profile_payload = model_context["profile_payload"]
+                            rendered_montage_config = model_context["montage_config"]
+                            stage_edit_generation_audit_path = model_context["audit_path"]
                     review_first_runtime.require_first_render_budget("optional_candidate_refinement")
                 if (
                     bool(getattr(request, "review_first_enabled", False))
@@ -33183,9 +33309,10 @@ def analyze(
                         "실프레임 하드 게이트로 확인하는 중…"
                     )
                     for retained_candidate in (
-                        stage_edit_generation_result.retained_candidates
+                        stage_edit_generation_result.retained_candidates[:8]
                     ):
-                        try:
+                        review_first_runtime.require_first_render_budget("optional_learned_candidate")
+                        def propose_learned_candidate():
                             materialized_review_candidate = (
                                 materialize_stage_edit_visual_candidate(
                                     retained_candidate,
@@ -33207,20 +33334,34 @@ def analyze(
                                     ),
                                 )
                             )
-                        except (
-                            StageEditVisualCandidateError,
-                            ValueError,
-                            cv2.error,
-                        ) as exc:
+                            # Validate learned source clocks and pixel geometry
+                            # before replacing the complete deterministic bundle.
+                            promoted_bundle = _review_first_group_bundle(
+                                timeline=materialized_review_candidate.visual_plan, request=request,
+                                eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                                common_start=common_start,
+                                section_plan=stage_edit_generation_result.learned_section_director.section_plan,
+                                phrase_times=phrase_times, output=baseline_bundle.render_plan.output,
+                                reporter=reporter, warnings=warnings)
+                            promoted_bundle = _apply_stage_edit_candidate_render_contract(promoted_bundle,
+                                materialized_review_candidate, motion_authority_v3=registered_stage_edit_motion_authority_v3)
+                            group_first.validate_plan(promoted_bundle.render_plan)
+                            return materialized_review_candidate, promoted_bundle
+                        candidate_proposal = group_first.run_optional(
+                            f"stage_edit_candidate_rank_{retained_candidate.rank}", propose_learned_candidate)
+                        if candidate_proposal is None:
+                            attempt = deepcopy(group_first.attempts[-1])
                             review_first_rejections.append(
                                 {
-                                    "stage_edit_candidate_rank": (
-                                        retained_candidate.rank
-                                    ),
-                                    "error": f"{type(exc).__name__}: {exc}",
+                                    "stage_edit_candidate_rank": retained_candidate.rank,
+                                    **attempt,
                                 }
                             )
                             continue
+                        materialized_review_candidate, promoted_bundle = candidate_proposal
+                        group_first.promote(promoted_bundle, plan=promoted_bundle.render_plan,
+                            authority="stage_edit_generation")
+                        review_first_verified_candidate_bundle = promoted_bundle
                         visual_timeline = (
                             materialized_review_candidate.visual_plan
                         )
@@ -33242,7 +33383,7 @@ def analyze(
                             ),
                             "dynamic_crop_applied_to_render": False,
                             "deterministic_face_crop_and_editorial_motion_applied_later": (
-                                True
+                                False
                             ),
                             "rejections_before_selection": list(
                                 review_first_rejections
@@ -33250,7 +33391,7 @@ def analyze(
                             "passed": True,
                         }
                         break
-                    if visual_timeline is None:
+                    if review_first_stage_edit_materialized is None:
                         warnings.append(
                             "StageEdit 경로가 시각 하드 게이트를 통과하지 "
                             "못해 기록을 남기고 결정론적 전체 구간 선택기로 전환했습니다."
@@ -33322,6 +33463,8 @@ def analyze(
             if visual_timeline is None:
                 raise RuntimeError("optional search ended without a complete incumbent") from exc
             warnings.append(f"선택 탐색 예산 종료 · 확보한 전체 경로로 렌더와 QA 진행: {exc}")
+            if isinstance(review_first_visual_selection_payload, dict):
+                review_first_visual_selection_payload["search_cutoff"] = str(exc)
             review_first_runtime.checkpoint("visual_incumbent_retained_at_search_cutoff")
         except (ValueError, cv2.error) as exc:
             _route_visual_timeline_selection_failure(
@@ -33336,11 +33479,42 @@ def analyze(
                 materialized_candidate_count=len(materialized_group_candidates),
                 warnings=warnings,
             )
+        finally:
+            if isinstance(review_first_visual_selection_payload, dict):
+                review_first_visual_selection_payload["stage_edit_rejections"] = deepcopy(
+                    locals().get("review_first_rejections", []))
+                if group_first is not None:
+                    review_first_visual_selection_payload["first_result_controller"] = group_first.to_dict()
+                    if stage_edit_generation_result is not None and review_first_stage_edit_materialized is None:
+                        # An attempted model is provenance, not the authority
+                        # of the deterministic pixels that survived rejection.
+                        review_first_visual_selection_payload["unselected_generation_attempt"] = {
+                            "audit_path": str(stage_edit_generation_audit_path),
+                            "registered_bundle": registered_stage_edit_bundle.to_dict() if registered_stage_edit_bundle else None,
+                            "candidate_count": len(stage_edit_generation_result.retained_candidates),
+                            "selected_for_render": False,
+                        }
+                        if defer_automatic_models:
+                            registered_stage_edit_bundle = None
+                            stage_edit_generation_result = None
+                            registered_stage_edit_motion_authority_v3 = None
+                            (stage_edit_montage_policy, rendered_montage_config,
+                             stage_edit_motion_cut_profile, stage_edit_motion_cut_profile_payload) = baseline_model_policy
+                        else:
+                            # A user-required checkpoint/registry is not an
+                            # optional installation. Never silently downgrade it.
+                            raise RuntimeError("required StageEdit model produced no validated render candidate")
+                    elif review_first_stage_edit_materialized is not None:
+                        automatic_group_editorial_authority = _enforce_automatic_group_stage_edit_requirement(
+                            request, registered_stage_edit_bundle, review_rendered_proxies=review_rendered_proxies)
+
+        def optional_group_refinement(stage, operation):
+            return group_first.run_optional(stage, operation) if group_first is not None else operation()
         if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
                 and (not review_first_runtime.enabled or review_first_runtime.optional_refinement_allowed)):
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
             try:
-                visual_boundary_repairs = repair_visual_timeline_boundaries(
+                visual_boundary_repairs = optional_group_refinement("boundary_repair", lambda: repair_visual_timeline_boundaries(
                     visual_timeline=visual_timeline,
                     sources=tuple(
                         request.sources[index] for index in eligible_indices
@@ -33350,14 +33524,15 @@ def analyze(
                     beat_period_seconds=group_draft.beat_period_seconds,
                     source_timewarps=eligible_timewarps,
                     **_visual_feature_cache_arguments(request),
-                )
-                visual_timeline = visual_boundary_repairs.timeline
-                reporter.log(
-                    "교차소스 경계 "
-                    f"{visual_boundary_repairs.reviewed_cross_source_count}개 검토 · "
-                    f"{visual_boundary_repairs.changed_count}개 컷시점 보정 · "
-                    f"{len(visual_boundary_repairs.failures)}개 원위치 유지"
-                )
+                ))
+                if visual_boundary_repairs is not None:
+                    visual_timeline = visual_boundary_repairs.timeline
+                    reporter.log(
+                        "교차소스 경계 "
+                        f"{visual_boundary_repairs.reviewed_cross_source_count}개 검토 · "
+                        f"{visual_boundary_repairs.changed_count}개 컷시점 보정 · "
+                        f"{len(visual_boundary_repairs.failures)}개 원위치 유지"
+                    )
             except (ValueError, cv2.error) as exc:
                 warnings.append(
                     "국소 컷시점 보정에 실패해 전역 선택 경계를 유지함: "
@@ -33391,22 +33566,24 @@ def analyze(
                       for _ in range(max(0, len(visual_timeline.choices) - 1))),
                 analysis_basis="prescribed_render_geometry_single_authority_v1",
             )
-        if visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels":
+        if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
+                and (group_first is None or review_first_runtime.optional_refinement_allowed)):
             try:
                 if any(value <= 0.0 for value in source_aspect_ratios):
                     raise ValueError(
                         "얼굴 맞춤 크롭을 위한 원본 해상도를 확인할 수 없음"
                     )
-                face_match_plan = build_face_match_plan(
+                face_match_plan = optional_group_refinement("face_match", lambda: build_face_match_plan(
                     visual_timeline=visual_timeline,
                     source_aspect_ratios=source_aspect_ratios,
                     section_plan=section_plan,
-                )
-                reporter.log(
-                    "얼굴 크기·위치 맞춤 "
-                    f"{face_match_plan.applied_count}개 적용 · "
-                    f"{face_match_plan.fallback_count}개 원본 화면 유지"
-                )
+                ))
+                if face_match_plan is not None:
+                    reporter.log(
+                        "얼굴 크기·위치 맞춤 "
+                        f"{face_match_plan.applied_count}개 적용 · "
+                        f"{face_match_plan.fallback_count}개 원본 화면 유지"
+                    )
             except (ValueError, cv2.error) as exc:
                 warnings.append(
                     "얼굴 맞춤을 안전하게 확정하지 못해 "
@@ -33414,7 +33591,7 @@ def analyze(
                 )
             try:
                 if face_match_plan is not None:
-                    visual_timeline = (
+                    rehydrated_timeline = optional_group_refinement("dissolve_evidence", lambda:
                         rehydrate_visual_timeline_dissolve_evidence(
                             visual_timeline,
                             sources=tuple(
@@ -33427,15 +33604,17 @@ def analyze(
                             **_visual_feature_cache_arguments(request),
                         )
                     )
-                group_transition_plan = build_group_transition_plan(
+                    if rehydrated_timeline is not None:
+                        visual_timeline = rehydrated_timeline
+                group_transition_plan = optional_group_refinement("group_transitions", lambda: build_group_transition_plan(
                     visual_timeline=visual_timeline,
                     face_match_plan=face_match_plan,
                     source_durations_seconds=local_durations,
-                )
+                ))
                 tier_counts = {
                     tier: sum(
                         transition.tier == tier
-                        for transition in group_transition_plan.transitions
+                        for transition in (group_transition_plan.transitions if group_transition_plan else ())
                     )
                     for tier in ("A", "B", "C", "D")
                 }
@@ -33482,15 +33661,16 @@ def analyze(
                     reporter.status(
                         "실제 컷 프레임의 특징점과 피사체 위치를 맞추는 중…"
                     )
-                    boundary_affine_plan = build_boundary_affine_plan(
+                    boundary_affine_plan = optional_group_refinement("boundary_affine", lambda: build_boundary_affine_plan(
                         visual_timeline=visual_timeline,
                         sources=tuple(
                             request.sources[index] for index in eligible_indices
                         ),
                         transitions=group_transition_plan.transitions,
                         face_match_plan=face_match_plan,
-                    )
-                    reporter.log(
+                    ))
+                    if boundary_affine_plan is not None:
+                        reporter.log(
                         "실프레임 affine 경계 "
                         f"{boundary_affine_plan.analyzed_count}개 분석 · "
                         f"{boundary_affine_plan.eligible_count}개 안전 후보"
@@ -33507,7 +33687,7 @@ def analyze(
                     editorial_width, editorial_height = output_size(
                         request.aspect_ratio
                     )
-                    boundary_subject_alignment_plan = (
+                    boundary_subject_alignment_plan = optional_group_refinement("boundary_subject_alignment", lambda:
                         build_boundary_subject_alignment_plan(
                             visual_timeline=visual_timeline,
                             sources=tuple(
@@ -33520,7 +33700,8 @@ def analyze(
                             output_height=editorial_height,
                         )
                     )
-                    reporter.log(
+                    if boundary_subject_alignment_plan is not None:
+                        reporter.log(
                         "경계 국소 피사체 정렬 "
                         f"{len(boundary_subject_alignment_plan.decisions)}개 검토 · "
                         f"{boundary_subject_alignment_plan.eligible_count}개 전환 · "
@@ -33533,7 +33714,7 @@ def analyze(
                         f"기존 보수적 편집 카메라만 사용함: {exc}"
                     )
                 try:
-                    editorial_motion_plan = build_editorial_motion_plan(
+                    editorial_motion_plan = optional_group_refinement("editorial_motion", lambda: build_editorial_motion_plan(
                         visual_timeline=visual_timeline,
                         transitions=group_transition_plan.transitions,
                         face_match_plan=face_match_plan,
@@ -33543,8 +33724,9 @@ def analyze(
                         ),
                         phrase_times=phrase_times,
                         section_plan=section_plan,
-                    )
-                    reporter.log(
+                    ))
+                    if editorial_motion_plan is not None:
+                        reporter.log(
                         "편집 카메라 "
                         f"{editorial_motion_plan.applied_count}개 세그먼트 · "
                         f"크기맞춤 {editorial_motion_plan.boundary_match_count}개 · "
@@ -34310,82 +34492,93 @@ def analyze(
                     "비교용 렌더 옵션으로 계속했습니다."
                 )
         else:
-            if visual_timeline is not None:
-                segments = tuple(
-                    replace(
-                        aligned_render_segment(
-                            source_index=eligible_indices[item.source_index],
-                            reference_start=item.canonical_master_start,
-                            common_master_start=common_start,
-                            source_offset=offsets[item.source_index],
-                            duration=item.duration_seconds,
-                            timewarp=eligible_timewarps[item.source_index],
-                            pan_crop=(
-                                face_match_plan.pan_crop_for(item.segment_index)
-                                if face_match_plan is not None
-                                else None
+            def complete_group_plan():
+                nonlocal segments, group_transition_plan
+                if visual_timeline is not None:
+                    segments = tuple(
+                        replace(
+                            aligned_render_segment(
+                                source_index=eligible_indices[item.source_index],
+                                reference_start=item.canonical_master_start,
+                                common_master_start=common_start,
+                                source_offset=offsets[item.source_index],
+                                duration=item.duration_seconds,
+                                timewarp=eligible_timewarps[item.source_index],
+                                pan_crop=(
+                                    face_match_plan.pan_crop_for(item.segment_index)
+                                    if face_match_plan is not None
+                                    else None
+                                ),
+                                editorial_transform=(
+                                    editorial_motion_plan.track_for(item.segment_index)
+                                    if editorial_motion_plan is not None
+                                    else None
+                                ),
                             ),
-                            editorial_transform=(
-                                editorial_motion_plan.track_for(item.segment_index)
-                                if editorial_motion_plan is not None
+                            look_adjustment=(
+                                source_look_match_result.adjustment_for_source(
+                                    item.source_index
+                                )
+                                if source_look_match_result is not None
                                 else None
-                            ),
-                        ),
-                        look_adjustment=(
-                            source_look_match_result.adjustment_for_source(
-                                item.source_index
-                            )
-                            if source_look_match_result is not None
-                            else None
-                        ),
-                    )
-                    for item in visual_timeline.choices
-                )
-            else:
-                segments = tuple(
-                    replace(
-                        aligned_render_segment(
-                            source_index=eligible_indices[item.source_index],
-                            reference_start=item.canonical_master_start,
-                            common_master_start=common_start,
-                            source_offset=item.audio_offset_seconds,
-                            duration=item.duration_seconds,
-                            timewarp=eligible_timewarps[item.source_index],
-                        ),
-                        look_adjustment=(
-                            source_look_match_result.adjustment_for_source(
-                                item.source_index
-                            )
-                            if source_look_match_result is not None
-                            else None
-                        ),
-                    )
-                    for item in group_draft.segments
-                )
-            if group_transition_plan is None:
-                group_transition_plan = GroupTransitionPlan(
-                    tuple(
-                        RenderTransition(
-                            tier="C",
-                            reason=(
-                                "rhythm_aligned_hard_cut_visual_analysis_unavailable"
                             ),
                         )
-                        for _ in range(max(0, len(segments) - 1))
-                    ),
-                    analysis_basis="rhythm_only_hard_cut_fallback_v1",
-                )
-            plan = RenderPlan(
-                sources=request.sources,
-                segments=segments,
-                reference_source=request.reference_source,
-                aspect_ratio=request.aspect_ratio,
-                output=rendered_video_path,
-                master_audio_start=common_start,
-                width=width,
-                height=height,
-                transitions=group_transition_plan.transitions,
-            )
+                        for item in visual_timeline.choices
+                    )
+                else:
+                    segments = tuple(
+                        replace(
+                            aligned_render_segment(
+                                source_index=eligible_indices[item.source_index],
+                                reference_start=item.canonical_master_start,
+                                common_master_start=common_start,
+                                source_offset=item.audio_offset_seconds,
+                                duration=item.duration_seconds,
+                                timewarp=eligible_timewarps[item.source_index],
+                            ),
+                            look_adjustment=(
+                                source_look_match_result.adjustment_for_source(
+                                    item.source_index
+                                )
+                                if source_look_match_result is not None
+                                else None
+                            ),
+                        )
+                        for item in group_draft.segments
+                    )
+                if group_transition_plan is None:
+                    group_transition_plan = GroupTransitionPlan(
+                        tuple(
+                            RenderTransition(
+                                tier="C",
+                                reason=(
+                                    "rhythm_aligned_hard_cut_visual_analysis_unavailable"
+                                ),
+                            )
+                            for _ in range(max(0, len(segments) - 1))
+                        ),
+                        analysis_basis="rhythm_only_hard_cut_fallback_v1",
+                    )
+                return RenderPlan(sources=request.sources, segments=segments,
+                    reference_source=request.reference_source, aspect_ratio=request.aspect_ratio,
+                    output=rendered_video_path, master_audio_start=common_start, width=width, height=height,
+                    transitions=group_transition_plan.transitions)
+            review_first_render_fallback_bundle = None
+            if review_first_verified_candidate_bundle is not None:
+                plan = review_first_verified_candidate_bundle.render_plan
+            elif group_first is not None:
+                plan = group_first.run_optional("final_geometry_plan", complete_group_plan,
+                    validate=group_first.validate_plan)
+                if plan is None:
+                    review_first_render_fallback_bundle = group_first.incumbent
+                    kept = review_first_render_fallback_bundle
+                    plan, visual_timeline, timeline_review = kept.render_plan, kept.visual_timeline, kept.timeline_review
+                    visual_boundary_repairs, face_match_plan = kept.boundary_repairs, kept.face_match_plan
+                    group_transition_plan, boundary_affine_plan = kept.group_transition_plan, kept.boundary_affine_plan
+                    editorial_motion_plan, boundary_look_match_result = kept.editorial_motion_plan, kept.boundary_look_match
+                    segments = plan.segments
+            else:
+                plan = complete_group_plan()
             review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
             if bool(getattr(request, "review_first_enabled", False)):
                 if visual_timeline is None or timeline_review is None:
@@ -34405,7 +34598,7 @@ def analyze(
                 )
                 final_montage_section_plan = (
                     stage_edit_generation_result.learned_section_director.section_plan
-                    if stage_edit_generation_result is not None
+                    if review_first_stage_edit_materialized is not None and stage_edit_generation_result is not None
                     and stage_edit_generation_result.learned_section_director
                     is not None
                     else visual_section_plan
@@ -34457,15 +34650,9 @@ def analyze(
                     ),
                 )
                 if review_first_stage_edit_materialized is not None:
-                    review_first_singleton_bundle = (
-                        _apply_stage_edit_candidate_render_contract(
-                            review_first_singleton_bundle,
-                            review_first_stage_edit_materialized,
-                            motion_authority_v3=(
-                                registered_stage_edit_motion_authority_v3
-                            ),
-                        )
-                    )
+                    if review_first_verified_candidate_bundle is None:
+                        raise RuntimeError("learned candidate lacks its atomically validated render bundle")
+                    review_first_singleton_bundle = review_first_verified_candidate_bundle
                     application_audit = _dynamic_crop_render_application_audit(
                         review_first_singleton_bundle,
                         review_first_stage_edit_materialized,
@@ -34479,6 +34666,16 @@ def analyze(
                         ] = application_audit[
                             "learned_framing_applied_to_final_render"
                         ]
+                elif review_first_render_fallback_bundle is not None:
+                    review_first_singleton_bundle = review_first_render_fallback_bundle
+                if group_first is not None:
+                    group_first.promote(review_first_singleton_bundle,
+                        plan=review_first_singleton_bundle.render_plan, authority=selected_path_authority)
+                    review_first_visual_selection_payload["first_result_controller"] = group_first.to_dict()
+                    review_first_visual_selection_payload["audit_path"] = str(request.output_directory /
+                        f"{base_filename}-review-first-selection-audit.json")
+                    _write_analysis_manifest_atomically(Path(review_first_visual_selection_payload["audit_path"]),
+                        review_first_visual_selection_payload)
                 plan = review_first_singleton_bundle.render_plan
                 segments = plan.segments
             if review_rendered_proxies:
@@ -34785,6 +34982,9 @@ def analyze(
             ),
         )
         review_first_runtime.checkpoint("full_render_complete")
+        if group_first is not None:
+            group_first.render_complete()
+            review_first_visual_selection_payload["first_result_controller"] = group_first.to_dict()
         timeline_interchange_paths = write_timeline_interchange_bundle(
             plan,
             output_directory=request.output_directory,
@@ -36024,6 +36224,140 @@ def analyze(
                 for _path_selection_attempt in range(
                     maximum_path_selection_attempt_count
                 ):
+                    if review_first_runtime.enabled:
+                        from .first_result_controller import FirstResultController
+                        # The selected path has already passed source/member and
+                        # synchronization checks. Freeze its primitive render
+                        # before attempting optional cameras; a proposal error
+                        # must not erase that path or relaunch the selector.
+                        primitive_segments = _attach_direct_member_portrait_fill_geometry(
+                            visual_selection=direct_visual_selection,
+                            eligible_indices=eligible_indices,
+                            eligible_source_aspect_ratios=direct_full_frame_ratios,
+                            render_segments=tuple(replace(item, crop=None, pan_crop=None,
+                                editorial_transform=None, outgoing_overlap_transform=None) for item in segments),
+                        )
+                        primitive_motion = EditorialMotionPlan(
+                            segments=tuple(EditorialMotionSegment(index, direct_visual_selection.source_indices[index], None,
+                                ("review_first_verified_source_primitive",))
+                                for index, item in enumerate(primitive_segments)),
+                            boundary_match_count=0, zoom_event_count=0, pan_event_count=0,
+                            roll_event_count=0, blocked_dissolve_segment_count=0,
+                            analysis_basis="official_target_fancam_verified_primitive_v1",
+                        )
+                        primitive_look = build_member_look_proxy_proposal(
+                            visual_selection=direct_visual_selection, render_segments=primitive_segments,
+                            mandatory_decoded_proxy=True)
+                        primitive_segments = primitive_look.apply(primitive_segments)
+                        candidate_width, candidate_height = direct_member_output_frame_size
+                        primitive_plan = RenderPlan(sources=request.sources, segments=primitive_segments,
+                            reference_source=request.reference_source, aspect_ratio=request.aspect_ratio,
+                            output=request.output_directory / f".{base_filename}-member-preflight-placeholder.mp4",
+                            master_audio_start=member_common_start, width=candidate_width, height=candidate_height,
+                            transitions=tuple(RenderTransition(reason="verified_member_primitive_hard_cut")
+                                for _ in range(len(primitive_segments)-1)),
+                            member_pose_dissolve_requested=direct_member_pose_dissolve_enabled,
+                            member_pose_dissolve_effective=False, member_pose_dissolve_count=0)
+                        member_first = FirstResultController(review_first_runtime, sources=request.sources,
+                            source_durations=tuple(float(info.video_streams[0].duration_seconds or
+                                info.duration_seconds or 0.) for info in media),
+                            master_start=member_common_start, duration=primitive_plan.duration,
+                            allowed_source_indices=eligible_indices)
+                        primitive = (primitive_plan, primitive_motion, primitive_look,
+                            {"applied_count": 0, "boundaries": [], "quality_approved": False}, {})
+                        member_first.install_baseline(primitive, plan=primitive_plan,
+                            authority="verified_member_source_primitive")
+
+                        def propose_member_camera():
+                            config = _direct_member_editorial_motion_config_from_visual_config(
+                                direct_visual_selection.config)
+                            dense_face_provider.begin_focal_boundary_reference_capture()
+                            motion = build_direct_member_editorial_motion_plan(
+                                visual_selection=direct_visual_selection, render_segments=segments,
+                                transitions=member_transitions, common_master_start=member_common_start,
+                                geometry_provider=direct_member_geometry_provider, fps=29.97, config=config)
+                            refs = _direct_member_focal_boundary_reference_mapping(
+                                direct_visual_selection.source_indices,
+                                dense_face_provider.focal_boundary_reference_capture())
+                            for index, (outgoing, incoming) in enumerate(zip(
+                                    direct_visual_selection.source_indices,
+                                    direct_visual_selection.source_indices[1:])):
+                                if outgoing == incoming or index in refs:
+                                    continue
+                                cut = direct_visual_selection.selected_boundary_master_seconds[index]
+                                def local_time(source, master):
+                                    warp = source_timewarps[eligible_indices[source]]
+                                    return warp.master_to_source(master) if warp is not None else master + offsets[source]
+                                pair = dense_face_provider.recover_exact_focal_pair_from_registered_references(
+                                    outgoing, local_time(outgoing, max(member_common_start, cut-1/29.97)),
+                                    incoming, local_time(incoming, cut))
+                                if pair is not None:
+                                    refs[index] = pair
+                            attached = _attach_direct_member_editorial_motion_tracks(
+                                visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
+                                render_segments=segments, motion_plan=motion)
+                            attached, proposed_transitions, camera_audit = register_automatic_member_dissolves(
+                                render_segments=attached, transitions=member_transitions,
+                                visual_selection=direct_visual_selection,
+                                eligible_request_source_indices=eligible_indices, common_master_start=member_common_start,
+                                focal_provider=dense_face_provider, config=config,
+                                registration_cache=joint_dissolve_registration_cache)
+                            preflight = MemberJointCameraPreflight(maximum_reselections=0).review(
+                                visual_selection=direct_visual_selection, render_segments=attached,
+                                transitions=proposed_transitions, camera_audit=camera_audit)
+                            if not preflight["passed"]:
+                                raise ValueError("optional joint camera unverified: " + preflight["reason"])
+                            attached = _attach_direct_member_portrait_fill_geometry(
+                                visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
+                                eligible_source_aspect_ratios=direct_full_frame_ratios, render_segments=attached)
+                            look = build_member_look_proxy_proposal(visual_selection=direct_visual_selection,
+                                render_segments=attached, mandatory_decoded_proxy=True)
+                            dissolve_count = sum(t.kind is TransitionKind.FACE_DISSOLVE for t in proposed_transitions)
+                            proposed_plan = replace(primitive_plan, segments=look.apply(attached),
+                                transitions=proposed_transitions, member_pose_dissolve_count=dissolve_count,
+                                member_pose_dissolve_effective=dissolve_count > 0)
+                            return proposed_plan, motion, look, camera_audit, refs
+
+                        proposed = member_first.run_optional("member_camera_and_dissolve", propose_member_camera,
+                            validate=lambda value: member_first.validate_plan(value[0]))
+                        if proposed is not None:
+                            member_first.promote(proposed, plan=proposed[0], authority="registered_member_camera_proposal")
+                        else:
+                            direct_motion_error = "optional camera proposal unavailable; verified primitive retained"
+                            warnings.append("멤버 카메라/효과 후보 미적용 · 동일 소스·시간축 기본안을 유지하며 최종 품질 QA는 별도 수행")
+                        (candidate_plan, candidate_member_motion_plan, candidate_member_look_plan,
+                         candidate_joint_dissolve_audit, candidate_focal_reference_candidates_by_boundary_index) = member_first.incumbent
+                        direct_cadence["first_result_controller"] = member_first.to_dict()
+                        direct_cadence["member_pose_dissolve_effective"] = candidate_plan.member_pose_dissolve_effective
+                        direct_cadence["member_pose_dissolve_count"] = candidate_plan.member_pose_dissolve_count
+                        if proposed is None:
+                            pose_payload = deepcopy(direct_cadence["pose_matched_dissolves"])
+                            direct_cadence["pose_matched_dissolves"] = {
+                                **pose_payload, "source_domain_planner_result": pose_payload,
+                                "member_pose_dissolve_effective": False, "member_pose_dissolve_count": 0,
+                                "selected_dissolve_count": 0, "selected_dissolves_per_minute": 0.,
+                                "selected_highlight_count": 0, "selected_both_moving_count": 0,
+                                "hard_cut_count": len(candidate_plan.transitions),
+                                "quality_approved": False, "first_result_primitive_used": True}
+                        decoded_proxy_path_audition_count = decoded_proxy_render_count = 1
+                        member_proxy_preflight, rendered_proxy_review_payload, rendered_proxy_review_path = (
+                            review_direct_member_candidate_proxy(candidate_plan, candidate_member_motion_plan,
+                                proxy_render_index=1))
+                        technical_issues = member_proxy_technical_issues(rendered_proxy_review_payload)
+                        if technical_issues:
+                            raise RuntimeError("member review-first proxy technical failure: " + ", ".join(technical_issues))
+                        segments, member_transitions = candidate_plan.segments, candidate_plan.transitions
+                        direct_cadence["joint_dissolve_registration"] = deepcopy(candidate_joint_dissolve_audit)
+                        member_look_plan, member_editorial_motion_plan = candidate_member_look_plan, candidate_member_motion_plan
+                        accepted_rendered_proxy_preflight_payload = deepcopy(rendered_proxy_review_payload)
+                        accepted_rendered_proxy_preflight_payload["review_first_decision"] = {
+                            "retained_first_technically_valid_candidate": True, "quality_approved": False,
+                            "quality_triggered_rerenders": 0, "final_pixel_qa_required": True,
+                            "controller": member_first.to_dict()}
+                        member_final_focal_reference_candidates_by_boundary_index = dict(
+                            candidate_focal_reference_candidates_by_boundary_index)
+                        reporter.log("멤버 단일 경로 · 보정 실패는 기록하고 첫 기술 정상 출력의 최종 QA로 진행")
+                        break
                     current_path_proxy_render_count = 0
                     untouched_direct_segments = segments
                     required_transform_boundary_indices = tuple(
@@ -37957,8 +38291,9 @@ def analyze(
                     "attempted": True,
                     "completed": direct_motion_error is None,
                     "fallback_to_untouched_full_frame": (
-                        direct_motion_error is not None
+                        direct_motion_error is not None and not review_first_runtime.enabled
                     ),
+                    "fallback_to_verified_primitive": direct_motion_error is not None and review_first_runtime.enabled,
                     "dense_render_path_reselection_count": (
                         dense_render_path_reselection_count
                     ),
@@ -38342,6 +38677,9 @@ def analyze(
                 ),
             )
             review_first_runtime.checkpoint("full_render_complete")
+            if review_first_runtime.enabled and use_direct_member_full_frame:
+                member_first.render_complete()
+                direct_cadence["first_result_controller"] = member_first.to_dict()
             timeline_interchange_paths = write_timeline_interchange_bundle(
                 plan,
                 output_directory=request.output_directory,

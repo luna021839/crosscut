@@ -12,6 +12,7 @@ snapshot made for a different source pool or clock solution.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from dataclasses import dataclass
 import hashlib
@@ -311,6 +312,7 @@ class StageEditInferenceSnapshotResult:
         }
 
 
+@isolated_optional()
 def materialize_stage_edit_inference_snapshot(
     *,
     song_id: str,

@@ -18,6 +18,7 @@ descriptors are never serialized.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -1354,6 +1355,7 @@ def _track_for_segment(
     )
 
 
+@isolated_optional()
 def build_boundary_subject_alignment_plan(
     *,
     visual_timeline: VisualTimelinePlan,

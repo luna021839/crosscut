@@ -164,6 +164,26 @@ class ProReviewFollowupTests(unittest.TestCase):
             self.assertEqual(collector.issues, [])
             self.assertTrue(all(metrics["checks"].values()), metrics["checks"])
 
+    def test_domain_verdict_is_recomputed_with_its_serialized_policy(self):
+        for domain in ("introduced_cross_source", "tier_d_continuity", "native_source_cut"):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as directory:
+                analysis, plan, selection = self._current_review_fixture(directory)
+                summary = selection["final_selected_review"]["boundary_domains"][domain]
+                summary["passed"] = not summary["passed"]
+                _install_review_first_contract(analysis, selection)
+                metrics, _ = _validate_selection(analysis, plan, selection,
+                    PostRenderQAConfig(required_complete_candidate_count=1), _IssueCollector())
+                self.assertFalse(metrics["checks"]["final_selected_decoded_review_contract_valid"])
+
+    def test_policy_change_cannot_leave_stale_domain_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            analysis, plan, selection = self._current_review_fixture(directory)
+            selection["final_selected_review"]["review_policy"]["minimum_boundary_score_p10"] = 99.
+            _install_review_first_contract(analysis, selection)
+            metrics, _ = _validate_selection(analysis, plan, selection,
+                PostRenderQAConfig(required_complete_candidate_count=1), _IssueCollector())
+            self.assertFalse(metrics["checks"]["final_selected_decoded_review_contract_valid"])
+
     def test_unknown_scores_are_quality_misses_not_malformed_contracts(self):
         for missing_count in (1, 8):
             with self.subTest(missing_count=missing_count), tempfile.TemporaryDirectory() as directory:

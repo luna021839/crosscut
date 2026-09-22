@@ -1,0 +1,138 @@
+import os
+from pathlib import Path
+import tempfile
+import subprocess
+import sys
+from threading import Event
+from time import monotonic
+import unittest
+from unittest.mock import patch
+
+from crosscut.optional_native_worker import run_isolated_python_call, optional_native_scope, current_optional_deadline
+from crosscut.review_first_runtime import ReviewFirstSearchCutoff
+from tests.process_fixture import assert_group_member_stopped
+
+
+@unittest.skipUnless(os.name == "posix", "native workers require POSIX")
+class OptionalNativeWorkerTests(unittest.TestCase):
+    def test_real_worker_round_trips_typed_result_and_exceptions(self):
+        value = {"result": (1, 2, Path("/synthetic/checkpoint"))}
+        self.assertEqual(run_isolated_python_call("tests.optional_worker_fixture", "echo",
+            {"value": value}, deadline=monotonic()+10.), value)
+        large = b'private-in-memory-only' * 100000
+        with patch('tempfile.TemporaryDirectory', side_effect=AssertionError('IPC must not persist descriptors')):
+            self.assertEqual(run_isolated_python_call("tests.optional_worker_fixture", "noisy_echo",
+                {"value": large}, deadline=monotonic()+10.), large)
+        with self.assertRaisesRegex(RuntimeError, "injected model failure"):
+            run_isolated_python_call("tests.optional_worker_fixture", "fail", {}, deadline=monotonic()+10.)
+
+    def test_native_block_and_descendant_are_killed_at_optional_deadline(self):
+        for name in ("native_block", "native_descendant"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "pid"
+                started = monotonic()
+                with self.assertRaises(ReviewFirstSearchCutoff):
+                    run_isolated_python_call("tests.optional_worker_fixture", name,
+                        {"pid_file": str(path)}, deadline=started+3.)
+                self.assertTrue(path.is_file(), "fixture startup did not reach native blocking code")
+                pid, group = map(int, path.read_text().split())
+                assert_group_member_stopped(self, pid, group)
+                self.assertLess(monotonic()-started, 4.5)
+
+    def test_materializers_use_isolation_only_inside_optional_scope(self):
+        from crosscut.stage_edit_head_materializer import materialize_stage_edit_head_frames_v2, materialize_stage_edit_head_frames_v3
+        self.assertIsNone(current_optional_deadline())
+        for function in (materialize_stage_edit_head_frames_v2, materialize_stage_edit_head_frames_v3):
+            with self.subTest(function=function.__name__), optional_native_scope(123.), patch(
+                    'crosscut.optional_native_worker.run_isolated_python_call', return_value="typed-result") as run:
+                self.assertEqual(function(checkpoint_directory=Path('/synthetic/checkpoint'), sequence=None,
+                                          canonical_source_ids=('a',)), "typed-result")
+                self.assertEqual(run.call_args.args[:2], ('crosscut.stage_edit_head_materializer', function.__name__))
+                self.assertEqual(run.call_args.kwargs['deadline'], 123.)
+        self.assertIsNone(current_optional_deadline())
+
+    def test_guard_terminates_native_work_when_owning_analysis_disappears(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native-pid"
+            code = ("from crosscut.optional_native_worker import run_isolated_python_call; "
+                    "from time import monotonic; "
+                    f"run_isolated_python_call('tests.optional_worker_fixture','native_block',"
+                    f"{{'pid_file':{str(path)!r}}}, deadline=monotonic()+15.)")
+            parent = subprocess.Popen([sys.executable, '-c', code])
+            try:
+                until = monotonic()+10.
+                while (not path.is_file() or len(path.read_text().split()) != 2) and monotonic() < until:
+                    Event().wait(.01)
+                self.assertTrue(path.is_file(), 'native fixture never started')
+                pid, group = map(int, path.read_text().split())
+                parent.kill()
+                parent.wait(timeout=2.)
+                assert_group_member_stopped(self, pid, group)
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                parent.wait(timeout=2.)
+
+    def test_actual_tiny_mlx_head_result_crosses_process_boundary(self):
+        from crosscut.stage_edit_transformer import mlx_runtime_version
+        from crosscut.stage_edit_head_materializer import StageEditHeadMaterializationResult
+        if mlx_runtime_version() is None:
+            self.skipTest('MLX unavailable')
+        result = run_isolated_python_call('tests.optional_worker_fixture', 'synthetic_mlx_head', {}, deadline=monotonic()+20.)
+        self.assertIsInstance(result, StageEditHeadMaterializationResult)
+        self.assertEqual(result.dynamic_crop_version, 3)
+        self.assertEqual(result.canonical_source_ids, ('A', 'B'))
+        self.assertEqual(result.to_dict()['frame_count'], 2)
+
+    def test_controller_alarm_and_native_guard_preserve_render_reserve(self):
+        from crosscut.first_result_controller import FirstResultController
+        from crosscut.review_first_runtime import ReviewFirstRuntime
+        from crosscut.render import RenderPlan, RenderSegment
+        from crosscut.ive import AspectRatio
+        from tests.optional_worker_fixture import decorated_native_block
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'blocked-pid'
+            runtime = ReviewFirstRuntime(enabled=True, total_budget_seconds=8.,
+                first_render_budget_seconds=3., refinement_stop_seconds=4.)
+            plan = RenderPlan(sources=(Path('/synthetic/a'),),
+                segments=(RenderSegment(source_index=0, source_start=0., master_start=0., duration=1.),),
+                reference_source=0, aspect_ratio=AspectRatio.LANDSCAPE, output=Path('/synthetic/out'))
+            controller = FirstResultController(runtime, sources=plan.sources, source_durations=(2.,),
+                master_start=0., duration=1.)
+            controller.install_baseline(plan, plan=plan, authority='synthetic-baseline')
+            result = controller.run_optional('native_camera', lambda: decorated_native_block(pid_file=str(path)))
+            self.assertIsNone(result)
+            self.assertIs(controller.incumbent, plan)
+            self.assertTrue(path.is_file(), 'test must enter native blocking code')
+            pid, group = map(int, path.read_text().split())
+            assert_group_member_stopped(self, pid, group)
+            self.assertGreater(runtime.total_budget_seconds - runtime.elapsed_seconds, 3.)
+            self.assertEqual(controller.to_dict()['attempts'][0]['status'], 'search_cutoff')
+
+    def test_all_opted_in_native_boundaries_dispatch_before_execution(self):
+        from crosscut.boundary_affine_plan import build_boundary_affine_plan
+        from crosscut.boundary_subject_alignment import build_boundary_subject_alignment_plan
+        from crosscut.visual_boundary_repair import repair_visual_timeline_boundaries
+        from crosscut.ive_causal_sensing_pipeline_inputs import materialize_ive_causal_sensing_for_stage_edit_pipeline
+        from crosscut.stage_edit_inference_snapshot import materialize_stage_edit_inference_snapshot
+        from crosscut.stage_edit_visual_candidate_adapter import materialize_stage_edit_visual_candidate
+        from crosscut.visual_score import rehydrate_visual_timeline_dissolve_evidence
+        from crosscut.source_look_match import analyze_source_look_match
+        import inspect
+        for function in (build_boundary_affine_plan, build_boundary_subject_alignment_plan,
+                         repair_visual_timeline_boundaries, materialize_ive_causal_sensing_for_stage_edit_pipeline,
+                         materialize_stage_edit_inference_snapshot, materialize_stage_edit_visual_candidate,
+                         rehydrate_visual_timeline_dissolve_evidence, analyze_source_look_match):
+            with self.subTest(function=function.__name__), optional_native_scope(123.), patch(
+                    'crosscut.optional_native_worker.run_isolated_python_call', return_value='isolated') as run:
+                kwargs = {name: None for name, parameter in inspect.signature(function).parameters.items()
+                          if parameter.default is inspect.Parameter.empty}
+                self.assertEqual(function(**kwargs), 'isolated')
+                self.assertEqual(run.call_args.args[:2], (function.__module__, function.__name__))
+
+    def test_expired_or_invalid_deadline_cannot_launch(self):
+        with self.assertRaises(ReviewFirstSearchCutoff):
+            run_isolated_python_call("no-module", "no-call", {}, deadline=monotonic()-1)
+        for value in (True, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                run_isolated_python_call("no-module", "no-call", {}, deadline=value)

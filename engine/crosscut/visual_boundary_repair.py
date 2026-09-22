@@ -8,6 +8,7 @@ pose, framing and structure discontinuity.  The output is a new immutable
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -1950,6 +1951,7 @@ def _updated_entry(
     return replace(choice, **changes)
 
 
+@isolated_optional()
 def repair_visual_timeline_boundaries(
     *,
     visual_timeline: VisualTimelinePlan,

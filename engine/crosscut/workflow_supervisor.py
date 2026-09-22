@@ -33,20 +33,25 @@ def terminate_owned_process_group(
             process.kill()
         process.wait(timeout=max(0.1, grace_seconds))
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait()
-        return
     # Waiting for the leader alone is insufficient: a descendant can ignore
     # TERM and keep media files / the app's stdout pipe open after it exits.
+    # Concurrent guard termination has produced EPERM followed by ESRCH in
+    # local native-worker tests; the cause is not assumed from EPERM alone.
+    # Retry within the *existing* cleanup grace, never treat permission denial
+    # itself as evidence of termination or silently ignore a live group.
     until = monotonic() + grace_seconds
+    term_sent = False
     while monotonic() < until:
         process.poll()
         try:
-            os.killpg(process.pid, 0)
+            os.killpg(process.pid, 0 if term_sent else signal.SIGTERM)
+            term_sent = True
         except ProcessLookupError:
-            break
+            process.wait(timeout=max(0.1, grace_seconds))
+            return
+        except PermissionError:
+            Event().wait(min(0.01, max(0.0, until - monotonic())))
+            continue
         try:
             process.wait(timeout=min(0.02, max(0.001, until - monotonic())))
         except subprocess.TimeoutExpired:

@@ -486,6 +486,8 @@ def _promote_review_to_domain_aware_v3(
     review: dict[str, object],
     plan: dict[str, object],
 ) -> None:
+    from crosscut.rendered_proxy_review import ProxyReviewConfig
+    review["review_policy"] = ProxyReviewConfig().to_dict()
     transitions = plan["transitions"]
     assert isinstance(transitions, list)
     boundaries = review["boundaries"]

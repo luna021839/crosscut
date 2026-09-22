@@ -1112,6 +1112,13 @@ def materialize_stage_edit_head_frames_v2(
 ) -> StageEditHeadMaterializationResult:
     """Run a verified production Dynamic Crop v2 checkpoint exactly once."""
 
+    from .optional_native_worker import current_optional_deadline, run_isolated_python_call
+    deadline = current_optional_deadline()
+    if deadline is not None:
+        return run_isolated_python_call(__name__, "materialize_stage_edit_head_frames_v2", dict(
+            checkpoint_directory=checkpoint_directory, sequence=sequence, canonical_source_ids=canonical_source_ids,
+            schema=schema, source_shot_sizes_by_token=source_shot_sizes_by_token), deadline=deadline)
+
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
     dynamic_metadata_path = _require_materializer_checkpoint_namespace(
         checkpoint,
@@ -1242,6 +1249,14 @@ def materialize_stage_edit_head_frames_v3(
     derivative_family_id_by_source: Mapping[str, int] | None = None,
 ) -> StageEditHeadMaterializationResult:
     """Run one verified source-conditioned Dynamic Crop v3 checkpoint."""
+
+    from .optional_native_worker import current_optional_deadline, run_isolated_python_call
+    deadline = current_optional_deadline()
+    if deadline is not None:
+        return run_isolated_python_call(__name__, "materialize_stage_edit_head_frames_v3", dict(
+            checkpoint_directory=checkpoint_directory, sequence=sequence, canonical_source_ids=canonical_source_ids,
+            schema=schema, source_shot_sizes_by_token=source_shot_sizes_by_token,
+            derivative_family_id_by_source=derivative_family_id_by_source), deadline=deadline)
 
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
     dynamic_metadata_path = _require_materializer_checkpoint_namespace(

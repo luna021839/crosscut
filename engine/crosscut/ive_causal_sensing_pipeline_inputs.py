@@ -12,6 +12,7 @@ decoding all happen only after that metadata-only guard succeeds.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from dataclasses import dataclass
 import errno
@@ -781,6 +782,7 @@ def prepare_ive_causal_sensing_pipeline_request(
     )
 
 
+@isolated_optional()
 def materialize_ive_causal_sensing_for_stage_edit_pipeline(
     *,
     song: str,

@@ -2095,7 +2095,7 @@ def _coalescing_look(
 def _editorial_transform_track_is_identity(
     track: EditorialTransformTrack | None,
 ) -> bool:
-    """Return whether an authored track renders the identity at every frame.
+    """Return whether a track's numeric camera parameters are neutral.
 
     Joint decoded candidates deliberately retain a process-bound renderer
     track even when every authorized keyframe is neutral.  Treating the mere
@@ -2103,6 +2103,9 @@ def _editorial_transform_track_is_identity(
     same-source runs from sharing one decode clock and could duplicate the
     split frame.  Linear interpolation between neutral keyframes is neutral,
     so checking every keyframe is an exact proof for the complete track.
+    This does NOT make the track equivalent to None: an authored neutral
+    camera still selects aspect-fill, whereas None selects contain+pad.
+    Pixel coalescing must compare that fit policy and preserve the track.
     """
 
     if track is None:
@@ -2244,6 +2247,7 @@ def _can_coalesce_identity_run(
     for offset, segment in enumerate(segments):
         if (
             not _has_identity_geometry(segment)
+            or (segment.editorial_transform is None) != (first.editorial_transform is None)
             or _coalescing_look(segment.look_adjustment) != first_look
         ):
             return False
@@ -2314,6 +2318,9 @@ def _combined_identity_segment(
         duration=sum(segment.duration for segment in segments),
         master_start=first.master_start,
         source_duration=last.source_end - first.source_start,
+        # Neutral camera presence carries aspect-fill semantics. Its last
+        # neutral keyframe extends over the combined duration unchanged.
+        editorial_transform=first.editorial_transform,
         look_adjustment=_coalescing_look(first.look_adjustment),
         boundary_look_track=_combined_boundary_look_track(segments),
     )
@@ -2335,6 +2342,7 @@ def _can_coalesce_post_clock_identity_slice(
     for offset, segment in enumerate(selected):
         if (
             not _has_identity_geometry(segment)
+            or (segment.editorial_transform is None) != (first.editorial_transform is None)
             or _coalescing_look(segment.look_adjustment) != first_look
         ):
             return False

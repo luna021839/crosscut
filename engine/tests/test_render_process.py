@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from crosscut.render_process import run_observed_render,render_log_callback
+from tests.process_fixture import wait_for_pid_file
 
 
 class FakeProcess:
@@ -60,9 +61,13 @@ class RenderProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / "progress-child"
+            ready_file = root / "ready"
+            release_file = root / "release"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import time\n"
+                "import os, time\nfrom pathlib import Path\n"
+                f"Path({str(ready_file)!r}).write_text(str(os.getpid()))\n"
+                f"while not Path({str(release_file)!r}).exists(): time.sleep(.005)\n"
                 "print('frame=1', flush=True)\n"
                 "print('progress=continue', flush=True)\n"
                 "time.sleep(10)\n",
@@ -70,39 +75,68 @@ class RenderProcessTests(unittest.TestCase):
             )
             executable.chmod(0o755)
             blocker = threading.Event()
+            callback_started = threading.Event()
             started = monotonic()
-            with self.assertRaises(subprocess.TimeoutExpired):
-                run_observed_render(
-                    [str(executable)],
-                    stderr_path=root / "stderr",
-                    progress_callback=lambda _event: blocker.wait(),
-                    timeout_seconds=0.2,
-                )
-            self.assertLess(monotonic() - started, 3.0)
+            offset = [0.]
+            ready_at = [None]
+            real_popen = subprocess.Popen
+            def ready_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                wait_for_pid_file(process, ready_file)
+                ready_at[0] = monotonic()
+                offset[0] = ready_at[0] - started
+                release_file.touch()
+                return process
+            def block_callback(_event):
+                callback_started.set()
+                blocker.wait()
+            try:
+                with patch('crosscut.render_process.subprocess.Popen', side_effect=ready_popen), patch(
+                    'crosscut.render_process.monotonic', side_effect=lambda: monotonic() - offset[0]
+                ), self.assertRaises(subprocess.TimeoutExpired):
+                    run_observed_render([str(executable)], stderr_path=root / "stderr",
+                                        progress_callback=block_callback, timeout_seconds=.2)
+            finally:
+                blocker.set()
+            self.assertTrue(callback_started.is_set(), 'startup timeout is not a stalled callback test')
+            self.assertLess(monotonic() - ready_at[0], 3.0)
 
     @unittest.skipUnless(os.name == "posix", "POSIX process groups required")
     def test_exited_parent_is_not_held_by_grandchild_progress_pipe(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / "inherited-pipe-parent"
+            ready_file = root / "ready"
+            release_file = root / "release"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import subprocess, sys\n"
+                "import os, subprocess, sys, time\nfrom pathlib import Path\n"
                 "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
+                f"Path({str(ready_file)!r}).write_text(str(os.getpid()))\n"
+                f"while not Path({str(release_file)!r}).exists(): time.sleep(.005)\n"
                 "print('frame=1', flush=True)\n"
                 "print('progress=end', flush=True)\n",
                 encoding="utf-8",
             )
             executable.chmod(0o755)
             started = monotonic()
-            result = run_observed_render(
-                [str(executable)],
-                stderr_path=root / "stderr",
-                progress_callback=lambda _event: None,
-                timeout_seconds=2.0,
-            )
+            offset = [0.]
+            ready_at = [None]
+            real_popen = subprocess.Popen
+            def ready_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                wait_for_pid_file(process, ready_file)
+                ready_at[0] = monotonic()
+                offset[0] = ready_at[0] - started
+                release_file.touch()
+                return process
+            with patch('crosscut.render_process.subprocess.Popen', side_effect=ready_popen), patch(
+                'crosscut.render_process.monotonic', side_effect=lambda: monotonic() - offset[0]
+            ):
+                result = run_observed_render([str(executable)], stderr_path=root / "stderr",
+                    progress_callback=lambda _event: None, timeout_seconds=2.)
             self.assertEqual(result.returncode, 0)
-            self.assertLess(monotonic() - started, 1.0)
+            self.assertLess(monotonic() - ready_at[0], 1.0)
 
     def test_app_log_uses_encoder_counts_not_quality_approval(self):
         logs=[];callback=render_log_callback(SimpleNamespace(log=logs.append),total_frames=100)
@@ -117,13 +151,30 @@ class RenderProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / 'partial-progress'
-            executable.write_text('#!/usr/bin/env python3\nimport sys,time\nsys.stdout.write("frame=1");sys.stdout.flush();time.sleep(20)\n')
+            ready_file = root / 'ready'
+            executable.write_text('#!/usr/bin/env python3\nimport os,sys,time\nfrom pathlib import Path\n'
+                'sys.stdout.write("frame=1");sys.stdout.flush()\n'
+                f'Path({str(ready_file)!r}).write_text(str(os.getpid()))\ntime.sleep(20)\n')
             executable.chmod(0o755)
             started = monotonic()
-            with self.assertRaises(subprocess.TimeoutExpired):
+            offset = [0.]
+            ready_at = [None]
+            real_popen = subprocess.Popen
+            def ready_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                wait_for_pid_file(process, ready_file)
+                ready_at[0] = monotonic()
+                offset[0] = ready_at[0] - started
+                return process
+            with patch('crosscut.render_process.subprocess.Popen', side_effect=ready_popen), patch(
+                'crosscut.render_process.monotonic', side_effect=lambda: monotonic() - offset[0]
+            ), self.assertRaises(subprocess.TimeoutExpired):
                 run_observed_render([str(executable)], stderr_path=root / 'stderr',
                     progress_callback=lambda event: None, timeout_seconds=.2)
-            self.assertLess(monotonic() - started, 1.5)
+            self.assertIsNotNone(ready_at[0])
+            self.assertLess(monotonic() - ready_at[0], 1.5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(ready_file.read_text()), 0)
 
 
 if __name__=='__main__':unittest.main()

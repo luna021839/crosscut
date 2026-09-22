@@ -8,6 +8,7 @@ borrows a candidate from the ordinary visual optimizer.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from dataclasses import dataclass, replace
 import hashlib
@@ -1047,6 +1048,7 @@ def materialize_stage_edit_visual_candidates(
         quality_gated_single_delivery=quality_gated_single_delivery)
 
 
+@isolated_optional(progress_callbacks=("progress_callback",))
 def materialize_stage_edit_visual_candidate(
     retained_candidate: RetainedStageEditCandidate,
     *,

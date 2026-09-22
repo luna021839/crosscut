@@ -5,6 +5,7 @@ are retained as blocking issues rather than folded into a generic low score.
 """
 from collections.abc import Mapping
 from copy import deepcopy
+import math
 
 PROXY_INTEGRITY_CONTRACT = "proxy_nested_technical_integrity_v1"
 EDITORIAL_BOUNDARY_REASONS = frozenset({
@@ -14,6 +15,24 @@ EDITORIAL_BOUNDARY_REASONS = frozenset({
     "motion_direction_discontinuity", "subject_continuity_unobserved",
     "boundary_measurements_unavailable", "weighted_boundary_score",
 })
+
+
+def boundary_domain_passed(*, domain: str, score_p10: float | None,
+                          issue_fraction: float, issue_count: int,
+                          review_policy: object) -> bool:
+    """Recompute a domain verdict using the producer's serialized policy."""
+    if not isinstance(review_policy, Mapping):
+        raise ValueError("boundary domain review policy is missing")
+    minimum = review_policy.get("minimum_boundary_score_p10")
+    maximum = review_policy.get("maximum_boundary_issue_fraction")
+    if any(type(value) not in (int, float) or not math.isfinite(value)
+           or not 0 <= value <= bound for value, bound in ((minimum, 100), (maximum, 1))):
+        raise ValueError("boundary domain review policy is invalid")
+    if domain == "introduced_cross_source":
+        return score_p10 is not None and score_p10 >= minimum and issue_fraction <= maximum
+    if domain not in ("tier_d_continuity", "native_source_cut"):
+        raise ValueError("unknown boundary domain")
+    return issue_count == 0
 
 
 def proxy_integrity_evidence(review: Mapping) -> dict:

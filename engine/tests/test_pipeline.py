@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import ExitStack
 from dataclasses import replace
 import hashlib
 import json
@@ -3381,8 +3382,15 @@ class PipelineTests(unittest.TestCase):
                     _cutoff_elapsed=elapsed
                 )
 
+    def test_automatic_group_optional_models_cannot_erase_complete_baseline(self):
+        for case in ("missing", "discovery_error", "motion_error", "all_rejected",
+                     "late_apply_error", "assembly_error", "cutoff", "explicit_registry_error"):
+            with self.subTest(case=case):
+                self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+                    _model_case=case)
+
     def test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
-        self, _cutoff_elapsed=None,
+        self, _cutoff_elapsed=None, _model_case=None,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -3562,6 +3570,99 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.render",
                 return_value="h264_videotoolbox",
             ) as render_video:
+                if _model_case is not None:
+                    import crosscut.pipeline as pipeline
+                    from crosscut.review_first_runtime import ReviewFirstRuntime, ReviewFirstSearchCutoff
+                    from crosscut.stage_edit_production_registry import STAGE_EDIT_PRODUCTION_REGISTRY_ENV
+                    from time import monotonic
+                    class ReachedDecodedProxy(BaseException):
+                        pass
+                    now = [monotonic()]
+                    runtime = ReviewFirstRuntime(enabled=True, _clock=lambda: now[0])
+                    def discover(_request):
+                        if _model_case == "explicit_registry_error":
+                            baseline_builder.assert_not_called()
+                            raise ValueError("explicit registry invalid")
+                        baseline_builder.assert_called_once()
+                        if _model_case == "discovery_error":
+                            raise ValueError("optional registry invalid")
+                        return None if _model_case in {"missing", "assembly_error"} else SimpleNamespace()
+                    generation = SimpleNamespace(
+                        retained_candidates=tuple(SimpleNamespace(rank=index) for index in range(2)),
+                        learned_section_director=SimpleNamespace(section_plan=section_plan))
+                    context = dict(bundle=SimpleNamespace(to_dict=lambda: {"fixture": True}),
+                        motion=None, policy=montage_policy, motion_profile=None, profile_payload=None,
+                        montage_config=pipeline._rendered_montage_config_from_policy(
+                            montage_policy, require_complete_role_duration_policy=True),
+                        snapshot=None, causal_audit=None, generation=generation,
+                        audit_path=root / "synthetic-generation-audit.json")
+                    def rejected_candidate(*args, **kwargs):
+                        if _model_case == "cutoff":
+                            now[0] += 361.
+                            raise ReviewFirstSearchCutoff("injected candidate cutoff")
+                        if _model_case == "late_apply_error":
+                            return SimpleNamespace(visual_plan=visual_timeline)
+                        raise ValueError("injected visual candidate rejection")
+                    def motion(bundle):
+                        if bundle is not None:
+                            baseline_builder.assert_called_once()
+                            raise RuntimeError("optional motion authority invalid")
+                        return None
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.dict("os.environ", {}, clear=True))
+                        if _model_case == "explicit_registry_error":
+                            stack.enter_context(patch.dict("os.environ", {STAGE_EDIT_PRODUCTION_REGISTRY_ENV: str(root / 'invalid-registry')}))
+                        stack.enter_context(patch('crosscut.pipeline.ReviewFirstRuntime', return_value=runtime))
+                        stack.enter_context(patch('crosscut.pipeline._discover_automatic_stage_edit_production_bundle', side_effect=discover))
+                        stack.enter_context(patch('crosscut.pipeline._registered_dynamic_crop_motion_authority_v3', side_effect=motion))
+                        stack.enter_context(patch('crosscut.pipeline.analyze_source_look_match', return_value=None))
+                        if _model_case == 'assembly_error':
+                            bad_face = SimpleNamespace(applied_count=1, fallback_count=0,
+                                pan_crop_for=Mock(side_effect=ValueError('invalid optional pan crop')))
+                            stack.enter_context(patch('crosscut.pipeline.build_face_match_plan', return_value=bad_face))
+                            stack.enter_context(patch('crosscut.pipeline.rehydrate_visual_timeline_dissolve_evidence', return_value=visual_timeline))
+                        candidate = stack.enter_context(patch('crosscut.pipeline.materialize_stage_edit_visual_candidate', side_effect=rejected_candidate))
+                        if _model_case in {"all_rejected", "late_apply_error", "cutoff"}:
+                            def model_context(**kwargs):
+                                baseline_builder.assert_called_once()
+                                return context
+                            stack.enter_context(patch('crosscut.pipeline._review_first_registered_group_generation', side_effect=model_context))
+                        stack.enter_context(patch('crosscut.pipeline._apply_stage_edit_candidate_render_contract', side_effect=ValueError('injected late geometry rejection')))
+                        proxy = stack.enter_context(patch('crosscut.pipeline.render_and_review_proxy', side_effect=ReachedDecodedProxy))
+                        if _model_case == "explicit_registry_error":
+                            with self.assertRaisesRegex(ValueError, 'explicit registry invalid'):
+                                analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
+                            proxy.assert_not_called()
+                        else:
+                            with self.assertRaises(ReachedDecodedProxy):
+                                analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
+                            plan = proxy.call_args.args[0]
+                            self.assertIsInstance(plan, RenderPlan)
+                            self.assertEqual(plan.sources, tuple(path.resolve() for path in sources))
+                            self.assertEqual(plan.output_frame_count, round(8 * plan.fps))
+                            audit_paths = list(automatic_request.output_directory.glob('*-review-first-selection-audit.json'))
+                            self.assertEqual(len(audit_paths), 1)
+                            audit = json.loads(audit_paths[0].read_text())
+                            self.assertEqual(audit['authority'], 'deterministic_full_song_visual_selector')
+                            self.assertTrue(audit['first_result_controller']['baseline_retained'])
+                            if _model_case in {"all_rejected", "late_apply_error"}:
+                                self.assertEqual(len(audit['stage_edit_rejections']), 2)
+                                self.assertEqual(candidate.call_count, 2)
+                                self.assertFalse(audit['unselected_generation_attempt']['selected_for_render'])
+                            if _model_case == 'cutoff':
+                                self.assertEqual(candidate.call_count, 1)
+                                self.assertIn('search_cutoff', audit)
+                            if _model_case in {'discovery_error', 'motion_error'}:
+                                self.assertTrue(any(row['stage'] == 'default_registered_models' and row['status'] == 'rejected'
+                                    for row in audit['first_result_controller']['attempts']))
+                            if _model_case == 'missing':
+                                self.assertTrue(any(row['stage'] == 'default_registered_models' and row['status'] == 'unavailable'
+                                    for row in audit['first_result_controller']['attempts']))
+                            if _model_case == 'assembly_error':
+                                self.assertTrue(any(row['stage'] == 'final_geometry_plan' and row['status'] == 'rejected'
+                                    for row in audit['first_result_controller']['attempts']))
+                        render_video.assert_not_called()  # Sentinel stops at real decoded-proxy entry.
+                    return
                 if _cutoff_elapsed is not None:
                     from crosscut.review_first_runtime import ReviewFirstRuntime, ReviewFirstDeadlineExceeded
                     now = [0.]
@@ -8269,8 +8370,26 @@ class PipelineTests(unittest.TestCase):
     def test_member_review_first_quality_miss_renders_once_and_reaches_final_review_ready(self) -> None:
         self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(_quality_miss=True)
 
-    def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(self, _quality_miss=False) -> None:
+    def test_member_default_dissolve_missing_camera_keeps_first_plan_without_reselection(self):
+        self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
+            _quality_miss=True, _camera_failure="joint", _dissolve_requested=True)
+
+    def test_member_dense_camera_failure_keeps_first_plan_without_reselection(self):
+        self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
+            _quality_miss=True, _camera_failure="dense", _dissolve_requested=True)
+
+    def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
+            self, _quality_miss=False, _camera_failure=None, _dissolve_requested=False) -> None:
         from crosscut.pipeline import _enforce_automatic_member_post_render_qa as actual_member_gate
+        from crosscut.member_joint_camera_preflight import MemberJointCameraPreflight
+        original_camera_review = MemberJointCameraPreflight.review
+        def camera_review(preflight, **kwargs):
+            if _camera_failure == "joint":
+                return {"passed": False, "reason": "required_camera_audit_missing"}
+            return original_camera_review(preflight, **kwargs)
+        camera_patcher = patch("crosscut.member_joint_camera_preflight.MemberJointCameraPreflight.review", camera_review)
+        camera_patcher.start()
+        self.addCleanup(camera_patcher.stop)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sources = tuple(root / f"official-gaeul-{index}.mp4" for index in range(10))
@@ -8284,7 +8403,7 @@ class PipelineTests(unittest.TestCase):
                     "target_member": "가을",
                     "source_mode": "automatic",
                     "sources": [],
-                    "member_pose_dissolve_enabled": False,
+                    "member_pose_dissolve_enabled": _dissolve_requested,
                     "output_directory": str(root / "out"),
                 }
             ).with_materialized_sources(sources, member_anchors=())
@@ -8544,14 +8663,14 @@ class PipelineTests(unittest.TestCase):
                 return report_path
 
             def member_proxy_continuity():
-                return {'schema_version': 1, 'analysis': 'automatic_member_exact_rendered_boundary_continuity_v1',
-                    'passed': not _quality_miss,
-                    'failure_reasons': ['rendered_pose_p95_above_floor'] if _quality_miss else [],
-                    'failure_boundary_indices': {}, 'boundaries': [],
-                    'metrics': {'output_frame_count': 1200, 'exact_incoming_first_frame_evaluated': True,
-                        'final_render_transform_domain_evaluated': True, 'attention_position_mismatch_p95': 0.,
-                        'attention_scale_mismatch_p95': 0., 'pose_mismatch_p95': .4 if _quality_miss else 0.,
-                        'silhouette_mismatch_p95': 0.}}
+                from tests.member_continuity_fixture import member_continuity_report
+                payload = member_continuity_report()
+                payload['passed'] = not _quality_miss
+                payload['failure_reasons'] = ['rendered_pose_p95_above_floor'] if _quality_miss else []
+                payload['metrics']['pose_mismatch_p95'] = .4 if _quality_miss else 0.
+                for boundary in payload['boundaries']:
+                    boundary['pose_mismatch'] = .4 if _quality_miss else 0.
+                return payload
 
             def pass_member_proxy(
                 plan: RenderPlan,
@@ -8640,7 +8759,7 @@ class PipelineTests(unittest.TestCase):
             ), patch(
                 "crosscut.pipeline.select_balanced_direct_member_sources",
                 side_effect=_bound_visual_selection(visual_selection),
-            ), patch(
+            ) as select_member_mock, patch(
                 "crosscut.pipeline._VideoDescriptorProvider",
                 return_value=DescriptorProviderStub(),
             ), patch(
@@ -8649,7 +8768,7 @@ class PipelineTests(unittest.TestCase):
                 return_value=(dense_face_provider, DescriptorProviderStub()),
             ) as source_first_session, patch(
                 "crosscut.pipeline.build_direct_member_editorial_motion_plan",
-                side_effect=build_direct_motion,
+                side_effect=ValueError("dense focal geometry unavailable") if _camera_failure == "dense" else build_direct_motion,
             ) as build_direct_motion_mock, patch(
                 "crosscut.pipeline.render_and_review_direct_member_proxy",
                 side_effect=pass_member_proxy,
@@ -8682,17 +8801,16 @@ class PipelineTests(unittest.TestCase):
             build_cropped_member.assert_not_called()
             build_member_motion.assert_not_called()
             build_direct_motion_mock.assert_called_once()
+            select_member_mock.assert_called_once()
             member_proxy_mock.assert_called_once()
             render_video.assert_called_once()
             source_first_session.assert_called_once()
             member_delivery_gate.assert_called_once()
             analyze_member_cut_local_sync.assert_called_once()
-            self.assertEqual(len(dense_face_provider.sample_calls), 1)
-            self.assertEqual(dense_face_provider.sample_calls[0][0], 1)
-            self.assertAlmostEqual(
-                dense_face_provider.sample_calls[0][1],
-                timewarps[1].master_to_source(4.0),
-            )
+            if _camera_failure != "dense":
+                self.assertEqual(len(dense_face_provider.sample_calls), 1)
+                self.assertEqual(dense_face_provider.sample_calls[0][0], 1)
+                self.assertAlmostEqual(dense_face_provider.sample_calls[0][1], timewarps[1].master_to_source(4.0))
             self.assertTrue(dense_face_provider.closed)
             partition_events = [
                 payload
@@ -8717,7 +8835,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertIs(cut_local_call.kwargs["source_timewarps"], timewarps)
             self.assertEqual(cut_local_call.kwargs["timewarp_payloads"], ())
-            self.assertFalse(plan.member_pose_dissolve_requested)
+            self.assertEqual(plan.member_pose_dissolve_requested, _dissolve_requested)
             self.assertFalse(plan.member_pose_dissolve_effective)
             self.assertEqual(plan.member_pose_dissolve_count, 0)
             self.assertEqual(len(plan.segments), 12)
@@ -8727,7 +8845,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(all(item.pan_crop is None for item in plan.segments))
             self.assertTrue(all(item.crop is None for item in plan.segments))
-            self.assertIs(plan.segments[0].editorial_transform, direct_track)
+            self.assertIs(plan.segments[0].editorial_transform, None if _camera_failure else direct_track)
             self.assertTrue(
                 all(
                     item.editorial_transform is None
@@ -8777,7 +8895,16 @@ class PipelineTests(unittest.TestCase):
                 direct["required_used_request_source_indices"],
                 list(range(10)),
             )
-            self.assertFalse(direct["member_pose_dissolve_requested"])
+            self.assertEqual(direct["member_pose_dissolve_requested"], _dissolve_requested)
+            if _camera_failure:
+                controller = direct["cadence"]["first_result_controller"]
+                self.assertTrue(controller["baseline_retained"])
+                self.assertEqual(controller["optional_attempt_count"], 1)
+                self.assertEqual(controller["rejected_attempt_count"], 1)
+                self.assertEqual(controller["selected_authority"], "verified_member_source_primitive")
+                self.assertEqual(controller["stage"], "REVIEW_READY")
+                self.assertIn("TECHNICALLY_VERIFIED", controller["stage_history"])
+                self.assertFalse(controller["quality_approved"])
             self.assertFalse(direct["member_pose_dissolve_effective"])
             self.assertEqual(direct["member_pose_dissolve_count"], 0)
             self.assertEqual(
@@ -8836,13 +8963,13 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(
                 direct["editorial_motion"]["analysis_basis"],
-                direct_motion_plan.analysis_basis,
+                "official_target_fancam_verified_primitive_v1" if _camera_failure else direct_motion_plan.analysis_basis,
             )
             self.assertEqual(
                 direct["dense_face_review"]["backend"],
                 "synthetic_dense_face_provider",
             )
-            self.assertTrue(direct["dense_face_review"]["completed"])
+            self.assertEqual(direct["dense_face_review"]["completed"], not bool(_camera_failure))
             self.assertFalse(
                 direct["dense_face_review"][
                     "fallback_to_untouched_full_frame"
@@ -8850,7 +8977,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(
                 direct["dense_face_review"]["applied_segment_count"],
-                1,
+                0 if _camera_failure else 1,
             )
             self.assertEqual(direct["final_source_usage"]["distinct_source_count"], 10)
             self.assertEqual(
@@ -8882,11 +9009,11 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(render_payload["cadence"]["passed"])
             self.assertEqual(
                 render_payload["editorial_motion"]["analysis_basis"],
-                direct_motion_plan.analysis_basis,
+                "official_target_fancam_verified_primitive_v1" if _camera_failure else direct_motion_plan.analysis_basis,
             )
             self.assertEqual(
                 manifest["editorial_motion"]["analysis_basis"],
-                direct_motion_plan.analysis_basis,
+                "official_target_fancam_verified_primitive_v1" if _camera_failure else direct_motion_plan.analysis_basis,
             )
             self.assertEqual(
                 manifest["editorial_motion"]["index_domain"],

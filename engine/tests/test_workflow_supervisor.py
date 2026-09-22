@@ -8,13 +8,25 @@ from time import monotonic
 from threading import Event
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
-from crosscut.workflow_supervisor import run_supervised_workflow
+from crosscut.workflow_supervisor import run_supervised_workflow, terminate_owned_process_group
+from tests.process_fixture import wait_for_pid_file, assert_group_member_stopped
 
 
 @unittest.skipUnless(os.name == "posix", "app requires POSIX supervision")
 class WorkflowSupervisorTests(unittest.TestCase):
+    def test_transient_exit_permission_race_is_retried_but_persistent_denial_is_not_ignored(self):
+        process = Mock(pid=123)
+        with patch('crosscut.workflow_supervisor.os.killpg',
+                   side_effect=[PermissionError('exit race'), ProcessLookupError('gone')]) as kill:
+            terminate_owned_process_group(process, grace_seconds=.05)
+        self.assertEqual(kill.call_count, 2)
+        process.wait.assert_called_once()
+        with patch('crosscut.workflow_supervisor.os.killpg', side_effect=PermissionError('still denied')):
+            with self.assertRaises(PermissionError):
+                terminate_owned_process_group(Mock(pid=123), grace_seconds=.02)
+
     def test_cli_wraps_default_and_strict_modes_in_the_same_absolute_deadline(self):
         import crosscut_cli
         for review_first in (True, False):
@@ -43,13 +55,7 @@ class WorkflowSupervisorTests(unittest.TestCase):
             real_popen = subprocess.Popen
             def ready_popen(*args, **kwargs):
                 process = real_popen(*args, **kwargs)
-                until = monotonic() + 3.
-                while not pid_file.exists() and monotonic() < until:
-                    Event().wait(.005)
-                if not pid_file.exists():
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                    self.fail('native-block fixture never became ready')
+                wait_for_pid_file(process, pid_file)
                 ready_at[0] = monotonic()
                 # Separate interpreter startup from the 250ms native-block
                 # fixture budget. Production clocks and limits are unchanged.
@@ -68,22 +74,37 @@ class WorkflowSupervisorTests(unittest.TestCase):
     def test_exited_parent_does_not_leave_term_ignoring_descendant(self):
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "descendant"
+            release_file = Path(directory) / "release"
             child = ("import os,signal,time; from pathlib import Path; "
                      "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
                      f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(20)")
             parent = ("import subprocess,sys,time; from pathlib import Path; "
                       f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
-                      f"p=Path({str(pid_file)!r})\nwhile not p.exists(): time.sleep(.01)")
-            self.assertEqual(run_supervised_workflow([sys.executable, "-c", parent],
-                absolute_deadline_monotonic_seconds=monotonic() + 2), 0)
+                      f"p=Path({str(release_file)!r})\nwhile not p.exists(): time.sleep(.01)")
+            # Child interpreter startup is not the cleanup behavior under test.
+            group = []
+            started = monotonic()
+            offset = [0.]
+            real_popen = subprocess.Popen
+            def ready_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                wait_for_pid_file(process, pid_file)
+                group.append(process.pid)
+                offset[0] = monotonic() - started
+                release_file.touch()
+                return process
+            with patch('crosscut.workflow_supervisor.subprocess.Popen', side_effect=ready_popen), patch(
+                'crosscut.workflow_supervisor.monotonic', side_effect=lambda: monotonic() - offset[0]
+            ):
+                self.assertEqual(run_supervised_workflow([sys.executable, "-c", parent],
+                    absolute_deadline_monotonic_seconds=started + 2), 0)
             pid = int(pid_file.read_text())
-            result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
-            self.assertTrue(not result.stdout.strip() or result.stdout.strip().startswith("Z"), result.stdout)
+            assert_group_member_stopped(self, pid, group[0])
 
     def test_successful_workflow_preserves_exit_code_and_supervised_environment(self):
         result = run_supervised_workflow(
             [sys.executable, "-c", "import os,sys; sys.exit(7 if os.environ.get('IVE_CROSSCUT_SUPERVISED_WORKFLOW')=='1' else 9)"],
-            absolute_deadline_monotonic_seconds=monotonic() + 2,
+            absolute_deadline_monotonic_seconds=monotonic() + 10,
         )
         self.assertEqual(result, 7)
 

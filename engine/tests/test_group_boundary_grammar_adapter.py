@@ -105,6 +105,17 @@ def _domain_summary(
 
 
 class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
+    def test_all_domain_verdicts_are_derived_not_trusted(self):
+        for domain in (INTRODUCED_CROSS_SOURCE_DOMAIN, TIER_D_CONTINUITY_DOMAIN, NATIVE_SOURCE_CUT_DOMAIN):
+            with self.subTest(domain=domain):
+                bundle = self._bundle()
+                proxy = deepcopy(bundle["rendered_proxy_review"].payload)
+                summary = proxy["boundary_domains"][domain]
+                summary["passed"] = not summary["passed"]
+                bundle["rendered_proxy_review"] = proxy
+                with self.assertRaisesRegex(GroupBoundaryGrammarAdapterError, "derived passed mismatch"):
+                    self._adapt(bundle)
+
     def test_real_producer_unknown_scores_flow_through_grammar_without_perfect_fallback(self):
         bundle = self._bundle()
         proxy = deepcopy(bundle["rendered_proxy_review"].payload)
@@ -363,6 +374,7 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
         }
         proxy_payload: dict[str, object] = {
             "schema_version": 3,
+            "review_policy": ProxyReviewConfig().to_dict(),
             "analysis": PROXY_ANALYSIS_BASIS,
             "transition_count": 3,
             "reviewed_boundary_count": 3,

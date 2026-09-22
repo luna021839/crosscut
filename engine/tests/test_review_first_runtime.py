@@ -16,6 +16,7 @@ from crosscut.review_first_runtime import (
     member_proxy_technical_issues,
 )
 from crosscut.proxy_review_contract import proxy_integrity_evidence
+from tests.member_continuity_fixture import member_continuity_report
 
 
 def _group_integrity_metrics():
@@ -31,15 +32,7 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
         payload = {
             "rendered_proxy_review": _group_integrity_metrics()["proxy_quality_and_geometry"]["technical_integrity"]["review"],
             "member_output_quality_failure_reasons": [],
-            "rendered_continuity": {
-                "schema_version": 1,
-                "analysis": "automatic_member_exact_rendered_boundary_continuity_v1",
-                "passed": True, "failure_reasons": [], "failure_boundary_indices": {},
-                "metrics": {"output_frame_count": 18,
-                            "exact_incoming_first_frame_evaluated": True,
-                            "final_render_transform_domain_evaluated": True},
-                "boundaries": [],
-            },
+            "rendered_continuity": member_continuity_report(),
         }
         self.assertEqual(member_proxy_technical_issues(payload), ())
         for change in (
@@ -165,6 +158,7 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
                 "passed": False,
                 "issues": [{"code": "member_perceptual_quality_not_pass"}],
                 "metrics": {
+                    "rendered_continuity": member_continuity_report(),
                     "perceptual_quality": {
                         "schema_version": 2,
                         "analysis": "full_final_decode_temporal_pumping_exact_source_retention_and_structure_binding_v2",
@@ -212,7 +206,7 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
                 disposition = classify_review_first_qa(
                     {"passed": False,
                      "issues": [{"code": "member_look_calibration_predicted_quality_not_pass"}],
-                     "metrics": {"member_look_calibration": {
+                     "metrics": {"rendered_continuity": member_continuity_report(), "member_look_calibration": {
                          "locations_bound": True, "segment_binding_valid": True,
                          "predicted_evidence_valid": True, "predicted_quality_valid": False,
                          **fields,
@@ -247,7 +241,7 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
 
     def test_success_is_approved_delivery(self) -> None:
         disposition = classify_review_first_qa(
-            {"passed": True, "issues": []},
+            {"passed": True, "issues": [], "metrics": {"rendered_continuity": member_continuity_report()}},
             content_binding_passed=True,
             review_first_enabled=True,
             member=True,

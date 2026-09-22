@@ -13,6 +13,7 @@ The decoded pixels are never serialized.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -474,6 +475,7 @@ def _face_match_segments(face_match_plan: FaceMatchPlan | None) -> dict[int, boo
     return output
 
 
+@isolated_optional()
 def build_boundary_affine_plan(
     *,
     visual_timeline: VisualTimelinePlan,

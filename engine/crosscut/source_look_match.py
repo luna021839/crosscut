@@ -9,6 +9,7 @@ adjustment instead of speculative grading.
 """
 
 from __future__ import annotations
+from .optional_native_worker import isolated_optional
 
 from dataclasses import dataclass
 import math
@@ -743,6 +744,7 @@ def match_source_look_samples(
     )
 
 
+@isolated_optional()
 def analyze_source_look_match(
     sources: Sequence[Path],
     *,

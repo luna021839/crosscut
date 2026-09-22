@@ -20,9 +20,7 @@ from crosscut.direct_member_look import (
     ANALYSIS_BASIS as MEMBER_LOOK_ANALYSIS_BASIS,
     DirectMemberLookConfig,
 )
-from crosscut.direct_member_rendered_continuity import (
-    ANALYSIS_BASIS as RENDERED_CONTINUITY_ANALYSIS_BASIS,
-)
+from tests.member_continuity_fixture import member_continuity_report
 from crosscut.events import EventReporter
 from crosscut.ive import AspectRatio
 from crosscut.member_post_render_qa import (
@@ -139,15 +137,9 @@ def _perceptual_payload(
 
 
 def _rendered_continuity_payload() -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "analysis": RENDERED_CONTINUITY_ANALYSIS_BASIS,
-        "passed": True,
-        "failure_reasons": [],
-        "failure_boundary_indices": {},
-        "metrics": {},
-        "boundaries": [],
-    }
+    # Actual measurement producer with synthetic descriptors, not a hand-written
+    # PASS shell. Matches the four one-second segments in _fixture.
+    return member_continuity_report()
 
 
 def _rendered_continuity_evaluator(
@@ -466,6 +458,35 @@ def _fixture(
 
 
 class AutomaticMemberPostRenderQATests(unittest.TestCase):
+    def test_empty_or_contradictory_continuity_cannot_pass_producer_or_exposure(self):
+        for damage in ("empty", "missing_boundary", "duplicate", "false_frame_count", "failed_wrong_plan", "passed_with_failure"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                artifacts, _ = _fixture(Path(directory))
+                continuity = _rendered_continuity_payload()
+                if damage == "empty":
+                    continuity.update(metrics={}, boundaries=[])
+                elif damage == "missing_boundary":
+                    continuity["boundaries"].pop()
+                elif damage == "duplicate":
+                    continuity["boundaries"][1] = continuity["boundaries"][0]
+                elif damage in {"false_frame_count", "failed_wrong_plan"}:
+                    continuity["metrics"]["output_frame_count"] = 121
+                    if damage == "failed_wrong_plan":
+                        continuity.update(passed=False, failure_reasons=["rendered_pose_p95_above_floor"])
+                else:
+                    continuity["failure_reasons"] = ["decode_failed"]
+                report = evaluate_automatic_member_post_render_qa(
+                    artifacts, runner=_runner,
+                    perceptual_evaluator=lambda *_a, **_kw: _perceptual_payload(),
+                    rendered_continuity_evaluator=lambda *_a, **_kw: continuity,
+                )
+                self.assertFalse(report.passed)
+                disposition = classify_review_first_qa(
+                    report.to_dict(), content_binding_passed=True,
+                    review_first_enabled=True, member=True,
+                )
+                self.assertFalse(disposition.video_output_exposed)
+
     def test_activation_is_required_only_for_automatic_direct_ive_member(self) -> None:
         required = {
             "request": {

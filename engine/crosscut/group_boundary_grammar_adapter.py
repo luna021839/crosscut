@@ -752,6 +752,7 @@ def _validate_domain_summary(
     summary: object,
     domain: str,
     records: Sequence[tuple[int, float | None, bool]],
+    review_policy: object,
 ) -> None:
     value = _mapping(summary, f"rendered_proxy_review.boundary_domains.{domain}")
     if str(_required(value, "domain", f"proxy domain {domain}")) != domain:
@@ -838,7 +839,15 @@ def _validate_domain_summary(
                        "OBSERVED" if len(scores) == len(records) else "INCOMPLETE")
     if score.get("evidence_status") != expected_status:
         raise GroupBoundaryGrammarAdapterError(f"proxy {domain} evidence status mismatch")
-    _boolean(_required(value, "passed", f"proxy domain {domain}"), f"proxy domain {domain}.passed")
+    from .proxy_review_contract import boundary_domain_passed
+    try:
+        expected_passed = boundary_domain_passed(domain=domain, score_p10=expected_p10,
+            issue_fraction=expected_fraction, issue_count=len(issues), review_policy=review_policy)
+    except ValueError as exc:
+        raise GroupBoundaryGrammarAdapterError(str(exc)) from exc
+    if _boolean(_required(value, "passed", f"proxy domain {domain}"),
+                f"proxy domain {domain}.passed") is not expected_passed:
+        raise GroupBoundaryGrammarAdapterError(f"proxy {domain} derived passed mismatch")
     expected_policy = (
         "editorial_boundary_p10_and_issue_fraction_gate"
         if domain == INTRODUCED_CROSS_SOURCE_DOMAIN
@@ -995,6 +1004,7 @@ def _validated_proxy_continuity(
             summary=domain_payload[domain],
             domain=domain,
             records=classified[domain],
+            review_policy=payload.get("review_policy"),
         )
         if _integer(
             _required(payload, top_count_keys[domain], "rendered_proxy_review"),
