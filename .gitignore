@@ -28,5 +28,6 @@ __pycache__/
 .playwright-mcp/
 outputs/
 tmp/
+.pro-review/
 *.wav
 *.pcm
