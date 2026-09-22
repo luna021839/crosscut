@@ -12,6 +12,7 @@ import crosscut_cli
 from crosscut.events import EventReporter
 from crosscut.pipeline import _enforce_automatic_stage_edit_post_render_qa
 from crosscut.post_render_qa import fingerprint_post_render_artifacts
+from engine.tests.test_review_first_runtime import _group_integrity_metrics
 
 
 def _disposition(status="REVIEW_READY"):
@@ -160,7 +161,10 @@ class ReviewFirstPipelineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             crosscut_cli._result_contains_exposable_video(artifact)
 
-    def test_content_bound_quality_failure_returns_review_ready_video(self) -> None:
+    def test_forged_group_pass_does_not_leave_passed_delivery_provenance(self) -> None:
+        self.test_content_bound_quality_failure_returns_review_ready_video(_forged_pass=True)
+
+    def test_content_bound_quality_failure_returns_review_ready_video(self, _forged_pass=False) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             base = "IVE-fixture-20260920-120000"
@@ -195,11 +199,12 @@ class ReviewFirstPipelineTests(unittest.TestCase):
 
             def evaluate(artifact_set, **_kwargs):  # type: ignore[no-untyped-def]
                 payload = {
-                    "passed": False,
-                    "issue_count": 1,
-                    "fail_issue_count": 1,
+                    "passed": _forged_pass,
+                    "issue_count": 0 if _forged_pass else 1,
+                    "metrics": {} if _forged_pass else _group_integrity_metrics(),
+                    "fail_issue_count": 0 if _forged_pass else 1,
                     "conditional_issue_count": 0,
-                    "issues": [
+                    "issues": [] if _forged_pass else [
                         {"code": "source_switch_density_below_hard_minimum"}
                     ],
                     "input_artifact_fingerprints": (
@@ -207,8 +212,8 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                     ),
                 }
                 report = SimpleNamespace(
-                    verdict=SimpleNamespace(value="FAIL"),
-                    passed=False,
+                    verdict=SimpleNamespace(value="PASS" if _forged_pass else "FAIL"),
+                    passed=_forged_pass,
                     analysis_basis="fixture_quality_failure",
                     to_dict=lambda: dict(payload),
                 )
@@ -221,6 +226,20 @@ class ReviewFirstPipelineTests(unittest.TestCase):
                 "crosscut.pipeline.evaluate_and_write_post_render_qa",
                 side_effect=evaluate,
             ):
+                if _forged_pass:
+                    with self.assertRaisesRegex(RuntimeError, "integrity contract failure"):
+                        _enforce_automatic_stage_edit_post_render_qa(
+                            registered_stage_edit_bundle=None,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            reporter=EventReporter(),
+                            automatic_ive_group_delivery=True,
+                        )
+                    self.assertEqual(manifest["artifact_role"], "rejected")
+                    self.assertFalse(manifest["post_render_qa"]["passed"])
+                    self.assertEqual(manifest["post_render_qa"]["delivery_gate_verdict"], "INPUT_UNUSABLE")
+                    self.assertFalse(manifest["app_result_exposure"]["video_output_exposed"])
+                    return
                 report_path = _enforce_automatic_stage_edit_post_render_qa(
                     registered_stage_edit_bundle=None,
                     manifest=manifest,  # type: ignore[arg-type]

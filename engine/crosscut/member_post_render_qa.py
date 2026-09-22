@@ -49,7 +49,7 @@ from .render import RENDER_PLAN_SOURCE_INDEX_DOMAIN
 SCHEMA_VERSION = 1
 ANALYSIS_BASIS = "automatic_ive_member_final_media_and_pixel_provenance_qa_v1"
 ARTIFACT_FINGERPRINT_CONTRACT = (
-    "automatic_ive_member_analysis_plan_video_content_sha256_v1"
+    "automatic_ive_member_analysis_plan_video_clock_content_sha256_v2"
 )
 RENDER_RECEIPT_CONTRACT = (
     "automatic_ive_member_exact_source_time_pixel_provenance_receipt_v1"
@@ -534,12 +534,17 @@ def _fingerprint_file(path: Path) -> dict[str, Any]:
 def fingerprint_automatic_member_artifacts(
     artifacts: AutomaticMemberPostRenderArtifactSet,
 ) -> dict[str, Any]:
-    return {
+    from .render_clock_artifact import bound_render_clock_path
+    result = {
         "contract": ARTIFACT_FINGERPRINT_CONTRACT,
         "analysis": _fingerprint_file(artifacts.analysis_path),
         "render_plan": _fingerprint_file(artifacts.render_plan_path),
         "video": _fingerprint_file(artifacts.video_path),
     }
+    clock = bound_render_clock_path(artifacts.video_path, artifacts.render_plan_path)
+    if clock is not None:
+        result["frame_clock"] = _fingerprint_file(clock)
+    return result
 
 
 def _source_identity(path: Path) -> dict[str, Any]:

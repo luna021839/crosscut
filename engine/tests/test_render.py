@@ -790,8 +790,8 @@ class RenderTests(unittest.TestCase):
         graph = build_filter_graph(plan)
 
         self.assertEqual(plan.output_frame_count, 60)
-        self.assertIn("[v0][v1]xfade=transition=custom:", graph)
-        self.assertIn("[v2][v3]xfade=transition=custom:", graph)
+        self.assertIn("[xin0a][xin0b]xfade=transition=custom:", graph)
+        self.assertIn("[xin1a][xin1b]xfade=transition=custom:", graph)
         self.assertEqual(graph.count("exp(-12*(P-0.5))"), 4)
         self.assertIn("duration=0.366666667:offset=0.500000000,format=yuv420p[vx0]", graph)
         self.assertIn("duration=0.366666667:offset=0.500000000,format=yuv420p[vx1]", graph)
@@ -914,8 +914,8 @@ class RenderTests(unittest.TestCase):
 
         graph = build_filter_graph(plan)
 
-        self.assertIn("[v0][v1]xfade=", graph)
-        self.assertIn("[vx0][v2]xfade=", graph)
+        self.assertIn("[xin0a][xin0b]xfade=", graph)
+        self.assertIn("[xin1a][xin1b]xfade=", graph)
         self.assertIn("offset=1.000000000,format=yuv420p[vx1]", graph)
         self.assertIn("[vx1]trim=end_frame=45,", graph)
         self.assertIn("[vchunk0]null[vcat]", graph)

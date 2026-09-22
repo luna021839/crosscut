@@ -43,6 +43,10 @@ class ReviewFirstDeadlineExceeded(BaseException):
     """
 
 
+class ReviewFirstSearchCutoff(Exception):
+    """Recoverable optional-search cutoff; keep the incumbent for render/QA."""
+
+
 def _deadline_stage(stage: str) -> str:
     return str(stage).strip() or "unknown_stage"
 
@@ -243,6 +247,18 @@ _MEMBER_CONTINUITY_EDITORIAL_REASONS = frozenset({
     "rendered_effect_endpoint_scale_discontinuity", "rendered_effect_endpoint_pose_discontinuity",
     "rendered_effect_endpoint_silhouette_discontinuity",
 })
+MEMBER_PRE_RENDER_EDITORIAL_REASONS = frozenset({
+    "visible_switch_density_outside_professional_range", "missing_actual_pose", "pose_over_hard_limit",
+    "missing_silhouette", "silhouette_over_hard_limit", "missing_attention_geometry",
+    "incompatible_attention_geometry", "unrepaired_attention_geometry", "opposed_or_missing_motion_direction",
+    "incompatible_or_missing_motion_shape", "incompatible_motion_speed", "incompatible_pose_phase",
+    "uncontracted_severe_boundary", "pose_mismatch_p95_above_professional_floor",
+    "silhouette_mismatch_p95_above_professional_floor", "attention_position_p95_above_professional_floor",
+    "attention_scale_p95_above_professional_floor", "motion_speed_p95_above_professional_floor",
+    "pose_phase_p95_above_professional_floor", "editorial_camera_density_below_professional_floor",
+    "native_output_portrait_duration_fraction_above_quality_floor",
+    "highlight_cut_density_gate_missing_or_failed", "requested_safe_transition_effect_not_materialized",
+})
 
 
 def _issue_codes(
@@ -271,6 +287,22 @@ def _mapping(value: object) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
+def _member_continuity_measurements_valid(continuity: Mapping[str, Any]) -> bool:
+    measurements = _mapping(continuity.get("metrics"))
+    return bool(
+        type(continuity.get("schema_version")) is int
+        and continuity["schema_version"] == 1
+        and continuity.get("analysis") == "automatic_member_exact_rendered_boundary_continuity_v1"
+        and isinstance(continuity.get("failure_boundary_indices"), Mapping)
+        and measurements is not None
+        and type(measurements.get("output_frame_count")) is int
+        and measurements["output_frame_count"] > 0
+        and measurements.get("exact_incoming_first_frame_evaluated") is True
+        and measurements.get("final_render_transform_domain_evaluated") is True
+        and isinstance(continuity.get("boundaries"), list)
+    )
+
+
 def _member_editorial_evidence_valid(
     code: str,
     report_payload: Mapping[str, Any],
@@ -296,22 +328,13 @@ def _member_editorial_evidence_valid(
         )
     if code == "member_rendered_continuity_not_pass":
         continuity = _mapping(metrics.get("rendered_continuity"))
-        measurements = _mapping(continuity.get("metrics")) if continuity is not None else None
         reasons = continuity.get("failure_reasons") if continuity is not None else None
         return bool(
             continuity is not None
-            and continuity.get("schema_version") == 1
-            and continuity.get("analysis") == "automatic_member_exact_rendered_boundary_continuity_v1"
+            and _member_continuity_measurements_valid(continuity)
             and continuity.get("passed") is False
             and isinstance(reasons, list) and reasons
             and all(isinstance(reason, str) and reason in _MEMBER_CONTINUITY_EDITORIAL_REASONS for reason in reasons)
-            and isinstance(continuity.get("failure_boundary_indices"), Mapping)
-            and measurements is not None
-            and type(measurements.get("output_frame_count")) is int
-            and measurements["output_frame_count"] > 0
-            and measurements.get("exact_incoming_first_frame_evaluated") is True
-            and measurements.get("final_render_transform_domain_evaluated") is True
-            and isinstance(continuity.get("boundaries"), list)
         )
     if code == "member_perceptual_quality_not_pass":
         perceptual = _mapping(metrics.get("perceptual_quality"))
@@ -334,6 +357,39 @@ def _member_editorial_evidence_valid(
             and video["decoded_frame_count"] == video.get("expected_frame_count")
         )
     return False
+
+
+def member_proxy_technical_issues(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Admit a proxy to final QA without turning quality failure into approval."""
+    from .proxy_review_contract import proxy_integrity_evidence
+    generic = payload.get("rendered_proxy_review")
+    if not isinstance(generic, Mapping):
+        return ("member_proxy_review_missing",)
+    issues = list(proxy_integrity_evidence(generic)["technical_issue_codes"])
+    quality = payload.get("member_output_quality_failure_reasons")
+    editorial_quality = {"member_proxy_overall_quality_p10", "member_proxy_source_quality_median_span",
+                         "member_proxy_perceptual_source_admission"}
+    if not isinstance(quality, list) or any(not isinstance(code, str) for code in quality):
+        issues.append("member_proxy_quality_reasons_invalid")
+    else:
+        issues.extend(code for code in quality if code not in editorial_quality)
+    continuity = payload.get("rendered_continuity")
+    if not isinstance(continuity, Mapping) or type(continuity.get("passed")) is not bool:
+        issues.append("member_proxy_continuity_invalid")
+    else:
+        # The same measurement contract is required on both the PASS and FAIL
+        # paths. A bare passed=True must not bypass missing/contradictory data.
+        reasons = continuity.get("failure_reasons")
+        if continuity["passed"] is True:
+            if reasons != [] or continuity.get("failure_boundary_indices") != {}:
+                issues.append("member_proxy_continuity_passed_with_failures")
+            if not _member_continuity_measurements_valid(continuity):
+                issues.append("member_proxy_continuity_measurements_invalid")
+        elif not _member_editorial_evidence_valid(
+            "member_rendered_continuity_not_pass", {"metrics": {"rendered_continuity": continuity}}
+        ):
+            issues.append("member_proxy_continuity_technical_or_unknown_failure")
+    return tuple(dict.fromkeys(issues))
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,10 +477,16 @@ def classify_review_first_qa(
     passed_contract_valid = isinstance(passed_value, bool)
     report_passed = passed_value is True
     editorial_catalog = _MEMBER_EDITORIAL_CODES if member else _GROUP_EDITORIAL_CODES
+    from .proxy_review_contract import proxy_integrity_evidence_valid
+    proxy_metrics = _mapping((_mapping(report_payload.get("metrics")) or {}).get("proxy_quality_and_geometry"))
+    proxy_codes = {"decoded_proxy_review_failed", "proxy_boundary_issues_require_manual_review"}
+    proxy_integrity_valid = bool(proxy_metrics is not None and
+        proxy_integrity_evidence_valid(proxy_metrics.get("technical_integrity")))
     editorial = tuple(
         code
         for code in codes
         if code in editorial_catalog
+        and (member or code not in proxy_codes or proxy_integrity_valid)
         and (
             not member
             or _member_editorial_evidence_valid(code, report_payload)
@@ -437,6 +499,8 @@ def classify_review_first_qa(
                 *(code for code in codes if code not in editorial),
                 *(() if passed_contract_valid else ("qa_passed_flag_invalid",)),
                 *(() if content_binding_passed else ("content_binding_failed",)),
+                *(("proxy_nested_technical_integrity_invalid",)
+                  if not member and not proxy_integrity_valid else ()),
                 *(
                     ("qa_passed_with_issues",)
                     if report_passed and codes
@@ -556,7 +620,7 @@ class ReviewFirstRuntime:
     def optional_refinement_allowed(self) -> bool:
         return bool(
             self.enabled
-            and self.elapsed_seconds < self.refinement_stop_seconds
+            and self.elapsed_seconds < min(self.first_render_budget_seconds, self.refinement_stop_seconds)
             and self.remaining_total_seconds > 0.0
         )
 
@@ -596,7 +660,7 @@ class ReviewFirstRuntime:
 
         self.require_total_budget(stage)
         if self.enabled and self.elapsed_seconds >= self.first_render_budget_seconds:
-            raise ReviewFirstDeadlineExceeded(
+            raise ReviewFirstSearchCutoff(
                 "review-first optional search exceeded the first-render budget "
                 f"during {str(stage).strip() or 'unknown_stage'}"
             )

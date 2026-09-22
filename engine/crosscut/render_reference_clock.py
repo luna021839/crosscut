@@ -8,6 +8,7 @@ from .render import segment_frame_counts
 from .render_boundary_clock import native_frame_clocks_for_output, RenderedBoundaryNativeFrame
 from .render_frame_schedule import FRAME_SCHEDULE_CONTRACT, probe_render_frame_clock
 from .render_plan_serialization import render_plan_from_json
+from .render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, render_clock_path, video_content_sha256
 
 
 @dataclass(frozen=True)
@@ -19,30 +20,25 @@ class RenderReferenceClock:
 
 def load_render_reference_clock(
     video_path: Path, plan_payload: Mapping[str, Any], output_frame_indices,
-    *, probe=probe_render_frame_clock,
+    *, probe=probe_render_frame_clock, allow_legacy: bool = False,
 ) -> RenderReferenceClock | None:
-    """Absent old sidecars retain legacy behavior; invalid present ones fail.
+    """Only the evaluated video's adjacent, content-bound clock has authority.
 
     The sidecar is not pixel approval. Its complete plan must round-trip, and
     its claimed verified native clocks must still match the actual sources.
     Unverified sources remain explicitly on the existing timestamp QA path.
     """
-    sidecar = Path(video_path).with_suffix(Path(video_path).suffix + '.frame-clock.json')
+    sidecar = render_clock_path(video_path)
     if not sidecar.exists():
-        # QA may inspect a deliberately perturbed/copy output against the
-        # original expected plan. Preserve that expected clock: falling back
-        # to the old one-frame-late clock could hide a real one-frame shift.
-        planned_output = plan_payload.get('output')
-        if not isinstance(planned_output, str) or not planned_output:
+        if allow_legacy and plan_payload.get('frame_clock_contract') is None:
             return None
-        original = Path(planned_output)
-        sidecar = original.with_suffix(original.suffix + '.frame-clock.json')
-        if not sidecar.exists():
-            return None
+        raise ValueError('required render clock artifact is missing')
     if sidecar.is_symlink() or not 0 < sidecar.stat().st_size <= 32 * 1024 * 1024:
         raise ValueError('render clock sidecar is not a bounded regular artifact')
     payload = json.loads(sidecar.read_text(encoding='utf-8'))
     if (not isinstance(payload, dict) or payload.get('contract') != FRAME_SCHEDULE_CONTRACT
+            or payload.get('artifact_contract') != RENDER_CLOCK_ARTIFACT_CONTRACT
+            or payload.get('video_content_sha256') != video_content_sha256(video_path)
             or type(payload.get('enabled')) is not bool
             or payload.get('quality_approval') is not False
             or payload.get('plan') != dict(plan_payload)):

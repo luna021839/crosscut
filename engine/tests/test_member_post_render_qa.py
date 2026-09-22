@@ -303,6 +303,9 @@ def _fixture(
     segments = plan["segments"]
     usage = plan_model.source_usage_payload()
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    from crosscut.render_clock_artifact import render_clock_path
+    # File-binding fixture; pixel/source-clock evaluation is injected separately.
+    render_clock_path(video_path).write_text('{"fixture": "member clock identity"}')
 
     eligible = [0, 1, 2, 3]
     mapping = {
@@ -729,6 +732,24 @@ class AutomaticMemberPostRenderQATests(unittest.TestCase):
             "member_pixel_provenance_incomplete",
             {item["code"] for item in report.issues},
         )
+
+    def test_clock_mutation_during_pixel_review_breaks_sha_binding(self) -> None:
+        from crosscut.render_clock_artifact import render_clock_path
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _manifest = _fixture(Path(directory))
+            clock = render_clock_path(artifacts.video_path)
+            original = clock.read_bytes()
+
+            def mutate(*_args: object, **_kwargs: object) -> dict[str, object]:
+                clock.write_bytes(original.replace(b"identity", b"tampered"))
+                self.assertEqual(clock.stat().st_size, len(original))
+                return _perceptual_payload()
+
+            report = evaluate_automatic_member_post_render_qa(
+                artifacts, runner=_runner, perceptual_evaluator=mutate,
+            )
+        self.assertFalse(report.passed)
+        self.assertIn("member_artifacts_changed_during_qa", {item["code"] for item in report.issues})
 
     def test_video_mutation_during_pixel_review_breaks_sha_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

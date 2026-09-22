@@ -8,18 +8,55 @@ import unittest
 
 from crosscut.review_first_runtime import (
     ReviewFirstDeadlineExceeded,
+    ReviewFirstSearchCutoff,
     ReviewFirstRuntime,
     ReviewFirstStatus,
     classify_review_first_qa,
     enforce_review_first_deadline,
+    member_proxy_technical_issues,
 )
+from crosscut.proxy_review_contract import proxy_integrity_evidence
+
+
+def _group_integrity_metrics():
+    return {"proxy_quality_and_geometry": {"technical_integrity": proxy_integrity_evidence({
+        "schema_version": 3, "geometry_provider_failure_count": 0, "reviewed_boundary_count": 0,
+        "introduced_cross_source_technical_issue_reasons": [], "boundaries": [],
+    })}}
 
 
 class ReviewFirstRuntimeTests(unittest.TestCase):
+    def test_member_proxy_pass_requires_complete_noncontradictory_measurements(self):
+        from copy import deepcopy
+        payload = {
+            "rendered_proxy_review": _group_integrity_metrics()["proxy_quality_and_geometry"]["technical_integrity"]["review"],
+            "member_output_quality_failure_reasons": [],
+            "rendered_continuity": {
+                "schema_version": 1,
+                "analysis": "automatic_member_exact_rendered_boundary_continuity_v1",
+                "passed": True, "failure_reasons": [], "failure_boundary_indices": {},
+                "metrics": {"output_frame_count": 18,
+                            "exact_incoming_first_frame_evaluated": True,
+                            "final_render_transform_domain_evaluated": True},
+                "boundaries": [],
+            },
+        }
+        self.assertEqual(member_proxy_technical_issues(payload), ())
+        for change in (
+            {"metrics": {}}, {"schema_version": 99},
+            {"failure_reasons": ["decode_failed"]},
+            {"failure_boundary_indices": {"decode_failed": [0]}},
+        ):
+            with self.subTest(change=change):
+                damaged = deepcopy(payload)
+                damaged["rendered_continuity"].update(change)
+                self.assertTrue(member_proxy_technical_issues(damaged))
+
     def test_editorial_failure_is_exposed_only_as_review_ready(self) -> None:
         disposition = classify_review_first_qa(
             {
                 "passed": False,
+                "metrics": _group_integrity_metrics(),
                 "issues": [
                     {"code": "source_switch_density_below_hard_minimum"},
                     {"code": "decoded_proxy_review_failed"},
@@ -227,11 +264,27 @@ class ReviewFirstRuntimeTests(unittest.TestCase):
         now[0] += 541.0
 
         self.assertFalse(runtime.optional_refinement_allowed)
-        with self.assertRaises(ReviewFirstDeadlineExceeded):
+        with self.assertRaises(ReviewFirstSearchCutoff):
             runtime.require_first_render_budget("candidate_search")
         payload = runtime.to_dict(status=ReviewFirstStatus.REVIEW_READY)
         self.assertEqual(payload["status"], "REVIEW_READY")
         self.assertEqual(payload["checkpoints"][0]["stage"], "selection")
+
+    def test_search_cutoff_is_recoverable_but_total_deadline_is_not(self):
+        now = [0.]
+        runtime = ReviewFirstRuntime(enabled=True, _clock=lambda: now[0])
+        for elapsed in (359., 360., 361., 599., 600.):
+            with self.subTest(elapsed=elapsed):
+                now[0] = elapsed
+                if elapsed >= 600:
+                    with self.assertRaises(ReviewFirstDeadlineExceeded): runtime.require_first_render_budget('search')
+                elif elapsed >= 360:
+                    with self.assertRaises(ReviewFirstSearchCutoff): runtime.require_first_render_budget('search')
+                    runtime.require_total_budget('baseline_or_final_render')
+                    self.assertGreater(runtime.bounded_timeout(900.,'render'),0.)
+                else:
+                    runtime.require_first_render_budget('search')
+                self.assertEqual(runtime.optional_refinement_allowed, elapsed < 360.)
 
     def test_external_deadline_counts_work_before_runtime_construction(self) -> None:
         now = [100.0]

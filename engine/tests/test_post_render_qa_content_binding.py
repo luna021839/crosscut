@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
+from engine.tests.test_review_first_runtime import _group_integrity_metrics
 
 from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
 from crosscut.pipeline import (
@@ -19,7 +20,10 @@ from crosscut.post_render_qa import (
     INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
     PostRenderArtifactSet,
     fingerprint_post_render_artifacts,
+    materialize_post_render_qa_snapshot,
+    cleanup_post_render_qa_snapshot,
 )
+from crosscut.render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, render_clock_path
 
 
 class _Reporter:
@@ -75,6 +79,7 @@ def _report(
 ) -> SimpleNamespace:
     payload = {
         "passed": True,
+        "metrics": _group_integrity_metrics(),
         "issues": [],
         "issue_count": 0,
         "fail_issue_count": 0,
@@ -90,6 +95,42 @@ def _report(
 
 
 class PostRenderQAContentBindingTests(unittest.TestCase):
+    def test_modern_clock_is_frozen_and_original_mutation_cannot_change_qa_input(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifacts, _ = _artifact_shell(Path(raw))
+            artifacts.render_plan_path.write_text(json.dumps({'frame_clock_contract': RENDER_CLOCK_ARTIFACT_CONTRACT}))
+            with self.assertRaisesRegex(ValueError, 'required frame clock'):
+                materialize_post_render_qa_snapshot(artifacts)
+            clock = render_clock_path(artifacts.video_path)
+            clock.write_text('{"fixture": "original"}')
+            snapshot = materialize_post_render_qa_snapshot(artifacts)
+            try:
+                self.assertIn('frame_clock', snapshot.declared_input_fingerprints)
+                clock.unlink()
+                frozen_clock = render_clock_path(snapshot.artifact_set.video_path)
+                self.assertEqual(json.loads(frozen_clock.read_text()), {'fixture': 'original'})
+                fingerprint = fingerprint_post_render_artifacts(snapshot.artifact_set)
+                self.assertEqual(fingerprint['frame_clock']['sha256'], snapshot.declared_input_fingerprints['frame_clock']['sha256'])
+            finally:
+                cleanup_post_render_qa_snapshot(snapshot)
+
+    def test_modern_clock_is_restored_from_qa_snapshot_during_promotion(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifacts, manifest = _artifact_shell(Path(raw))
+            artifacts.render_plan_path.write_text(json.dumps({'frame_clock_contract': RENDER_CLOCK_ARTIFACT_CONTRACT}))
+            clock = render_clock_path(artifacts.video_path)
+            clock.write_text('{"fixture": "original"}')
+            def evaluate(frozen, **kwargs):
+                report = _report(fingerprint_post_render_artifacts(frozen))
+                frozen.default_report_path.write_text(json.dumps(report.to_dict()))
+                clock.write_text('{"fixture": "changed"}')
+                return report, frozen.default_report_path
+            with patch('crosscut.pipeline.evaluate_and_write_post_render_qa', side_effect=evaluate):
+                _enforce_automatic_stage_edit_post_render_qa(registered_stage_edit_bundle=None,
+                    manifest=manifest, manifest_path=artifacts.analysis_path, reporter=_Reporter(),
+                    automatic_ive_group_delivery=True)
+            self.assertEqual(json.loads(clock.read_text()), {'fixture': 'original'})
+
     def test_same_path_same_size_replacement_changes_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             artifacts, _manifest = _artifact_shell(Path(raw))

@@ -33,6 +33,7 @@ from engine.crosscut.rendered_proxy_review import (
     NATIVE_SOURCE_CUT_DOMAIN,
     TIER_D_CONTINUITY_DOMAIN,
     RenderedProxyReview,
+    _boundary_domain_summary, _boundary_evidence, ProxyReviewConfig,
 )
 from engine.crosscut.section_director import (
     SectionDirective,
@@ -104,6 +105,20 @@ def _domain_summary(
 
 
 class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
+    def test_real_producer_unknown_scores_flow_through_grammar_without_perfect_fallback(self):
+        bundle = self._bundle()
+        proxy = deepcopy(bundle["rendered_proxy_review"].payload)
+        for boundary in proxy["boundaries"]:
+            if boundary["review_domain"] == INTRODUCED_CROSS_SOURCE_DOMAIN:
+                boundary.update(weighted_score=None, passed=False, evidence_coverage=_boundary_evidence({}))
+        proxy["boundary_domains"] = {domain: _boundary_domain_summary(
+            proxy["boundaries"], domain=domain, config=ProxyReviewConfig()) for domain in proxy["boundary_domains"]}
+        proxy["introduced_cross_source_boundary_issue_indices"] = [0, 2]
+        bundle["rendered_proxy_review"] = proxy
+        result = self._adapt(bundle)
+        self.assertIsNone(result.introduced_boundary_continuity.score_p10)
+        self.assertEqual(result.introduced_boundary_continuity.issue_count, 2)
+
     @staticmethod
     def _rehash(payload: dict[str, object], field: str) -> None:
         unsigned = deepcopy(payload)

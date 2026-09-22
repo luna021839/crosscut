@@ -671,43 +671,10 @@ def _reference_view_for_span(
         span.editorial_transform,
         relative_time,
     )
-    # Match render._editorial_transform_filters: aspect-fill to its even,
-    # maximum-zoom working canvas, then rotate, then zoompan. Cropping at native
-    # source resolution first changes integer crop origins and the sampled view.
+    from .render_geometry import reproject_editorial_frame
     maximum_zoom = max(float(item["zoom"]) for item in span.editorial_transform["keyframes"])
-    width = max(size[0], int(math.ceil(size[0] * maximum_zoom / 2.0)) * 2)
-    height = max(size[1], int(math.ceil(size[1] * maximum_zoom / 2.0)) * 2)
-    source_height, source_width = working.shape[:2]
-    scale = max(width / source_width, height / source_height)
-    scaled_width = max(width, int(round(source_width * scale)))
-    scaled_height = max(height, int(round(source_height * scale)))
-    working = cv2.resize(working, (scaled_width, scaled_height), interpolation=cv2.INTER_CUBIC)
-    left, top = (scaled_width - width) // 2, (scaled_height - height) // 2
-    working = working[top:top + height, left:left + width]
-    if abs(roll) > 1e-9:
-        height, width = working.shape[:2]
-        rotation = cv2.getRotationMatrix2D(
-            (width / 2.0, height / 2.0),
-            -roll,  # FFmpeg rotate is clockwise; OpenCV positive is counter-clockwise.
-            1.0,
-        )
-        working = cv2.warpAffine(
-            working,
-            rotation,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
-    height, width = working.shape[:2]
-    crop_width = max(1, int(width / zoom))
-    crop_height = max(1, int(height / zoom))
-    left = int(width * center_x - width / (2.0 * zoom))
-    top = int(height * center_y - height / (2.0 * zoom))
-    left = min(max(0, left), width - crop_width)
-    top = min(max(0, top), height - crop_height)
-    working = working[top : top + crop_height, left : left + crop_width]
-    return cv2.resize(working, size, interpolation=cv2.INTER_CUBIC)
+    return reproject_editorial_frame(working, size=size, zoom=zoom, center_x=center_x,
+        center_y=center_y, roll_degrees=roll, maximum_zoom=maximum_zoom)
 
 
 def _contrast_normalized_detail(value: _FrameScalar) -> float:
@@ -883,6 +850,7 @@ def evaluate_post_render_perceptual_quality(
     *,
     config: PerceptualQualityConfig | None = None,
     capture_factory: CaptureFactory = cv2.VideoCapture,
+    allow_legacy_reference_clock: bool = False,
 ) -> dict[str, Any]:
     """Return fail-closed scalar evidence for one final video and render plan."""
 
@@ -919,7 +887,8 @@ def evaluate_post_render_perceptual_quality(
     }
     from .render_reference_clock import load_render_reference_clock
     try:
-        reference_clock = load_render_reference_clock(video_path, plan, retention_output_indices)
+        reference_clock = load_render_reference_clock(video_path, plan, retention_output_indices,
+            allow_legacy=allow_legacy_reference_clock)
     except (OSError, ValueError, TypeError) as exc:
         issues.add("perceptual_render_source_clock_invalid", "fail",
             "Recorded render clock could not be rebound to the exact current plan and media.",

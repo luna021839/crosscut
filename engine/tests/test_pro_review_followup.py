@@ -18,16 +18,91 @@ from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack,
 from crosscut.rendered_proxy_review import ProxyReviewConfig, _boundary_domain_summary, _boundary_evidence, _distribution
 from engine.tests.test_post_render_qa import _fixture_payloads, _promote_review_to_domain_aware_v3
 from engine.tests.test_review_first_selection_contract import _install_review_first_contract
+from crosscut.review_first_runtime import classify_review_first_qa
+from crosscut.proxy_review_contract import proxy_integrity_evidence
 
 
 class ProReviewFollowupTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+    def test_camera_projection_portrait_odd_aspect_and_intermediate_keyframes(self):
+        for source_size, size in (((960,540),(960,540)), ((541,961),(540,960)), ((1001,777),(960,540))):
+            sw, sh = source_size; width, height = size
+            frame = np.full((sh,sw,3),40,np.uint8)
+            cv2.circle(frame,(round(sw*.62),round(sh*.4)),12,(0,0,255),-1)
+            def centroid(pixels):
+                ys,xs=np.nonzero((pixels[:,:,2]>180)&(pixels[:,:,1]<70)&(pixels[:,:,0]<70))
+                self.assertGreater(len(xs),30)
+                return np.array([xs.mean(),ys.mean()])
+            for sign in (-1,1):
+                track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.08,.49,.51,sign*1.5),
+                    EditorialTransformKeyframe(1.,1.20,.53,.48,sign*.5)))
+                filters=_editorial_transform_filters(track,width=width,height=height,fps=2.)
+                result=subprocess.run(['ffmpeg','-v','error','-f','rawvideo','-pix_fmt','bgr24',
+                    '-s',f'{sw}x{sh}','-r','2','-i','pipe:0','-vf',','.join(filters),'-frames:v','3',
+                    '-pix_fmt','bgr24','-f','rawvideo','pipe:1'],input=frame.tobytes()*3,
+                    capture_output=True,timeout=15,check=True)
+                decoded=np.frombuffer(result.stdout,np.uint8).reshape(3,height,width,3)
+                span=_Span(0,0,0,3,0,0.,1.,1.5,0,None,None,json.loads(json.dumps(asdict(track))))
+                for i in range(3):
+                    with self.subTest(source=source_size,size=size,sign=sign,t=i/2):
+                        expected=_reference_view_for_span(frame,span,relative_time=i/2,size=size)
+                        self.assertLess(np.linalg.norm(centroid(decoded[i])-centroid(expected)),2.)
+
+    def test_full_qa_nested_technical_reasons_are_never_editorial(self):
+        from engine.tests.test_post_render_qa import _persist_fixture, _FakeRunner, _perceptual_pass_payload
+        from crosscut.post_render_qa import evaluate_post_render_qa
+        for reason in ("introduced_cross_source_duplicate_or_freeze", "introduced_cross_source_black_frame",
+                       "decode_failure", "future_unknown_failure", "geometry_provider_failure", "editorial"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                def mutate(analysis, plan, selection):
+                    _promote_review_to_domain_aware_v3(selection["final_selected_review"], plan)
+                    review = selection["final_selected_review"]
+                    boundary = review["boundaries"][0]
+                    actual_reason = "face_scale_discontinuity" if reason == "editorial" else reason
+                    boundary.update(passed=False, issue_reasons=[actual_reason],
+                                    technical_integrity_issue_reasons=[] if reason == "editorial" else [actual_reason])
+                    review.update(passed=False, boundary_issue_indices=[0],
+                                  introduced_cross_source_boundary_issue_indices=[0])
+                    review["boundary_score"].update(issue_count=1, issue_fraction=1/8)
+                    review["boundary_domains"] = {domain: _boundary_domain_summary(
+                        review["boundaries"], domain=domain, config=ProxyReviewConfig())
+                        for domain in review["boundary_domains"]}
+                    if reason == "geometry_provider_failure": review["geometry_provider_failure_count"] = 1
+                    selection["complete_candidates"][0].update(
+                        group_transitions={"transitions": deepcopy(plan["transitions"])},
+                        visual_timeline={"choices": deepcopy(plan["segments"])})
+                    _install_review_first_contract(analysis, selection)
+                artifacts, _, _, _ = _persist_fixture(Path(directory), mutate=mutate)
+                report = evaluate_post_render_qa(artifacts, runner=_FakeRunner(),
+                    perceptual_evaluator=lambda *args, **kwargs: _perceptual_pass_payload())
+                disposition = classify_review_first_qa(report.to_dict(), content_binding_passed=True,
+                    review_first_enabled=True, member=False)
+                self.assertEqual(disposition.video_output_exposed, reason == "editorial", disposition)
+
+    def test_group_classifier_requires_intact_nested_proof_even_for_passed_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, selection = self._current_review_fixture(directory)
+            evidence = proxy_integrity_evidence(selection["final_selected_review"])
+            for corrupt in (True, False):
+                checked = deepcopy(evidence)
+                if corrupt:
+                    checked["review"]["boundaries"][0]["technical_integrity_issue_reasons"] = ["unknown"]
+                result = classify_review_first_qa({"passed": True, "issues": [], "metrics": {
+                    "proxy_quality_and_geometry": {"technical_integrity": checked}}},
+                    content_binding_passed=True, review_first_enabled=True, member=False)
+                self.assertEqual(result.video_output_exposed, not corrupt)
+            result = classify_review_first_qa({"passed": True, "issues": []}, content_binding_passed=True,
+                review_first_enabled=True, member=False)
+            self.assertFalse(result.video_output_exposed)
+
     @staticmethod
     def _current_review_fixture(directory, *, missing_count=0):
         _, analysis, plan, selection = _fixture_payloads(Path(directory))
         review = selection["final_selected_review"]
         _promote_review_to_domain_aware_v3(review, plan)
         for boundary in review["boundaries"][:missing_count]:
-            boundary.update(weighted_score=None, passed=False, evidence_coverage=_boundary_evidence({}))
+            boundary.update(weighted_score=None, passed=False, evidence_coverage=_boundary_evidence({}),
+                            issue_reasons=["boundary_measurements_unavailable"])
         review["boundary_domains"] = {
             domain: _boundary_domain_summary(review["boundaries"], domain=domain, config=ProxyReviewConfig())
             for domain in ("introduced_cross_source", "tier_d_continuity", "native_source_cut")

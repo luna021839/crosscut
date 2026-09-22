@@ -12,6 +12,7 @@ from crosscut.render import (RenderSegment, RenderTransition, TransitionKind, No
 from crosscut.render_plan_serialization import render_plan_from_json
 from crosscut.render_reference_clock import load_render_reference_clock
 from crosscut.render_frame_schedule import FRAME_SCHEDULE_CONTRACT
+from crosscut.render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, video_content_sha256
 from engine.tests.test_render_boundary_clock import plan, clocks
 
 
@@ -24,10 +25,12 @@ class RenderReferenceClockTests(TestCase):
             output=Path(self.tmp.name)/'render.mp4')
         self.sidecar = self.p.output.with_suffix('.mp4.frame-clock.json')
         self.clocks = clocks(Fraction(60))
+        self.p.output.write_bytes(b'fixture video identity')
 
     def write(self, p=None, **overrides):
         p=p or self.p
         self.payload = dict(contract=FRAME_SCHEDULE_CONTRACT, enabled=True,
+            artifact_contract=RENDER_CLOCK_ARTIFACT_CONTRACT, video_content_sha256=video_content_sha256(p.output),
             source_clocks={str(i):self.clocks[i].to_dict() for i in {s.source_index for s in p.segments}},
             timestamp_fallback_source_indices=[],plan=p.to_json(),quality_approval=False)
         self.payload.update(overrides)
@@ -83,8 +86,23 @@ class RenderReferenceClockTests(TestCase):
         self.write(enabled=False,source_clocks={},timestamp_fallback_source_indices=[0,1])
         self.assertEqual(self.load().frames,{})
 
-    def test_missing_old_sidecar_returns_explicit_no_clock(self):
-        self.assertIsNone(self.load())
+    def test_missing_sidecar_is_not_an_implicit_legacy_fallback(self):
+        with self.assertRaisesRegex(ValueError, 'required render clock'):
+            self.load()
+        old = self.p.to_json(); old.pop('frame_clock_contract')
+        self.assertIsNone(load_render_reference_clock(self.p.output, old, (), allow_legacy=True))
+        with self.assertRaises(ValueError):
+            load_render_reference_clock(self.p.output, self.p.to_json(), (), allow_legacy=True)
+
+    def test_clock_is_bound_to_video_and_never_reads_original_output_fallback(self):
+        self.write()
+        copied = self.p.output.with_name('copy.mp4')
+        copied.write_bytes(self.p.output.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'required render clock'):
+            load_render_reference_clock(copied, self.p.to_json(), ())
+        self.p.output.write_bytes(b'other run')
+        with self.assertRaisesRegex(ValueError, 'exact render plan'):
+            self.load()
 
     def test_overlap_samples_rejected_but_pure_samples_remain_available(self):
         p=replace(self.p,segments=(RenderSegment(0,0.,1.,0.),RenderSegment(1,0.,1.,1.)),

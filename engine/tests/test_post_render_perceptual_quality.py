@@ -153,6 +153,7 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
                 plan,
                 config=_settings(),
                 capture_factory=factory,
+                allow_legacy_reference_clock=True,  # synthetic captures have no render artifact
             )
 
     def test_stable_exact_source_render_passes_with_scalar_only_evidence(self) -> None:
@@ -380,6 +381,7 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
                 plan,
                 config=config,
                 capture_factory=factory,
+                allow_legacy_reference_clock=True,
             )
 
         retention = payload["metrics"]["exact_source_retention"]
@@ -452,6 +454,7 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
                     retention_segment_guard_frames=3,
                 ),
                 capture_factory=factory,
+                allow_legacy_reference_clock=True,
             )
 
         evidence = payload["metrics"]["exact_source_retention"]
@@ -649,6 +652,13 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
                 ],
                 check=True,
             )
+            # Deliberately rebind the synthetic corrupted video to the expected
+            # clock so this test still exercises pixel mismatch detection,
+            # independently of the missing/modified clock rejection tests.
+            from crosscut.render_clock_artifact import render_clock_path, video_content_sha256
+            clock = json.loads(render_clock_path(normal).read_text())
+            clock['video_content_sha256'] = video_content_sha256(shifted)
+            render_clock_path(shifted).write_text(json.dumps(clock))
             shifted_payload = evaluate_post_render_perceptual_quality(
                 shifted,
                 plan,
@@ -754,6 +764,7 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
                 plan,
                 config=_settings(),
                 capture_factory=factory,
+                allow_legacy_reference_clock=True,
             )
 
         retention = payload["metrics"]["exact_source_retention"]

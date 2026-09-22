@@ -663,7 +663,9 @@ def _persist_mock_bound_qa_report(
 ) -> tuple[SimpleNamespace, Path]:
     passed = verdict == "PASS"
     fingerprints = fingerprint_post_render_artifacts(artifact_set)  # type: ignore[arg-type]
+    from engine.tests.test_review_first_runtime import _group_integrity_metrics
     payload = {
+        "metrics": _group_integrity_metrics(),
         "issue_count": 0 if passed else 1,
         "fail_issue_count": 0,
         "conditional_issue_count": 0 if passed else 1,
@@ -3372,8 +3374,15 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("시각 숏 중앙값 1.40초", logs[0])
         self.assertIn("소스 런 중앙값/최장 2.80/4.20초", logs[0])
 
+    def test_group_review_first_retains_incumbent_at_search_deadline(self):
+        for elapsed in (359.0, 360.0, 361.0, 599.0, 600.0):
+            with self.subTest(elapsed=elapsed):
+                self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+                    _cutoff_elapsed=elapsed
+                )
+
     def test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
-        self,
+        self, _cutoff_elapsed=None,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -3483,6 +3492,21 @@ class PipelineTests(unittest.TestCase):
                     ),
                 )
             )
+            section_plan = SectionPlan((SectionDirective(
+                section_index=0,
+                role=SectionRole.VERSE_LIKE,
+                start_seconds=0.0,
+                end_seconds=8.0,
+                energy_score=0.5,
+                confidence=0.9,
+                phrase_count=1,
+                preferred_source_hold_beats=4,
+                target_source_switches_per_minute=13.5,
+                camera_motion_budget=0.34,
+                target_roll_events_per_minute=0.0,
+                establish_with_wide_shot=False,
+                protect_last_beat_from_extra_cut=False,
+            ),))
 
             class RhythmStub:
                 bpm = 120.0
@@ -3511,6 +3535,9 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.analyze_rhythm",
                 return_value=RhythmStub(),
             ), patch(
+                "crosscut.pipeline.build_section_plan",
+                return_value=section_plan,
+            ), patch(
                 "crosscut.pipeline.analyze_source_derivative_diversity",
                 return_value=_source_derivative_diversity_fixture(len(sources)),
             ), patch(
@@ -3522,7 +3549,7 @@ class PipelineTests(unittest.TestCase):
             ), patch(
                 "crosscut.pipeline.build_visual_timeline",
                 return_value=visual_timeline,
-            ), patch(
+            ) as baseline_builder, patch(
                 "crosscut.pipeline.repair_visual_timeline_boundaries",
                 return_value=repairs,
             ), patch(
@@ -3535,6 +3562,26 @@ class PipelineTests(unittest.TestCase):
                 "crosscut.pipeline.render",
                 return_value="h264_videotoolbox",
             ) as render_video:
+                if _cutoff_elapsed is not None:
+                    from crosscut.review_first_runtime import ReviewFirstRuntime, ReviewFirstDeadlineExceeded
+                    now = [0.]
+                    runtime = ReviewFirstRuntime(enabled=True, _clock=lambda:now[0])
+                    now[0] = _cutoff_elapsed
+                    with patch('crosscut.pipeline.ReviewFirstRuntime', return_value=runtime):
+                        if _cutoff_elapsed >= 600.:
+                            with self.assertRaises(ReviewFirstDeadlineExceeded):
+                                analyze(replace(request,review_first_enabled=True), reporter)
+                            render_video.assert_not_called()
+                        else:
+                            bounded_artifact = analyze(replace(request,review_first_enabled=True), reporter)
+                            baseline_builder.assert_called_once()
+                            render_video.assert_called_once()
+                            self.assertEqual(baseline_builder.call_args.kwargs['maximum_results'],1)
+                            self.assertEqual(len(render_video.call_args.args[0].segments),2)
+                            self.assertIsNotNone(bounded_artifact.manifest['visual_timeline'])
+                            if _cutoff_elapsed >= 360.:
+                                self.assertTrue(any('확보한 전체 경로' in item for item in bounded_artifact.manifest['warnings']))
+                    return
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "automatic GROUP render blocked by timeline review failures",
@@ -8219,7 +8266,11 @@ class PipelineTests(unittest.TestCase):
                 track_member.assert_not_called()
                 build_cropped_member.assert_not_called()
 
-    def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(self) -> None:
+    def test_member_review_first_quality_miss_renders_once_and_reaches_final_review_ready(self) -> None:
+        self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(_quality_miss=True)
+
+    def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(self, _quality_miss=False) -> None:
+        from crosscut.pipeline import _enforce_automatic_member_post_render_qa as actual_member_gate
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sources = tuple(root / f"official-gaeul-{index}.mp4" for index in range(10))
@@ -8422,6 +8473,26 @@ class PipelineTests(unittest.TestCase):
                 )
                 eligible = direct_payload["eligible_request_source_indices"]
                 assert eligible == list(range(10))
+                if _quality_miss:
+                    # Full analyze() orchestration plus the actual final exposure
+                    # controller. Media/model work is injected in this code test.
+                    from crosscut.member_post_render_qa import AutomaticMemberPostRenderArtifactSet, fingerprint_automatic_member_artifacts
+                    artifacts = AutomaticMemberPostRenderArtifactSet.from_manifest(manifest_path, manifest)
+                    artifacts.render_plan_path.write_text('{}')
+                    artifacts.video_path.write_bytes(b'synthetic member output')
+                    def evaluate(bound, **unused):
+                        fingerprints = fingerprint_automatic_member_artifacts(bound)
+                        report_payload = {'passed': False, 'verdict': 'FAIL',
+                            'issues': [{'code': 'member_rendered_continuity_not_pass'}],
+                            'issue_count': 1, 'metrics': {'rendered_continuity': member_proxy_continuity()},
+                            'input_artifact_fingerprints': fingerprints, 'final_artifact_fingerprints': fingerprints}
+                        report = SimpleNamespace(passed=False, verdict='FAIL',
+                            input_artifact_fingerprints=fingerprints, final_artifact_fingerprints=fingerprints,
+                            render_receipt={'all_eligible_sources_pixel_proven': True}, to_dict=lambda: report_payload)
+                        bound.default_report_path.write_text(json.dumps(report_payload))
+                        return report, bound.default_report_path
+                    with patch('crosscut.pipeline.evaluate_and_write_automatic_member_post_render_qa', side_effect=evaluate):
+                        return actual_member_gate(**kwargs)
                 receipt = {
                     "contract": MEMBER_RENDER_RECEIPT_CONTRACT,
                     "eligible_source_indices": eligible,
@@ -8472,12 +8543,22 @@ class PipelineTests(unittest.TestCase):
                 )
                 return report_path
 
+            def member_proxy_continuity():
+                return {'schema_version': 1, 'analysis': 'automatic_member_exact_rendered_boundary_continuity_v1',
+                    'passed': not _quality_miss,
+                    'failure_reasons': ['rendered_pose_p95_above_floor'] if _quality_miss else [],
+                    'failure_boundary_indices': {}, 'boundaries': [],
+                    'metrics': {'output_frame_count': 1200, 'exact_incoming_first_frame_evaluated': True,
+                        'final_render_transform_domain_evaluated': True, 'attention_position_mismatch_p95': 0.,
+                        'attention_scale_mismatch_p95': 0., 'pose_mismatch_p95': .4 if _quality_miss else 0.,
+                        'silhouette_mismatch_p95': 0.}}
+
             def pass_member_proxy(
                 plan: RenderPlan,
                 _output_path: Path,
                 **_kwargs: object,
             ) -> tuple[RenderPlan, DirectMemberRenderedProxyPreflight]:
-                return plan, DirectMemberRenderedProxyPreflight(
+                preflight = DirectMemberRenderedProxyPreflight(
                     {
                         "schema_version": 1,
                         "passed": True,
@@ -8488,6 +8569,9 @@ class PipelineTests(unittest.TestCase):
                         "generic_repair_target_boundary_indices": [],
                         "continuity_repair_target_boundary_indices": [],
                         "rendered_proxy_review": {
+                            "schema_version": 3, "geometry_provider_failure_count": 0,
+                            "reviewed_boundary_count": 0, "boundaries": [],
+                            "introduced_cross_source_technical_issue_reasons": [],
                             "passed": True,
                             "weighted_score": 1.0,
                         },
@@ -8511,6 +8595,12 @@ class PipelineTests(unittest.TestCase):
                     }
                 )
 
+                payload = dict(preflight.payload)
+                payload['passed'] = not _quality_miss
+                payload['direct_member_rendered_continuity_passed'] = not _quality_miss
+                payload['rendered_continuity'] = member_proxy_continuity()
+                return plan, DirectMemberRenderedProxyPreflight(payload)
+
             professional_gate_metrics = {
                 "visible_switches_per_minute": 16.5,
                 "pose_mismatch_p95": 0.0,
@@ -8518,13 +8608,13 @@ class PipelineTests(unittest.TestCase):
                 "editorial_transform_segment_count": 1,
             }
             professional_gate = SimpleNamespace(
-                passed=True,
-                failure_reasons=(),
+                passed=not _quality_miss,
+                failure_reasons=('pose_mismatch_p95_above_professional_floor',) if _quality_miss else (),
                 metrics=professional_gate_metrics,
                 to_dict=lambda: {
                     "contract": "synthetic_direct_member_professional_gate",
-                    "passed": True,
-                    "failure_reasons": [],
+                    "passed": not _quality_miss,
+                    "failure_reasons": ["pose_mismatch_p95_above_professional_floor"] if _quality_miss else [],
                     "metrics": dict(professional_gate_metrics),
                 },
             )
@@ -8563,7 +8653,7 @@ class PipelineTests(unittest.TestCase):
             ) as build_direct_motion_mock, patch(
                 "crosscut.pipeline.render_and_review_direct_member_proxy",
                 side_effect=pass_member_proxy,
-            ), patch(
+            ) as member_proxy_mock, patch(
                 "crosscut.pipeline."
                 "evaluate_direct_member_professional_pre_render_gate",
                 return_value=professional_gate,
@@ -8592,6 +8682,8 @@ class PipelineTests(unittest.TestCase):
             build_cropped_member.assert_not_called()
             build_member_motion.assert_not_called()
             build_direct_motion_mock.assert_called_once()
+            member_proxy_mock.assert_called_once()
+            render_video.assert_called_once()
             source_first_session.assert_called_once()
             member_delivery_gate.assert_called_once()
             analyze_member_cut_local_sync.assert_called_once()
@@ -8649,11 +8741,14 @@ class PipelineTests(unittest.TestCase):
                 manifest["render"]["cut_local_sync"],
                 member_cut_local_sync_payload,
             )
-            self.assertEqual(manifest["artifact_role"], "delivery")
+            self.assertEqual(manifest["artifact_role"], "review_ready" if _quality_miss else "delivery")
             self.assertTrue(
                 manifest["app_result_exposure"]["video_output_exposed"]
             )
-            self.assertTrue(manifest["post_render_qa"]["passed"])
+            self.assertEqual(manifest["post_render_qa"]["passed"], not _quality_miss)
+            if _quality_miss:
+                self.assertEqual(manifest['post_render_qa']['review_first_disposition']['status'], 'REVIEW_READY')
+                self.assertFalse(manifest['app_result_exposure']['delivery_completion_message_allowed'])
             self.assertTrue(
                 manifest["post_render_qa"]["render_receipt"][
                     "all_eligible_sources_pixel_proven"

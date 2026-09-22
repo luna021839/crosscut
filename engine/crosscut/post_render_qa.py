@@ -107,7 +107,7 @@ ANALYSIS_BASIS = (
     "content_bound_full_decode_professional_post_render_qa_v2"
 )
 INPUT_ARTIFACT_FINGERPRINT_CONTRACT = (
-    "post_render_qa_input_artifact_content_sha256_v1"
+    "post_render_qa_input_artifact_content_sha256_v2"
 )
 DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT = (
     "final_render_plan_registered_release_freeze_decode_and_motion_evidence_"
@@ -697,9 +697,10 @@ def _file_content_fingerprint(path: Path) -> dict[str, Any]:
 def fingerprint_post_render_artifacts(
     artifact_set: PostRenderArtifactSet,
 ) -> dict[str, Any]:
-    """Return exact content identities for the four mandatory QA inputs."""
+    """Include the required modern frame clock in the exact QA read authority."""
 
-    return {
+    from .render_clock_artifact import bound_render_clock_path
+    result = {
         "contract": INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
         "analysis": _file_content_fingerprint(artifact_set.analysis_path),
         "render_plan": _file_content_fingerprint(
@@ -708,6 +709,10 @@ def fingerprint_post_render_artifacts(
         "selection": _file_content_fingerprint(artifact_set.selection_path),
         "video": _file_content_fingerprint(artifact_set.video_path),
     }
+    clock = bound_render_clock_path(artifact_set.video_path, artifact_set.render_plan_path)
+    if clock is not None:
+        result["frame_clock"] = _file_content_fingerprint(clock)
+    return result
 
 
 def normalize_post_render_artifact_fingerprints(
@@ -722,6 +727,9 @@ def normalize_post_render_artifact_fingerprints(
         "selection": declared_artifact_set.selection_path,
         "video": declared_artifact_set.video_path,
     }
+    if "frame_clock" in fingerprints:
+        from .render_clock_artifact import render_clock_path
+        declared_paths["frame_clock"] = render_clock_path(declared_artifact_set.video_path)
     if fingerprints.get("contract") != INPUT_ARTIFACT_FINGERPRINT_CONTRACT:
         raise ValueError("post-render artifact fingerprints use the wrong contract")
     normalized: dict[str, Any] = {
@@ -785,7 +793,7 @@ def _clone_or_copy_snapshot_file(source: Path, destination: Path) -> str:
 def materialize_post_render_qa_snapshot(
     artifact_set: PostRenderArtifactSet,
 ) -> PostRenderQAEvaluationSnapshot:
-    """Freeze four QA inputs in a private same-filesystem artifact set.
+    """Freeze all QA inputs, including the clock, in private independent inodes.
 
     Content equality is checked after all independent snapshot inodes exist.
     The evaluator must receive only the returned ``artifact_set``; the original
@@ -814,6 +822,9 @@ def materialize_post_render_qa_snapshot(
         ("selection", artifact_set.selection_path, frozen.selection_path),
         ("video", artifact_set.video_path, frozen.video_path),
     )
+    if "frame_clock" in declared_fingerprints:
+        from .render_clock_artifact import render_clock_path
+        source_and_destination += (("frame_clock", render_clock_path(artifact_set.video_path), render_clock_path(frozen.video_path)),)
     methods: dict[str, str] = {}
     try:
         for key, source, destination in source_and_destination:
@@ -3971,6 +3982,12 @@ def _proxy_quality_and_geometry_metrics(
     config: PostRenderQAConfig,
     collector: _IssueCollector,
 ) -> dict[str, Any]:
+    from .proxy_review_contract import proxy_integrity_evidence
+    integrity = proxy_integrity_evidence(final_review)
+    for code in integrity["technical_issue_codes"]:
+        collector.add(code, QAIssueSeverity.FAIL,
+                      "Decoded proxy contains a technical failure or invalid nested evidence.",
+                      path="rendered_proxy_review.technical_integrity", value=False, threshold=True)
     if final_review.get("passed") is not True:
         collector.add(
             "decoded_proxy_review_failed",
@@ -4364,6 +4381,7 @@ def _proxy_quality_and_geometry_metrics(
             }
         )
     return {
+        "technical_integrity": integrity,
         "overall_quality_p10": quality_p10,
         "source_quality_median_span": source_median_span,
         "used_source_indices": sorted(choices_used),

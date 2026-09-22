@@ -208,6 +208,9 @@ from .request import (
     MINIMUM_AUTOMATIC_SOURCE_COUNT,
 )
 from .review_first_runtime import (
+    MEMBER_PRE_RENDER_EDITORIAL_REASONS,
+    ReviewFirstSearchCutoff,
+    member_proxy_technical_issues,
     ReviewFirstRuntime,
     ReviewFirstStatus,
     classify_review_first_qa,
@@ -4905,7 +4908,6 @@ def _complete_automatic_stage_edit_post_render_qa(
         and snapshot_stable_through_promotion
         and report_stable_through_promotion
     )
-    effective_passed = bool(report.passed and promotion_binding_passed)
     request_payload = manifest.get("request")
     review_first_enabled = bool(
         isinstance(request_payload, Mapping)
@@ -4917,6 +4919,7 @@ def _complete_automatic_stage_edit_post_render_qa(
         review_first_enabled=review_first_enabled,
         member=False,
     )
+    effective_passed = qa_disposition.status is ReviewFirstStatus.APPROVED
     delivery_gate_verdict = (
         "PASS" if effective_passed else qa_disposition.status.value
     )
@@ -4929,7 +4932,7 @@ def _complete_automatic_stage_edit_post_render_qa(
     }
     if promotion_binding_passed:
         promoted_inputs: dict[str, Any] = {}
-        for key, source, destination in (
+        promotion_inputs = (
             (
                 "render_plan",
                 artifact_set.render_plan_path,
@@ -4945,7 +4948,11 @@ def _complete_automatic_stage_edit_post_render_qa(
                 artifact_set.video_path,
                 declared_artifact_set.video_path,
             ),
-        ):
+        )
+        if "frame_clock" in pre_promotion_input_fingerprints:
+            from .render_clock_artifact import render_clock_path
+            promotion_inputs += (("frame_clock", render_clock_path(artifact_set.video_path), render_clock_path(declared_artifact_set.video_path)),)
+        for key, source, destination in promotion_inputs:
             promoted_inputs[key] = (
                 _atomically_materialize_verified_snapshot_file(
                     source,
@@ -5095,6 +5102,9 @@ def _complete_automatic_stage_edit_post_render_qa(
             f"post-render QA verdict {report.verdict.value}"
             if not report.passed
             else "post-render QA artifact content binding failure"
+            if not promotion_binding_passed
+            else "post-render QA integrity contract failure: "
+            + ", ".join(qa_disposition.technical_issue_codes)
         )
         raise RuntimeError(
             "automatic IVE GROUP final render blocked by mandatory "
@@ -5188,7 +5198,6 @@ def _enforce_automatic_member_post_render_qa(
         == report.final_artifact_fingerprints
         == pre_exposure_fingerprints
     )
-    effective_passed = bool(report.passed and content_binding_passed)
     qa_disposition = classify_review_first_qa(
         {**report_payload, "passed": bool(report.passed)},
         content_binding_passed=content_binding_passed,
@@ -5198,6 +5207,7 @@ def _enforce_automatic_member_post_render_qa(
         ),
         member=True,
     )
+    effective_passed = qa_disposition.status is ReviewFirstStatus.APPROVED
     final_role = qa_disposition.artifact_role
     final_exposure = {
         "contract": AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
@@ -5259,6 +5269,8 @@ def _enforce_automatic_member_post_render_qa(
             f"verdict {report.verdict}"
             if not report.passed
             else "artifact content binding failure"
+            if not content_binding_passed
+            else "integrity contract failure: " + ", ".join(qa_disposition.technical_issue_codes)
         )
         raise RuntimeError(
             "automatic IVE MEMBER final render blocked by mandatory "
@@ -28117,9 +28129,7 @@ def analyze(
                 completed: int,
                 total: int,
             ) -> None:
-                review_first_runtime.require_first_render_budget(
-                    "full_song_visual_selection"
-                )
+                review_first_runtime.require_first_render_budget("optional_full_song_visual_selection")
                 reporter.progress(
                     0.96 + 0.018 * completed / max(1, total),
                     f"컷 전후 대형을 비교하는 중… {completed}/{total}",
@@ -33147,6 +33157,23 @@ def analyze(
             else:
                 review_first_runtime.checkpoint("visual_selection_started")
                 review_first_rejections: list[dict[str, Any]] = []
+                if bool(getattr(request, "review_first_enabled", False)):
+                    # Establish one complete incumbent before optional learned
+                    # candidate materialization. Its progress uses the real
+                    # 600s ceiling, never the recoverable 360s search cutoff.
+                    def baseline_progress(completed, total):
+                        review_first_runtime.require_total_budget("required_visual_baseline")
+                        reporter.progress(0.96 + 0.018 * completed / max(1, total),
+                            f"첫 전체 편집 경로 확인 중… {completed}/{total}")
+                    visual_timeline = build_visual_timeline(**{
+                        **visual_builder_arguments, "progress_callback": baseline_progress, "maximum_results": 1})
+                    review_first_visual_selection_payload = {
+                        "contract": "review_first_visual_selection_v1",
+                        "authority": "deterministic_full_song_visual_selector",
+                        "incumbent_retained_before_optional_search": True,
+                        "passed": True,
+                    }
+                    review_first_runtime.require_first_render_budget("optional_candidate_refinement")
                 if (
                     bool(getattr(request, "review_first_enabled", False))
                     and stage_edit_generation_result is not None
@@ -33291,6 +33318,11 @@ def analyze(
                     f"프레임 품질·구도·움직임 전역 선택 점수 "
                     f"{visual_timeline.optimizer_score:.3f}"
                 )
+        except ReviewFirstSearchCutoff as exc:
+            if visual_timeline is None:
+                raise RuntimeError("optional search ended without a complete incumbent") from exc
+            warnings.append(f"선택 탐색 예산 종료 · 확보한 전체 경로로 렌더와 QA 진행: {exc}")
+            review_first_runtime.checkpoint("visual_incumbent_retained_at_search_cutoff")
         except (ValueError, cv2.error) as exc:
             _route_visual_timeline_selection_failure(
                 request=request,
@@ -33304,7 +33336,8 @@ def analyze(
                 materialized_candidate_count=len(materialized_group_candidates),
                 warnings=warnings,
             )
-        if visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels":
+        if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
+                and (not review_first_runtime.enabled or review_first_runtime.optional_refinement_allowed)):
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
             try:
                 visual_boundary_repairs = repair_visual_timeline_boundaries(
@@ -36522,6 +36555,25 @@ def analyze(
                         candidate_member_motion_plan,
                         proxy_render_index=decoded_proxy_render_count,
                     )
+                    if bool(getattr(request, "review_first_enabled", False)):
+                        technical_issues = member_proxy_technical_issues(rendered_proxy_review_payload)
+                        if technical_issues:
+                            raise RuntimeError("member review-first proxy technical failure: " + ", ".join(technical_issues))
+                        segments = candidate_segments
+                        member_transitions = candidate_plan.transitions
+                        direct_cadence["joint_dissolve_registration"] = deepcopy(candidate_joint_dissolve_audit)
+                        member_look_plan = candidate_member_look_plan
+                        member_editorial_motion_plan = candidate_member_motion_plan
+                        accepted_rendered_proxy_preflight_payload = deepcopy(rendered_proxy_review_payload)
+                        accepted_rendered_proxy_preflight_payload["review_first_decision"] = {
+                            "retained_first_technically_valid_candidate": True,
+                            "quality_approved": False,
+                            "quality_triggered_rerenders": 0,
+                            "final_pixel_qa_required": True,
+                        }
+                        member_final_focal_reference_candidates_by_boundary_index = dict(candidate_focal_reference_candidates_by_boundary_index)
+                        reporter.log("멤버 첫 기술 정상 후보 확정 · 품질 재렌더 없이 최종 출력 QA로 진행")
+                        break
                     continuity_metrics = rendered_proxy_review_payload[
                         "rendered_continuity"
                     ]["metrics"]
@@ -38075,7 +38127,14 @@ def analyze(
                 "편집 카메라 "
                 f"{professional_gate_result.metrics['editorial_transform_segment_count']}개"
             )
-            if not professional_gate_result.passed:
+            reviewable_pre_render_miss = bool(
+                getattr(request, "review_first_enabled", False)
+                and professional_gate_result.failure_reasons
+                and all(reason in MEMBER_PRE_RENDER_EDITORIAL_REASONS for reason in professional_gate_result.failure_reasons)
+                and accepted_rendered_proxy_preflight_payload is not None
+                and not member_proxy_technical_issues(accepted_rendered_proxy_preflight_payload)
+            )
+            if not professional_gate_result.passed and not reviewable_pre_render_miss:
                 raise RuntimeError(
                     "automatic member professional pre-render gate rejected "
                     "the edit before FFmpeg: "

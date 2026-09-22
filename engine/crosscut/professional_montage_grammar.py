@@ -518,11 +518,14 @@ class IntroducedBoundaryContinuityEvidence:
             )
         if boundary_count:
             if self.score_p10 is None:
-                raise MontageGrammarEvidenceError(
-                    "introduced score_p10 is required when boundaries exist"
-                )
-            score_p10 = _finite(self.score_p10, "introduced score_p10")
-            if not 0.0 <= score_p10 <= 100.0:
+                if issue_count != boundary_count:
+                    raise MontageGrammarEvidenceError(
+                        "unobserved introduced scores must mark every boundary as an issue"
+                    )
+                score_p10 = None
+            else:
+                score_p10 = _finite(self.score_p10, "introduced score_p10")
+            if score_p10 is not None and not 0.0 <= score_p10 <= 100.0:
                 raise MontageGrammarEvidenceError(
                     "introduced score_p10 must lie in [0, 100]"
                 )
@@ -1171,6 +1174,8 @@ def assess_professional_boundary_grammar(
         )
 
     continuity = evidence.introduced_boundary_continuity
+    if continuity.boundary_count and continuity.score_p10 is None:
+        failures.append("introduced_boundary_score_unobserved")
     if continuity.issue_fraction > (
         settings.maximum_introduced_boundary_issue_fraction + 1e-12
     ):

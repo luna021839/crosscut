@@ -7207,6 +7207,7 @@ def build_visual_timeline(
     feature_cache_directory: Path | None = None,
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
+    maximum_results: int = 32,
 ) -> VisualTimelinePlan:
     """Build the selected visual plan while preserving the existing API."""
 
@@ -7228,7 +7229,7 @@ def build_visual_timeline(
         feature_cache_directory=feature_cache_directory,
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache,
-        maximum_candidate_results=32,
+        maximum_candidate_results=maximum_results,
         candidate_set_only=False,
     )
     if not isinstance(result, VisualTimelinePlan):  # pragma: no cover - invariant

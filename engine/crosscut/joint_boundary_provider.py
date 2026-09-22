@@ -82,7 +82,7 @@ JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS = (
     "visual_boundary_repair_professional_gates_v4+face_led_spatial_remeasurement_v1+"
     "scalar_only_exact_raw_result_context_proof_v2+"
     "renderer_exact_boundary_local_active_handle_track_v3+"
-    "immutable_transform_subject_basis_v1+selected_bridge_audit_handoff_v1"
+    "immutable_transform_subject_basis_v1+selected_bridge_audit_handoff_v1+clockwise_canvas_geometry_v2"
 )
 _SIDE_SAMPLE_RADIUS_FRAMES = 3
 _BOUNDARY_TRANSFORM_HOLD_FRAMES = _SIDE_SAMPLE_RADIUS_FRAMES + 0.5
@@ -1340,7 +1340,7 @@ class DecodedBoundaryOptionProvider:
             f"injected-process-callable:{id(transformed_descriptor_provider)}"
             if transformed_descriptor_provider is not None
             else (
-                "production-decoded-renderer-transform-descriptor-v1"
+                "production-decoded-renderer-transform-descriptor-v2"
                 if descriptor_provider is None
                 else "unavailable-with-injected-raw-descriptor-provider"
             )
@@ -2018,7 +2018,7 @@ class DecodedBoundaryOptionProvider:
         transform: BoundaryTransformState,
     ) -> FrameVisualDescriptor | None:
         request_key = (
-            "request-v2",
+            "request-v3-clockwise-canvas",
             self._cache_source_indices[source_index],
             round(float(seconds), 7),
             transform.crop_xywh,
@@ -2048,7 +2048,7 @@ class DecodedBoundaryOptionProvider:
             descriptor = None
             if frame is not None:
                 content_key = (
-                    "decoded-working-frame-v2",
+                    "decoded-working-frame-v3-clockwise-canvas",
                     self._cache_source_indices[source_index],
                     sampler.frame_digest_at(seconds, frame),
                     transform.crop_xywh,
@@ -2081,42 +2081,19 @@ class DecodedBoundaryOptionProvider:
                     and x + crop_width <= 1.0 + _EPSILON
                     and y + crop_height <= 1.0 + _EPSILON
                 ):
-                    left = max(0, min(width - 1, int(math.floor(x * width))))
-                    top = max(0, min(height - 1, int(math.floor(y * height))))
-                    right = max(
-                        left + 1,
-                        min(width, int(math.ceil((x + crop_width) * width))),
-                    )
-                    bottom = max(
-                        top + 1,
-                        min(height, int(math.ceil((y + crop_height) * height))),
-                    )
-                    working = frame[top:bottom, left:right]
                     try:
-                        working = cv2.resize(
-                            working,
-                            (width, height),
-                            interpolation=cv2.INTER_LANCZOS4,
-                        )
-                        if abs(transform.rotation_degrees) > _EPSILON:
-                            matrix = cv2.getRotationMatrix2D(
-                                (width / 2.0, height / 2.0),
-                                transform.rotation_degrees,
-                                1.0,
-                            )
-                            working = cv2.warpAffine(
-                                working,
-                                matrix,
-                                (width, height),
-                                flags=cv2.INTER_LANCZOS4,
-                                borderMode=cv2.BORDER_REFLECT_101,
-                            )
+                        from .render_geometry import reproject_editorial_frame
+                        keyframe = self._renderer_keyframe(transform, 0.)
+                        working = reproject_editorial_frame(frame, size=(width, height),
+                            zoom=keyframe.zoom, maximum_zoom=keyframe.zoom,
+                            center_x=keyframe.center_x, center_y=keyframe.center_y,
+                            roll_degrees=keyframe.roll_degrees)
                         descriptor = describe_frame(
                             working,
                             include_subject_geometry=True,
                             include_formation_pose=True,
                         )
-                    except cv2.error:
+                    except (cv2.error, ValueError):
                         descriptor = None
         if descriptor is not None and not isinstance(
             descriptor,
@@ -2884,7 +2861,7 @@ class DecodedBoundaryOptionProvider:
     ) -> EditorialTransformKeyframe:
         crop = transform.crop_xywh
         if crop is None:
-            return EditorialTransformKeyframe(time_seconds, 1.0)
+            return EditorialTransformKeyframe(time_seconds, 1.0, roll_degrees=transform.rotation_degrees)
         x, y, width, height = crop
         if not math.isclose(width, height, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("renderer transform cannot represent anisotropic crop")

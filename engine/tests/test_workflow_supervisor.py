@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 from time import monotonic
+from threading import Event
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,10 +38,30 @@ class WorkflowSupervisorTests(unittest.TestCase):
                 "ctypes.CDLL(None).sleep(20)"
             )
             started = monotonic()
-            with self.assertRaises(subprocess.TimeoutExpired):
+            offset = [0.]
+            ready_at = [None]
+            real_popen = subprocess.Popen
+            def ready_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                until = monotonic() + 3.
+                while not pid_file.exists() and monotonic() < until:
+                    Event().wait(.005)
+                if not pid_file.exists():
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    self.fail('native-block fixture never became ready')
+                ready_at[0] = monotonic()
+                # Separate interpreter startup from the 250ms native-block
+                # fixture budget. Production clocks and limits are unchanged.
+                offset[0] = ready_at[0] - started
+                return process
+            with patch('crosscut.workflow_supervisor.subprocess.Popen', side_effect=ready_popen), patch(
+                'crosscut.workflow_supervisor.monotonic', side_effect=lambda: monotonic() - offset[0]
+            ), self.assertRaises(subprocess.TimeoutExpired):
                 run_supervised_workflow([sys.executable, "-c", code],
                                         absolute_deadline_monotonic_seconds=started + .25)
-            self.assertLess(monotonic() - started, 1.8)
+            self.assertIsNotNone(ready_at[0])
+            self.assertLess(monotonic() - ready_at[0], 1.8)
             with self.assertRaises(ProcessLookupError):
                 os.kill(int(pid_file.read_text()), 0)
 

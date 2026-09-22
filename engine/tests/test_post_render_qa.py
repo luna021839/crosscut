@@ -500,6 +500,7 @@ def _promote_review_to_domain_aware_v3(
                 "transition_reason": transition["reason"],
                 "transition_tier": transition["tier"],
                 "source_clock_contiguous": False,
+                "technical_integrity_issue_reasons": [],
             }
         )
     review.update(
@@ -510,6 +511,7 @@ def _promote_review_to_domain_aware_v3(
             "introduced_cross_source_boundary_issue_indices": [],
             "tier_d_continuity_count": 0,
             "native_source_cut_count": 0,
+            "introduced_cross_source_technical_issue_reasons": [],
             "boundary_domains": {
                 "introduced_cross_source": {
                     "domain": "introduced_cross_source",

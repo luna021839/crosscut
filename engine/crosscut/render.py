@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -1381,7 +1382,9 @@ class RenderPlan:
             payload["source_local_start"] = segment.source_start
             payload["source_local_end"] = segment.source_end
             serialized_segments.append(payload)
+        from .render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT
         return {
+            "frame_clock_contract": RENDER_CLOCK_ARTIFACT_CONTRACT,
             "sources": [str(path) for path in self.sources],
             "segments": serialized_segments,
             "reference_source": self.reference_source,
@@ -2613,8 +2616,13 @@ def build_filter_graph(
                 xfade = "xfade=transition=hblur:"
             else:  # pragma: no cover - guarded by uses_overlap
                 raise ValueError("unsupported overlap transition kind")
+            # concat can report frame_rate=1/0 even with evenly spaced PTS.
+            # xfade requires a declared CFR on both inputs (not merely settb).
+            for label, normalized in ((current_label, f"xin{xfade_index}a"),
+                    (f"v{next_unit.first_segment_index}", f"xin{xfade_index}b")):
+                parts.append(f"[{label}]fps={plan.fps:.9f},settb=AVTB[{normalized}]")
             parts.append(
-                f"[{current_label}][v{next_unit.first_segment_index}]"
+                f"[xin{xfade_index}a][xin{xfade_index}b]"
                 f"{xfade}"
                 f"duration={transition.duration_seconds(plan.fps):.9f}:"
                 f"offset={cumulative_frames / plan.fps:.9f},format=yuv420p"
@@ -2642,10 +2650,11 @@ def build_filter_graph(
     else:
         labels = "".join(f"[{label}]" for label in chunk_labels)
         parts.append(f"{labels}concat=n={len(chunk_labels)}:v=1:a=0[vcat]")
+    output_rate = Fraction(plan.fps).limit_denominator(1_001_000)
     parts.append(
         f"[vcat]fps={plan.fps:.6f},tpad=stop_mode=clone:stop_duration=1,"
         f"trim=end_frame={plan.output_frame_count},"
-        f"setpts=N/({plan.fps:.6f}*TB),settb=AVTB[vout]"
+        f"settb={output_rate.denominator}/{output_rate.numerator},setpts=N[vout]"
     )
     parts.append(
         f"[{plan.reference_source}:a]atrim=start={plan.master_audio_start:.6f}:"
@@ -2727,14 +2736,16 @@ def render(
         filter_path = root / "filter.ffscript"
         filter_path.write_text(filter_graph, encoding="utf-8")
         clock_evidence = root / "frame-clock.json"
-        clock_evidence.write_text(json.dumps({
+        from .render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, video_content_sha256, render_clock_path
+        clock_payload = {
+            "artifact_contract": RENDER_CLOCK_ARTIFACT_CONTRACT,
             "contract": FRAME_SCHEDULE_CONTRACT,
             "enabled": use_verified_frame_schedule,
             "source_clocks": {str(index): clock.to_dict() for index, clock in source_clocks.items()},
             "timestamp_fallback_source_indices": sorted({segment.source_index for segment in plan.segments} - source_clocks.keys()),
             "plan": plan.to_json(), "filter_graph": filter_graph,
             "quality_approval": False,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        }
         temporary_output = root / f"render{plan.output.suffix or '.mp4'}"
         codecs = (video_codec, "libx264") if video_codec == "h264_videotoolbox" else (video_codec,)
         failures: list[str] = []
@@ -2784,6 +2795,11 @@ def render(
                 )
             command.extend(
                 (
+                    "-r", str(Fraction(plan.fps).limit_denominator(1_001_000)),
+                    "-fps_mode:v", "cfr",
+                    "-enc_time_base:v", str(1 / Fraction(plan.fps).limit_denominator(1_001_000)),
+                    "-video_track_timescale", str(Fraction(plan.fps).limit_denominator(1_001_000).numerator),
+                    "-movie_timescale", str(Fraction(plan.fps).limit_denominator(1_001_000).numerator),
                     "-tag:v",
                     "avc1",
                     "-c:a",
@@ -2811,8 +2827,10 @@ def render(
                     f"{maximum_runtime_seconds} seconds"
                 ) from exc
             if completed.returncode == 0:
+                clock_payload["video_content_sha256"] = video_content_sha256(temporary_output)
+                clock_evidence.write_text(json.dumps(clock_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 temporary_output.replace(plan.output)
-                clock_evidence.replace(plan.output.with_suffix(plan.output.suffix + ".frame-clock.json"))
+                clock_evidence.replace(render_clock_path(plan.output))
                 return codec
             failures.append(f"{codec}: {completed.stderr.strip() or 'unknown FFmpeg error'}")
         raise RuntimeError("video render failed: " + " | ".join(failures))
