@@ -8750,26 +8750,34 @@ def _densify_direct_full_frame_highlights(
     *,
     minimum_span_count: int | None = None,
 ) -> tuple[_DirectFullFrameSpan, ...]:
-    """Add musically bound highlight cuts without weakening visual gates.
+    """Add musically bound cuts without weakening visual gates.
 
     The reference cadence remains roughly four timing units outside active
     sections.  Inside BUILD/CHORUS-like intervals, long holds are split only
     at boundaries already emitted by ``build_group_draft``. A one-unit child
     is eligible only when its real duration still reaches the 1.8-second floor.
-    The global target is deliberately bounded below the 19.5/min hard ceiling;
-    the visual selector must still independently approve every added cut.
+    The ordinary target stays within 19.5/min; an explicit capacity minimum
+    can use the 21/min hard ceiling. The visual selector must still
+    independently approve every added cut. If
+    a whole-edit minimum is supplied, the same musical-boundary split is also
+    allowed outside annotated highlights so the generator can actually reach
+    the professional cadence floor that the final gate enforces.
     """
 
     items = tuple(timing_segments)
     baseline = tuple(base_spans)
-    if not items or not baseline or not highlight_intervals:
+    if not items or not baseline:
         return baseline
-    normalized = _normalized_direct_member_highlight_intervals(
-        highlight_intervals,
-        range_start=items[0].canonical_master_start,
-        range_end=items[-1].canonical_master_end,
+    normalized = (
+        _normalized_direct_member_highlight_intervals(
+            highlight_intervals,
+            range_start=items[0].canonical_master_start,
+            range_end=items[-1].canonical_master_end,
+        )
+        if highlight_intervals
+        else ()
     )
-    if not normalized:
+    if not normalized and minimum_span_count is None:
         return baseline
     total_duration = (
         items[-1].canonical_master_end - items[0].canonical_master_start
@@ -8787,23 +8795,25 @@ def _densify_direct_full_frame_highlights(
         )
         + 1
     )
-    target_span_count = min(
-        math.floor(
-            total_duration
-            * _DIRECT_MEMBER_INITIAL_MAX_SWITCHES_PER_MINUTE
-            / 60.0
-        )
-        + 1,
-        max(
-            len(baseline),
-            math.ceil(
+    target_span_count = len(baseline)
+    if normalized:
+        target_span_count = min(
+            math.floor(
                 total_duration
-                * _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE
+                * _DIRECT_MEMBER_INITIAL_MAX_SWITCHES_PER_MINUTE
                 / 60.0
             )
             + 1,
-        ),
-    )
+            max(
+                len(baseline),
+                math.ceil(
+                    total_duration
+                    * _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE
+                    / 60.0
+                )
+                + 1,
+            ),
+        )
     if minimum_span_count is not None:
         # Sparse all-source proofs need two reusable carrier slots so the
         # portrait performance sources can bridge the landscape inserts. Use
@@ -8815,6 +8825,10 @@ def _densify_direct_full_frame_highlights(
         )
     counts = [span.timing_segment_count for span in baseline]
     while len(counts) < target_span_count:
+        needs_global_capacity = (
+            minimum_span_count is not None
+            and len(counts) < min(minimum_span_count, hard_maximum_span_count)
+        )
         candidates: list[
             tuple[
                 tuple[float, float, int, float, int, int],
@@ -8830,22 +8844,30 @@ def _densify_direct_full_frame_highlights(
             group_start = items[unit_start].canonical_master_start
             group_end = items[unit_start + count - 1].canonical_master_end
             group_duration = group_end - group_start
-            overlap = _direct_member_interval_overlap_seconds(
-                group_start,
-                group_end,
-                normalized,
+            overlap = (
+                _direct_member_interval_overlap_seconds(
+                    group_start,
+                    group_end,
+                    normalized,
+                )
+                if normalized
+                else 0.0
             )
             overlap_fraction = overlap / group_duration
-            if overlap_fraction < 0.50:
+            if overlap_fraction < 0.50 and not needs_global_capacity:
                 unit_start += count
                 continue
             for split_offset in range(1, count):
                 boundary_unit = items[unit_start + split_offset - 1]
                 boundary_seconds = boundary_unit.canonical_master_end
-                if not _direct_member_boundary_is_highlight(
-                    boundary_seconds,
-                    normalized,
-                ):
+                is_highlight_cut = (
+                    overlap_fraction >= 0.50
+                    and _direct_member_boundary_is_highlight(
+                        boundary_seconds,
+                        normalized,
+                    )
+                )
+                if not is_highlight_cut and not needs_global_capacity:
                     continue
                 left_duration = boundary_seconds - group_start
                 right_duration = group_end - boundary_seconds
@@ -8865,22 +8887,21 @@ def _densify_direct_full_frame_highlights(
                     if "beat" in reasons
                     else 3
                 )
+                target_run_seconds = (
+                    _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
+                    if is_highlight_cut
+                    else _DIRECT_MEMBER_TARGET_RUN_SECONDS
+                )
                 target_errors = sorted(
                     (
-                        abs(
-                            left_duration
-                            - _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
-                        ),
-                        abs(
-                            right_duration
-                            - _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
-                        ),
+                        abs(left_duration - target_run_seconds),
+                        abs(right_duration - target_run_seconds),
                     )
                 )
                 candidates.append(
                     (
                         (
-                            -overlap_fraction,
+                            -overlap_fraction if is_highlight_cut else 1.0,
                             target_errors[0],
                             musical_penalty,
                             target_errors[1],
@@ -15905,10 +15926,26 @@ def _select_direct_member_partition_profile(
         represented_source_count
         + _DIRECT_MEMBER_MINIMUM_ALL_SOURCE_REUSE_SPAN_COUNT
     )
+    performance_duration_seconds = (
+        timing_draft.common_master_end - timing_draft.common_master_start
+    )
+    minimum_global_cadence_span_count = (
+        math.ceil(
+            performance_duration_seconds
+            * _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+            / 60.0
+            - 1e-9
+        )
+        + 1
+    )
+    minimum_seed_span_count = max(
+        minimum_all_source_span_count,
+        minimum_global_cadence_span_count,
+    )
     base = _direct_full_frame_base_partition_profile(
         timing_draft.segments,
         highlight_intervals=normalized_highlight_intervals,
-        minimum_span_count=minimum_all_source_span_count,
+        minimum_span_count=minimum_seed_span_count,
     )
     in_run_preferred_profile = (
         _direct_member_in_run_preferred_partition_profile(
@@ -15943,7 +15980,7 @@ def _select_direct_member_partition_profile(
                 _direct_member_short_proof_capacity_expansion_profiles(
                     timing_draft.segments,
                     (ordinary_base, *ordinary_warm_start_profiles),
-                    minimum_span_count=minimum_all_source_span_count,
+                    minimum_span_count=minimum_seed_span_count,
                     highlight_intervals=normalized_highlight_intervals,
                     excluded_unit_counts=(base.unit_counts,),
                 )
@@ -16061,7 +16098,11 @@ def _select_direct_member_partition_profile(
                 "contract": (
                     "input_bound_musical_carrier_slot_expansion_v1"
                 ),
-                "minimum_span_count": minimum_all_source_span_count,
+                "minimum_span_count": minimum_seed_span_count,
+                "minimum_global_cadence_span_count": (
+                    minimum_global_cadence_span_count
+                ),
+                "minimum_seed_span_count": minimum_seed_span_count,
                 "ordinary_base_span_count": len(ordinary_base.spans),
                 "capacity_base_span_count": len(base.spans),
                 "ordinary_cache_status": (
@@ -17603,7 +17644,12 @@ def _select_direct_member_partition_profile(
                     "visual_gates_relaxed": False,
                 }
             )
-            minimum_feasible_structural_cost: tuple[int, int, int] | None = None
+            # Once one feasible profile exists, prune only strictly deeper or
+            # more displaced structural edits.  Musical-boundary penalty is a
+            # selection tie-breaker after the real visual optimizer cost is
+            # known; using it here would discard an unevaluated peer that may
+            # have markedly better decoded continuity.
+            minimum_feasible_structural_cost: tuple[int, int] | None = None
             while queued:
                 if _direct_partition_terminal_audition_due(
                     evaluated_profile_count=(
@@ -17672,7 +17718,7 @@ def _select_direct_member_partition_profile(
                     eligible_queue = [
                         item
                         for item in queued
-                        if item[0][2:] <= minimum_feasible_structural_cost
+                        if item[0][2:4] <= minimum_feasible_structural_cost
                     ]
                     partition_search_post_feasible_cost_pruned_profile_count += (
                         len(queued) - len(eligible_queue)
@@ -17682,8 +17728,9 @@ def _select_direct_member_partition_profile(
                         break
                     queued.sort(
                         key=lambda item: (
-                            item[0][2:],
+                            item[0][2:4],
                             item[0][0:2],
+                            item[0][4],
                             item[1],
                         )
                     )
@@ -17771,9 +17818,10 @@ def _select_direct_member_partition_profile(
                 if error is None:
                     # Proof progress orders equal-cost exploration only.  It
                     # must not prune another candidate with the same changed
-                    # boundary count, displacement, and musical penalty: that
-                    # candidate may win the actual warning/optimizer rank.
-                    structural_cost = priority[2:]
+                    # boundary count and displacement.  Musical penalty is
+                    # intentionally excluded because that candidate may win
+                    # the actual warning/optimizer rank.
+                    structural_cost = priority[2:4]
                     if (
                         minimum_feasible_structural_cost is None
                         or structural_cost < minimum_feasible_structural_cost
@@ -17781,10 +17829,15 @@ def _select_direct_member_partition_profile(
                         minimum_feasible_structural_cost = structural_cost
                     continue
                 _collect_counterfactual_secondary_profile(profile, error)
-                if minimum_feasible_structural_cost is None and (
-                    _direct_partition_failure_is_proven(error.diagnostics)
-                ):
-                    _record_terminal_safe_hold_candidate(profile, error)
+                if _direct_partition_failure_is_proven(error.diagnostics):
+                    if minimum_feasible_structural_cost is None:
+                        _record_terminal_safe_hold_candidate(profile, error)
+                    # A feasible sibling must not suppress proof-authorized
+                    # children of this fully evaluated peer.  Its children may
+                    # have the same structural edit cost yet win on decoded
+                    # continuity/optimizer score; the queue's bounded
+                    # post-feasible filter decides whether they remain
+                    # admissible.
                     _enqueue_children(profile, error)
             if (
                 not feasible

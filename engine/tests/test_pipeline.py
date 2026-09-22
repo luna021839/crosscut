@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from crosscut.auto_anchor import AutoAnchorResult
 from crosscut.direct_member_visual import DirectMemberVisualSelectionError
@@ -92,6 +92,10 @@ from crosscut.stage_edit_semimarkov_beam import (
 from crosscut.stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
 )
+from crosscut.source_derivative_diversity import (
+    SourceDerivativeConfig,
+    SourceDerivativeDiversityResult,
+)
 from crosscut.audio import AlignmentResult, SourceAlignment
 from crosscut.media import AudioStreamInfo, MediaInfo, VideoStreamInfo
 from crosscut.render import (
@@ -107,7 +111,9 @@ from crosscut.render import (
 from crosscut.rendered_montage_grammar_review import (
     RenderedMontageGrammarConfig,
 )
+from crosscut.rendered_candidate_selection import RenderedCandidate, RenderedCandidateReview
 from crosscut.rendered_proxy_review import RenderedProxyReview
+from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.request import AnalysisRequest, MemberAnchorRequest
 from crosscut.tracking import (
     MemberTrackObservation,
@@ -115,7 +121,7 @@ from crosscut.tracking import (
     TrackingFailure,
     TrackingState,
 )
-from crosscut.timeline import ShotType
+from crosscut.timeline import NoCompleteTimelinePath, ShotType
 from crosscut.timewarp import (
     TimeWarpConfig,
     TimeWarpControlPoint,
@@ -139,6 +145,60 @@ def _media(path: str, duration: float) -> MediaInfo:
         video_streams=(),
         tags={},
     )
+
+
+def _source_derivative_diversity_fixture(
+    source_count: int,
+) -> SourceDerivativeDiversityResult:
+    """Return verified-distinct synthetic metadata for pipeline unit tests."""
+
+    return SourceDerivativeDiversityResult(
+        canonical_sample_times_seconds=(),
+        source_decode_audit=tuple(
+            {
+                "source_index": index,
+                "decoded_sample_count": 0,
+                "clock_contract_complete": True,
+            }
+            for index in range(source_count)
+        ),
+        pairs=(),
+        family_ids=tuple(range(source_count)),
+        family_consistency_conflict_count=0,
+        clock_contract_complete=True,
+        production_ready=True,
+        audit_sha256="a" * 64,
+        config=SourceDerivativeConfig(),
+    )
+
+
+def _current_montage_policy_fixture(root: Path):
+    """Write and strict-load a hermetic montage profile for unit tests."""
+
+    from engine.tests.test_professional_montage_policy import (
+        _install_positive_duration_role,
+        _profile,
+        _write,
+    )
+
+    profile = _profile()
+    _install_positive_duration_role(
+        profile,
+        role_name="build",
+        close_values=[0.0, 0.0, 0.0]
+        + [0.18 + 0.01 * index for index in range(17)],
+        nonwide_values=[0.0, 0.0, 0.0]
+        + [0.50 + 0.01 * index for index in range(17)],
+    )
+    _install_positive_duration_role(
+        profile,
+        role_name="bridge_like",
+        close_values=[0.0, 0.0, 0.0] + [0.32] * 17,
+        nonwide_values=[0.60] * 20,
+    )
+    path = root / "current-montage-profile.json"
+    _write(path, profile)
+    return load_professional_montage_policy(path), path
 
 
 def _tracking(source: str, source_local_time: float) -> MemberTrackingResult:
@@ -2284,11 +2344,14 @@ class PipelineTests(unittest.TestCase):
                 "targeted_repair_made_no_timing_change",
             )
 
-    def test_automatic_group_proxy_rerank_applies_actual_winner_and_blocks_failure(
+    def test_automatic_group_joint_stream_delivers_first_pass_and_blocks_exhaustion(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            montage_policy, _montage_path = _current_montage_policy_fixture(
+                root
+            )
             sources = tuple(root / f"source-{index}.mp4" for index in range(9))
             for source in sources:
                 source.touch()
@@ -2298,6 +2361,7 @@ class PipelineTests(unittest.TestCase):
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
                     "source_mode": "automatic",
+                    "review_first_enabled": False,
                     "sources": [str(source) for source in sources],
                     "output_directory": str(root / "out"),
                     "source_cache_directory": str(root / "source-cache"),
@@ -2405,532 +2469,312 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-            class SelectionStub:
-                selected_candidate_index = 6
-                reviews = tuple(object() for _ in range(8))
-                successful_review_count = 8
-                minimum_candidate_count_satisfied = True
-                passed = False
-                selected = SimpleNamespace(
-                    review_payload={
-                        "passed": False,
-                        "weighted_score": 96.0,
-                        "boundary_issue_indices": [0],
-                    },
-                    weighted_score=96.0,
-                )
-
-                def to_dict(self) -> dict[str, object]:
-                    return {
-                        "selected_candidate_index": self.selected_candidate_index,
-                        "reviewed_candidate_count": len(self.reviews),
-                        "passed": self.passed,
-                    }
-
-            selection = SelectionStub()
+            section_plan = SectionPlan((SectionDirective(
+                section_index=0,
+                role=SectionRole.CHORUS_LIKE,
+                start_seconds=0.0,
+                end_seconds=8.0,
+                energy_score=0.8,
+                confidence=0.9,
+                phrase_count=1,
+                preferred_source_hold_beats=2,
+                target_source_switches_per_minute=20.0,
+                camera_motion_budget=0.5,
+                target_roll_events_per_minute=0.0,
+                establish_with_wide_shot=False,
+                protect_last_beat_from_extra_cut=False,
+            ),))
             candidate_set = SimpleNamespace(
-                to_dict=lambda: {
-                    "candidate_count": 8,
-                    "selected_candidate_index": 0,
-                }
+                optimizer_workspace=SimpleNamespace(
+                    candidates_by_segment=((SimpleNamespace(),),)
+                ),
+                candidates=(),
+                ranked_candidates=(),
+                to_dict=lambda: {"candidate_count": 8},
             )
             materialized = tuple(
-                SimpleNamespace(candidate_index=index, review_rank=index)
+                SimpleNamespace(
+                    candidate_index=index,
+                    review_rank=index,
+                    candidate_history_entry={"candidate_index": index},
+                )
                 for index in range(8)
+            )
+            records = tuple(
+                SimpleNamespace(
+                    candidate_index=index,
+                    cadence_profile=f"profile-{index}",
+                    timeline_result=SimpleNamespace(
+                        candidates=(SimpleNamespace(source_id=str(index)),)
+                    ),
+                    review=SimpleNamespace(passed=True, boundaries=()),
+                )
+                for index in range(8)
+            )
+            proposal_pool = SimpleNamespace(
+                paths=tuple(range(8)),
+                scalar_audit=lambda: {"path_count": 8},
             )
             look_result = SimpleNamespace(
                 adjustments=tuple(SourceLookAdjustment() for _ in sources),
                 target_mode="explicit_reference",
                 adjustment_for_source=lambda index: SourceLookAdjustment(),
-                to_dict=lambda: {
-                    "target_mode": "explicit_reference",
-                    "evidence": [],
-                },
+                to_dict=lambda: {"target_mode": "explicit_reference", "evidence": []},
             )
 
-            with patch(
-                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
-            ), patch(
-                "crosscut.pipeline.probe_media",
-                side_effect=lambda source: _analysis_media(source, duration=12.0),
-            ), patch(
-                "crosscut.pipeline._align_sequentially",
-                return_value=(alignment, None),
-            ), patch(
-                "crosscut.pipeline.analyze_rhythm",
-                return_value=RhythmStub(),
-            ), patch(
-                "crosscut.pipeline.detect_scene_changes_in_video",
-                return_value=(),
-            ), patch(
-                "crosscut.pipeline.analyze_source_look_match",
-                return_value=look_result,
-            ) as analyze_look, patch(
-                "crosscut.pipeline.estimate_shared_performance_range",
-                side_effect=ValueError("synthetic range unavailable"),
-            ), patch(
-                "crosscut.pipeline.build_group_draft",
-                return_value=group_draft,
-            ), patch(
-                "crosscut.pipeline.build_visual_timeline_candidate_set",
-                return_value=candidate_set,
-            ) as build_candidates, patch(
-                "crosscut.pipeline.materialize_visual_timeline_candidates",
-                return_value=materialized,
-            ) as materialize_candidates, patch(
-                "crosscut.pipeline.materialize_visual_timeline_candidate_record",
-            ) as materialize_candidate_record, patch(
-                "crosscut.pipeline._derive_complete_group_candidate",
-                side_effect=lambda item, **_kwargs: bundles[
-                    item.candidate_index
-                ],
-            ) as derive, patch(
-                "crosscut.pipeline._review_complete_group_candidates",
-                return_value=selection,
-            ) as review_candidates, patch("crosscut.pipeline.write_plan"), patch(
-                "crosscut.pipeline.render",
-                return_value="h264_videotoolbox",
-            ) as render_video:
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "blocked by decoded proxy review",
-                ):
-                    analyze(
-                        request,
-                        _MemoryReporter(),  # type: ignore[arg-type]
-                        review_rendered_proxies=True,
+            def materialize_joint_batch(**kwargs):
+                kwargs["provider_audit_sink"]({"closed": True})
+                batch_index = kwargs["batch_index"]
+                if batch_index >= 2:
+                    raise NoCompleteTimelinePath(
+                        "synthetic complete path pool exhausted",
+                        reason_code="joint_visual_complete_path_no_good_exhausted",
+                        rejection_counts={"proof_materialization_call_count": 0},
                     )
-                render_video.assert_not_called()
-                self.assertTrue(
-                    any(
-                        (root / "out").glob(
-                            "*-rendered-candidate-selection.json"
+                start = batch_index * 4
+                selection_set = SimpleNamespace(
+                    analysis_basis="synthetic_joint_visual_selection",
+                    candidate_records=records[start:start + 4],
+                    unique_source_shot_path_count=4,
+                    proof_variant_supplement_count=0,
+                    selected_candidate_index=0,
+                    role_control_audits=(),
+                    shared_bridge_evidence_cache_audit={},
+                    shared_option_evidence_cache_audit={},
+                    profile_failures=(),
+                )
+                return selection_set, materialized[start:start + 4]
+
+            def globally_index_joint_batch(candidates, *, first_candidate_index, **_kwargs):
+                return tuple(
+                    SimpleNamespace(
+                        materialized=item,
+                        candidate_index=first_candidate_index + offset,
+                        review_rank=item.review_rank,
+                    )
+                    for offset, item in enumerate(candidates)
+                )
+
+            # The orchestration test substitutes pixel/identity producers;
+            # their exact evidence contracts have dedicated integration tests.
+            # The actual stream reducer, budgets, cohort selection, and final
+            # render handoff below must still enforce a passing delivery.
+            cases = (
+                ("later_pass", 6, None, None),
+                ("montage_failed", 6, None, None),
+                ("all_failed", None, None, None),
+                ("derivation_failed", 6, 6, None),
+                ("decode_failed", 6, None, 6),
+            )
+            for name, winner, derivation_failure, decode_failure in cases:
+                with self.subTest(case=name):
+                    case_request = replace(request, output_directory=root / name)
+
+                    def derive_candidate(item, **_kwargs):
+                        if item.candidate_index == derivation_failure:
+                            raise ValueError("synthetic complete derivation failure")
+                        return bundles[item.candidate_index]
+
+                    def review_one(candidate_bundles, **_kwargs):
+                        self.assertEqual(len(candidate_bundles), 1)
+                        bundle = candidate_bundles[0]
+                        candidate = RenderedCandidate(
+                            candidate_index=bundle.candidate_index,
+                            render_plan=bundle.render_plan,
+                            pre_render_score=bundle.pre_render_score,
+                            payload=bundle,
                         )
-                    )
-                )
+                        if bundle.candidate_index == decode_failure:
+                            review = RenderedCandidateReview(
+                                candidate, None, error="synthetic decoder failure",
+                            )
+                        else:
+                            review = RenderedCandidateReview(
+                                candidate,
+                                {
+                                    "passed": bundle.candidate_index == winner,
+                                    "weighted_score": 96.0,
+                                    "partial_reedit_boundary_issue_indices": [],
+                                    "visible_boundary_score": {
+                                        "issue_fraction": 0.0,
+                                        "p10": 96.0,
+                                    },
+                                },
+                            )
+                        return SimpleNamespace(reviews=(review,))
 
-                selection.passed = True
-                selection.selected.review_payload["passed"] = True
-                artifact = analyze(
-                    request,
-                    _MemoryReporter(),  # type: ignore[arg-type]
-                    allow_failed_comparison_render=True,
-                    review_rendered_proxies=True,
-                )
+                    materialize = Mock(side_effect=materialize_joint_batch)
+                    derive = Mock(side_effect=derive_candidate)
+                    review = Mock(side_effect=review_one)
+                    render_video = Mock(return_value="h264_videotoolbox")
 
-                def fail_last_candidate(item, **_kwargs):
-                    if item.candidate_index == 7:
-                        raise ValueError("synthetic complete derivation failure")
-                    return bundles[item.candidate_index]
+                    def qa_handoff(*, manifest, automatic_ive_group_delivery, **_kwargs):
+                        render_video.assert_called_once()
+                        self.assertTrue(automatic_ive_group_delivery)
+                        self.assertEqual(manifest["artifact_role"], "pending_qa")
+                        self.assertFalse(manifest["app_result_exposure"]["video_output_exposed"])
+                        manifest["artifact_role"] = "delivery"
+                        manifest["app_result_exposure"].update({
+                            "video_output_exposed": True,
+                            "delivery_completion_message_allowed": True,
+                        })
 
-                derive.side_effect = fail_last_candidate
-                selection.reviews = tuple(object() for _ in range(7))
-                selection.minimum_candidate_count_satisfied = False
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "requires exactly 8 complete candidates; got 7",
-                ):
-                    analyze(
-                        request,
-                        _MemoryReporter(),  # type: ignore[arg-type]
-                        review_rendered_proxies=True,
-                    )
-                selection_reports = tuple(
-                    (root / "out").glob(
-                        "*-rendered-candidate-selection.json"
-                    )
-                )
-                self.assertTrue(selection_reports)
-                blocked_report = json.loads(
-                    max(
-                        selection_reports,
-                        key=lambda path: path.stat().st_mtime_ns,
-                    ).read_text(encoding="utf-8")
-                )
-
-                derive.side_effect = lambda item, **_kwargs: bundles[
-                    item.candidate_index
-                ]
-                selection.reviews = tuple(object() for _ in range(8))
-                selection.successful_review_count = 7
-                selection.minimum_candidate_count_satisfied = True
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "8 successful decoded reviews; got 8 complete / 7 decoded",
-                ):
-                    analyze(
-                        request,
-                        _MemoryReporter(),  # type: ignore[arg-type]
-                        review_rendered_proxies=True,
-                    )
-                decoded_failure_report = json.loads(
-                    max(
-                        (root / "out").glob(
-                            "*-rendered-candidate-selection.json"
+                    post_render_qa = Mock(side_effect=qa_handoff)
+                    look = Mock(return_value=look_result)
+                    seed = Mock(return_value=candidate_set)
+                    with patch.multiple(
+                        "crosscut.pipeline",
+                        _load_stage_edit_montage_policy=Mock(return_value=montage_policy),
+                        _enforce_automatic_group_stage_edit_requirement=Mock(return_value=None),
+                        probe_media=Mock(side_effect=lambda source: _analysis_media(source, duration=12.0)),
+                        _align_sequentially=Mock(return_value=(alignment, None)),
+                        analyze_rhythm=Mock(return_value=RhythmStub()),
+                        build_section_plan=Mock(return_value=section_plan),
+                        analyze_source_derivative_diversity=Mock(
+                            return_value=_source_derivative_diversity_fixture(len(sources))
                         ),
-                        key=lambda path: path.stat().st_mtime_ns,
-                    ).read_text(encoding="utf-8")
-                )
-
-                materialize_candidates.return_value = materialized[:7]
-                selection.successful_review_count = 8
-                review_call_count = review_candidates.call_count
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "requires exactly 8 complete candidates; got 7",
-                ):
-                    analyze(
-                        request,
-                        _MemoryReporter(),  # type: ignore[arg-type]
-                        review_rendered_proxies=True,
-                    )
-                self.assertEqual(
-                    review_candidates.call_count,
-                    review_call_count,
-                )
-                structure_failure_report = json.loads(
-                    max(
-                        (root / "out").glob(
-                            "*-rendered-candidate-selection.json"
+                        detect_scene_changes_in_video_cached=Mock(
+                            return_value=((), {"detection_policy": "synthetic_test"})
                         ),
-                        key=lambda path: path.stat().st_mtime_ns,
-                    ).read_text(encoding="utf-8")
-                )
-
-                class FocusIssueStub:
-                    code = "focus_mismatch_exceeded"
-
-                class PostRepairIssueStub:
-                    code = "focus_mismatch_exceeded"
-
-                class PostRepairFailureReviewStub:
-                    passed = False
-                    weighted_score = 20.0
-                    hard_failures = (PostRepairIssueStub(),)
-
-                    @staticmethod
-                    def to_dict() -> dict[str, object]:
-                        return {
-                            "passed": False,
-                            "weighted_score": 20.0,
-                            "hard_failures": [
-                                {"code": "focus_mismatch_exceeded"}
-                            ],
-                        }
-
-                passing_recovery_records = tuple(
-                    SimpleNamespace(
-                        candidate_index=index,
-                        review_rank=index,
-                        review=SimpleNamespace(
-                            passed=True,
-                            hard_failures=(),
+                        analyze_source_look_match=look,
+                        estimate_shared_performance_range=Mock(
+                            side_effect=ValueError("synthetic range unavailable")
                         ),
-                    )
-                    for index in range(4)
-                )
-                density_failure_record = SimpleNamespace(
-                    candidate_index=9,
-                    review_rank=4,
-                    review=SimpleNamespace(
-                        passed=False,
-                        hard_failures=(
-                            SimpleNamespace(
-                                code=(
-                                    "source_switch_density_below_hard_minimum"
+                        build_group_draft=Mock(return_value=group_draft),
+                        build_visual_timeline_optimizer_seed=seed,
+                        build_joint_proposal_pool=Mock(return_value=proposal_pool),
+                        _materialize_joint_feedback_batch_with_fresh_provider=materialize,
+                        _joint_selection_proof_materialization_call_count=(
+                            lambda selection, **_kwargs: len(selection.candidate_records)
+                        ),
+                        joint_candidate_review_summaries=lambda *_args, **_kwargs: (),
+                        _joint_selection_retry_audit_payload=lambda *_args, **_kwargs: {},
+                        _exact_source_shot_path=lambda item: ((str(item.candidate_index), "shot"),),
+                        _pre_review_hard_failure_codes=lambda _item: (),
+                        _globally_index_joint_visual_candidate_batch=globally_index_joint_batch,
+                        _joint_complete_path_signature=lambda item: ("synthetic", item.candidate_index),
+                        _record_bound_joint_decoded_feedback=Mock(
+                            return_value=({"feedback_binding_valid": True}, None)
+                        ),
+                        _derive_complete_group_candidate=derive,
+                        _review_complete_group_candidates=review,
+                        _review_stage_edit_bundle_montage=Mock(return_value=(
+                            {
+                                "passed": name != "montage_failed",
+                                "failures": [],
+                                "highlight_aggregate": {
+                                    "soft_targets": {"aggregate_alignment_score": 0.80}
+                                },
+                            },
+                            {
+                                "stage_edit_exact_shot_clock": None,
+                                "dynamic_crop_version": None,
+                                "dynamic_crop_v3_decodes": None,
+                                "dynamic_crop_motion_v3": None,
+                            },
+                        )),
+                        _enforce_automatic_stage_edit_post_render_qa=post_render_qa,
+                        write_plan=Mock(),
+                        render=render_video,
+                    ):
+                        if name == "later_pass":
+                            artifact = analyze(
+                                case_request, _MemoryReporter(),
+                                review_rendered_proxies=True,
+                            )
+                            report = artifact.manifest["rendered_candidate_selection"]
+                            self.assertEqual(report["selected_candidate_index"], 6)
+                            self.assertEqual(report["complete_candidate_count"], 1)
+                            self.assertEqual(report["successful_review_count"], 1)
+                            self.assertTrue(report["exact_complete_candidate_count_satisfied"])
+                            self.assertEqual(materialize.call_count, 2)
+                            self.assertEqual(derive.call_count, 7)
+                            self.assertEqual(review.call_count, 7)
+                            render_video.assert_called_once()
+                            post_render_qa.assert_called_once()
+                            self.assertEqual(render_video.call_args.args[0].segments[0].source_index, 6)
+                            self.assertEqual(
+                                artifact.manifest["render"]["rendered_proxy_review"]["weighted_score"],
+                                96.0,
+                            )
+                        elif name == "montage_failed":
+                            with self.assertRaisesRegex(
+                                RuntimeError, "blocked by decoded proxy review",
+                            ):
+                                analyze(
+                                    case_request, _MemoryReporter(),
+                                    review_rendered_proxies=True,
                                 )
-                            ),
-                        ),
-                    ),
-                )
-                focus_recovery_records = tuple(
-                    SimpleNamespace(
-                        candidate_index=index,
-                        review_rank=index + 1,
-                        review=SimpleNamespace(
-                            passed=False,
-                            hard_failures=(FocusIssueStub(),),
-                        ),
+                            render_video.assert_not_called()
+                            post_render_qa.assert_not_called()
+                            report_path, = case_request.output_directory.glob(
+                                "*-rendered-candidate-selection.json"
+                            )
+                            report = json.loads(report_path.read_text(encoding="utf-8"))
+                            self.assertFalse(report["passed"])
+                            self.assertEqual(report["complete_candidate_count"], 1)
+                            self.assertEqual(report["selected_candidate_index"], 6)
+                            self.assertEqual(materialize.call_count, 2)
+                            self.assertEqual(review.call_count, 7)
+                        else:
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                "requires 1 successfully decoded candidates; got 0",
+                            ):
+                                analyze(
+                                    case_request, _MemoryReporter(),
+                                    review_rendered_proxies=True,
+                                )
+                            render_video.assert_not_called()
+                            post_render_qa.assert_not_called()
+                            report_paths = tuple(case_request.output_directory.glob(
+                                "*-rendered-candidate-selection.json"
+                            ))
+                            self.assertEqual(len(report_paths), 1)
+                            report = json.loads(report_paths[0].read_text(encoding="utf-8"))
+                            self.assertFalse(report["passed"])
+                            self.assertEqual(report["complete_candidate_count"], 0)
+                            self.assertEqual(report["successful_review_count"], 0)
+                            self.assertEqual(
+                                report["blocking_reason"],
+                                "joint_decoded_exact_complete_path_exhausted",
+                            )
+                            self.assertEqual(materialize.call_count, 3)
+                            self.assertEqual(derive.call_count, 8)
+                            self.assertEqual(review.call_count, 7 if derivation_failure is not None else 8)
+                            if derivation_failure is not None:
+                                self.assertEqual(
+                                    report["candidate_derivation_failures"][0]["candidate_index"], 6
+                                )
+                            if decode_failure is not None:
+                                self.assertTrue(any(
+                                    failure.get("error") == "synthetic decoder failure"
+                                    for failure in report["candidate_decoded_review_failures"]
+                                ))
+                    self.assertEqual(
+                        report["source_index_mapping"]["eligible_to_request"], list(range(9))
                     )
-                    for index in range(4, 9)
-                )
-                candidate_set.ranked_candidates = (
-                    passing_recovery_records
-                    + (density_failure_record,)
-                    + focus_recovery_records
-                )
-                recovery_materialized = materialized + (
-                    SimpleNamespace(candidate_index=8, review_rank=8),
-                )
-                recovery_bundles = {
-                    item.candidate_index: item for item in bundles
-                }
-                recovery_bundles[4] = replace(
-                    recovery_bundles[4],
-                    timeline_review=PostRepairFailureReviewStub(),  # type: ignore[arg-type]
-                )
-                recovery_bundles[8] = replace(
-                    recovery_bundles[7],
-                    candidate_index=8,
-                    review_rank=8,
-                )
-                materialize_candidates.return_value = materialized[:4]
-                materialize_candidate_record.side_effect = (
-                    lambda _candidate_set, record: recovery_materialized[
-                        record.candidate_index
-                    ]
-                )
-                derive.side_effect = lambda item, **_kwargs: recovery_bundles[
-                    item.candidate_index
-                ]
-                selection.reviews = tuple(object() for _ in range(8))
-                selection.successful_review_count = 8
-                selection.minimum_candidate_count_satisfied = True
-                selection.passed = True
-                selection.selected.review_payload["passed"] = True
-
-                recovered_artifact = analyze(
-                    request,
-                    _MemoryReporter(),  # type: ignore[arg-type]
-                    allow_failed_comparison_render=True,
-                    review_rendered_proxies=True,
-                )
-                recovery_report = recovered_artifact.manifest[
-                    "rendered_candidate_selection"
-                ]
-
-            build_candidates.assert_called()
-            self.assertEqual(
-                build_candidates.call_args.kwargs["maximum_results"],
-                32,
-            )
-            self.assertEqual(
-                build_candidates.call_args.kwargs["feature_cache_directory"],
-                (root / "source-cache").resolve(),
-            )
-            self.assertEqual(materialize_candidates.call_count, 6)
-            self.assertTrue(
-                all(
-                    call.kwargs["maximum_candidates"] == 8
-                    and call.kwargs["passed_only"] is True
-                    for call in materialize_candidates.call_args_list
-                )
-            )
-            self.assertEqual(analyze_look.call_count, 6)
-            self.assertEqual(
-                analyze_look.call_args.kwargs["reference_source"],
-                0,
-            )
-            self.assertEqual(
-                analyze_look.call_args.kwargs["source_timewarps"],
-                (None,) * len(sources),
-            )
-            self.assertEqual(derive.call_count, 48)
-            self.assertTrue(
-                all(
-                    call.kwargs["source_look_match"] is look_result
-                    for call in derive.call_args_list
-                )
-            )
-            self.assertEqual(render_video.call_count, 2)
-            self.assertEqual(materialize_candidate_record.call_count, 5)
-            self.assertEqual(
-                recovery_report["structure_passing_materialized_count"],
-                4,
-            )
-            self.assertEqual(
-                recovery_report["repair_eligible_candidate_count"],
-                5,
-            )
-            self.assertEqual(
-                recovery_report["repair_eligible_materialized_count"],
-                5,
-            )
-            self.assertEqual(
-                recovery_report["repair_eligible_attempted_count"],
-                5,
-            )
-            self.assertEqual(
-                recovery_report["total_materialized_candidate_count"],
-                9,
-            )
-            self.assertEqual(
-                recovery_report[
-                    "post_repair_structure_passing_complete_count"
-                ],
-                8,
-            )
-            self.assertEqual(
-                recovery_report["complete_candidate_count"],
-                8,
-            )
-            self.assertEqual(
-                recovery_report[
-                    "candidate_post_repair_review_rejections"
-                ][0]["candidate_index"],
-                4,
-            )
-            self.assertTrue(
-                recovery_report[
-                    "exact_complete_candidate_count_satisfied"
-                ]
-            )
-            self.assertEqual(blocked_report["complete_candidate_count"], 7)
-            self.assertFalse(
-                blocked_report["exact_complete_candidate_count_satisfied"]
-            )
-            self.assertFalse(blocked_report["passed"])
-            self.assertEqual(
-                blocked_report["blocking_reason"],
-                "automatic_group_requires_exactly_eight_complete_candidates",
-            )
-            self.assertEqual(
-                blocked_report["candidate_derivation_failures"][0][
-                    "candidate_index"
-                ],
-                7,
-            )
-            self.assertIn(
-                "synthetic complete derivation failure",
-                blocked_report["candidate_derivation_failures"][0]["error"],
-            )
-            self.assertEqual(
-                blocked_report["structure_passing_materialized_count"],
-                8,
-            )
-            self.assertEqual(
-                blocked_report["source_index_mapping"][
-                    "eligible_to_request"
-                ],
-                list(range(9)),
-            )
-            self.assertEqual(
-                blocked_report["nested_index_domains"][
-                    "complete_candidates[].visual_timeline.choices[]"
-                    ".source_index"
-                ],
-                ELIGIBLE_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(
-                blocked_report["nested_index_domains"][
-                    "complete_candidates[].final_render_segments[]"
-                    ".request_source_index"
-                ],
-                REQUEST_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(
-                blocked_report["nested_index_domains"][
-                    "final_selected_review.boundaries[]"
-                    ".outgoing_source_index"
-                ],
-                REQUEST_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(decoded_failure_report["complete_candidate_count"], 8)
-            self.assertEqual(
-                decoded_failure_report["successful_review_count"],
-                7,
-            )
-            self.assertFalse(
-                decoded_failure_report[
-                    "exact_successful_decoded_review_count_satisfied"
-                ]
-            )
-            self.assertFalse(
-                decoded_failure_report[
-                    "exact_complete_candidate_count_satisfied"
-                ]
-            )
-            self.assertEqual(
-                decoded_failure_report["blocking_reason"],
-                (
-                    "automatic_group_requires_exactly_eight_"
-                    "successful_decoded_candidate_reviews"
-                ),
-            )
-            self.assertFalse(decoded_failure_report["passed"])
-            self.assertEqual(
-                structure_failure_report[
-                    "structure_passing_materialized_count"
-                ],
-                7,
-            )
-            self.assertEqual(
-                structure_failure_report["complete_candidate_count"],
-                7,
-            )
-            self.assertEqual(
-                structure_failure_report["candidate_derivation_failures"],
-                [],
-            )
-            self.assertEqual(
-                structure_failure_report["reviewed_candidate_count"],
-                0,
-            )
-            self.assertEqual(
-                structure_failure_report["successful_review_count"],
-                0,
-            )
-            self.assertFalse(structure_failure_report["passed"])
-            final_plan = render_video.call_args.args[0]
-            self.assertEqual(final_plan.segments[0].source_index, 6)
-            self.assertEqual(
-                artifact.manifest["rendered_candidate_selection"][
-                    "selected_candidate_index"
-                ],
-                6,
-            )
-            self.assertEqual(
-                artifact.manifest["render"]["rendered_proxy_review"][
-                    "weighted_score"
-                ],
-                96.0,
-            )
-            self.assertEqual(
-                artifact.manifest["source_look_match"]["index_domain"],
-                ELIGIBLE_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(
-                artifact.manifest["render"]["source_look_match"][
-                    "target_mode"
-                ],
-                "explicit_reference",
-            )
-            selection_payload = artifact.manifest[
-                "rendered_candidate_selection"
-            ]
-            self.assertEqual(
-                selection_payload["source_index_mapping"][
-                    "eligible_to_request"
-                ],
-                list(range(9)),
-            )
-            self.assertEqual(
-                selection_payload["nested_index_domains"][
-                    "visual_candidate_set.candidates[].source_sequence[]"
-                ],
-                ELIGIBLE_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(
-                selection_payload["nested_index_domains"][
-                    "candidates[].review.source_quality.per_source[]"
-                    ".source_index"
-                ],
-                REQUEST_SOURCE_INDEX_DOMAIN,
-            )
-            manifest_domains = artifact.manifest["source_index_mapping"][
-                "payload_index_domains"
-            ]
-            self.assertEqual(
-                manifest_domains["source_look_match.target_source_index"],
-                ELIGIBLE_SOURCE_INDEX_DOMAIN,
-            )
-            self.assertEqual(
-                manifest_domains[
-                    "rendered_candidate_selection.complete_candidates[]"
-                    ".final_render_segments[].request_source_index"
-                ],
-                REQUEST_SOURCE_INDEX_DOMAIN,
-            )
+                    self.assertEqual(
+                        report["nested_index_domains"][
+                            "complete_candidates[].final_render_segments[].request_source_index"
+                        ],
+                        REQUEST_SOURCE_INDEX_DOMAIN,
+                    )
+                    look.assert_called_once()
+                    self.assertIsNone(look.call_args.kwargs["reference_source"])
+                    self.assertEqual(
+                        seed.call_args.kwargs["feature_cache_directory"],
+                        (root / "source-cache").resolve(),
+                    )
+                    self.assertTrue(all(
+                        call.kwargs["source_look_match"] is look_result
+                        for call in derive.call_args_list
+                    ))
+                    self.assertTrue(all(
+                        call.kwargs["maximum_review_count"] == 1
+                        and call.kwargs["minimum_required_candidate_count"] == 1
+                        for call in review.call_args_list
+                    ))
 
     def test_timeline_review_helper_logs_concise_reference_metrics(self) -> None:
         sources = tuple(

@@ -55,6 +55,50 @@ def _timing_segments(count: int) -> tuple[DraftSegment, ...]:
 
 
 class DirectMemberHighlightCadenceTests(unittest.TestCase):
+    def test_global_minimum_can_use_music_boundaries_outside_sparse_highlight(
+        self,
+    ) -> None:
+        timing = _timing_segments(60)
+        baseline = _coarsen_direct_full_frame_spans(timing)
+        for highlights in ((), ((1.0, 1.5),)):
+            with self.subTest(highlights=highlights):
+                dense = _densify_direct_full_frame_highlights(
+                    timing, baseline, highlights, minimum_span_count=16,
+                )
+                self.assertEqual(len(dense), 16)
+                self.assertEqual(dense[0].canonical_master_start, 0.0)
+                self.assertEqual(dense[-1].canonical_master_end, 60.0)
+                self.assertTrue(
+                    all(span.duration_seconds >= 1.8 for span in dense)
+                )
+                self.assertTrue(
+                    all(span.canonical_master_end in range(1, 61) for span in dense)
+                )
+                self.assertEqual(
+                    sum(span.timing_segment_count for span in dense), 60,
+                )
+        self.assertEqual(
+            _densify_direct_full_frame_highlights(timing, baseline, ((1.0, 1.5),)),
+            baseline,
+        )
+
+    def test_global_capacity_keeps_highlight_priority_and_cadence_ceiling(
+        self,
+    ) -> None:
+        timing = _timing_segments(60)
+        baseline = _coarsen_direct_full_frame_spans(timing)
+        dense = _densify_direct_full_frame_highlights(
+            timing, baseline, ((20.0, 24.0),), minimum_span_count=16,
+        )
+        self.assertEqual(len(dense), 16)
+        self.assertIn(22.0, tuple(span.canonical_master_end for span in dense))
+        bounded = _densify_direct_full_frame_highlights(
+            timing, baseline, ((1.0, 1.5),), minimum_span_count=100,
+        )
+        duration = timing[-1].canonical_master_end - timing[0].canonical_master_start
+        self.assertLessEqual((len(bounded) - 1) * 60.0 / duration, 21.0)
+        self.assertTrue(all(span.duration_seconds >= 1.8 for span in bounded))
+
     def test_short_highlight_proof_uses_last_professional_cadence_slot(
         self,
     ) -> None:
