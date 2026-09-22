@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from engine.tests.test_review_first_runtime import _group_integrity_metrics
+
 from crosscut.audio import AlignmentResult, SourceAlignment
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.ive import AspectRatio
@@ -518,6 +520,8 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
     ) -> SimpleNamespace:
         passed = verdict == "PASS"
         payload = {
+            "passed": passed,
+            "metrics": _group_integrity_metrics(),
             "issue_count": 0 if passed else 1,
             "fail_issue_count": 0,
             "conditional_issue_count": 0 if passed else 1,
