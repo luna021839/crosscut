@@ -61,3 +61,28 @@ class MemberContinuityContractTests(unittest.TestCase):
                 report = member_continuity_report()
                 mutate(report)
                 self.assertFalse(member_continuity_measurements_valid(report))
+
+    def test_nested_motion_requires_real_scalar_measurements_and_exact_frame_clock(self):
+        mutations = (
+            lambda m: m.clear(),
+            lambda m: m.pop('motion_magnitudes'),
+            lambda m: m['motion_magnitudes'].update(outgoing_pose=float('nan')),
+            lambda m: m['master_timestamps_seconds'].update(incoming_start=99.),
+            lambda m: m['source_local_timestamps_seconds'].pop('incoming_next'),
+            lambda m: m.update(contract='unknown'),
+            lambda m: m.update(both_moving='false'),
+            lambda m: m.update(subject_direction_cosine=1.1),
+            lambda m: m['motion_component_counts'].update(outgoing=True),
+            lambda m: m['motion_magnitudes'].update(incoming_decision=.5),
+            lambda m: m.update(direction_cosine=.2),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                report = member_continuity_report()
+                mutate(report['boundaries'][0]['motion'])
+                self.assertFalse(member_continuity_measurements_valid(report))
+                disposition = classify_review_first_qa({'passed': True, 'issues': [],
+                    'metrics': {'rendered_continuity': report}},
+                    content_binding_passed=True, review_first_enabled=True, member=True)
+                self.assertEqual(disposition.status, ReviewFirstStatus.INPUT_UNUSABLE)
+                self.assertFalse(disposition.video_output_exposed)

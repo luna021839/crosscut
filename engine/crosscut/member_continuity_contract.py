@@ -27,6 +27,68 @@ def _p95(values: list) -> float | None:
     return observed[math.ceil(.95 * len(observed)) - 1] if observed else None
 
 
+def _motion_measurements_valid(value: object, *, frame: int, fps: float) -> bool:
+    """Validate observed four-frame scalars, not an editorial motion threshold."""
+    if not isinstance(value, Mapping):
+        return False
+    basis = value.get('motion_basis')
+    contracts = {
+        'aggregate_pose_silhouette_subject_v1': 'cut_adjacent_exact_entry_output_space_pose_motion_v3',
+        'focal_common_joint_articulation_v1': 'cut_adjacent_focal_articulation_separate_framing_v4',
+    }
+    if (not isinstance(basis, str) or basis not in contracts
+            or value.get('contract') != contracts[basis]
+            or value.get('subject_motion_separate_from_articulation') is not
+                (basis == 'focal_common_joint_articulation_v1')
+            or any(type(value.get(key)) is not bool for key in ('timestamp_bound_adjacent', 'both_moving'))
+            or any(value.get(key) is not True for key in ('output_space_subject_motion_used',
+                'direction_cosine_influenced_gate_or_bonus', 'motion_speed_and_pose_phase_influenced_gate_or_bonus'))
+            or any(value.get(key) is not False for key in ('sparse_or_nonadjacent_evidence_used', 'raw_vectors_persisted'))):
+        return False
+    # These are samples of the final decoded video, not source-media clocks.
+    for key in ('master_timestamps_seconds', 'source_local_timestamps_seconds'):
+        times = value.get(key)
+        if not isinstance(times, Mapping) or any(not _matches(times.get(name), index / fps)
+                for name, index in zip(('outgoing_previous', 'outgoing_endpoint', 'incoming_start', 'incoming_next'),
+                                       (frame-2, frame-1, frame, frame+1))):
+            return False
+    magnitudes, counts = value.get('motion_magnitudes'), value.get('motion_component_counts')
+    if not isinstance(magnitudes, Mapping) or not isinstance(counts, Mapping):
+        return False
+    for side in ('outgoing', 'incoming'):
+        for name in ('pose', 'silhouette', 'subject', 'aggregate', 'decision'):
+            key = side + '_' + name
+            if key not in magnitudes:
+                return False
+            number = magnitudes[key]
+            if number is not None and (type(number) not in (int, float)
+                    or not math.isfinite(number) or number < 0):
+                return False
+        if (not _matches(magnitudes[side+'_decision'], magnitudes[side+'_aggregate'])
+                or type(counts.get(side)) is not int
+                or counts[side] != sum(magnitudes[side+'_'+name] is not None
+                    for name in ('pose', 'silhouette', 'subject'))):
+            return False
+    for key in ('endpoint_pose_shape_mismatch', 'endpoint_pose_shape_compatibility',
+                'motion_speed_ratio_mismatch', 'subject_motion_speed_ratio_mismatch',
+                'pose_phase_continuation_mismatch'):
+        if not _measurement(value, key):
+            return False
+    mismatch = value['endpoint_pose_shape_mismatch']
+    if not _matches(value['endpoint_pose_shape_compatibility'], None if mismatch is None else 1.-mismatch):
+        return False
+    for key in ('direction_cosine_audit_only', 'direction_cosine', 'subject_direction_cosine'):
+        if key not in value:
+            return False
+        number = value[key]
+        if number is not None and (type(number) not in (int, float)
+                or not math.isfinite(number) or not -1 <= number <= 1):
+            return False
+    preference = value.get('soft_preference_applied')
+    return (type(preference) in (int, float) and math.isfinite(preference) and preference >= 0
+            and _matches(value['direction_cosine'], value['direction_cosine_audit_only']))
+
+
 def member_continuity_measurements_valid(value: object, *, plan: Mapping | None = None) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -87,7 +149,7 @@ def member_continuity_measurements_valid(value: object, *, plan: Mapping | None 
             if (not _measurement(record, "silhouette_mismatch")
                     or record.get("sample_frame_indices") != [frame-2, frame-1, frame, frame+1]
                     or frame < 2 or frame + 1 >= frame_count
-                    or not isinstance(record.get("motion"), Mapping)):
+                    or not _motion_measurements_valid(record.get("motion"), frame=frame, fps=fps)):
                 return False
             hard_records.append(record)
         else:
