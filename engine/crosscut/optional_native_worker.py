@@ -6,8 +6,10 @@ and no raw descriptor, face vector, or model result is persisted for IPC.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+import copyreg
 import importlib
 import inspect
+import io
 import math
 import os
 import pickle
@@ -15,9 +17,37 @@ import signal
 import subprocess
 import sys
 from time import monotonic
+from types import MappingProxyType
 
 _optional_deadline = ContextVar("optional_native_deadline", default=None)
 _WORKER_MODULE = "crosscut.optional_native_worker"
+
+
+def _restore_readonly_mapping(value):
+    return MappingProxyType(value)
+
+
+def _reduce_readonly_mapping(value):
+    # The worker entry point runs as __main__. Always emit the canonical
+    # importable function, not a reference to the caller's unrelated __main__.
+    from .optional_native_worker import _restore_readonly_mapping
+    return _restore_readonly_mapping, (dict(value),)
+
+
+def _encode_message(value):
+    """Private IPC only: preserve immutable maps and shared object identity.
+
+    Visual candidates and repair evidence deliberately contain mappingproxy
+    fields. Do not flatten those contracts to mutable dictionaries or install
+    a process-global pickle reducer. In particular, authority seals and custom
+    provider callbacks receive no special serialization/bypass here.
+    """
+    stream = io.BytesIO()
+    writer = pickle.Pickler(stream, protocol=pickle.HIGHEST_PROTOCOL)
+    writer.dispatch_table = copyreg.dispatch_table.copy()
+    writer.dispatch_table[MappingProxyType] = _reduce_readonly_mapping
+    writer.dump(value)
+    return stream.getvalue()
 
 
 @contextmanager
@@ -66,7 +96,7 @@ def run_isolated_python_call(module: str, name: str, kwargs: dict, *, deadline: 
         raise ValueError("optional worker deadline must be finite")
     if deadline <= monotonic():
         raise ReviewFirstSearchCutoff("optional native work has no admission budget")
-    request = pickle.dumps((module, name, kwargs), protocol=pickle.HIGHEST_PROTOCOL)
+    request = _encode_message((module, name, kwargs))
     # The worker/guardian enforce the absolute cutoff themselves. Defer our
     # competing Python alarm until the process and IPC handles are reaped.
     with defer_deadline_during_owned_native_wait():
@@ -115,11 +145,13 @@ def _execute():
     try:
         module, name, kwargs = pickle.load(sys.stdin.buffer)
         value = getattr(importlib.import_module(module), name)(**kwargs)
-        payload = True, value
+        encoded = _encode_message((True, value))
     except Exception as exc:
-        payload = False, f"{type(exc).__name__}: {exc}"
+        # Encoding itself can fail. Report that concrete failure without
+        # writing a partial success payload to the anonymous IPC channel.
+        encoded = _encode_message((False, f"{type(exc).__name__}: {exc}"))
     with output:
-        pickle.dump(payload, output, protocol=pickle.HIGHEST_PROTOCOL)
+        output.write(encoded)
 
 
 def _guard(deadline: float, owner: int):

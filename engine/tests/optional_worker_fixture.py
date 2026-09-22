@@ -20,6 +20,67 @@ def fail():
     raise ValueError("injected model failure")
 
 
+def unserializable_result():
+    return lambda: 'unsupported callback result'
+
+
+def synthetic_boundary_descriptor(*_args):
+    from tests.test_visual_boundary_repair import _descriptor
+    return _descriptor(.5)
+
+
+def synthetic_boundary_repair():
+    """Real repair result, including its recursively immutable audit maps."""
+    from pathlib import Path
+    from crosscut.visual_score import VisualTimelinePlan
+    from crosscut.visual_boundary_repair import repair_visual_timeline_boundaries
+    from tests.test_visual_boundary_repair import _choice
+    return repair_visual_timeline_boundaries(
+        visual_timeline=VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 1.),
+        sources=(Path('/synthetic/a'), Path('/synthetic/b')),
+        audio_offsets=(0., 0.), scene_cut_times=((), ()),
+        descriptor_provider=synthetic_boundary_descriptor)
+
+
+def synthetic_visual_materialized():
+    """Real visual DP/materialization; only decoded descriptors are synthetic."""
+    from pathlib import Path
+    from unittest.mock import patch
+    from crosscut.timeline import ShotType
+    from crosscut.visual_score import FrameVisualDescriptor, build_prescribed_visual_timeline_candidate_set
+    from crosscut.visual_candidate_materialization import materialize_visual_timeline_candidates
+    descriptor = FrameVisualDescriptor(
+        quality_score=.9, composition_score=.9, shot_scale=.35,
+        shot_type=ShotType.GROUP_WIDE, face_count=0,
+        structure_embedding=(.1, .2, .3), motion=(0., 0.),
+        color_embedding=(.2, .3, .4), detected_person_count=6,
+        person_layout_embedding=(.1, .2, .3, .4), silhouette_embedding=(.1, .2),
+        silhouette_bbox_xywh=(.2, .1, .6, .8), silhouette_centroid_xy=(.5, .5),
+        silhouette_area_ratio=.4, silhouette_confidence=.9, silhouette_backend='synthetic')
+
+    class Sampler:
+        frame_rate = 30.
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def feature_descriptor_at(self, *_args, **_kwargs):
+            return descriptor
+        descriptor_at = feature_descriptor_at
+        def sface_embedding_at(self, *_args, **_kwargs):
+            return ()
+        def close(self):
+            pass
+
+    with patch('crosscut.visual_score._VideoSampler', Sampler):
+        candidate_set = build_prescribed_visual_timeline_candidate_set(
+            sources=tuple(Path(f'/synthetic/source-{index}.mp4') for index in range(8)),
+            canonical_spans=tuple((float(index), float(index+1)) for index in range(60)),
+            prescribed_source_indices=tuple((index//4) % 8 for index in range(60)),
+            audio_offsets=(0.,)*8, sync_scores=(.9,)*8,
+            scene_cut_times=((),)*8, source_timewarps=(None,)*8)
+        return materialize_visual_timeline_candidates(candidate_set,
+            maximum_candidates=1, passed_only=True)[0]
+
+
 def native_block(*, pid_file):
     import ctypes
     import os

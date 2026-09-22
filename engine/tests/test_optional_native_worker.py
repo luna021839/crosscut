@@ -26,6 +26,59 @@ class OptionalNativeWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "injected model failure"):
             run_isolated_python_call("tests.optional_worker_fixture", "fail", {}, deadline=monotonic()+10.)
 
+    def test_real_immutable_visual_results_cross_both_ipc_directions(self):
+        from dataclasses import replace
+        from types import MappingProxyType
+        from crosscut.visual_boundary_repair import VisualBoundaryRepairPlan
+        from crosscut.visual_candidate_materialization import MaterializedVisualTimelineCandidate
+        for name, expected_type in (('synthetic_boundary_repair', VisualBoundaryRepairPlan),
+                                    ('synthetic_visual_materialized', MaterializedVisualTimelineCandidate)):
+            with self.subTest(name=name):
+                value = run_isolated_python_call('tests.optional_worker_fixture', name, {},
+                    deadline=monotonic()+15.)
+                self.assertIsInstance(value, expected_type)
+                clone = run_isolated_python_call('tests.optional_worker_fixture', 'echo', {'value': value},
+                    deadline=monotonic()+15.)
+                # Re-run the production constructors after the worker crossing.
+                self.assertEqual(replace(clone), value)
+                if isinstance(clone, VisualBoundaryRepairPlan):
+                    audit = clone.repairs[0].result_edge_context
+                    self.assertIsInstance(audit, MappingProxyType)
+                    self.assertIsInstance(audit['outgoing'], MappingProxyType)
+                else:
+                    audit = clone.candidate_set.face_metadata_by_candidate
+                    self.assertIsInstance(audit, MappingProxyType)
+                    self.assertIs(clone.candidate_record, clone.candidate_set.candidates[0])
+                with self.assertRaises(TypeError):
+                    audit['mutation'] = True
+
+    def test_decorated_repair_keeps_explicit_provider_and_readonly_audit(self):
+        import pickle
+        from types import MappingProxyType
+        from crosscut.visual_score import VisualTimelinePlan
+        from crosscut.visual_boundary_repair import repair_visual_timeline_boundaries
+        from tests.test_visual_boundary_repair import _choice
+        from tests.optional_worker_fixture import synthetic_boundary_descriptor
+        kwargs = dict(visual_timeline=VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 1.),
+            sources=(Path('/synthetic/a'), Path('/synthetic/b')),
+            audio_offsets=(0., 0.), scene_cut_times=((), ()),
+            descriptor_provider=synthetic_boundary_descriptor)
+        strict = repair_visual_timeline_boundaries(**kwargs)
+        with optional_native_scope(monotonic()+15.):
+            isolated = repair_visual_timeline_boundaries(**kwargs)
+        self.assertEqual(strict, isolated)
+        self.assertEqual(isolated.reviewed_cross_source_count, 1)
+        self.assertIsInstance(isolated.repairs[0].result_edge_context, MappingProxyType)
+        # IPC support must not change global pickle policy or erase a provider.
+        with self.assertRaises(TypeError):
+            pickle.dumps(MappingProxyType({'private': 'memory-only'}))
+        kwargs['descriptor_provider'] = lambda *_args: None
+        with optional_native_scope(monotonic()+15.), self.assertRaises((AttributeError, TypeError)):
+            repair_visual_timeline_boundaries(**kwargs)
+        with self.assertRaisesRegex(RuntimeError, 'optional native call failed:.*pickle'):
+            run_isolated_python_call('tests.optional_worker_fixture', 'unserializable_result', {},
+                deadline=monotonic()+15.)
+
     def test_native_block_and_descendant_are_killed_at_optional_deadline(self):
         for name in ("native_block", "native_descendant"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
