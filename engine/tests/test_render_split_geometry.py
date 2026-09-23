@@ -13,11 +13,51 @@ import numpy as np
 from crosscut.ive import AspectRatio
 from crosscut.render import (RenderPlan, RenderSegment, RenderTransition,
     EditorialTransformTrack, EditorialTransformKeyframe, NormalizedCrop,
-    PanCropTrack, PanCropKeyframe, SourceLookAdjustment, build_filter_graph, render)
+    PanCropTrack, PanCropKeyframe, SourceLookAdjustment, TransitionKind,
+    MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY, DIRECT_MEMBER_POSE_DISSOLVE_REASON, build_filter_graph, render)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class RenderSplitGeometryTests(unittest.TestCase):
+    def test_split_preserves_outgoing_dissolve_camera_pixels(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for sw, sh, width, height in ((321, 241, 180, 320), (240, 320, 320, 180)):
+                source = root / f'source-{sw}.mp4'
+                subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                    f'testsrc=s={sw}x{sh}:r=30:d=3', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono',
+                    '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv444p', '-c:a', 'aac', str(source)],
+                    check=True, capture_output=True)
+                def pixels(path):
+                    return subprocess.run(['ffmpeg', '-v', 'error', '-i', str(path),
+                        '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], check=True, capture_output=True).stdout
+                for nominal in (EditorialTransformTrack((EditorialTransformKeyframe(0., 1.),)),
+                                EditorialTransformTrack((EditorialTransformKeyframe(0., 1.1),))):
+                    zoom = 1.1 if nominal is not None and nominal.keyframes[0].zoom > 1 else 1.
+                    handle = EditorialTransformTrack((EditorialTransformKeyframe(0., zoom),
+                        EditorialTransformKeyframe(6/30, 1.25, .53, .48, 1.5)))
+                    segment = RenderSegment(0, 0., 1., 0., editorial_transform=nominal,
+                        outgoing_overlap_transform=handle)
+                    incoming = RenderSegment(1, 1., 1., 1.)
+                    base = RenderPlan((source, source), (segment, incoming), 0,
+                        AspectRatio.PORTRAIT if height > width else AspectRatio.LANDSCAPE,
+                        root / 'base.mp4', width=width, height=height, fps=30.,
+                        transitions=(RenderTransition(TransitionKind.FACE_DISSOLVE, 7,
+                            DIRECT_MEMBER_POSE_DISSOLVE_REASON, tier='A',
+                            transform_overlap_authority=MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY),))
+                    render(base, video_codec='libx264')
+                    expected = pixels(base.output)
+                    self.assertEqual(len(expected), 60*width*height*3)
+                    for pieces in (2, 3):
+                        with self.subTest(size=(sw, sh), nominal=nominal, pieces=pieces):
+                            split = replace(base, output=root / 'split.mp4',
+                                segments=tuple(replace(segment, source_start=i/pieces, master_start=i/pieces,
+                                    duration=1/pieces, outgoing_overlap_transform=handle if i == pieces-1 else None)
+                                    for i in range(pieces)) + (incoming,),
+                                transitions=(RenderTransition(),)*(pieces-1)+base.transitions)
+                            render(split, video_codec='libx264')
+                            self.assertEqual(pixels(split.output), expected)
+
     def test_split_preserves_effective_geometry_and_clock(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

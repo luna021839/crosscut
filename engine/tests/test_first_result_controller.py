@@ -12,6 +12,32 @@ from crosscut.review_first_runtime import classify_review_first_qa, ReviewFirstS
 
 
 class FirstResultControllerTests(unittest.TestCase):
+    def test_journal_survives_failures_cancellation_and_bounded_attempts(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory, patch(
+                'crosscut.first_result_controller.enforce_review_first_deadline', return_value=nullcontext()):
+            _, controller, plan = self.make()
+            controller.journal_path = Path(directory) / 'attempts.json'
+            def failure():
+                running = json.loads(controller.journal_path.read_text())
+                self.assertEqual(running['attempts'][-1]['status'], 'running')
+                raise ValueError('dense focal unavailable')
+            controller.run_optional('camera', failure)
+            journal = json.loads(controller.journal_path.read_text())
+            self.assertEqual(journal['rejected_attempt_count'], 1)
+            self.assertTrue(journal['baseline_retained'])
+            def cancelled(): raise KeyboardInterrupt()
+            with self.assertRaises(KeyboardInterrupt):
+                controller.run_optional('cancel', cancelled)
+            self.assertEqual(json.loads(controller.journal_path.read_text())['attempts'][-1]['status'], 'cancelled')
+            for _ in range(70):
+                controller.run_optional('bounded', lambda: None)
+            journal = json.loads(controller.journal_path.read_text())
+            self.assertEqual(len(journal['attempts']), 64)
+            self.assertEqual(journal['omitted_attempt_count'], 8)
+            self.assertEqual(journal['selected_authority'], 'verified_primitive')
+
     def make(self):
         clock = [0.]
         runtime = ReviewFirstRuntime(enabled=True, _clock=lambda: clock[0])

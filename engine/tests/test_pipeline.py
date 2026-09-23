@@ -3384,7 +3384,8 @@ class PipelineTests(unittest.TestCase):
 
     def test_automatic_group_optional_models_cannot_erase_complete_baseline(self):
         for case in ("missing", "discovery_error", "motion_error", "all_rejected",
-                     "late_apply_error", "assembly_error", "cutoff", "explicit_registry_error"):
+                     "late_apply_error", "assembly_error", "malformed_boundary", "late_clock_error",
+                     "cutoff", "explicit_registry_error"):
             with self.subTest(case=case):
                 self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
                     _model_case=case)
@@ -3586,7 +3587,7 @@ class PipelineTests(unittest.TestCase):
                         baseline_builder.assert_called_once()
                         if _model_case == "discovery_error":
                             raise ValueError("optional registry invalid")
-                        return None if _model_case in {"missing", "assembly_error"} else SimpleNamespace()
+                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error"} else SimpleNamespace()
                     generation = SimpleNamespace(
                         retained_candidates=tuple(SimpleNamespace(rank=index) for index in range(2)),
                         learned_section_director=SimpleNamespace(section_plan=section_plan))
@@ -3616,6 +3617,19 @@ class PipelineTests(unittest.TestCase):
                         stack.enter_context(patch('crosscut.pipeline._discover_automatic_stage_edit_production_bundle', side_effect=discover))
                         stack.enter_context(patch('crosscut.pipeline._registered_dynamic_crop_motion_authority_v3', side_effect=motion))
                         stack.enter_context(patch('crosscut.pipeline.analyze_source_look_match', return_value=None))
+                        if _model_case == 'malformed_boundary':
+                            bad_timeline = replace(visual_timeline, choices=(replace(visual_timeline.choices[0], segment_index=99),)+visual_timeline.choices[1:])
+                            repair = VisualBoundaryRepairPlan(bad_timeline, (visual_timeline,), (), 0, ())
+                            stack.enter_context(patch('crosscut.pipeline.repair_visual_timeline_boundaries', return_value=repair))
+                        if _model_case == 'late_clock_error':
+                            original_clock = pipeline._deterministic_exact_shot_clock_from_timeline
+                            clock_calls = []
+                            def late_clock(*args, **kwargs):
+                                clock_calls.append(True)
+                                if len(clock_calls) > 1:
+                                    kwargs['phrase_times'] = (float('nan'),)
+                                return original_clock(*args, **kwargs)
+                            stack.enter_context(patch('crosscut.pipeline._deterministic_exact_shot_clock_from_timeline', side_effect=late_clock))
                         if _model_case == 'assembly_error':
                             bad_face = SimpleNamespace(applied_count=1, fallback_count=0,
                                 pan_crop_for=Mock(side_effect=ValueError('invalid optional pan crop')))
@@ -3658,8 +3672,11 @@ class PipelineTests(unittest.TestCase):
                             if _model_case == 'missing':
                                 self.assertTrue(any(row['stage'] == 'default_registered_models' and row['status'] == 'unavailable'
                                     for row in audit['first_result_controller']['attempts']))
-                            if _model_case == 'assembly_error':
+                            if _model_case in {'assembly_error', 'late_clock_error'}:
                                 self.assertTrue(any(row['stage'] == 'final_geometry_plan' and row['status'] == 'rejected'
+                                    for row in audit['first_result_controller']['attempts']))
+                            if _model_case == 'malformed_boundary':
+                                self.assertTrue(any(row['stage'] == 'boundary_repair' and row['status'] == 'rejected'
                                     for row in audit['first_result_controller']['attempts']))
                         render_video.assert_not_called()  # Sentinel stops at real decoded-proxy entry.
                     return
@@ -8378,8 +8395,12 @@ class PipelineTests(unittest.TestCase):
         self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
             _quality_miss=True, _camera_failure="dense", _dissolve_requested=True)
 
+    def test_member_rejection_journal_survives_technical_proxy_failure(self):
+        self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
+            _quality_miss=True, _camera_failure='dense', _dissolve_requested=True, _proxy_failure=True)
+
     def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
-            self, _quality_miss=False, _camera_failure=None, _dissolve_requested=False) -> None:
+            self, _quality_miss=False, _camera_failure=None, _dissolve_requested=False, _proxy_failure=False) -> None:
         from crosscut.pipeline import _enforce_automatic_member_post_render_qa as actual_member_gate
         from crosscut.member_joint_camera_preflight import MemberJointCameraPreflight
         original_camera_review = MemberJointCameraPreflight.review
@@ -8667,9 +8688,9 @@ class PipelineTests(unittest.TestCase):
                 payload = member_continuity_report()
                 payload['passed'] = not _quality_miss
                 payload['failure_reasons'] = ['rendered_pose_p95_above_floor'] if _quality_miss else []
-                payload['metrics']['pose_mismatch_p95'] = .4 if _quality_miss else 0.
+                payload['metrics']['pose_mismatch_p95'] = .27 if _quality_miss else 0.
                 for boundary in payload['boundaries']:
-                    boundary['pose_mismatch'] = .4 if _quality_miss else 0.
+                    boundary['pose_mismatch'] = .27 if _quality_miss else 0.
                 return payload
 
             def pass_member_proxy(
@@ -8677,6 +8698,13 @@ class PipelineTests(unittest.TestCase):
                 _output_path: Path,
                 **_kwargs: object,
             ) -> tuple[RenderPlan, DirectMemberRenderedProxyPreflight]:
+                if _proxy_failure:
+                    journals = list(request.output_directory.glob('*-member-first-result-journal.json'))
+                    self.assertEqual(len(journals), 1)
+                    journal = json.loads(journals[0].read_text())
+                    self.assertEqual(journal['rejected_attempt_count'], 1)
+                    self.assertIn('dense focal geometry unavailable', journal['attempts'][0]['error'])
+                    raise RuntimeError('synthetic technical proxy failure')
                 preflight = DirectMemberRenderedProxyPreflight(
                     {
                         "schema_version": 1,
@@ -8720,6 +8748,17 @@ class PipelineTests(unittest.TestCase):
                 payload['rendered_continuity'] = member_proxy_continuity()
                 return plan, DirectMemberRenderedProxyPreflight(payload)
 
+            # This fixture verifies the full parent pipeline. The actual IPC
+            # and worker-owned provider are exercised separately with real processes.
+            spec_patch = patch('crosscut.member_camera_worker.MemberCameraProviderSpec.from_provider',
+                return_value=SimpleNamespace(validate_files=lambda: None))
+            worker_patch = patch('crosscut.member_camera_worker.propose_member_camera_in_worker',
+                side_effect=lambda provider_spec, arguments: __import__('crosscut.pipeline', fromlist=['_build_member_camera_with_provider'])._build_member_camera_with_provider(
+                    dense_face_provider=dense_face_provider, **arguments))
+            spec_patch.start()
+            worker_patch.start()
+            self.addCleanup(spec_patch.stop)
+            self.addCleanup(worker_patch.stop)
             professional_gate_metrics = {
                 "visible_switches_per_minute": 16.5,
                 "pose_mismatch_p95": 0.0,
@@ -8795,6 +8834,11 @@ class PipelineTests(unittest.TestCase):
                 side_effect=pass_member_delivery_gate,
             ) as member_delivery_gate:
                 reporter = _MemoryReporter()
+                if _proxy_failure:
+                    self.assertRaisesRegex(RuntimeError, 'synthetic technical proxy failure', analyze, request, reporter)
+                    member_delivery_gate.assert_not_called()
+                    render_video.assert_not_called()
+                    return
                 artifact = analyze(request, reporter)  # type: ignore[arg-type]
 
             track_member.assert_not_called()

@@ -20316,6 +20316,8 @@ class _GroupRenderCandidateBundle:
     editorial_motion_plan: EditorialMotionPlan | None
     render_plan: RenderPlan
     boundary_look_match: BoundaryLookMatchResult | None = None
+    section_plan: SectionPlan | None = None
+    dynamic_crop_application: Mapping[str, Any] | None = None
     output_geometry_deferral: Mapping[str, Any] | None = None
     splice_graph_authorization: Mapping[str, Any] | None = None
     diagnostics: tuple[str, ...] = ()
@@ -20330,7 +20332,17 @@ class _GroupRenderCandidateBundle:
         DynamicCropMotionTimelineEvidenceV3 | None
     ) = None
 
+    def __post_init__(self):
+        from .visual_boundary_repair import _freeze_audit_value
+        # These dictionaries are executable authority, not mutable diagnostics.
+        # Copy/freeze them when ownership changes; serialize only through to_dict.
+        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application'):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _freeze_audit_value(value))
+
     def to_dict(self) -> dict[str, Any]:
+        from .visual_boundary_repair import _thaw_audit_value
         return {
             "candidate_index": self.candidate_index,
             "review_rank": self.review_rank,
@@ -20390,7 +20402,7 @@ class _GroupRenderCandidateBundle:
                 dict(item) for item in self.candidate_lineage
             ],
             "stage_edit_exact_shot_clock": (
-                deepcopy(dict(self.stage_edit_exact_shot_clock))
+                _thaw_audit_value(self.stage_edit_exact_shot_clock)
                 if self.stage_edit_exact_shot_clock is not None
                 else None
             ),
@@ -22629,7 +22641,8 @@ def _stage_edit_montage_analysis_payload(
             "rendered montage review requires the final edit's exact "
             "section/phrase shot clock"
         )
-    exact_clock = deepcopy(dict(exact_clock_value))
+    from .visual_boundary_repair import _thaw_audit_value
+    exact_clock = _thaw_audit_value(exact_clock_value)
     if exact_clock.get("contract") != EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT:
         raise RuntimeError("StageEdit exact serialized-token shot clock changed")
     dynamic_crop_version = bundle.stage_edit_dynamic_crop_version
@@ -25401,7 +25414,8 @@ def _attempt_stage_edit_windowed_beam_reedit(
     actual_final_exact_clock = getattr(
         final_bundle, "stage_edit_exact_shot_clock", None
     )
-    if actual_final_exact_clock != expected_final_exact_clock:
+    from .visual_boundary_repair import _thaw_audit_value
+    if _thaw_audit_value(actual_final_exact_clock) != expected_final_exact_clock:
         raise RuntimeError(
             "accepted windowed StageEdit repair exact shot clock is stale or "
             "does not match the final repaired source path"
@@ -26939,6 +26953,75 @@ def _enforce_automatic_group_stage_edit_requirement(
     }
 
 
+def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_selection, segments,
+        member_transitions, member_common_start, eligible_indices, source_timewarps, offsets,
+        direct_full_frame_ratios, primitive_plan):
+    """Worker-owned camera solve; strict callers and synthetic tests share the implementation."""
+    from .member_joint_camera_preflight import MemberJointCameraPreflight
+    from .automatic_joint_dissolve import register_automatic_member_dissolves
+    from .member_look_preflight import build_member_look_proxy_proposal
+
+    def source_local(source, master):
+        if type(source) is not int or not 0 <= source < len(eligible_indices):
+            raise ValueError('member camera source index outside eligibility')
+        warp = source_timewarps[eligible_indices[source]]
+        return warp.master_to_source(master) if warp is not None else master+offsets[source]
+    def direct_member_geometry_provider(source, master):
+        return dense_face_provider.sample(source, source_local(source, master))
+    def paired(outgoing, outgoing_time, incoming, incoming_time):
+        return dense_face_provider.paired_samples(outgoing, source_local(outgoing, outgoing_time),
+                                                  incoming, source_local(incoming, incoming_time))
+    direct_member_geometry_provider.paired_samples = paired
+    config = _direct_member_editorial_motion_config_from_visual_config(
+        direct_visual_selection.config)
+    dense_face_provider.begin_focal_boundary_reference_capture()
+    motion = build_direct_member_editorial_motion_plan(
+        visual_selection=direct_visual_selection, render_segments=segments,
+        transitions=member_transitions, common_master_start=member_common_start,
+        geometry_provider=direct_member_geometry_provider, fps=29.97, config=config)
+    refs = _direct_member_focal_boundary_reference_mapping(
+        direct_visual_selection.source_indices,
+        dense_face_provider.focal_boundary_reference_capture())
+    for index, (outgoing, incoming) in enumerate(zip(
+            direct_visual_selection.source_indices,
+            direct_visual_selection.source_indices[1:])):
+        if outgoing == incoming or index in refs:
+            continue
+        cut = direct_visual_selection.selected_boundary_master_seconds[index]
+        def local_time(source, master):
+            warp = source_timewarps[eligible_indices[source]]
+            return warp.master_to_source(master) if warp is not None else master + offsets[source]
+        pair = dense_face_provider.recover_exact_focal_pair_from_registered_references(
+            outgoing, local_time(outgoing, max(member_common_start, cut-1/29.97)),
+            incoming, local_time(incoming, cut))
+        if pair is not None:
+            refs[index] = pair
+    attached = _attach_direct_member_editorial_motion_tracks(
+        visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
+        render_segments=segments, motion_plan=motion)
+    attached, proposed_transitions, camera_audit = register_automatic_member_dissolves(
+        render_segments=attached, transitions=member_transitions,
+        visual_selection=direct_visual_selection,
+        eligible_request_source_indices=eligible_indices, common_master_start=member_common_start,
+        focal_provider=dense_face_provider, config=config,
+        registration_cache={})
+    preflight = MemberJointCameraPreflight(maximum_reselections=0).review(
+        visual_selection=direct_visual_selection, render_segments=attached,
+        transitions=proposed_transitions, camera_audit=camera_audit)
+    if not preflight["passed"]:
+        raise ValueError("optional joint camera unverified: " + preflight["reason"])
+    attached = _attach_direct_member_portrait_fill_geometry(
+        visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
+        eligible_source_aspect_ratios=direct_full_frame_ratios, render_segments=attached)
+    look = build_member_look_proxy_proposal(visual_selection=direct_visual_selection,
+        render_segments=attached, mandatory_decoded_proxy=True)
+    dissolve_count = sum(t.kind is TransitionKind.FACE_DISSOLVE for t in proposed_transitions)
+    proposed_plan = replace(primitive_plan, segments=look.apply(attached),
+        transitions=proposed_transitions, member_pose_dissolve_count=dissolve_count,
+        member_pose_dissolve_effective=dissolve_count > 0)
+    return proposed_plan, motion, look, camera_audit, refs
+
+
 def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, timewarps,
                                common_start, section_plan, phrase_times, output, reporter, warnings):
     """Freeze source clocks, geometry and exact shot IDs before optional work."""
@@ -26961,7 +27044,43 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
         group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=None,
-        render_plan=plan, stage_edit_exact_shot_clock=clock)
+        render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan)
+
+
+def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, timewarps, common_start):
+    if not isinstance(bundle, _GroupRenderCandidateBundle) or bundle.timeline_review is None:
+        raise ValueError('complete GROUP bundle requires its timeline review')
+    if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
+        raise ValueError('complete GROUP bundle requires finite review and section authority')
+    plan, timeline = bundle.render_plan, bundle.visual_timeline
+    if len(plan.segments) != len(timeline.choices):
+        raise ValueError('GROUP timeline/render cardinality changed')
+    clock = bundle.stage_edit_exact_shot_clock
+    if (not isinstance(clock, Mapping) or len(clock.get('shots', ())) != len(timeline.choices)
+            or clock.get('contract') != EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT
+            or clock.get('source_index_domain') != ELIGIBLE_SOURCE_INDEX_DOMAIN):
+        raise ValueError('GROUP bundle lacks an exact shot clock')
+    if tuple(bundle.group_transition_plan.transitions) != tuple(plan.transitions):
+        raise ValueError('GROUP transition authority differs from renderer')
+    for index, (choice, segment, shot) in enumerate(zip(timeline.choices, plan.segments, clock['shots'])):
+        if (choice.segment_index != index or type(choice.source_index) is not int
+                or not 0 <= choice.source_index < len(eligible_indices)
+                or not math.isfinite(choice.canonical_master_start)
+                or not math.isfinite(choice.duration_seconds) or choice.duration_seconds <= 0
+                or choice.canonical_master_start < bundle.section_plan.start_seconds-1e-6
+                or choice.canonical_master_end > bundle.section_plan.end_seconds+1e-6
+                or shot.get('shot_index') != index or shot.get('source_index') != choice.source_index):
+            raise ValueError('GROUP bundle timeline/section/source/shot authority differs')
+        expected = aligned_render_segment(source_index=eligible_indices[choice.source_index],
+            reference_start=choice.canonical_master_start, common_master_start=common_start,
+            source_offset=offsets[choice.source_index], duration=choice.duration_seconds,
+            timewarp=timewarps[choice.source_index])
+        if (segment.source_index != expected.source_index or any(abs(getattr(segment, name)-getattr(expected, name)) > 1e-6
+                for name in ('master_start', 'source_start', 'duration', 'source_end'))):
+            raise ValueError('GROUP bundle source/reference clocks differ from timeline')
+        if any(type(shot.get(key)) not in (int, float) or not math.isfinite(shot[key])
+               or not 0 <= shot[key] <= 1 for key in ('section_progress', 'phrase_progress')):
+            raise ValueError('GROUP bundle shot progress is invalid')
 
 
 def _review_first_registered_group_generation(*, request, alignment, alignment_eligibility,
@@ -33268,6 +33387,7 @@ def analyze(
                         source_durations=tuple(float(info.video_streams[0].duration_seconds or
                             info.duration_seconds or 0.) for info in media),
                         master_start=common_start, duration=baseline_bundle.render_plan.duration,
+                        journal_path=request.output_directory / f"{base_filename}-group-first-result-journal.json",
                         allowed_source_indices=eligible_indices)
                     group_first.install_baseline(baseline_bundle, plan=baseline_bundle.render_plan,
                         authority="deterministic_full_song_visual_selector")
@@ -33346,6 +33466,10 @@ def analyze(
                             promoted_bundle = _apply_stage_edit_candidate_render_contract(promoted_bundle,
                                 materialized_review_candidate, motion_authority_v3=registered_stage_edit_motion_authority_v3)
                             group_first.validate_plan(promoted_bundle.render_plan)
+                            _validate_review_first_group_bundle(promoted_bundle, eligible_indices=eligible_indices,
+                                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+                            promoted_bundle = replace(promoted_bundle, dynamic_crop_application=
+                                _dynamic_crop_render_application_audit(promoted_bundle, materialized_review_candidate))
                             return materialized_review_candidate, promoted_bundle
                         candidate_proposal = group_first.run_optional(
                             f"stage_edit_candidate_rank_{retained_candidate.rank}", propose_learned_candidate)
@@ -33508,8 +33632,20 @@ def analyze(
                         automatic_group_editorial_authority = _enforce_automatic_group_stage_edit_requirement(
                             request, registered_stage_edit_bundle, review_rendered_proxies=review_rendered_proxies)
 
-        def optional_group_refinement(stage, operation):
-            return group_first.run_optional(stage, operation) if group_first is not None else operation()
+        def optional_group_refinement(stage, operation, validate=None):
+            return group_first.run_optional(stage, operation, validate=validate) if group_first is not None else operation()
+        def validate_boundary_repair(proposal):
+            if proposal is None:
+                return
+            # Reject corrupt timeline metadata before any later consumer reads
+            # it, not merely when the final encoder constructs a RenderPlan.
+            bundle = _review_first_group_bundle(timeline=proposal.timeline, request=request,
+                eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                common_start=common_start, section_plan=section_plan, phrase_times=phrase_times,
+                output=group_first.baseline.render_plan.output, reporter=reporter, warnings=warnings)
+            _validate_review_first_group_bundle(bundle, eligible_indices=eligible_indices,
+                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+            group_first.validate_plan(bundle.render_plan)
         if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
                 and (not review_first_runtime.enabled or review_first_runtime.optional_refinement_allowed)):
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
@@ -33524,7 +33660,7 @@ def analyze(
                     beat_period_seconds=group_draft.beat_period_seconds,
                     source_timewarps=eligible_timewarps,
                     **_visual_feature_cache_arguments(request),
-                ))
+                ), validate=validate_boundary_repair)
                 if visual_boundary_repairs is not None:
                     visual_timeline = visual_boundary_repairs.timeline
                     reporter.log(
@@ -34240,7 +34376,8 @@ def analyze(
                 config=rendered_montage_config,
                 reference_profile=stage_edit_montage_policy.profile_identity,
             )
-            stage_edit_exact_shot_clock_payload = deepcopy(
+            from .visual_boundary_repair import _thaw_audit_value
+            stage_edit_exact_shot_clock_payload = _thaw_audit_value(
                 _final_montage_analysis["stage_edit_exact_shot_clock"]
             )
             raw_dynamic_crop_version = _final_montage_analysis[
@@ -34563,24 +34700,10 @@ def analyze(
                     reference_source=request.reference_source, aspect_ratio=request.aspect_ratio,
                     output=rendered_video_path, master_audio_start=common_start, width=width, height=height,
                     transitions=group_transition_plan.transitions)
-            review_first_render_fallback_bundle = None
-            if review_first_verified_candidate_bundle is not None:
-                plan = review_first_verified_candidate_bundle.render_plan
-            elif group_first is not None:
-                plan = group_first.run_optional("final_geometry_plan", complete_group_plan,
-                    validate=group_first.validate_plan)
-                if plan is None:
-                    review_first_render_fallback_bundle = group_first.incumbent
-                    kept = review_first_render_fallback_bundle
-                    plan, visual_timeline, timeline_review = kept.render_plan, kept.visual_timeline, kept.timeline_review
-                    visual_boundary_repairs, face_match_plan = kept.boundary_repairs, kept.face_match_plan
-                    group_transition_plan, boundary_affine_plan = kept.group_transition_plan, kept.boundary_affine_plan
-                    editorial_motion_plan, boundary_look_match_result = kept.editorial_motion_plan, kept.boundary_look_match
-                    segments = plan.segments
-            else:
+            def complete_group_bundle():
+                # Construction AND semantic validation live in the optional
+                # transaction. Nothing is promoted as a RenderPlan-only result.
                 plan = complete_group_plan()
-            review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
-            if bool(getattr(request, "review_first_enabled", False)):
                 if visual_timeline is None or timeline_review is None:
                     raise RuntimeError(
                         "review-first GROUP render requires one complete reviewed "
@@ -34609,7 +34732,7 @@ def analyze(
                     raise RuntimeError(
                         "review-first GROUP render lacks an exact section plan"
                     )
-                review_first_singleton_bundle = _GroupRenderCandidateBundle(
+                bundle = _GroupRenderCandidateBundle(
                     candidate_index=0,
                     review_rank=(
                         review_first_stage_edit_materialized.review_rank
@@ -34630,6 +34753,7 @@ def analyze(
                     boundary_affine_plan=boundary_affine_plan,
                     editorial_motion_plan=editorial_motion_plan,
                     render_plan=plan,
+                    section_plan=final_montage_section_plan,
                     boundary_look_match=boundary_look_match_result,
                     diagnostics=("bounded_review_first_singleton_finalization",),
                     candidate_origin="ordinary_visual_baseline",
@@ -34649,35 +34773,39 @@ def analyze(
                         )
                     ),
                 )
-                if review_first_stage_edit_materialized is not None:
-                    if review_first_verified_candidate_bundle is None:
-                        raise RuntimeError("learned candidate lacks its atomically validated render bundle")
-                    review_first_singleton_bundle = review_first_verified_candidate_bundle
-                    application_audit = _dynamic_crop_render_application_audit(
-                        review_first_singleton_bundle,
-                        review_first_stage_edit_materialized,
-                    )
-                    if isinstance(review_first_visual_selection_payload, dict):
-                        review_first_visual_selection_payload[
-                            "dynamic_crop_application"
-                        ] = application_audit
-                        review_first_visual_selection_payload[
-                            "dynamic_crop_applied_to_render"
-                        ] = application_audit[
-                            "learned_framing_applied_to_final_render"
-                        ]
-                elif review_first_render_fallback_bundle is not None:
-                    review_first_singleton_bundle = review_first_render_fallback_bundle
-                if group_first is not None:
-                    group_first.promote(review_first_singleton_bundle,
-                        plan=review_first_singleton_bundle.render_plan, authority=selected_path_authority)
-                    review_first_visual_selection_payload["first_result_controller"] = group_first.to_dict()
-                    review_first_visual_selection_payload["audit_path"] = str(request.output_directory /
-                        f"{base_filename}-review-first-selection-audit.json")
-                    _write_analysis_manifest_atomically(Path(review_first_visual_selection_payload["audit_path"]),
-                        review_first_visual_selection_payload)
-                plan = review_first_singleton_bundle.render_plan
+                _validate_review_first_group_bundle(bundle, eligible_indices=eligible_indices,
+                    offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+                group_first.validate_plan(plan)
+                return bundle
+
+            review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
+            if group_first is not None:
+                if review_first_verified_candidate_bundle is None:
+                    proposal = group_first.run_optional("final_geometry_plan", complete_group_bundle)
+                    if proposal is not None:
+                        group_first.promote(proposal, plan=proposal.render_plan, authority=proposal.cadence_profile)
+                # Consume one owned bundle, including clock/review/geometry.
+                # A rejected proposal cannot leak any of its local metadata.
+                kept = review_first_singleton_bundle = group_first.incumbent
+                plan, visual_timeline, timeline_review = kept.render_plan, kept.visual_timeline, kept.timeline_review
+                visual_boundary_repairs, face_match_plan = kept.boundary_repairs, kept.face_match_plan
+                group_transition_plan, boundary_affine_plan = kept.group_transition_plan, kept.boundary_affine_plan
+                editorial_motion_plan, boundary_look_match_result = kept.editorial_motion_plan, kept.boundary_look_match
+                final_montage_section_plan = kept.section_plan
+                selected_path_authority = group_first.to_dict()["selected_authority"]
+                if kept.dynamic_crop_application is not None:
+                    from .visual_boundary_repair import _thaw_audit_value
+                    review_first_visual_selection_payload['dynamic_crop_application'] = _thaw_audit_value(kept.dynamic_crop_application)
+                    review_first_visual_selection_payload['dynamic_crop_applied_to_render'] = (
+                        kept.dynamic_crop_application['learned_framing_applied_to_final_render'])
+                review_first_visual_selection_payload["first_result_controller"] = group_first.to_dict()
+                review_first_visual_selection_payload["audit_path"] = str(request.output_directory /
+                    f"{base_filename}-review-first-selection-audit.json")
+                _write_analysis_manifest_atomically(Path(review_first_visual_selection_payload["audit_path"]),
+                    review_first_visual_selection_payload)
                 segments = plan.segments
+            else:
+                plan = complete_group_plan()
             if review_rendered_proxies:
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
@@ -34748,7 +34876,8 @@ def analyze(
                         config=rendered_montage_config,
                         reference_profile=stage_edit_montage_policy.profile_identity,
                     )
-                    stage_edit_exact_shot_clock_payload = deepcopy(
+                    from .visual_boundary_repair import _thaw_audit_value
+                    stage_edit_exact_shot_clock_payload = _thaw_audit_value(
                         final_montage_analysis["stage_edit_exact_shot_clock"]
                     )
                     raw_dynamic_crop_version = final_montage_analysis[
@@ -36262,6 +36391,7 @@ def analyze(
                             source_durations=tuple(float(info.video_streams[0].duration_seconds or
                                 info.duration_seconds or 0.) for info in media),
                             master_start=member_common_start, duration=primitive_plan.duration,
+                            journal_path=request.output_directory / f"{base_filename}-member-first-result-journal.json",
                             allowed_source_indices=eligible_indices)
                         primitive = (primitive_plan, primitive_motion, primitive_look,
                             {"applied_count": 0, "boundaries": [], "quality_approved": False}, {})
@@ -36269,57 +36399,24 @@ def analyze(
                             authority="verified_member_source_primitive")
 
                         def propose_member_camera():
-                            config = _direct_member_editorial_motion_config_from_visual_config(
-                                direct_visual_selection.config)
-                            dense_face_provider.begin_focal_boundary_reference_capture()
-                            motion = build_direct_member_editorial_motion_plan(
-                                visual_selection=direct_visual_selection, render_segments=segments,
-                                transitions=member_transitions, common_master_start=member_common_start,
-                                geometry_provider=direct_member_geometry_provider, fps=29.97, config=config)
-                            refs = _direct_member_focal_boundary_reference_mapping(
-                                direct_visual_selection.source_indices,
-                                dense_face_provider.focal_boundary_reference_capture())
-                            for index, (outgoing, incoming) in enumerate(zip(
-                                    direct_visual_selection.source_indices,
-                                    direct_visual_selection.source_indices[1:])):
-                                if outgoing == incoming or index in refs:
-                                    continue
-                                cut = direct_visual_selection.selected_boundary_master_seconds[index]
-                                def local_time(source, master):
-                                    warp = source_timewarps[eligible_indices[source]]
-                                    return warp.master_to_source(master) if warp is not None else master + offsets[source]
-                                pair = dense_face_provider.recover_exact_focal_pair_from_registered_references(
-                                    outgoing, local_time(outgoing, max(member_common_start, cut-1/29.97)),
-                                    incoming, local_time(incoming, cut))
-                                if pair is not None:
-                                    refs[index] = pair
-                            attached = _attach_direct_member_editorial_motion_tracks(
-                                visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
-                                render_segments=segments, motion_plan=motion)
-                            attached, proposed_transitions, camera_audit = register_automatic_member_dissolves(
-                                render_segments=attached, transitions=member_transitions,
-                                visual_selection=direct_visual_selection,
-                                eligible_request_source_indices=eligible_indices, common_master_start=member_common_start,
-                                focal_provider=dense_face_provider, config=config,
-                                registration_cache=joint_dissolve_registration_cache)
-                            preflight = MemberJointCameraPreflight(maximum_reselections=0).review(
-                                visual_selection=direct_visual_selection, render_segments=attached,
-                                transitions=proposed_transitions, camera_audit=camera_audit)
-                            if not preflight["passed"]:
-                                raise ValueError("optional joint camera unverified: " + preflight["reason"])
-                            attached = _attach_direct_member_portrait_fill_geometry(
-                                visual_selection=direct_visual_selection, eligible_indices=eligible_indices,
-                                eligible_source_aspect_ratios=direct_full_frame_ratios, render_segments=attached)
-                            look = build_member_look_proxy_proposal(visual_selection=direct_visual_selection,
-                                render_segments=attached, mandatory_decoded_proxy=True)
-                            dissolve_count = sum(t.kind is TransitionKind.FACE_DISSOLVE for t in proposed_transitions)
-                            proposed_plan = replace(primitive_plan, segments=look.apply(attached),
-                                transitions=proposed_transitions, member_pose_dissolve_count=dissolve_count,
-                                member_pose_dissolve_effective=dissolve_count > 0)
-                            return proposed_plan, motion, look, camera_audit, refs
+                            from .member_camera_worker import MemberCameraProviderSpec, propose_member_camera_in_worker
+                            provider_spec = MemberCameraProviderSpec.from_provider(
+                                dense_face_provider, _visual_feature_cache_arguments(request))
+                            result = propose_member_camera_in_worker(provider_spec=provider_spec, arguments=dict(
+                                direct_visual_selection=direct_visual_selection, segments=segments,
+                                member_transitions=member_transitions, member_common_start=member_common_start,
+                                eligible_indices=eligible_indices, source_timewarps=source_timewarps, offsets=offsets,
+                                direct_full_frame_ratios=direct_full_frame_ratios, primitive_plan=primitive_plan))
+                            provider_spec.validate_files()
+                            return result
+
+                        def validate_member_camera(value):
+                            from .member_camera_worker import validate_member_camera_clock
+                            validate_member_camera_clock(value, primitive_plan)
+                            member_first.validate_plan(value[0])
 
                         proposed = member_first.run_optional("member_camera_and_dissolve", propose_member_camera,
-                            validate=lambda value: member_first.validate_plan(value[0]))
+                            validate=validate_member_camera)
                         if proposed is not None:
                             member_first.promote(proposed, plan=proposed[0], authority="registered_member_camera_proposal")
                         else:

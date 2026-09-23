@@ -1735,6 +1735,16 @@ final class EngineContractTests: XCTestCase {
                 editMode: .group
             )
         )
+        for error in ["missing registry", "invalid registry", "corrupt optional checkpoint"] {
+            let optional = Data("""
+                {"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true},
+                 "runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":false,"production_registry_error":"\(error)"}},
+                 "mode_capabilities":{"review_first_group":{"ready":true,"quality_approved":false}}}
+                """.utf8)
+            XCTAssertTrue(EngineLocator.automaticAcquisitionProbeReady(from: optional, editMode: .group))
+            XCTAssertFalse(EngineLocator.automaticAcquisitionProbeReady(from: optional, editMode: .group,
+                                                                       requireProfessionalModel: true))
+        }
     }
 
     func testAutomaticAcquisitionProbeUsesModeEvenWhenGlobalDoctorExitsNonzero() throws {
@@ -1870,6 +1880,35 @@ final class EngineContractTests: XCTestCase {
 
         try await Task.sleep(nanoseconds: 450_000_000)
         XCTAssertEqual(runner.state, .cancelled)
+    }
+
+    @MainActor
+    func testOptionalGroupModelAbsencePassesDoctorAndLaunchesWorker() async throws {
+        for error in ["missing_registry", "invalid_registry", "corrupt_checkpoint"] {
+            let python = try makeExecutableScript("""
+                if [ "$3" = "doctor" ]; then
+                  printf '%s\\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true},"mode_capabilities":{"review_first_group":{"ready":true,"quality_approved":false}},"runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":false,"production_registry_error":"\(error)"}}}'
+                  exit 1
+                fi
+                printf '%s\\n' "$3" > "$(dirname "$0")/worker-entered"
+                exit 0
+                """)
+            let engine = python.deletingLastPathComponent().appendingPathComponent("crosscut_cli.py")
+            let marker = python.deletingLastPathComponent().appendingPathComponent("worker-entered")
+            let runner = EngineRunner(locateEngine: { engine }, preparationProbe: { engine, _, _ in
+                EngineLocator.supportsAutomaticAcquisition(pythonURL: python, engineURL: engine, editMode: .group)
+                    ? .ready(python) : .automaticAcquisitionUnavailable
+            })
+            runner.start(request: EditRequest(song: "synthetic readiness", targetMember: .gaeul,
+                editMode: .group, aspectRatio: .landscape, sources: [],
+                outputDirectory: python.deletingLastPathComponent().appendingPathComponent("out"), sourceMode: .automatic))
+            for _ in 0..<100 {
+                if FileManager.default.fileExists(atPath: marker.path) { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), "analyze")
+            runner.cancel()
+        }
     }
 
     func testAugmentedPathAlwaysIncludesHomebrewMediaTools() {

@@ -1,8 +1,8 @@
 """Measurement completeness for both proxy and final member continuity reports.
 
 A PASS flag is not evidence. This contract validates the serialized observation
-domain independently of editorial thresholds, which remain owned by the actual
-continuity evaluator.
+domain and reconciles the verdict against the evaluator's trusted configuration,
+never against thresholds supplied by the report being checked.
 """
 from collections.abc import Mapping
 import math
@@ -89,7 +89,7 @@ def _motion_measurements_valid(value: object, *, frame: int, fps: float) -> bool
             and _matches(value['direction_cosine'], value['direction_cosine_audit_only']))
 
 
-def member_continuity_measurements_valid(value: object, *, plan: Mapping | None = None) -> bool:
+def member_continuity_measurements_valid(value: object, *, plan: Mapping | None = None, config=None) -> bool:
     if not isinstance(value, Mapping):
         return False
     metrics = value.get("metrics")
@@ -145,6 +145,13 @@ def member_continuity_measurements_valid(value: object, *, plan: Mapping | None 
                 or any(type(record.get(key)) is not bool for key in (
                     "focal_face_reference_guided", "body_reference_guided"))):
             return False
+        similarity = record.get('focal_face_correspondence_similarity')
+        if ('focal_face_correspondence_similarity' not in record
+                or (similarity is not None and (type(similarity) not in (int, float)
+                    or not math.isfinite(similarity) or not -1 <= similarity <= 1))
+                or (record['focal_face_reference_guided'] and
+                    (record['body_reference_guided'] or similarity is None))):
+            return False
         if kind == "hard_cut":
             if (not _measurement(record, "silhouette_mismatch")
                     or record.get("sample_frame_indices") != [frame-2, frame-1, frame, frame+1]
@@ -192,6 +199,25 @@ def member_continuity_measurements_valid(value: object, *, plan: Mapping | None 
         return False
     if type(metrics.get("focal_reference_authority_active")) is not bool:
         return False
+    # Reconstruct reference coverage from rows, never from a worker's summary.
+    face_count = sum(row['focal_face_reference_guided'] for row in hard_records)
+    body_count = sum(row['body_reference_guided'] for row in hard_records)
+    correspondence_count = sum(row.get('focal_face_correspondence_similarity') is not None for row in hard_records)
+    reference_counts = {
+        'focal_face_reference_guided_boundary_count': face_count,
+        'body_reference_guided_boundary_count': body_count,
+        'focal_face_correspondence_boundary_count': correspondence_count,
+        'effect_focal_face_reference_guided_boundary_count': sum(row['focal_face_reference_guided'] for row in records if row not in hard_records),
+        'effect_body_reference_guided_boundary_count': sum(row['body_reference_guided'] for row in records if row not in hard_records),
+        'effect_focal_face_correspondence_boundary_count': sum(row.get('focal_face_correspondence_similarity') is not None for row in records if row not in hard_records),
+    }
+    if any(type(metrics.get(key)) is not int or metrics[key] != count for key, count in reference_counts.items()):
+        return False
+    for key, count in (('focal_face_reference_guided_fraction', face_count),
+                       ('target_reference_guided_fraction', face_count+body_count),
+                       ('focal_face_authoritative_fraction', correspondence_count)):
+        if not _matches(metrics.get(key), count / hard_count if hard_count else 0.):
+            return False
     strict_rows = ([row for row in attention_rows if row["focal_face_reference_guided"]
                     or row["body_reference_guided"]]
                    if metrics["focal_reference_authority_active"] else attention_rows)
@@ -206,6 +232,8 @@ def member_continuity_measurements_valid(value: object, *, plan: Mapping | None 
                 or any(type(index) is not int or index not in observed for index in indices)
                 or len(set(indices)) != len(indices)):
             return False
+    if not _trusted_editorial_verdict_valid(value, config=config):
+        return False
     if plan is not None:
         segments, transitions = plan.get("segments"), plan.get("transitions")
         if (not isinstance(segments, list) or not isinstance(transitions, list)
@@ -228,3 +256,79 @@ def member_continuity_measurements_valid(value: object, *, plan: Mapping | None 
         if observed != expected:
             return False
     return True
+
+
+def _trusted_editorial_verdict_valid(value, *, config=None):
+    from .direct_member_rendered_continuity import DirectMemberRenderedContinuityConfig
+    from .direct_member_visual import DirectMemberVisualConfig
+    settings = config if config is not None else DirectMemberRenderedContinuityConfig()
+    if not isinstance(settings, DirectMemberRenderedContinuityConfig):
+        return False
+    metrics, reasons = value['metrics'], set(value['failure_reasons'])
+    expected = set()
+    def fail_if(condition, reason):
+        if condition: expected.add(reason)
+    hard = metrics['hard_cut_source_switch_count']
+    fail_if(not value['boundaries'], 'no_rendered_source_switch_boundaries')
+    for field, floor, reason in (
+        ('actual_pose_coverage_fraction', settings.minimum_actual_pose_coverage_fraction, 'rendered_actual_pose_coverage_below_floor'),
+        ('attention_coverage_fraction', settings.minimum_attention_coverage_fraction, 'rendered_attention_coverage_below_floor')):
+        fail_if(hard > 0 and metrics[field]+1e-9 < floor, reason)
+    target_pose = metrics.get('pose_measurement_basis') == 'source_referenced_output_rtmpose_body7'
+    fraction = metrics['target_reference_guided_fraction' if target_pose else 'focal_face_authoritative_fraction']
+    fail_if(metrics['focal_reference_authority_active'] and hard > 0
+        and fraction+1e-9 < settings.minimum_focal_reference_guided_fraction,
+        'rendered_focal_reference_coverage_below_floor')
+    for field, reason in (('attention_position', 'attention_position'), ('attention_scale', 'attention_scale'),
+                          ('pose', 'pose'), ('silhouette', 'silhouette')):
+        number = metrics[field+'_mismatch_p95']
+        fail_if(number is not None and number > getattr(settings, 'maximum_'+field+'_mismatch_p95')+1e-9,
+                'rendered_'+reason+'_p95_above_floor')
+    for row in value['boundaries']:
+        guided = row['focal_face_reference_guided'] or row['body_reference_guided']
+        fail_if(target_pose and not guided, 'rendered_boundary_target_reference_unresolved')
+        if row['transition_kind'] == 'hard_cut':
+            motion = row['motion']
+            # A decoded adjacent window cannot truthfully claim non-adjacency.
+            if motion['timestamp_bound_adjacent'] is not True:
+                return False
+            fail_if(not row['descriptors_available'], 'rendered_boundary_descriptor_missing')
+            fail_if(row['attention_position_mismatch'] is None or row['attention_scale_mismatch'] is None,
+                    'rendered_boundary_attention_missing')
+            fail_if(row['pose_mismatch'] is None and row['silhouette_mismatch'] is None and not guided,
+                    'rendered_boundary_shape_evidence_missing')
+            for field, reason in (('attention_position', 'position'), ('attention_scale', 'scale'),
+                                  ('pose', 'pose'), ('silhouette', 'silhouette')):
+                number = row[field+'_mismatch']
+                fail_if(number is not None and number > getattr(settings, 'maximum_'+field+'_mismatch')+1e-9,
+                        'rendered_boundary_'+reason+'_discontinuity')
+            magnitudes = motion['motion_magnitudes']
+            strong = guided and all(magnitudes[side+'_subject'] is not None and
+                magnitudes[side+'_subject']+1e-9 >= settings.minimum_strong_subject_motion_magnitude
+                for side in ('incoming', 'outgoing'))
+            if row.get('strong_output_subject_motion_gate_applied') is not strong:
+                return False
+            cosine, speed = motion['subject_direction_cosine'], motion['subject_motion_speed_ratio_mismatch']
+            fail_if(strong and (cosine is None or cosine < -settings.maximum_strong_subject_motion_opposition-1e-9),
+                    'rendered_boundary_motion_direction_opposed')
+            fail_if(strong and speed is not None and speed > settings.maximum_strong_subject_motion_speed_ratio_mismatch+1e-9,
+                    'rendered_boundary_motion_speed_discontinuity')
+            phase = motion['pose_phase_continuation_mismatch']
+            fail_if(motion['both_moving'] and phase is not None and
+                    phase > DirectMemberVisualConfig().maximum_pose_phase_continuation_mismatch+1e-9,
+                    'rendered_boundary_pose_phase_discontinuity')
+        else:
+            for step in row['endpoint_steps']:
+                fail_if(step['attention_position_step'] is None or step['attention_scale_step'] is None,
+                        'rendered_effect_endpoint_attention_missing')
+                fail_if(step['pose_step'] is None and step['silhouette_step'] is None,
+                        'rendered_effect_endpoint_shape_evidence_missing')
+                for field, reason in (('attention_position', 'position'), ('attention_scale', 'scale'),
+                                      ('pose', 'pose'), ('silhouette', 'silhouette')):
+                    if field == 'silhouette' and step.get('target_reference_guided') is True:
+                        continue
+                    number = step[field+'_step']
+                    fail_if(number is not None and number > getattr(settings, 'maximum_effect_endpoint_'+field+'_step')+1e-9,
+                            'rendered_effect_endpoint_'+reason+'_discontinuity')
+    # The payload's own thresholds cannot weaken the consumer's policy.
+    return not (expected-reasons) and (not value['passed'] or not expected)

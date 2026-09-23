@@ -6,6 +6,10 @@ from failed proposals; decoded technical and editorial QA still run afterward.
 from copy import deepcopy
 from dataclasses import replace
 from enum import Enum
+import json
+import os
+from pathlib import Path
+import tempfile
 from typing import Callable
 
 from .render import RenderPlan, segment_frame_counts
@@ -26,7 +30,7 @@ class FirstResultStage(str, Enum):
 
 class FirstResultController:
     def __init__(self, runtime: ReviewFirstRuntime, *, sources, source_durations,
-                 master_start: float, duration: float, allowed_source_indices=None):
+                 master_start: float, duration: float, allowed_source_indices=None, journal_path=None):
         self.runtime = runtime
         self.sources = tuple(sources)
         self.source_durations = tuple(source_durations)
@@ -46,6 +50,24 @@ class FirstResultController:
         self.skipped_count = 0
         self._selected_authority = None
         self._history = [self.stage.value]
+        self.journal_path = Path(journal_path) if journal_path is not None else None
+        self.omitted_attempt_count = 0
+
+    def _persist(self):
+        if self.journal_path is None:
+            return
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix='.' + self.journal_path.name, suffix='.tmp',
+                                    dir=self.journal_path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(self.to_dict(), stream, ensure_ascii=False, allow_nan=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(self.journal_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def validate_plan(self, plan: RenderPlan) -> None:
         if not isinstance(plan, RenderPlan):
@@ -76,6 +98,7 @@ class FirstResultController:
         self._selected_authority = authority
         self.stage = FirstResultStage.BASELINE_PLAN_READY
         self._history.append(self.stage.value)
+        self._persist()
         return value
 
     def run_optional(self, stage: str, operation: Callable, *, validate: Callable | None = None):
@@ -86,10 +109,14 @@ class FirstResultController:
             self.skipped_count += 1
             if len(self.attempts) < 64:
                 self.attempts.append(dict(stage=stage, status="skipped_search_cutoff", elapsed_seconds=0.))
+            else:
+                self.omitted_attempt_count += 1
+            self._persist()
             return None
         started = self.runtime.elapsed_seconds
         row = dict(stage=stage, status="running")
         self.attempts.append(row)
+        self._persist()
         cutoff = min(self.runtime.deadline_monotonic_seconds,
             self.runtime.deadline_monotonic_seconds - self.runtime.total_budget_seconds
             + min(self.runtime.first_render_budget_seconds, self.runtime.refinement_stop_seconds))
@@ -110,14 +137,19 @@ class FirstResultController:
             row["status"] = "search_cutoff"
         except Exception as exc:
             row.update(status="rejected", error_type=type(exc).__name__, error=str(exc)[:2000])
+        except BaseException:
+            row["status"] = "cancelled"
+            raise
         finally:
             row["elapsed_seconds"] = max(0., self.runtime.elapsed_seconds-started)
+            self._persist()
         return None
 
     def promote(self, value, *, plan: RenderPlan, authority: str):
         self.validate_plan(plan)
         self.incumbent = value
         self._selected_authority = authority
+        self._persist()
         return value
 
     def render_complete(self):
@@ -125,6 +157,7 @@ class FirstResultController:
             raise RuntimeError("first result render completion is out of order")
         self.stage = FirstResultStage.RENDERED
         self._history.append(self.stage.value)
+        self._persist()
 
     def to_dict(self):
         return dict(contract="retained_complete_first_result_plan_v1", stage=self.stage.value,
@@ -133,6 +166,8 @@ class FirstResultController:
             optional_attempt_count=sum(r["status"] != "skipped_search_cutoff" for r in self.attempts),
             rejected_attempt_count=sum(r["status"] == "rejected" for r in self.attempts),
             skipped_count=self.skipped_count, attempts=deepcopy(self.attempts),
+            omitted_attempt_count=self.omitted_attempt_count,
+            journal_path=str(self.journal_path) if self.journal_path is not None else None,
             quality_approved=False, decoded_qa_required=True)
 
 

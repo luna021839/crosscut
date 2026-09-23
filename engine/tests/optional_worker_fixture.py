@@ -9,6 +9,20 @@ def echo(*, value):
     return value
 
 
+def returned_with_inherited_pipe(*, pid_file):
+    import os
+    import signal
+    import time
+    from pathlib import Path
+    child = os.fork()
+    if child == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(12.)
+        os._exit(0)
+    Path(pid_file).write_text(f'{child} {os.getpgrp()}')
+    return 'leader-returned'
+
+
 def noisy_echo(*, value):
     import os
     print('synthetic Python diagnostic', flush=True)
@@ -22,6 +36,44 @@ def fail():
 
 def unserializable_result():
     return lambda: 'unsupported callback result'
+
+
+class SyntheticMemberLook:
+    def apply(self, segments): return tuple(segments)
+
+
+class SyntheticMemberCameraSpec:
+    """Child-local model injection; production camera/provider plumbing remains real."""
+    def __init__(self, pid_file, mode):
+        self.pid_file, self.mode = pid_file, mode
+    def validate_files(self): pass
+    def open(self):
+        import crosscut.pipeline as pipeline
+        import crosscut.member_look_preflight as look
+        from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
+        def camera(**kwargs):
+            kwargs['geometry_provider'](0, 0.)
+            return EditorialMotionPlan(segments=(EditorialMotionSegment(0, 0, None),),
+                boundary_match_count=0, zoom_event_count=0, pan_event_count=0,
+                roll_event_count=0, blocked_dissolve_segment_count=0)
+        pipeline.build_direct_member_editorial_motion_plan = camera
+        look.build_member_look_proxy_proposal = lambda **kw: SyntheticMemberLook()
+        return SyntheticMemberCameraProvider(self.pid_file, self.mode)
+
+
+class SyntheticMemberCameraProvider:
+    def __init__(self, pid_file, mode): self.pid_file, self.mode = pid_file, mode
+    def sample(self, *_args):
+        import os
+        from pathlib import Path
+        Path(self.pid_file).write_text(f'{os.getpid()} {os.getpgrp()}')
+        if self.mode == 'block': return native_block(pid_file=self.pid_file)
+        if self.mode == 'error': raise ValueError('synthetic member camera failure')
+        return None
+    def paired_samples(self, *args): return self.sample(), self.sample()
+    def begin_focal_boundary_reference_capture(self): pass
+    def focal_boundary_reference_capture(self): return ()
+    def close(self): pass
 
 
 def synthetic_boundary_descriptor(*_args):

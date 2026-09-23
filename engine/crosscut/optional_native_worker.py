@@ -155,18 +155,41 @@ def _execute():
 
 
 def _guard(deadline: float, owner: int):
-    # The guard and native child share this *owned* session. Killing this
-    # group also stops the native child if the app/analysis parent vanished.
+    # The guardian stays outside the work group so it can kill ALL inherited
+    # pipe holders even after the execute leader returned successfully.
     if os.getpid() != os.getpgrp():
         raise RuntimeError("native guard must own its process group")
-    process = subprocess.Popen([sys.executable, "-m", _WORKER_MODULE, "execute"])
-    while True:
-        if os.getppid() != owner or monotonic() >= deadline:
-            os.killpg(os.getpgrp(), signal.SIGKILL)
+    def cancelled(_signum, _frame):
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, cancelled)
+    process = None
+    try:
+        # Do not allow TERM between fork and recording the owned PID. SIGKILL
+        # is reserved for work-group cleanup (including TERM-ignoring native code).
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
-            return process.wait(timeout=min(.05, max(.001, deadline-monotonic())))
-        except subprocess.TimeoutExpired:
-            pass
+            process = subprocess.Popen([sys.executable, "-m", _WORKER_MODULE, "execute"],
+                                       start_new_session=True)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        while True:
+            if os.getppid() != owner or monotonic() >= deadline:
+                return 124
+            try:
+                return process.wait(timeout=min(.05, max(.001, deadline-monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        # Normal result, parent death and cancellation all close descendants'
+        # inherited IPC fds BEFORE the guardian exits. Preserve the leader's
+        # success return code; do not kill the guardian's own group here.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=1.)
 
 
 if __name__ == "__main__":

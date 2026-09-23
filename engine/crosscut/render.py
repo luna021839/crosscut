@@ -2321,6 +2321,9 @@ def _combined_identity_segment(
         # Neutral camera presence carries aspect-fill semantics. Its last
         # neutral keyframe extends over the combined duration unchanged.
         editorial_transform=first.editorial_transform,
+        # This track is local to the external dissolve handle, not to the
+        # merged nominal run. Preserve it without shifting its local clock.
+        outgoing_overlap_transform=last.outgoing_overlap_transform,
         look_adjustment=_coalescing_look(first.look_adjustment),
         boundary_look_track=_combined_boundary_look_track(segments),
     )

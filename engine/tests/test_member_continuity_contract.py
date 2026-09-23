@@ -7,6 +7,40 @@ from tests.member_continuity_fixture import member_continuity_report
 
 
 class MemberContinuityContractTests(unittest.TestCase):
+    def test_semantic_pass_mutations_reach_final_gate_and_classifier(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from crosscut.member_post_render_qa import _rendered_continuity_payload, _Issues, AutomaticMemberPostRenderQAConfig
+        plan = {'fps': 30., 'output_frame_count': 120,
+            'segments': [{'source_index': index, 'duration': 1.} for index in range(4)],
+            'transitions': [{'kind': 'hard_cut', 'frame_count': 0} for _ in range(3)]}
+        def remove_pose(report):
+            for row in report['boundaries']: row['pose_mismatch'] = None
+            report['metrics'].update(actual_pose_boundary_count=0, actual_pose_coverage_fraction=0., pose_mismatch_p95=None)
+            report['thresholds']['minimum_actual_pose_coverage_fraction'] = 0.  # Not trusted.
+        mutations = (
+            remove_pose,
+            lambda r: r['boundaries'][0]['motion'].clear(),
+            lambda r: r['boundaries'][0]['motion'].update(timestamp_bound_adjacent=False),
+            lambda r: r['boundaries'][0]['motion']['master_timestamps_seconds'].update(incoming_start=999.),
+            lambda r: r['metrics'].update(focal_face_reference_guided_boundary_count=3,
+                focal_face_reference_guided_fraction=1., focal_reference_authority_active=True),
+            lambda r: r['boundaries'][0].update(focal_face_correspondence_similarity=float('nan')),
+            lambda r: r['boundaries'][0].update(focal_face_reference_guided=True, body_reference_guided=True),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                report = member_continuity_report(plan)
+                mutate(report)
+                issues = _Issues()
+                payload = _rendered_continuity_payload(SimpleNamespace(video_path=Path('/synthetic/output')),
+                    plan, AutomaticMemberPostRenderQAConfig(), lambda *a, **k: report, issues)
+                self.assertFalse(member_continuity_measurements_valid(payload, plan=plan))
+                disposition = classify_review_first_qa({'passed': True, 'issues': [],
+                    'metrics': {'rendered_continuity': payload}}, content_binding_passed=True,
+                    review_first_enabled=True, member=True)
+                self.assertEqual(disposition.status, ReviewFirstStatus.INPUT_UNUSABLE)
+
     def test_actual_producer_accepts_hard_effect_and_sparse_source_switch_indices(self):
         for kind in ("hard_cut", "face_dissolve", "member_zoom_bridge", "member_blur_bridge"):
             with self.subTest(kind=kind):

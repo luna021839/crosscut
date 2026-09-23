@@ -256,7 +256,8 @@ enum EngineLocator {
         }
     }
 
-    static func automaticAcquisitionProbeReady(from data: Data, editMode: EditMode) -> Bool {
+    static func automaticAcquisitionProbeReady(from data: Data, editMode: EditMode,
+                                               requireProfessionalModel: Bool = false) -> Bool {
         guard let text = String(data: data, encoding: .utf8),
               let openingBrace = text.firstIndex(of: "{") else {
             return false
@@ -273,13 +274,14 @@ enum EngineLocator {
         let modeKey = editMode == .group ? "automatic_group" : "automatic_member"
         guard modeReadiness[modeKey] as? Bool == true else { return false }
         if editMode == .group {
-            guard let runtimeContract = payload["runtime_contract"] as? [String: Any],
-                  let stageEdit = runtimeContract["stage_edit_generation"]
-                    as? [String: Any],
-                  stageEdit["automatic_group_generation_ready"] as? Bool == true
-            else {
-                return false
-            }
+            let runtimeContract = payload["runtime_contract"] as? [String: Any]
+            let stageEdit = runtimeContract?["stage_edit_generation"] as? [String: Any]
+            let modelReady = stageEdit?["automatic_group_generation_ready"] as? Bool == true
+            let capabilities = payload["mode_capabilities"] as? [String: Any]
+            let reviewFirst = capabilities?["review_first_group"] as? [String: Any]
+            // Old engines cannot opt into the new baseline contract merely by
+            // omitting a model field. Explicit required-model callers stay strict.
+            return modelReady || (!requireProfessionalModel && reviewFirst?["ready"] as? Bool == true)
         }
         return true
     }

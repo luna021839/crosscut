@@ -211,7 +211,7 @@ class DoctorTests(unittest.TestCase):
             "user_anchor_forward_continuous_track_only",
         )
 
-    def test_automatic_group_fails_closed_without_registered_stage_edit_bundle(
+    def test_automatic_group_baseline_ready_without_optional_stage_edit_bundle(
         self,
     ) -> None:
         runtime_contract = _ready_runtime_contract()
@@ -228,20 +228,36 @@ class DoctorTests(unittest.TestCase):
         )
 
         readiness = report["mode_readiness"]
-        self.assertFalse(readiness["automatic_group"])
+        self.assertTrue(readiness["automatic_group"])
         self.assertTrue(readiness["automatic_member"])
-        self.assertFalse(report["ready"])
+        self.assertTrue(report["ready"])
         professional = report["mode_capabilities"][
             "professional_group_generation"
         ]
         self.assertFalse(professional["ready"])
         self.assertTrue(professional["architecture_available"])
         self.assertIsNone(professional["installed_production_bundle"])
-        self.assertEqual(professional["required_for"], ["automatic_group"])
+        self.assertEqual(professional["required_for"], ["explicit_required_model"])
+        self.assertTrue(report["mode_capabilities"]["review_first_group"]["ready"])
+        self.assertIsNotNone(report["mode_capabilities"]["review_first_group"]["warning"])
         self.assertEqual(
             professional["failure_policy"],
-            "fail_closed_no_silent_visual_fallback",
+            "optional_review_first_with_provenance_explicit_required_fail_closed",
         )
+
+    def test_invalid_optional_registry_retains_baseline_with_error_provenance(self):
+        for error in ('invalid production registry', 'checkpoint digest mismatch'):
+            with self.subTest(error=error):
+                contract = _ready_runtime_contract()
+                contract['stage_edit_generation'].update(installed_production_bundle=None,
+                    production_registry_error=error, automatic_group_generation_ready=False)
+                report = self._report_with_pose_statuses(
+                    _pose_statuses(_model_status(PERSON_DETECTOR_MODEL)), runtime_contract=contract)
+                self.assertTrue(report['mode_readiness']['automatic_group'])
+                capabilities = report['mode_capabilities']
+                self.assertTrue(capabilities['review_first_group']['ready'])
+                self.assertFalse(capabilities['professional_group_generation']['ready'])
+                self.assertEqual(capabilities['professional_group_generation']['production_registry_error'], error)
 
     def test_automatic_member_requires_verified_person_detector(self) -> None:
         failures = {

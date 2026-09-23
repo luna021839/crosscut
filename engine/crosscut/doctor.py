@@ -150,7 +150,6 @@ def runtime_report() -> dict[str, object]:
     automatic_group_ready = bool(
         group_mode_ready
         and acquisition_ready
-        and professional_group_generation_ready
     )
     automatic_member_ready = bool(
         group_mode_ready
@@ -215,6 +214,13 @@ def runtime_report() -> dict[str, object]:
             },
         },
         "mode_capabilities": {
+            "review_first_group": {
+                "ready": automatic_group_ready,
+                "professional_model_available": professional_group_generation_ready,
+                "warning": None if professional_group_generation_ready else
+                    "Optional professional model unavailable; first review uses validated baseline",
+                "quality_approved": False,
+            },
             "professional_group_generation": {
                 "ready": professional_group_generation_ready,
                 "architecture_available": bool(
@@ -226,8 +232,9 @@ def runtime_report() -> dict[str, object]:
                 "production_registry_error": stage_edit_generation.get(
                     "production_registry_error"
                 ),
-                "required_for": ["automatic_group"],
-                "failure_policy": "fail_closed_no_silent_visual_fallback",
+                "required_for": ["explicit_required_model"],
+                "optional_for": ["automatic_group_review_first"],
+                "failure_policy": "optional_review_first_with_provenance_explicit_required_fail_closed",
             },
             # Confirmed-anchor tracking belongs only to the local member path;
             # automatic portrait edits use verified full-frame visual evidence.

@@ -15,6 +15,50 @@ from tests.process_fixture import assert_group_member_stopped
 
 @unittest.skipUnless(os.name == "posix", "native workers require POSIX")
 class OptionalNativeWorkerTests(unittest.TestCase):
+    def test_actual_member_camera_entry_owns_provider_outside_analysis(self):
+        from types import SimpleNamespace
+        from crosscut.member_camera_worker import propose_member_camera_in_worker
+        from crosscut.direct_member_visual import DirectMemberVisualConfig
+        from crosscut.ive import AspectRatio
+        from crosscut.render import RenderPlan, RenderSegment
+        from tests.optional_worker_fixture import SyntheticMemberCameraSpec
+        for mode in ('normal', 'error', 'block'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'camera-pid'
+                plan = RenderPlan((Path('/synthetic/source'),), (RenderSegment(0, 0., 1., 0.),), 0,
+                    AspectRatio.PORTRAIT, Path('/synthetic/out'), width=1080, height=1920, member_pose_dissolve_requested=True,
+                    member_pose_dissolve_effective=False, member_pose_dissolve_count=0)
+                arguments = dict(direct_visual_selection=SimpleNamespace(config=DirectMemberVisualConfig(),
+                    source_indices=(0,), boundaries=(), selected_boundary_master_seconds=(), source_frame_geometries=(None,)),
+                    segments=plan.segments, member_transitions=(), member_common_start=0., eligible_indices=(0,),
+                    source_timewarps=(None,), offsets=(0.,), direct_full_frame_ratios=(9/16,), primitive_plan=plan)
+                started = monotonic()
+                with optional_native_scope(started+4.):
+                    if mode == 'normal':
+                        result = propose_member_camera_in_worker(provider_spec=SyntheticMemberCameraSpec(str(path), mode), arguments=arguments)
+                        self.assertTrue(result[0].member_pose_dissolve_requested)
+                        self.assertEqual(result[0].segments, plan.segments)
+                    elif mode == 'error':
+                        with self.assertRaisesRegex(RuntimeError, 'synthetic member camera failure'):
+                            propose_member_camera_in_worker(provider_spec=SyntheticMemberCameraSpec(str(path), mode), arguments=arguments)
+                    else:
+                        with self.assertRaises(ReviewFirstSearchCutoff):
+                            propose_member_camera_in_worker(provider_spec=SyntheticMemberCameraSpec(str(path), mode), arguments=arguments)
+                pid, group = map(int, path.read_text().split())
+                self.assertNotEqual(pid, os.getpid())
+                assert_group_member_stopped(self, pid, group)
+                self.assertLess(monotonic()-started, 5.5)
+
+    def test_returned_worker_cannot_leave_inherited_pipe_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'child'
+            started = monotonic()
+            result = run_isolated_python_call('tests.optional_worker_fixture', 'returned_with_inherited_pipe',
+                {'pid_file': str(path)}, deadline=started+5.)
+            self.assertEqual(result, 'leader-returned')
+            self.assertLess(monotonic()-started, 4.)
+            assert_group_member_stopped(self, *map(int, path.read_text().split()))
+
     def test_real_worker_round_trips_typed_result_and_exceptions(self):
         value = {"result": (1, 2, Path("/synthetic/checkpoint"))}
         self.assertEqual(run_isolated_python_call("tests.optional_worker_fixture", "echo",

@@ -1383,7 +1383,7 @@ def _rendered_continuity_payload(
             value=f"{type(exc).__name__}: {exc}",
         )
     from .member_continuity_contract import member_continuity_measurements_valid
-    contract_valid = member_continuity_measurements_valid(payload, plan=plan)
+    contract_valid = member_continuity_measurements_valid(payload, plan=plan, config=config.rendered_continuity)
     if not contract_valid:
         issues.add(
             "member_rendered_continuity_contract_invalid",
