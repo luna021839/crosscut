@@ -26983,7 +26983,8 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
     motion = build_direct_member_editorial_motion_plan(
         visual_selection=direct_visual_selection, render_segments=segments,
         transitions=member_transitions, common_master_start=member_common_start,
-        geometry_provider=direct_member_geometry_provider, fps=29.97, config=config)
+        geometry_provider=direct_member_geometry_provider, fps=primitive_plan.fps, config=config,
+        pose_geometry_provider=getattr(dense_face_provider,'selector_geometry',None))
     refs = _direct_member_focal_boundary_reference_mapping(
         direct_visual_selection.source_indices,
         dense_face_provider.focal_boundary_reference_capture())
@@ -26997,7 +26998,7 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
             warp = source_timewarps[eligible_indices[source]]
             return warp.master_to_source(master) if warp is not None else master + offsets[source]
         pair = dense_face_provider.recover_exact_focal_pair_from_registered_references(
-            outgoing, local_time(outgoing, max(member_common_start, cut-1/29.97)),
+            outgoing, local_time(outgoing, max(member_common_start, cut-1/primitive_plan.fps)),
             incoming, local_time(incoming, cut))
         if pair is not None:
             refs[index] = pair
@@ -27008,8 +27009,10 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
         render_segments=attached, transitions=member_transitions,
         visual_selection=direct_visual_selection,
         eligible_request_source_indices=eligible_indices, common_master_start=member_common_start,
-        focal_provider=dense_face_provider, config=config,
+        focal_provider=dense_face_provider, config=config, fps=primitive_plan.fps,
         registration_cache={})
+    from .direct_member_roll import bind_registered_member_roll
+    motion = bind_registered_member_roll(motion,attached,camera_audit)
     preflight = MemberJointCameraPreflight(maximum_reselections=0).review(
         visual_selection=direct_visual_selection, render_segments=attached,
         transitions=proposed_transitions, camera_audit=camera_audit)
@@ -36524,6 +36527,7 @@ def analyze(
                                 ),
                                 fps=29.97,
                                 config=candidate_member_motion_config,
+                                pose_geometry_provider=getattr(dense_face_provider,'selector_geometry',None),
                             )
                         )
                         focal_capture = (
@@ -36850,6 +36854,9 @@ def analyze(
                         config=candidate_member_motion_config,
                         registration_cache=joint_dissolve_registration_cache,
                     )
+                    from .direct_member_roll import bind_registered_member_roll
+                    candidate_member_motion_plan = bind_registered_member_roll(
+                        candidate_member_motion_plan,attached_segments,candidate_joint_dissolve_audit)
                     reporter.log(
                         "직캠 양쪽 디졸브 카메라 적용 "
                         f"{candidate_joint_dissolve_audit['applied_count']}개 · "

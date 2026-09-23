@@ -2925,6 +2925,7 @@ def build_direct_member_editorial_motion_plan(
     config: DirectMemberEditorialMotionConfig | None = None,
     source_frame_sizes: Sequence[tuple[int, int]] | None = None,
     output_frame_size: tuple[int, int] = (1080, 1920),
+    pose_geometry_provider: Callable | None = None,
 ) -> EditorialMotionPlan:
     """Add dense-verified face or full-subject matches to direct 9:16 cuts."""
 
@@ -4401,7 +4402,7 @@ def build_direct_member_editorial_motion_plan(
     if missing_required:
         skipped["required_dense_partial_unresolved"] = len(missing_required)
 
-    return EditorialMotionPlan(
+    no_roll_plan = EditorialMotionPlan(
         segments=tuple(
             EditorialMotionSegment(
                 segment_index=index,
@@ -4468,6 +4469,11 @@ def build_direct_member_editorial_motion_plan(
             for boundary_index in sorted(final_boundary_residuals)
         ),
     )
+    from .direct_member_roll import apply_direct_member_roll
+    return apply_direct_member_roll(no_roll_plan,visual_selection=visual_selection,
+        render_segments=renders,transitions=transition_items,source_frame_geometries=source_frame_geometries,
+        pose_geometry_provider=pose_geometry_provider,common_master_start=common_master_start,
+        fps=fps,config=settings)
 
 
 __all__ = [

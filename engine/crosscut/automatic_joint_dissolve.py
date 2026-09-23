@@ -14,6 +14,7 @@ from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_disso
     joint_pose_anchor_observations)
 from .joint_dissolve_pose import source_focal_overlap_pose
 from .render import TransitionKind,DIRECT_MEMBER_POSE_DISSOLVE_REASON,quantized_segment_frame_counts
+from .member_roll_geometry import MEMBER_ROLL_CONTRACT
 
 
 def register_automatic_member_dissolves(*, render_segments, transitions, visual_selection,
@@ -179,51 +180,72 @@ All measurement calls use the actual source-local clocks of the render plan.
                 master_seconds=obs.master_seconds,source_seconds=obs.source_seconds,
                 frame_geometry=geometry_by_request[obs.source_index])
                 for obs in seq) for seq in observations)
-        key=hashlib.sha256(repr((observations,pose_observations,fps,limits,settings.maximum_center_shift,
+        output_size=(geometry_by_request[pair[0].source_index].output_width,
+                     geometry_by_request[pair[0].source_index].output_height)
+        if any((geometry_by_request[s.source_index].output_width,
+                geometry_by_request[s.source_index].output_height)!=output_size for s in pair):
+            row['reason']='inconsistent_output_geometry';continue
+        fit_arguments=dict(fps=fps,maximum_zooms=limits,maximum_center_shift=settings.maximum_center_shift,
+            maximum_position_mismatch=settings.maximum_face_residual_position_mismatch,
+            maximum_scale_mismatch=settings.maximum_face_residual_scale_mismatch,
+            pose_observations=pose_observations,output_size=output_size)
+        key=hashlib.sha256(repr((MEMBER_ROLL_CONTRACT,output_size,observations,pose_observations,fps,limits,settings.maximum_center_shift,
             settings.maximum_face_residual_position_mismatch,settings.maximum_face_residual_scale_mismatch)).encode()).hexdigest()
         row['registration_cache_hit']=key in solves
         if key not in solves:
-            solves[key]=fit_joint_dissolve_registration(*observations,fps=fps,maximum_zooms=limits,
-                maximum_center_shift=settings.maximum_center_shift,
-                maximum_position_mismatch=settings.maximum_face_residual_position_mismatch,
-                maximum_scale_mismatch=settings.maximum_face_residual_scale_mismatch,
-                pose_observations=pose_observations)
+            solves[key]=fit_joint_dissolve_registration(*observations,**fit_arguments)
         tracks,fit=solves[key];row['registration']=fit
         if tracks is None:
             row['reason']='joint_solver_no_verified_solution';continue
-        try:
-            a,b,registered=materialize_joint_dissolve_registration(left_segment=pair[0],right_segment=pair[1],
-                left_observations=observations[0],right_observations=observations[1],tracks=tracks,
-                transition=effect,common_master_start=common_master_start,fps=fps,ramp_seconds=settings.ramp_seconds,
-                incoming_transition=effects[index-1] if compose_previous else None)
-        except ValueError as error:
-            row.update(reason='camera_composition_unavailable',detail=str(error));continue
-        containment=review_joint_dissolve_containment(segments=(a,b),transitions=(registered,),
-            source_geometries=geometry_by_request,geometry_provider=sample,pixel_containment_provider=pixels,
-            bracketed_body_containment_provider=bracketed_body,
-            fps=fps,frame_counts=counts[index:index+2],minimum_face_visible=settings.minimum_dense_face_visible_fraction,
-            minimum_body_visible=settings.minimum_face_associated_subject_visible_fraction,
-            legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
-            legacy_face_only_maximum_center_shift=settings.legacy_face_only_maximum_center_shift)
-        row['containment']=containment
-        if not containment['passed']:
-            alternate,return_audit=shorten_joint_incoming_return(b.editorial_transform,registered,containment,fps=fps)
-            row['visibility_timed_return']=return_audit
-            if alternate is not None:
-                row['initial_containment']=containment
-                alternate_b=replace(b,editorial_transform=alternate)
-                revised=review_joint_dissolve_containment(segments=(a,alternate_b),transitions=(registered,),
+        def materialize_and_review(candidate_tracks):
+            attempt={}
+            try:
+                a,b,registered=materialize_joint_dissolve_registration(left_segment=pair[0],right_segment=pair[1],
+                    left_observations=observations[0],right_observations=observations[1],tracks=candidate_tracks,
+                    transition=effect,common_master_start=common_master_start,fps=fps,ramp_seconds=settings.ramp_seconds,
+                    incoming_transition=effects[index-1] if compose_previous else None)
+            except ValueError as error:
+                return None,dict(reason='camera_composition_unavailable',detail=str(error))
+            def containment_for(left,right):
+                return review_joint_dissolve_containment(segments=(left,right),transitions=(registered,),
                     source_geometries=geometry_by_request,geometry_provider=sample,pixel_containment_provider=pixels,
                     bracketed_body_containment_provider=bracketed_body,
                     fps=fps,frame_counts=counts[index:index+2],minimum_face_visible=settings.minimum_dense_face_visible_fraction,
                     minimum_body_visible=settings.minimum_face_associated_subject_visible_fraction,
                     legacy_face_only_maximum_zoom=settings.legacy_face_only_maximum_zoom,
                     legacy_face_only_maximum_center_shift=settings.legacy_face_only_maximum_center_shift)
-                row['containment']=revised
-                containment=revised
-                if revised['passed']:b=alternate_b
-        if not containment['passed']:
-            row['reason']='joint_camera_containment_not_verified';continue
+            containment=containment_for(a,b)
+            attempt['containment']=containment
+            if not containment['passed']:
+                alternate,return_audit=shorten_joint_incoming_return(b.editorial_transform,registered,containment,fps=fps)
+                attempt['visibility_timed_return']=return_audit
+                if alternate is not None:
+                    attempt['initial_containment']=containment
+                    alternate_b=replace(b,editorial_transform=alternate)
+                    containment=containment_for(a,alternate_b)
+                    attempt['containment']=containment
+                    if containment['passed']:b=alternate_b
+            if not containment['passed']:
+                return None,dict(attempt,reason='joint_camera_containment_not_verified')
+            return (a,b,registered),attempt
+        candidate,attempt=materialize_and_review(tracks)
+        if candidate is None and any(abs(p.roll_degrees)>1e-9 for track in tracks for p in track.keyframes):
+            # Rotation is a refinement of a complete prior solve. If its new
+            # ramps/containment fail, re-use the same measurements for the exact
+            # no-roll solve, without another selection, decode or proxy render.
+            row['rejected_roll_proposal']=dict(attempt,registration=fit)
+            baseline_key=(key,'without_roll')
+            if baseline_key not in solves:
+                solves[baseline_key]=fit_joint_dissolve_registration(*observations,**fit_arguments,enable_rotation=False)
+            baseline_tracks,baseline_fit=solves[baseline_key]
+            if baseline_tracks is not None:
+                candidate,attempt=materialize_and_review(baseline_tracks)
+                row['registration']=baseline_fit
+                row['roll_refinement_rejected']=True
+        row.update(attempt)
+        if candidate is None:
+            continue
+        a,b,registered=candidate
         segments[index:index+2]=(a,b);effects[index]=registered
         owned_incoming.add(index+1)
         row.update(applied=True,reason='joint_camera_registered_pending_decoded_qa',

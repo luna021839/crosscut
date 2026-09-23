@@ -655,6 +655,7 @@ def _reference_view_for_span(
     *,
     relative_time: float,
     size: tuple[int, int],
+    render_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
     working = frame
     if span.crop is not None:
@@ -673,8 +674,15 @@ def _reference_view_for_span(
     )
     from .render_geometry import reproject_editorial_frame
     maximum_zoom = max(float(item["zoom"]) for item in span.editorial_transform["keyframes"])
-    return reproject_editorial_frame(working, size=size, zoom=zoom, center_x=center_x,
-        center_y=center_y, roll_degrees=roll, maximum_zoom=maximum_zoom)
+    # A rotation on the analysis canvas is not the rendered camera: even
+    # maximum-zoom dimensions and integer crop positions change with resolution.
+    # Reconstruct rolled tracks on the real output canvas, then downsample just
+    # like the decoded output. Keep the established unrolled fast path intact.
+    rolled_track=any(abs(float(item['roll_degrees']))>1e-9 for item in span.editorial_transform['keyframes'])
+    pixel_size=render_size if render_size is not None and rolled_track else size
+    reference=reproject_editorial_frame(working,size=pixel_size,zoom=zoom,center_x=center_x,
+        center_y=center_y,roll_degrees=roll,maximum_zoom=maximum_zoom)
+    return cv2.resize(reference,size,interpolation=cv2.INTER_AREA) if pixel_size!=size else reference
 
 
 def _contrast_normalized_detail(value: _FrameScalar) -> float:
@@ -1416,6 +1424,7 @@ def evaluate_post_render_perceptual_quality(
                             span,
                             relative_time=relative_time,
                             size=size,
+                            render_size=(width,height),
                         )
                     except ValueError:
                         geometry_failures += 1

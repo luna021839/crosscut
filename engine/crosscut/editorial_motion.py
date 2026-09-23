@@ -197,6 +197,12 @@ class EditorialMotionPlan:
     boundary_residual_attention_mismatches: tuple[
         tuple[int, float, float], ...
     ] = ()
+    member_roll_audit: tuple = ()
+
+    def __post_init__(self):
+        if self.member_roll_audit:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self,'member_roll_audit',tuple(_freeze_audit_value(row) for row in self.member_roll_audit))
 
     @property
     def applied_count(self) -> int:
@@ -211,6 +217,7 @@ class EditorialMotionPlan:
         return matches[0]
 
     def to_dict(self) -> dict[str, Any]:
+        from .visual_boundary_repair import _thaw_audit_value
         confirmed_member_policy = self.analysis_basis.startswith(
             "confirmed_member_anchor_"
         )
@@ -240,6 +247,9 @@ class EditorialMotionPlan:
                     else "4.8_to_9.0_percent"
                 ),
                 "roll": (
+                    "observed_focal_screen_pose_with_dense_rotated_containment"
+                    if direct_member_policy and self.member_roll_audit
+                    else
                     "disabled_without_dense_direct_member_head_pose_evidence"
                     if direct_member_policy
                     else "disabled_without_confirmed_member_head_pose_evidence"
@@ -317,6 +327,7 @@ class EditorialMotionPlan:
                 else None
             ),
             "segments": [item.to_dict() for item in self.segments],
+            **({'member_roll_audit':_thaw_audit_value(self.member_roll_audit)} if self.member_roll_audit else {}),
         }
 
 

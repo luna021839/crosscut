@@ -88,9 +88,10 @@ def joint_pose_anchor_observations(pose_observations):
     return tuple(sequences), dict(audit, face_detection_claimed=False)
 
 
-def fit_joint_dissolve_registration(left, right, *, fps, maximum_zooms,
+def _fit_joint_dissolve_geometry(left, right, *, fps, maximum_zooms,
         maximum_center_shift=.16, maximum_position_mismatch=.08,
-        maximum_scale_mismatch=.06, pose_observations=None):
+        maximum_scale_mismatch=.06, pose_observations=None,
+        fixed_roll_degrees=(0.,0.), output_size=(1080,1920)):
     """One bounded solve in affine coordinates z*x+t, with viewport constraints.
 
 Registration error is balanced with modest magnification and camera temporal
@@ -98,6 +99,9 @@ smoothness. There is no search over source identities, cuts or time shifts.
 Both returned tracks use overlap-relative output frame times.
     """
     left,right=tuple(left),tuple(right)
+    from .member_roll_geometry import rotate_points, project_box as rolled_box, roll_ramp_safe_zoom
+    from .render import EDITORIAL_TRANSFORM_EDGE_MARGIN
+    rotated=any(abs(value)>1e-9 for value in fixed_roll_degrees)
     n=len(left)
     if (not 2<=n<=64 or len(right)!=n or isinstance(fps,bool) or not math.isfinite(fps) or fps<=0
             or len(maximum_zooms)!=2 or any(not math.isfinite(z) or not 1<=z<=2 for z in maximum_zooms)
@@ -125,10 +129,20 @@ Both returned tracks use overlap-relative output frame times.
     centers=boxes[:,:,:2]+boxes[:,:,2:]/2
     sizes=np.sqrt(np.prod(boxes[:,:,2:],axis=-1))
     normalizer=np.maximum(sizes.mean(axis=0),1e-6)
-    seed=np.zeros((2,n,3));seed[:,:,0]=1.
+    minimum_zooms=tuple(roll_ramp_safe_zoom(v) if abs(v)>1e-9 else 1. for v in fixed_roll_degrees)
+    if any(low>high for low,high in zip(minimum_zooms,maximum_zooms)):
+        return None,dict(reason='rotation_exceeds_source_capacity',quality_approval=False,source_indices=[left[0].source_index,right[0].source_index])
+    seed=np.zeros((2,n,3))
+    for side,zoom in enumerate(minimum_zooms):
+        seed[side,:,0]=zoom;seed[side,:,1:]=(1-zoom)/2
     pose_points,pose_audit=paired_overlap_pose_arrays(pose_observations,(left,right))
     raw_pose_error=(np.mean(np.sum((pose_points[0]-pose_points[1])**2,axis=-1))
                     if pose_points is not None else None)
+    raw_pose_points=pose_points
+    if rotated:
+        centers=np.array([rotate_points(centers[s],fixed_roll_degrees[s],output_size=output_size) for s in range(2)])
+        if pose_points is not None:
+            pose_points=np.array([rotate_points(pose_points[s],fixed_roll_degrees[s],output_size=output_size) for s in range(2)])
     def unpack(v):return v.reshape(2,n,3)
     def objective(v):
         a=unpack(v);z=a[:,:,0];t=a[:,:,1:]
@@ -147,8 +161,18 @@ Both returned tracks use overlap-relative output frame times.
         a=unpack(v);z=a[:,:,0];t=a[:,:,1:]
         # t<=0 and t+z>=1 keep the original frame covering the viewport.
         center_numerator=.5-t-.5*z[:,:,None]
-        return np.concatenate((-t.ravel(),(t+z[:,:,None]-1).ravel(),
-            (maximum_center_shift**2*z**2-np.sum(center_numerator**2,axis=-1)).ravel()))
+        limits=[-t.ravel(),(t+z[:,:,None]-1).ravel(),
+            (maximum_center_shift**2*z**2-np.sum(center_numerator**2,axis=-1)).ravel()]
+        if rotated:
+            corners=np.array(((0.,0.),(1.,0.),(1.,1.),(0.,1.)))
+            for side,roll in enumerate(fixed_roll_degrees):
+                crop=(corners[None,:,:]-t[side,:,None,:])/z[side,:,None,None]
+                margin=EDITORIAL_TRANSFORM_EDGE_MARGIN*min(1.,abs(roll))
+                # The renderer validates portrait AND landscape edge coverage.
+                for dimensions in {(16,9),(9,16),tuple(output_size)}:
+                    original=rotate_points(crop,-roll,output_size=dimensions)
+                    limits.extend(((original-margin).ravel(),(1-margin-original).ravel()))
+        return np.concatenate(limits)
     def registration_limits(v):
         a=unpack(v);z=a[:,:,0]
         output=centers*z[:,:,None]+a[:,:,1:]
@@ -156,7 +180,7 @@ Both returned tracks use overlap-relative output frame times.
         ratio=math.exp(maximum_scale_mismatch*math.log(3.2)/2)
         return np.concatenate(((maximum_position_mismatch*.42)**2-np.sum((output[0]-output[1])**2,axis=-1),
             ratio*scale[0]-scale[1],ratio*scale[1]-scale[0]))
-    bounds=[bound for cap in maximum_zooms for _ in range(n) for bound in ((1.,cap),(-1.,0.),(-1.,0.))]
+    bounds=[bound for low,cap in zip(minimum_zooms,maximum_zooms) for _ in range(n) for bound in ((low,cap),(-1.,0.),(-1.,0.))]
     constraints=[{'type':'ineq','fun':inside},{'type':'ineq','fun':registration_limits}]
     def pose_nonregression(v):
         a=unpack(v)
@@ -180,7 +204,7 @@ Both returned tracks use overlap-relative output frame times.
     values=unpack(result.x)
     if pose_points is not None:
         audit['focal_pose_registration'].update(
-            before=pose_registration_metrics(pose_points,seed),
+            before=pose_registration_metrics(raw_pose_points,np.broadcast_to(np.array((1.,0.,0.)),(2,n,3))),
             after=pose_registration_metrics(pose_points,values),
             nonregression_required=True,
         )
@@ -194,7 +218,7 @@ Both returned tracks use overlap-relative output frame times.
                 # Remove only solver floating-point edge noise, not a real pan.
                 cx=float(np.clip((.5-tx)/zoom,.5/zoom,1.-.5/zoom))
                 cy=float(np.clip((.5-ty)/zoom,.5/zoom,1.-.5/zoom))
-                points.append(EditorialTransformKeyframe(i/fps,float(zoom),cx,cy))
+                points.append(EditorialTransformKeyframe(i/fps,float(zoom),cx,cy,fixed_roll_degrees[side]))
             tracks.append(EditorialTransformTrack(tuple(points),reason='joint_temporal_dissolve_registration_v1'))
     except ValueError:
         return None,dict(audit,reason='joint_transform_renderer_invalid')
@@ -211,13 +235,60 @@ Both returned tracks use overlap-relative output frame times.
         projected=[]
         for side in range(2):
             p=tracks[side].evaluate(i/fps)
-            projected.append(project_box(boxes[side,i],zoom=p.zoom,center_x=p.center_x,center_y=p.center_y))
+            projected.append(rolled_box(boxes[side,i],p,output_size=output_size) if rotated else
+                project_box(boxes[side,i],zoom=p.zoom,center_x=p.center_x,center_y=p.center_y))
         residuals.append(attention_mismatch(*projected))
     audit.update(maximum_position_mismatch=max(v[0] for v in residuals),maximum_scale_mismatch=max(v[1] for v in residuals),
         maximum_zooms=[max(p.zoom for p in track.keyframes) for track in tracks])
     if audit['maximum_position_mismatch']>maximum_position_mismatch+1e-9 or audit['maximum_scale_mismatch']>maximum_scale_mismatch+1e-9:
         return None,dict(audit,reason='joint_registration_residual_exceeded')
     return tuple(tracks),dict(audit,reason='measured_joint_registration')
+
+
+def fit_joint_dissolve_registration(left, right, *, fps, maximum_zooms,
+        maximum_center_shift=.16, maximum_position_mismatch=.08,
+        maximum_scale_mismatch=.06, pose_observations=None,
+        output_size=(1080,1920), enable_rotation=True):
+    """Refine a complete scale/pan solution only with measured relative roll.
+
+    Retain the no-roll solution on insufficient evidence, capacity, renderer or
+    pose/face nonregression failure. Rotation does not relax the original solve.
+    """
+    from .member_roll_geometry import estimate_pair_roll, project_points
+    left,right=tuple(left),tuple(right)
+    arguments=dict(fps=fps,maximum_zooms=maximum_zooms,maximum_center_shift=maximum_center_shift,
+        maximum_position_mismatch=maximum_position_mismatch,
+        maximum_scale_mismatch=maximum_scale_mismatch,pose_observations=pose_observations)
+    base,audit=_fit_joint_dissolve_geometry(left,right,**arguments)
+    if not enable_rotation:
+        return base,audit
+    angle,roll_audit=estimate_pair_roll(pose_observations,fps=fps,output_size=output_size)
+    if angle is None:
+        return base,dict(audit,roll=roll_audit)
+    points,_=paired_overlap_pose_arrays(pose_observations,(left,right))
+    rolls=(-angle/2,angle/2)
+    proposed,rotated_audit=_fit_joint_dissolve_geometry(left,right,**arguments,
+        fixed_roll_degrees=rolls,output_size=output_size)
+    if proposed is None:
+        return base,dict(audit,roll=dict(roll_audit,accepted=False,applied=False,
+            reason='rotation_solve_rejected',solve=rotated_audit))
+    try:
+        before=[];after=[]
+        for i in range(len(left)):
+            original=[project_points(points[s,i],base[s].evaluate(i/fps),output_size=output_size)
+                      if base is not None else points[s,i] for s in range(2)]
+            changed=[project_points(points[s,i],proposed[s].evaluate(i/fps),output_size=output_size) for s in range(2)]
+            before.append(float(np.mean(np.sum((original[0]-original[1])**2,axis=-1))))
+            after.append(float(np.mean(np.sum((changed[0]-changed[1])**2,axis=-1))))
+        if (any(a>b+.000000001 for a,b in zip(after,before)) or
+                sum(after)>.8*sum(before)):
+            raise ValueError('observed roll does not improve the solved pose within face limits')
+    except ValueError as error:
+        return base,dict(audit,roll=dict(roll_audit,accepted=False,reason=str(error)))
+    roll_audit.update(applied=True,camera_roll_degrees=list(rolls),
+        solved_pose_rms_before=math.sqrt(sum(before)/len(before)),
+        solved_pose_rms_after=math.sqrt(sum(after)/len(after)))
+    return proposed,dict(rotated_audit,roll=roll_audit,no_roll_solution_available=base is not None)
 
 
 def compose_joint_dissolve_cameras(incoming, outgoing, *, incoming_frame_count, fps):
@@ -401,6 +472,13 @@ This is containment evidence, not a final artistic/pixel quality judgement.
     from .render import quantized_segment_frame_counts
     from .focal_pixel_containment_support import FocalPixelContainmentSupport
     from .focal_bracket_containment import FocalBracketContainmentSupport
+    from .member_roll_geometry import box_visible_fraction as rotated_visible_fraction
+    def visible(box,geometry,state):
+        mapped=map_box_to_portrait_fill(box,geometry)
+        if abs(state.roll_degrees)>1e-9:
+            return rotated_visible_fraction(mapped,state,
+                output_size=(geometry.output_width,geometry.output_height))
+        return box_visible_fraction(mapped,zoom=state.zoom,center_x=state.center_x,center_y=state.center_y)
     segments=tuple(segments);transitions=tuple(transitions)
     counts=quantized_segment_frame_counts(segments,fps) if frame_counts is None else tuple(frame_counts)
     if len(counts)!=len(segments) or any(isinstance(n,bool) or not isinstance(n,int) or n<2 for n in counts):
@@ -417,13 +495,13 @@ This is containment evidence, not a final artistic/pixel quality judgement.
                 continue
             local=(segment.source_start if scope=='nominal' else segment.source_end)+seconds*segment.source_playback_rate
             sample=geometry_provider(segment.source_index,local)
-            row=dict(segment_index=index,scope=scope,output_local_seconds=seconds,source_local_seconds=local)
+            row=dict(segment_index=index,scope=scope,output_local_seconds=seconds,source_local_seconds=local,
+                roll_degrees=state.roll_degrees)
             widened=(state.zoom>legacy_face_only_maximum_zoom+1e-9 or
-                math.hypot(state.center_x-.5,state.center_y-.5)>legacy_face_only_maximum_center_shift+1e-9)
+                math.hypot(state.center_x-.5,state.center_y-.5)>legacy_face_only_maximum_center_shift+1e-9
+                or abs(state.roll_degrees)>1e-9)
             valid=isinstance(sample,DirectMemberFaceSample) and sample.alignment_geometry_basis in (FOCAL_FACE_BASIS,FOCAL_SELECTOR_BODY_BASIS)
-            if abs(state.roll_degrees)>1e-9:
-                row.update(passed=False,reason='rotated_containment_not_measured')
-            elif not valid:
+            if not valid:
                 body_support = (bracketed_body_containment_provider(segment.source_index, local)
                     if scope == 'nominal' and bracketed_body_containment_provider else None)
                 if (isinstance(body_support, FocalBracketContainmentSupport)
@@ -431,11 +509,9 @@ This is containment evidence, not a final artistic/pixel quality judgement.
                         and abs(body_support.source_seconds-local) <= 1e-9):
                     geometry = source_geometries[segment.source_index]
                     body_box = body_support.bbox_xywh
-                    body_fraction = box_visible_fraction(map_box_to_portrait_fill(body_box, geometry),
-                        zoom=state.zoom, center_x=state.center_x, center_y=state.center_y)
+                    body_fraction = visible(body_box,geometry,state)
                     upper_box = (*body_box[:3], body_box[3]*.25)
-                    upper_fraction = box_visible_fraction(map_box_to_portrait_fill(upper_box, geometry),
-                        zoom=state.zoom, center_x=state.center_x, center_y=state.center_y)
+                    upper_fraction = visible(upper_box,geometry,state)
                     row.update(passed=body_fraction >= minimum_body_visible and upper_fraction >= minimum_face_visible,
                         reason='bracketed_observed_body_containment', body_visible_fraction=body_fraction,
                         upper_body_visible_fraction=upper_fraction,
@@ -448,7 +524,7 @@ This is containment evidence, not a final artistic/pixel quality judgement.
                 support=pixel_containment_provider(segment.source_index,local) if pixel_containment_provider else None
                 if (isinstance(support,FocalPixelContainmentSupport) and support.source_index==segment.source_index
                     and abs(support.source_seconds-local)<=1e-9):
-                    fraction=box_visible_fraction(map_box_to_portrait_fill(support.bbox_xywh,source_geometries[segment.source_index]),zoom=state.zoom,center_x=state.center_x,center_y=state.center_y)
+                    fraction=visible(support.bbox_xywh,source_geometries[segment.source_index],state)
                     row.update(passed=fraction>=minimum_face_visible and not widened,
                         reason='widened_subject_evidence_missing' if widened else 'bidirectional_focal_pixel_containment',
                         face_visible_fraction=fraction,bidirectional_iou=support.bidirectional_iou,
@@ -459,9 +535,9 @@ This is containment evidence, not a final artistic/pixel quality judgement.
                 face_fraction=None;body_fraction=None
                 geometry=source_geometries[segment.source_index]
                 if sample.face_count==1:
-                    face_fraction=box_visible_fraction(map_box_to_portrait_fill(sample.bbox_xywh,geometry),zoom=state.zoom,center_x=state.center_x,center_y=state.center_y)
+                    face_fraction=visible(sample.bbox_xywh,geometry,state)
                 if sample.subject_bbox_xywh is not None and sample.subject_confidence>=.30:
-                    body_fraction=box_visible_fraction(map_box_to_portrait_fill(sample.subject_bbox_xywh,geometry),zoom=state.zoom,center_x=state.center_x,center_y=state.center_y)
+                    body_fraction=visible(sample.subject_bbox_xywh,geometry,state)
                 passed=(face_fraction is not None or body_fraction is not None) and (face_fraction is None or face_fraction>=minimum_face_visible) and (body_fraction is None or body_fraction>=minimum_body_visible) and (not widened or body_fraction is not None)
                 row.update(passed=passed,face_visible_fraction=face_fraction,body_visible_fraction=body_fraction,
                     basis=sample.alignment_geometry_basis,reason='measured_containment' if passed else 'focal_geometry_cropped')

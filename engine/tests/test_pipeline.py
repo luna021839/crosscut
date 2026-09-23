@@ -8399,8 +8399,15 @@ class PipelineTests(unittest.TestCase):
         self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
             _quality_miss=True, _camera_failure='dense', _dissolve_requested=True, _proxy_failure=True)
 
+    def test_member_successful_rotation_reaches_final_render_and_exposure_with_dissolve_off(self):
+        # Camera generation/pixels have separate real tests. This exercises the
+        # complete analyze caller and actual final exposure controller.
+        self.test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
+            _quality_miss=True, _roll_degrees=1.2)
+
     def test_automatic_portrait_member_uses_direct_full_frame_without_identity_anchor(
-            self, _quality_miss=False, _camera_failure=None, _dissolve_requested=False, _proxy_failure=False) -> None:
+            self, _quality_miss=False, _camera_failure=None, _dissolve_requested=False, _proxy_failure=False,
+            _roll_degrees=0.) -> None:
         from crosscut.pipeline import _enforce_automatic_member_post_render_qa as actual_member_gate
         from crosscut.member_joint_camera_preflight import MemberJointCameraPreflight
         original_camera_review = MemberJointCameraPreflight.review
@@ -8544,7 +8551,7 @@ class PipelineTests(unittest.TestCase):
             direct_track = EditorialTransformTrack(
                 (
                     EditorialTransformKeyframe(0.0, 1.0),
-                    EditorialTransformKeyframe(0.75, 1.06),
+                    EditorialTransformKeyframe(0.75, 1.12 if _roll_degrees else 1.06,roll_degrees=_roll_degrees),
                 ),
                 reason="official_fancam_dense_face_scale_position_match",
             )
@@ -8562,7 +8569,7 @@ class PipelineTests(unittest.TestCase):
                 boundary_match_count=1,
                 zoom_event_count=1,
                 pan_event_count=0,
-                roll_event_count=0,
+                roll_event_count=int(bool(_roll_degrees)),
                 blocked_dissolve_segment_count=0,
                 analysis_basis=(
                     "official_target_fancam_unambiguous_face_"
