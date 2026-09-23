@@ -710,7 +710,7 @@ class RenderTests(unittest.TestCase):
         )
         self.assertGreater(frame_deltas[14], 1.0)
 
-    def test_cross_cut_look_ramps_merge_with_adjacent_same_source_clocks(self) -> None:
+    def test_cross_cut_look_ramps_keep_local_pixels_on_shared_source_clocks(self) -> None:
         last_frame = 5.0 / 30.0
         outgoing = BoundaryLookTrack(
             (
@@ -763,9 +763,17 @@ class RenderTests(unittest.TestCase):
 
         self.assertEqual(graph.count("[0:v]trim="), 1)
         self.assertEqual(graph.count("[1:v]trim="), 1)
-        self.assertIn("if(lt(t,0.4000000000)", graph)
-        self.assertIn("if(lt(t,0.5666666667)", graph)
-        self.assertIn("if(lt(t,0.1666666667)", graph)
+        # Source decoding stays shared, while each temporal ramp keeps the
+        # segment-local clock on which it was measured and authored.
+        self.assertEqual(graph.count("split=2"), 2)
+        self.assertEqual(graph.count("eq=brightness="), 2)
+        self.assertIn("trim=start_frame=12:end_frame=18", graph)
+        self.assertIn("trim=start_frame=0:end_frame=6", graph)
+        self.assertEqual(graph.count("settb=expr=1/(30),setpts=N,settb=AVTB"), 4)
+        self.assertNotIn("if(lt(t,0.4000000000)", graph)
+        self.assertNotIn("if(lt(t,0.5666666667)", graph)
+        self.assertIn("brightness='if(lt(t,0.1666666667),(0.0000000000+", graph)
+        self.assertIn("brightness='if(lt(t,0.1666666667),(-0.0200000000+", graph)
         self.assertEqual(len(plan.transitions), 5)
 
     def test_mixed_dissolve_runs_extend_outgoing_handles_then_concat(self) -> None:

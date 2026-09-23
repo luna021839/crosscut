@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
+from .optional_native_worker import isolated_optional
 from .reference_match import (
     DecodedTargetFrames,
     ReferenceMatchConfig,
@@ -1415,6 +1416,7 @@ def _quantile95(values: Sequence[float]) -> float | None:
     return float(np.quantile(np.asarray(values, dtype=np.float64), 0.95))
 
 
+@isolated_optional()
 def analyze_cut_local_sync(
     plan: RenderPlan,
     *,
@@ -1861,10 +1863,14 @@ def resolve_cut_local_sync_activation(
     render_object = dict(render) if isinstance(render, Mapping) else {}
     candidate_origin = render_object.get("candidate_origin")
     promotion_contract = render_object.get("stage_edit_promotion_contract")
+    from .review_first_selection_contract import (
+        REVIEW_FIRST_CANDIDATE_POOL, review_first_stage_edit_promotion_binding_valid,
+    )
+    review_first_learned = review_first_stage_edit_promotion_binding_valid(selected, render_object)
     stage_edit_present = bool(
         generation is not None
         or promotion is not None
-        or candidate_origin == "explicit_stage_edit_generation"
+        or candidate_origin in {"explicit_stage_edit_generation", "stage_edit_generation"}
         or promotion_contract is not None
     )
     registered_seen = bool(
@@ -1901,12 +1907,16 @@ def resolve_cut_local_sync_activation(
     if required and explicit_seen or not required and registered_seen:
         errors.append("stage_edit_activation_markers_disagree")
     if stage_edit_present:
-        if candidate_pool not in {
+        allowed_pools = {
             "stage_edit_generation_only",
             "stage_edit_generation_plus_typed_visual_floor_v1",
-        }:
+        }
+        if review_first_learned:
+            allowed_pools.add(REVIEW_FIRST_CANDIDATE_POOL)
+        if candidate_pool not in allowed_pools:
             errors.append("stage_edit_candidate_pool_missing_or_invalid")
-        if candidate_origin != "explicit_stage_edit_generation":
+        expected_origin = "stage_edit_generation" if review_first_learned else "explicit_stage_edit_generation"
+        if candidate_origin != expected_origin:
             errors.append("stage_edit_candidate_origin_missing_or_invalid")
     return {
         "required": required,

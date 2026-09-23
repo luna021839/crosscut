@@ -20331,12 +20331,13 @@ class _GroupRenderCandidateBundle:
     dynamic_crop_motion_timeline_v3: (
         DynamicCropMotionTimelineEvidenceV3 | None
     ) = None
+    cut_local_sync: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         from .visual_boundary_repair import _freeze_audit_value
         # These dictionaries are executable authority, not mutable diagnostics.
         # Copy/freeze them when ownership changes; serialize only through to_dict.
-        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application'):
+        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync'):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _freeze_audit_value(value))
@@ -20418,6 +20419,10 @@ class _GroupRenderCandidateBundle:
                 self.dynamic_crop_motion_timeline_v3.to_dict()
                 if self.dynamic_crop_motion_timeline_v3 is not None
                 else None
+            ),
+            "cut_local_sync": (
+                _thaw_audit_value(self.cut_local_sync)
+                if self.cut_local_sync is not None else None
             ),
         }
 
@@ -33470,6 +33475,25 @@ def analyze(
                                 offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
                             promoted_bundle = replace(promoted_bundle, dynamic_crop_application=
                                 _dynamic_crop_render_application_audit(promoted_bundle, materialized_review_candidate))
+                            if registered_stage_edit_bundle is not None:
+                                # Mandatory source-clock evidence belongs to the
+                                # proposal, before ownership changes. A native
+                                # failure or search cutoff must retain the complete
+                                # incumbent, including its non-model QA authority.
+                                sync_evidence = analyze_cut_local_sync(
+                                    promoted_bundle.render_plan,
+                                    source_timewarps=source_timewarps,
+                                    timewarp_payloads=local_timewarp_payloads,
+                                    pts_cache_directory=request.source_cache_directory,
+                                    pts_derived_cache_directory=request.visual_feature_derived_cache_directory,
+                                )
+                                if sync_evidence.get("passed") is not True:
+                                    raise ValueError(
+                                        "learned GROUP candidate cut-local sync rejected: "
+                                        f"unknown={sync_evidence.get('unknown_boundary_count')}; "
+                                        f"reasons={sync_evidence.get('unknown_reason_counts')}"
+                                    )
+                                promoted_bundle = replace(promoted_bundle, cut_local_sync=sync_evidence)
                             return materialized_review_candidate, promoted_bundle
                         candidate_proposal = group_first.run_optional(
                             f"stage_edit_candidate_rank_{retained_candidate.rank}", propose_learned_candidate)
@@ -34792,6 +34816,9 @@ def analyze(
                 group_transition_plan, boundary_affine_plan = kept.group_transition_plan, kept.boundary_affine_plan
                 editorial_motion_plan, boundary_look_match_result = kept.editorial_motion_plan, kept.boundary_look_match
                 final_montage_section_plan = kept.section_plan
+                if kept.cut_local_sync is not None:
+                    from .visual_boundary_repair import _thaw_audit_value
+                    cut_local_sync_payload = _thaw_audit_value(kept.cut_local_sync)
                 selected_path_authority = group_first.to_dict()["selected_authority"]
                 if kept.dynamic_crop_application is not None:
                     from .visual_boundary_repair import _thaw_audit_value
@@ -34989,6 +35016,12 @@ def analyze(
                             selected_path_authority=selected_path_authority,
                         )
                     )
+                    if review_first_stage_edit_materialized is not None:
+                        from .review_first_selection_contract import build_review_first_stage_edit_promotion
+                        rendered_candidate_selection_payload["stage_edit_render_promotion"] = (
+                            build_review_first_stage_edit_promotion(rendered_candidate_selection_payload,
+                                registered=registered_stage_edit_bundle is not None)
+                        )
                     rendered_candidate_selection_payload.update({
                         "review_first_visual_selection": deepcopy(
                             review_first_visual_selection_payload
@@ -35021,7 +35054,7 @@ def analyze(
                         rendered_candidate_selection_path,
                         rendered_candidate_selection_payload,
                     )
-        if registered_stage_edit_bundle is not None:
+        if registered_stage_edit_bundle is not None and cut_local_sync_payload is None:
             reporter.status(
                 "등록된 StageEdit 최종 컷을 실제 PTS·포즈·"
                 "바디 모션으로 로컬 동기 검증 중…"
@@ -35177,6 +35210,9 @@ def analyze(
             "stage_edit_promotion_contract": (
                 stage_edit_visual_candidate_batch.contract
                 if stage_edit_visual_candidate_batch is not None
+                else rendered_candidate_selection_payload["stage_edit_render_promotion"]["contract"]
+                if review_first_stage_edit_materialized is not None
+                and rendered_candidate_selection_payload is not None
                 else None
             ),
             "joint_visual_selection": deepcopy(joint_visual_selection_audit),

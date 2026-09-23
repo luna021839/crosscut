@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+import json
 
 
 REVIEW_FIRST_RELEASE_CANDIDATE_COUNT = 1
 REVIEW_FIRST_CANDIDATE_POOL = "bounded_review_first_single_full_song_v1"
+REVIEW_FIRST_STAGE_EDIT_PROMOTION_CONTRACT = "review_first_stage_edit_render_promotion_v1"
 REVIEW_FIRST_ALLOWED_AUTHORITIES = frozenset(
     {
         "stage_edit_generation",
@@ -155,6 +157,66 @@ def review_first_release_binding_valid(
     )
 
 
+def build_review_first_stage_edit_promotion(
+    selection: Mapping[str, object], *, registered: bool,
+) -> dict[str, object]:
+    """Bind learned provenance without turning a decoded quality miss into PASS.
+
+    The singleton release cohort and learned candidate origin are different
+    facts. Persist both, so the independent sync reviewer does not have to infer
+    an eight-candidate promotion from the presence of a learned checkpoint.
+    """
+    complete = _sequence(selection.get("complete_candidates"))
+    candidate = complete[0] if complete and len(complete) == 1 else None
+    review = selection.get("final_selected_review")
+    if (type(registered) is not bool
+            or selection.get("selected_path_authority") != "stage_edit_generation"
+            or not isinstance(candidate, Mapping)
+            or candidate.get("candidate_origin") != "explicit_stage_edit_generation"
+            or type(candidate.get("stage_edit_dynamic_crop_version")) is not int
+            or candidate.get("stage_edit_dynamic_crop_version") not in (2, 3)
+            or not isinstance(review, Mapping) or type(review.get("passed")) is not bool):
+        raise ValueError("review-first learned promotion requires a complete learned candidate")
+    return {
+        "contract": REVIEW_FIRST_STAGE_EDIT_PROMOTION_CONTRACT,
+        "activation": ("automatic_registered_production_bundle" if registered
+                       else "explicit_stage_edit_generation_request_only"),
+        "candidate_pool": REVIEW_FIRST_CANDIDATE_POOL,
+        "selected_candidate_index": candidate.get("candidate_index"),
+        "selected_candidate_origin": candidate["candidate_origin"],
+        "selected_candidate_lineage": deepcopy(candidate.get("candidate_lineage")),
+        "dynamic_crop_version": candidate["stage_edit_dynamic_crop_version"],
+        "selected_version": "original",
+        "required_complete_candidate_count": REVIEW_FIRST_RELEASE_CANDIDATE_COUNT,
+        "required_decoded_proxy_review_count": REVIEW_FIRST_RELEASE_CANDIDATE_COUNT,
+        "decoded_selected_proxy_passed": review["passed"],
+        "promotion_state": "pending_final_post_render_qa",
+        "delivery_completion_message_allowed": False,
+    }
+
+
+def review_first_stage_edit_promotion_binding_valid(
+    selection: Mapping[str, object], render: Mapping[str, object],
+) -> bool:
+    """Replay both production contracts; a pool label alone grants no exception."""
+    promotion = selection.get("stage_edit_render_promotion")
+    if (not review_first_release_binding_valid(selection, render)
+            or render.get("stage_edit_promotion_contract") != REVIEW_FIRST_STAGE_EDIT_PROMOTION_CONTRACT
+            or not isinstance(promotion, Mapping)
+            or promotion.get("activation") not in {
+                "automatic_registered_production_bundle", "explicit_stage_edit_generation_request_only"}):
+        return False
+    try:
+        expected = build_review_first_stage_edit_promotion(selection,
+            registered=promotion["activation"] == "automatic_registered_production_bundle")
+        # Python container equality conflates False/0 and True/1. Persisted
+        # contract fields must retain their exact JSON types as well as values.
+        return json.dumps(dict(promotion), sort_keys=True, allow_nan=False) == json.dumps(
+            expected, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+
+
 __all__ = [
     "REVIEW_FIRST_ALLOWED_AUTHORITIES",
     "REVIEW_FIRST_CANDIDATE_POOL",
@@ -162,4 +224,7 @@ __all__ = [
     "review_first_release_binding_valid",
     "review_first_release_policy_payload",
     "build_review_first_selection_payload",
+    "REVIEW_FIRST_STAGE_EDIT_PROMOTION_CONTRACT",
+    "build_review_first_stage_edit_promotion",
+    "review_first_stage_edit_promotion_binding_valid",
 ]

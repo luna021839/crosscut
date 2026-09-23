@@ -2159,20 +2159,18 @@ def _boundary_look_values(
     )
 
 
-def _boundary_look_is_frame_continuous(
-    left: RenderSegment,
-    right: RenderSegment,
-    *,
-    left_frame_count: int,
-    fps: float,
-) -> bool:
-    left_last_time = min(left.duration, (left_frame_count - 1) / fps)
-    outgoing = _boundary_look_values(left.boundary_look_track, left_last_time)
-    incoming = _boundary_look_values(right.boundary_look_track, 0.0)
-    return all(
-        math.isclose(left_value, right_value, rel_tol=0.0, abs_tol=1e-9)
-        for left_value, right_value in zip(outgoing, incoming, strict=True)
-    )
+def _coalescing_boundary_look(track: BoundaryLookTrack | None) -> tuple[float, ...] | None:
+    """Only time-invariant look is safe to move onto a shared pixel clock.
+
+    Temporal ramps keep their own segment-local filters after shared decoding.
+    Rebuilding them on an accumulated seconds clock changes fractional-frame
+    placement and FFmpeg's quantized timestamp/lookup-table rounding.
+    """
+    first = _boundary_look_values(track, 0.0)
+    if track is None:
+        return first
+    return first if all(_boundary_look_values(track, point.time_seconds) == first
+                        for point in track.keyframes) else None
 
 
 def _can_share_source_clock(
@@ -2228,7 +2226,6 @@ def _can_share_source_clock(
 
 def _can_coalesce_identity_run(
     plan: RenderPlan,
-    frame_counts: tuple[int, ...],
     *,
     first_index: int,
     candidate_last_index: int,
@@ -2244,65 +2241,18 @@ def _can_coalesce_identity_run(
     segments = plan.segments[first_index : candidate_last_index + 1]
     first = segments[0]
     first_look = _coalescing_look(first.look_adjustment)
-    for offset, segment in enumerate(segments):
+    first_boundary_look = _coalescing_boundary_look(first.boundary_look_track)
+    if first_boundary_look is None:
+        return False
+    for segment in segments:
         if (
             not _has_identity_geometry(segment)
             or (segment.editorial_transform is None) != (first.editorial_transform is None)
             or _coalescing_look(segment.look_adjustment) != first_look
-        ):
-            return False
-        if offset == 0:
-            continue
-        boundary_index = first_index + offset - 1
-        previous = segments[offset - 1]
-        if not _boundary_look_is_frame_continuous(
-            previous,
-            segment,
-            left_frame_count=frame_counts[boundary_index],
-            fps=plan.fps,
+            or _coalescing_boundary_look(segment.boundary_look_track) != first_boundary_look
         ):
             return False
     return True
-
-
-def _combined_boundary_look_track(
-    segments: tuple[RenderSegment, ...],
-) -> BoundaryLookTrack | None:
-    """Shift compatible segment-local look tracks onto one run clock."""
-
-    identity = BoundaryLookKeyframe(0.0)
-    keyframes: list[BoundaryLookKeyframe] = []
-    timeline_offset = 0.0
-    for segment in segments:
-        track = segment.boundary_look_track
-        if track is None or track.is_identity:
-            if not keyframes:
-                keyframes.append(identity)
-        else:
-            for keyframe in track.keyframes:
-                shifted = BoundaryLookKeyframe(
-                    time_seconds=timeline_offset + keyframe.time_seconds,
-                    brightness=keyframe.brightness,
-                    contrast=keyframe.contrast,
-                    saturation=keyframe.saturation,
-                    temperature_balance=keyframe.temperature_balance,
-                )
-                if (
-                    keyframes
-                    and shifted.time_seconds
-                    <= keyframes[-1].time_seconds + 1e-12
-                ):
-                    # At an exact segment boundary the incoming frame owns the
-                    # timestamp.  Eligibility already proved both endpoint
-                    # states equal, so replacing the prior sample is neutral.
-                    keyframes[-1] = shifted
-                else:
-                    keyframes.append(shifted)
-        timeline_offset += segment.duration
-    if not keyframes or keyframes[0].time_seconds > 1e-12:
-        keyframes.insert(0, identity)
-    combined = BoundaryLookTrack(tuple(keyframes))
-    return None if combined.is_identity else combined
 
 
 def _combined_identity_segment(
@@ -2325,38 +2275,31 @@ def _combined_identity_segment(
         # merged nominal run. Preserve it without shifting its local clock.
         outgoing_overlap_transform=last.outgoing_overlap_transform,
         look_adjustment=_coalescing_look(first.look_adjustment),
-        boundary_look_track=_combined_boundary_look_track(segments),
+        # Coalescing proved this look is constant and equal for the entire run.
+        boundary_look_track=first.boundary_look_track,
     )
 
 
 def _can_coalesce_post_clock_identity_slice(
     segments: tuple[RenderSegment, ...],
-    frame_counts: tuple[int, ...],
     *,
     first_offset: int,
     candidate_last_offset: int,
-    fps: float,
 ) -> bool:
     """Prove pixel equivalence after a source clock is already canonical."""
 
     selected = segments[first_offset : candidate_last_offset + 1]
     first = selected[0]
     first_look = _coalescing_look(first.look_adjustment)
-    for offset, segment in enumerate(selected):
+    first_boundary_look = _coalescing_boundary_look(first.boundary_look_track)
+    if first_boundary_look is None:
+        return False
+    for segment in selected:
         if (
             not _has_identity_geometry(segment)
             or (segment.editorial_transform is None) != (first.editorial_transform is None)
             or _coalescing_look(segment.look_adjustment) != first_look
-        ):
-            return False
-        if offset == 0:
-            continue
-        previous_offset = first_offset + offset - 1
-        if not _boundary_look_is_frame_continuous(
-            selected[offset - 1],
-            segment,
-            left_frame_count=frame_counts[previous_offset],
-            fps=fps,
+            or _coalescing_boundary_look(segment.boundary_look_track) != first_boundary_look
         ):
             return False
     return True
@@ -2377,10 +2320,8 @@ def _post_clock_slices(
             last_offset + 1 < len(unit.segments)
             and _can_coalesce_post_clock_identity_slice(
                 unit.segments,
-                unit.segment_frame_counts,
                 first_offset=first_offset,
                 candidate_last_offset=last_offset + 1,
-                fps=fps,
             )
         ):
             last_offset += 1
@@ -2430,7 +2371,6 @@ def _video_render_units(
             combined = first
         elif _can_coalesce_identity_run(
             plan,
-            frame_counts,
             first_index=first_index,
             candidate_last_index=last_index,
         ):
@@ -2496,7 +2436,12 @@ def _shared_clock_video_filter(
         chain = [
             f"[{split_labels[offset]}]trim="
             f"start_frame={start_frame}:end_frame={end_frame}",
-            "setpts=PTS-STARTPTS",
+            # Reset in the exact frame timebase before returning to AVTB.
+            # Subtracting rounded global PTS keeps a +/-1us phase error that
+            # changes per-frame camera/color expressions after fractional cuts.
+            f"settb=expr=1/({fps:.17g})",
+            "setpts=N",
+            "settb=AVTB",
         ]
         chain.extend(
             _video_post_clock_filters(
