@@ -10,6 +10,33 @@ from crosscut.vision import detect_scene_changes_in_video_cached, SceneChange
 
 
 class NativeSceneModelTests(unittest.TestCase):
+    def test_only_exact_source_and_reference_analyzer_can_reuse_pre_gpu_scalars(self):
+        from crosscut.native_scene_model import _REFERENCE_ONLY_IMPLEMENTATION_SHA256
+        from crosscut.source_scalar_cache import PersistentSourceScalarCache
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.mp4'; source.write_bytes(b'source-one')
+            identity = {'contract':'test', 'implementation_sha256':'new',
+                        'optional_executor_sha256':'gpu', 'threshold':.5}
+            legacy = {key:value for key,value in identity.items() if key != 'optional_executor_sha256'}
+            legacy['implementation_sha256'] = _REFERENCE_ONLY_IMPLEMENTATION_SHA256
+            cache = PersistentSourceScalarCache(source_cache_directory=root,
+                source_path=source, namespace='native-transnet-scene-changes-v1', analyzer=legacy)
+            cache.put({'changes':[dict(frame_index=10,score=.8,frame_difference=.7,histogram_distance=.6)]})
+            with patch('crosscut.native_scene_model.native_scene_analyzer_identity',return_value=identity), \
+                 patch('crosscut.native_scene_model.ensure_native_scene_model',side_effect=RuntimeError('cache miss')):
+                changes, report = detect_native_scene_changes_cached(source,source_cache_directory=root,derived_cache_directory=None)
+                self.assertEqual(changes[0].frame_index,10)
+                self.assertTrue(report['reference_executor_cache_reused'])
+                self.assertEqual(report['detection_policy'],legacy)
+                source.write_bytes(b'source-two')
+                with self.assertRaisesRegex(RuntimeError,'cache miss'):
+                    detect_native_scene_changes_cached(source,source_cache_directory=root,derived_cache_directory=None)
+                source.write_bytes(b'source-one')
+                identity['threshold'] = .6
+                with self.assertRaisesRegex(RuntimeError,'cache miss'):
+                    detect_native_scene_changes_cached(source,source_cache_directory=root,derived_cache_directory=None)
+
     def test_measured_native_cut_reaches_existing_joint_guard(self):
         from crosscut.joint_boundary_provider import DecodedBoundaryOptionProvider
         boundary=15.135858389858278

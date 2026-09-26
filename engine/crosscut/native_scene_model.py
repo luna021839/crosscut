@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import lru_cache
 import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import platform
 from pathlib import Path
+from time import monotonic
 from typing import Sequence
 
 import cv2
@@ -25,6 +28,10 @@ MODEL_FILES = {
     "variables/variables.index": (5526, "8b99e28b4ad11372d9a1ad9703298c2e370df14859da4245fdbe818e92dd403f"),
 }
 CONTRACT = "transnetv2_source_native_first_incoming_frame_v1"
+# This exact predecessor used the same source decoder, pinned weights,
+# windows, threshold and incoming-frame convention. Its TensorFlow scalars
+# remain authoritative; never relabel them as new GPU measurements.
+_REFERENCE_ONLY_IMPLEMENTATION_SHA256 = "c981751a27486bb898f19c6df7067c8d81a48fff0f9349df749e9ff7449b3fd7"
 
 
 def ensure_native_scene_model(cache_directory: Path) -> Path:
@@ -61,9 +68,15 @@ def _tensorflow():
 
 def native_scene_analyzer_identity() -> dict:
     tf = _tensorflow()
+    try:
+        mlx_version = version("mlx")
+    except PackageNotFoundError:
+        mlx_version = None
     return {
         "contract": CONTRACT,
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "optional_executor_sha256": hashlib.sha256(Path(__file__).with_name("native_scene_mlx.py").read_bytes()).hexdigest(),
+        "optional_executor_mlx_version": mlx_version,
         "upstream_commit": UPSTREAM_COMMIT,
         "models": {name: digest for name, (_, digest) in MODEL_FILES.items()},
         "tensorflow": tf.__version__, "opencv": cv2.__version__,
@@ -75,7 +88,16 @@ def native_scene_analyzer_identity() -> dict:
 
 @lru_cache(maxsize=1)
 def _load_model(directory: str):
-    return _tensorflow().saved_model.load(directory)
+    reference = _tensorflow().saved_model.load(directory)
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            from .native_scene_mlx import CalibratedMLXSceneModel
+            return CalibratedMLXSceneModel(reference)
+        except (ImportError, RuntimeError, ValueError):
+            # Optional compute backend only; the exact pinned model remains
+            # authoritative if this machine cannot construct the GPU port.
+            pass
+    return reference
 
 
 def prediction_intervals(predictions: Sequence[float], threshold: float = .5) -> tuple[tuple[int, int], ...]:
@@ -119,6 +141,7 @@ def predict_native_frames(frames: np.ndarray, model) -> tuple[np.ndarray, np.nda
 def detect_native_scene_changes(path: Path, model_directory: Path):
     # Imports are delayed because vision's cached wrapper calls this module.
     from .vision import SceneChange, SceneDetectionConfig, _scene_features
+    decode_started = monotonic()
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise ValueError(f"could not open source for native scene detection: {path}")
@@ -133,7 +156,11 @@ def detect_native_scene_changes(path: Path, model_directory: Path):
         capture.release()
     if not frames:
         raise ValueError("source has no decoded frames for native scene detection")
-    single, many = predict_native_frames(np.stack(frames), _load_model(str(model_directory)))
+    decode_seconds = monotonic() - decode_started
+    inference_started = monotonic()
+    model = _load_model(str(model_directory))
+    single, many = predict_native_frames(np.stack(frames), model)
+    inference_seconds = monotonic() - inference_started
     changes = []
     transition_intervals = []
     settings = replace(SceneDetectionConfig(), analysis_size=(48, 27))
@@ -154,6 +181,10 @@ def detect_native_scene_changes(path: Path, model_directory: Path):
             "maximum_many_frame_probability": float(np.max(many[first:last+1])),
         })
     return tuple(changes), {"decoded_frame_count": len(frames),
+                            "decode_seconds": decode_seconds,
+                            "inference_seconds": inference_seconds,
+                            "executor": (model.diagnostics() if callable(getattr(model, "diagnostics", None))
+                                         else {"executor_contract": "pinned_tensorflow_reference"}),
                             "transition_intervals": transition_intervals,
                             "raw_frames_persisted": False}
 
@@ -181,6 +212,27 @@ def detect_native_scene_changes_cached(path: Path, *, source_cache_directory: Pa
         else:
             return changes, {**cache.diagnostics(), "enabled": True, "analysis_reused": True,
                              "detection_policy": identity, "semantic_invalid_record_count": 0}
+    if invalid == 0:
+        reference_identity = {key: value for key, value in identity.items()
+                              if key not in {"optional_executor_sha256", "optional_executor_mlx_version"}}
+        reference_identity["implementation_sha256"] = _REFERENCE_ONLY_IMPLEMENTATION_SHA256
+        reference_cache = PersistentSourceScalarCache(
+            source_cache_directory=source_cache_directory or root,
+            derived_cache_directory=derived_cache_directory,
+            source_path=Path(path), namespace="native-transnet-scene-changes-v1",
+            analyzer=reference_identity,
+        )
+        reference_payload = reference_cache.get()
+        if reference_payload is not None:
+            try:
+                changes = _scene_changes_from_scalar_payload(reference_payload)
+            except (TypeError, ValueError):
+                invalid += 1
+            else:
+                return changes, {**reference_cache.diagnostics(), "enabled": True,
+                                 "analysis_reused": True, "detection_policy": reference_identity,
+                                 "semantic_invalid_record_count": 0,
+                                 "reference_executor_cache_reused": True}
     model_directory = ensure_native_scene_model(Path(root))
     changes, observations = detect_native_scene_changes(Path(path), model_directory)
     cache.put({"changes": [{"frame_index": c.frame_index, "score": c.score,

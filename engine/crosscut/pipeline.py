@@ -27523,6 +27523,16 @@ def analyze(
         reporter.log(
             f"{source.name}: 방송 카메라 컷 {len(changes)}개 감지{cache_label}"
         )
+        native_observations = scene_cache_diagnostics.get("native_observations")
+        if isinstance(native_observations, dict):
+            reporter.emit(
+                "log",
+                message=f"{source.name}: 원본 카메라 컷 분석 측정 완료",
+                measurement_type="native_scene_analysis",
+                source_index=index,
+                source_name=source.name,
+                measurements=native_observations,
+            )
         reporter.progress(
             0.64 + 0.30 * (index + 1) / len(request.sources),
             "방송 카메라 컷을 분석하는 중…",
