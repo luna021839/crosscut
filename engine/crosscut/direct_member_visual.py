@@ -29,6 +29,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 import cv2
 
+from .member_boundary_observations import (
+    MemberBoundaryObservationPlan, MemberBoundaryObservationStore,
+)
 from .member_bridge_contract import (
     MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
@@ -1792,25 +1795,47 @@ def _scored_boundary_search_mismatch(
     config: DirectMemberVisualConfig,
 ) -> DirectBoundaryMismatch:
     mismatch = candidate.matrix[outgoing_source_index][incoming_source_index]
+    def handles(source_index):
+        return ((candidate.incoming_next[source_index], candidate.incoming_future[source_index])
+                if source_index < len(candidate.incoming_next)
+                and source_index < len(candidate.incoming_future) else ())
+    return _scored_boundary_pair_mismatch(
+        mismatch, offset_frames=candidate.offset_frames,
+        outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
+        outgoing_sample=(candidate.outgoing[outgoing_source_index]
+                         if outgoing_source_index < len(candidate.outgoing) else None),
+        incoming_sample=(candidate.incoming[incoming_source_index]
+                         if incoming_source_index < len(candidate.incoming) else None),
+        outgoing_handles=handles(outgoing_source_index), incoming_handles=handles(incoming_source_index),
+        candidate_count=candidate_count, priority_boundary=priority_boundary, config=config,
+    )
+
+
+def _scored_boundary_pair_mismatch(
+    mismatch: DirectBoundaryMismatch,
+    *,
+    offset_frames: int,
+    outgoing_source_index: int,
+    incoming_source_index: int,
+    outgoing_sample: _BoundarySample | None,
+    incoming_sample: _BoundarySample | None,
+    outgoing_handles: tuple[_BoundarySample, ...],
+    incoming_handles: tuple[_BoundarySample, ...],
+    candidate_count: int,
+    priority_boundary: bool,
+    config: DirectMemberVisualConfig,
+) -> DirectBoundaryMismatch:
+    """Shared exact pair scoring; no all-source matrix is required here."""
     if mismatch.cinematic_bridge is not None:
         handle_failures: list[str] = []
-        handles = []
-        for label, source_index in (("outgoing", outgoing_source_index),
-                                     ("incoming", incoming_source_index)):
-            samples = (
-                (candidate.incoming_next[source_index], candidate.incoming_future[source_index])
-                if source_index < len(candidate.incoming_next)
-                and source_index < len(candidate.incoming_future) else ()
-            )
+        for label, samples in (("outgoing", outgoing_handles), ("incoming", incoming_handles)):
             handle_failures.extend(member_bridge_handle_quality_failures(
                 tuple(sample.descriptor.quality_score if sample.descriptor is not None else None
                       for sample in samples), label=label))
-            handles.append(samples)
         if mismatch.cinematic_bridge.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS:
             handle_failures.extend(_focal_bridge_handle_pose_failures(
-                candidate.outgoing[outgoing_source_index] if outgoing_source_index < len(candidate.outgoing) else None,
-                candidate.incoming[incoming_source_index] if incoming_source_index < len(candidate.incoming) else None,
-                *handles, source_indices=(outgoing_source_index, incoming_source_index)))
+                outgoing_sample, incoming_sample, outgoing_handles, incoming_handles,
+                source_indices=(outgoing_source_index, incoming_source_index)))
         if handle_failures:
             # These are the exact samples the downstream effect author uses.
             # A required effect cannot rescue a severe edge when its own
@@ -1819,7 +1844,7 @@ def _scored_boundary_search_mismatch(
                 warning_flags=tuple(dict.fromkeys((*mismatch.warning_flags,*handle_failures))),
                 severe_flags=tuple(dict.fromkeys((*mismatch.severe_flags,*handle_failures))))
     penalty = (
-        abs(candidate.offset_frames)
+        abs(offset_frames)
         * config.boundary_search_offset_penalty_per_frame
     )
     motion = mismatch.motion_connection
@@ -1844,14 +1869,70 @@ def _scored_boundary_search_mismatch(
     return replace(
         mismatch,
         cost=mismatch.cost + penalty - priority_motion_preference,
-        boundary_search_offset_frames=candidate.offset_frames,
+        boundary_search_offset_frames=offset_frames,
         boundary_search_offset_seconds=(
-            candidate.offset_frames * config.sample_frame_step_seconds
+            offset_frames * config.sample_frame_step_seconds
         ),
         boundary_search_offset_penalty=penalty,
         boundary_search_candidate_count=candidate_count,
         priority_motion_preference_applied=priority_motion_preference,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedMemberPairCandidate:
+    plan: MemberBoundaryObservationPlan
+    outgoing_samples: tuple[_BoundarySample, ...]
+    incoming_samples: tuple[_BoundarySample, ...]
+    mismatch: DirectBoundaryMismatch
+
+
+def _observe_member_boundary_pair(
+    observations: MemberBoundaryObservationStore[_BoundarySample],
+    *,
+    outgoing_source_index: int,
+    incoming_source_index: int,
+    source_frame_geometries: Sequence[DirectMemberSourceFrameGeometry | None],
+    continuous_official_portrait_fancam_contract: bool,
+    priority_boundary: bool,
+    config: DirectMemberVisualConfig,
+    adjust_mismatch: Callable[[float, int, int, DirectBoundaryMismatch], DirectBoundaryMismatch] | None = None,
+) -> tuple[_ObservedMemberPairCandidate, ...]:
+    """Materialize one exact source pair, retaining every allowed cut offset.
+
+    This is observation evidence, not a path or render plan. The caller must
+    still apply the complete policy and joint offset/geometry constraints.
+    Feedback/obstruction costs can enter through the same measured-edge hook;
+    unknown source pairs have no placeholder samples, mismatch or approval.
+    """
+    if len(source_frame_geometries) != observations.source_count:
+        raise ValueError("pair geometry domain must match observation sources")
+    plans = tuple(plan for plan in observations.plans
+        if outgoing_source_index != incoming_source_index or plan.offset_frames == 0)
+    observations.prepare((plan.offset_frames, source) for plan in plans
+        for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+    candidates = []
+    for plan in plans:
+        outgoing = observations.samples_for(plan.offset_frames, outgoing_source_index)
+        incoming = observations.samples_for(plan.offset_frames, incoming_source_index)
+        mismatch = _boundary_mismatch(outgoing[1], incoming[2], config,
+            outgoing_previous=outgoing[0], incoming_next=incoming[3],
+            outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
+            outgoing_source_geometry=source_frame_geometries[outgoing_source_index],
+            incoming_source_geometry=source_frame_geometries[incoming_source_index],
+            continuous_official_portrait_fancam_contract=continuous_official_portrait_fancam_contract)
+        if adjust_mismatch is not None:
+            mismatch = adjust_mismatch(plan.cut_master_seconds,
+                outgoing_source_index, incoming_source_index, mismatch)
+            if not isinstance(mismatch, DirectBoundaryMismatch):
+                raise TypeError("pair adjustment must return an observed mismatch")
+        candidates.append(_ObservedMemberPairCandidate(plan, outgoing, incoming,
+            _scored_boundary_pair_mismatch(mismatch, offset_frames=plan.offset_frames,
+                outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
+                outgoing_sample=outgoing[1], incoming_sample=incoming[2],
+                outgoing_handles=outgoing[3:], incoming_handles=incoming[3:],
+                candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config)))
+    return tuple(candidates)
 
 
 def _best_boundary_search_edge(
@@ -12650,84 +12731,83 @@ def select_balanced_direct_member_sources(
                     and incoming_next_master < incoming_future_master
                 ):
                     continue
-                boundary_plans.append((offset_frames, boundary, (
+                master_times = (
                     outgoing_previous_master, outgoing_master, incoming_master,
                     incoming_next_master, incoming_future_master,
-                )))
-            prepare_focal = getattr(provider, 'prepare_focal_observations', None)
-            if callable(prepare_focal):
-                # The exact same eligible observations may be read in source
-                # order. This cannot remove an offset, select a cut, or borrow
-                # a neighboring pose; scalar target authority is unchanged.
-                prepare_focal(tuple(
-                    (source_index, _source_local_time(master_seconds,
-                        source_index=source_index, audio_offsets=offsets,
-                        source_timewarps=clocks))
-                    for _offset, _boundary, master_times in boundary_plans
-                    for source_index in range(source_count)
-                    for master_seconds, eligible in zip(master_times,
+                )
+                boundary_plans.append(MemberBoundaryObservationPlan(
+                    offset_frames=offset_frames,
+                    cut_master_seconds=boundary,
+                    master_times=master_times,
+                    local_times_by_source=tuple(tuple(
+                        _source_local_time(master_seconds, source_index=source_index,
+                            audio_offsets=offsets, source_timewarps=clocks)
+                        for master_seconds in master_times)
+                        for source_index in range(source_count)),
+                    eligibility_by_source=tuple(
                         _boundary_endpoint_content_eligibility(
                             span_diagnostics[boundary_index].sources[source_index].valid,
-                            span_diagnostics[boundary_index+1].sources[source_index].valid),
-                        strict=True)
-                    if eligible))
-            for offset_frames, boundary, master_times in boundary_plans:
+                            span_diagnostics[boundary_index+1].sources[source_index].valid)
+                        for source_index in range(source_count)),
+                ))
+            if not boundary_plans or not any(plan.offset_frames == 0 for plan in boundary_plans):
+                raise RuntimeError("boundary local search did not retain its canonical state")
+
+            def observe_boundary_source(plan, source_index):
+                nonlocal sample_count, failed_sample_count, content_invalid_boundary_samples_skipped
+                source = resolved_sources[source_index]
+                local_times = plan.local_times_by_source[source_index]
+                endpoint_eligibility = plan.eligibility_by_source[source_index]
+                descriptors = tuple(
+                    boundary_provider(source_index, source, local_seconds) if eligible else None
+                    for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
+                )
+                sample_count += sum(endpoint_eligibility)
+                content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
+                failed_sample_count += sum(
+                    eligible and descriptor is None
+                    for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
+                )
+                return tuple(
+                    _boundary_sample_with_focal_geometry(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        source_index=source_index,
+                        descriptor=descriptor,
+                        provider=provider,
+                    )
+                    if eligible else _BoundarySample(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        descriptor=None,
+                        attention=None,
+                    )
+                    # Only content-invalid samples are represented as missing.
+                    # The store keeps an unrequested source/offset absent.
+                    for master_seconds, local_seconds, descriptor, eligible in zip(
+                        plan.master_times, local_times, descriptors, endpoint_eligibility, strict=True)
+                )
+
+            prepare_focal = getattr(provider, 'prepare_focal_observations', None)
+            observations = MemberBoundaryObservationStore(
+                boundary_plans, observe=observe_boundary_source,
+                prepare=prepare_focal if callable(prepare_focal) else None,
+            )
+            # Full-domain mode is retained until the path/evidence coordinator
+            # also covers holds, cinematic bridges and joint offset constraints.
+            # Observation storage itself is now demand-addressable and does not
+            # interpret an unrequested source as a failed target observation.
+            observations.prepare((plan.offset_frames, source_index)
+                for plan in boundary_plans for source_index in range(source_count))
+            for plan in boundary_plans:
+                offset_frames, boundary = plan.offset_frames, plan.cut_master_seconds
                 outgoing_previous: list[_BoundarySample] = []
                 outgoing: list[_BoundarySample] = []
                 incoming: list[_BoundarySample] = []
                 incoming_next: list[_BoundarySample] = []
                 incoming_future: list[_BoundarySample] = []
-                for source_index, source in enumerate(resolved_sources):
-                    outgoing_eligible = span_diagnostics[boundary_index].sources[source_index].valid
-                    incoming_eligible = span_diagnostics[boundary_index + 1].sources[source_index].valid
-                    endpoint_eligibility = _boundary_endpoint_content_eligibility(
-                        outgoing_eligible, incoming_eligible)
-                    local_times = tuple(
-                        _source_local_time(
-                            master_seconds,
-                            source_index=source_index,
-                            audio_offsets=offsets,
-                            source_timewarps=clocks,
-                        )
-                        for master_seconds in master_times
-                    )
-                    descriptors = tuple(
-                        boundary_provider(source_index, source, local_seconds) if eligible else None
-                        for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
-                    )
-                    sample_count += sum(endpoint_eligibility)
-                    content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
-                    failed_sample_count += sum(
-                        eligible and descriptor is None
-                        for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
-                    )
-                    samples = tuple(
-                        _boundary_sample_with_focal_geometry(
-                            master_seconds=master_seconds,
-                            source_local_seconds=local_seconds,
-                            source_index=source_index,
-                            descriptor=descriptor,
-                            provider=provider,
-                        )
-                        if eligible else _BoundarySample(
-                            master_seconds=master_seconds,
-                            source_local_seconds=local_seconds,
-                            descriptor=None,
-                            attention=None,
-                        )
-                        # Content-invalid source/segments are excluded by every
-                        # path solver below, for every boundary offset. Their
-                        # expensive focal observations cannot affect a legal
-                        # path. Preserve explicit missing evidence here rather
-                        # than substituting a midpoint or an invented pose.
-                        for master_seconds, local_seconds, descriptor, eligible in zip(
-                            master_times,
-                            local_times,
-                            descriptors,
-                            endpoint_eligibility,
-                            strict=True,
-                        )
-                    )
+                for source_index in range(source_count):
+                    samples = observations.samples_for(offset_frames, source_index)
                     outgoing_previous.append(samples[0])
                     outgoing.append(samples[1])
                     incoming.append(samples[2])
