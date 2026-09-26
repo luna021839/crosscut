@@ -38,6 +38,7 @@ class FakeCapture:
         self.read_calls = 0
         self.bad_pts = False
         self.fail_next_read = False
+        self.grab_calls = 0
 
     def getBackendName(self):
         return self.backend
@@ -58,6 +59,14 @@ class FakeCapture:
 
     def read(self):
         self.read_calls += 1
+        success, index = self._advance()
+        return (True, np.full((2, 3, 3), index, dtype=np.int32)) if success else (False, None)
+
+    def grab(self):
+        self.grab_calls += 1
+        return self._advance()[0]
+
+    def _advance(self):
         if self.fail_next_read:
             self.fail_next_read = False
             return False, None
@@ -66,7 +75,7 @@ class FakeCapture:
         index = self.next_index
         self.next_index += 1
         self.last_pts = index / self.fps * 1000.0
-        return True, np.full((2, 3, 3), index, dtype=np.int32)
+        return True, index
 
 
 class ConstantFrameClockTests(unittest.TestCase):
@@ -151,6 +160,40 @@ class SeekLocalityTests(unittest.TestCase):
             np.testing.assert_array_equal(reader.frame_at(index / 30), index)
             self.assertLessEqual(len(reader.frames), 3)
         self.assertEqual(reader.seek_count, 5)
+
+    def test_intermediate_frames_are_decoded_without_color_conversion_or_processing(self):
+        processed = []
+        capture = FakeCapture()
+        reader = SeekLocalityReader(capture, clock=ConstantFrameClock(Fraction(30), 300),
+            process_frame=lambda frame: processed.append(int(frame[0, 0, 0])) or frame)
+        for index in (20, 45, 46, 20, 30):
+            np.testing.assert_array_equal(reader.frame_at(index / 30), index)
+        self.assertEqual(processed, [20, 45, 46, 30])
+        self.assertEqual(reader.materialized_frame_count, 4)
+        self.assertEqual(reader.skipped_materialization_count, 24)
+        self.assertEqual(capture.grab_calls, 24)
+        self.assertEqual(reader.seek_count, 2)
+        self.assertGreaterEqual(reader.decode_seconds, 0.)
+        self.assertGreaterEqual(reader.process_seconds, 0.)
+
+    def test_skipped_frame_clock_divergence_still_disables_reuse(self):
+        capture = FakeCapture()
+        reader = self.make_reader(capture)
+        reader.frame_at(20 / 30)
+        capture.bad_pts = True
+        np.testing.assert_array_equal(reader.frame_at(45 / 30), 45)
+        self.assertFalse(reader.enabled)
+        self.assertEqual(reader.fallback_count, 1)
+
+    def test_frame_processor_failure_propagates_without_cached_neighbor(self):
+        reader = self.make_reader()
+        reader.frame_at(20 / 30)
+        def broken(frame):
+            raise RuntimeError('processor failure')
+        reader.process_frame = broken
+        with self.assertRaisesRegex(RuntimeError, 'processor failure'):
+            reader.frame_at(45 / 30)
+        self.assertNotIn(45, reader.frames)
 
     def test_irregular_clock_or_backend_uses_timestamp_path(self):
         for capture, clock in (

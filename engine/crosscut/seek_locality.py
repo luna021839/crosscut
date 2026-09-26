@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+from time import monotonic
 from typing import Any, Callable, Mapping
 
 import cv2
@@ -118,12 +119,16 @@ def probe_constant_frame_clock(
 
 
 class SeekLocalityReader:
-    """Reuse a bounded pixel window, or fall back to ordinary timestamp seeks.
+    """Reuse requested pixels, or fall back to ordinary timestamp seeks.
 
 The caller still owns the exact rational request identities and persistent
 cache. These decoder-index aliases are transient, source-local pixels only.
 Any observed decoder position or clock inconsistency disables reuse instead
 of issuing unverified pixels. Exceptions from the frame processor propagate.
+Sparse intermediate frames advance the codec and undergo clock checks without
+RGB conversion/resizing. Gaps of up to four frames retain the small local pixel
+window used by motion probes. An uncached backward request seeks normally; it
+never borrows a neighbor.
     """
 
     def __init__(
@@ -153,6 +158,10 @@ of issuing unverified pixels. Exceptions from the frame processor propagate.
         self.next_index: int | None = None
         self.seek_count = 0
         self.read_count = 0
+        self.materialized_frame_count = 0
+        self.skipped_materialization_count = 0
+        self.decode_seconds = 0.0
+        self.process_seconds = 0.0
         self.pixel_cache_hit_count = 0
         self.fallback_count = 0
         self.frame_rate = float(capture.get(cv2.CAP_PROP_FPS))
@@ -176,11 +185,38 @@ of issuing unverified pixels. Exceptions from the frame processor propagate.
         self.fallback_count += 1
 
     def _seek_read(self, timestamp_ms: float) -> np.ndarray | None:
-        self.capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_ms)
-        self.seek_count += 1
-        success, frame = self.capture.read()
-        self.read_count += 1
-        return self.process_frame(frame) if success else None
+        self._seek(timestamp_ms)
+        success, frame = self._advance(materialize=True)
+        return self._process(frame) if success else None
+
+    def _seek(self, timestamp_ms: float) -> None:
+        started = monotonic()
+        try:
+            self.capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_ms)
+            self.seek_count += 1
+        finally:
+            self.decode_seconds += monotonic() - started
+
+    def _advance(self, *, materialize: bool) -> tuple[bool, Any]:
+        started = monotonic()
+        try:
+            self.read_count += 1
+            if materialize or not callable(getattr(self.capture, 'grab', None)):
+                success, frame = self.capture.read()
+                self.materialized_frame_count += int(success)
+                return success, frame
+            success = self.capture.grab()
+            self.skipped_materialization_count += int(success)
+            return success, None
+        finally:
+            self.decode_seconds += monotonic() - started
+
+    def _process(self, frame: np.ndarray) -> np.ndarray:
+        started = monotonic()
+        try:
+            return self.process_frame(frame)
+        finally:
+            self.process_seconds += monotonic() - started
 
     def frame_at(self, seconds: float) -> np.ndarray | None:
         if not math.isfinite(seconds):
@@ -208,13 +244,13 @@ of issuing unverified pixels. Exceptions from the frame processor propagate.
             self.next_index is None
             or not 0 <= target - self.next_index <= self.maximum_forward_frames
         ):
-            self.capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_ms)
-            self.seek_count += 1
+            self._seek(timestamp_ms)
             self.next_index = target
+        retain_small_gap = target - self.next_index <= 4
         while self.next_index <= target:
             frame_index = self.next_index
-            success, frame = self.capture.read()
-            self.read_count += 1
+            materialize = retain_small_gap or frame_index == target
+            success, frame = self._advance(materialize=materialize)
             if (
                 not success
                 or not math.isclose(
@@ -229,7 +265,8 @@ of issuing unverified pixels. Exceptions from the frame processor propagate.
             ):
                 self._disable()
                 return self._seek_read(timestamp_ms)
-            self.frames[frame_index] = self.process_frame(frame)
+            if materialize:
+                self.frames[frame_index] = self._process(frame)
             self.next_index += 1
             while len(self.frames) > self.maximum_cached_frames:
                 self.frames.popitem(last=False)

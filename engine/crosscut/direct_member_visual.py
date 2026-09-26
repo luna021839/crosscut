@@ -24,6 +24,7 @@ import json
 import math
 from pathlib import Path
 from statistics import median
+from time import monotonic
 from typing import Any, Callable, Mapping, Sequence
 
 import cv2
@@ -3264,6 +3265,7 @@ class _VideoDescriptorProvider:
         feature_derived_cache_directory: Path | None = None,
         require_persistent_feature_cache: bool = False,
         focal_geometry_provider: Callable[[int, float, FrameVisualDescriptor | None], FocalSelectorGeometry] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
@@ -3283,6 +3285,9 @@ class _VideoDescriptorProvider:
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
+        self._progress_callback = progress_callback
+        self._started = self._last_progress = monotonic()
+        self._descriptor_seconds = 0.0
         self._require_persistent_feature_cache = (
             require_persistent_feature_cache
         )
@@ -3317,6 +3322,33 @@ class _VideoDescriptorProvider:
         _source: Path,
         source_local_seconds: float,
     ) -> FrameVisualDescriptor | None:
+        started = monotonic()
+        value = self._descriptor_at(source_index, source_local_seconds)
+        now = monotonic()
+        self._descriptor_seconds += now - started
+        if self._progress_callback is not None and now - self._last_progress >= 30.0:
+            readers = tuple(sampler._seek_locality for sampler in self._samplers
+                            if sampler is not None and sampler._seek_locality is not None)
+            self._progress_callback({
+                "phase": "visual_descriptors",
+                "elapsed_seconds": round(now - self._started, 3),
+                "descriptor_seconds": round(self._descriptor_seconds, 3),
+                "descriptor_request_count": self._request_count,
+                "descriptor_memory_cache_hits": self._cache_hit_count,
+                "describe_frame_call_count": sum(sampler.describe_frame_call_count
+                    for sampler in self._samplers if sampler is not None),
+                "decode_seconds": round(sum(reader.decode_seconds for reader in readers), 3),
+                "working_frame_seconds": round(sum(reader.process_seconds for reader in readers), 3),
+                "decoded_frame_count": sum(reader.read_count for reader in readers),
+                "materialized_frame_count": sum(reader.materialized_frame_count for reader in readers),
+                "skipped_materialization_count": sum(reader.skipped_materialization_count for reader in readers),
+                "source_index": source_index,
+                "source_seconds": source_local_seconds,
+            })
+            self._last_progress = now
+        return value
+
+    def _descriptor_at(self, source_index: int, source_local_seconds: float) -> FrameVisualDescriptor | None:
         sampler = self._samplers[source_index]
         if (
             sampler is not None

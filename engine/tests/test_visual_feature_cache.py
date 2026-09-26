@@ -531,7 +531,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82",
+            "4af3b6fe5a7c63ce3a752566a8c32747f8181f05c2bc80f2640d48cc5380d084",
         )
 
     def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
@@ -543,7 +543,34 @@ class VisualFeatureCacheTests(unittest.TestCase):
         # A later cache-capacity-only change may reuse this corrected numeric
         # generation, but must still not cross the earlier face-scale change.
         closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
-        self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (previous,))
+        self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
+            "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b", previous))
+
+    def test_sparse_materialization_reuses_only_exact_numeric_predecessor(self):
+        old_components = _audited_active_analyzer_components()
+        new_components = _audited_active_analyzer_components()
+        old_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82")
+        new_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            "4af3b6fe5a7c63ce3a752566a8c32747f8181f05c2bc80f2640d48cc5380d084")
+        old, current = map(_analyzer_from_components, (old_components, new_components))
+        self.assertEqual(current.digest, "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'source.mp4'; source.write_bytes(b'same-source')
+            request = _request()
+            previous = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=old)
+            self.assertTrue(previous.put(request, {'value':.123}))
+            changed = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertEqual(changed.get_by_locator(request.locator), {'value':.123})
+            self.assertEqual(changed.diagnostics()['decode_free_legacy_hit_count'], 1)
+            new_components['runtime']['numpy'] = 'different-runtime'
+            incompatible = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source,
+                analyzer=_analyzer_from_components(new_components))
+            self.assertIsNone(incompatible.get_by_locator(request.locator))
+            source.write_bytes(b'changed-source')
+            replaced = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertIsNone(replaced.get_by_locator(request.locator))
 
     def test_larger_working_pixel_lru_reuses_only_exact_corrected_generation(self):
         old_components = _audited_active_analyzer_components()

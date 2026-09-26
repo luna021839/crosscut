@@ -149,6 +149,18 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Sparse decode skips only intermediate RGB materialization. All 432 real
+    # requests across eight sources had identical pixels; full descriptor
+    # pairs and AV1/H264/VFR clock regressions also match. Other source bytes,
+    # runtime/model/schema components or decoder revisions remain incompatible.
+    "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest="9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b",
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest="619a7e5f5ca525a2f95833e8bf648af3a9012474dc44cef34d502fd5af532b82",
+            current_descriptor_digest="4af3b6fe5a7c63ce3a752566a8c32747f8181f05c2bc80f2640d48cc5380d084",
+        ),
+    ),
     # Only the 480px process-local pixel LRU grew from 32 to 128 frames.
     # Source clocks, decoded pixels, feature computation and model/runtime
     # bindings are unchanged; real UHD repeated-window pixels match exactly.

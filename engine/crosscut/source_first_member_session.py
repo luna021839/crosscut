@@ -48,7 +48,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
             queries+=1
             now=time.monotonic()
             if now-last>=30.:
-                progress_callback(dict(elapsed_seconds=round(now-started,3),queries=queries,
+                progress_callback(dict(phase='focal_geometry',elapsed_seconds=round(now-started,3),queries=queries,
                     body_frame_inference_count=focal.bodies.frame_inference_count,
                     native_face_inference_count=focal.native_faces.inference_frame_count,
                     unresolved_query_memo=focal._source_first_unresolved_memo.diagnostics(),
@@ -57,7 +57,8 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
                 last=now
             return result
     try:
-        visual=_VideoDescriptorProvider(sources,focal_geometry_provider=resolver,**arguments)
+        visual=_VideoDescriptorProvider(sources,focal_geometry_provider=resolver,
+            progress_callback=progress_callback,**arguments)
     except BaseException:
         focal.close()
         raise
