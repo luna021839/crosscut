@@ -4484,6 +4484,9 @@ def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
                 "seek_locality_sha256": hashlib.sha256(
                     Path(__file__).with_name("seek_locality.py").read_bytes()
                 ).hexdigest(),
+                "shared_source_frames_sha256": hashlib.sha256(
+                    Path(__file__).with_name("shared_source_frames.py").read_bytes()
+                ).hexdigest(),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -4948,7 +4951,12 @@ class _VideoSampler:
         feature_cache_directory: Path | None = None,
         feature_derived_cache_directory: Path | None = None,
         require_persistent_feature_cache: bool = False,
+        shared_source_frames: object | None = None,
     ) -> None:
+        from .shared_source_frames import validate_shared_sources
+        shared = validate_shared_sources((path,), (shared_source_frames,)
+            if shared_source_frames is not None else None)
+        self._shared_source_frames = shared[0] if shared is not None else None
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
         self.path = path
@@ -5066,6 +5074,9 @@ class _VideoSampler:
     def assert_required_persistent_cache_available(self) -> None:
         """Attest strict cache storage before any process-local fast return."""
 
+        shared = getattr(self, '_shared_source_frames', None)
+        if shared is not None:
+            shared.assert_source_available()
         if not self._persistent_feature_cache_required:
             return
         persistent = self.persistent_feature_cache
@@ -5086,12 +5097,15 @@ class _VideoSampler:
 
     def frame_at(self, seconds: float) -> np.ndarray | None:
         key = self.frame_identity(seconds)
+        shared = getattr(self, '_shared_source_frames', None)
+        if shared is not None:
+            shared.assert_source_available()
         if key not in self.cache:
             # Preserve source-time seeking (important for VFR media) while the
             # LRU key retains the exact rational request rather than a rounded
             # millisecond.  The persistent key additionally verifies decoded
             # working-frame SHA-256 before reusing numeric features.
-            if self._seek_locality is None:
+            if shared is None and self._seek_locality is None:
                 # Cold pixel reads alone need a packet-clock probe. Fully warm
                 # persistent descriptor requests never open this decoder path.
                 self._seek_locality = SeekLocalityReader(
@@ -5104,7 +5118,8 @@ class _VideoSampler:
                     maximum_cached_frames=128,
                 )
             self.frame_decode_count += 1
-            self.cache[key] = self._seek_locality.frame_at(key.canonical_seconds)
+            self.cache[key] = (shared.working_at(key.canonical_seconds) if shared is not None
+                else self._seek_locality.frame_at(key.canonical_seconds))
             while len(self.cache) > 32:
                 self.cache.popitem(last=False)
         else:
@@ -5382,6 +5397,8 @@ class _VideoSampler:
                 "pixel_cache_hit_count": self._seek_locality.pixel_cache_hit_count if self._seek_locality else 0,
                 "fallback_count": self._seek_locality.fallback_count if self._seek_locality else 0,
             },
+            "shared_source_frames": (self._shared_source_frames.diagnostics()
+                if getattr(self, '_shared_source_frames', None) is not None else None),
             "describe_frame_call_count": self.describe_frame_call_count,
             "descriptor_content_cache_hit_count": (
                 self.descriptor_content_cache_hit_count

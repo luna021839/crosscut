@@ -21,7 +21,9 @@ from .visual_score import _working_frame, _detect_faces, _normalized_face_metada
 
 
 class NativeFocalFaceProvider:
-    def __init__(self, sources, maximum_detection_width=960):
+    def __init__(self, sources, maximum_detection_width=960, *, shared_source_frames=None):
+        from .shared_source_frames import validate_shared_sources
+        self._shared_source_frames = validate_shared_sources(sources, shared_source_frames)
         if maximum_detection_width not in (480, 960):
             raise ValueError('native focal face detection width is unsupported')
         self.sources = tuple(Path(p) for p in sources)
@@ -43,6 +45,11 @@ class NativeFocalFaceProvider:
                 or not 0<=source<len(self.sources) or isinstance(seconds, bool)
                 or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds<0):
             raise ValueError('native focal query must be source/time bound')
+        if self._shared_source_frames is not None:
+            owner = self._shared_source_frames[source]
+            frame = owner.native_at(seconds)
+            self._readers[source] = owner.reader
+            return frame
         if source not in self._captures:
             capture = cv2.VideoCapture(str(self.sources[source]))
             if not capture.isOpened():
@@ -57,6 +64,8 @@ class NativeFocalFaceProvider:
                 or not 0<=source<len(self.sources) or isinstance(seconds, bool)
                 or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds<0):
             raise ValueError('native focal query must be source/time bound')
+        if self._shared_source_frames is not None:
+            self._shared_source_frames[source].assert_source_available()
         # Exact requested times are retained for VFR sources; there is no
         # rounding into a different provider's frame-clock coordinate system.
         key = (source, seconds)

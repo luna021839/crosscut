@@ -42,6 +42,7 @@ class SharedMemberSessionTests(unittest.TestCase):
             self.assertIs(dense,focal.return_value)
             self.assertIs(selector,visual.return_value)
             self.assertIs(visual.call_args.kwargs['focal_geometry_provider'],dense.selector_geometry)
+            self.assertIs(visual.call_args.kwargs['shared_source_frames'], dense.shared_source_frames)
             assets.assert_called_once_with(Path('external'))
 
     def test_visual_constructor_failure_closes_focal_capture_ownership(self):

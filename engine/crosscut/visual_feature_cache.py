@@ -161,6 +161,18 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Shared source ownership preserves all native/working pixels on 870 real
+    # queries (eight member and two group sources), plus paired full numeric
+    # descriptors. This edge includes the exact shared-reader dependency and
+    # does not admit another source, feature mode, runtime or model revision.
+    "2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest="b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a",
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest="022e714b516d1b08226a11219e8001349995fe4d753e3e74ecc4288b5f846cc6",
+            current_descriptor_digest="ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192",
+        ),
+    ),
     # The explicit content-only option leaves default/full feature numerics
     # unchanged on 144 real frames from eight sources. Old request identities
     # still mean include_pose=True; the new False flag cannot read them as

@@ -335,7 +335,10 @@ class DirectMemberDenseFaceProvider:
         require_persistent_feature_cache: bool = False,
         require_focal_consensus: bool = False,
         focal_candidate_provider: Callable[[int, float], tuple[FocalFaceCandidate, ...]] | None = None,
+        shared_source_frames: Sequence[object] | None = None,
     ) -> None:
+        from .shared_source_frames import validate_shared_sources
+        shared = validate_shared_sources(sources, shared_source_frames)
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
         if not isinstance(require_focal_consensus, bool):
@@ -395,10 +398,11 @@ class DirectMemberDenseFaceProvider:
         if require_persistent_feature_cache:
             sampler_arguments["require_persistent_feature_cache"] = True
         try:
-            for source in self._sources:
+            for source_index, source in enumerate(self._sources):
                 sampler: _VideoSampler | None = None
                 try:
-                    sampler = _VideoSampler(source, **sampler_arguments)
+                    sampler = _VideoSampler(source, **sampler_arguments,
+                        **({'shared_source_frames': shared[source_index]} if shared is not None else {}))
                     # The sampler's reader owns capture position and its pixel
                     # window, even while lazily uninitialized. A second wrapper
                     # that reads capture directly makes the reader detect an

@@ -518,7 +518,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor_ast,
-            "f10500a2b35616d13ca89ffe69c723f33f7fa185100fbe241578fdb3a5bd74d6",
+            "155011228942eed6ebf67363e423d55f46f499ce72335a81c1039ea3f44028a8",
         )
         # Reader behavior is part of the audited endpoint, even if the import
         # alias and sampler AST remain unchanged. Older constants above retain
@@ -528,10 +528,12 @@ class VisualFeatureCacheTests(unittest.TestCase):
             "contract": "visual-score-with-seek-locality-v1",
             "descriptor_ast_sha256": descriptor_ast,
             "seek_locality_sha256": hashlib.sha256(dependency.read_bytes()).hexdigest(),
+            "shared_source_frames_sha256": hashlib.sha256(
+                visual_score_path.with_name("shared_source_frames.py").read_bytes()).hexdigest(),
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "022e714b516d1b08226a11219e8001349995fe4d753e3e74ecc4288b5f846cc6",
+            "ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192",
         )
 
     def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
@@ -544,8 +546,45 @@ class VisualFeatureCacheTests(unittest.TestCase):
         # generation, but must still not cross the earlier face-scale change.
         closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
         self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
+            "b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a",
             "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10",
             "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b", previous))
+
+    def test_shared_source_readers_migrate_exact_full_and_content_records_only(self):
+        from dataclasses import replace
+        old_components = _audited_active_analyzer_components()
+        old_components['code_sha256'].update({
+            'visual_score_descriptor_ast_v1': '022e714b516d1b08226a11219e8001349995fe4d753e3e74ecc4288b5f846cc6',
+            'pose.py': 'cab4b390073348daf33181a2fa0c8a171058e33f8c21223d501370ee23f17b21',
+        })
+        new_components = json.loads(json.dumps(old_components))
+        new_components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            'ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192')
+        old, current = map(_analyzer_from_components, (old_components, new_components))
+        self.assertEqual(old.digest, 'b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a')
+        self.assertEqual(current.digest, '2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'source'; source.write_bytes(b'original')
+            previous = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=old)
+            full = _request()
+            content = replace(full, include_pose=False)
+            self.assertTrue(previous.put(full, {'measurement': .123, 'mode': 'full'}))
+            self.assertTrue(previous.put(content, {'measurement': .123, 'mode': 'content'}))
+            changed = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertEqual(changed.get_by_locator(full.locator), {'measurement': .123, 'mode': 'full'})
+            self.assertEqual(changed.get_by_locator(content.locator), {'measurement': .123, 'mode': 'content'})
+            self.assertEqual(changed.diagnostics()['decode_free_legacy_hit_count'], 2)
+            for part, name, value in (('code_sha256', 'visual_score_descriptor_ast_v1', '0'*64),
+                    ('runtime', 'opencv', 'different'), ('model_asset_sha256_or_state', 'new', 'unverified')):
+                bad_components = json.loads(json.dumps(new_components))
+                bad_components[part][name] = value
+                bad = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source,
+                    analyzer=_analyzer_from_components(bad_components))
+                self.assertIsNone(bad.get_by_locator(full.locator))
+            source.write_bytes(b'replaced')
+            replaced = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            self.assertIsNone(replaced.get_by_locator(full.locator))
 
     def test_content_feature_split_reuses_unchanged_full_mode_only(self):
         from dataclasses import replace

@@ -30,19 +30,33 @@ from .source_first_published_cache import SourceFirstPublishedGeometryCache as S
 class SourceFirstFocalGeometryProvider:
     def __init__(self, sources, *, body_model_path: Path, pose_model_path: Path,
                  feature_cache_directory=None, feature_derived_cache_directory=None,
-                 require_persistent_feature_cache=False, body_execution_device='cpu'):
+                 require_persistent_feature_cache=False, body_execution_device='cpu',
+                 share_source_frames=True):
+        from .shared_source_frames import SharedSourceFrames
+        if not isinstance(share_source_frames, bool):
+            raise TypeError('share_source_frames must be boolean')
         from .source_first_execution import resolve_body_execution_device, body_observation_namespace
         self.body_execution_device = resolve_body_execution_device(body_execution_device)
         self.sources = tuple(Path(p) for p in sources)
         self._identities = tuple(self._identity(p) for p in self.sources)
         with ExitStack() as cleanup:
-            self.native_faces = NativeFocalFaceProvider(self.sources)
+            self.shared_source_frames = None
+            if share_source_frames:
+                shared = []
+                for source in self.sources:
+                    owner = SharedSourceFrames(source)
+                    cleanup.callback(owner.close)
+                    shared.append(owner)
+                self.shared_source_frames = tuple(shared)
+            self.native_faces = NativeFocalFaceProvider(self.sources,
+                shared_source_frames=self.shared_source_frames)
             cleanup.callback(self.native_faces.close)
             self.faces = DirectMemberDenseFaceProvider(self.sources, require_focal_consensus=True,
                 focal_candidate_provider=self.native_faces.candidates_at,
                 feature_cache_directory=feature_cache_directory,
                 feature_derived_cache_directory=feature_derived_cache_directory,
-                require_persistent_feature_cache=require_persistent_feature_cache)
+                require_persistent_feature_cache=require_persistent_feature_cache,
+                shared_source_frames=self.shared_source_frames)
             cleanup.callback(self.faces.close)
             self.pose = BodyPose2DAnalyzer(pose_model_path)
             if self.body_execution_device == 'mps':
@@ -67,7 +81,7 @@ class SourceFirstFocalGeometryProvider:
         paths=('body_pose_2d.py','body_appearance.py','_osnet_ain_network.py','focal_body_track.py',
             'focal_body_track_provider.py','focal_reference_consensus.py','focal_pose.py',
             'focal_selector_geometry.py','native_focal_faces.py','native_frame_reader.py',
-            'seek_locality.py','source_first_geometry_cache.py')
+            'seek_locality.py','source_first_geometry_cache.py','shared_source_frames.py')
         components={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in paths}
         for method in (cls.selector_geometry,DirectMemberDenseFaceProvider._ensure_focal_consensus,
                 DirectMemberDenseFaceProvider._focal_candidates,_enable_dense_sequential_frame_reads):
@@ -245,6 +259,7 @@ class SourceFirstFocalGeometryProvider:
             'native_face_inference_frame_count': self.native_faces.inference_frame_count,
             'pose': self.pose.fingerprint(), 'body_appearance': self.encoder.fingerprint(),
             'native_face': self.native_faces.fingerprint(),
+            'shared_source_frames': [owner.diagnostics() for owner in self.shared_source_frames or ()],
             'persistent_geometry':self._persistent.diagnostics() if self._persistent else None,
             'raw_descriptor_cache_changed': False, 'final_quality_authority': False}
 
@@ -252,10 +267,14 @@ class SourceFirstFocalGeometryProvider:
         try:
             if self._persistent is not None:self._persistent.close()
         finally:
-            self.native_faces.close()
-            self.faces.close()
-            self._cache.clear()
-            self._boundary_references.clear()
-            self.bodies._references.clear()
-            self.bodies._frame_cache.clear()
-            self.bodies._track_cache.clear()
+            try:
+                self.native_faces.close()
+                self.faces.close()
+                self._cache.clear()
+                self._boundary_references.clear()
+                self.bodies._references.clear()
+                self.bodies._frame_cache.clear()
+                self.bodies._track_cache.clear()
+            finally:
+                for owner in self.shared_source_frames or ():
+                    owner.close()

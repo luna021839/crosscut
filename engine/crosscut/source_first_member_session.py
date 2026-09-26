@@ -20,6 +20,8 @@ def _decoder_locality_diagnostics(focal):
         working=[describe(i, getattr(sampler, '_seek_locality', None), sampler)
                  for i, sampler in enumerate(focal.faces._samplers)],
         native=[describe(i, reader) for i, reader in sorted(focal.native_faces._readers.items())],
+        shared=[dict(source_index=i, **owner.diagnostics())
+                for i, owner in enumerate(getattr(focal, 'shared_source_frames', None) or ())],
     )
 
 
@@ -58,7 +60,8 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
             return result
     try:
         visual=_VideoDescriptorProvider(sources,focal_geometry_provider=resolver,
-            progress_callback=progress_callback,**arguments)
+            progress_callback=progress_callback,
+            shared_source_frames=getattr(focal, 'shared_source_frames', None),**arguments)
     except BaseException:
         focal.close()
         raise
