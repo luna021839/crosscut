@@ -218,6 +218,14 @@ class DirectMemberVisualSelectionError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class DirectMemberFeatureHydrationError(RuntimeError):
+    """An observation/runtime inconsistency, never an alternate-partition signal."""
+
+    def __init__(self, message: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 @dataclass(frozen=True, slots=True)
 class DirectMemberVisualConfig:
     """Thresholds and weights for one direct-member visual optimization."""
@@ -3290,6 +3298,7 @@ class _VideoDescriptorProvider:
         self._decode_count = 0
         self._content_request_count = 0
         self._content_full_cache_hit_count = 0
+        self._focal_proposal_request_count = 0
         self._progress_callback = progress_callback
         self._started = self._last_progress = monotonic()
         self._descriptor_seconds = 0.0
@@ -3340,6 +3349,20 @@ class _VideoDescriptorProvider:
         superset, but a content descriptor cannot satisfy a full request.
         """
         self._content_request_count += 1
+        return self._request_descriptor(source_index, source_local_seconds, include_pose=False)
+
+    def focal_proposal_at(
+        self, source_index: int, _source: Path, source_local_seconds: float,
+    ) -> FrameVisualDescriptor | None:
+        """Appearance/context support; exact target joints come from focal authority.
+
+        The selected boundary and effect handles are restored through __call__
+        before leaving the selector. This endpoint cannot replace full pose
+        for legacy/group consumers or bypass a missing focal observation.
+        """
+        if not callable(self.focal_geometry_at):
+            raise ValueError('focal proposal features require exact focal authority')
+        self._focal_proposal_request_count += 1
         return self._request_descriptor(source_index, source_local_seconds, include_pose=False)
 
     def _request_descriptor(
@@ -3435,6 +3458,12 @@ class _VideoDescriptorProvider:
             "descriptor_cache_entry_count": len(self._descriptor_cache),
             "content_request_count": self._content_request_count,
             "content_full_cache_hit_count": self._content_full_cache_hit_count,
+            "focal_proposal_request_count": self._focal_proposal_request_count,
+            "focal_observation_batch": (
+                self.prepare_focal_observations.diagnostics()
+                if callable(getattr(getattr(self, 'prepare_focal_observations', None), 'diagnostics', None))
+                else None
+            ),
             "persistent_visual_feature_cache": {
                 "contract": "ive_source_local_visual_features_v1",
                 "enabled_source_count": len(persistent),
@@ -3502,6 +3531,41 @@ def _boundary_sample_with_focal_geometry(
         if attention is None and focal.body_track is not None and focal.person is not None:
             attention = _AttentionGeometry(focal.person.bbox_xywh, focal.person.centroid_xy, FOCAL_SELECTOR_BODY_BASIS)
     return _BoundarySample(master_seconds, source_local_seconds, descriptor, attention, focal)
+
+
+def _same_nonjoint_features(left: FrameVisualDescriptor, right: FrameVisualDescriptor) -> bool:
+    """Full hydration may add joints, but cannot change the scored observation."""
+    for name in FrameVisualDescriptor.__dataclass_fields__:
+        if name in ('pose_embedding', 'pose_confidence', 'pose_backend'):
+            continue
+        before, after = getattr(left, name), getattr(right, name)
+        if name == 'formation_people':
+            before = tuple(replace(person, upper_body_keypoints_xyc=()) for person in before)
+            after = tuple(replace(person, upper_body_keypoints_xyc=()) for person in after)
+        if before != after:
+            return False
+    return True
+
+
+def _hydrate_focal_boundary_sample(sample, *, source_index, source, provider, cache):
+    if sample.descriptor is None:
+        return sample
+    focal = sample.focal_geometry
+    if (not isinstance(focal, FocalSelectorGeometry) or focal.source_index != source_index
+            or not math.isclose(focal.source_seconds, sample.source_local_seconds, abs_tol=1e-9, rel_tol=0)):
+        raise ValueError('deferred pose requires the same exact focal observation')
+    key = (source_index, sample.source_local_seconds)
+    if key not in cache:
+        cache[key] = provider(source_index, source, sample.source_local_seconds)
+    full = cache[key]
+    if full is None or not _same_nonjoint_features(sample.descriptor, full):
+        raise DirectMemberFeatureHydrationError(
+            'selected focal boundary full features are missing or changed',
+            {'failure': 'selected_focal_descriptor_hydration_failed',
+             'eligible_source_index': source_index, 'source_seconds': sample.source_local_seconds,
+             'full_descriptor_missing': full is None, 'visual_gates_relaxed': False,
+             'retry_as_another_partition': False})
+    return replace(sample, descriptor=full)
 
 
 def _focal_sample_in_body_attention_basis(sample: _BoundarySample | None) -> _BoundarySample | None:
@@ -12310,9 +12374,13 @@ def select_balanced_direct_member_sources(
         owned_provider = _VideoDescriptorProvider(resolved_sources)
         provider = owned_provider
     # Custom providers keep their existing contract. Only this explicit
-    # content endpoint can omit joints; all boundary/motion calls below use
-    # the original provider and full focal authority.
+    # content endpoint can omit joints. Focal proposals may separately defer
+    # unrelated generic joints, but every cut still uses exact target pose;
+    # all retained endpoint/effect descriptors are hydrated before returning.
     content_provider = getattr(provider, 'content_at', None) or provider
+    focal_proposal_provider = (getattr(provider, 'focal_proposal_at', None)
+        if callable(getattr(provider, 'focal_geometry_at', None)) else None)
+    boundary_provider = focal_proposal_provider or provider
     scene_cut_artifact_cache: dict[tuple[int, int], bool] = {}
 
     def _scene_cut_is_transient_portrait_fancam_artifact(
@@ -12537,6 +12605,7 @@ def select_balanced_direct_member_sources(
             local_frame_offsets = camera_feedback.frame_offsets(
                 canonical_cut=canonical_boundary, ordinary_offsets=frame_offsets,
                 frame_step=resolved_config.sample_frame_step_seconds)
+            boundary_plans = []
             for offset_frames in local_frame_offsets:
                 boundary = (
                     canonical_boundary
@@ -12581,19 +12650,34 @@ def select_balanced_direct_member_sources(
                     and incoming_next_master < incoming_future_master
                 ):
                     continue
+                boundary_plans.append((offset_frames, boundary, (
+                    outgoing_previous_master, outgoing_master, incoming_master,
+                    incoming_next_master, incoming_future_master,
+                )))
+            prepare_focal = getattr(provider, 'prepare_focal_observations', None)
+            if callable(prepare_focal):
+                # The exact same eligible observations may be read in source
+                # order. This cannot remove an offset, select a cut, or borrow
+                # a neighboring pose; scalar target authority is unchanged.
+                prepare_focal(tuple(
+                    (source_index, _source_local_time(master_seconds,
+                        source_index=source_index, audio_offsets=offsets,
+                        source_timewarps=clocks))
+                    for _offset, _boundary, master_times in boundary_plans
+                    for source_index in range(source_count)
+                    for master_seconds, eligible in zip(master_times,
+                        _boundary_endpoint_content_eligibility(
+                            span_diagnostics[boundary_index].sources[source_index].valid,
+                            span_diagnostics[boundary_index+1].sources[source_index].valid),
+                        strict=True)
+                    if eligible))
+            for offset_frames, boundary, master_times in boundary_plans:
                 outgoing_previous: list[_BoundarySample] = []
                 outgoing: list[_BoundarySample] = []
                 incoming: list[_BoundarySample] = []
                 incoming_next: list[_BoundarySample] = []
                 incoming_future: list[_BoundarySample] = []
                 for source_index, source in enumerate(resolved_sources):
-                    master_times = (
-                        outgoing_previous_master,
-                        outgoing_master,
-                        incoming_master,
-                        incoming_next_master,
-                        incoming_future_master,
-                    )
                     outgoing_eligible = span_diagnostics[boundary_index].sources[source_index].valid
                     incoming_eligible = span_diagnostics[boundary_index + 1].sources[source_index].valid
                     endpoint_eligibility = _boundary_endpoint_content_eligibility(
@@ -12608,7 +12692,7 @@ def select_balanced_direct_member_sources(
                         for master_seconds in master_times
                     )
                     descriptors = tuple(
-                        provider(source_index, source, local_seconds) if eligible else None
+                        boundary_provider(source_index, source, local_seconds) if eligible else None
                         for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
                     )
                     sample_count += sum(endpoint_eligibility)
@@ -13909,6 +13993,12 @@ def select_balanced_direct_member_sources(
             )
         )
     diagnostics: list[DirectBoundaryVisualDiagnostic] = []
+    hydrated_descriptors = {}
+    def retained_sample(sample, source_index):
+        if focal_proposal_provider is None:
+            return sample
+        return _hydrate_focal_boundary_sample(sample, source_index=source_index,
+            source=resolved_sources[source_index], provider=provider, cache=hydrated_descriptors)
     raw_cross_source_pair_count = source_count * (source_count - 1)
     for boundary_index, (outgoing_index, incoming_index) in enumerate(
         zip(path, path[1:])
@@ -13994,8 +14084,8 @@ def select_balanced_direct_member_sources(
                 ),
                 outgoing_eligible_source_index=outgoing_index,
                 incoming_eligible_source_index=incoming_index,
-                outgoing_sample=selected_candidate.outgoing[outgoing_index],
-                incoming_sample=selected_candidate.incoming[incoming_index],
+                outgoing_sample=retained_sample(selected_candidate.outgoing[outgoing_index], outgoing_index),
+                incoming_sample=retained_sample(selected_candidate.incoming[incoming_index], incoming_index),
                 mismatch=mismatch,
                 selected_pair_rank=selected_rank,
                 candidate_pair_count=len(ranked_pairs),
@@ -14015,15 +14105,23 @@ def select_balanced_direct_member_sources(
                 ),
                 cut_applied=cut_applied,
                 outgoing_handle_samples=(
-                    selected_candidate.incoming_next[outgoing_index],
-                    selected_candidate.incoming_future[outgoing_index],
+                    retained_sample(selected_candidate.incoming_next[outgoing_index], outgoing_index),
+                    retained_sample(selected_candidate.incoming_future[outgoing_index], outgoing_index),
                 ),
                 incoming_handle_samples=(
-                    selected_candidate.incoming_next[incoming_index],
-                    selected_candidate.incoming_future[incoming_index],
+                    retained_sample(selected_candidate.incoming_next[incoming_index], incoming_index),
+                    retained_sample(selected_candidate.incoming_future[incoming_index], incoming_index),
                 ),
             )
         )
+    optimizer_search_diagnostics['focal_feature_schedule'] = {
+        'contract': 'focal_proposals_full_retained_effect_samples_v1',
+        'enabled': focal_proposal_provider is not None,
+        'retained_full_descriptor_query_count': len(hydrated_descriptors),
+        'exact_target_pose_queries_omitted': False,
+        'boundary_offsets_or_sources_removed': False,
+        'full_effect_handle_features_required': True,
+    }
     return DirectMemberVisualSelection(
         source_indices=path,
         source_quotas=selected_source_targets,

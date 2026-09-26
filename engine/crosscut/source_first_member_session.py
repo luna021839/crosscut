@@ -3,6 +3,7 @@ import time
 from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
 from .source_first_model_assets import ensure_source_first_model_assets
 from .source_first_unresolved_memo import install_source_first_unresolved_memo
+from .source_first_observation_batch import SourceFirstObservationBatch
 from .direct_member_visual import _VideoDescriptorProvider
 
 
@@ -62,6 +63,8 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
         visual=_VideoDescriptorProvider(sources,focal_geometry_provider=resolver,
             progress_callback=progress_callback,
             shared_source_frames=getattr(focal, 'shared_source_frames', None),**arguments)
+        visual.prepare_focal_observations = SourceFirstObservationBatch(focal,
+            progress_callback=progress_callback)
     except BaseException:
         focal.close()
         raise

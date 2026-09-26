@@ -20,7 +20,7 @@ class BoundaryObservationPruningTests(unittest.TestCase):
         self.assertEqual(_boundary_endpoint_content_eligibility(False, False), (False,) * 5)
         self.assertEqual(_boundary_endpoint_content_eligibility(True, True), (True,) * 5)
 
-    def run_selection(self, *, exhaustive=False, partial=False):
+    def run_selection(self, *, exhaustive=False, partial=False, prepared=None):
         raw_calls, focal_calls = [], []
         def provider(source, path, seconds):
             raw_calls.append((source, seconds))
@@ -30,6 +30,8 @@ class BoundaryObservationPruningTests(unittest.TestCase):
             focal_calls.append((source, seconds))
             return replace(geometry(source), source_seconds=seconds)
         provider.focal_geometry_at = focal
+        if prepared is not None:
+            provider.prepare_focal_observations = lambda queries: prepared.extend(queries)
         args = dict(sources=tuple(Path(f'{i}.mp4') for i in range(3)),
             canonical_spans=tuple((float(i), float(i+1)) for i in range(6)),
             audio_offsets=(0.,)*3, descriptor_provider=provider,
@@ -41,6 +43,13 @@ class BoundaryObservationPruningTests(unittest.TestCase):
         else:
             result = select_balanced_direct_member_sources(**args)
         return result, raw_calls, focal_calls
+
+    def test_batched_plan_keeps_pruning_and_outgoing_overlap_handles_identical(self):
+        prepared = []
+        result, raw, focal = self.run_selection(prepared=prepared)
+        plain, plain_raw, plain_focal = self.run_selection()
+        self.assertEqual(prepared, focal)
+        self.assertEqual((result, raw, focal), (plain, plain_raw, plain_focal))
 
     def test_actual_selector_preserves_legal_path_and_effect_handles_with_fewer_observations(self):
         result, raw, focal = self.run_selection()
