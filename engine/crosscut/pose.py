@@ -1056,7 +1056,12 @@ class SubjectGeometryAnalyzer:
         image: np.ndarray,
         *,
         include_formation_pose: bool = False,
+        include_pose: bool = True,
     ) -> SubjectGeometryDescriptor:
+        if not isinstance(include_pose, bool):
+            raise TypeError("include_pose must be boolean")
+        if include_formation_pose and not include_pose:
+            raise ValueError("formation pose requires pose inference")
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("subject geometry expects a non-empty BGR image")
         with self._lock:
@@ -1167,7 +1172,7 @@ class SubjectGeometryAnalyzer:
                         )
 
                     dominant = _dominant_person(pose_persons)
-                    if dominant is not None:
+                    if dominant is not None and include_pose:
                         dominant_index = next(
                             (
                                 index
@@ -1213,6 +1218,7 @@ def describe_subject_geometry(
     image: np.ndarray,
     *,
     include_formation_pose: bool = False,
+    include_pose: bool = True,
 ) -> SubjectGeometryDescriptor:
     global _DEFAULT_ANALYZER
     if _DEFAULT_ANALYZER is None:
@@ -1220,6 +1226,7 @@ def describe_subject_geometry(
     return _DEFAULT_ANALYZER.describe(
         image,
         include_formation_pose=include_formation_pose,
+        include_pose=include_pose,
     )
 
 

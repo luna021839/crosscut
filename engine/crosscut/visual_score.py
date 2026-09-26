@@ -4119,7 +4119,12 @@ def describe_frame(
     following_frame: np.ndarray | None = None,
     include_subject_geometry: bool = True,
     include_formation_pose: bool = False,
+    include_pose: bool = True,
 ) -> FrameVisualDescriptor:
+    if not isinstance(include_pose, bool):
+        raise TypeError("include_pose must be boolean")
+    if include_formation_pose and not include_pose:
+        raise ValueError("formation pose requires pose inference")
     working = _working_frame(frame)
     gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
     structure_embedding = _structure_embedding(gray)
@@ -4127,6 +4132,7 @@ def describe_frame(
         describe_subject_geometry(
             working,
             include_formation_pose=include_formation_pose,
+            **({"include_pose": False} if not include_pose else {}),
         )
         if include_subject_geometry
         else SubjectGeometryDescriptor()
@@ -4975,7 +4981,7 @@ class _VideoSampler:
         # once per identical primary/following pixel pair and analysis options.
         # This LRU holds immutable descriptors and hashes, never frame pixels.
         self.descriptor_content_cache: OrderedDict[
-            tuple[str, str | None, bool, bool], FrameVisualDescriptor
+            tuple[str, str | None, bool, bool, bool], FrameVisualDescriptor
         ] = OrderedDict()
         self.descriptor_content_cache_hit_count = 0
         self.descriptor_content_cache_miss_count = 0
@@ -5122,9 +5128,18 @@ class _VideoSampler:
         following_seconds: float | None = None,
         include_subject_geometry: bool = True,
         include_formation_pose: bool = False,
+        include_pose: bool = True,
+        cache_only: bool = False,
     ) -> FrameVisualDescriptor | None:
-        """Return one exact descriptor with optional persistent reuse."""
+        """Return an exact, feature-scoped descriptor.
 
+        A cache-only lookup never decodes, infers, writes, or remembers a miss.
+        It permits content consumers to reuse already measured full geometry
+        without making full pose a prerequisite for a new content sample.
+        """
+
+        if not isinstance(cache_only, bool):
+            raise TypeError("cache_only must be boolean")
         self.assert_required_persistent_cache_available()
         persistent = self.persistent_feature_cache
 
@@ -5139,6 +5154,7 @@ class _VideoSampler:
             following=following,
             include_subject_geometry=include_subject_geometry,
             include_formation_pose=include_formation_pose,
+            include_pose=include_pose,
         )
         if locator in self.descriptor_locator_cache:
             self.descriptor_locator_cache.move_to_end(locator)
@@ -5165,6 +5181,8 @@ class _VideoSampler:
                         self.descriptor_locator_cache.popitem(last=False)
                     return descriptor
 
+        if cache_only:
+            return None
         frame = self.frame_at(seconds)
         if frame is None:
             self.descriptor_locator_cache[locator] = None
@@ -5189,6 +5207,7 @@ class _VideoSampler:
             ),
             include_subject_geometry=include_subject_geometry,
             include_formation_pose=include_formation_pose,
+            include_pose=include_pose,
         )
         if request in self.descriptor_cache:
             self.descriptor_cache.move_to_end(request)
@@ -5198,6 +5217,7 @@ class _VideoSampler:
             request.following_working_frame_sha256,
             include_subject_geometry,
             include_formation_pose,
+            include_pose,
         )
         descriptor = self.descriptor_content_cache.get(content_key)
         content_hit = descriptor is not None
@@ -5233,6 +5253,8 @@ class _VideoSampler:
                 describe_arguments["include_subject_geometry"] = False
             if include_formation_pose:
                 describe_arguments["include_formation_pose"] = True
+            if not include_pose:
+                describe_arguments["include_pose"] = False
             self.describe_frame_call_count += 1
             descriptor = describe_frame(frame, **describe_arguments)
             computed = True

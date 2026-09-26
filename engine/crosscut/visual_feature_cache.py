@@ -116,6 +116,7 @@ class _DecodeEquivalentAnalyzerMigration:
     descriptor_component_name: str
     legacy_descriptor_digest: str
     current_descriptor_digest: str
+    additional_code_changes: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         for digest in (
@@ -129,6 +130,17 @@ class _DecodeEquivalentAnalyzerMigration:
             raise ValueError("analyzer migration component name is blank")
         if self.legacy_descriptor_digest == self.current_descriptor_digest:
             raise ValueError("analyzer migration must change descriptor code")
+        names = {self.descriptor_component_name}
+        for name, previous, current in self.additional_code_changes:
+            if (not name.strip() or name in names or _SHA256.fullmatch(previous) is None
+                    or _SHA256.fullmatch(current) is None or previous == current):
+                raise ValueError("analyzer migration additional code identity is invalid")
+            names.add(name)
+
+    @property
+    def code_changes(self) -> tuple[tuple[str, str, str], ...]:
+        return ((self.descriptor_component_name, self.legacy_descriptor_digest,
+                 self.current_descriptor_digest),) + self.additional_code_changes
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +161,22 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # The explicit content-only option leaves default/full feature numerics
+    # unchanged on 144 real frames from eight sources. Old request identities
+    # still mean include_pose=True; the new False flag cannot read them as
+    # partial records. Both changed implementation components are bound, and
+    # every intermediate complete analyzer digest is still verified.
+    "b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest="ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10",
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest="4af3b6fe5a7c63ce3a752566a8c32747f8181f05c2bc80f2640d48cc5380d084",
+            current_descriptor_digest="022e714b516d1b08226a11219e8001349995fe4d753e3e74ecc4288b5f846cc6",
+            additional_code_changes=(("pose.py",
+                "2d0fbf3e426039c281a5331e93e567a652f3ee50d5be3744446e07038e741870",
+                "cab4b390073348daf33181a2fa0c8a171058e33f8c21223d501370ee23f17b21"),),
+        ),
+    ),
     # Sparse decode skips only intermediate RGB materialization. All 432 real
     # requests across eight sources had identical pixels; full descriptor
     # pairs and AV1/H264/VFR clock regressions also match. Other source bytes,
@@ -748,6 +776,7 @@ class DescriptorRequestLocator:
     following: CanonicalFrameIdentity | None
     include_subject_geometry: bool
     include_formation_pose: bool
+    include_pose: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.include_subject_geometry, bool) or not isinstance(
@@ -756,6 +785,10 @@ class DescriptorRequestLocator:
             raise TypeError("descriptor feature flags must be booleans")
         if self.include_formation_pose and not self.include_subject_geometry:
             raise ValueError("formation pose requires subject geometry")
+        if not isinstance(self.include_pose, bool):
+            raise TypeError("include_pose must be boolean")
+        if self.include_formation_pose and not self.include_pose:
+            raise ValueError("formation pose requires pose inference")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -765,6 +798,7 @@ class DescriptorRequestLocator:
             ),
             "include_subject_geometry": self.include_subject_geometry,
             "include_formation_pose": self.include_formation_pose,
+            **({"include_pose": False} if not self.include_pose else {}),
         }
 
 
@@ -776,6 +810,7 @@ class DescriptorRequestIdentity:
     following_working_frame_sha256: str | None
     include_subject_geometry: bool
     include_formation_pose: bool
+    include_pose: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.include_subject_geometry, bool) or not isinstance(
@@ -784,6 +819,10 @@ class DescriptorRequestIdentity:
             raise TypeError("descriptor feature flags must be booleans")
         if self.include_formation_pose and not self.include_subject_geometry:
             raise ValueError("formation pose requires subject geometry")
+        if not isinstance(self.include_pose, bool):
+            raise TypeError("include_pose must be boolean")
+        if self.include_formation_pose and not self.include_pose:
+            raise ValueError("formation pose requires pose inference")
         if _SHA256.fullmatch(self.primary_working_frame_sha256) is None:
             raise ValueError("primary working frame must have a SHA-256 identity")
         if (self.following is None) != (
@@ -808,6 +847,7 @@ class DescriptorRequestIdentity:
             ),
             "include_subject_geometry": self.include_subject_geometry,
             "include_formation_pose": self.include_formation_pose,
+            **({"include_pose": False} if not self.include_pose else {}),
         }
 
     @property
@@ -817,11 +857,12 @@ class DescriptorRequestIdentity:
             following=self.following,
             include_subject_geometry=self.include_subject_geometry,
             include_formation_pose=self.include_formation_pose,
+            include_pose=self.include_pose,
         )
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "DescriptorRequestIdentity":
-        if not isinstance(value, Mapping) or set(value) != {
+        if not isinstance(value, Mapping) or set(value) - {"include_pose"} != {
             "primary",
             "following",
             "primary_working_frame_sha256",
@@ -846,6 +887,7 @@ class DescriptorRequestIdentity:
             ],
             include_subject_geometry=value["include_subject_geometry"],
             include_formation_pose=value["include_formation_pose"],
+            include_pose=value.get("include_pose", True),
         )
 
 
@@ -1100,23 +1142,18 @@ class PersistentVisualFeatureCache:
             return False
         if set(actual_code) != set(expected_code):
             return False
-        descriptor_names = {
-            edge.descriptor_component_name
-            for _endpoint_digest, edge in migration_path.edges
-        }
-        if len(descriptor_names) != 1:
-            return False
-        descriptor_name = next(iter(descriptor_names))
-        if descriptor_name not in actual_code:
+        changed_names = {name for _endpoint, edge in migration_path.edges
+                         for name, _old, _new in edge.code_changes}
+        if not changed_names.issubset(actual_code):
             return False
         if any(
             actual_code.get(name) != expected_code.get(name)
             for name in expected_code
-            if name != descriptor_name
+            if name not in changed_names
         ):
             return False
         # Replay the complete audited chain. Each intermediate component object
-        # is reconstructed by changing only the allowlisted descriptor digest,
+        # is reconstructed by changing only the exact allowlisted code digests,
         # then hashed against that edge's canonical full analyzer endpoint.
         # The graph is therefore routing only; it cannot manufacture an
         # endpoint or bridge any schema/model/runtime/other-code difference.
@@ -1127,13 +1164,14 @@ class PersistentVisualFeatureCache:
         for endpoint_digest, edge in migration_path.edges:
             if (
                 working_analyzer_digest != edge.legacy_analyzer_digest
-                or working_code.get(descriptor_name)
-                != edge.legacy_descriptor_digest
+                or any(working_code.get(name) != previous
+                       for name, previous, _current in edge.code_changes)
                 or _analyzer_components_sha256(working_components)
                 != edge.legacy_analyzer_digest
             ):
                 return False
-            working_code[descriptor_name] = edge.current_descriptor_digest
+            for name, _previous, current in edge.code_changes:
+                working_code[name] = current
             if (
                 _analyzer_components_sha256(working_components)
                 != endpoint_digest

@@ -3280,11 +3280,13 @@ class _VideoDescriptorProvider:
         self._samplers: list[_VideoSampler | None] = []
         self.focal_geometry_at = focal_geometry_provider
         self._descriptor_cache: dict[
-            tuple[int, CanonicalFrameIdentity], FrameVisualDescriptor | None
+            tuple[int, CanonicalFrameIdentity, bool], FrameVisualDescriptor | None
         ] = {}
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
+        self._content_request_count = 0
+        self._content_full_cache_hit_count = 0
         self._progress_callback = progress_callback
         self._started = self._last_progress = monotonic()
         self._descriptor_seconds = 0.0
@@ -3322,8 +3324,25 @@ class _VideoDescriptorProvider:
         _source: Path,
         source_local_seconds: float,
     ) -> FrameVisualDescriptor | None:
+        return self._request_descriptor(source_index, source_local_seconds, include_pose=True)
+
+    def content_at(
+        self, source_index: int, _source: Path, source_local_seconds: float,
+    ) -> FrameVisualDescriptor | None:
+        """Content-only evidence. Never used for a cut or focal-pose query.
+
+        Keep face/person/silhouette, obstruction and exposure measurements;
+        skip unused joint inference. A cached full descriptor is a valid
+        superset, but a content descriptor cannot satisfy a full request.
+        """
+        self._content_request_count += 1
+        return self._request_descriptor(source_index, source_local_seconds, include_pose=False)
+
+    def _request_descriptor(
+        self, source_index: int, source_local_seconds: float, *, include_pose: bool,
+    ) -> FrameVisualDescriptor | None:
         started = monotonic()
-        value = self._descriptor_at(source_index, source_local_seconds)
+        value = self._descriptor_at(source_index, source_local_seconds, include_pose=include_pose)
         now = monotonic()
         self._descriptor_seconds += now - started
         if self._progress_callback is not None and now - self._last_progress >= 30.0:
@@ -3335,6 +3354,8 @@ class _VideoDescriptorProvider:
                 "descriptor_seconds": round(self._descriptor_seconds, 3),
                 "descriptor_request_count": self._request_count,
                 "descriptor_memory_cache_hits": self._cache_hit_count,
+                "content_request_count": self._content_request_count,
+                "content_full_cache_hit_count": self._content_full_cache_hit_count,
                 "describe_frame_call_count": sum(sampler.describe_frame_call_count
                     for sampler in self._samplers if sampler is not None),
                 "decode_seconds": round(sum(reader.decode_seconds for reader in readers), 3),
@@ -3348,7 +3369,8 @@ class _VideoDescriptorProvider:
             self._last_progress = now
         return value
 
-    def _descriptor_at(self, source_index: int, source_local_seconds: float) -> FrameVisualDescriptor | None:
+    def _descriptor_at(self, source_index: int, source_local_seconds: float, *,
+                       include_pose: bool = True) -> FrameVisualDescriptor | None:
         sampler = self._samplers[source_index]
         if (
             sampler is not None
@@ -3358,17 +3380,30 @@ class _VideoDescriptorProvider:
         self._request_count += 1
         if sampler is None:
             return None
-        key = (source_index, sampler.frame_identity(source_local_seconds))
+        identity = sampler.frame_identity(source_local_seconds)
+        key = (source_index, identity, include_pose)
         if key in self._descriptor_cache:
             self._cache_hit_count += 1
             return self._descriptor_cache[key]
         self._decode_count += 1
         try:
-            descriptor = sampler.feature_descriptor_at(
-                source_local_seconds,
-                include_subject_geometry=True,
-                include_formation_pose=True,
-            )
+            descriptor = None
+            if not include_pose:
+                descriptor = self._descriptor_cache.get((source_index, identity, True))
+                if descriptor is None:
+                    descriptor = sampler.feature_descriptor_at(
+                        source_local_seconds, include_subject_geometry=True,
+                        include_formation_pose=True, cache_only=True,
+                    )
+                if descriptor is not None:
+                    self._content_full_cache_hit_count += 1
+            if descriptor is None:
+                descriptor = sampler.feature_descriptor_at(
+                    source_local_seconds,
+                    include_subject_geometry=True,
+                    include_formation_pose=include_pose,
+                    **({"include_pose": False} if not include_pose else {}),
+                )
         except (cv2.error, ValueError, FloatingPointError):
             descriptor = None
         self._descriptor_cache[key] = descriptor
@@ -3389,6 +3424,8 @@ class _VideoDescriptorProvider:
             "descriptor_cache_hit_count": self._cache_hit_count,
             "descriptor_decode_count": self._decode_count,
             "descriptor_cache_entry_count": len(self._descriptor_cache),
+            "content_request_count": self._content_request_count,
+            "content_full_cache_hit_count": self._content_full_cache_hit_count,
             "persistent_visual_feature_cache": {
                 "contract": "ive_source_local_visual_features_v1",
                 "enabled_source_count": len(persistent),
@@ -12263,6 +12300,10 @@ def select_balanced_direct_member_sources(
     if provider is None:
         owned_provider = _VideoDescriptorProvider(resolved_sources)
         provider = owned_provider
+    # Custom providers keep their existing contract. Only this explicit
+    # content endpoint can omit joints; all boundary/motion calls below use
+    # the original provider and full focal authority.
+    content_provider = getattr(provider, 'content_at', None) or provider
     scene_cut_artifact_cache: dict[tuple[int, int], bool] = {}
 
     def _scene_cut_is_transient_portrait_fancam_artifact(
@@ -12303,7 +12344,7 @@ def select_balanced_direct_member_sources(
             for index, probe_master in enumerate(probe_master_seconds)
         )
         descriptors = tuple(
-            provider(
+            content_provider(
                 source_index,
                 resolved_sources[source_index],
                 max(0.0, local_seconds),
@@ -12389,7 +12430,7 @@ def select_balanced_direct_member_sources(
                         audio_offsets=offsets,
                         source_timewarps=clocks,
                     )
-                    descriptor = provider(source_index, source, local_seconds)
+                    descriptor = content_provider(source_index, source, local_seconds)
                     sample_count += 1
                     failed_sample_count += int(descriptor is None)
                     # These six samples only detect blank/obstructed/static
@@ -12410,7 +12451,7 @@ def select_balanced_direct_member_sources(
                         master_seconds, source_index=source_index,
                         audio_offsets=offsets, source_timewarps=clocks,
                     )
-                    descriptor = provider(source_index, source, local_seconds)
+                    descriptor = content_provider(source_index, source, local_seconds)
                     sample_count += 1
                     failed_sample_count += int(descriptor is None)
                     return _BoundarySample(
