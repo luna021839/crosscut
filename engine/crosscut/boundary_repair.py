@@ -142,6 +142,7 @@ class BoundaryRepairRequest:
     incoming_scene_cut_times_seconds: tuple[float, ...] = ()
     beat_period_seconds: float | None = None
     beat_intensity: float | None = None
+    output_timeline_origin_seconds: float | None = None
 
     def __post_init__(self) -> None:
         nominal = _finite(self.nominal_boundary_seconds, "nominal boundary")
@@ -151,6 +152,11 @@ class BoundaryRepairRequest:
         )
         end = _finite(self.incoming_segment_end_seconds, "incoming segment end")
         fps = _finite(self.output_fps, "output fps")
+        if self.output_timeline_origin_seconds is not None:
+            origin = _finite(self.output_timeline_origin_seconds, "output timeline origin")
+            if origin < 0.0 or origin > start:
+                raise ValueError("output timeline origin must precede the outgoing span")
+            object.__setattr__(self, "output_timeline_origin_seconds", origin)
         outgoing_offset = _finite(
             self.outgoing_source_offset_seconds,
             "outgoing source offset",
@@ -304,7 +310,7 @@ class BoundaryRepairResult:
 
     @property
     def changed(self) -> bool:
-        return self.selected.frame_offset != 0
+        return abs(self.selected.boundary_seconds - self.nominal_boundary_seconds) > 1e-9
 
     @property
     def nominal_candidate(self) -> BoundaryCandidateScore | None:
@@ -393,6 +399,7 @@ def repair_boundary(
     visual_cost_callback: BoundaryVisualCost | None = None,
     visual_costs_by_frame_offset: Mapping[int, float] | None = None,
     config: BoundaryRepairConfig | None = None,
+    visible_scene_cuts_callback: Callable[[BoundaryCandidateContext], tuple[tuple[float, ...], tuple[float, ...]]] | None = None,
 ) -> BoundaryRepairResult:
     """Choose a locally repaired cut without changing either source.
 
@@ -434,11 +441,14 @@ def repair_boundary(
     candidates: list[BoundaryCandidateScore] = []
     rejected: list[BoundaryCandidateRejection] = []
 
+    origin = request.output_timeline_origin_seconds
+    search_center = (request.nominal_boundary_seconds if origin is None else
+        origin + round((request.nominal_boundary_seconds-origin)*request.output_fps)/request.output_fps)
     for frame_offset in range(
         -settings.search_radius_frames,
         settings.search_radius_frames + 1,
     ):
-        boundary = request.nominal_boundary_seconds + frame_offset * frame_seconds
+        boundary = search_center + frame_offset * frame_seconds
         left_duration = boundary - request.outgoing_segment_start_seconds
         right_duration = request.incoming_segment_end_seconds - boundary
         if (
@@ -506,6 +516,8 @@ def repair_boundary(
             guard_seconds=guard_seconds,
             outgoing=False,
         )
+        if visible_scene_cuts_callback is not None:
+            outgoing_cuts, incoming_cuts = visible_scene_cuts_callback(context)
         beat_deviation = abs(boundary - request.nominal_boundary_seconds)
         if request.beat_period_seconds is None:
             beat_periods = 0.0
@@ -565,7 +577,8 @@ def repair_boundary(
         ),
     )
     return BoundaryRepairResult(
-        policy=BOUNDARY_REPAIR_POLICY,
+        policy=(BOUNDARY_REPAIR_POLICY if origin is None else
+                "fixed_source_output_tick_search_renderer_bound_flanks_v2"),
         nominal_boundary_seconds=request.nominal_boundary_seconds,
         selected=selected,
         candidates=tuple(candidates),

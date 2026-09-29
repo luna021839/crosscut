@@ -40,6 +40,9 @@ from .timeline import (
 from .timeline_review import TimelineReview, TimelineReviewConfig, review_timeline
 from .timewarp import TimeWarpMap
 from .render_span_clock import rendered_internal_cut_master_times
+from .render import RenderPlan, RenderSegment
+from .render_boundary_clock import hard_cut_boundary_sample_clocks
+from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_clock
 from .stage_edit_temporal_pose_motion import (
     TemporalPoseMotionBoundaryAnalysis,
     TemporalPoseMotionThresholds,
@@ -74,7 +77,7 @@ from .visual_splice_failure_feedback import (
 ANALYSIS_BASIS = (
     "decoded_plus_minus_three_frame_formation_layout_and_actual_pose_boundary_"
     "repair_v4+complete_success_offset_audit_v1+"
-    "temporal_pose_motion_audit_v1"
+    "temporal_pose_motion_audit_v1+renderer_bound_output_tick_audition_v2"
 )
 _PRODUCTION_REVIEW_GATES = TimelineReviewConfig()
 _NEAREST_TEMPORAL_POSE_RADIUS_FRAMES = 3
@@ -1969,6 +1972,7 @@ def repair_visual_timeline_boundaries(
     config: BoundaryRepairConfig | None = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     boundary_indices: Sequence[int] | None = None,
+    render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
 ) -> VisualBoundaryRepairPlan:
     """Return locally repaired timing for every or only requested boundaries.
 
@@ -2001,6 +2005,21 @@ def repair_visual_timeline_boundaries(
         raise ValueError("boundary-repair source arrays must have matching lengths")
     if not math.isfinite(output_fps) or output_fps <= 0.0:
         raise ValueError("output_fps must be positive and finite")
+    if render_frame_clocks is not None and (
+        len(render_frame_clocks) != len(sources)
+        or any(clock is not None and not isinstance(clock, VerifiedRenderFrameClock)
+               for clock in render_frame_clocks)
+    ):
+        raise ValueError("render frame clocks must match the boundary source domain")
+    verified_clocks = dict(enumerate(render_frame_clocks)) if render_frame_clocks is not None else {}
+
+    def verified_clock(source_index):
+        if source_index not in verified_clocks:
+            # Explicit descriptor fixtures retain their old unproven clock
+            # unless their caller supplies a separately verified source grid.
+            verified_clocks[source_index] = (probe_render_frame_clock(Path(sources[source_index]))
+                if descriptor_provider is None else None)
+        return verified_clocks[source_index]
     settings = config or BoundaryRepairConfig()
     # Reject unauthorized calibration before opening media, invoking a
     # descriptor provider, or discovering that every requested boundary can
@@ -2256,6 +2275,44 @@ def repair_visual_timeline_boundaries(
             incoming_offset = (
                 source_time(incoming.source_index, nominal) - nominal
             )
+            outgoing_clock = verified_clock(outgoing.source_index)
+            incoming_clock = verified_clock(incoming.source_index)
+            renderer_bound = outgoing_clock is not None and incoming_clock is not None
+            output_origin = choices[0].canonical_master_start
+            rendered_clocks_by_boundary = {}
+
+            def rendered_sample_times(boundary, flank_frames=3):
+                key = (boundary, flank_frames)
+                if key not in rendered_clocks_by_boundary:
+                    segments = []
+                    for index, choice in enumerate(choices):
+                        start = boundary if index == boundary_index+1 else choice.canonical_master_start
+                        end = boundary if index == boundary_index else choice.canonical_master_end
+                        source_start = source_time(choice.source_index, start) if index == boundary_index+1 else choice.source_local_start
+                        source_end = source_time(choice.source_index, end) if index == boundary_index else choice.source_local_end
+                        segments.append(RenderSegment(choice.source_index, source_start,
+                            end-start, start-output_origin, source_duration=source_end-source_start))
+                    # Geometry does not change source scheduling. This numeric
+                    # audit plan is never rendered or persisted as a video job.
+                    clock_plan = RenderPlan(tuple(Path(path) for path in sources),
+                        tuple(segments), outgoing.source_index, "16:9",
+                        Path(sources[0]).with_suffix(".clock-audit-unused.mp4"), fps=output_fps)
+                    samples = hard_cut_boundary_sample_clocks(clock_plan,
+                        {outgoing.source_index: outgoing_clock, incoming.source_index: incoming_clock},
+                        boundary_index=boundary_index, flank_frames=flank_frames)
+                    rendered_clocks_by_boundary[key] = tuple(sample.source_request_seconds for sample in samples)
+                return rendered_clocks_by_boundary[key]
+
+            def visible_scene_cuts(context):
+                before, last, first, after = rendered_sample_times(
+                    context.boundary_seconds, settings.interior_scene_cut_guard_frames)
+                def cuts_between(source_index, clock, lower, upper):
+                    rate = float(clock.frame_rate)
+                    low, high = int(lower*rate+.5), int(upper*rate+.5)
+                    return tuple(float(cut) for cut in scene_cut_times[source_index]
+                        if low < int(float(cut)*rate+.5) <= high)
+                return (cuts_between(outgoing.source_index, outgoing_clock, before, last),
+                        cuts_between(incoming.source_index, incoming_clock, first, after))
             evidence_by_offset: dict[
                 int,
                 tuple[BoundaryVisualEvidence, FrameVisualDescriptor, FrameVisualDescriptor],
@@ -2311,6 +2368,7 @@ def repair_visual_timeline_boundaries(
                                 evidence.temporal_pose_motion.to_dict()
                             ),
                             "visual_evidence": evidence.to_dict(),
+                            "sample_clock_basis": ("renderer_bound_output_ticks_v2" if renderer_bound else "unverified_legacy_midpoint_v1"),
                         }
                     )
                 return tuple(audit)
@@ -2324,13 +2382,28 @@ def repair_visual_timeline_boundaries(
                 incoming_exact_seconds = (
                     context.incoming_source_local_seconds + frame_seconds / 2.0
                 )
+                outgoing_preceding_seconds = outgoing_exact_seconds-side_sample_span_seconds
+                incoming_following_seconds = incoming_exact_seconds+side_sample_span_seconds
+                if renderer_bound:
+                    try:
+                        (outgoing_preceding_seconds, outgoing_exact_seconds,
+                         incoming_exact_seconds, incoming_following_seconds) = rendered_sample_times(context.boundary_seconds)
+                    except ValueError:
+                        return None
+                    if any(not 0 <= int(seconds*float(clock.frame_rate)+.5) < clock.frame_count
+                           for clock, seconds in (
+                               (outgoing_clock, outgoing_preceding_seconds),
+                               (outgoing_clock, outgoing_exact_seconds),
+                               (incoming_clock, incoming_exact_seconds),
+                               (incoming_clock, incoming_following_seconds))):
+                        return None
                 outgoing_descriptor = sample_descriptor(
                     outgoing.source_index,
                     outgoing_exact_seconds,
                 )
                 outgoing_preceding_descriptor = sample_descriptor(
                     outgoing.source_index,
-                    outgoing_exact_seconds - side_sample_span_seconds,
+                    outgoing_preceding_seconds,
                 )
                 incoming_descriptor = sample_descriptor(
                     incoming.source_index,
@@ -2338,7 +2411,7 @@ def repair_visual_timeline_boundaries(
                 )
                 incoming_following_descriptor = sample_descriptor(
                     incoming.source_index,
-                    incoming_exact_seconds + side_sample_span_seconds,
+                    incoming_following_seconds,
                 )
                 if (
                     outgoing_descriptor is None
@@ -2362,9 +2435,11 @@ def repair_visual_timeline_boundaries(
                         1, _NEAREST_TEMPORAL_POSE_RADIUS_FRAMES + 1
                     ):
                         offset = direction * distance
-                        candidate_seconds = (
-                            exact_seconds + offset * frame_seconds
-                        )
+                        step_seconds = (frame_seconds if not renderer_bound else
+                            (outgoing_exact_seconds-outgoing_preceding_seconds)/3.0
+                            if direction < 0 else
+                            (incoming_following_seconds-incoming_exact_seconds)/3.0)
+                        candidate_seconds = exact_seconds + offset * step_seconds
                         if crosses_source_camera_cut(
                             source_index,
                             exact_seconds,
@@ -2448,9 +2523,11 @@ def repair_visual_timeline_boundaries(
                         ),
                         beat_period_seconds=beat_period_seconds,
                         beat_intensity=1.0 if beat_period_seconds is not None else None,
+                        output_timeline_origin_seconds=output_origin if renderer_bound else None,
                     ),
                     visual_cost_callback=visual_cost,
                     config=settings,
+                    visible_scene_cuts_callback=visible_scene_cuts if renderer_bound else None,
                 )
                 evidence, outgoing_descriptor, incoming_descriptor = evidence_by_offset[
                     result.selected_frame_offset
@@ -2481,6 +2558,11 @@ def repair_visual_timeline_boundaries(
             original_scene_risk = bool(
                 outgoing.exit_scene_cut_near or incoming.entry_scene_cut_near
             )
+            if renderer_bound:
+                original_cuts = visible_scene_cuts(BoundaryCandidateContext(
+                    0, nominal, source_time(outgoing.source_index, nominal),
+                    source_time(incoming.source_index, nominal)))
+                original_scene_risk = any(original_cuts)
             if selected_scene_risk and not original_scene_risk:
                 failures.append(
                     bind_failure_to_attempt(
@@ -2625,7 +2707,7 @@ def repair_visual_timeline_boundaries(
         analysis_basis=(
             f"{visual_timeline.analysis_basis}+local_boundary_repair_v4+"
             "complete_success_offset_audit_v1+"
-            "temporal_pose_motion_audit_v1"
+            "temporal_pose_motion_audit_v1+renderer_bound_output_tick_audition_v2"
         ),
         selected_candidate_index=visual_timeline.selected_candidate_index,
         candidate_generation_basis=visual_timeline.candidate_generation_basis,

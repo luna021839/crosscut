@@ -160,3 +160,36 @@ def native_frame_clocks_for_output(
     if set(result) != wanted:
         raise RuntimeError('native sample coverage differs from requested output frames')
     return result
+
+
+def hard_cut_boundary_sample_clocks(
+    plan: RenderPlan, source_clocks: Mapping[int, VerifiedRenderFrameClock], *,
+    boundary_index: int, flank_frames: int = 3,
+) -> tuple[RenderedBoundaryNativeFrame, ...]:
+    """Four actually visible audition frames, never synthetic half-frame times.
+
+    Outgoing-before/last and incoming-first/after use the existing renderer
+    scheduling authority. A short run cannot borrow frames from another source,
+    and a terminal clone is not newly observed continuity evidence.
+    """
+    if not isinstance(plan, RenderPlan):
+        raise TypeError('hard-cut audition requires a RenderPlan')
+    if (isinstance(boundary_index, bool) or not isinstance(boundary_index, int)
+            or not 0 <= boundary_index < len(plan.segments)-1):
+        raise ValueError('audition boundary is outside the render plan')
+    if isinstance(flank_frames, bool) or not isinstance(flank_frames, int) or flank_frames < 1:
+        raise ValueError('audition flank frames must be a positive integer')
+    left, right = plan.segments[boundary_index:boundary_index+2]
+    if left.source_index == right.source_index:
+        raise ValueError('audition requires a cross-source hard cut')
+    counts = segment_frame_counts(plan)
+    cut_frame = sum(counts[:boundary_index+1])
+    requested = (cut_frame-1-flank_frames, cut_frame-1, cut_frame, cut_frame+flank_frames)
+    samples = native_frame_clocks_for_output(plan, source_clocks, requested)
+    result = tuple(samples[index] for index in requested)
+    if any(sample.terminal_clone for sample in result):
+        raise ValueError('terminal clone is not audition evidence')
+    if (any(sample.source_index != left.source_index for sample in result[:2])
+            or any(sample.source_index != right.source_index for sample in result[2:])):
+        raise ValueError('visible source run is shorter than audition flank')
+    return result

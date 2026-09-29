@@ -3616,6 +3616,14 @@ def _group_splice_analysis_basis_identity(
                     Path(__file__).with_name("visual_boundary_repair.py"),
                     root_symbols=("repair_visual_timeline_boundaries",),
                 ),
+                "rendered_boundary_clock": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("render_boundary_clock.py"),
+                    root_symbols=("hard_cut_boundary_sample_clocks",),
+                ),
+                "verified_source_frame_clock": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("render_frame_schedule.py"),
+                    root_symbols=("probe_render_frame_clock",),
+                ),
                 "splice_failure_feedback": python_symbol_dependency_sha256(
                     Path(__file__).with_name(
                         "visual_splice_failure_feedback.py"
