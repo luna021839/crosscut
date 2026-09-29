@@ -299,6 +299,109 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(decision.outgoing_state.roll_degrees, 1.0, places=5)
         self.assertEqual(plan.roll_event_count, 1)
 
+    def test_dense_strength_search_keeps_a_proved_partial_match_without_redecoding(self):
+        timeline = VisualTimelinePlan((
+            _choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.),
+        ), 1.)
+        calls = []
+
+        def frames(source, seconds):
+            calls.append((source, round(seconds * 30)))
+            return _frame(source, marker=50 if source == 0 else 100 + round((seconds - 1) * 30))
+
+        def observation(frame):
+            marker = round(float(frame.mean()))
+            if marker < 75:
+                box = (.41, .365, .18, .27)
+            else:
+                index = marker - 100
+                excursion = max(0., min(index / 5., (13. - index) / 8.))
+                box = (.42 - .371 * excursion, .38, .16, .24)
+            return BoundarySubjectObservation(face_count=1, face_box_xywh=box,
+                                              face_eye_scale=box[3] * .42)
+
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a'), Path('b')), transitions=(RenderTransition(tier='C'),),
+            fps=30., frame_provider=frames, observation_provider=observation,
+            source_resolutions=((1920, 1080),) * 2)
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertGreater(plan.dense_track_candidate_attempt_count, 1)
+        self.assertLessEqual(plan.dense_track_candidate_attempt_count, 5)
+        self.assertEqual(len(calls), len(set(calls)), 'strengths must share exact decoded observations')
+        decision = plan.decisions[0]
+        self.assertTrue(decision.partial_scale_alignment)
+        self.assertLess(decision.incoming_state.zoom, 1.125)
+        self.assertGreater(decision.incoming_state.zoom, 1.)
+        self.assertGreater(decision.baseline_geometry_mismatch - decision.transformed_geometry_mismatch, .015)
+        self.assertEqual(decision.validated_output_frame_count, 13)
+        track = plan.track_for(1)
+        settings = BoundarySubjectAlignmentConfig()
+        full_strength_failed_frames = 0
+        for index in range(14):
+            subject = _subject(observation(_frame(1, marker=100 + index)),
+                preferred_kind='face', settings=settings, framing_policy='close_face')
+            keyframe = track.evaluate(index / 30.)
+            chosen = _TransformState(keyframe.zoom, keyframe.center_x, keyframe.center_y,
+                                     keyframe.roll_degrees)
+            full = _TransformState(1. + .125 * (1. - index / 13.))
+            full_strength_failed_frames += min(_project_box(box, full)[1]
+                for box in subject.containment_boxes) < settings.minimum_face_visible_fraction
+            self.assertGreaterEqual(min(_project_box(box, chosen)[1]
+                for box in subject.containment_boxes), settings.minimum_face_visible_fraction)
+        self.assertGreater(full_strength_failed_frames, 0, 'the original first-choice curve must fail')
+
+    def test_bad_entry_ramp_does_not_remove_a_separately_valid_exit_ramp(self):
+        timeline = VisualTimelinePlan(tuple(
+            _choice(index, index, start=float(index), end=float(index + 1))
+            for index in range(3)), 1.)
+        calls = []
+
+        def frames(source, seconds):
+            calls.append((source, round(seconds * 30)))
+            missing = source == 1 and round((seconds - 1) * 30) == 6
+            return _frame(source, marker=0 if missing else 100 if source == 1 else 50)
+
+        observation = _observations(source0_box=(.41, .365, .18, .27),
+                                    source1_box=(.42, .38, .16, .24))
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=tuple(Path(str(index)) for index in range(3)),
+            transitions=(RenderTransition(tier='C'),) * 2, fps=30.,
+            frame_provider=frames, observation_provider=observation,
+            source_resolutions=((1920, 1080),) * 3)
+        self.assertFalse(plan.decisions[0].eligible)
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertTrue(plan.decisions[1].eligible)
+        self.assertEqual(plan.segments[1].boundary_indices, (1,))
+        self.assertEqual(plan.track_for(1).evaluate(0.).zoom, 1.)
+        self.assertGreater(plan.track_for(1).evaluate(29 / 30.).zoom, 1.)
+        self.assertLessEqual(plan.dense_track_candidate_attempt_count, 35)
+        self.assertEqual(len(calls), len(set(calls)))
+
+    def test_all_dense_strengths_still_reject_missing_geometry_with_bounded_work(self):
+        timeline = VisualTimelinePlan(tuple(
+            _choice(index, index, start=float(index), end=float(index + 1))
+            for index in range(3)), 1.)
+        calls = []
+
+        def frames(source, seconds):
+            calls.append((source, round(seconds * 30)))
+            missing = source == 1 and round((seconds - 1) * 30) in (6, 23)
+            return _frame(source, marker=0 if missing else 100 if source == 1 else 50)
+
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=tuple(Path(str(index)) for index in range(3)),
+            transitions=(RenderTransition(tier='C'),) * 2, fps=30., frame_provider=frames,
+            observation_provider=_observations(source0_box=(.41, .365, .18, .27),
+                                              source1_box=(.42, .38, .16, .24)),
+            source_resolutions=((1920, 1080),) * 3)
+        self.assertEqual(plan.eligible_count, 0)
+        self.assertIsNone(plan.track_for(1))
+        self.assertTrue(all(decision.rejection_reason == 'per_frame_subject_geometry_unavailable'
+                            for decision in plan.decisions))
+        self.assertLessEqual(plan.dense_track_candidate_attempt_count, 35)
+        self.assertEqual(len(calls), len(set(calls)))
+
     def test_missing_geometry_on_one_transformed_frame_fails_closed(self) -> None:
         timeline = VisualTimelinePlan(
             (

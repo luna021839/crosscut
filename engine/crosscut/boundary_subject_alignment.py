@@ -22,6 +22,8 @@ from .optional_native_worker import isolated_optional
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from functools import lru_cache
+from itertools import product
 import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -504,6 +506,7 @@ class BoundarySubjectAlignmentPlan:
     window_frames: int
     analysis_basis: str = ANALYSIS_BASIS
     sample_clock_basis: str = "unverified_injected_segment_clock_v1"
+    dense_track_candidate_attempt_count: int = 0
 
     @property
     def eligible_count(self) -> int:
@@ -584,7 +587,11 @@ class BoundarySubjectAlignmentPlan:
                 "legacy_editorial_schema_globally_relaxed": False,
                 "close_face_containment": "measured_face_plus_source_clipped_head_margin",
                 "medium_wide_containment": "full_visible_performer_or_formation",
+                "transform_search": "endpoint_valid_strengths_ranked_then_complete_dense_windows_v1",
+                "maximum_track_candidates_per_segment": 35,
+                "dense_observations_reused_across_strengths": True,
             },
+            "dense_track_candidate_attempt_count": self.dense_track_candidate_attempt_count,
             "decision_count": len(self.decisions),
             "eligible_count": self.eligible_count,
             "applied_segment_count": self.applied_segment_count,
@@ -1796,6 +1803,7 @@ def build_boundary_subject_alignment_plan(
                 )
         return None
 
+    @lru_cache(maxsize=2048)
     def dense_subject_at(
         choice_index: int, frame_index: int,
         preferred_kind: str, framing_policy: str | None,
@@ -1829,6 +1837,7 @@ def build_boundary_subject_alignment_plan(
 
     decisions: list[BoundarySubjectAlignmentDecision] = []
     candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
+    candidate_options: dict[int, tuple[BoundarySubjectAlignmentDecision, ...]] = {}
 
     def rejected(
         boundary_index: int,
@@ -2063,6 +2072,7 @@ def build_boundary_subject_alignment_plan(
             selected_state: _TransformState | None = None
             selected_transformed = baseline
             selected_layout = baseline_layout
+            valid_states: list[tuple[_TransformState, float, float]] = []
             saw_containment_failure = False
             saw_layout_failure = False
             for trial_state in state_candidates:
@@ -2128,10 +2138,11 @@ def build_boundary_subject_alignment_plan(
                     < settings.minimum_geometry_improvement_fraction
                 ):
                     continue
-                selected_state = trial_state
-                selected_transformed = trial_transformed
-                selected_layout = trial_layout
-                break
+                valid_states.append((trial_state, trial_transformed, trial_layout))
+                if selected_state is None:
+                    selected_state = trial_state
+                    selected_transformed = trial_transformed
+                    selected_layout = trial_layout
             if selected_state is None:
                 reason = (
                     "exact_subject_would_be_clipped"
@@ -2193,49 +2204,20 @@ def build_boundary_subject_alignment_plan(
             )
             decisions.append(candidate)
             candidate_by_boundary[boundary_index] = candidate
+            candidate_options[boundary_index] = tuple(
+                replace(candidate,
+                    outgoing_state=trial_state if transformed_side == "outgoing" else _TransformState(),
+                    incoming_state=trial_state if transformed_side == "incoming" else _TransformState(),
+                    transformed_geometry_mismatch=trial_transformed,
+                    transformed_layout_mismatch=trial_layout,
+                    roll_applied=abs(trial_state.roll_degrees) > 1e-6,
+                    partial_scale_alignment=desired_zoom > trial_state.zoom + 1e-9)
+                for trial_state, trial_transformed, trial_layout in valid_states
+            )
 
-        # Build segment-local curves.  Only the two choices adjacent to an
-        # eligible boundary can receive a transform; Tier-D neighbors never
-        # inherit, reset, or demote this curve.
-        invalid_boundaries: dict[int, str] = {}
-        segment_tracks: dict[int, EditorialTransformTrack] = {}
-        segment_boundaries: dict[int, tuple[int, ...]] = {}
-        for choice_index, choice in enumerate(choices):
-            entry_decision = candidate_by_boundary.get(choice_index - 1)
-            exit_decision = candidate_by_boundary.get(choice_index)
-            entry = (
-                (entry_decision.boundary_index, entry_decision.incoming_state)
-                if entry_decision is not None
-                and entry_decision.transformed_side == "incoming"
-                else None
-            )
-            exit = (
-                (exit_decision.boundary_index, exit_decision.outgoing_state)
-                if exit_decision is not None
-                and exit_decision.transformed_side == "outgoing"
-                else None
-            )
-            if entry is None and exit is None:
-                continue
-            last_frame_time = (counts[choice_index] - 1) / fps
-            try:
-                track = _track_for_segment(
-                    last_frame_time=last_frame_time,
-                    ramp_frames=settings.window_frames,
-                    fps=fps,
-                    entry=entry,
-                    exit=exit,
-                )
-            except ValueError:
-                for boundary in (entry, exit):
-                    if boundary is not None:
-                        invalid_boundaries[boundary[0]] = "composite_track_renderer_safety_rejection"
-                continue
-            if track is None:
-                continue
-            touched = tuple(
-                boundary[0] for boundary in (entry, exit) if boundary is not None
-            )
+        def validate_track(choice_index, track, selected):
+            """Same dense pixel/geometry gates for every competing curve."""
+            touched = tuple(selected)
             failure: str | None = None
             validated = 0
             optical_flow_validated = 0
@@ -2269,7 +2251,7 @@ def build_boundary_subject_alignment_plan(
                         frame_index if boundary_index == choice_index - 1
                         else counts[choice_index] - 1 - frame_index),
                 )
-                boundary = candidate_by_boundary[nearest_boundary]
+                boundary = selected[nearest_boundary]
                 preferred_kind = boundary.subject_kind
                 framing_policy = (
                     boundary.outgoing_shot_policy
@@ -2357,43 +2339,72 @@ def build_boundary_subject_alignment_plan(
                 ):
                     failure = "per_frame_layout_mismatch_gate"
                     break
-            if failure is not None:
-                for boundary_index in touched:
-                    invalid_boundaries[boundary_index] = failure
-                continue
-            segment_tracks[choice.segment_index] = track
-            segment_boundaries[choice.segment_index] = touched
-            for boundary_index in touched:
-                candidate_by_boundary[boundary_index] = replace(
-                    candidate_by_boundary[boundary_index],
-                    validated_output_frame_count=(
-                        candidate_by_boundary[boundary_index].validated_output_frame_count
-                        + validated
-                    ),
-                    optical_flow_containment_frame_count=(
-                        candidate_by_boundary[
-                            boundary_index
-                        ].optical_flow_containment_frame_count
-                        + optical_flow_validated
-                    ),
-                )
+            return failure, validated, optical_flow_validated
 
-        if invalid_boundaries:
-            for boundary_index, reason in invalid_boundaries.items():
-                candidate = candidate_by_boundary[boundary_index]
+        # Each cut transforms exactly one side, so a boundary belongs to one
+        # segment only. Try its endpoint-valid strengths against the COMPLETE
+        # visible settle, including any neighboring ramp. Choosing a weaker
+        # curve is not permission to skip a failed frame or relax a gate.
+        segment_tracks: dict[int, EditorialTransformTrack] = {}
+        segment_boundaries: dict[int, tuple[int, ...]] = {}
+        dense_attempts = 0
+        for choice_index, choice in enumerate(choices):
+            entry_options = tuple(item for item in candidate_options.get(choice_index - 1, ())
+                                  if item.transformed_side == "incoming")
+            exit_options = tuple(item for item in candidate_options.get(choice_index, ())
+                                 if item.transformed_side == "outgoing")
+            owned = {item.boundary_index for item in (*entry_options, *exit_options)}
+            if not owned:
+                continue
+            # At most (5+1)*(5+1)-1 = 35 combinations. The absent-side option
+            # preserves a valid neighbor when another ramp cannot be made
+            # safe. Prefer both cuts, then greatest proven endpoint gain.
+            combinations = [pair for pair in product((*entry_options, None), (*exit_options, None))
+                            if any(item is not None for item in pair)]
+            combinations.sort(key=lambda pair: (
+                -sum(item is not None for item in pair),
+                -sum(item.baseline_geometry_mismatch - item.transformed_geometry_mismatch
+                     for item in pair if item is not None),
+            ))
+            selected = {}
+            solo_failures: dict[int, str] = {}
+            for entry_decision, exit_decision in combinations:
+                trial = {item.boundary_index: item for item in (entry_decision, exit_decision)
+                         if item is not None}
+                dense_attempts += 1
+                try:
+                    track = _track_for_segment(
+                        last_frame_time=(counts[choice_index] - 1) / fps,
+                        ramp_frames=settings.window_frames, fps=fps,
+                        entry=(entry_decision.boundary_index, entry_decision.incoming_state)
+                              if entry_decision is not None else None,
+                        exit=(exit_decision.boundary_index, exit_decision.outgoing_state)
+                             if exit_decision is not None else None,
+                    )
+                    if track is None:
+                        raise ValueError("non-neutral candidates produced no track")
+                except ValueError:
+                    failure = "composite_track_renderer_safety_rejection"
+                else:
+                    failure, validated, optical_flow_validated = validate_track(choice_index, track, trial)
+                if failure is not None:
+                    if len(trial) == 1:
+                        solo_failures[next(iter(trial))] = failure
+                    continue
+                selected = trial
+                segment_tracks[choice.segment_index] = track
+                segment_boundaries[choice.segment_index] = tuple(trial)
+                for boundary_index, decision in trial.items():
+                    candidate_by_boundary[boundary_index] = replace(decision,
+                        validated_output_frame_count=validated,
+                        optical_flow_containment_frame_count=optical_flow_validated)
+                break
+            for boundary_index in owned - set(selected):
                 candidate_by_boundary[boundary_index] = replace(
-                    candidate,
-                    eligible=False,
-                    rejection_reason=reason,
-                    validated_output_frame_count=0,
+                    candidate_by_boundary[boundary_index], eligible=False,
+                    rejection_reason=solo_failures.get(boundary_index, "no_compatible_dense_track"),
+                    validated_output_frame_count=0, optical_flow_containment_frame_count=0,
                 )
-            # Remove every segment touching a failed boundary.  A surviving
-            # neighbor is rebuilt without it so one bad detector frame cannot
-            # cascade beyond the explicitly adjacent segment.
-            for segment_index, touched in tuple(segment_boundaries.items()):
-                if any(index in invalid_boundaries for index in touched):
-                    segment_tracks.pop(segment_index, None)
-                    segment_boundaries.pop(segment_index, None)
 
         final_decisions = tuple(
             candidate_by_boundary.get(item.boundary_index, item)
@@ -2414,6 +2425,7 @@ def build_boundary_subject_alignment_plan(
             tuple(headroom_items),
             settings.window_frames,
             sample_clock_basis=clock_basis,
+            dense_track_candidate_attempt_count=dense_attempts,
         )
     finally:
         if capture is not None:
