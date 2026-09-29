@@ -5,6 +5,7 @@ from unittest.mock import patch
 import crosscut.direct_member_visual as visual
 from crosscut.member_observation_search import ObservationState, ProposalEdge
 from engine.tests.test_member_bridge_spacing import edge as verified_edge
+from engine.tests.test_direct_member_visual import _optimizer_mismatch
 
 
 class KnownMemberEffectPolicyTests(unittest.TestCase):
@@ -45,6 +46,52 @@ class KnownMemberEffectPolicyTests(unittest.TestCase):
         self.assertEqual(graph[0][0][1].severe_flags, ('attention_scale',))
         self.assertTrue(result.optimizer_search_diagnostics['solver']['postsolve_path_audit_passed'])
         self.assertEqual(result.optimizer_search_diagnostics['cinematic_bridge_boundary_indices'], [0])
+
+    def test_empty_primary_proposal_uses_bounded_priority_not_exact_quality_search(self):
+        graph, context = self.fixture()
+        with patch.object(visual, '_member_milp_solve_limits',
+                          wraps=visual._member_milp_solve_limits) as limits:
+            result = visual._decide_direct_member_path_policy(graph, **context)
+        limits.assert_called_once_with(graph, lexicographic=False)
+        solver = result.optimizer_search_diagnostics['solver']
+        self.assertEqual(solver['requested_mip_relative_gap'], .10)
+        self.assertEqual(solver['time_limit_seconds'], 4.)
+        self.assertTrue(solver['postsolve_path_audit_passed'])
+        self.assertTrue(solver['silhouette_outlier_minimum_proven'])
+        self.assertEqual(solver['silhouette_outlier_proof_basis'], 'constant_zero_primary_objective')
+        self.assertEqual(solver['silhouette_outlier_count'], 0)
+        self.assertEqual(result.path[:2], (0, 1))
+
+    def test_nonconstant_primary_proposal_keeps_exact_lexicographic_search(self):
+        graph, context = self.fixture()
+        rows = [[list(row) for row in matrix] for matrix in graph]
+        rows[1][1][2] = ProposalEdge(ObservationState.ELIGIBLE, .10,
+            policy_evidence=replace(_optimizer_mismatch(.05), silhouette_mismatch=.40))
+        graph = tuple(tuple(tuple(row) for row in matrix) for matrix in rows)
+        with patch.object(visual, '_member_milp_solve_limits',
+                          wraps=visual._member_milp_solve_limits) as limits:
+            result = visual._decide_direct_member_path_policy(graph, **context)
+        limits.assert_called_once_with(graph, lexicographic=True)
+        solver = result.optimizer_search_diagnostics['solver']
+        self.assertEqual(solver['requested_mip_relative_gap'], 0.)
+        self.assertEqual(solver['time_limit_seconds'], 4.)
+        self.assertEqual(solver['silhouette_outlier_proof_basis'], 'exact_lexicographic_solver')
+        self.assertTrue(solver['postsolve_path_audit_passed'])
+
+    def test_measured_role_aware_quality_stays_exact_even_when_primary_is_empty(self):
+        proposals, context = self.fixture()
+        graph = tuple(tuple(tuple(edge.policy_evidence or _optimizer_mismatch(.05)
+            for edge in row) for row in matrix) for matrix in proposals)
+        result = visual._heterogeneous_cinematic_visual_path(graph,
+            source_order=(0, 1, 2), candidate_validity=context['candidate_validity'],
+            span_durations=(3.,) * 6, source_geometries=context['source_frame_geometries'],
+            priority_cut_boundary_indices=(0,), maximum_priority_cut_hold_count=0,
+            config=context['resolved_config'], require_cinematic_bridge=True)
+        self.assertIsNotNone(result)
+        solver = result[2]['solver']
+        self.assertEqual(solver['requested_mip_relative_gap'], 0.)
+        self.assertEqual(solver['time_limit_seconds'], 45.)
+        self.assertTrue(solver['postsolve_path_audit_passed'])
 
     def test_unknown_rejected_legacy_and_stale_effects_cannot_trigger_priority(self):
         good = verified_edge()

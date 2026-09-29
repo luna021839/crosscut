@@ -6360,7 +6360,7 @@ def _member_milp_solve_limits(matrices, *, lexicographic: bool = False):
     transition must be measured before delivery. Counterfactual infeasibility
     requires an actual solver proof; a time limit never supplies that proof.
     Real measured matrices retain the original quality optimization settings.
-    Keep the role-aware lexicographic objective exact even for proposals.
+    Keep any nonconstant role-aware primary objective exact even for proposals.
     """
     proposal_only = bool(matrices) and all(isinstance(edge, ProposalEdge)
         for matrix in matrices for row in matrix for edge in row)
@@ -10624,7 +10624,13 @@ def _heterogeneous_cinematic_visual_path(
         ),
         shape=(len(constraint_lower), variable_count),
     ).tocsr()
-    solve_limits = _member_milp_solve_limits(matrices, lexicographic=True)
+    # With no silhouette-outlier edges the primary objective is identically
+    # zero. Proving the artificial proposal-priority objective optimal would
+    # spend the entire solve budget without protecting any visual measurement.
+    # Measured matrices and a nonconstant primary objective remain exact.
+    solve_limits = _member_milp_solve_limits(
+        matrices, lexicographic=bool(professional_bad_silhouette_edges)
+    )
     result = milp(
         objective,
         integrality=integrality,
@@ -11218,7 +11224,14 @@ def _heterogeneous_cinematic_visual_path(
             "silhouette_outlier_maximum_for_professional_gate": (
                 maximum_professional_outlier_count
             ),
-            "silhouette_outlier_minimum_proven": status == 0,
+            "silhouette_outlier_minimum_proven": (
+                not professional_bad_silhouette_edges or status == 0
+            ),
+            "silhouette_outlier_proof_basis": (
+                "constant_zero_primary_objective"
+                if not professional_bad_silhouette_edges
+                else "exact_lexicographic_solver" if status == 0 else "not_proven"
+            ),
             "silhouette_professional_gate_predicted_to_pass": (
                 len(selected_bad_silhouette_edge_indices)
                 <= maximum_professional_outlier_count
