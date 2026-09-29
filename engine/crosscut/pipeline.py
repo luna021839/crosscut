@@ -21022,16 +21022,20 @@ def _validated_output_geometry_deferral(
             )
         )
         if decision is not None and decision.eligible:
-            transformed_segment_index = (
-                decision.outgoing_segment_index
-                if decision.transformed_side == "outgoing"
-                else decision.incoming_segment_index
+            transformed_segment_indices = (
+                (decision.outgoing_segment_index, decision.incoming_segment_index)
+                if decision.transformed_side == "both" else
+                (decision.outgoing_segment_index,) if decision.transformed_side == "outgoing"
+                else (decision.incoming_segment_index,)
             )
-            track_attached = bool(
-                editorial_motion is not None
-                and editorial_motion.track_for(transformed_segment_index)
-                is not None
-            )
+            try:
+                track_attached = bool(
+                    editorial_motion is not None
+                    and all(editorial_motion.track_for(index) is not None
+                            for index in transformed_segment_indices)
+                )
+            except ValueError:
+                track_attached = False
             geometry_improved = bool(
                 decision.baseline_geometry_mismatch is not None
                 and decision.transformed_geometry_mismatch is not None
@@ -21042,6 +21046,12 @@ def _validated_output_geometry_deferral(
                 subject_alignment is not None
                 and decision.validated_output_frame_count
                 >= subject_alignment.window_frames
+                and (decision.transformed_side != 'both' or (
+                    decision.outgoing_validated_output_frame_count > 0
+                    and decision.incoming_validated_output_frame_count > 0
+                    and decision.validated_output_frame_count == (
+                        decision.outgoing_validated_output_frame_count
+                        + decision.incoming_validated_output_frame_count)))
             )
             if (
                 track_attached

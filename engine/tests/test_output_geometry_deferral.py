@@ -199,6 +199,21 @@ class OutputGeometryDeferralTests(unittest.TestCase):
         self.assertFalse(result["raw_failure_thresholds_lowered"])
         self.assertEqual(result["unresolved_boundary_indices"], [])
 
+    def test_bilateral_deferral_requires_both_attached_tracks_and_side_counts(self):
+        review = _review_with_failure('focus_mismatch_exceeded')
+        alignment, motion = _alignment_and_motion(validated_output_frame_count=16)
+        decision = replace(alignment.decisions[0], transformed_side='both',
+            outgoing_validated_output_frame_count=8,incoming_validated_output_frame_count=8)
+        alignment = replace(alignment, decisions=(decision,))
+        def eligible(candidate, evidence=alignment):
+            return _validated_output_geometry_deferral(timeline_review=review,boundary_indices=(5,),
+                subject_alignment=evidence,editorial_motion=candidate)['pre_proxy_eligible']
+        self.assertFalse(eligible(motion))
+        complete = replace(motion, segments=(replace(motion.segments[0],segment_index=5,source_index=0),*motion.segments))
+        self.assertTrue(eligible(complete))
+        self.assertFalse(eligible(complete,replace(alignment,decisions=(replace(decision,
+            outgoing_validated_output_frame_count=0),))))
+
     def test_missing_track_or_dense_frames_fails_closed(self) -> None:
         review = _review_with_failure("focus_mismatch_exceeded")
         for attach_track, frame_count in ((False, 8), (True, 7)):

@@ -48,7 +48,7 @@ from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
-ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v4"
+ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v5"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -204,6 +204,7 @@ class BoundarySubjectAlignmentConfig:
     maximum_formation_zoom: float = 1.33
     maximum_silhouette_zoom: float = 1.08
     maximum_face_center_shift: float = 0.040
+    maximum_paired_face_center_shift: float = 0.100
     maximum_upper_body_center_shift: float = 0.040
     maximum_formation_center_shift: float = 0.018
     maximum_silhouette_center_shift: float = 0.025
@@ -244,6 +245,7 @@ class BoundarySubjectAlignmentConfig:
                 "maximum_formation_zoom",
                 "maximum_silhouette_zoom",
                 "maximum_face_center_shift",
+                "maximum_paired_face_center_shift",
                 "maximum_upper_body_center_shift",
                 "maximum_formation_center_shift",
                 "maximum_silhouette_center_shift",
@@ -270,6 +272,8 @@ class BoundarySubjectAlignmentConfig:
             raise ValueError("unknown-resolution zoom must be conservative")
         if not 0.0 <= self.maximum_center_shift <= 0.040:
             raise ValueError("boundary pan exceeds the renderer schema")
+        if not 0.0 <= self.maximum_paired_face_center_shift <= 0.100:
+            raise ValueError("paired face pan exceeds the bilateral framing budget")
         if not 0.0 <= self.maximum_roll_degrees <= 1.60:
             raise ValueError("boundary roll exceeds the renderer schema")
         if not 0.0 <= self.minimum_silhouette_confidence <= 1.0:
@@ -387,6 +391,8 @@ class BoundarySubjectAlignmentDecision:
     incoming_native_frame_index: int | None = None
     outgoing_output_frame_index: int | None = None
     incoming_output_frame_index: int | None = None
+    outgoing_validated_output_frame_count: int = 0
+    incoming_validated_output_frame_count: int = 0
 
     def __post_init__(self) -> None:
         if self.boundary_index < 0 or min(
@@ -413,11 +419,14 @@ class BoundarySubjectAlignmentDecision:
         if self.transformed_side is not None and self.transformed_side not in {
             "outgoing",
             "incoming",
+            "both",
         }:
             raise ValueError("transformed side is invalid")
         if min(
             self.validated_output_frame_count,
             self.optical_flow_containment_frame_count,
+            self.outgoing_validated_output_frame_count,
+            self.incoming_validated_output_frame_count,
         ) < 0:
             raise ValueError("validated frame counts cannot be negative")
         if self.optical_flow_containment_frame_count > self.validated_output_frame_count:
@@ -425,12 +434,8 @@ class BoundarySubjectAlignmentDecision:
 
     @property
     def uses_pan(self) -> bool:
-        state = (
-            self.outgoing_state
-            if self.transformed_side == "outgoing"
-            else self.incoming_state
-        )
-        return math.hypot(state.center_x - 0.5, state.center_y - 0.5) > 0.003
+        return any(math.hypot(state.center_x - 0.5, state.center_y - 0.5) > 0.003
+                   for state in (self.outgoing_state, self.incoming_state))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -465,6 +470,8 @@ class BoundarySubjectAlignmentDecision:
             "incoming_native_frame_index": self.incoming_native_frame_index,
             "outgoing_output_frame_index": self.outgoing_output_frame_index,
             "incoming_output_frame_index": self.incoming_output_frame_index,
+            "outgoing_validated_output_frame_count": self.outgoing_validated_output_frame_count,
+            "incoming_validated_output_frame_count": self.incoming_validated_output_frame_count,
         }
 
 
@@ -592,6 +599,10 @@ class BoundarySubjectAlignmentPlan:
                 "transform_search": "endpoint_valid_strengths_ranked_then_complete_dense_windows_v1",
                 "maximum_track_candidates_per_segment": 120,
                 "dense_observations_reused_across_strengths": True,
+                "paired_framing_fallback": "common_face_scale_center_on_two_unused_segments_v1",
+                "maximum_paired_framing_candidates_per_boundary": 5,
+                "paired_framing_publication": "both_complete_dense_windows_or_neither",
+                "paired_face_center_shift_cap": 0.10,
             },
             "dense_track_candidate_attempt_count": self.dense_track_candidate_attempt_count,
             "decision_count": len(self.decisions),
@@ -1494,6 +1505,61 @@ def _target_state(
     return (candidate, roll_applied)
 
 
+def _joint_face_alignment_states(
+    outgoing: _SubjectGeometry,
+    incoming: _SubjectGeometry,
+    *,
+    maximum_zooms: tuple[float, float],
+    settings: BoundarySubjectAlignmentConfig,
+) -> tuple[tuple[_TransformState, _TransformState, float, float], ...]:
+    """Bounded common framing, still requiring two complete dense reviews.
+
+    A nearly equal-size face can have a large vertical displacement. Scaling
+    only the smaller side gives too little crop margin to pan. Fund modest
+    zoom on BOTH original rasters and split the displacement between them.
+    No zoom-out, synthesized pixels, roll, identity claim or relaxed gate.
+    """
+    if outgoing.kind != 'face' or incoming.kind != 'face':
+        return ()
+    subjects = (outgoing, incoming)
+    baseline = _geometry_mismatch(outgoing.alignment_box, incoming.alignment_box)
+    baseline_layout = _layout_mismatch(outgoing.layout_boxes, incoming.layout_boxes)
+    centers = tuple(_center(subject.alignment_box) for subject in subjects)
+    candidates = {}
+    for extra in (1.02, 1.05, 1.08, 1.12, 1.18, 1.25, 1.33, 1.50):
+        common_scale = max(outgoing.scale, incoming.scale) * extra
+        zooms = tuple(common_scale / subject.scale for subject in subjects)
+        if any(zoom > maximum + 1e-9 for zoom, maximum in zip(zooms, maximum_zooms)):
+            continue
+        for weight in (0., .25, .5, .75, 1.):
+            center = tuple(centers[0][axis]*weight + centers[1][axis]*(1.-weight)
+                           for axis in (0, 1))
+            target = (center[0]-.005, center[1]-.005, .01, .01)
+            states = tuple(_target_state(box=subject.alignment_box, target_box=target,
+                zoom=zoom, roll_degrees=0., maximum_center_shift=settings.maximum_paired_face_center_shift,
+                settings=settings)[0] for subject, zoom in zip(subjects, zooms))
+            if any(state is None for state in states):
+                continue
+            visibility = min(_project_box(box, state)[1]
+                for subject, state in zip(subjects, states)
+                for box in (subject.alignment_box, *subject.containment_boxes))
+            if visibility + 1e-9 < settings.minimum_face_visible_fraction:
+                continue
+            mismatch = _geometry_mismatch(*(_project_box(subject.alignment_box, state)[0]
+                for subject, state in zip(subjects, states)))
+            layout = _layout_mismatch(*(tuple(_project_box(box, state)[0] for box in subject.layout_boxes)
+                for subject, state in zip(subjects, states)))
+            if (layout > settings.maximum_transformed_layout_mismatch
+                    or layout > baseline_layout + settings.maximum_layout_worsening
+                    or baseline-mismatch < settings.minimum_geometry_improvement
+                    or (baseline-mismatch)/max(1e-9, baseline) < settings.minimum_geometry_improvement_fraction):
+                continue
+            candidates[states] = (states[0], states[1], mismatch, layout)
+    # Subpixel floating-point noise is not a reason to zoom farther. Prefer
+    # the smallest raster consumption among equivalent geometric matches.
+    return tuple(sorted(candidates.values(), key=lambda item: (round(item[2], 6), item[0].zoom+item[1].zoom))[:5])
+
+
 def _headroom(
     source_index: int,
     resolution: tuple[int, int] | None,
@@ -1709,6 +1775,14 @@ def build_boundary_subject_alignment_plan(
             return None
         return _fixed_crop_at(match.pan_crop, frame_index / fps)
 
+    def maximum_zoom_at(choice_index, frame_index, subject_kind):
+        crop = base_crop_for(choice_index, frame_index)
+        source = choices[choice_index].source_index
+        return min(_headroom(source, resolutions[source], output_width=output_width,
+            output_height=output_height, base_crop_scale=crop[3] if crop else 1.,
+            base_crop_width_scale=crop[2] if crop else 1., settings=settings).effective_max_zoom,
+            _subject_zoom_cap(subject_kind, settings))
+
     # The serialized source-level value describes untouched source pixels.
     # A segment-specific base crop is accounted for again at the exact side we
     # intend to transform; one cropped close-up must not penalize every raw shot
@@ -1889,6 +1963,7 @@ def build_boundary_subject_alignment_plan(
     decisions: list[BoundarySubjectAlignmentDecision] = []
     candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
     candidate_options: dict[int, tuple[BoundarySubjectAlignmentDecision, ...]] = {}
+    joint_options: dict[int, tuple[BoundarySubjectAlignmentDecision, ...]] = {}
 
     def rejected(
         boundary_index: int,
@@ -2021,6 +2096,23 @@ def build_boundary_subject_alignment_plan(
                     )
                 )
                 continue
+            if (subject_kind == 'face' and not outgoing_cut and not incoming_cut
+                    and all(observation.face_landmarks_xy is not None
+                            and len(observation.face_landmarks_xy) == 5
+                            and observation.face_eye_scale is not None
+                            for observation in (outgoing_observation, incoming_observation))):
+                paired_states = _joint_face_alignment_states(outgoing_subject, incoming_subject,
+                    maximum_zooms=(maximum_zoom_at(boundary_index, counts[boundary_index]-1, subject_kind),
+                                   maximum_zoom_at(boundary_index+1, 0, subject_kind)), settings=settings)
+                template = rejected(boundary_index, 'paired_framing_not_dense_validated',
+                    subject_kind=subject_kind, baseline=baseline, ratio=ratio,
+                    outgoing_policy=outgoing_policy, incoming_policy=incoming_policy,
+                    baseline_layout=baseline_layout)
+                joint_options[boundary_index] = tuple(replace(template, eligible=True,
+                    rejection_reason=None, transformed_side='both', outgoing_state=left_state,
+                    incoming_state=right_state, transformed_geometry_mismatch=mismatch,
+                    transformed_layout_mismatch=layout)
+                    for left_state, right_state, mismatch, layout in paired_states)
             if outgoing_scale < incoming_scale:
                 transformed_side = "outgoing"
                 source_index = left.source_index
@@ -2069,27 +2161,7 @@ def build_boundary_subject_alignment_plan(
                 if transformed_side == "outgoing"
                 else 0
             )
-            transformed_base_crop = base_crop_for(
-                transformed_choice_index,
-                transformed_frame_index,
-            )
-            maximum_zoom = min(
-                _headroom(
-                source_index,
-                resolutions[source_index],
-                output_width=output_width,
-                output_height=output_height,
-                base_crop_scale=(
-                    transformed_base_crop[3]
-                    if transformed_base_crop is not None
-                    else 1.0
-                ),
-                base_crop_width_scale=(transformed_base_crop[2]
-                    if transformed_base_crop is not None else 1.0),
-                    settings=settings,
-                ).effective_max_zoom,
-                _subject_zoom_cap(subject_kind, settings),
-            )
+            maximum_zoom = maximum_zoom_at(transformed_choice_index, transformed_frame_index, subject_kind)
             desired_zoom = ratio
             if ratio <= settings.already_matched_scale_ratio:
                 desired_zoom = 1.02
@@ -2347,7 +2419,7 @@ def build_boundary_subject_alignment_plan(
                 preferred_kind = boundary.subject_kind
                 framing_policy = (
                     boundary.outgoing_shot_policy
-                    if boundary.transformed_side == "outgoing"
+                    if choice_index == nearest_boundary
                     else boundary.incoming_shot_policy
                 )
                 # Keep the verified endpoint's framing contract through this
@@ -2498,6 +2570,48 @@ def build_boundary_subject_alignment_plan(
                     rejection_reason=solo_failures.get(boundary_index, "no_compatible_dense_track"),
                     validated_output_frame_count=0, optical_flow_containment_frame_count=0,
                 )
+
+        # Preserve every already validated independent ramp. A paired fallback
+        # may claim only two unused segments; this avoids silently changing a
+        # neighboring cut or combining independently approved curves. Publish
+        # BOTH tracks only after BOTH complete visible windows pass.
+        initial_decisions = {item.boundary_index: item for item in decisions}
+        for boundary_index, options in sorted(joint_options.items()):
+            current = candidate_by_boundary.get(boundary_index, initial_decisions[boundary_index])
+            sides = (boundary_index, boundary_index+1)
+            if (current.eligible or not options
+                    or any(choices[index].segment_index in segment_tracks for index in sides)):
+                continue
+            for candidate in options:
+                tracks = []
+                counts_by_side = []
+                flow_count = 0
+                for index in sides:
+                    outgoing = index == boundary_index
+                    dense_attempts += 1
+                    track = _track_for_segment(last_frame_time=(counts[index]-1)/fps,
+                        ramp_frames=settings.window_frames, fps=fps,
+                        entry=None if outgoing else (boundary_index, candidate.incoming_state),
+                        exit=(boundary_index, candidate.outgoing_state) if outgoing else None)
+                    if track is None:
+                        break
+                    failure, validated, tracked = validate_track(index, track, {boundary_index: candidate})
+                    if failure is not None:
+                        break
+                    tracks.append(track)
+                    counts_by_side.append(validated)
+                    flow_count += tracked
+                if len(tracks) != 2:
+                    continue
+                for index, track in zip(sides, tracks):
+                    segment_tracks[choices[index].segment_index] = track
+                    segment_boundaries[choices[index].segment_index] = (boundary_index,)
+                candidate_by_boundary[boundary_index] = replace(candidate,
+                    validated_output_frame_count=sum(counts_by_side),
+                    optical_flow_containment_frame_count=flow_count,
+                    outgoing_validated_output_frame_count=counts_by_side[0],
+                    incoming_validated_output_frame_count=counts_by_side[1])
+                break
 
         final_decisions = tuple(
             candidate_by_boundary.get(item.boundary_index, item)

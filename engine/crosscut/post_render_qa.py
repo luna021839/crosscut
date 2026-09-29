@@ -4600,6 +4600,7 @@ def _bound_local_alignment_tracks(
         "exact_cut_frame_shot_adaptive_subject_alignment_v2",
         "exact_cut_frame_shot_adaptive_subject_alignment_v3",
         "exact_cut_frame_shot_adaptive_subject_alignment_v4",
+        "exact_cut_frame_shot_adaptive_subject_alignment_v5",
     }:
         return set(), set()
     try:
@@ -4640,8 +4641,12 @@ def _bound_local_alignment_tracks(
         for boundary_index in indices:
             boundary = decisions.get(boundary_index, {}) if _integer(boundary_index) is not None else {}
             side = boundary.get("transformed_side")
+            paired = side == 'both' and alignment.get('analysis_basis') == 'exact_cut_frame_shot_adaptive_subject_alignment_v5'
+            if paired:
+                side = 'outgoing' if boundary.get('outgoing_segment_index') == index else 'incoming'
             target = boundary.get(f"{side}_segment_index")
-            count = _integer(boundary.get("validated_output_frame_count"))
+            count = _integer(boundary.get(f'{side}_validated_output_frame_count'
+                if paired else "validated_output_frame_count"))
             valid = bool(valid and boundary.get("eligible") is True
                 and boundary.get("rejection_reason") is None and target == index
                 and boundary.get("outgoing_segment_index") == boundary_index
@@ -4651,6 +4656,12 @@ def _bound_local_alignment_tracks(
                 and 0 <= boundary_index < len(typed.transitions)
                 and typed.transitions[boundary_index].kind.value == "hard_cut"
                 and typed.segments[boundary_index].source_index != typed.segments[boundary_index+1].source_index)
+            if paired:
+                side_counts = tuple(_integer(boundary.get(f'{name}_validated_output_frame_count'))
+                                    for name in ('outgoing', 'incoming'))
+                valid = bool(valid and indices == [boundary_index]
+                    and all(value is not None and value > 0 for value in side_counts)
+                    and boundary.get('validated_output_frame_count') == sum(value or 0 for value in side_counts))
             if not valid:
                 break
             endpoint = track.evaluate((counts[index]-1)/typed.fps if side == "outgoing" else 0.)
@@ -4665,6 +4676,23 @@ def _bound_local_alignment_tracks(
         if valid:
             bound_segments.add(index)
             bound_boundaries.update(indices)
+    # A paired endpoint was measured relative to the other transformed side.
+    # One attached/validated curve can never inherit the paired authority.
+    while True:
+        previous_bound = set(bound_segments)
+        for boundary_index in tuple(bound_boundaries):
+            boundary = decisions[boundary_index]
+            if boundary.get('transformed_side') != 'both':
+                continue
+            pair = {boundary.get('outgoing_segment_index'), boundary.get('incoming_segment_index')}
+            if not pair <= bound_segments:
+                bound_segments.difference_update(pair)
+        if bound_segments == previous_bound:
+            break
+    bound_boundaries = {boundary for boundary in bound_boundaries
+        if ({decisions[boundary].get('outgoing_segment_index'), decisions[boundary].get('incoming_segment_index')}
+            if decisions[boundary].get('transformed_side') == 'both' else
+            {decisions[boundary].get(f"{decisions[boundary].get('transformed_side')}_segment_index")}) <= bound_segments}
     return bound_segments, bound_boundaries
 
 
@@ -4681,7 +4709,8 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
     alignment = _mapping(motion.get('boundary_subject_alignment')) or {}
     basis = alignment.get('analysis_basis')
     subject_caps = {'face': 2.0}
-    if basis == 'exact_cut_frame_shot_adaptive_subject_alignment_v4':
+    if basis in {'exact_cut_frame_shot_adaptive_subject_alignment_v4',
+                 'exact_cut_frame_shot_adaptive_subject_alignment_v5'}:
         subject_caps['formation'] = 1.33
     elif basis != 'exact_cut_frame_shot_adaptive_subject_alignment_v3':
         return {}
@@ -4775,6 +4804,14 @@ def _transform_metrics(
     motion_segments = [_mapping(raw) or {} for raw in segments]
     plan_segments = _sequence(plan.get("segments")) or []
     local_alignment_segments, local_alignment_boundaries = _bound_local_alignment_tracks(motion, plan)
+    alignment_report = _mapping(motion.get('boundary_subject_alignment')) or {}
+    paired_alignment_segments = {
+        segment for raw in (_sequence(alignment_report.get('decisions')) or [])
+        if (item := _mapping(raw)) is not None and item.get('transformed_side') == 'both'
+        and item.get('boundary_index') in local_alignment_boundaries
+        for segment in (item.get('outgoing_segment_index'), item.get('incoming_segment_index'))
+        if segment in local_alignment_segments
+    }
     native_zoom_budgets = _native_local_alignment_zoom_budgets(
         motion, plan, local_alignment_segments, config, runner=runner)
     frame_visible_contract = motion.get("event_count_contract") == "frame_visible_active_targets_v1"
@@ -4962,7 +4999,8 @@ def _transform_metrics(
             max_zoom > native_zoom_budgets.get(segment_index, {}).get(
                 'maximum_zoom', config.maximum_editorial_zoom) + 1e-9
             or max_shift > (
-                max(config.maximum_editorial_center_shift, 0.04)
+                max(config.maximum_editorial_center_shift,
+                    0.10 if segment_index in paired_alignment_segments else 0.04)
                 if segment_index in local_alignment_segments
                 else config.maximum_editorial_center_shift
             ) + 1e-9
