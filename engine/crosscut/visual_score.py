@@ -1442,7 +1442,7 @@ def _select_safe_cadence_candidates(
                 candidates_by_segment,
                 config=profile.config,
                 preferred_source_ids=preferred_source_ids,
-                maximum_results=16,
+                maximum_results=1 if maximum_results == 1 else 16,
                 diversity_penalty=0.12,
                 minimum_hamming_fraction=0.02,
                 forbidden_boundary_edges=forbidden_boundary_edges,
@@ -1458,6 +1458,12 @@ def _select_safe_cadence_candidates(
             if role_audit is not None:
                 role_audit["candidate_generation_exhaustion"] = exc.to_dict()
             pool = ()
+        # A first-result request has no alternative-cohort consumer. Its first
+        # viable profile is the same first item the round-robin would retain,
+        # without solving another 47 paths that cannot be selected. Infeasible
+        # profiles still advance to the next profile with identical hard gates.
+        if maximum_results == 1 and pool:
+            return ((pool[0],), (profile.name,))
         pools.append(pool)
     pooled = tuple(pools)
     candidates: list[TimelineResult] = []
@@ -2157,6 +2163,21 @@ def _validated_sha256_identity(value: object, name: str) -> str:
     return value
 
 
+def _validate_visual_result_limit(
+    value: int, *, singleton: bool, name: str,
+) -> None:
+    """Keep first-result materialization distinct from an 8–32 path cohort."""
+    if not isinstance(singleton, bool):
+        raise TypeError("singleton must be a boolean")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not (value == 1 if singleton else 8 <= value <= 32)
+    ):
+        expected = "1 for singleton materialization" if singleton else "between 8 and 32"
+        raise ValueError(f"{name} must be {expected}")
+
+
 @dataclass(frozen=True, slots=True)
 class VisualTimelineOptimizerWorkspace:
     """Transient descriptor lattice and every input needed to rerun the DP.
@@ -2183,6 +2204,7 @@ class VisualTimelineOptimizerWorkspace:
     ] = field(default_factory=dict, repr=False, compare=False)
     prescribed_source_ids: tuple[str, ...] | None = None
     maximum_results: int = 32
+    singleton: bool = False
 
     def __post_init__(self) -> None:
         segments = tuple(
@@ -2249,12 +2271,10 @@ class VisualTimelineOptimizerWorkspace:
         phrases = tuple(float(value) for value in self.phrase_times)
         if any(not math.isfinite(value) for value in phrases):
             raise ValueError("workspace phrase times must be finite")
-        if (
-            isinstance(self.maximum_results, bool)
-            or not isinstance(self.maximum_results, int)
-            or not 8 <= self.maximum_results <= 32
-        ):
-            raise ValueError("workspace maximum_results must be between 8 and 32")
+        _validate_visual_result_limit(
+            self.maximum_results, singleton=self.singleton,
+            name="workspace maximum_results",
+        )
         object.__setattr__(self, "candidates_by_segment", segments)
         object.__setattr__(
             self,
@@ -2323,6 +2343,7 @@ class VisualTimelineCandidateSet:
         repr=False,
         compare=False,
     )
+    singleton: bool = False
 
     def __post_init__(self) -> None:
         records = tuple(self.candidates)
@@ -2390,12 +2411,10 @@ class VisualTimelineCandidateSet:
             raise TypeError(
                 "optimizer_workspace must be a VisualTimelineOptimizerWorkspace"
             )
-        if (
-            isinstance(self.requested_maximum_results, bool)
-            or not isinstance(self.requested_maximum_results, int)
-            or not 8 <= self.requested_maximum_results <= 32
-        ):
-            raise ValueError("requested_maximum_results must be between 8 and 32")
+        _validate_visual_result_limit(
+            self.requested_maximum_results, singleton=self.singleton,
+            name="requested_maximum_results",
+        )
         if not records:
             raise ValueError("visual timeline candidate set cannot be empty")
         if self.prescribed_render_segments is not None:
@@ -2442,6 +2461,8 @@ class VisualTimelineCandidateSet:
             or self.minimum_materialization_target < 1
         ):
             raise ValueError("minimum_materialization_target must be positive")
+        if self.singleton and self.minimum_materialization_target != 1:
+            raise ValueError("singleton materialization target must be 1")
         expected_indices = tuple(range(len(records)))
         if tuple(record.candidate_index for record in records) != expected_indices:
             raise ValueError("candidate indices must be contiguous generation order")
@@ -2496,6 +2517,11 @@ class VisualTimelineCandidateSet:
                         "visual candidate source_id is outside the source list"
                     )
         if self.optimizer_workspace is not None:
+            if (
+                self.optimizer_workspace.singleton != self.singleton
+                or self.optimizer_workspace.maximum_results != self.requested_maximum_results
+            ):
+                raise ValueError("candidate-set result mode must match its optimizer workspace")
             if optimizer_input_identity is None:
                 raise ValueError(
                     "candidate set with optimizer workspace needs input identity"
@@ -2682,6 +2708,7 @@ class VisualTimelineCandidateSet:
     def to_dict(self) -> dict[str, Any]:
         return {
             "candidate_generation_basis": self.candidate_generation_basis,
+            "selection_mode": "singleton" if self.singleton else "alternative_cohort",
             "candidate_count": len(self.candidates),
             "requested_maximum_results": self.requested_maximum_results,
             "minimum_materialization_target": self.minimum_materialization_target,
@@ -2818,6 +2845,11 @@ class VisualTimelineOptimizerSeed:
             raise ValueError(
                 "optimizer seed requested_maximum_results must be between 8 and 32"
             )
+        if (
+            self.optimizer_workspace.singleton
+            or self.optimizer_workspace.maximum_results != self.requested_maximum_results
+        ):
+            raise ValueError("optimizer seed requires a matching alternative-cohort workspace")
         if (
             isinstance(self.minimum_materialization_target, bool)
             or not isinstance(self.minimum_materialization_target, int)
@@ -6525,12 +6557,6 @@ def _build_visual_timeline(
     every decoded sample and the persisted source-local span.
     """
 
-    if (
-        isinstance(maximum_candidate_results, bool)
-        or not isinstance(maximum_candidate_results, int)
-        or not 8 <= maximum_candidate_results <= 32
-    ):
-        raise ValueError("maximum_candidate_results must be between 8 and 32")
     if not isinstance(candidate_set_only, bool) or not isinstance(
         optimizer_seed_only,
         bool,
@@ -6540,6 +6566,11 @@ def _build_visual_timeline(
         raise ValueError(
             "optimizer_seed_only requires candidate_set_only output mode"
         )
+    singleton = not candidate_set_only and maximum_candidate_results == 1
+    _validate_visual_result_limit(
+        maximum_candidate_results, singleton=singleton,
+        name="maximum_candidate_results",
+    )
     source_count = len(sources)
     if prescribed_render_segments is not None:
         from .render import RenderSegment
@@ -7105,7 +7136,7 @@ def _build_visual_timeline(
     candidate_generation_basis = (
         "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
     )
-    minimum_materialization_target = 1 if prescribed_indices is not None else 8
+    minimum_materialization_target = 1 if singleton or prescribed_indices is not None else 8
     if prescribed_indices is not None:
         candidate_generation_basis = (
             "prescribed_source_path_visual_hard_gates_then_reference_review_v1"
@@ -7114,6 +7145,12 @@ def _build_visual_timeline(
         candidate_generation_basis = (
             "human_reference_role_conditioned_three_cadence_profiles_"
             "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
+        )
+    if singleton:
+        candidate_generation_basis = (
+            "first_viable_safe_cadence_singleton_then_reference_review_v1"
+            if professional_montage_selection_policy is None else
+            "human_reference_role_conditioned_first_viable_safe_cadence_singleton_v1"
         )
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"
@@ -7165,6 +7202,7 @@ def _build_visual_timeline(
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         prescribed_source_ids=workspace_prescribed_source_ids,
         maximum_results=maximum_candidate_results,
+        singleton=singleton,
     )
     if optimizer_seed_only:
         return VisualTimelineOptimizerSeed(
@@ -7222,6 +7260,7 @@ def _build_visual_timeline(
         feature_cache_directory=feature_cache_directory,
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache,
+        singleton=singleton,
     )
     if candidate_set_only:
         return candidate_set
@@ -7250,7 +7289,11 @@ def build_visual_timeline(
     require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
 ) -> VisualTimelinePlan:
-    """Build the selected visual plan while preserving the existing API."""
+    """Build a selected plan, optionally requesting only one complete path.
+
+    ``maximum_results=1`` is a bounded first-result request, not an alternative
+    cohort. The candidate-set and optimizer-seed APIs still require 8–32.
+    """
 
     result = _build_visual_timeline(
         sources=sources,

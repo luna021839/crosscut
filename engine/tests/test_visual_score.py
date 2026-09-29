@@ -273,6 +273,89 @@ class VisualScoreTests(unittest.TestCase):
         self.assertEqual(cadence_profiles.count("reference"), 11)
         self.assertEqual(cadence_profiles.count("dense_safe"), 10)
 
+    def test_singleton_uses_one_path_and_stops_at_first_viable_profile(self) -> None:
+        result = self.timeline_result("0")
+        exhausted = NoCompleteTimelinePath("exhausted", reason_code="test_exhaustion")
+        for failures in range(3):
+            with self.subTest(failures=failures), patch(
+                "crosscut.visual_score.select_timeline_candidates",
+                side_effect=[exhausted] * failures + [(result,)],
+            ) as select:
+                results, profiles = _select_safe_cadence_candidates(
+                    ((result.candidates[0],),), preferred_source_ids=None,
+                    diversity=VisualDiversityConfig(), maximum_results=1,
+                )
+                self.assertEqual(results, (result,))
+                self.assertEqual(profiles, (("balanced", "reference", "dense_safe")[failures],))
+                self.assertEqual(select.call_count, failures + 1)
+                self.assertTrue(all(call.kwargs["maximum_results"] == 1 for call in select.call_args_list))
+
+    def test_singleton_real_builder_materializes_complete_plan(self) -> None:
+        descriptor = FrameVisualDescriptor(
+            quality_score=0.95, composition_score=0.90, shot_scale=0.4,
+            shot_type=ShotType.MEDIUM, face_count=0,
+            structure_embedding=(0.0,) * 96, motion=(0.0, 0.0),
+        )
+        class Sampler:
+            def __init__(self, *_args, **_kwargs):
+                pass
+            def feature_descriptor_at(self, *_args, **_kwargs):
+                return descriptor
+            descriptor_at = feature_descriptor_at
+            transition_descriptor_at = feature_descriptor_at
+            def sface_embedding_at(self, *_args, **_kwargs):
+                return ()
+            def close(self):
+                pass
+
+        from crosscut.visual_score import materialize_visual_timeline_candidate
+        with patch("crosscut.visual_score._VideoSampler", Sampler), patch(
+            "crosscut.visual_score.materialize_visual_timeline_candidate",
+            wraps=materialize_visual_timeline_candidate,
+        ) as materialize:
+            plan = build_visual_timeline(
+                sources=(Path("a.mp4"), Path("b.mp4")),
+                canonical_spans=((1., 2.), (2., 3.)), audio_offsets=(0., 0.5),
+                sync_scores=(0.95, 0.9), scene_cut_times=((), ()), maximum_results=1,
+            )
+        self.assertEqual(len(plan.choices), 2)
+        self.assertEqual(len(plan.candidate_review_summaries), 1)
+        carrier = materialize.call_args.args[0]
+        self.assertTrue(carrier.singleton)
+        self.assertTrue(carrier.optimizer_workspace.singleton)
+        self.assertEqual(carrier.requested_maximum_results, 1)
+        self.assertEqual(carrier.minimum_materialization_target, 1)
+        self.assertEqual(carrier.to_dict()["selection_mode"], "singleton")
+        for choice in plan.choices:
+            self.assertAlmostEqual(choice.source_local_start,
+                                   choice.canonical_master_start + carrier.audio_offsets[choice.source_index])
+        with self.assertRaisesRegex(ValueError, "between 8 and 32"):
+            replace(carrier, singleton=False)
+        with self.assertRaisesRegex(ValueError, "target must be 1"):
+            replace(carrier, minimum_materialization_target=8)
+        with self.assertRaisesRegex(ValueError, "alternative-cohort workspace"):
+            VisualTimelineOptimizerSeed(
+                optimizer_workspace=carrier.optimizer_workspace,
+                optimizer_input_identity=carrier.optimizer_input_identity,
+                sources=carrier.sources, audio_offsets=carrier.audio_offsets,
+                source_timewarps=carrier.source_timewarps,
+                source_clock_basis=carrier.source_clock_basis, requested_maximum_results=8,
+            )
+
+    def test_cohort_and_optimizer_seed_still_reject_singleton_before_sensing(self) -> None:
+        args = dict(sources=(Path("a.mp4"), Path("b.mp4")),
+                    canonical_spans=((1., 2.),), audio_offsets=(0., 0.),
+                    sync_scores=(0.9, 0.9), scene_cut_times=((), ()))
+        with patch("crosscut.visual_score._create_video_samplers") as samplers:
+            for builder in (build_visual_timeline_candidate_set, build_visual_timeline_optimizer_seed):
+                for count in (1, 2, 7, True, 1.0, 33):
+                    with self.subTest(builder=builder.__name__, count=count), self.assertRaises(ValueError):
+                        builder(**args, maximum_results=count)
+            for count in (0, 2, 7, True, 1.0, 33):
+                with self.subTest(builder="selected", count=count), self.assertRaises(ValueError):
+                    build_visual_timeline(**args, maximum_results=count)
+        samplers.assert_not_called()
+
     def test_safe_cadence_profile_exhaustion_keeps_other_profiles(self) -> None:
         reference = self.timeline_result("reference")
         dense = self.timeline_result("dense")

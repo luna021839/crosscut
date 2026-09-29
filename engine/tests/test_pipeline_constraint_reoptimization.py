@@ -2476,6 +2476,33 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("리듬 타임라인", warnings[0])
 
+    def test_review_first_failure_persists_original_error_without_rhythm_fallback(self) -> None:
+        for retained in (False, True):
+            with self.subTest(retained=retained), tempfile.TemporaryDirectory() as directory:
+                request = SimpleNamespace(
+                    sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+                    output_directory=Path(directory), edit_mode=EditMode.GROUP,
+                    review_first_enabled=True,
+                )
+                warnings = []
+                original = ValueError("maximum_candidate_results must be between 8 and 32")
+                kwargs = dict(request=request, base_filename="group", eligible_indices=(0, 1),
+                              exc=original, joint_visual_selection_attempted=False,
+                              joint_visual_selection_active=False, materialized_candidate_count=0,
+                              warnings=warnings, complete_incumbent_retained=retained)
+                if retained:
+                    _route_visual_timeline_selection_failure(**kwargs)
+                    self.assertIn("편집안 유지", warnings[0])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "before render") as raised:
+                        _route_visual_timeline_selection_failure(**kwargs)
+                    self.assertIs(raised.exception.__cause__, original)
+                    self.assertEqual(warnings, [])
+                report = json.loads((Path(directory) / "group-visual-selection-failure.json").read_text())
+                self.assertEqual(report["error"], str(original))
+                self.assertFalse(report["rhythm_timeline_fallback_allowed"])
+                self.assertEqual(report["complete_incumbent_retained"], retained)
+
     def test_joint_nested_source_domains_cover_final_render_copies(self) -> None:
         domains = _source_index_mapping(
             (Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),

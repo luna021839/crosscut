@@ -3390,6 +3390,14 @@ class PipelineTests(unittest.TestCase):
                 self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
                     _model_case=case)
 
+    def test_group_review_first_real_visual_producer_reaches_proxy_entry(self):
+        self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+            _model_case="real_producer")
+
+    def test_group_review_first_baseline_failure_never_calls_renderer(self):
+        self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+            _model_case="baseline_error")
+
     def test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
         self, _cutoff_elapsed=None, _model_case=None,
     ) -> None:
@@ -3587,7 +3595,7 @@ class PipelineTests(unittest.TestCase):
                         baseline_builder.assert_called_once()
                         if _model_case == "discovery_error":
                             raise ValueError("optional registry invalid")
-                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error"} else SimpleNamespace()
+                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error", "real_producer"} else SimpleNamespace()
                     generation = SimpleNamespace(
                         retained_candidates=tuple(SimpleNamespace(rank=index) for index in range(2)),
                         learned_section_director=SimpleNamespace(section_plan=section_plan))
@@ -3611,6 +3619,37 @@ class PipelineTests(unittest.TestCase):
                         return None
                     with ExitStack() as stack:
                         stack.enter_context(patch.dict("os.environ", {}, clear=True))
+                        if _model_case == "baseline_error":
+                            baseline_builder.side_effect = ValueError("original visual producer failure")
+                        if _model_case == "real_producer":
+                            from crosscut.visual_score import build_visual_timeline, FrameVisualDescriptor
+                            descriptor = FrameVisualDescriptor(
+                                quality_score=.95, composition_score=.9, shot_scale=.4,
+                                shot_type=ShotType.MEDIUM, face_count=0,
+                                structure_embedding=(.2, .4, .6, .8), motion=(0., 0.),
+                                pose_embedding=(.2, .4, .6, .8), pose_confidence=.9,
+                                pose_backend="synthetic_test_pose", detected_person_count=1,
+                                person_layout_embedding=(.2, .4, .6, .8),
+                                silhouette_embedding=(.2, .4, .6, .8),
+                                silhouette_bbox_xywh=(.35, .18, .30, .70),
+                                silhouette_centroid_xy=(.5, .53),
+                                silhouette_backend="synthetic_test_silhouette", silhouette_confidence=.9)
+                            class Sampler:
+                                def __init__(self, *_args, **_kwargs):
+                                    pass
+                                def feature_descriptor_at(self, *_args, **_kwargs):
+                                    return descriptor
+                                descriptor_at = feature_descriptor_at
+                                transition_descriptor_at = feature_descriptor_at
+                                def sface_embedding_at(self, *_args, **_kwargs):
+                                    return ()
+                                def close(self):
+                                    pass
+                            # Use the real producer, DP, carriers and materializer;
+                            # only media sensing is synthetic. The former mock
+                            # accepted maximum_results=1 while production rejected it.
+                            baseline_builder.side_effect = build_visual_timeline
+                            stack.enter_context(patch('crosscut.visual_score._VideoSampler', Sampler))
                         if _model_case == "explicit_registry_error":
                             stack.enter_context(patch.dict("os.environ", {STAGE_EDIT_PRODUCTION_REGISTRY_ENV: str(root / 'invalid-registry')}))
                         stack.enter_context(patch('crosscut.pipeline.ReviewFirstRuntime', return_value=runtime))
@@ -3647,6 +3686,14 @@ class PipelineTests(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, 'explicit registry invalid'):
                                 analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
                             proxy.assert_not_called()
+                        elif _model_case == "baseline_error":
+                            with self.assertRaisesRegex(RuntimeError, 'original visual producer failure') as raised:
+                                analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
+                            self.assertIsInstance(raised.exception.__cause__, ValueError)
+                            proxy.assert_not_called()
+                            failures = list(automatic_request.output_directory.glob('*-visual-selection-failure.json'))
+                            self.assertEqual(len(failures), 1)
+                            self.assertEqual(json.loads(failures[0].read_text())['status'], 'baseline_unavailable')
                         else:
                             with self.assertRaises(ReachedDecodedProxy):
                                 analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)

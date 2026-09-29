@@ -21582,8 +21582,9 @@ def _route_visual_timeline_selection_failure(
     joint_visual_selection_active: bool,
     materialized_candidate_count: int,
     warnings: list[str],
+    complete_incumbent_retained: bool = False,
 ) -> None:
-    """Route joint failures to fail-close and retain the legacy fallback only."""
+    """Never spend a render on a missing mandatory visual selection bundle."""
 
     if joint_visual_selection_attempted:
         _raise_joint_visual_selection_failure(
@@ -21594,6 +21595,31 @@ def _route_visual_timeline_selection_failure(
             selection_active=joint_visual_selection_active,
             materialized_candidate_count=materialized_candidate_count,
         )
+    if (
+        bool(getattr(request, "review_first_enabled", False))
+        and request.edit_mode is EditMode.GROUP
+    ):
+        payload: dict[str, Any] = {
+            "analysis_basis": "review_first_visual_selection_failure_v1",
+            "status": "incumbent_retained" if complete_incumbent_retained else "baseline_unavailable",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "complete_incumbent_retained": complete_incumbent_retained,
+            "rhythm_timeline_fallback_allowed": False,
+            "final_media_authority": False,
+            "source_index_mapping": _source_index_mapping(request.sources, eligible_indices),
+        }
+        if isinstance(exc, NoCompleteTimelinePath):
+            payload["no_complete_timeline_path"] = exc.to_dict()
+        failure_path = request.output_directory / f"{base_filename}-visual-selection-failure.json"
+        _write_analysis_manifest_atomically(failure_path, payload)
+        if not complete_incumbent_retained:
+            raise RuntimeError(
+                "review-first GROUP visual baseline unavailable before render; "
+                f"{type(exc).__name__}: {exc}; report: {failure_path}"
+            ) from exc
+        warnings.append(f"추가 시각 선택 실패 · 확보한 전체 편집안 유지: {exc}")
+        return
     warnings.append(
         f"프레임 시각 점수를 확정하지 못해 리듬 타임라인을 사용함: {exc}"
     )
@@ -33651,7 +33677,15 @@ def analyze(
                 joint_visual_selection_active=joint_visual_selection_active,
                 materialized_candidate_count=len(materialized_group_candidates),
                 warnings=warnings,
+                complete_incumbent_retained=(
+                    group_first is not None and group_first.incumbent is not None
+                ),
             )
+            if group_first is not None and group_first.incumbent is not None:
+                # Discard a partially assigned optional timeline together with
+                # its geometry; the controller owns the complete transaction.
+                visual_timeline = group_first.incumbent.visual_timeline
+                review_first_verified_candidate_bundle = group_first.incumbent
         finally:
             if isinstance(review_first_visual_selection_payload, dict):
                 review_first_visual_selection_payload["stage_edit_rejections"] = deepcopy(
@@ -34859,6 +34893,16 @@ def analyze(
             else:
                 plan = complete_group_plan()
             if review_rendered_proxies:
+                if bool(getattr(request, "review_first_enabled", False)) and (
+                    review_first_singleton_bundle is None
+                    or source_derivative_diversity_result is None
+                    or rendered_montage_config is None
+                    or stage_edit_montage_policy is None
+                ):
+                    raise RuntimeError(
+                        "review-first GROUP candidate lacks mandatory decoded "
+                        "montage evidence before proxy render"
+                    )
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
                 )
@@ -34891,16 +34935,6 @@ def analyze(
                     proxy_metadata["path"] = None
                     proxy_metadata["temporary_proxy_removed_after_review"] = True
                 if bool(getattr(request, "review_first_enabled", False)):
-                    if (
-                        review_first_singleton_bundle is None
-                        or source_derivative_diversity_result is None
-                        or rendered_montage_config is None
-                        or stage_edit_montage_policy is None
-                    ):
-                        raise RuntimeError(
-                            "review-first GROUP candidate lacks mandatory decoded "
-                            "montage evidence"
-                        )
                     technical_proxy_passed = bool(
                         rendered_proxy_review_payload.get("passed")
                     )
