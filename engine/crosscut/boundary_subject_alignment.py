@@ -1810,9 +1810,20 @@ def build_boundary_subject_alignment_plan(
             framing_policy=framing_policy,
         )
         if subject is None and preferred_kind == "face":
+            # Preserve the measured head through a brief detector dropout
+            # before changing semantic scale to the entire stage silhouette.
+            # This uses actual adjacent pixels and the existing forward/back
+            # flow checks for every face/head/performer envelope. A coarse
+            # silhouette must not bypass that stronger available evidence.
+            tracked = optical_subject_at(
+                choice_index, frame_index, preferred_kind, framing_policy,
+            )
+            if tracked is not None:
+                return tracked, True
             # A verified whole-performer envelope can guard containment on a
             # transient face miss. It is not treated as a newly identified face.
             subject = _subject(observation, preferred_kind="silhouette", settings=settings)
+            return subject, False
         if subject is not None:
             return subject, False
         subject = optical_subject_at(choice_index, frame_index, preferred_kind, framing_policy)
@@ -1820,9 +1831,6 @@ def build_boundary_subject_alignment_plan(
 
     decisions: list[BoundarySubjectAlignmentDecision] = []
     candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
-    target_layout_by_boundary: dict[
-        int, tuple[tuple[float, float, float, float], ...]
-    ] = {}
 
     def rejected(
         boundary_index: int,
@@ -2187,11 +2195,6 @@ def build_boundary_subject_alignment_plan(
             )
             decisions.append(candidate)
             candidate_by_boundary[boundary_index] = candidate
-            target_layout_by_boundary[boundary_index] = (
-                incoming_subject.layout_boxes
-                if transformed_side == "outgoing"
-                else outgoing_subject.layout_boxes
-            )
 
         # Build segment-local curves.  Only the two choices adjacent to an
         # eligible boundary can receive a transform; Tier-D neighbors never
@@ -2318,14 +2321,35 @@ def build_boundary_subject_alignment_plan(
                         tuple(_project_box(box, state)[0] for box in subject.layout_boxes),
                     )
                 else:
-                    # Do not interpret a face-to-silhouette detector fallback
-                    # as physical body motion. Preserve its prior, stricter
-                    # endpoint-envelope test, in addition to containment.
-                    target_layout = target_layout_by_boundary[nearest_boundary]
-                    baseline_frame_layout = _layout_mismatch(subject.layout_boxes, target_layout)
+                    # A detector dropout changes evidence kind, not the
+                    # dancer's size. Compare two measured silhouettes in the
+                    # SAME source/time neighborhood, not a whole-stage mask
+                    # against the other camera's frozen head. Both larger
+                    # envelopes must also survive their actual transforms.
+                    previous_common, _ = dense_subject_at(
+                        choice_index, frame_index - 1, "silhouette", None,
+                    )
+                    current_common, _ = dense_subject_at(
+                        choice_index, frame_index, "silhouette", None,
+                    )
+                    if previous_common is None or current_common is None:
+                        failure = "per_frame_common_geometry_unavailable"
+                        break
+                    common_visibility = min(
+                        _project_box(box, transform)[1]
+                        for common, transform in (
+                            (previous_common, previous_state), (current_common, state),
+                        ) for box in common.containment_boxes
+                    )
+                    if common_visibility + 1e-9 < settings.minimum_silhouette_visible_fraction:
+                        failure = "per_frame_subject_containment_failed"
+                        break
+                    baseline_frame_layout = _layout_mismatch(
+                        previous_common.layout_boxes, current_common.layout_boxes,
+                    )
                     transformed_frame_layout = _layout_mismatch(
-                        tuple(_project_box(box, state)[0] for box in subject.layout_boxes),
-                        target_layout,
+                        tuple(_project_box(box, previous_state)[0] for box in previous_common.layout_boxes),
+                        tuple(_project_box(box, state)[0] for box in current_common.layout_boxes),
                     )
                 if (
                     transformed_frame_layout

@@ -430,7 +430,9 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
                     silhouette_box_xywh=(0.36, 0.18, 0.28, 0.70),
                     silhouette_confidence=0.93,
                 )
-            return regular(frame)
+            return replace(regular(frame),
+                silhouette_box_xywh=(0.36, 0.18, 0.28, 0.70),
+                silhouette_confidence=0.93)
 
         plan = build_boundary_subject_alignment_plan(
             visual_timeline=timeline,
@@ -473,7 +475,9 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
         def observations(frame: np.ndarray) -> BoundarySubjectObservation:
             marker = float(frame[:32, :96].mean())
             if marker < 20.0:
-                return BoundarySubjectObservation()
+                return (BoundarySubjectObservation(
+                    silhouette_box_xywh=(0., 0., 1., 1.), silhouette_confidence=.96,
+                ) if broad_silhouette else BoundarySubjectObservation())
             box = (
                 (0.44, 0.33, 0.12, 0.18)
                 if marker < 75.0
@@ -487,11 +491,8 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
                 formation_boxes_xywh=((0.34, 0.12, 0.32, 0.76),),
             )
 
-        with patch(
-            "crosscut.boundary_subject_alignment._optical_flow_box",
-            wraps=_optical_flow_box,
-        ) as optical_flow:
-            plan = build_boundary_subject_alignment_plan(
+        def build(config=None):
+            return build_boundary_subject_alignment_plan(
                 visual_timeline=timeline,
                 sources=(Path("a.mp4"), Path("b.mp4")),
                 transitions=(RenderTransition(tier="C", reason="hard"),),
@@ -499,18 +500,68 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
                 frame_provider=frames,
                 observation_provider=observations,
                 source_resolutions=((3840, 2160), (3840, 2160)),
+                config=config,
             )
 
-        self.assertEqual(plan.eligible_count, 1)
-        self.assertEqual(plan.optical_flow_containment_frame_count, 1)
-        self.assertEqual(
-            plan.decisions[0].optical_flow_containment_frame_count,
-            1,
-        )
-        self.assertTrue(
-            any(call.args[2][3] > 0.70 for call in optical_flow.call_args_list),
-            "full performer containment must be optically tracked with the face",
-        )
+        for broad_silhouette in (False, True):
+            with self.subTest(broad_silhouette=broad_silhouette), patch(
+                "crosscut.boundary_subject_alignment._optical_flow_box",
+                wraps=_optical_flow_box,
+            ) as optical_flow:
+                plan = build()
+            self.assertEqual(plan.eligible_count, 1)
+            self.assertEqual(plan.optical_flow_containment_frame_count, 1)
+            self.assertEqual(plan.decisions[0].optical_flow_containment_frame_count, 1)
+            self.assertTrue(
+                any(call.args[2][3] > 0.70 for call in optical_flow.call_args_list),
+                "full performer containment must be optically tracked with the face",
+            )
+        # A high-confidence aggregate silhouette is not a measured head, and
+        # cannot pass the crop just because the exact optical proof failed.
+        with patch("crosscut.boundary_subject_alignment._optical_flow_box", return_value=None):
+            untracked = build(BoundarySubjectAlignmentConfig(
+                minimum_silhouette_visible_fraction=.999))
+        self.assertEqual(untracked.eligible_count, 0)
+        self.assertEqual(untracked.decisions[0].rejection_reason,
+                         "per_frame_subject_containment_failed")
+
+    def test_mixed_face_dropout_needs_common_adjacent_silhouettes(self):
+        timeline = VisualTimelinePlan((
+            _choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.),
+        ), 1.)
+        silhouette = (0., .15, 1., .85)
+        face_box = (.43, .29, .18, .27)
+        face = _subject(BoundarySubjectObservation(face_count=1, face_box_xywh=face_box),
+            preferred_kind='face', settings=BoundarySubjectAlignmentConfig())
+        self.assertGreater(_layout_mismatch((silhouette,), face.layout_boxes), .34,
+            'the reproducer must reject the former silhouette-to-frozen-head comparison')
+        for mode, reason in (
+            ('common', None),
+            ('missing_previous', 'per_frame_common_geometry_unavailable'),
+            ('layout_jump', 'per_frame_layout_mismatch_gate'),
+        ):
+            def observe(frame):
+                marker = int(round(float(frame.mean())))
+                dropout = marker == 111
+                box = (.40, .26, .20, .30) if marker < 75 else face_box
+                body = ((.04, .05, .25, .3) if dropout and mode == 'layout_jump'
+                        else None if not dropout and mode == 'missing_previous' else silhouette)
+                return BoundarySubjectObservation(
+                    face_count=0 if dropout else 1,
+                    face_box_xywh=None if dropout else box,
+                    face_eye_scale=None if dropout else box[3] * .42,
+                    silhouette_box_xywh=body, silhouette_confidence=.93 if body else 0.)
+            with self.subTest(mode=mode):
+                plan = build_boundary_subject_alignment_plan(
+                    visual_timeline=timeline, sources=(Path('a'),Path('b')),
+                    transitions=(RenderTransition(tier='C',reason='hard'),),fps=30.,
+                    frame_provider=lambda source, seconds: _frame(source,
+                        marker=50 if source==0 else 100+round((seconds-1)*30)),
+                    observation_provider=observe, source_resolutions=((1920,1080),)*2)
+                self.assertEqual(plan.decisions[0].rejection_reason, reason)
+                self.assertEqual(plan.eligible_count, int(reason is None))
+                self.assertEqual(plan.optical_flow_containment_frame_count, 0)
 
     def test_optical_face_without_full_performer_track_fails_closed(self) -> None:
         timeline = VisualTimelinePlan(
