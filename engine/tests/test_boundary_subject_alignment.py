@@ -1130,11 +1130,59 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
             if decision.transformed_side == "outgoing"
             else decision.incoming_state
         )
-        self.assertLessEqual(transformed.zoom, 1.08)
+        self.assertLessEqual(transformed.zoom, 1.33)
         self.assertLessEqual(
             np.hypot(transformed.center_x - 0.5, transformed.center_y - 0.5),
             0.018 + 1e-9,
         )
+
+    def test_formation_native_zoom_keeps_resolution_and_dense_containment_limits(self):
+        timeline = VisualTimelinePlan((_choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.)), 1.)
+        def observed(frame):
+            scale = 1. if float(frame.mean()) < 75. else 1.5
+            boxes = tuple((.5 + (x-.5)*scale, .5-.15*scale, .10*scale, .30*scale)
+                          for x in (.29, .45, .61))
+            return BoundarySubjectObservation(detected_person_count=3, formation_boxes_xywh=boxes)
+        for resolution, expected in (((3840,2160),1.33), ((2560,1440),1.33),
+                                     ((1920,1080),1.18), (None,1.06)):
+            with self.subTest(resolution=resolution):
+                plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+                    sources=(Path('a.mp4'), Path('b.mp4')),
+                    transitions=(RenderTransition(tier='C'),), fps=30.,
+                    frame_provider=lambda index, _seconds: _frame(index),
+                    observation_provider=observed, source_resolutions=(resolution,resolution))
+                self.assertEqual(plan.eligible_count, 1)
+                self.assertEqual(plan.validated_output_frame_count, 13)
+                decision = plan.decisions[0]
+                self.assertEqual(decision.subject_kind, 'formation')
+                self.assertAlmostEqual(decision.outgoing_state.zoom, expected)
+                for box in observed(_frame(0)).formation_boxes_xywh:
+                    self.assertGreaterEqual(_project_box(box, decision.outgoing_state)[1], .985)
+
+    def test_more_formation_headroom_preserves_the_exact_old_low_zoom_family(self):
+        timeline = VisualTimelinePlan((_choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.)), 1.)
+        def frames(source, seconds):
+            return _frame(source, marker=50 if source == 0 else 100+round((seconds-1)*30))
+        def observed(frame):
+            marker = round(float(frame.mean()))
+            index = marker-100
+            excursion = max(0., min(index/4., (13.-index)/9.)) if marker >= 100 else 0.
+            scale = 1.5 if marker < 75 else 1.
+            return BoundarySubjectObservation(detected_person_count=3, formation_boxes_xywh=tuple(
+                (.5+(x-.5)*scale-.26*excursion, .5-.15*scale, .10*scale, .30*scale)
+                for x in (.29,.45,.61)))
+        plans = [build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a'), Path('b')), transitions=(RenderTransition(tier='C'),),
+            fps=30., frame_provider=frames, observation_provider=observed,
+            source_resolutions=((3840,2160),)*2,
+            config=BoundarySubjectAlignmentConfig(maximum_formation_zoom=cap)) for cap in (1.08,1.33)]
+        self.assertEqual([plan.eligible_count for plan in plans], [1,1])
+        self.assertEqual(plans[0].track_for(1), plans[1].track_for(1))
+        self.assertGreater(plans[1].dense_track_candidate_attempt_count,
+                           plans[0].dense_track_candidate_attempt_count)
+        self.assertEqual(plans[1].validated_output_frame_count, 13)
 
     def test_close_to_formation_family_mismatch_fails_closed(self) -> None:
         timeline = VisualTimelinePlan(

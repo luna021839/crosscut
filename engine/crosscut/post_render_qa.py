@@ -4599,6 +4599,7 @@ def _bound_local_alignment_tracks(
     if alignment.get("analysis_basis") not in {
         "exact_cut_frame_shot_adaptive_subject_alignment_v2",
         "exact_cut_frame_shot_adaptive_subject_alignment_v3",
+        "exact_cut_frame_shot_adaptive_subject_alignment_v4",
     }:
         return set(), set()
     try:
@@ -4668,16 +4669,21 @@ def _bound_local_alignment_tracks(
 
 
 def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *, runner=_run_command):
-    """Independently probe pixels for larger *bound face* corrections only.
+    """Independently probe pixels for larger bound face/formation corrections.
 
     Serialized 4K labels and planner headroom values grant no permission.
     The actual selected file must remain unchanged across probing, have
     no declared anamorphic aspect/rotation, and retain pixels after its exact base
-    crop. Old, decorative, formation and unbound tracks keep the legacy cap.
+    crop. Only v4 formation reports can claim its separate 1.33 cap; v3 remains
+    face-only. Old, decorative, other-body and unbound tracks keep the legacy cap.
     """
     from .render_plan_serialization import render_plan_from_json
     alignment = _mapping(motion.get('boundary_subject_alignment')) or {}
-    if alignment.get('analysis_basis') != 'exact_cut_frame_shot_adaptive_subject_alignment_v3':
+    basis = alignment.get('analysis_basis')
+    subject_caps = {'face': 2.0}
+    if basis == 'exact_cut_frame_shot_adaptive_subject_alignment_v4':
+        subject_caps['formation'] = 1.33
+    elif basis != 'exact_cut_frame_shot_adaptive_subject_alignment_v3':
         return {}
     try:
         typed = render_plan_from_json(dict(plan))
@@ -4695,8 +4701,10 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
         if track is None or max(frame.zoom for frame in track.keyframes) <= config.maximum_editorial_zoom:
             continue
         indices = tracks.get(index, {}).get('boundary_indices', [])
-        if not indices or any(decisions.get(boundary, {}).get('subject_kind') != 'face' for boundary in indices):
+        kinds = [decisions.get(boundary, {}).get('subject_kind') for boundary in indices]
+        if not kinds or any(kind not in subject_caps for kind in kinds):
             continue
+        subject_cap = min(subject_caps[kind] for kind in kinds)
         source = typed.sources[segment.source_index]
         if source not in probed:
             probed[source] = None
@@ -4737,7 +4745,7 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
         pixels_height = math.floor(height * float(f'{crop_height:.8f}') / 2.) * 2
         native = min(pixels_width / typed.width, pixels_height / typed.height)
         profile = 2.0 if height >= 2000 and native >= 1.75 else 1.33 if height >= 1300 and native >= 1.20 else config.maximum_editorial_zoom
-        maximum = min(profile, native)
+        maximum = min(profile, native, subject_cap)
         if maximum > config.maximum_editorial_zoom:
             budgets[index] = {'maximum_zoom': maximum, 'source_index': segment.source_index,
                 'source_width': width, 'source_height': height,

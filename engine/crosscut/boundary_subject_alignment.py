@@ -48,7 +48,7 @@ from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
-ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v3"
+ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v4"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -201,7 +201,7 @@ class BoundarySubjectAlignmentConfig:
     minimum_performer_visible_fraction: float = 0.985
     maximum_face_zoom: float = 2.0
     maximum_upper_body_zoom: float = 1.16
-    maximum_formation_zoom: float = 1.08
+    maximum_formation_zoom: float = 1.33
     maximum_silhouette_zoom: float = 1.08
     maximum_face_center_shift: float = 0.040
     maximum_upper_body_center_shift: float = 0.040
@@ -585,12 +585,12 @@ class BoundarySubjectAlignmentPlan:
                 ),
                 "group_transition_kind": "hard_cut_only",
                 "legacy_editorial_schema_globally_relaxed": False,
-                "native_zoom_policy": "source_resolution_after_base_crop_face_alignment_only_v1",
+                "native_zoom_policy": "source_resolution_after_base_crop_face_and_formation_alignment_v2",
                 "close_face_containment": "measured_face_plus_source_clipped_head_margin",
                 "paired_tight_medium_containment": "bilateral_central_landmark_face_and_source_truncated_torso_head_envelope_v1",
                 "medium_wide_containment": "full_visible_performer_or_formation",
                 "transform_search": "endpoint_valid_strengths_ranked_then_complete_dense_windows_v1",
-                "maximum_track_candidates_per_segment": 35,
+                "maximum_track_candidates_per_segment": 120,
                 "dense_observations_reused_across_strengths": True,
             },
             "dense_track_candidate_attempt_count": self.dense_track_candidate_attempt_count,
@@ -2119,7 +2119,20 @@ def build_boundary_subject_alignment_plan(
                 ),
                 settings=settings,
             )
-            if state is None:
+            target_states = [state] if state is not None else []
+            if subject_kind == "formation" and zoom > 1.08 + 1e-9:
+                # A larger native-pixel budget must not erase the exact old
+                # low-zoom family. Recompute its pan at that zoom: scaling a
+                # stronger state's pan does not reproduce the old geometry.
+                conservative_state, _ = _target_state(
+                    box=box, target_box=target_box, zoom=1.08,
+                    roll_degrees=0.0,
+                    maximum_center_shift=_subject_center_shift_cap(subject_kind, settings),
+                    settings=settings,
+                )
+                if conservative_state is not None:
+                    target_states.append(conservative_state)
+            if not target_states:
                 decisions.append(
                     rejected(
                         boundary_index,
@@ -2138,15 +2151,16 @@ def build_boundary_subject_alignment_plan(
             # clips a hand/foot or crosses the layout gate.  Every tried state
             # still passes the renderer edge check and the same dense gates;
             # this is bounded partial alignment, never an unchecked crop.
-            state_candidates = tuple(
+            state_candidates = tuple(dict.fromkeys(
                 _TransformState(
                     1.0 + (state.zoom - 1.0) * strength,
                     0.5 + (state.center_x - 0.5) * strength,
                     0.5 + (state.center_y - 0.5) * strength,
                     state.roll_degrees * strength,
                 )
+                for state in target_states
                 for strength in (1.0, 0.82, 0.66, 0.50, 0.36)
-            )
+            ))
             selected_state: _TransformState | None = None
             selected_transformed = baseline
             selected_layout = baseline_layout
@@ -2434,7 +2448,8 @@ def build_boundary_subject_alignment_plan(
             owned = {item.boundary_index for item in (*entry_options, *exit_options)}
             if not owned:
                 continue
-            # At most (5+1)*(5+1)-1 = 35 combinations. The absent-side option
+            # At most (10+1)*(10+1)-1 = 120 combinations, including formation's
+            # unchanged conservative family. The absent-side option
             # preserves a valid neighbor when another ramp cannot be made
             # safe. Prefer both cuts, then greatest proven endpoint gain.
             combinations = [pair for pair in product((*entry_options, None), (*exit_options, None))

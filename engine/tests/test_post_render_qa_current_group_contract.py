@@ -8,7 +8,9 @@ import unittest
 import subprocess
 import shutil
 
-from crosscut.boundary_subject_alignment import build_boundary_subject_alignment_plan
+from crosscut.boundary_subject_alignment import (
+    BoundarySubjectObservation, build_boundary_subject_alignment_plan,
+)
 from crosscut.editorial_motion import build_editorial_motion_plan
 from crosscut.ive import AspectRatio
 from crosscut.post_render_qa import (
@@ -23,7 +25,7 @@ from engine.tests.test_boundary_subject_alignment import _choice, _frame, _obser
 from engine.tests.test_post_render_qa import _fixture_payloads, _install_valid_registered_montage_evidence
 
 
-def produced_plan(root: Path, *, paired_corrections=False, native_zoom=False):
+def produced_plan(root: Path, *, paired_corrections=False, native_zoom=False, formation=False):
     choices = (
         _choice(0, 0, start=0., end=1.),
         _choice(1, 1, start=1., end=2.))
@@ -32,10 +34,14 @@ def produced_plan(root: Path, *, paired_corrections=False, native_zoom=False):
     visual = VisualTimelinePlan(choices, 1.)
     sources = (root/'a.mp4', root/'b.mp4')
     transitions = (RenderTransition(tier='C'),) * (len(choices)-1)
+    def formation_observations(frame):
+        scale = 1.5 if float(frame.mean()) < 75. else 1.
+        return BoundarySubjectObservation(detected_person_count=3, formation_boxes_xywh=tuple(
+            (.5+(x-.5)*scale, .5-.15*scale, .10*scale, .30*scale) for x in (.29,.45,.61)))
     alignment = build_boundary_subject_alignment_plan(visual_timeline=visual,
         sources=sources, transitions=transitions, fps=30.,
         frame_provider=lambda index, _seconds: _frame(index),
-        observation_provider=_observations(
+        observation_provider=formation_observations if formation else _observations(
             source0_box=(.38,.27,.24,.36) if native_zoom else (.35,.23,.225,.27),
             source1_box=(.42,.33,.16,.24) if native_zoom else (.40,.26,.20,.24)),
         source_resolutions=(((3840,2160),)*2 if native_zoom else ((1920,1080),)*2))
@@ -52,6 +58,33 @@ def produced_plan(root: Path, *, paired_corrections=False, native_zoom=False):
 
 
 class CurrentGroupContractTests(unittest.TestCase):
+    def test_dense_formation_native_budget_is_separately_capped_and_not_backdated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, motion = produced_plan(Path(directory), native_zoom=True, formation=True)
+            for source in plan.sources:
+                source.write_bytes(b'native pixel probe fixture')
+            payload = motion.to_dict()
+            serialized = json.loads(json.dumps(plan.to_json()))
+            self.assertAlmostEqual(plan.segments[1].editorial_transform.keyframes[0].zoom, 1.33)
+            def probe(command, _timeout):
+                return subprocess.CompletedProcess(command, 0, json.dumps({'streams': [dict(
+                    width=3840, height=2160, sample_aspect_ratio='1:1')]}), '')
+            for basis, allowed in (('v4', True), ('v3', False), ('v2', False)):
+                with self.subTest(basis=basis):
+                    changed = deepcopy(payload)
+                    changed['boundary_subject_alignment']['analysis_basis'] = (
+                        'exact_cut_frame_shot_adaptive_subject_alignment_'+basis)
+                    collector = _IssueCollector()
+                    metrics = _transform_metrics({'editorial_motion':changed}, serialized,
+                        PostRenderQAConfig(), collector, runner=probe)
+                    codes = [item.code for item in collector.issues]
+                    if allowed:
+                        self.assertEqual(metrics['native_resolution_zoom_budgets'][1]['maximum_zoom'],1.33)
+                        self.assertNotIn('editorial_transform_safety_bound_exceeded', codes)
+                    else:
+                        self.assertFalse(metrics['native_resolution_zoom_budgets'])
+                        self.assertIn('editorial_transform_safety_bound_exceeded', codes)
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'native media tools required')
     def test_native_budget_is_probed_from_real_encoded_source_not_manifest_labels(self):
         with tempfile.TemporaryDirectory() as directory:
