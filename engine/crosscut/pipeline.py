@@ -35017,6 +35017,15 @@ def analyze(
                 _validate_review_first_group_bundle(bundle, eligible_indices=eligible_indices,
                     offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
                 group_first.validate_plan(plan)
+                from .review_first_repair_lineage import review_first_repair_lineage
+                repair_lineage = review_first_repair_lineage(
+                    candidate_index=bundle.candidate_index,
+                    timeline=bundle.visual_timeline, repairs=bundle.boundary_repairs,
+                    review=bundle.timeline_review,
+                )
+                if repair_lineage is not None:
+                    bundle = replace(bundle,
+                        candidate_lineage=(*bundle.candidate_lineage, repair_lineage))
                 return bundle
 
             review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
