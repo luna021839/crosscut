@@ -84,9 +84,13 @@ class DemandMemberSelectionTests(unittest.TestCase):
         self.assertTrue(audit['policy_resolved_after_final_observation'])
         self.assertFalse(audit['global_visual_optimality_claimed'])
         self.assertGreater(audit['unobserved_transition_count'], 0)
-        self.assertGreater(audit['reused_observation_count'], 0)
+        # Role-only sampling may leave no incidental complete reverse pairs.
+        # Cache publication is tested directly; it is not required to invent
+        # observations just to make a reuse counter positive on this path.
+        self.assertGreaterEqual(audit['observed_transition_count'],len(result.boundaries))
         self.assertEqual(audit['observed_transition_count'],
-                         audit['exact_pair_request_count']+audit['reused_observation_count'])
+                         audit['exact_pair_request_count']+audit['reused_observation_count']
+                         -audit['reused_pair_refinement_reservation_count'])
         json.dumps(result.to_dict(), allow_nan=False)
 
     def force_first_boundary(self, *, bridge):

@@ -1041,6 +1041,16 @@ def _shot_policy(observation: BoundarySubjectObservation) -> str:
         and observation.face_box_xywh[3] >= 0.2184
     ):
         return "close_face"
+    if (
+        _has_unambiguous_face(observation)
+        and observation.face_box_xywh[3] >= 0.0924
+    ):
+        # Match the measured non-wide face scale used by describe_frame and
+        # decoded montage review (.42 * .22). Background/foreground people
+        # do not turn a dominant medium face into a formation-wide shot.
+        # This grants no identity or head-only crop; medium containment still
+        # protects the associated performer throughout every transformed frame.
+        return "medium_focus"
     if observed_people >= 3 or len(boxes) >= 3:
         return "wide_formation"
     if _has_unambiguous_face(observation):
@@ -1926,14 +1936,29 @@ def build_boundary_subject_alignment_plan(
                     or native_sample_at(boundary_index+1, 0) is None):
                 decisions.append(rejected(boundary_index, "unverified_renderer_cut_frame"))
                 continue
-            if _native_cut_in_boundary_window(
+            outgoing_cut = _native_cut_in_boundary_window(
                 left, outgoing=True, frame_count=counts[boundary_index],
                 fps=fps, window_frames=settings.window_frames,
                 **native_cut_window_arguments(boundary_index, outgoing=True),
-            ) or _native_cut_in_boundary_window(
+            )
+            incoming_cut = _native_cut_in_boundary_window(
                 right, outgoing=False, frame_count=counts[boundary_index + 1],
                 fps=fps, window_frames=settings.window_frames,
                 **native_cut_window_arguments(boundary_index+1, outgoing=False),
+            )
+            cut_sides = ((left, outgoing_cut), (right, incoming_cut))
+            localized_verified_cuts = (
+                renderer_bound and left.source_index in native_clocks
+                and right.source_index in native_clocks
+                and not left.exit_scene_cut_near and not right.entry_scene_cut_near
+                and all(choice.internal_scene_cut_master_seconds
+                        and all(math.isfinite(value)
+                                and choice.canonical_master_start <= value <= choice.canonical_master_end
+                                for value in choice.internal_scene_cut_master_seconds)
+                        for choice, has_cut in cut_sides if has_cut)
+            )
+            if (outgoing_cut or incoming_cut) and (
+                not localized_verified_cuts or outgoing_cut and incoming_cut
             ):
                 decisions.append(rejected(boundary_index, "broadcaster_native_internal_cut"))
                 continue
@@ -2029,6 +2054,16 @@ def build_boundary_subject_alignment_plan(
                 if transformed_side == "outgoing"
                 else boundary_index + 1
             )
+            # Only this side receives a ramp. A verified camera cut on the
+            # untouched side cannot interrupt that ramp; its exact endpoint
+            # remains the measured target. Never animate across a native cut
+            # on the side that actually moves, or excuse an unlocalized cut.
+            if (outgoing_cut if transformed_side == "outgoing" else incoming_cut):
+                decisions.append(rejected(boundary_index, "broadcaster_native_internal_cut",
+                    subject_kind=subject_kind, baseline=baseline, ratio=ratio,
+                    outgoing_policy=outgoing_policy, incoming_policy=incoming_policy,
+                    baseline_layout=baseline_layout))
+                continue
             transformed_frame_index = (
                 counts[transformed_choice_index] - 1
                 if transformed_side == "outgoing"

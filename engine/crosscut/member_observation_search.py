@@ -115,6 +115,7 @@ class ObservedPathProposal(Generic[Evidence]):
     reused_observation_count: int = 0
     endpoint_excluded_transition_count: int = 0
     refinement_count: int = 0
+    reused_pair_refinement_reservation_count: int = 0
 
 
 class MemberObservationSearchIncomplete(RuntimeError):
@@ -190,6 +191,8 @@ class MemberObservationSearch(Generic[Evidence]):
         self._observation_calls = 0
         self._refinement_calls = 0
         self._reused_observations = 0
+        self._reserved_pairs: set[TransitionDemand] = set()
+        self._reused_refinement_reservations = 0
 
     def proposal_graph(self) -> ProposalGraph:
         def edge(demand: TransitionDemand) -> ProposalEdge:
@@ -214,6 +217,7 @@ class MemberObservationSearch(Generic[Evidence]):
         error.diagnostics['reused_observation_count'] = self._reused_observations
         error.diagnostics['endpoint_excluded_transition_count'] = len(self._excluded)
         error.diagnostics['refinement_count'] = self._refinement_calls
+        error.diagnostics['reused_pair_refinement_reservation_count'] = self._reused_refinement_reservations
         return error
 
     @property
@@ -245,6 +249,7 @@ class MemberObservationSearch(Generic[Evidence]):
                 elapsed_seconds=round(monotonic()-self._started, 3),
                 solver_call_count=self._solver_calls, observation_count=self._observation_calls,
                 refinement_count=self._refinement_calls,
+                reused_pair_refinement_reservation_count=self._reused_refinement_reservations,
                 reused_observation_count=self._reused_observations,
                 unobserved_transition_count=self.unobserved_count,
                 endpoint_excluded_transition_count=len(self._excluded), **payload))
@@ -266,7 +271,6 @@ class MemberObservationSearch(Generic[Evidence]):
                 seen = set()
                 for item in related:
                     if (not isinstance(item, TransitionObservation)
-                            or not item.complete
                             or item.demand.boundary_index != demand.boundary_index
                             or item.demand not in self._domain
                             or item.demand in self._observed or item.demand in self._excluded
@@ -294,16 +298,19 @@ class MemberObservationSearch(Generic[Evidence]):
                         if other not in self._observed and certificate.excludes(other):
                             self._excluded[other] = certificate
 
-        def charge_observation(*, refining=False):
-            if refining:
-                # The initial demand already reserves this pair's complete
-                # offset domain. Deferring its remaining offsets is not an
-                # additional source-pair authorization or a budget reset.
-                self._refinement_calls += 1
-            else:
+        def charge_observation(demand, *, refining=False):
+            if not refining or demand not in self._reserved_pairs:
+                # Cache-only positive offsets cost no new inference. If that
+                # pair is selected, reserve its remaining work BEFORE calling
+                # refinement; cache publication never grants free native work.
                 if self._observation_calls >= self.maximum_observations:
                     raise self._incomplete('exact_observation_budget_exhausted')
                 self._observation_calls += 1
+                self._reserved_pairs.add(demand)
+                if refining:
+                    self._reused_refinement_reservations += 1
+            if refining:
+                self._refinement_calls += 1
 
         while self._solver_calls < self.maximum_solver_calls:
             self._solver_calls += 1
@@ -331,7 +338,7 @@ class MemberObservationSearch(Generic[Evidence]):
                     continue
                 # Charge before the call so external failures do not reset work
                 # accounting if a caller deliberately resumes this same ledger.
-                charge_observation()
+                charge_observation(demand)
                 self._emit('exact_pair_started', boundary_index=demand.boundary_index,
                     outgoing_source_index=demand.outgoing_source_index, incoming_source_index=demand.incoming_source_index)
                 observed = observe(demand)
@@ -360,8 +367,8 @@ class MemberObservationSearch(Generic[Evidence]):
                     if refine is None:
                         raise ValueError('partial selected observations require complete refinement')
                     for previous in pending:
-                        charge_observation(refining=True)
                         demand = previous.demand
+                        charge_observation(demand, refining=True)
                         self._emit('exact_pair_refinement_started', boundary_index=demand.boundary_index,
                             outgoing_source_index=demand.outgoing_source_index,
                             incoming_source_index=demand.incoming_source_index)
@@ -380,5 +387,6 @@ class MemberObservationSearch(Generic[Evidence]):
                 self._emit('observed_path_policy_verified')
                 return ObservedPathProposal(path, tuple(self._observed[demand] for demand in demands),
                     self._solver_calls, self._observation_calls, self.unobserved_count,
-                    self._reused_observations, len(self._excluded), self._refinement_calls)
+                    self._reused_observations, len(self._excluded), self._refinement_calls,
+                    self._reused_refinement_reservations)
         raise self._incomplete("proposal_solver_budget_exhausted")

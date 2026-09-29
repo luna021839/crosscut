@@ -168,8 +168,34 @@ class MemberPairObservationTests(unittest.TestCase):
             result=self.pair(store,stop_after_first_eligible=True,cinematic_bridge_enabled=False)
         self.assertEqual([item.plan.offset_frames for item in result],[0,-2,2])
         self.assertFalse(result[-1].mismatch.severe_flags)
-        with self.assertRaises(ValueError):
-            self.pair(store,stop_after_first_eligible=True,observed_only=True)
+        self.assertEqual(3,len(self.pair(store,stop_after_first_eligible=True,observed_only=True)))
+
+    def test_read_only_progressive_reuses_cached_positive_offset_without_native_work(self):
+        for roles in (False,True):
+            store,observer,prepare=self.store(roles=roles)
+            self.pair(store,left=0,right=1,stop_after_first_eligible=True)
+            self.pair(store,left=2,right=3,stop_after_first_eligible=True)
+            observer.reset_mock(); prepare.reset_mock()
+            reused=self.pair(store,observed_only=True,stop_after_first_eligible=True)
+            self.assertEqual([0],[item.plan.offset_frames for item in reused])
+            self.assertFalse(reused[0].mismatch.severe_flags)
+            self.assertEqual(1,reused[0].mismatch.boundary_search_candidate_count)
+            observer.assert_not_called(); prepare.assert_not_called()
+            full=self.pair(store)
+            self.assertEqual(3,len(full))
+            self.assertEqual(reused[0].raw_mismatch,full[0].raw_mismatch)
+
+    def test_read_only_partial_rejection_or_missing_effect_handles_stays_unknown(self):
+        store,observer,prepare=self.store(roles=True)
+        self.pair(store,stop_after_first_eligible=True)
+        bridge=DirectMemberCinematicBridge('pose_dissolve',False,False,('attention_scale',),.02,.05,.02)
+        for effect in (None,bridge):
+            observer.reset_mock(); prepare.reset_mock()
+            with self.assertRaises(UnobservedBoundarySample):
+                self.pair(store,observed_only=True,stop_after_first_eligible=True,
+                    adjust=lambda clock,left,right,value:replace(value,
+                        severe_flags=('attention_scale',),cinematic_bridge=effect))
+            observer.assert_not_called(); prepare.assert_not_called()
 
     def test_read_only_pair_reuses_real_samples_without_preparation_or_inference(self):
         store, observer, prepare = self.store()

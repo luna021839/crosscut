@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import replace
+from fractions import Fraction
 import unittest
 from unittest.mock import patch
 
@@ -31,6 +32,7 @@ from crosscut.render import (
     TransitionKind,
 )
 from crosscut.timeline import ShotType
+from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
@@ -208,6 +210,32 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
         self.assertEqual(track.evaluate(.3).zoom, 1.)
         self.assertGreater(track.evaluate(59/30.).zoom, 1.)
 
+    def test_verified_cut_on_untransformed_side_does_not_block_other_side_alignment(self):
+        timeline = VisualTimelinePlan((
+            replace(_choice(0,0,start=0.,end=1.), internal_scene_cut_master_seconds=(.8,)),
+            _choice(1,1,start=1.,end=2.)),1.)
+        clocks = (VerifiedRenderFrameClock(Fraction(30),300,'a'*64),)*2
+        large, small = (.3875,.23,.225,.27), (.40,.26,.20,.24)
+        args = dict(visual_timeline=timeline, sources=(Path('a.mp4'),Path('b.mp4')),
+            transitions=(RenderTransition(tier='C'),),fps=30.,
+            frame_provider=lambda index,_seconds:_frame(index),
+            source_resolutions=((1920,1080),)*2,render_frame_clocks=clocks)
+        plan = build_boundary_subject_alignment_plan(**args,
+            observation_provider=_observations(source0_box=large,source1_box=small))
+        self.assertEqual(1,plan.eligible_count)
+        self.assertEqual('incoming',plan.decisions[0].transformed_side)
+        self.assertEqual(13,plan.validated_output_frame_count)
+        self.assertIsNone(plan.track_for(0))
+        self.assertIsNotNone(plan.track_for(1))
+        # Reversing the scale requires animating the source with the cut.
+        blocked = build_boundary_subject_alignment_plan(**args,
+            observation_provider=_observations(source0_box=small,source1_box=large))
+        self.assertEqual(0,blocked.eligible_count)
+        self.assertEqual('broadcaster_native_internal_cut',blocked.decisions[0].rejection_reason)
+        unknown = build_boundary_subject_alignment_plan(**{**args,'render_frame_clocks':None},
+            observation_provider=_observations(source0_box=large,source1_box=small))
+        self.assertEqual(0,unknown.eligible_count)
+
     def test_close_face_uses_head_envelope_but_medium_keeps_full_performer(self):
         settings = BoundarySubjectAlignmentConfig()
         observation = BoundarySubjectObservation(face_count=1,
@@ -249,6 +277,36 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
             settings=BoundarySubjectAlignmentConfig()))
         with self.assertRaises(ValueError):
             BoundarySubjectObservation(face_count=0, face_is_unambiguous_dominant=True)
+
+    def test_dominant_medium_face_is_not_reclassified_by_background_person_count(self):
+        boxes = ((.05,.25,.13,.65), (.35,.20,.30,.68), (.80,.25,.13,.65))
+        observed = BoundarySubjectObservation(face_count=3,
+            face_box_xywh=(.44,.25,.12,.16), face_is_unambiguous_dominant=True,
+            detected_person_count=3, formation_boxes_xywh=boxes)
+        self.assertEqual('medium_focus', _shot_policy(observed))
+        subject = _subject(observed, preferred_kind='face', settings=BoundarySubjectAlignmentConfig())
+        self.assertEqual((boxes[1],), subject.containment_boxes)
+        self.assertEqual('wide_formation', _shot_policy(replace(observed, face_is_unambiguous_dominant=False)))
+        self.assertEqual('wide_formation', _shot_policy(replace(observed, face_box_xywh=(.46,.25,.06,.08))))
+
+    def test_medium_face_alignment_survives_background_person_count_change(self):
+        timeline = VisualTimelinePlan((_choice(0,0,start=0.,end=1.),
+            _choice(1,1,start=1.,end=2.)),1.)
+        def observe(frame):
+            small = float(frame.mean()) < 75
+            face = (.45,.30,.10,.14) if small else (.445,.29,.11,.154)
+            boxes = ((.35,.20,.30,.65),) + (((.02,.30,.13,.60),(.85,.30,.13,.60)) if small else ())
+            return BoundarySubjectObservation(face_count=1,face_box_xywh=face,
+                face_eye_scale=face[3]*.42,detected_person_count=len(boxes),formation_boxes_xywh=boxes)
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a.mp4'),Path('b.mp4')),transitions=(RenderTransition(tier='C'),),
+            fps=30.,frame_provider=lambda index,_seconds:_frame(index),
+            observation_provider=observe,source_resolutions=((1920,1080),)*2)
+        self.assertEqual(1,plan.eligible_count)
+        self.assertEqual(13,plan.validated_output_frame_count)
+        self.assertEqual('medium_focus',plan.decisions[0].outgoing_shot_policy)
+        self.assertEqual('medium_focus',plan.decisions[0].incoming_shot_policy)
+        self.assertLess(plan.decisions[0].transformed_geometry_mismatch,plan.decisions[0].baseline_geometry_mismatch)
 
     def test_real_planner_accepts_close_scale_match_despite_source_truncated_torso(self):
         timeline = VisualTimelinePlan((

@@ -1931,11 +1931,18 @@ def _observe_member_boundary_pair(
         if outgoing_source_index != incoming_source_index or plan.offset_frames == 0)
     if type(stop_after_first_eligible) is not bool or type(cinematic_bridge_enabled) is not bool:
         raise ValueError("progressive pair observation and effects must be boolean")
-    if observed_only and stop_after_first_eligible:
-        raise ValueError("read-only complete pair reuse cannot publish a partial offset domain")
     if stop_after_first_eligible:
         plans = tuple(sorted(plans, key=lambda plan: (abs(plan.offset_frames), plan.offset_frames)))
+    complete_domain_count = len(plans)
     role_samples = observations.supports_sample_demands
+    if observed_only and stop_after_first_eligible:
+        available = observations.observed_sample_demands
+        plans = tuple(plan for plan in plans if all(
+            (plan.offset_frames, source, slot) in available
+            for source, slots in ((outgoing_source_index, (0, 1)), (incoming_source_index, (2, 3)))
+            for slot in slots))
+        if not plans:
+            raise UnobservedBoundarySample('no complete cached offset for this source pair')
 
     def prepare_pair(needed):
         if role_samples:
@@ -1952,7 +1959,7 @@ def _observe_member_boundary_pair(
             for slot in range(5) if (plan.offset_frames, source, slot) in available})
 
     if observed_only:
-        # Validate the complete offset domain before scoring. Missing samples
+        # Validate the requested offset domain before scoring. Missing samples
         # cannot trigger preparation, decoding, target inference or defaults.
         for plan in plans:
             if role_samples:
@@ -1968,7 +1975,7 @@ def _observe_member_boundary_pair(
         samples_for = observations.samples_for
     candidates = []
     for plan_index, plan in enumerate(plans):
-        if stop_after_first_eligible:
+        if stop_after_first_eligible and not observed_only:
             # Audition the canonical offset first. If it cannot carry this
             # edit, prepare the remaining domain in ONE source-ordered batch.
             # Seven separate recovery windows would undo decoder locality on
@@ -2000,6 +2007,10 @@ def _observe_member_boundary_pair(
             if not observed_only:
                 observations.prepare_samples((plan.offset_frames, source, slot)
                     for source in dict.fromkeys((outgoing_source_index, incoming_source_index)) for slot in (3, 4))
+            elif stop_after_first_eligible and not all(
+                    (plan.offset_frames, source, slot) in observations.observed_sample_demands
+                    for source in (outgoing_source_index, incoming_source_index) for slot in (3, 4)):
+                continue  # Unknown effect handle, not an eligible or failed offset.
             for source in dict.fromkeys((outgoing_source_index, incoming_source_index)):
                 observations.requested_samples(plan.offset_frames, source, (3, 4), observed_only=observed_only)
             outgoing, incoming = (sample_view(plan, source) for source in (outgoing_source_index, incoming_source_index))
@@ -2016,12 +2027,19 @@ def _observe_member_boundary_pair(
         if stop_after_first_eligible and plan_index == 0 and (outgoing_source_index == incoming_source_index
                 or not measured.severe_flags
                 or (cinematic_bridge_enabled and measured.cinematic_bridge is not None)):
-            available = observations.observed_demands
-            if not all((candidate_plan.offset_frames, source) in available
+            available = observations.observed_sample_demands
+            if not all((candidate_plan.offset_frames, source, slot) in available
                     for candidate_plan in plans
-                    for source in (outgoing_source_index,incoming_source_index)):
+                    for source, slots in ((outgoing_source_index, (0, 1)), (incoming_source_index, (2, 3)))
+                    for slot in slots):
                 break  # Already cached offsets cost no new inference; keep them.
-    if len(candidates) < len(plans):
+    if len(candidates) < complete_domain_count:
+        if observed_only and not any(outgoing_source_index == incoming_source_index
+                or not candidate.mismatch.severe_flags
+                or (cinematic_bridge_enabled and candidate.mismatch.cinematic_bridge is not None)
+                for candidate in candidates):
+            # Missing alternatives are unknown, never a complete rejection.
+            raise UnobservedBoundarySample('cached offsets do not establish an eligible pair')
         candidates = [replace(candidate, mismatch=replace(candidate.mismatch,
             boundary_search_candidate_count=len(candidates))) for candidate in candidates]
     return tuple(candidates)
@@ -14011,7 +14029,7 @@ def select_balanced_direct_member_sources(
                 continuous_official_portrait_fancam_contract=continuous_official_portrait_fancam_contract,
                 priority_boundary=boundary in priority_boundaries, config=resolved_config,
                 observed_only=observed_only,
-                stop_after_first_eligible=not (observed_only or complete_offsets),
+                stop_after_first_eligible=not complete_offsets,
                 cinematic_bridge_enabled=cinematic_bridge_enabled,
                 adjust_mismatch=lambda clock, left, right, mismatch:
                     adjust_boundary_mismatch(boundary, clock, left, right, mismatch))
@@ -14029,8 +14047,9 @@ def select_balanced_direct_member_sources(
             for other in observation_search.unobserved_at(demand.boundary_index):
                 left, right = other.outgoing_source_index, other.incoming_source_index
                 plans = tuple(plan for plan in store.plans if left != right or plan.offset_frames == 0)
-                if all((plan.offset_frames, source, slot) in available for plan in plans
-                       for source, slots in ((left, (0, 1)), (right, (2, 3))) for slot in slots):
+                if any(all((plan.offset_frames, source, slot) in available
+                       for source, slots in ((left, (0, 1)), (right, (2, 3))) for slot in slots)
+                       for plan in plans):
                     try:
                         result.append(observe_transition(other, observed_only=True))
                     except UnobservedBoundarySample:
@@ -14055,14 +14074,16 @@ def select_balanced_direct_member_sources(
             for index, (left, right) in enumerate(zip(policy_decision.path, policy_decision.path[1:]))
             if left != right or policy_decision.usage_policy in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES)
         observation_search_diagnostics = {
-            'contract': 'progressive_exact_member_offsets_with_complete_selected_refinement_v2',
+            'contract': 'progressive_exact_member_offsets_with_funded_cached_positive_reuse_v3',
             'solver_call_count': observed_path.solver_call_count,
             'exact_pair_request_count': observed_path.observation_count,
             'exact_pair_refinement_count': observed_path.refinement_count,
-            'total_exact_pair_work_count': observed_path.observation_count+observed_path.refinement_count,
+            'reused_pair_refinement_reservation_count': observed_path.reused_pair_refinement_reservation_count,
+            'total_exact_pair_work_count': (observed_path.observation_count+observed_path.refinement_count
+                - observed_path.reused_pair_refinement_reservation_count),
             'reused_observation_count': observed_path.reused_observation_count,
             'endpoint_excluded_transition_count': observed_path.endpoint_excluded_transition_count,
-            'observed_transition_count': observed_path.observation_count+observed_path.reused_observation_count,
+            'observed_transition_count': len(observation_search.observations),
             'unobserved_transition_count': observed_path.unobserved_transition_count,
             'coarse_span_flanks_are_proposal_only': True,
             'selected_transitions_and_all_offsets_observed': all(item.complete for item in observed_path.transitions),

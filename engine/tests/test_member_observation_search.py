@@ -86,9 +86,40 @@ class MemberObservationSearchTests(unittest.TestCase):
         self.assertFalse(caught.exception.diagnostics['render_authorized'])
 
     def test_partial_reused_pairs_cannot_acquire_unfunded_refinement_authority(self):
-        with self.assertRaisesRegex(ValueError,'boundary-local'):
-            self.search().run(propose=lambda _:(0,1,2,0),observe=observed,
-                reuse_observed=lambda _: (replace(observed(TransitionDemand(0,0,2)),complete=False),))
+        for budget in (1,2):
+            search = self.search(spans=2,observations=budget,calls=3)
+            fresh, reused = TransitionDemand(0,0,1), TransitionDemand(0,0,2)
+            proposals = iter(((0,1),(0,2),(0,2)))
+            observer = Mock(side_effect=lambda demand: observed(demand,False))
+            refine = Mock(side_effect=lambda previous:replace(previous,complete=True))
+            args = dict(propose=lambda _:next(proposals),observe=observer,refine=refine,
+                reuse_observed=lambda demand:(replace(observed(reused),complete=False),) if demand==fresh else ())
+            if budget==1:
+                with self.assertRaises(MemberObservationSearchIncomplete) as caught:
+                    search.run(**args)
+                refine.assert_not_called()
+                self.assertEqual(1,caught.exception.diagnostics['observation_count'])
+                self.assertFalse(caught.exception.diagnostics['render_authorized'])
+            else:
+                result=search.run(**args)
+                self.assertEqual(2,result.observation_count)
+                self.assertEqual(1,result.refinement_count)
+                self.assertEqual(1,result.reused_pair_refinement_reservation_count)
+                self.assertTrue(all(item.complete for item in result.transitions))
+                self.assertEqual(3,result.solver_call_count)
+                refine.assert_called_once()
+            observer.assert_called_once_with(fresh)
+
+    def test_unused_cached_positive_offsets_do_not_reserve_native_work(self):
+        search=self.search(spans=2,observations=1,calls=2)
+        refine=Mock()
+        result=search.run(propose=lambda _:(0,1),observe=observed,refine=refine,
+            reuse_observed=lambda _:(replace(observed(TransitionDemand(0,0,2)),complete=False),))
+        self.assertEqual(1,result.observation_count)
+        self.assertEqual(1,result.reused_observation_count)
+        self.assertEqual(0,result.refinement_count)
+        self.assertEqual(0,result.reused_pair_refinement_reservation_count)
+        refine.assert_not_called()
 
     def test_failure_repairs_path_without_observing_its_tail_or_repeating_good_edges(self):
         search = self.search()
