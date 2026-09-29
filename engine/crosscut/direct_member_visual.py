@@ -12040,6 +12040,32 @@ class _DirectMemberPathDecision:
     quota_assignment_provenance: dict[str, Any]
 
 
+def _known_focal_effect_proposal_edges(matrices, priority_boundaries):
+    """Only actual observed focal-motion certificates seed effect proposals.
+
+    This does not clear a hard-cut failure or mint evidence for unknown pairs.
+    Non-demand/exhaustive callers retain their existing policy ordering.
+    """
+    if not all(isinstance(edge, ProposalEdge)
+               for matrix in matrices for row in matrix for edge in row):
+        return ()
+    result = []
+    for boundary, matrix in enumerate(matrices):
+        for left, row in enumerate(matrix):
+            for right, edge in enumerate(row):
+                proof = edge.policy_evidence
+                if (left == right or edge.state is not ObservationState.ELIGIBLE
+                        or not isinstance(proof, DirectBoundaryMismatch)
+                        or not proof.severe_flags
+                        or not isinstance(proof.cinematic_bridge, DirectMemberCinematicBridge)
+                        or not set(proof.severe_flags) <= set(proof.cinematic_bridge.authorized_severe_flags)
+                        or not verified_focal_pose_dissolve_spacing(proof)):
+                    continue
+                if boundary in priority_boundaries or _exceptional_nonpriority_cinematic_bridge(proof):
+                    result.append((boundary, left, right))
+    return tuple(result)
+
+
 def _decide_direct_member_path_policy(
     matrices,
     *,
@@ -12078,6 +12104,62 @@ def _decide_direct_member_path_policy(
     selected_duration_targets: tuple[float, ...] | None = None
     selected_duration_minimums: tuple[float, ...] = ()
     selected_duration_maximums: tuple[float, ...] = ()
+    known_effect_edges = (
+        _known_focal_effect_proposal_edges(matrices, priority_boundaries)
+        if cinematic_bridge_enabled and heterogeneous_cinematic_authorized
+        and continuous_official_portrait_fancam_contract else ()
+    )
+    early_effect_error = None
+    early_effect_audit = None
+    if known_effect_edges:
+        # Unknown hard edges are optimistic *observation proposals*. Requiring
+        # their entire domain to become infeasible before considering an
+        # already verified dissolve threw away measured progress. Solve the
+        # existing bounded effect policy first, without changing its geometry,
+        # spacing, source-exposure, hold, or independent output gates.
+        early_effect_audit = {
+            "contract": "verified_focal_effect_observation_progress_v1",
+            "known_effect_edges": [list(item) for item in known_effect_edges],
+            "strict_hard_infeasibility_required": False,
+            "hard_cut_severe_flags_cleared": False,
+            "unknown_edges_still_require_observation": True,
+            "render_authorized": False,
+        }
+        try:
+            proposal = _heterogeneous_cinematic_visual_path(
+                matrices, source_order=order, candidate_validity=candidate_validity,
+                span_durations=tuple(end - start for start, end in spans),
+                source_geometries=source_frame_geometries,
+                priority_cut_boundary_indices=priority_boundaries,
+                forbidden_same_source_hold_boundary_indices=forbidden_hold_boundaries,
+                maximum_priority_cut_hold_count=maximum_priority_cut_hold_count,
+                config=resolved_config, require_cinematic_bridge=True,
+                represented_source_indices=represented_source_indices,
+                forbidden_source_paths=normalized_forbidden_paths,
+            )
+        except DirectMemberVisualSelectionError as caught:
+            early_effect_error = caught
+            early_effect_audit["failure"] = caught.diagnostics
+            proposal = None
+        early_effect_audit["path_found"] = proposal is not None
+        if proposal is not None:
+            path, cost, diagnostics = proposal
+            role = str(diagnostics["usage_policy"])
+            if role not in _DIRECT_MEMBER_CINEMATIC_USAGE_POLICIES:
+                raise RuntimeError("verified effect proposal returned a non-cinematic policy")
+            return _DirectMemberPathDecision(
+                path=path, optimizer_cost=cost,
+                optimizer_search_diagnostics={**diagnostics,
+                    "verified_effect_proposal": early_effect_audit},
+                usage_policy=role,
+                selected_source_targets=tuple(diagnostics["source_count_targets"]),
+                selected_count_minimums=tuple(diagnostics["source_count_minimums"]),
+                selected_count_maximums=tuple(diagnostics["source_count_maximums"]),
+                selected_duration_targets=tuple(diagnostics["source_duration_targets_seconds"]),
+                selected_duration_minimums=tuple(diagnostics["source_duration_minimums_seconds"]),
+                selected_duration_maximums=tuple(diagnostics["source_duration_maximums_seconds"]),
+                quota_assignment_provenance=quota_assignment_provenance,
+            )
     try:
         path, optimizer_cost, optimizer_search_diagnostics = (
             _balanced_visual_path(
@@ -12251,10 +12333,14 @@ def _decide_direct_member_path_policy(
             heterogeneous_fallback = None
             heterogeneous_fallback_error: (
                 DirectMemberVisualSelectionError | None
-            ) = None
+            ) = early_effect_error
             if (
                 role_aware_safe_hold_fallback is None
                 and heterogeneous_fallback_authorized
+                # Do not repeat the same expensive solve after its failure.
+                # Feedback-adaptive source usage is a genuinely different
+                # domain and retains its existing separately bounded attempt.
+                and (not known_effect_edges or adaptive_minimum_diversity_authorized)
             ):
                 try:
                     heterogeneous_fallback = (
@@ -12417,6 +12503,8 @@ def _decide_direct_member_path_policy(
                     or error
                 )
                 diagnostics = dict(primary_fallback_error.diagnostics)
+                if early_effect_audit is not None:
+                    diagnostics["verified_effect_proposal"] = early_effect_audit
                 diagnostics.setdefault(
                     "strict_cross_source_failure",
                     strict_failure_summary,
@@ -12541,6 +12629,11 @@ def _decide_direct_member_path_policy(
                     str(primary_fallback_error),
                     diagnostics,
                 ) from primary_fallback_error
+    if early_effect_audit is not None:
+        optimizer_search_diagnostics = {
+            **optimizer_search_diagnostics,
+            "verified_effect_proposal": early_effect_audit,
+        }
     return _DirectMemberPathDecision(
         path=path,
         optimizer_cost=optimizer_cost,
@@ -12618,11 +12711,13 @@ def select_balanced_direct_member_sources(
     ``source_frame_sizes`` authorizes geometry repair only by proving that the
     post-portrait-fill working frame remains no larger than decoded source
     pixels. Missing sizes retain the historical no-repair hard gates.
-    ``cinematic_bridge_enabled`` authorizes a terminal role-aware allocation
-    for official member fancams, including portrait-only sets, only after strict
-    balanced and bounded no-cut paths are proven infeasible. Its framing-only
-    severe edges remain forbidden as hard cuts and must be materialized as
-    audited effects.
+    ``cinematic_bridge_enabled`` authorizes role-aware effect allocation for
+    official member fancams, including portrait-only sets. Demand-driven search
+    can propose an already observed, focal-motion-verified pose dissolve before
+    exhausting unknown hard edges; every unknown selected pair still requires
+    observation and joint cut-time validation. Other effect candidates retain
+    the strict/bounded-hold infeasibility fallback. Framing-only severe edges
+    remain forbidden as hard cuts and must be materialized as audited effects.
     ``render_infeasible_transition_edges`` carries dense-render certificates
     from a prior motion solve.  A certified source pair is removed only near
     its measured canonical boundary; the optimizer must choose another source
