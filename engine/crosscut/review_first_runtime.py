@@ -206,6 +206,18 @@ def enforce_review_first_deadline(
                 )
 
 
+# These producer codes cover both a measured quality miss and a missing value.
+# Only the former is editorial; the evidence check below keeps missing/invalid
+# measurements blocking instead of treating this as an unconditional allowlist.
+_GROUP_PROXY_MEASUREMENT_CODES = {
+    "proxy_quality_overall_quality_p10": ("overall_quality_p10", 1.0, "minimum"),
+    "proxy_quality_source_quality_median_span": ("source_quality_median_span", 1.0, "maximum"),
+    "proxy_quality_boundary_score_p10": ("boundary_score_p10", 100.0, "minimum"),
+    "proxy_quality_proxy_weighted_score": ("weighted_score", 100.0, "minimum"),
+    "proxy_subject_geometry_coverage_incomplete": ("subject_geometry_coverage", 1.0, "coverage"),
+    "proxy_closeup_face_coverage_incomplete": ("closeup_face_coverage", 1.0, "coverage"),
+}
+
 _GROUP_EDITORIAL_CODES = frozenset(
     {
         "boundary_professional_combined_evidence_gate_failed",
@@ -252,7 +264,7 @@ _GROUP_EDITORIAL_CODES = frozenset(
         "visible_boundary_repair_evidence_missing",
         "visible_cut_far_from_beat_grid",
         "visual_shot_median_too_slow",
-    }
+    } | _GROUP_PROXY_MEASUREMENT_CODES.keys()
 )
 _MEMBER_EDITORIAL_CODES = frozenset(
     {
@@ -314,6 +326,53 @@ def _issue_codes(
 
 def _mapping(value: object) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
+
+
+def _group_proxy_measurement_evidence_valid(
+    code: str, report_payload: Mapping[str, Any],
+) -> bool:
+    """A valid decoded measurement may miss a quality target without corruption."""
+    from .proxy_review_contract import proxy_integrity_evidence_valid
+
+    metrics = _mapping((_mapping(report_payload.get("metrics")) or {}).get("proxy_quality_and_geometry"))
+    if metrics is None or not proxy_integrity_evidence_valid(metrics.get("technical_integrity")):
+        return False
+    field_name, upper, gate = _GROUP_PROXY_MEASUREMENT_CODES[code]
+    value = metrics.get(field_name)
+
+    def finite_in_range(number: object) -> bool:
+        return type(number) in (int, float) and math.isfinite(number) and 0 <= number <= upper
+
+    if not finite_in_range(value):
+        return False
+    issues = report_payload.get("issues")
+    matching = [issue for issue in issues if isinstance(issue, Mapping) and issue.get("code") == code]
+    if not matching:
+        return False
+    # Validate every occurrence, not just the first duplicate with this code.
+    for issue in matching:
+        threshold = issue.get("threshold")
+        if (not finite_in_range(issue.get("value")) or issue["value"] != value
+                or not finite_in_range(threshold)):
+            return False
+        if gate == "minimum" and not value < threshold:
+            return False
+        if gate == "maximum" and not value > threshold:
+            return False
+        if gate == "coverage" and not (threshold == 1.0 and value < 1.0):
+            return False
+    if gate == "coverage":
+        integrity_review = metrics["technical_integrity"]["review"]
+        total = integrity_review["reviewed_boundary_count"]
+        denominator = (metrics.get("closeup_relevant_boundary_count")
+                       if field_name == "closeup_face_coverage" else total)
+        if (metrics.get("boundary_sample_contract_valid") is not True
+                or type(denominator) is not int or not 0 < denominator <= total):
+            return False
+        covered = value * denominator
+        if not math.isclose(covered, round(covered), abs_tol=1e-8):
+            return False
+    return True
 
 
 def _member_continuity_measurements_valid(continuity: Mapping[str, Any]) -> bool:
@@ -508,6 +567,8 @@ def classify_review_first_qa(
         for code in codes
         if code in editorial_catalog
         and (member or code not in proxy_codes or proxy_integrity_valid)
+        and (member or code not in _GROUP_PROXY_MEASUREMENT_CODES
+             or _group_proxy_measurement_evidence_valid(code, report_payload))
         and (
             not member
             or _member_editorial_evidence_valid(code, report_payload)
