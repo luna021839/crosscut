@@ -30,6 +30,7 @@ from .boundary_repair import (
     repair_boundary,
 )
 from .pose import POSE_BACKEND
+from .closeup_gesture import CloseupGestureEvidence, CloseupGestureProvider
 from .timeline import (
     BoundarySideStability,
     ShotType,
@@ -405,9 +406,14 @@ class BoundaryVisualEvidence:
     evidence_coverage: BoundaryEvidenceCoverage
     outgoing_side_stability: BoundarySideStability | None = None
     incoming_side_stability: BoundarySideStability | None = None
+    closeup_gesture: CloseupGestureEvidence | None = None
+
+    @property
+    def selection_cost(self) -> float:
+        return self.closeup_gesture.mismatch if self.closeup_gesture is not None else self.total_cost
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "total_cost": self.total_cost,
             "base_total_cost": self.base_total_cost,
             "formation_mismatch": self.formation_mismatch,
@@ -437,6 +443,11 @@ class BoundaryVisualEvidence:
                 else None
             ),
         }
+        if self.closeup_gesture is not None:
+            payload["closeup_gesture"] = self.closeup_gesture.to_dict()
+            payload["selection_cost"] = self.selection_cost
+            payload["selection_cost_basis"] = "exact_arm_articulation_after_unchanged_production_gates"
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +511,10 @@ class VisualBoundaryRepair:
             raise ValueError(
                 "selected boundary repair offset did not pass production gates"
             )
+        if (self.selected_visual_evidence.closeup_gesture is not None
+                and not math.isclose(self.result.selected.visual_cost,
+                    self.selected_visual_evidence.selection_cost, rel_tol=0., abs_tol=1e-12)):
+            raise ValueError("selected gesture ranking cost disagrees with exact arm evidence")
         selected_visual_payload = selected_audit[0].get("visual_evidence")
         if (
             not isinstance(selected_visual_payload, Mapping)
@@ -1973,6 +1988,7 @@ def repair_visual_timeline_boundaries(
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     boundary_indices: Sequence[int] | None = None,
     render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
+    closeup_gesture_model_path: Path | None = None,
 ) -> VisualBoundaryRepairPlan:
     """Return locally repaired timing for every or only requested boundaries.
 
@@ -2087,6 +2103,7 @@ def repair_visual_timeline_boundaries(
         )
 
     samplers: dict[int, _VideoSampler] = {}
+    gesture_provider: CloseupGestureProvider | None = None
     if descriptor_provider is None:
         def provider(source_index: int, seconds: float) -> FrameVisualDescriptor | None:
             # Preserve the former boundary sampler's fail-closed behavior at
@@ -2374,6 +2391,7 @@ def repair_visual_timeline_boundaries(
                 return tuple(audit)
 
             def visual_cost(context: BoundaryCandidateContext) -> float | None:
+                nonlocal gesture_provider
                 frame_seconds = 1.0 / output_fps
                 side_sample_span_seconds = 3.0 * frame_seconds
                 outgoing_exact_seconds = (
@@ -2500,7 +2518,25 @@ def repair_visual_timeline_boundaries(
                 )
                 if not _passes_production_transition_gates(evidence):
                     return None
-                return evidence.total_cost
+                if closeup_gesture_model_path is not None:
+                    # Optional final timing refinement, not another source
+                    # selection. It must use both exact, verified frames; a
+                    # nearby MediaPipe pose cannot substitute for either arm.
+                    if not renderer_bound:
+                        return None
+                    if gesture_provider is None:
+                        gesture_provider = CloseupGestureProvider(sources, closeup_gesture_model_path)
+                    gesture = gesture_provider.compare(
+                        (outgoing.source_index, outgoing_exact_seconds, outgoing_clock, outgoing_descriptor),
+                        (incoming.source_index, incoming_exact_seconds, incoming_clock, incoming_descriptor))
+                    if gesture is None:
+                        return None
+                    # Keep legacy geometric and temporal-motion costs intact.
+                    # Articulation is a separately named ranking objective, not
+                    # a fake calibrated temporal-motion bonus or pass signal.
+                    evidence = replace(evidence, closeup_gesture=gesture)
+                    evidence_by_offset[context.frame_offset] = (evidence, outgoing_descriptor, incoming_descriptor)
+                return evidence.selection_cost
 
             try:
                 result = repair_boundary(
@@ -2532,6 +2568,12 @@ def repair_visual_timeline_boundaries(
                 evidence, outgoing_descriptor, incoming_descriptor = evidence_by_offset[
                     result.selected_frame_offset
                 ]
+                if closeup_gesture_model_path is not None and result.changed:
+                    original = evidence_by_offset.get(0)
+                    if (original is None or original[0].closeup_gesture is None
+                            or evidence.closeup_gesture is None
+                            or evidence.closeup_gesture.mismatch >= original[0].closeup_gesture.mismatch-1e-6):
+                        raise ValueError('optional_gesture_refinement_no_proven_articulation_improvement')
             except (ValueError, KeyError, cv2.error) as exc:
                 failure: dict[str, Any] = {
                     "boundary_index": boundary_index,
@@ -2700,6 +2742,8 @@ def repair_visual_timeline_boundaries(
     finally:
         for sampler in samplers.values():
             sampler.close()
+        if gesture_provider is not None:
+            gesture_provider.close()
 
     repaired_timeline = VisualTimelinePlan(
         choices=tuple(choices),
@@ -2708,6 +2752,7 @@ def repair_visual_timeline_boundaries(
             f"{visual_timeline.analysis_basis}+local_boundary_repair_v4+"
             "complete_success_offset_audit_v1+"
             "temporal_pose_motion_audit_v1+renderer_bound_output_tick_audition_v2"
+            + ("+exact_closeup_arm_articulation_refinement_v1" if closeup_gesture_model_path is not None else "")
         ),
         selected_candidate_index=visual_timeline.selected_candidate_index,
         candidate_generation_basis=visual_timeline.candidate_generation_basis,

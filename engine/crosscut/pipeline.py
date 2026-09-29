@@ -20952,6 +20952,61 @@ def _review_first_wide_boundary_repair(
         analysis_suffix='review_first_single_targeted_eight_frame_repair_v1')
 
 
+def _review_first_closeup_gesture_repair(
+    earlier: VisualBoundaryRepairPlan,
+    *,
+    sources: Sequence[Path],
+    closeup_gesture_model_path: Path | None = None,
+    **repair_arguments: Any,
+) -> VisualBoundaryRepairPlan | None:
+    """One exact-arm audition, preserving sources/cuts and music/source clocks.
+
+    This is not a render retry or a missing-pose veto on source availability.
+    At most twelve existing tight-shot boundaries are sampled once; all other
+    boundaries stay fixed. Complete exact arms rank only candidates admitted
+    by the unchanged production gates. No reanalysis of the whole sources.
+    """
+    from .timeline import ShotType
+    choices = earlier.timeline.choices
+    targets = tuple(i for i,(left,right) in enumerate(zip(choices, choices[1:]))
+        if left.source_index != right.source_index
+        and (left.exit_shot_type or left.shot_type) is ShotType.CLOSE_UP
+        and (right.entry_shot_type or right.shot_type) is ShotType.CLOSE_UP)
+    if not targets:
+        return None
+    if len(targets) > 12:
+        targets = tuple(targets[round(i*(len(targets)-1)/11)] for i in range(12))
+    if closeup_gesture_model_path is None:
+        cache = repair_arguments.get('feature_cache_directory')
+        if cache is None:
+            return None
+        from .source_first_model_assets import ensure_source_first_model_assets
+        closeup_gesture_model_path = ensure_source_first_model_assets(cache).pose_model_path
+    later = repair_visual_timeline_boundaries(
+        visual_timeline=earlier.timeline, sources=sources, boundary_indices=targets,
+        config=BoundaryRepairConfig(search_radius_frames=8, interior_scene_cut_guard_frames=9),
+        closeup_gesture_model_path=closeup_gesture_model_path, **repair_arguments)
+    old, new = earlier.timeline.choices, later.timeline.choices
+    if (len(new) != len(old) or tuple(c.source_index for c in new) != tuple(c.source_index for c in old)
+            or abs(new[0].canonical_master_start-old[0].canonical_master_start) > 1e-9
+            or abs(new[-1].canonical_master_end-old[-1].canonical_master_end) > 1e-9
+            or any(abs(a.canonical_master_end-b.canonical_master_end) > 1e-9
+                   for i,(a,b) in enumerate(zip(old,new)) if i not in targets)):
+        raise ValueError('gesture timing repair changed the source path or unrelated boundary')
+    if not later.changed_count:
+        return None
+    before = review_timeline(earlier.timeline, available_source_count=len(sources))
+    after = review_timeline(later.timeline, available_source_count=len(sources))
+    def failures(review):
+        return {(issue.code, occurrence) for issue in review.hard_failures
+                for occurrence in (issue.occurrences or (None,))}
+    if (not failures(after).issubset(failures(before))
+            or after.source_switch_count != before.source_switch_count):
+        return None
+    return _merge_visual_boundary_repair_plans(earlier, later,
+        analysis_suffix='single_exact_closeup_arm_articulation_refinement_v1')
+
+
 def _output_geometry_deferred_boundary_indices(
     review: TimelineReview | None,
 ) -> tuple[int, ...]:
@@ -33920,6 +33975,22 @@ def analyze(
                                 f'추가 보정 {widened.changed_count-visual_boundary_repairs.changed_count}개')
                             visual_boundary_repairs = widened
                             visual_timeline = widened.timeline
+                        try:
+                            gesture_refined = optional_group_refinement('closeup_gesture_repair', lambda:
+                                _review_first_closeup_gesture_repair(visual_boundary_repairs,
+                                    sources=tuple(request.sources[index] for index in eligible_indices),
+                                    audio_offsets=offsets, scene_cut_times=scene_cut_times,
+                                    beat_period_seconds=group_draft.beat_period_seconds,
+                                    source_timewarps=eligible_timewarps,
+                                    **_visual_feature_cache_arguments(request)),
+                                validate=validate_boundary_repair)
+                            if gesture_refined is not None:
+                                reporter.log('클로즈업 실제 팔·손목 연결 보정 · 소스·전환 수 유지 · '
+                                    f'추가 컷시점 보정 {gesture_refined.changed_count-visual_boundary_repairs.changed_count}개')
+                                visual_boundary_repairs = gesture_refined
+                                visual_timeline = gesture_refined.timeline
+                        except (OSError, ValueError, cv2.error) as exc:
+                            warnings.append(f'선택적 실제 팔 자세 보정을 확정하지 못해 기존 전체 경로 유지: {exc}')
             except (ValueError, cv2.error) as exc:
                 warnings.append(
                     "국소 컷시점 보정에 실패해 전역 선택 경계를 유지함: "

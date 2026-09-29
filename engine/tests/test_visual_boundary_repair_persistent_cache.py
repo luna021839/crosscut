@@ -177,7 +177,7 @@ class VisualBoundaryRepairPersistentCacheTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "feature_cache_directory cannot wrap an explicit descriptor_provider",
+            "persistent feature cache cannot wrap an explicit descriptor_provider",
         ):
             repair_visual_timeline_boundaries(
                 visual_timeline=plan,
