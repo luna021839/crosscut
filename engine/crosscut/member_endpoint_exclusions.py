@@ -67,3 +67,36 @@ def observed_unresolved_endpoints(store, boundary_index):
                     tuple(sample.master_seconds for sample in samples),
                     tuple(sample.source_local_seconds for sample in samples)))
     return tuple(certificates)
+
+
+def probe_unresolved_endpoint(store, *, boundary_index, outgoing_source_index, incoming_source_index):
+    """Complete only a canonically missing endpoint before scoring its partner.
+
+    This is native work, so the caller must reserve a pair budget first. A
+    canonical negative is only a scheduling hint: every exact allowed offset
+    must be observed and independently certified by the read-only authority.
+    One recovered face/body, legacy data or an unobserved offset cannot exclude
+    anything. Same-source holds and observers without role demands stay intact.
+    """
+    if (type(boundary_index) is not int or boundary_index < 0
+            or any(type(source) is not int or not 0 <= source < store.source_count
+                   for source in (outgoing_source_index, incoming_source_index))):
+        raise ValueError('endpoint probe needs a valid boundary/source domain')
+    if outgoing_source_index == incoming_source_index or not store.supports_sample_demands:
+        return None
+    for source, role, slot in ((outgoing_source_index, 'outgoing', 1),
+                               (incoming_source_index, 'incoming', 2)):
+        if (0, source, slot) not in store.observed_sample_demands:
+            continue
+        focal = store.observed_sample(0, source, slot).focal_geometry
+        if (not isinstance(focal, FocalSelectorGeometry) or focal.face_bbox_xywh is not None
+                or focal.body_track is not None):
+            continue
+        store.prepare_samples((plan.offset_frames, source, slot) for plan in store.plans)
+        for plan in store.plans:
+            store.requested_samples(plan.offset_frames, source, (slot,))
+        certificate = next((item for item in observed_unresolved_endpoints(store, boundary_index)
+            if item.source_index == source and item.role == role), None)
+        if certificate is not None:
+            return certificate
+    return None

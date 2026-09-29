@@ -116,6 +116,7 @@ class ObservedPathProposal(Generic[Evidence]):
     endpoint_excluded_transition_count: int = 0
     refinement_count: int = 0
     reused_pair_refinement_reservation_count: int = 0
+    endpoint_only_observation_count: int = 0
 
 
 class MemberObservationSearchIncomplete(RuntimeError):
@@ -193,6 +194,7 @@ class MemberObservationSearch(Generic[Evidence]):
         self._reused_observations = 0
         self._reserved_pairs: set[TransitionDemand] = set()
         self._reused_refinement_reservations = 0
+        self._endpoint_only_observations = 0
 
     def proposal_graph(self) -> ProposalGraph:
         def edge(demand: TransitionDemand) -> ProposalEdge:
@@ -218,6 +220,7 @@ class MemberObservationSearch(Generic[Evidence]):
         error.diagnostics['endpoint_excluded_transition_count'] = len(self._excluded)
         error.diagnostics['refinement_count'] = self._refinement_calls
         error.diagnostics['reused_pair_refinement_reservation_count'] = self._reused_refinement_reservations
+        error.diagnostics['endpoint_only_observation_count'] = self._endpoint_only_observations
         return error
 
     @property
@@ -252,13 +255,14 @@ class MemberObservationSearch(Generic[Evidence]):
                 reused_pair_refinement_reservation_count=self._reused_refinement_reservations,
                 reused_observation_count=self._reused_observations,
                 unobserved_transition_count=self.unobserved_count,
+                endpoint_only_observation_count=self._endpoint_only_observations,
                 endpoint_excluded_transition_count=len(self._excluded), **payload))
 
     def run(
         self,
         *,
         propose: Callable[[ProposalGraph], Sequence[int] | None],
-        observe: Callable[[TransitionDemand], TransitionObservation[Evidence]],
+        observe: Callable[[TransitionDemand], TransitionObservation[Evidence] | MemberEndpointExclusion],
         refine: Callable[[TransitionObservation[Evidence]], TransitionObservation[Evidence]] | None = None,
         reuse_observed: Callable[[TransitionDemand], Sequence[TransitionObservation[Evidence]]] | None = None,
         endpoint_exclusions: Callable[[TransitionDemand], Sequence[MemberEndpointExclusion]] | None = None,
@@ -342,6 +346,26 @@ class MemberObservationSearch(Generic[Evidence]):
                 self._emit('exact_pair_started', boundary_index=demand.boundary_index,
                     outgoing_source_index=demand.outgoing_source_index, incoming_source_index=demand.incoming_source_index)
                 observed = observe(demand)
+                if isinstance(observed, MemberEndpointExclusion):
+                    if not observed.excludes(demand):
+                        raise ValueError('endpoint observation does not exclude its requested pair')
+                    publish_related(demand)
+                    # Publishing cached evidence may have completed this exact
+                    # rejected pair without I/O. Keep that real measurement;
+                    # never double-count it as a separate excluded edge.
+                    cached_pair = self._observed.get(demand)
+                    if observed not in self._endpoint_certificates or not (
+                            demand in self._excluded
+                            or cached_pair is not None and not cached_pair.eligible):
+                        raise ValueError('endpoint observation must be confirmed by read-only exact samples')
+                    self._endpoint_only_observations += 1
+                    self._emit('exact_pair_endpoint_excluded', boundary_index=demand.boundary_index,
+                        outgoing_source_index=demand.outgoing_source_index,
+                        incoming_source_index=demand.incoming_source_index,
+                        excluded_source_index=observed.source_index, excluded_role=observed.role)
+                    rejected = True
+                    observation_changed = True
+                    break
                 if not isinstance(observed, TransitionObservation) or observed.demand != demand:
                     raise ValueError("observer returned evidence for a different transition")
                 self._observed[demand] = observed
@@ -388,5 +412,5 @@ class MemberObservationSearch(Generic[Evidence]):
                 return ObservedPathProposal(path, tuple(self._observed[demand] for demand in demands),
                     self._solver_calls, self._observation_calls, self.unobserved_count,
                     self._reused_observations, len(self._excluded), self._refinement_calls,
-                    self._reused_refinement_reservations)
+                    self._reused_refinement_reservations, self._endpoint_only_observations)
         raise self._incomplete("proposal_solver_budget_exhausted")

@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from crosscut.member_endpoint_exclusions import MemberEndpointExclusion, observed_unresolved_endpoints
+from crosscut.member_endpoint_exclusions import (
+    MemberEndpointExclusion, observed_unresolved_endpoints, probe_unresolved_endpoint,
+)
 from crosscut.member_boundary_observations import MemberBoundaryObservationStore
 from crosscut.member_observation_search import MemberObservationSearch, ObservationState, TransitionDemand, TransitionObservation
 from crosscut.focal_selector_geometry import FocalSelectorGeometry
@@ -15,6 +17,137 @@ from engine.tests.test_source_first_focal_geometry import geometry
 
 
 class MemberEndpointExclusionTests(unittest.TestCase):
+    def selective_store(self, modes=lambda offset, source, slot: 'missing' if source == 2 else 'face'):
+        full, observer, _ = self.store(modes)
+        slots = Mock(side_effect=lambda p, source, indices:
+            {slot: observer(p, source)[slot] for slot in indices})
+        prepare = Mock()
+        store = MemberBoundaryObservationStore(full.plans, observe=Mock(),
+            observe_samples=slots, prepare=prepare)
+        return store, slots, prepare
+
+    def test_endpoint_probe_only_completes_the_explicitly_missing_side(self):
+        for left, right, role, slot in ((2,0,'outgoing',1), (0,2,'incoming',2)):
+            with self.subTest(role=role):
+                store, observer, prepare = self.selective_store()
+                for source, indices in ((left,(0,1)), (right,(2,3))):
+                    store.requested_samples(0, source, indices)
+                observer.reset_mock()
+                certificate = probe_unresolved_endpoint(store, boundary_index=3,
+                    outgoing_source_index=left, incoming_source_index=right)
+                self.assertEqual((certificate.source_index, certificate.role), (2,role))
+                self.assertEqual(certificate.offsets, (0,-2,2))
+                self.assertEqual(observer.call_count, 2)
+                self.assertEqual({call.args[1:] for call in observer.call_args_list}, {(2,(slot,))})
+                prepared = prepare.call_args.args[0]
+                self.assertEqual(prepared, tuple((2,p.local_times_by_source[2][slot])
+                    for p in store.plans if p.offset_frames != 0))
+                self.assertNotIn((-2, right if role=='outgoing' else left, 2 if role=='outgoing' else 1),
+                    store.observed_sample_demands)
+
+    def test_endpoint_probe_never_treats_unobserved_legacy_or_one_recovery_as_absence(self):
+        for recovery in ('face','body','legacy'):
+            store, _, _ = self.selective_store(lambda offset,source,slot:
+                recovery if offset==2 or source!=2 else 'missing')
+            for source, indices in ((2,(0,1)), (0,(2,3))):
+                store.requested_samples(0,source,indices)
+            self.assertIsNone(probe_unresolved_endpoint(store,boundary_index=0,
+                outgoing_source_index=2,incoming_source_index=0))
+        for mode in ('unobserved','legacy','face','body','hold'):
+            store, observer, prepare = self.selective_store(lambda *_: 'missing' if mode=='hold' else mode)
+            if mode!='unobserved':
+                store.requested_samples(0,2,(0,1,2,3))
+            observer.reset_mock()
+            self.assertIsNone(probe_unresolved_endpoint(store,boundary_index=0,
+                outgoing_source_index=2,incoming_source_index=2 if mode=='hold' else 0))
+            observer.assert_not_called(); prepare.assert_not_called()
+
+    def test_progressive_pair_can_return_a_real_endpoint_certificate_without_fake_pair_cost(self):
+        store, _, _ = self.selective_store()
+        result = _observe_member_boundary_pair(store,outgoing_source_index=2,incoming_source_index=0,
+            source_frame_geometries=(direct_member_source_frame_geometry((2160,3840)),)*4,
+            continuous_official_portrait_fancam_contract=True,priority_boundary=True,
+            config=DirectMemberVisualConfig(),stop_after_first_eligible=True,
+            endpoint_boundary_index=5)
+        self.assertIsInstance(result,MemberEndpointExclusion)
+        self.assertIn(result,observed_unresolved_endpoints(store,5))
+        self.assertNotIn((-2,0,2),store.observed_sample_demands)
+        # The complete legacy scorer must reject every allowed offset, with
+        # no usable effect. The certificate never stands in for paired cost.
+        measured = _observe_member_boundary_pair(store,outgoing_source_index=2,incoming_source_index=0,
+            source_frame_geometries=(direct_member_source_frame_geometry((2160,3840)),)*4,
+            continuous_official_portrait_fancam_contract=True,priority_boundary=True,
+            config=DirectMemberVisualConfig())
+        self.assertEqual(len(measured),len(store.plans))
+        self.assertTrue(all('cross_source_focal_subject_unresolved' in item.mismatch.severe_flags
+            and item.mismatch.cinematic_bridge is None for item in measured))
+
+    def test_certified_endpoint_probe_charges_budget_and_needs_read_only_confirmation(self):
+        certificate=MemberEndpointExclusion(0,0,'outgoing',(0,),(1.,),(2.,))
+        for confirmed,budget in ((False,2),(True,1),(True,2)):
+            search=MemberObservationSearch(((True,)*3,)*2,maximum_observations=budget,
+                maximum_solver_calls=3)
+            proposals=iter(((0,1),(1,2),(1,2)))
+            observer=Mock(side_effect=lambda demand: certificate if demand.outgoing_source_index==0
+                else TransitionObservation(demand,True,.2,('actual paired samples',)))
+            args=dict(propose=lambda _:next(proposals),observe=observer,
+                endpoint_exclusions=lambda _: (certificate,) if confirmed else ())
+            if not confirmed:
+                with self.assertRaisesRegex(ValueError,'confirmed'):
+                    search.run(**args)
+            elif budget==1:
+                from crosscut.member_observation_search import MemberObservationSearchIncomplete
+                with self.assertRaises(MemberObservationSearchIncomplete) as caught:
+                    search.run(**args)
+                self.assertEqual(caught.exception.diagnostics['observation_count'],1)
+                self.assertEqual(caught.exception.diagnostics['endpoint_only_observation_count'],1)
+                self.assertFalse(search.observations)
+            else:
+                result=search.run(**args)
+                self.assertEqual(result.endpoint_only_observation_count,1)
+                self.assertEqual(result.observation_count,2)
+                self.assertEqual(result.endpoint_excluded_transition_count,2)
+                self.assertEqual(len(search.observations),1)
+                self.assertEqual(result.source_indices,(1,2))
+
+    def test_endpoint_probe_io_failure_propagates_without_a_negative_certificate(self):
+        store, _, prepare = self.selective_store()
+        store.requested_samples(0,2,(0,1))
+        prepare.side_effect=OSError('SSD disconnected')
+        with self.assertRaisesRegex(OSError,'SSD disconnected'):
+            probe_unresolved_endpoint(store,boundary_index=0,
+                outgoing_source_index=2,incoming_source_index=0)
+        self.assertEqual(observed_unresolved_endpoints(store,0),())
+
+    def test_endpoint_probe_retains_an_actual_cached_rejection_without_counting_it_twice(self):
+        certificate=MemberEndpointExclusion(0,0,'outgoing',(0,),(1.,),(2.,))
+        failed=TransitionDemand(0,0,1)
+        measured=TransitionObservation(failed,False,.8,('all actual cached offsets',))
+        search=MemberObservationSearch(((True,)*3,)*2,maximum_observations=2,
+            maximum_solver_calls=3)
+        proposals=iter(((0,1),(1,2),(1,2)))
+        result=search.run(propose=lambda _:next(proposals),
+            observe=lambda demand:certificate if demand==failed else TransitionObservation(demand,True,.2,('pixels',)),
+            reuse_observed=lambda demand:(measured,) if demand==failed else (),
+            endpoint_exclusions=lambda _:(certificate,))
+        self.assertIn(measured,search.observations)
+        self.assertNotIn(failed,search.endpoint_excluded_demands)
+        self.assertEqual(result.endpoint_only_observation_count,1)
+        self.assertEqual(result.endpoint_excluded_transition_count,1)
+        self.assertEqual(result.reused_observation_count,1)
+        self.assertEqual(result.unobserved_transition_count,3)
+
+    def test_unrelated_endpoint_certificate_cannot_reject_the_requested_pair(self):
+        for certificate in (MemberEndpointExclusion(1,0,'outgoing',(0,),(1.,),(2.,)),
+                            MemberEndpointExclusion(0,2,'incoming',(0,),(1.,),(2.,))):
+            search=MemberObservationSearch(((True,)*3,)*2,maximum_observations=2,
+                maximum_solver_calls=3)
+            with self.assertRaisesRegex(ValueError,'requested pair'):
+                search.run(propose=lambda _:(0,1),observe=lambda _:certificate,
+                    endpoint_exclusions=lambda _:(certificate,))
+            self.assertFalse(search.observations)
+            self.assertFalse(search.endpoint_excluded_demands)
+
     def test_partial_roles_prove_only_the_completely_observed_endpoint_side(self):
         full, observer, _ = self.store()
         selective = Mock(side_effect=lambda p, source, slots:

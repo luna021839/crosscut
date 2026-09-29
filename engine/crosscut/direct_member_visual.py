@@ -38,7 +38,9 @@ from .member_observation_search import (
     ProposalEdge, TransitionDemand, TransitionObservation,
 )
 from .member_path_flow import member_path_flow_rows
-from .member_endpoint_exclusions import observed_unresolved_endpoints
+from .member_endpoint_exclusions import (
+    MemberEndpointExclusion, observed_unresolved_endpoints, probe_unresolved_endpoint,
+)
 from .member_bridge_contract import (
     MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
@@ -1914,7 +1916,8 @@ def _observe_member_boundary_pair(
     observed_only: bool = False,
     stop_after_first_eligible: bool = False,
     cinematic_bridge_enabled: bool = True,
-) -> tuple[_ObservedMemberPairCandidate, ...]:
+    endpoint_boundary_index: int | None = None,
+) -> tuple[_ObservedMemberPairCandidate, ...] | MemberEndpointExclusion:
     """Observe exact pair offsets, optionally deferring unused alternatives.
 
     This is observation evidence, not a path or render plan. The caller must
@@ -1931,6 +1934,10 @@ def _observe_member_boundary_pair(
         if outgoing_source_index != incoming_source_index or plan.offset_frames == 0)
     if type(stop_after_first_eligible) is not bool or type(cinematic_bridge_enabled) is not bool:
         raise ValueError("progressive pair observation and effects must be boolean")
+    if endpoint_boundary_index is not None and (
+            type(endpoint_boundary_index) is not int or endpoint_boundary_index < 0
+            or observed_only or not stop_after_first_eligible):
+        raise ValueError('endpoint probing is only valid for funded fresh progressive observations')
     if stop_after_first_eligible:
         plans = tuple(sorted(plans, key=lambda plan: (abs(plan.offset_frames), plan.offset_frames)))
     complete_domain_count = len(plans)
@@ -2024,6 +2031,16 @@ def _observe_member_boundary_pair(
                 candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config),
             mismatch))
         measured = candidates[-1].mismatch
+        if (plan_index == 0 and endpoint_boundary_index is not None
+                and outgoing_source_index != incoming_source_index
+                and measured.severe_flags
+                and not (cinematic_bridge_enabled and measured.cinematic_bridge is not None)):
+            certificate = probe_unresolved_endpoint(observations,
+                boundary_index=endpoint_boundary_index,
+                outgoing_source_index=outgoing_source_index,
+                incoming_source_index=incoming_source_index)
+            if certificate is not None:
+                return certificate
         if stop_after_first_eligible and plan_index == 0 and (outgoing_source_index == incoming_source_index
                 or not measured.severe_flags
                 or (cinematic_bridge_enabled and measured.cinematic_bridge is not None)):
@@ -14031,8 +14048,11 @@ def select_balanced_direct_member_sources(
                 observed_only=observed_only,
                 stop_after_first_eligible=not complete_offsets,
                 cinematic_bridge_enabled=cinematic_bridge_enabled,
+                endpoint_boundary_index=boundary if not observed_only and not complete_offsets else None,
                 adjust_mismatch=lambda clock, left, right, mismatch:
                     adjust_boundary_mismatch(boundary, clock, left, right, mismatch))
+            if isinstance(candidates, MemberEndpointExclusion):
+                return candidates
             best = min(candidates, key=lambda item: (
                 0 if not item.mismatch.severe_flags else 1 if item.mismatch.cinematic_bridge is not None else 2,
                 item.mismatch.cost, abs(item.plan.offset_frames), item.plan.offset_frames))
@@ -14074,7 +14094,7 @@ def select_balanced_direct_member_sources(
             for index, (left, right) in enumerate(zip(policy_decision.path, policy_decision.path[1:]))
             if left != right or policy_decision.usage_policy in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES)
         observation_search_diagnostics = {
-            'contract': 'progressive_exact_member_offsets_with_funded_cached_positive_reuse_v3',
+            'contract': 'progressive_exact_member_offsets_with_certified_endpoint_probe_v4',
             'solver_call_count': observed_path.solver_call_count,
             'exact_pair_request_count': observed_path.observation_count,
             'exact_pair_refinement_count': observed_path.refinement_count,
@@ -14083,6 +14103,7 @@ def select_balanced_direct_member_sources(
                 - observed_path.reused_pair_refinement_reservation_count),
             'reused_observation_count': observed_path.reused_observation_count,
             'endpoint_excluded_transition_count': observed_path.endpoint_excluded_transition_count,
+            'endpoint_only_observation_count': observed_path.endpoint_only_observation_count,
             'observed_transition_count': len(observation_search.observations),
             'unobserved_transition_count': observed_path.unobserved_transition_count,
             'coarse_span_flanks_are_proposal_only': True,
