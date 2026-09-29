@@ -368,6 +368,39 @@ def _camera_states(
     return (panned, (0.5, 0.5)) if panned != (0.5, 0.5) else (panned,)
 
 
+def _repair_zoom_candidates(
+    *,
+    box: NormalizedBox,
+    target_box: NormalizedBox,
+    lossless_limit: float,
+    maximum_residual_scale: float,
+    legacy_face_only_maximum_zoom: float,
+    expanded: bool,
+) -> tuple[float, ...]:
+    """Bounded alternatives after the legacy exact-height choice failed.
+
+    Zoom also provides room to pan. The exact height ratio alone can leave
+    too little camera travel, or unnecessarily crop an otherwise visible
+    body. Search only inside the unchanged face-area mismatch and decoded
+    pixel limits; every candidate still goes through all geometry gates.
+    """
+    ideal_height = target_box[3] / box[3]
+    primary = min(lossless_limit, max(1.02, ideal_height))
+    if not expanded:
+        return (primary,) if primary > 1.0 + 1e-9 else ()
+    area_zoom = math.sqrt(target_box[2] * target_box[3] / (box[2] * box[3]))
+    scale_factor = math.exp(maximum_residual_scale * math.log(3.2) / 2.0)
+    lower = max(min(1.02, lossless_limit), area_zoom / scale_factor)
+    upper = min(lossless_limit, area_zoom * scale_factor)
+    if lower > upper + 1e-12:
+        return ()
+    values = {lower + (upper - lower) * index / 16.0 for index in range(17)}
+    values.update((ideal_height, area_zoom, legacy_face_only_maximum_zoom))
+    return tuple(sorted(value for value in values
+                        if value > 1.0 + 1e-9 and lower <= value <= upper
+                        and abs(value - primary) > 1e-10))
+
+
 def find_lossless_boundary_transform_repair(
     *,
     outgoing_face_box: NormalizedBox,
@@ -432,122 +465,127 @@ def find_lossless_boundary_transform_repair(
             incoming_subject_basis,
         ),
     )
-    for (
-        side,
-        source_index,
-        box,
-        target_box,
-        source_geometry,
-        subject_box,
-        subject_basis,
-    ) in sides:
-        lossless_limit = min(maximum_zoom, source_geometry.lossless_zoom_capacity)
-        if lossless_limit <= 1.0 + 1e-9:
-            continue
-        ideal_zoom = target_box[3] / box[3]
-        requested_zoom = max(1.02, ideal_zoom)
-        zoom = min(lossless_limit, requested_zoom)
-        if zoom <= 1.0 + 1e-9:
-            continue
-        for center_x, center_y in _camera_states(
-            box=box,
-            target_box=target_box,
-            zoom=zoom,
-            maximum_center_shift=maximum_center_shift,
-        ):
-            face_visible = box_visible_fraction(
-                box,
-                zoom=zoom,
-                center_x=center_x,
-                center_y=center_y,
-            )
-            if face_visible + 1e-9 < minimum_face_visible_fraction:
+    # Preserve all previously admissible repairs before expanding the search.
+    for expanded_zoom_search in (False, True):
+        for (
+            side,
+            source_index,
+            box,
+            target_box,
+            source_geometry,
+            subject_box,
+            subject_basis,
+        ) in sides:
+            lossless_limit = min(maximum_zoom, source_geometry.lossless_zoom_capacity)
+            if lossless_limit <= 1.0 + 1e-9:
                 continue
-            shift = math.hypot(center_x - 0.5, center_y - 0.5)
-            widened = (
-                zoom > legacy_face_only_maximum_zoom + 1e-9
-                or shift > legacy_face_only_maximum_center_shift + 1e-9
-            )
-            mapped_subject = (
-                _validated_box(subject_box) if subject_box is not None else None
-            )
-            subject_visible: float | None = None
-            if widened:
-                if mapped_subject is None or not subject_basis:
-                    continue
-                subject_visible = box_visible_fraction(
-                    mapped_subject,
+            for zoom in _repair_zoom_candidates(
+                box=box,
+                target_box=target_box,
+                lossless_limit=lossless_limit,
+                maximum_residual_scale=maximum_residual_attention_scale_mismatch,
+                legacy_face_only_maximum_zoom=legacy_face_only_maximum_zoom,
+                expanded=expanded_zoom_search,
+            ):
+                for center_x, center_y in _camera_states(
+                    box=box,
+                    target_box=target_box,
                     zoom=zoom,
-                    center_x=center_x,
-                    center_y=center_y,
-                )
-                if subject_visible + 1e-9 < minimum_subject_visible_fraction:
-                    continue
-            transformed_box = project_box(
-                box,
-                zoom=zoom,
-                center_x=center_x,
-                center_y=center_y,
+                    maximum_center_shift=maximum_center_shift,
+                ):
+                    face_visible = box_visible_fraction(
+                        box,
+                        zoom=zoom,
+                        center_x=center_x,
+                        center_y=center_y,
+                    )
+                    if face_visible + 1e-9 < minimum_face_visible_fraction:
+                        continue
+                    shift = math.hypot(center_x - 0.5, center_y - 0.5)
+                    widened = (
+                        zoom > legacy_face_only_maximum_zoom + 1e-9
+                        or shift > legacy_face_only_maximum_center_shift + 1e-9
+                    )
+                    mapped_subject = (
+                        _validated_box(subject_box) if subject_box is not None else None
+                    )
+                    subject_visible: float | None = None
+                    if widened:
+                        if mapped_subject is None or not subject_basis:
+                            continue
+                        subject_visible = box_visible_fraction(
+                            mapped_subject,
+                            zoom=zoom,
+                            center_x=center_x,
+                            center_y=center_y,
+                        )
+                        if subject_visible + 1e-9 < minimum_subject_visible_fraction:
+                            continue
+                    transformed_box = project_box(
+                        box,
+                        zoom=zoom,
+                        center_x=center_x,
+                        center_y=center_y,
+                    )
+                    if side == "outgoing":
+                        transformed_left, transformed_right = transformed_box, right
+                    else:
+                        transformed_left, transformed_right = left, transformed_box
+                    residual_position, residual_scale = attention_mismatch(
+                        transformed_left,
+                        transformed_right,
+                    )
+                    residual_center = math.hypot(
+                        box_center(transformed_left)[0] - box_center(transformed_right)[0],
+                        box_center(transformed_left)[1] - box_center(transformed_right)[1],
+                    )
+                    if residual_center > maximum_residual_center_distance + 1e-9:
+                        continue
+                    if residual_scale > maximum_residual_attention_scale_mismatch + 1e-9:
+                        continue
+                    transformed_mismatch = face_geometry_mismatch(
+                        transformed_left,
+                        transformed_right,
+                    )
+                    improvement = (
+                        (baseline - transformed_mismatch) / baseline
+                        if baseline > 1e-9
+                        else 0.0
+                    )
+                    if improvement + 1e-9 < minimum_improvement_fraction:
+                        continue
+                    candidates.append(
+                        DirectMemberBoundaryTransformRepair(
+                            transformed_side=side,
+                            transformed_source_index=source_index,
+                            zoom=zoom,
+                            center_x=center_x,
+                            center_y=center_y,
+                            source_geometry=source_geometry,
+                            raw_attention_position_mismatch=raw_position,
+                            raw_attention_scale_mismatch=raw_scale,
+                            residual_attention_position_mismatch=residual_position,
+                            residual_attention_scale_mismatch=residual_scale,
+                            baseline_face_geometry_mismatch=baseline,
+                            transformed_face_geometry_mismatch=transformed_mismatch,
+                            improvement_fraction=improvement,
+                            face_visible_fraction=face_visible,
+                            subject_geometry_basis=(subject_basis if widened else None),
+                            subject_visible_fraction=(subject_visible if widened else None),
+                            alignment_geometry_basis=alignment_geometry_basis,
+                        )
+                    )
+        if candidates:
+            return min(
+                candidates,
+                key=lambda item: (
+                    item.transformed_face_geometry_mismatch,
+                    item.zoom - 1.0,
+                    item.center_shift,
+                    item.transformed_source_index,
+                ),
             )
-            if side == "outgoing":
-                transformed_left, transformed_right = transformed_box, right
-            else:
-                transformed_left, transformed_right = left, transformed_box
-            residual_position, residual_scale = attention_mismatch(
-                transformed_left,
-                transformed_right,
-            )
-            residual_center = math.hypot(
-                box_center(transformed_left)[0] - box_center(transformed_right)[0],
-                box_center(transformed_left)[1] - box_center(transformed_right)[1],
-            )
-            if residual_center > maximum_residual_center_distance + 1e-9:
-                continue
-            if residual_scale > maximum_residual_attention_scale_mismatch + 1e-9:
-                continue
-            transformed_mismatch = face_geometry_mismatch(
-                transformed_left,
-                transformed_right,
-            )
-            improvement = (
-                (baseline - transformed_mismatch) / baseline
-                if baseline > 1e-9
-                else 0.0
-            )
-            if improvement + 1e-9 < minimum_improvement_fraction:
-                continue
-            candidates.append(
-                DirectMemberBoundaryTransformRepair(
-                    transformed_side=side,
-                    transformed_source_index=source_index,
-                    zoom=zoom,
-                    center_x=center_x,
-                    center_y=center_y,
-                    source_geometry=source_geometry,
-                    raw_attention_position_mismatch=raw_position,
-                    raw_attention_scale_mismatch=raw_scale,
-                    residual_attention_position_mismatch=residual_position,
-                    residual_attention_scale_mismatch=residual_scale,
-                    baseline_face_geometry_mismatch=baseline,
-                    transformed_face_geometry_mismatch=transformed_mismatch,
-                    improvement_fraction=improvement,
-                    face_visible_fraction=face_visible,
-                    subject_geometry_basis=(subject_basis if widened else None),
-                    subject_visible_fraction=(subject_visible if widened else None),
-                    alignment_geometry_basis=alignment_geometry_basis,
-                )
-            )
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda item: (
-            item.transformed_face_geometry_mismatch,
-            item.zoom - 1.0,
-            item.center_shift,
-            item.transformed_source_index,
-        ),
-    )
+    return None
 
 
 __all__ = [

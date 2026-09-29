@@ -704,6 +704,9 @@ class DirectMemberVisualConfig:
             "severe_penalty": self.severe_penalty,
             "severe_edge_effect": "ineligible_fail_closed_if_quota_path_exhausted",
             "lossless_transform_repair": {
+                "zoom_search_basis": (
+                    "incumbent_first_bounded_feasible_scale_frontier_v1"
+                ),
                 "scope": (
                     "pipeline_verified_official_target_member_fancam_only"
                 ),
