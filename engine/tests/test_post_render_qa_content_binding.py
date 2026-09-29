@@ -12,6 +12,7 @@ from engine.tests.test_review_first_runtime import _group_integrity_metrics
 from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
 from crosscut.pipeline import (
     _enforce_automatic_stage_edit_post_render_qa,
+    _json_payload_matches,
     _persist_qa_input_analysis_snapshot,
     _read_stable_regular_file,
     _write_analysis_manifest_atomically,
@@ -95,6 +96,96 @@ def _report(
 
 
 class PostRenderQAContentBindingTests(unittest.TestCase):
+    def test_json_equivalence_rejects_changed_values_and_ambiguous_keys(self):
+        for left, right in (
+            ({'x': True}, {'x': 1}), ({'x': (1, 2)}, {'x': [2, 1]}),
+            ({'x': None}, {'x': 0}), ({1: 'a', '1': 'b'}, {'1': 'b'}),
+            ({'x': float('nan')}, {'x': float('nan')}),
+            ({'x': float('inf')}, {'x': float('inf')}),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertFalse(_json_payload_matches(left, right))
+
+    def test_json_array_and_object_key_serialization_does_not_break_binding(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifacts, manifest = _artifact_shell(Path(raw))
+            manifest['observed_cut_points'] = ((14, 526), (47, 1736))
+            manifest['source_diagnostics'] = {0: {'samples': (1., 2.)}}
+            _write_analysis_manifest_atomically(artifacts.analysis_path, manifest)
+
+            def evaluate(frozen, **kwargs):
+                report = _report(fingerprint_post_render_artifacts(frozen))
+                payload = report.to_dict()
+                payload['metrics']['serialized_coordinates'] = {0: (.3, .4)}
+                report.to_dict = lambda: payload
+                frozen.default_report_path.write_text(json.dumps(payload))
+                return report, frozen.default_report_path
+
+            with patch('crosscut.pipeline.evaluate_and_write_post_render_qa', side_effect=evaluate):
+                path = _enforce_automatic_stage_edit_post_render_qa(
+                    registered_stage_edit_bundle=None, manifest=manifest,
+                    manifest_path=artifacts.analysis_path, reporter=_Reporter(),
+                    automatic_ive_group_delivery=True)
+            self.assertTrue(path.is_file())
+            self.assertTrue(manifest['post_render_qa']['promotion_binding']['passed'])
+            self.assertEqual((), _qa_snapshot_directories(Path(raw)))
+
+    def test_report_boolean_to_integer_substitution_is_not_json_equivalent(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifacts, manifest = _artifact_shell(Path(raw))
+            def evaluate(frozen, **kwargs):
+                report = _report(fingerprint_post_render_artifacts(frozen))
+                payload = report.to_dict()
+                payload['passed'] = 1
+                frozen.default_report_path.write_text(json.dumps(payload))
+                return report, frozen.default_report_path
+            with patch('crosscut.pipeline.evaluate_and_write_post_render_qa', side_effect=evaluate):
+                with self.assertRaisesRegex(RuntimeError, 'content binding failure'):
+                    _enforce_automatic_stage_edit_post_render_qa(
+                        registered_stage_edit_bundle=None, manifest=manifest,
+                        manifest_path=artifacts.analysis_path, reporter=_Reporter(),
+                        automatic_ive_group_delivery=True)
+            self.assertEqual('rejected', manifest['artifact_role'])
+            diagnostic_path = Path(manifest['post_render_qa']['report_path'])
+            diagnostic = json.loads(diagnostic_path.read_text())
+            self.assertFalse(diagnostic['render_authorized'])
+            self.assertFalse(diagnostic['content_binding_passed'])
+            self.assertTrue(diagnostic['evaluator_report']['passed'])
+            self.assertEqual('unbound_evaluator_diagnostic',
+                manifest['post_render_qa']['report_preservation_kind'])
+            self.assertEqual((), _qa_snapshot_directories(Path(raw)))
+
+    def test_serialized_failed_report_is_preserved_without_promoting_video(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifacts, manifest = _artifact_shell(Path(raw))
+            manifest['cut_frames'] = (14, 47)
+            _write_analysis_manifest_atomically(artifacts.analysis_path, manifest)
+            def evaluate(frozen, **kwargs):
+                report = _report(fingerprint_post_render_artifacts(frozen))
+                payload = report.to_dict()
+                payload.update(passed=False, issues=[{
+                    'code': 'fixture_editorial_failure', 'severity': 'FAIL',
+                    'value': (.4, .6), 'message': 'measured editorial failure'}],
+                    fail_issue_count=1, issue_count=1)
+                report.passed = False
+                report.verdict.value = 'FAIL'
+                report.to_dict = lambda: payload
+                frozen.default_report_path.write_text(json.dumps(payload))
+                return report, frozen.default_report_path
+            with patch('crosscut.pipeline.evaluate_and_write_post_render_qa', side_effect=evaluate):
+                with self.assertRaisesRegex(RuntimeError, 'verdict FAIL'):
+                    _enforce_automatic_stage_edit_post_render_qa(
+                        registered_stage_edit_bundle=None, manifest=manifest,
+                        manifest_path=artifacts.analysis_path, reporter=_Reporter(),
+                        automatic_ive_group_delivery=True)
+            qa = manifest['post_render_qa']
+            self.assertEqual('rejected', manifest['artifact_role'])
+            self.assertFalse(manifest['app_result_exposure']['video_output_exposed'])
+            self.assertTrue(qa['promotion_binding']['passed'])
+            self.assertFalse(json.loads(Path(qa['report_path']).read_text())['passed'])
+            self.assertEqual('verified_qa_report', qa['report_preservation_kind'])
+            self.assertEqual((), _qa_snapshot_directories(Path(raw)))
+
     def test_modern_clock_is_frozen_and_original_mutation_cannot_change_qa_input(self):
         with tempfile.TemporaryDirectory() as raw:
             artifacts, _ = _artifact_shell(Path(raw))

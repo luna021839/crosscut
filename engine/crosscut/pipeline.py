@@ -4386,6 +4386,32 @@ class VerifiedAutomaticMemberAlignmentPeerConsensus(Mapping[str, Any]):
         return self._payload()
 
 
+def _json_payload_matches(left: object, right: object) -> bool:
+    """Compare the persisted JSON contract, not Python container identities.
+
+    Tuples serialize as arrays and numeric object keys serialize as strings.
+    Conversely Python considers True == 1, which is not a matching JSON
+    boolean. No nonfinite values or colliding serialized keys are accepted.
+    File hashes, source binding and stable-inode checks remain independent.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate serialized JSON object key')
+            result[key] = value
+        return result
+
+    def canonical(payload):
+        normalized = json.loads(json.dumps(payload, allow_nan=False), object_pairs_hook=unique_object)
+        return json.dumps(normalized, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+    try:
+        return canonical(left) == canonical(right)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _write_analysis_manifest_atomically(
     path: Path,
     manifest: Mapping[str, Any],
@@ -4816,7 +4842,7 @@ def _complete_automatic_stage_edit_post_render_qa(
         persisted_analysis_payload = None
     in_memory_manifest_matches_evaluated_analysis = bool(
         persisted_analysis_payload is not None
-        and persisted_analysis_payload == manifest
+        and _json_payload_matches(persisted_analysis_payload, manifest)
     )
     qa_input_analysis_snapshot: dict[str, Any] = {}
     expected_analysis_fingerprint = (
@@ -4867,7 +4893,7 @@ def _complete_automatic_stage_edit_post_render_qa(
         persisted_report_matches = bool(
             report_path_contract_matches
             and isinstance(persisted_report, Mapping)
-            and dict(persisted_report) == report_payload
+            and _json_payload_matches(dict(persisted_report), report_payload)
         )
     except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
         persisted_report_matches = False
@@ -4896,7 +4922,7 @@ def _complete_automatic_stage_edit_post_render_qa(
             report_stable_through_promotion = bool(
                 final_report_fingerprint == report_content_fingerprint
                 and isinstance(final_report_payload, Mapping)
-                and dict(final_report_payload) == report_payload
+                and _json_payload_matches(dict(final_report_payload), report_payload)
             )
         except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
             report_stable_through_promotion = False
@@ -4983,6 +5009,25 @@ def _complete_automatic_stage_edit_post_render_qa(
                 expected_fingerprint=report_content_fingerprint,
             )
         )
+    else:
+        # A mismatched report must never authorize delivery. Retain the
+        # evaluator's payload as explicitly UNBOUND diagnostic evidence before
+        # removing its private read snapshot; do not publish a dead report URL
+        # or require another expensive media decode just to inspect the failure.
+        diagnostic_path = declared_artifact_set.output_directory / (
+            f"{declared_artifact_set.base_name}-post-render-qa-unbound-diagnostic.json"
+        )
+        _write_analysis_manifest_atomically(diagnostic_path, {
+            "contract": "post_render_qa_unbound_evaluator_diagnostic_v1",
+            "artifact_role": "diagnostic",
+            "render_authorized": False,
+            "content_binding_passed": False,
+            "persisted_report_matches_evaluator_payload": persisted_report_matches,
+            "report_path_matches_bound_default": report_path_contract_matches,
+            "evaluator_report": report_payload,
+        })
+        _diagnostic_bytes, diagnostic_fingerprint = _read_stable_regular_file(diagnostic_path)
+        delivery_materialization["unbound_diagnostic"] = diagnostic_fingerprint
     if snapshot_stable_through_promotion:
         snapshot_source = Path(str(qa_input_analysis_snapshot["path"]))
         snapshot_destination = declared_artifact_set.output_directory / (
@@ -5028,9 +5073,11 @@ def _complete_automatic_stage_edit_post_render_qa(
         "passed": promotion_binding_passed,
     }
     promoted_report = delivery_materialization.get("report")
+    unbound_diagnostic = delivery_materialization.get("unbound_diagnostic", {})
     report_audit_path = str(
         promoted_report.get("path")
         if isinstance(promoted_report, Mapping) and promoted_report.get("path")
+        else unbound_diagnostic["path"] if unbound_diagnostic.get("path")
         else report_content_fingerprint.get(
             "path",
             candidate_report_path.absolute(),
@@ -5047,6 +5094,9 @@ def _complete_automatic_stage_edit_post_render_qa(
         "ive_product_floor_required_independent_of_activation": True,
         "success_requires_pass": True,
         "report_path": report_audit_path,
+        "report_preservation_kind": (
+            "unbound_evaluator_diagnostic" if unbound_diagnostic else "verified_qa_report"
+        ),
         "verdict": report.verdict.value,
         "passed": effective_passed,
         "review_first_disposition": qa_disposition.to_dict(),
@@ -5177,7 +5227,7 @@ def _enforce_automatic_member_post_render_qa(
         raise RuntimeError(
             "automatic IVE MEMBER pending analysis manifest is unreadable"
         ) from exc
-    if not isinstance(persisted, dict) or persisted != manifest:
+    if not isinstance(persisted, dict) or not _json_payload_matches(persisted, manifest):
         raise RuntimeError(
             "automatic IVE MEMBER pending analysis differs from persisted QA input"
         )

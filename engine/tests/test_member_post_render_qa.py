@@ -795,9 +795,25 @@ class AutomaticMemberPostRenderQATests(unittest.TestCase):
 
 
 class AutomaticMemberPipelineExposureTests(unittest.TestCase):
+    def test_json_boolean_mutation_is_not_accepted_as_the_persisted_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, manifest = _fixture(Path(directory))
+            manifest['observed_proof'] = True
+            artifacts.analysis_path.write_text(json.dumps(manifest))
+            manifest['observed_proof'] = 1
+            with patch('crosscut.pipeline.evaluate_and_write_automatic_member_post_render_qa') as evaluate:
+                with self.assertRaisesRegex(RuntimeError, 'differs from persisted QA input'):
+                    _enforce_automatic_member_post_render_qa(manifest=manifest,
+                        manifest_path=artifacts.analysis_path, reporter=EventReporter())
+            evaluate.assert_not_called()
+
     def test_pass_promotes_delivery_and_cli_accepts_only_the_bound_mp4(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifacts, manifest = _fixture(Path(directory))
+            # Actual camera/geometry producers use tuples and indexed maps;
+            # writing JSON must not become a false input-tampering failure.
+            manifest['observed_cut_samples'] = {0: (.1, .2), 1: (.3, .4)}
+            artifacts.analysis_path.write_text(json.dumps(manifest))
 
             def evaluate(item, **kwargs):  # type: ignore[no-untyped-def]
                 return evaluate_and_write_automatic_member_post_render_qa(
