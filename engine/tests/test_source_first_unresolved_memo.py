@@ -7,7 +7,8 @@ from unittest.mock import Mock, patch
 
 from crosscut.focal_selector_geometry import FocalSelectorGeometry
 from crosscut.source_first_unresolved_memo import (
-    SourceFirstUnresolvedMemo, install_source_first_unresolved_memo, _verified_empty_native_detection)
+    SourceFirstUnresolvedMemo, install_source_first_unresolved_memo, _verified_empty_native_detection,
+    _verified_complete_native_candidates)
 
 
 class UnresolvedMemoTests(unittest.TestCase):
@@ -163,6 +164,54 @@ class UnresolvedMemoTests(unittest.TestCase):
         self.bodies._references[0]=(1,2)
         memo=SourceFirstUnresolvedMemo(self.provider);memo(0,10.)
         self.assertEqual(memo.diagnostics()['records'],0)
+
+    def test_nonempty_completion_requires_every_detected_face_to_have_identity_features(self):
+        import numpy as np
+        self.provider.native_faces = SimpleNamespace(maximum_detection_width=960,
+            frame_at=Mock(return_value=np.zeros((20, 20, 3), dtype=np.uint8)))
+        candidate = SimpleNamespace(bbox_xywh=(.1, .1, .2, .2))
+        metadata = (candidate.bbox_xywh, ((.1, .1),)*5, None, None, None)
+        for backend, count, candidates, expected in (
+            ('yunet', 1, (candidate,), True), ('yunet', 2, (candidate,), False),
+            ('haar', 1, (candidate,), False), ('none', 0, (candidate,), False),
+            ('yunet', 1, (SimpleNamespace(bbox_xywh=(.4, .1, .2, .2)),), False),
+        ):
+            with patch('crosscut.visual_score._detect_faces', return_value=((object(),)*count, backend)), \
+                 patch('crosscut.visual_score._normalized_face_metadata', return_value=metadata):
+                self.assertEqual(_verified_complete_native_candidates(self.provider, 0, 10., candidates), expected)
+
+    def test_partial_sface_result_is_not_marked_as_completed_native_observation(self):
+        self.provider.native_faces = SimpleNamespace(inference_frame_count=0)
+        def candidates(source, seconds):
+            self.provider.native_faces.inference_frame_count += 1
+            return (object(),)
+        self.faces._external_focal_candidate_provider = candidates
+        install_source_first_unresolved_memo(self.provider)
+        for complete in (False, True):
+            memo = self.provider._source_first_unresolved_memo
+            memo.completed_face_frames.clear()
+            with patch('crosscut.source_first_unresolved_memo._verified_complete_native_candidates', return_value=complete):
+                self.faces._external_focal_candidate_provider(0, 10.)
+            self.assertEqual(bool(memo.completed_face_frames), complete)
+
+    def test_provider_completion_receipt_never_repeats_detection(self):
+        self.provider.native_faces = SimpleNamespace(inference_frame_count=0,
+            candidate_observation_complete=Mock(return_value=True))
+        def candidates(source, seconds):
+            self.provider.native_faces.inference_frame_count += 1
+            return ()
+        self.faces._external_focal_candidate_provider = candidates
+        install_source_first_unresolved_memo(self.provider)
+        memo = self.provider._source_first_unresolved_memo
+        with patch('crosscut.source_first_unresolved_memo._verified_complete_native_candidates', side_effect=AssertionError('duplicate detection')), \
+             patch('crosscut.source_first_unresolved_memo._verified_empty_native_detection', side_effect=AssertionError('duplicate detection')):
+            self.faces._external_focal_candidate_provider(0, 10.)
+            self.provider.native_faces.candidate_observation_complete.return_value = False
+            self.faces._external_focal_candidate_provider(0, 11.)
+        self.assertIn((0, 300, 30, 1), memo.completed_face_frames)
+        self.assertNotIn((0, 330, 30, 1), memo.completed_face_frames)
+        self.assertEqual(memo.native_completion_receipt_count, 2)
+        self.assertEqual(memo.empty_face_validation_count, 0)
 
     def test_positive_geometry_and_exceptions_are_not_negative_entries(self):
         memo=SourceFirstUnresolvedMemo(self.provider)

@@ -182,11 +182,12 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
                 self.assertGreater(calls, 10)
                 self.assertEqual(batch.skipped_body_dependency_count, 0)
             else:
-                self.assertEqual(calls, 1)
-                self.assertGreater(batch.skipped_body_dependency_count, 10)
-                self.assertEqual(batch.anchor_impossible_query_count, 1)
+                # This fixture already contains the complete native-face
+                # window, so even the exact query body is unnecessary.
+                self.assertEqual(calls, 0)
+                self.assertEqual(batch.proven_missing_query_body_skip_count, 1)
             self.assertEqual(provider.faces._focal_candidates.call_count,
-                len(track_dependency_times(provider.faces._samplers[0], 10.)))
+                len(track_dependency_times(provider.faces._samplers[0], 10.)) if anchors else 1)
             self.assertFalse(batch.diagnostics()['query_offsets_removed'])
 
     def test_incomplete_faces_and_small_working_cache_keep_all_body_work(self):
@@ -196,6 +197,10 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
                 provider._source_first_unresolved_memo.completed_face_frames.clear()
             else:
                 provider.shared_source_frames[0].maximum_working_frames = 2
+                # A cold/incomplete window still obeys the pixel-cache bound.
+                # A completed face certificate needs no working pixels.
+                provider.faces._focal_candidate_cache.clear()
+                provider.faces._focal_candidates.side_effect = lambda *_: ()
             install_source_first_anchor_prefilter(provider)
             batch = SourceFirstObservationBatch(provider)
             batch(((0, 10.),))

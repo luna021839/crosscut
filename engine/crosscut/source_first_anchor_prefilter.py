@@ -33,16 +33,23 @@ class SourceFirstAnchorPrefilter:
                 and item.reference_similarity - max(
                     (other.reference_similarity for k, other in enumerate(observed) if k != i),
                     default=-1.) >= .06 for i, item in enumerate(observed))
+        return self.native_face_anchor_state(source, seconds)
+
+    def native_face_anchor_state(self, source, seconds, *, require_complete=False):
+        provider = self.provider
+        sampler = provider.faces._samplers[source]
+        key = provider.faces._identity_key(source, sampler, seconds)
         faces = provider.faces._focal_candidate_cache.get(key)
         memo = provider._source_first_unresolved_memo
-        if faces is None or not faces and key not in memo.completed_face_frames:
+        if (faces is None or (require_complete or not faces)
+                and key not in memo.completed_face_frames):
             return None
         bank = provider.faces._frozen_focal_banks.get(source)
         if bank is None or memo.namespace != provider.observation_namespace:
             return None
         return bank.select(faces) is not None
 
-    def cannot_resolve(self, source, seconds):
+    def cannot_resolve(self, source, seconds, *, native_faces_only=False):
         """A complete upper bound of fewer than two anchors, never a guess."""
         from .source_first_observation_batch import track_dependency_times
         provider = self.provider
@@ -62,7 +69,8 @@ class SourceFirstAnchorPrefilter:
         self.checked_windows += 1
         possible_times = set()
         for time in track_dependency_times(sampler, seconds):
-            state = self.anchor_state(source, time)
+            state = (self.native_face_anchor_state(source, time, require_complete=True)
+                     if native_faces_only else self.anchor_state(source, time))
             if state is None:
                 return False
             if state:
@@ -71,6 +79,30 @@ class SourceFirstAnchorPrefilter:
                 return False
         self.impossible_windows += 1
         return True
+
+    def query_cannot_resolve(self, source, seconds):
+        """Prove both exact-face admission and body recovery are impossible.
+
+        This is stricter than the track-only test: even one visible frozen
+        face can directly admit an exact body/pose without two track anchors.
+        No model work is done here. An unobserved/failed query remains unknown.
+        """
+        # Do not memoize disproof from possibly incomplete body/pose inference.
+        # The complete native face upper bound alone must be sufficient.
+        if not self.cannot_resolve(source, seconds, native_faces_only=True):
+            return False
+        provider = self.provider
+        sampler = provider.faces._samplers[source]
+        key = provider.faces._identity_key(source, sampler, seconds)
+        faces = provider.faces._focal_candidate_cache.get(key)
+        memo = provider._source_first_unresolved_memo
+        bank = provider.faces._frozen_focal_banks[source]
+        if (faces is None or not faces and key not in memo.completed_face_frames
+                or bank.select(faces) is not None):
+            return False
+        existing = provider.bodies._track_cache.get(key)
+        # An already resolved trajectory retains its original authority.
+        return existing is None or existing.observation is None
 
     def track_at(self, source, seconds):
         provider = self.provider

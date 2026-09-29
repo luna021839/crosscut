@@ -31,6 +31,7 @@ class NativeFocalFaceProvider:
         self._captures = {}
         self._readers = {}
         self._cache = OrderedDict()
+        self._candidate_completeness = {}
         self.inference_frame_count = 0
 
     def fingerprint(self):
@@ -74,24 +75,37 @@ class NativeFocalFaceProvider:
             return self._cache[key]
         native = self.frame_at(source, seconds)
         candidates = []
+        complete = False
         if native is not None:
             working = _working_frame(native, maximum_width=self.maximum_detection_width)
             faces, backend = _detect_faces(working, cv2.cvtColor(working, cv2.COLOR_BGR2GRAY))
             if backend == 'yunet':
+                complete = True
                 for face in faces:
                     bbox, landmarks, _roll, eye_scale, _geometry = _normalized_face_metadata(
                         face, frame_width=working.shape[1], frame_height=working.shape[0])
                     if bbox is None or landmarks is None:
+                        complete = False
                         continue
                     features = extract_sface_embedding(native, bbox_xywh=bbox, landmarks_xy=landmarks)
                     if features:
                         candidates.append(FocalFaceCandidate(bbox, features, eye_scale,
                             _landmark_rms_scale(landmarks, frame_width=working.shape[1], frame_height=working.shape[0])))
+                    else:
+                        complete = False
             self.inference_frame_count += 1
         self._cache[key] = tuple(candidates)
+        # Scalar completion evidence shares the exact bounded candidate cache;
+        # it does not repeat detection or persist pixels/identity features.
+        self._candidate_completeness[key] = complete
         if len(self._cache)>4096:
-            self._cache.popitem(last=False)
+            evicted, _ = self._cache.popitem(last=False)
+            self._candidate_completeness.pop(evicted, None)
         return self._cache[key]
+
+    def candidate_observation_complete(self, source, seconds):
+        return (type(source) is int and type(seconds) in (int, float)
+                and self._candidate_completeness.get((source, seconds)) is True)
 
     def close(self):
         for capture in self._captures.values():
@@ -99,3 +113,4 @@ class NativeFocalFaceProvider:
         self._captures.clear()
         self._readers.clear()
         self._cache.clear()
+        self._candidate_completeness.clear()

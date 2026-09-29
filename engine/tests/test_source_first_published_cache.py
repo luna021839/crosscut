@@ -16,8 +16,9 @@ class PublishedGeometryCacheTests(unittest.TestCase):
         from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
         current = SourceFirstFocalGeometryProvider.observation_fingerprint()
         previous = decode_equivalent_focal_fingerprints(current)
-        self.assertEqual(len(previous), 2)
-        for unknown in (*previous, '0'*64):
+        self.assertEqual(len(previous), 3)
+        self.assertEqual(decode_equivalent_focal_fingerprints(previous[0]), previous[1:])
+        for unknown in (*previous[1:], '0'*64):
             self.assertEqual(decode_equivalent_focal_fingerprints(unknown), ())
         encoder = Mock()
         encoder.fingerprint.return_value = {'model': 'exact', 'adapter': 'mps-v1'}

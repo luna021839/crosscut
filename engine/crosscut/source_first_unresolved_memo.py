@@ -1,12 +1,13 @@
 """Run-local reuse of completely observed, unresolved target-track queries.
 
 Positive geometry keeps its existing persistent namespace. Only scalar missing
-results are retained here, and only when every tracker frame has completed
-native face analysis, body detections and all requested pose inferences.
+results are retained here: either every tracker frame completed native faces,
+body detections and requested poses, or complete native-face observations prove
+both direct admission and the required two recovery anchors impossible.
 Failed decodes, absent models and exceptions must remain retryable. No missing result
 is published to disk or promoted to source exclusion or cut approval.
 """
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import replace
 import math
 
@@ -27,6 +28,31 @@ def _verified_empty_native_detection(provider, source, seconds):
     return backend == 'yunet' and not faces
 
 
+def _verified_complete_native_candidates(provider, source, seconds, candidates):
+    """Partial SFace extraction is not evidence that the target is absent.
+
+    Inspect the same still-cached native raster while the provider is observing
+    it. This never repeats SFace extraction or performs a neighboring-frame
+    lookup; every detected box must have yielded a native identity candidate.
+    """
+    from .visual_score import _detect_faces, _working_frame, _normalized_face_metadata
+    native = provider.native_faces.frame_at(source, seconds)
+    if native is None:
+        return False
+    working = _working_frame(native, maximum_width=provider.native_faces.maximum_detection_width)
+    faces, backend = _detect_faces(working, cv2.cvtColor(working, cv2.COLOR_BGR2GRAY))
+    if backend != 'yunet' or len(faces) != len(candidates):
+        return False
+    boxes = []
+    for face in faces:
+        box, landmarks, *_ = _normalized_face_metadata(face,
+            frame_width=working.shape[1], frame_height=working.shape[0])
+        if box is None or landmarks is None:
+            return False
+        boxes.append(box)
+    return Counter(boxes) == Counter(candidate.bbox_xywh for candidate in candidates)
+
+
 class SourceFirstUnresolvedMemo:
     def __init__(self, provider, *, maximum_entries=65536):
         if isinstance(maximum_entries, bool) or not isinstance(maximum_entries, int) or maximum_entries <= 0:
@@ -43,6 +69,9 @@ class SourceFirstUnresolvedMemo:
         self.incomplete_reasons = {}
         self.hits = self.records = self.evictions = 0
         self.empty_face_validation_count = 0
+        self.complete_face_validation_count = 0
+        self.native_completion_receipt_count = 0
+        self.anchor_bound_records = 0
         self.closed = False
 
     def candidates_at(self, source, seconds):
@@ -52,9 +81,18 @@ class SourceFirstUnresolvedMemo:
         # succeeded. Verify empty results on that same native frame so Haar
         # fallback and absent/failed models never become observed negatives.
         if self.provider.native_faces.inference_frame_count > before:
-            if not result:
+            completion = getattr(self.provider.native_faces, 'candidate_observation_complete', None)
+            if callable(completion):
+                self.native_completion_receipt_count += 1
+                if completion(source, seconds) is not True:
+                    return result
+            elif not result:
                 self.empty_face_validation_count += 1
                 if not _verified_empty_native_detection(self.provider, source, seconds):
+                    return result
+            else:
+                self.complete_face_validation_count += 1
+                if not _verified_complete_native_candidates(self.provider, source, seconds, result):
                     return result
             sampler = self.provider.faces._samplers[source]
             key = self.provider.faces._identity_key(source, sampler, seconds)
@@ -67,6 +105,14 @@ class SourceFirstUnresolvedMemo:
     def _incomplete(self, reason):
         self.incomplete_reasons[reason] = self.incomplete_reasons.get(reason, 0) + 1
         return False
+
+    def _remember(self, key, value):
+        self.entries[key] = value
+        self.entries.move_to_end(key)
+        self.records += 1
+        if len(self.entries) > self.maximum_entries:
+            self.entries.popitem(last=False)
+            self.evictions += 1
 
     def _fully_observed_failure(self, source, seconds, key, sampler):
         body = self.provider.bodies
@@ -130,20 +176,33 @@ class SourceFirstUnresolvedMemo:
                 published = provider._persistent.get(provider._persistent_key(source, key), source, seconds)
                 if published is not None and (published.face_bbox_xywh is not None or published.person is not None):
                     self.entries.pop(key)
+                    # The scalar resolver may still hold the original missing
+                    # result. Do not resurrect it on the very next query after
+                    # this memo entry has yielded to a published positive.
+                    getattr(provider, '_cache', {}).pop(key, None)
                     return published
             self.entries.move_to_end(key)
             self.hits += 1
             return replace(self.entries[key], source_seconds=seconds)
+        prefilter = getattr(provider, '_source_first_anchor_prefilter', None)
+        if (key not in getattr(provider, '_cache', {}) and prefilter is not None
+                and prefilter.query_cannot_resolve(source, seconds)):
+            # A concurrently published positive must outrank a new negative
+            # certificate just as it does an existing run-local memo entry.
+            if provider._persistent is not None:
+                published = provider._persistent.get(provider._persistent_key(source, key), source, seconds)
+                if published is not None:
+                    return published
+            value = FocalSelectorGeometry(source, seconds, None, pose_backend='rtmpose_body7')
+            self._remember(key, value)
+            self.anchor_bound_records += 1
+            return value
         value = self.original(source, seconds, descriptor)
         if (isinstance(value, FocalSelectorGeometry) and value.source_index == source
                 and math.isclose(value.source_seconds, seconds, abs_tol=1e-9, rel_tol=0)
                 and value.face_bbox_xywh is None and value.person is None
                 and self._fully_observed_failure(source, seconds, key, sampler)):
-            self.entries[key] = value
-            self.records += 1
-            if len(self.entries) > self.maximum_entries:
-                self.entries.popitem(last=False)
-                self.evictions += 1
+            self._remember(key, value)
         return value
 
     def diagnostics(self):
@@ -152,6 +211,9 @@ class SourceFirstUnresolvedMemo:
                     hits=self.hits, records=self.records, evictions=self.evictions,
                     incomplete_window_reasons=dict(self.incomplete_reasons),
                     empty_native_detection_validation_count=self.empty_face_validation_count,
+                    complete_native_detection_validation_count=self.complete_face_validation_count,
+                    native_completion_receipt_count=self.native_completion_receipt_count,
+                    complete_anchor_bound_records=self.anchor_bound_records,
                     negative_observations_persisted=False, render_authorized=False)
 
     def provider_diagnostics(self):

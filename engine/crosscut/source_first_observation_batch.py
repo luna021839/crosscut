@@ -39,6 +39,7 @@ class SourceFirstObservationBatch:
         self.cached_geometry_count = self.capacity_fallback_count = 0
         self.direct_resolved_query_count = self.recovery_query_count = 0
         self.anchor_impossible_query_count = self.skipped_body_dependency_count = 0
+        self.proven_missing_query_body_skip_count = 0
         self.face_first_capacity_fallback_count = 0
         self.elapsed_seconds = 0.
 
@@ -94,15 +95,24 @@ class SourceFirstObservationBatch:
                 references = provider.bodies._ensure_references(source)
                 dependencies = {}
                 recovery_times = []
+                prefilter = getattr(provider, '_source_first_anchor_prefilter', None)
                 # First observe the exact requested frames, in source order.
                 # Only unresolved queries need the expensive track lattice.
                 # Use the resolver's same pure rule; do not publish geometry
                 # here or substitute adjacent evidence for an exact frame.
                 for _key, seconds in sorted(pending.items(), key=lambda item: item[1]):
                     faces = provider.faces._focal_candidates(source, seconds)
-                    frame = provider.bodies.frame_observations(source, seconds)
                     self.dependency_frame_count += 1
                     face = bank.select(faces) if bank else None
+                    # Adjacent offsets often share an already completed native
+                    # face window. A missing exact target face plus fewer than
+                    # two possible recovery anchors cannot produce geometry,
+                    # irrespective of this query's unmeasured body/pose.
+                    if (face is None and prefilter is not None
+                            and prefilter.query_cannot_resolve(source, seconds)):
+                        self.proven_missing_query_body_skip_count += 1
+                        continue
+                    frame = provider.bodies.frame_observations(source, seconds)
                     selected, reason = select_direct_focal_observation(face, faces, frame)
                     if selected is not None or reason == 'frozen_solo_face_body_unobserved':
                         self.direct_resolved_query_count += 1
@@ -113,7 +123,6 @@ class SourceFirstObservationBatch:
                             key = provider.faces._identity_key(source, sampler, time)
                             if key not in pending:
                                 dependencies.setdefault(key, time)
-                prefilter = getattr(provider, '_source_first_anchor_prefilter', None)
                 owners = getattr(provider, 'shared_source_frames', None)
                 capacity = owners[source].maximum_working_frames if owners else 0
                 if prefilter is not None and len(dependencies) + len(pending) <= capacity:
@@ -167,6 +176,7 @@ class SourceFirstObservationBatch:
             recovery_query_count=self.recovery_query_count,
             anchor_impossible_query_count=self.anchor_impossible_query_count,
             skipped_body_dependency_count=self.skipped_body_dependency_count,
+            proven_missing_query_body_skip_count=self.proven_missing_query_body_skip_count,
             face_first_capacity_fallback_count=self.face_first_capacity_fallback_count,
             capacity_fallback_count=self.capacity_fallback_count,
             elapsed_seconds=self.elapsed_seconds,
