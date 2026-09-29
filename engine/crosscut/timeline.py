@@ -594,6 +594,10 @@ class TimelineConfig:
     long_hold_penalty: float = 0.14
     source_hold_penalty: float = 0.0
     source_switch_bonus: float = 0.0
+    # Different camera versions of one broadcast still count as separate
+    # usable sources. Discount only their soft stage-change reward.
+    source_broadcast_slots: tuple[tuple[str, str], ...] = ()
+    same_broadcast_switch_bonus_multiplier: float = 0.25
     ping_pong_penalty: float = 0.0
     preferred_source_bonus: float = 0.0
     preferred_source_max_score_sacrifice: float = 0.0
@@ -688,6 +692,19 @@ class TimelineConfig:
             )
         if not isfinite(self.source_switch_bonus) or self.source_switch_bonus < 0.0:
             raise ValueError("source_switch_bonus must be finite and non-negative")
+        if (
+            not isfinite(self.same_broadcast_switch_bonus_multiplier)
+            or not 0.0 <= self.same_broadcast_switch_bonus_multiplier <= 1.0
+        ):
+            raise ValueError("same broadcast switch multiplier must be normalized")
+        if not isinstance(self.source_broadcast_slots, tuple) or any(
+            not isinstance(item, tuple) or len(item) != 2
+            or any(not isinstance(value, str) or not value.strip() for value in item)
+            for item in self.source_broadcast_slots
+        ):
+            raise ValueError("broadcast slots must be immutable source/slot pairs")
+        if len(dict(self.source_broadcast_slots)) != len(self.source_broadcast_slots):
+            raise ValueError("broadcast slot source IDs must be unique")
         for name in (
             "maximum_cross_source_scale_delta",
             "maximum_cross_source_focus_mismatch",
@@ -2116,6 +2133,10 @@ def select_timeline(
     if timeline_mode is TimelineMode.MEMBER and target is None:
         raise ValueError("target_member is required in member mode")
     settings = config or TimelineConfig()
+    broadcast_slot_by_source = (
+        dict(settings.source_broadcast_slots)
+        if timeline_mode is TimelineMode.GENERAL else {}
+    )
     segments = _normalise_segments(candidates_by_segment)
     supplied_no_goods = (
         forbidden_boundary_edges
@@ -2422,6 +2443,12 @@ def select_timeline(
                     if not same_source
                     else 0.0
                 )
+                previous_slot = broadcast_slot_by_source.get(previous_candidate.source_id)
+                if (
+                    not same_source and previous_slot is not None
+                    and previous_slot == broadcast_slot_by_source.get(current_candidate.source_id)
+                ):
+                    cadence_score *= settings.same_broadcast_switch_bonus_multiplier
                 if (
                     same_source
                     and settings.preferred_max_source_hold_segments is not None

@@ -173,6 +173,9 @@ class AcquisitionArtifact:
         VerifiedMemberAcquisitionIdentityAuthority | None
     ) = None
     member_identity_authority_error: str | None = None
+    # Soft editorial hints only: these are not duplicate-source families,
+    # minimum-source-count evidence, or member identity authority.
+    group_broadcast_slot_hints: tuple[str | None, ...] = ()
 
 
 class _MediaContractError(AcquisitionError):
@@ -2738,6 +2741,59 @@ def _issue_member_acquisition_identity_authority(
     )
 
 
+def _group_broadcast_slot_hints(
+    source_paths: Sequence[Path], manifest: Mapping[str, Any],
+) -> tuple[str | None, ...]:
+    """Bind title-derived stage hints to the exact current acquired files.
+
+    Missing/stale metadata remains unknown, never a reason to drop a source.
+    Upload dates are deliberately not treated as performance dates.
+    """
+
+    if manifest.get("edit_mode") != "group":
+        return ()
+    unknown = (None,) * len(source_paths)
+    selected = manifest.get("selected")
+    summary = manifest.get("summary")
+    if not (
+        manifest.get("edit_mode") == "group"
+        and manifest.get("schema_version") == 1
+        and isinstance(summary, dict)
+        and summary.get("status") == "complete"
+        and isinstance(selected, list)
+        and len(selected) == len(source_paths)
+    ):
+        return unknown
+    hints: list[str | None] = []
+    for index, (source, entry) in enumerate(zip(source_paths, selected, strict=True)):
+        hint = None
+        if isinstance(entry, dict) and isinstance(entry.get("title"), str):
+            title = entry["title"]
+            date = _broadcast_date(title)
+            program = _music_show_program(title)
+            local_path = entry.get("local_path")
+            try:
+                valid = (
+                    type(entry.get("source_index")) is int
+                    and entry["source_index"] == index
+                    and isinstance(local_path, str)
+                    and not Path(local_path).is_symlink()
+                    and Path(local_path).resolve(strict=True) == source
+                    and date is not None
+                    and program is not None
+                    and entry.get("broadcast_date_basis") == "title"
+                    and entry.get("broadcast_date") == date
+                    and entry.get("broadcast_program") == program
+                    and _content_integrity_matches(source, entry.get("content_integrity"))
+                )
+            except (OSError, ValueError, RuntimeError):
+                valid = False
+            if valid:
+                hint = f"{date}:{program}"
+        hints.append(hint)
+    return tuple(hints)
+
+
 def _build_acquisition_artifact(
     *,
     source_paths: Sequence[Path],
@@ -2774,6 +2830,9 @@ def _build_acquisition_artifact(
         manifest=manifest,
         member_identity_authority=authority,
         member_identity_authority_error=authority_error,
+        group_broadcast_slot_hints=_group_broadcast_slot_hints(
+            normalized_sources, manifest,
+        ),
     )
 
 

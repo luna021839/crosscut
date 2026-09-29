@@ -560,6 +560,7 @@ class BoundarySubjectAlignmentPlan:
                 "native_cut_scope": "active_boundary_window_plus_two_frame_tracking_guard",
                 "dissolve_overlap_transformed": False,
                 "frame_validation": "every_transformed_output_frame_after_base_crop",
+                "layout_validation": "cross_source_at_cut_then_adjacent_source_local_motion_v1",
                 "shot_policy": (
                     "close_face_medium_upper_body_wide_formation_"
                     "with_silhouette_fail_closed_fallback"
@@ -1625,6 +1626,26 @@ def build_boundary_subject_alignment_plan(
                 )
         return None
 
+    def dense_subject_at(
+        choice_index: int, frame_index: int,
+        preferred_kind: str, framing_policy: str | None,
+    ) -> tuple[_SubjectGeometry | None, bool]:
+        observation = observation_at(choice_index, frame_index)
+        if observation is None:
+            return None, False
+        subject = _subject(
+            observation, preferred_kind=preferred_kind, settings=settings,
+            framing_policy=framing_policy,
+        )
+        if subject is None and preferred_kind == "face":
+            # A verified whole-performer envelope can guard containment on a
+            # transient face miss. It is not treated as a newly identified face.
+            subject = _subject(observation, preferred_kind="silhouette", settings=settings)
+        if subject is not None:
+            return subject, False
+        subject = optical_subject_at(choice_index, frame_index, preferred_kind, framing_policy)
+        return subject, subject is not None
+
     decisions: list[BoundarySubjectAlignmentDecision] = []
     candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
     target_layout_by_boundary: dict[
@@ -2037,9 +2058,6 @@ def build_boundary_subject_alignment_plan(
             failure: str | None = None
             validated = 0
             optical_flow_validated = 0
-            preferred_kind = next(
-                candidate_by_boundary[index].subject_kind for index in touched
-            )
             for frame_index in range(counts[choice_index]):
                 state_keyframe = track.evaluate(frame_index / fps)
                 state = _TransformState(
@@ -2048,16 +2066,20 @@ def build_boundary_subject_alignment_plan(
                     state_keyframe.center_y,
                     state_keyframe.roll_degrees,
                 )
-                if state.neutral:
+                previous_keyframe = track.evaluate(max(0, frame_index - 1) / fps)
+                previous_state = _TransformState(
+                    previous_keyframe.zoom, previous_keyframe.center_x,
+                    previous_keyframe.center_y, previous_keyframe.roll_degrees,
+                )
+                if state.neutral and previous_state.neutral:
                     continue
-                validated += 1
+                validated += int(not state.neutral)
                 try:
                     state.keyframe(frame_index / fps)
                 except ValueError:
                     failure = "per_frame_renderer_edge_safety_rejection"
                     break
-                observation = observation_at(choice_index, frame_index)
-                if observation is None:
+                if observation_at(choice_index, frame_index) is None:
                     failure = "per_frame_decode_or_geometry_failed"
                     break
                 nearest_boundary = min(
@@ -2067,6 +2089,7 @@ def build_boundary_subject_alignment_plan(
                         else counts[choice_index] - 1 - frame_index),
                 )
                 boundary = candidate_by_boundary[nearest_boundary]
+                preferred_kind = boundary.subject_kind
                 framing_policy = (
                     boundary.outgoing_shot_policy
                     if boundary.transformed_side == "outgoing"
@@ -2075,33 +2098,10 @@ def build_boundary_subject_alignment_plan(
                 # Keep the verified endpoint's framing contract through this
                 # short window. Detector-size jitter cannot replace a head
                 # envelope with a whole torso part way through one ramp.
-                subject = _subject(
-                    observation,
-                    preferred_kind=preferred_kind,
-                    settings=settings,
-                    framing_policy=framing_policy,
+                subject, used_flow = dense_subject_at(
+                    choice_index, frame_index, preferred_kind, framing_policy,
                 )
-                if subject is None and preferred_kind == "face":
-                    # A transient face-detector miss must not become a blind
-                    # crop.  A high-confidence *whole performer* silhouette is
-                    # a stricter containment envelope and can safely validate
-                    # that frame without changing the face-derived endpoint
-                    # target.  The inverse fallback is forbidden: one face does
-                    # not prove that a group silhouette remains visible.
-                    subject = _subject(
-                        observation,
-                        preferred_kind="silhouette",
-                        settings=settings,
-                    )
-                if subject is None:
-                    subject = optical_subject_at(
-                        choice_index,
-                        frame_index,
-                        preferred_kind,
-                        framing_policy,
-                    )
-                    if subject is not None:
-                        optical_flow_validated += 1
+                optical_flow_validated += int(used_flow and not state.neutral)
                 if subject is None:
                     failure = "per_frame_subject_geometry_unavailable"
                     break
@@ -2113,18 +2113,40 @@ def build_boundary_subject_alignment_plan(
                 if visibility + 1e-9 < threshold:
                     failure = "per_frame_subject_containment_failed"
                     break
-                target_layout = target_layout_by_boundary[nearest_boundary]
-                baseline_frame_layout = _layout_mismatch(
-                    subject.layout_boxes,
-                    target_layout,
+                if frame_index == 0:
+                    # The incoming endpoint already passed the exact
+                    # cross-camera layout/improvement checks above.
+                    continue
+                previous_subject, _ = dense_subject_at(
+                    choice_index, frame_index - 1, preferred_kind, framing_policy,
                 )
-                transformed_frame_layout = _layout_mismatch(
-                    tuple(
-                        _project_box(box, state)[0]
-                        for box in subject.layout_boxes
-                    ),
-                    target_layout,
-                )
+                if previous_subject is None:
+                    failure = "per_frame_subject_geometry_unavailable"
+                    break
+                if previous_subject.kind == subject.kind:
+                    # Both frames are from the same visible source. Comparing
+                    # a moving dancer to the other camera's frozen endpoint
+                    # wrongly penalizes genuine choreography. Instead check
+                    # the actual adjacent-frame motion before/after the curve,
+                    # including its join back to a neutral transform.
+                    baseline_frame_layout = _layout_mismatch(
+                        previous_subject.layout_boxes, subject.layout_boxes,
+                    )
+                    transformed_frame_layout = _layout_mismatch(
+                        tuple(_project_box(box, previous_state)[0]
+                              for box in previous_subject.layout_boxes),
+                        tuple(_project_box(box, state)[0] for box in subject.layout_boxes),
+                    )
+                else:
+                    # Do not interpret a face-to-silhouette detector fallback
+                    # as physical body motion. Preserve its prior, stricter
+                    # endpoint-envelope test, in addition to containment.
+                    target_layout = target_layout_by_boundary[nearest_boundary]
+                    baseline_frame_layout = _layout_mismatch(subject.layout_boxes, target_layout)
+                    transformed_frame_layout = _layout_mismatch(
+                        tuple(_project_box(box, state)[0] for box in subject.layout_boxes),
+                        target_layout,
+                    )
                 if (
                     transformed_frame_layout
                     > settings.maximum_transformed_layout_mismatch

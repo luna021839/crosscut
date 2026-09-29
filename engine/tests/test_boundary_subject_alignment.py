@@ -16,6 +16,7 @@ from crosscut.boundary_subject_alignment import (
     _subject,
     _TransformState,
     _project_box,
+    _layout_mismatch,
     _native_cut_in_boundary_window,
     build_boundary_subject_alignment_plan,
 )
@@ -332,6 +333,76 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
             "per_frame_subject_geometry_unavailable",
         )
         self.assertIsNone(plan.track_for(0))
+        self.assertIsNone(plan.track_for(1))
+
+    def test_moving_closeup_uses_adjacent_motion_not_a_frozen_other_camera(self) -> None:
+        timeline = VisualTimelinePlan((
+            _choice(0, 0, start=0.0, end=1.0),
+            _choice(1, 1, start=1.0, end=2.0),
+        ), 1.0)
+        out_box = (.40, .29, .16, .27)
+
+        def observation(frame):
+            marker = int(round(float(frame.mean())))
+            index = marker - 100
+            box = out_box if marker < 75 else (.50 - .03 * index, .31, .16, .24)
+            return BoundarySubjectObservation(face_count=1, face_box_xywh=box,
+                                               face_eye_scale=box[3] * .42)
+
+        def frames(source, seconds):
+            return _frame(source, marker=50 if source == 0 else 100 + round((seconds - 1) * 30))
+
+        plan = build_boundary_subject_alignment_plan(
+            visual_timeline=timeline, sources=(Path("a"), Path("b")),
+            transitions=(RenderTransition(tier="C", reason="hard"),), fps=30,
+            frame_provider=frames, observation_provider=observation,
+            source_resolutions=((1920, 1080),) * 2,
+        )
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertGreater(plan.decisions[0].validated_output_frame_count, 0)
+        track = plan.track_for(1)
+        self.assertIsNotNone(track)
+        settings = BoundarySubjectAlignmentConfig()
+        target = _subject(observation(frames(0, 0)), preferred_kind="face",
+                          settings=settings, framing_policy="close_face")
+        old_frozen_reference_failures = 0
+        for index in range(14):
+            subject = _subject(observation(frames(1, 1 + index / 30)), preferred_kind="face",
+                               settings=settings, framing_policy="close_face")
+            keyframe = track.evaluate(index / 30)
+            state = _TransformState(keyframe.zoom, keyframe.center_x,
+                                    keyframe.center_y, keyframe.roll_degrees)
+            baseline = _layout_mismatch(subject.layout_boxes, target.layout_boxes)
+            transformed = _layout_mismatch(
+                tuple(_project_box(box, state)[0] for box in subject.layout_boxes),
+                target.layout_boxes,
+            )
+            old_frozen_reference_failures += transformed > baseline + settings.maximum_layout_worsening
+        self.assertGreater(old_frozen_reference_failures, 0,
+                           "the reproducer must fail the former frozen-endpoint test")
+
+    def test_adjacent_layout_pop_is_still_rejected_inside_a_matched_settle(self) -> None:
+        timeline = VisualTimelinePlan((
+            _choice(0, 0, start=0.0, end=1.0),
+            _choice(1, 1, start=1.0, end=2.0),
+        ), 1.0)
+
+        def observation(frame):
+            marker = int(round(float(frame.mean())))
+            box = ((.40, .29, .18, .27) if marker < 75 else
+                   (.28, .35, .06, .08) if marker == 106 else (.50, .31, .16, .24))
+            return BoundarySubjectObservation(face_count=1, face_box_xywh=box,
+                                               face_eye_scale=box[3] * .42)
+
+        plan = build_boundary_subject_alignment_plan(
+            visual_timeline=timeline, sources=(Path("a"), Path("b")),
+            transitions=(RenderTransition(tier="C", reason="hard"),), fps=30,
+            frame_provider=lambda source, seconds: _frame(
+                source, marker=50 if source == 0 else 100 + round((seconds - 1) * 30)),
+            observation_provider=observation, source_resolutions=((1920, 1080),) * 2,
+        )
+        self.assertEqual(plan.eligible_count, 0)
+        self.assertEqual(plan.decisions[0].rejection_reason, "per_frame_layout_mismatch_gate")
         self.assertIsNone(plan.track_for(1))
 
     def test_high_confidence_silhouette_can_validate_a_transient_face_miss(self) -> None:

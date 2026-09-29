@@ -438,6 +438,7 @@ from .visual_score import (
     PersistentVisualFeatureCacheInitializationError,
     PersistentVisualFeatureCacheRuntimeError,
     ProfessionalMontageSelectionPolicy,
+    VisualDiversityConfig,
     VisualTimelineCandidateSet,
     VisualTimelineChoice,
     VisualTimelineOptimizerSeed,
@@ -27184,6 +27185,22 @@ def _review_first_registered_group_generation(*, request, alignment, alignment_e
         profile_payload=profile_payload, montage_config=montage_config, audit_path=audit_path)
 
 
+def _group_visual_diversity_config(
+    eligible_indices: Sequence[int],
+    group_broadcast_slot_hints: tuple[str | None, ...],
+) -> VisualDiversityConfig:
+    """Keep acquired request indices separate from the selector's local IDs."""
+
+    return VisualDiversityConfig(
+        source_broadcast_slots=tuple(
+            (str(eligible_index), group_broadcast_slot_hints[request_index])
+            for eligible_index, request_index in enumerate(eligible_indices)
+            if group_broadcast_slot_hints
+            and group_broadcast_slot_hints[request_index] is not None
+        ),
+    )
+
+
 def analyze(
     request: AnalysisRequest,
     reporter: EventReporter,
@@ -27194,11 +27211,20 @@ def analyze(
     acquisition_identity_authority: (
         VerifiedMemberAcquisitionIdentityAuthority | None
     ) = None,
+    group_broadcast_slot_hints: tuple[str | None, ...] = (),
 ) -> AnalysisArtifact:
     if not isinstance(allow_failed_comparison_render, bool):
         raise TypeError("allow_failed_comparison_render must be a boolean")
     if not isinstance(review_rendered_proxies, bool):
         raise TypeError("review_rendered_proxies must be a boolean")
+    if group_broadcast_slot_hints and (
+        request.source_mode is not SourceMode.AUTOMATIC
+        or request.edit_mode is not EditMode.GROUP
+        or len(group_broadcast_slot_hints) != len(request.sources)
+        or any(value is not None and (not isinstance(value, str) or not value.strip())
+               for value in group_broadcast_slot_hints)
+    ):
+        raise ValueError("group broadcast hints must match automatic group source order")
     review_first_runtime = ReviewFirstRuntime(
         enabled=bool(getattr(request, "review_first_enabled", False)),
         absolute_deadline_monotonic_seconds=(
@@ -28421,6 +28447,9 @@ def analyze(
                 "sync_scores": sync_scores,
                 "scene_cut_times": scene_cut_times,
                 "source_timewarps": eligible_timewarps,
+                "diversity_config": _group_visual_diversity_config(
+                    eligible_indices, group_broadcast_slot_hints,
+                ),
                 # Only source-local numeric descriptors are persisted here.
                 # Timeline optimization/review/exact-eight/proxy gates always
                 # run again for every analysis.
@@ -39317,6 +39346,19 @@ def analyze(
             )
             if group_draft is not None
             else None
+        ),
+        "group_broadcast_diversity": (
+            {
+                "basis": "content_bound_title_broadcast_slot_soft_preference_v1",
+                "source_index_domain": "request",
+                "source_broadcast_slots": list(group_broadcast_slot_hints),
+                "eligible_request_indices": list(eligible_indices),
+                "same_broadcast_switch_bonus_multiplier": 0.25,
+                "source_exclusion_authority": False,
+                "minimum_source_count_authority": False,
+                "member_identity_authority": False,
+            }
+            if group_broadcast_slot_hints else None
         ),
         "visual_timeline": (
             _with_index_domain(

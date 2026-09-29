@@ -154,6 +154,7 @@ class VisualDiversityConfig:
     # technically diverse but visibly random source rotation.
     preferred_source_bonus: float = 1.30
     maximum_preferred_score_sacrifice: float = 0.16
+    source_broadcast_slots: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -168,6 +169,9 @@ class VisualDiversityConfig:
             raise ValueError(
                 "maximum preferred score sacrifice must be finite and non-negative"
             )
+        # Reuse the selector's immutable hint validation. No lattice or media
+        # work runs here; the full config is also part of optimizer identity.
+        TimelineConfig(source_broadcast_slots=self.source_broadcast_slots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +384,7 @@ def _safe_cadence_profiles(
         ),
         source_hold_penalty=0.22,
         source_switch_bonus=0.20,
+        source_broadcast_slots=diversity.source_broadcast_slots,
         ping_pong_penalty=0.42,
         maximum_switch_score_sacrifice=0.65,
         preferred_source_bonus=diversity.preferred_source_bonus,

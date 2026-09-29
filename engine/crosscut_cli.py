@@ -548,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
                     if acquisition is not None
                     else None
                 ),
+                group_broadcast_slot_hints=(
+                    getattr(acquisition, "group_broadcast_slot_hints", ())
+                    if acquisition is not None else ()
+                ),
             )
         warnings = artifact.manifest.get("warnings") or []
         for warning in warnings:
