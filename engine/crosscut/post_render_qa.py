@@ -6243,6 +6243,82 @@ def _boundary_pose_evidence_metrics(
     }
 
 
+def _audited_renderer_bound_repair_radius(repair: Mapping[str, Any]) -> int | None:
+    """Recover a wider producer domain from proof, not a requested-radius flag.
+
+    Both the ordinary and first-result paths may audition eight frames before
+    proxy rendering. They are not a proxy-triggered partial re-edit. The final
+    QA must recognize their complete, exact-clock observation domain without
+    granting an eight-frame exception to legacy or stale metadata.
+    """
+    from .boundary_repair import RENDERER_BOUND_BOUNDARY_REPAIR_POLICY
+    from .visual_splice_failure_feedback import splice_feedback_context_identity
+
+    result = _mapping(repair.get("result")) or {}
+    if result.get("policy") != RENDERER_BOUND_BOUNDARY_REPAIR_POLICY:
+        return None
+    audit = _sequence(repair.get("candidate_evidence_audit")) or []
+    if not audit or any(not isinstance(item, Mapping) for item in audit):
+        return None
+    offsets = [item.get("frame_offset") for item in audit]
+    if any(type(value) is not int for value in offsets):
+        return None
+    radius = offsets[-1]
+    if not 1 <= radius <= 8 or offsets != list(range(-radius, radius + 1)):
+        return None
+    if any(item.get("sample_clock_basis") != "renderer_bound_output_ticks_v2"
+           for item in audit if item.get("visual_evidence") is not None):
+        return None
+    selected_offset = _integer(result.get("selected_frame_offset"))
+    selected_audit = next((item for item in audit
+                           if item["frame_offset"] == selected_offset), None)
+    selected = _mapping(result.get("selected"))
+    visual = _mapping(repair.get("selected_visual_evidence"))
+    if (selected_audit is None or selected is None or visual is None
+            or selected_audit.get("production_transition_gate_passed") is not True
+            or selected_audit.get("professional_gate_passed") is not True
+            or selected_audit.get("visual_evidence") != visual
+            or selected.get("frame_offset") != selected_offset
+            or sum(item == selected for item in (_sequence(result.get("candidates")) or [])) != 1):
+        return None
+    index = _integer(repair.get("boundary_index"))
+    observed = _mapping(repair.get("observed_edge_context"))
+    final = _mapping(repair.get("result_edge_context"))
+    if index is None or observed is None or final is None:
+        return None
+    try:
+        for context, field in ((observed, "observed_edge_context_identity"),
+                               (final, "result_edge_context_identity")):
+            if (context.get("boundary_index") != index
+                    or splice_feedback_context_identity(context) != repair.get(field)):
+                return None
+        if (observed.get("contract") != "exact_splice_clock_span_edge_context_v1"
+                or final.get("contract") != "exact_splice_selected_boundary_visual_proof_context_v1"
+                or float.fromhex(final["canonical_master_boundary_hex"])
+                != result.get("selected_boundary_seconds")):
+            return None
+        for side, segment, endpoint in (("outgoing", index, "end"),
+                                        ("incoming", index + 1, "start")):
+            before, after = observed[side], final[side]
+            if (before["source_index"] != repair[f"{side}_source_index"]
+                    or after["source_index"] != before["source_index"]
+                    or before["segment_index"] != segment or after["segment_index"] != segment
+                    or before["shot_id"] != after["shot_id"]
+                    or float.fromhex(before[f"canonical_master_{endpoint}_hex"])
+                    != result.get("nominal_boundary_seconds")):
+                return None
+            # Candidate source seconds use the local linear search map; the
+            # final context uses the authoritative nonlinear timewarp. They
+            # need not be bit-identical. The canonical chosen output tick is
+            # independently checked against the final timeline below.
+            local_seconds = float.fromhex(after["source_local_boundary_hex"])
+            if not math.isfinite(local_seconds) or local_seconds < 0:
+                return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return radius
+
+
 def _beat_phrase_metrics(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -6339,6 +6415,7 @@ def _beat_phrase_metrics(
     selected_boundary_seconds: dict[int, float] = {}
     nominal_boundary_seconds: dict[int, float] = {}
     repair_result_by_index: dict[int, Mapping[str, Any]] = {}
+    audited_radius_by_index: dict[int, int] = {}
     repair_payload_consistency: dict[int, bool] = {}
     for raw in final_repairs:
         repair = _mapping(raw) or {}
@@ -6348,6 +6425,9 @@ def _beat_phrase_metrics(
         if index is not None and offset is not None:
             offsets[index] = offset
             repair_result_by_index[index] = result
+            audited_radius = _audited_renderer_bound_repair_radius(repair)
+            if audited_radius is not None:
+                audited_radius_by_index[index] = audited_radius
             selected_seconds = _number(result.get("selected_boundary_seconds"))
             if selected_seconds is not None:
                 selected_boundary_seconds[index] = selected_seconds
@@ -6415,6 +6495,9 @@ def _beat_phrase_metrics(
             if index in partial_changed
             else config.standard_boundary_repair_maximum_frames
         )
+        audited_radius = audited_radius_by_index.get(index)
+        if audited_radius is not None:
+            maximum = max(maximum, min(audited_radius, config.partial_reedit_maximum_frames))
         passed = abs(offset) <= maximum
         selected_seconds = selected_boundary_seconds.get(index)
         nominal_seconds = nominal_boundary_seconds.get(index)
@@ -6482,6 +6565,7 @@ def _beat_phrase_metrics(
                 "payload_consistent": payload_consistent,
                 "maximum_allowed_frames": maximum,
                 "partial_reedit_boundary": index in partial_changed,
+                "complete_renderer_bound_audited_radius": audited_radius,
                 "passed": passed,
             }
         )
