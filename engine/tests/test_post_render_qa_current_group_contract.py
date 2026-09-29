@@ -21,12 +21,15 @@ from engine.tests.test_boundary_subject_alignment import _choice, _frame, _obser
 from engine.tests.test_post_render_qa import _fixture_payloads, _install_valid_registered_montage_evidence
 
 
-def produced_plan(root: Path):
-    visual = VisualTimelinePlan((
+def produced_plan(root: Path, *, paired_corrections=False):
+    choices = (
         _choice(0, 0, start=0., end=1.),
-        _choice(1, 1, start=1., end=2.)), 1.)
+        _choice(1, 1, start=1., end=2.))
+    if paired_corrections:
+        choices += (_choice(2, 0, start=2., end=3.),)
+    visual = VisualTimelinePlan(choices, 1.)
     sources = (root/'a.mp4', root/'b.mp4')
-    transitions = (RenderTransition(tier='C'),)
+    transitions = (RenderTransition(tier='C'),) * (len(choices)-1)
     alignment = build_boundary_subject_alignment_plan(visual_timeline=visual,
         sources=sources, transitions=transitions, fps=30.,
         frame_provider=lambda index, _seconds: _frame(index),
@@ -46,6 +49,37 @@ def produced_plan(root: Path):
 
 
 class CurrentGroupContractTests(unittest.TestCase):
+    def test_adjacent_dense_face_matches_are_not_decorative_pulses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, motion = produced_plan(Path(directory), paired_corrections=True)
+            payload = motion.to_dict()
+            serialized = json.loads(json.dumps(plan.to_json()))
+            self.assertEqual(motion.boundary_match_count, 2)
+            self.assertTrue(all(item['count'] >= 0 for item in payload['skipped_boundary_reasons']))
+            def analysis_for(value):
+                return {'editorial_motion': value, 'render': {'final_render_segments': [
+                    {'segment_index': index, 'output_start_seconds': float(index),
+                     'output_end_seconds': float(index+1)} for index in range(3)]}}
+            collector = _IssueCollector()
+            metrics = _transform_metrics(analysis_for(payload), serialized, PostRenderQAConfig(), collector)
+            self.assertLess(metrics['minimum_derived_event_spacing_seconds'], 3.5)
+            self.assertEqual(metrics['dense_local_correction_spacing_pair_count'], 1)
+            self.assertIsNone(metrics['minimum_guarded_event_spacing_seconds'])
+            self.assertNotIn('editorial_event_spacing_below_minimum', [item.code for item in collector.issues])
+            # A label alone, an absent report or unproved dense frames cannot
+            # claim the exemption; identical unbound pixel tracks still fail.
+            for mode in ('missing', 'count', 'endpoint', 'track'):
+                altered = deepcopy(payload)
+                alignment = altered['boundary_subject_alignment']
+                if mode == 'missing': altered['boundary_subject_alignment'] = None
+                elif mode == 'count': alignment['decisions'][0]['validated_output_frame_count'] = 0
+                elif mode == 'endpoint': alignment['decisions'][0]['incoming_state']['zoom'] = 1.
+                else: alignment['segments'][1]['keyframes'][0]['zoom'] = 1.
+                rejected = _IssueCollector()
+                details = _transform_metrics(analysis_for(altered), serialized, PostRenderQAConfig(), rejected)
+                self.assertEqual(details['dense_local_correction_spacing_pair_count'], 0)
+                self.assertIn('editorial_event_spacing_below_minimum', [item.code for item in rejected.issues])
+
     def test_deterministic_profile_does_not_require_fabricated_stage_edit_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             _artifacts, analysis, plan, selection = _fixture_payloads(Path(directory))

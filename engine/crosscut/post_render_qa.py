@@ -4766,7 +4766,7 @@ def _transform_metrics(
         and _integer(item.get("segment_index")) is not None
     }
     global_state_points: list[
-        tuple[float, float, float, float, float]
+        tuple[float, float, float, float, float, int | None]
     ] = []
     for item in applied:
         serialized_reasons = tuple(
@@ -4951,6 +4951,7 @@ def _transform_metrics(
                             zoom_delta,
                             pan_delta,
                             roll_delta,
+                            segment_index,
                         )
                     )
     non_applied_with_keyframes = [
@@ -4978,9 +4979,9 @@ def _transform_metrics(
         output_start = _number(final_segment.get("output_start_seconds"))
         output_end = _number(final_segment.get("output_end_seconds"))
         if output_start is not None:
-            global_state_points.append((output_start, 0.0, 0.0, 0.0, 0.0))
+            global_state_points.append((output_start, 0.0, 0.0, 0.0, 0.0, segment_index))
         if output_end is not None:
-            global_state_points.append((output_end, 0.0, 0.0, 0.0, 0.0))
+            global_state_points.append((output_end, 0.0, 0.0, 0.0, 0.0, segment_index))
     if unsafe_keyframes:
         collector.add(
             "editorial_transform_safety_bound_exceeded",
@@ -5018,7 +5019,8 @@ def _transform_metrics(
     )
     fps = _number(plan.get("fps")) or 0.0
     states_by_time: dict[float, tuple[float, float, float, float]] = {}
-    for event_time, magnitude, zoom_delta, pan_delta, roll_delta in global_state_points:
+    state_owners_by_time: dict[float, set[int | None]] = {}
+    for event_time, magnitude, zoom_delta, pan_delta, roll_delta, segment_index in global_state_points:
         prior = states_by_time.get(event_time, (0.0, 0.0, 0.0, 0.0))
         states_by_time[event_time] = (
             max(magnitude, prior[0]),
@@ -5026,8 +5028,11 @@ def _transform_metrics(
             max(pan_delta, prior[2]),
             max(roll_delta, prior[3]),
         )
+        if magnitude > 1e-9:
+            state_owners_by_time.setdefault(event_time, set()).add(segment_index)
     ordered_state_points = sorted(states_by_time.items())
     deduplicated_event_times: list[float] = []
+    deduplicated_event_owners: list[set[int | None]] = []
     derived_zoom_event_count = 0
     derived_pan_event_count = 0
     derived_roll_event_count = 0
@@ -5042,6 +5047,8 @@ def _transform_metrics(
         deduplicated_event_times.append(
             max(active_excursion, key=lambda item: item[1])[0]
         )
+        deduplicated_event_owners.append(set().union(
+            *(state_owners_by_time.get(item[0], {None}) for item in active_excursion)))
         derived_zoom_event_count += any(item[2] > 1e-9 for item in active_excursion)
         derived_pan_event_count += any(item[3] > 1e-9 for item in active_excursion)
         derived_roll_event_count += any(item[4] > 1e-9 for item in active_excursion)
@@ -5216,17 +5223,28 @@ def _transform_metrics(
         )
     ]
     minimum_spacing = min(event_spacings, default=None)
+    # The decorative pulse spacing rule is not a reason to leave faces
+    # unmatched at two nearby cuts. Exempt only two fully bound, densely
+    # validated local corrections. Decorative, mixed or unbound events still
+    # obey the original 3.5-second guard, including proximity to a correction.
+    local_spacing_pairs = [
+        bool(left and right and left <= local_alignment_segments and right <= local_alignment_segments)
+        for left, right in zip(deduplicated_event_owners, deduplicated_event_owners[1:])
+    ]
+    guarded_spacings = [gap for gap, is_local in zip(event_spacings, local_spacing_pairs, strict=True)
+                       if not is_local]
+    minimum_guarded_spacing = min(guarded_spacings, default=None)
     if (
-        minimum_spacing is not None
-        and minimum_spacing
+        minimum_guarded_spacing is not None
+        and minimum_guarded_spacing
         < config.minimum_editorial_event_spacing_seconds - 1e-9
     ):
         collector.add(
             "editorial_event_spacing_below_minimum",
             QAIssueSeverity.FAIL,
-            "Serialized editorial transform events violate the minimum spacing.",
+            "Decorative or unbound editorial transform events violate the minimum spacing.",
             path="editorial_motion.segments[].keyframes",
-            value=minimum_spacing,
+            value=minimum_guarded_spacing,
             threshold=config.minimum_editorial_event_spacing_seconds,
         )
     return {
@@ -5279,6 +5297,9 @@ def _transform_metrics(
         "derived_decorative_zoom_event_count": derived_decorative_zoom_count,
         "derived_event_spacing_seconds": _distribution(event_spacings),
         "minimum_derived_event_spacing_seconds": minimum_spacing,
+        "spacing_gate_basis": "decorative_or_unbound_pairs_with_exact_dense_local_correction_exception_v1",
+        "minimum_guarded_event_spacing_seconds": minimum_guarded_spacing,
+        "dense_local_correction_spacing_pair_count": sum(local_spacing_pairs),
         "reason_category_entropy_normalized": _normalized_entropy(reason_categories),
         "diversity_threshold_status": "reference_calibration_required",
         "unsafe_keyframes": unsafe_keyframes,

@@ -1411,7 +1411,9 @@ def build_editorial_motion_plan(
         if is_affine:
             selected_affine_boundaries.add(boundary_index)
         event_times.append(event_time)
-    rejected_boundary_candidates = len(boundary_candidates) - boundary_match_count
+    local_boundary_matches = (boundary_subject_alignment_plan.eligible_count
+                              if boundary_subject_alignment_plan is not None else 0)
+    rejected_boundary_candidates = len(boundary_candidates) - (boundary_match_count - local_boundary_matches)
     if rejected_boundary_candidates:
         skipped["boundary_density_or_spacing_cap"] = rejected_boundary_candidates
     zoom_effects: dict[int, str] = {}
