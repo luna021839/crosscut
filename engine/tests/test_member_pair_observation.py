@@ -7,27 +7,32 @@ from crosscut.direct_member_visual import (
     DirectMemberVisualConfig, _DirectBoundarySearchCandidate,
     _boundary_sample_with_focal_geometry, _boundary_mismatch,
     _observe_member_boundary_pair, _scored_boundary_search_mismatch,
+    _materialize_member_observation_domain, DirectMemberCinematicBridge,
 )
-from crosscut.member_boundary_observations import MemberBoundaryObservationStore
-from crosscut.member_observation_search import MemberObservationSearch, TransitionObservation
+from crosscut.member_boundary_observations import MemberBoundaryObservationStore, UnobservedBoundarySample
+from crosscut.member_observation_search import MemberObservationSearch, TransitionObservation, TransitionDemand
 from engine.tests.test_direct_member_visual import _descriptor
 from engine.tests.test_source_first_focal_geometry import geometry
 from engine.tests.test_member_boundary_observations import plan
 
 
 class MemberPairObservationTests(unittest.TestCase):
-    def store(self):
+    def store(self, *, roles=False, bad_handle=False):
         plans = tuple(replace(plan(offset), eligibility_by_source=((True,)*5,)*4)
                       for offset in (0, -2, 2))
-        def observe(p, source):
+        def one_sample(p, source, slot):
             provider = SimpleNamespace(focal_geometry_at=lambda s, t, raw:
                 replace(geometry(s), source_seconds=t))
-            return tuple(_boundary_sample_with_focal_geometry(
-                master_seconds=master, source_local_seconds=local, source_index=source,
-                descriptor=_descriptor(.2+.02*source), provider=provider)
-                for master, local in zip(p.master_times, p.local_times_by_source[source]))
-        observer, prepare = Mock(side_effect=observe), Mock()
-        return MemberBoundaryObservationStore(plans, observe=observer, prepare=prepare), observer, prepare
+            return _boundary_sample_with_focal_geometry(
+                master_seconds=p.master_times[slot], source_local_seconds=p.local_times_by_source[source][slot],
+                source_index=source, descriptor=_descriptor(.2+.02*source,
+                    quality_score=0. if bad_handle and slot == 4 else .9), provider=provider)
+        observer = Mock(side_effect=lambda p, source: tuple(one_sample(p, source, slot) for slot in range(5)))
+        role_observer = Mock(side_effect=lambda p, source, slots:
+            {slot: one_sample(p, source, slot) for slot in slots})
+        prepare = Mock()
+        return MemberBoundaryObservationStore(plans, observe=observer, prepare=prepare,
+            observe_samples=role_observer if roles else None), role_observer if roles else observer, prepare
 
     def pair(self, store, left=0, right=3, adjust=None, observed_only=False, **kwargs):
         return _observe_member_boundary_pair(store,
@@ -36,6 +41,81 @@ class MemberPairObservationTests(unittest.TestCase):
             continuous_official_portrait_fancam_contract=True,
             priority_boundary=True, config=DirectMemberVisualConfig(), adjust_mismatch=adjust,
             observed_only=observed_only, **kwargs)
+
+    def test_role_hard_cut_scores_equal_exhaustive_with_four_not_ten_samples(self):
+        sparse, observer, prepare = self.store(roles=True)
+        full, _, _ = self.store()
+        actual, expected = self.pair(sparse), self.pair(full)
+        self.assertEqual([item.mismatch for item in actual], [item.mismatch for item in expected])
+        self.assertEqual([item.raw_mismatch for item in actual], [item.raw_mismatch for item in expected])
+        self.assertEqual(sum(len(call.args[2]) for call in observer.call_args_list), 12)
+        self.assertEqual(sum(len(call.args[0]) for call in prepare.call_args_list), 12)
+        self.assertFalse(sparse.observed_demands, 'unrequested handles are not five observed samples')
+        for observed, reference in zip(actual, expected, strict=True):
+            for slot in (0, 1): self.assertEqual(observed.outgoing_samples[slot], reference.outgoing_samples[slot])
+            for slot in (2, 3): self.assertEqual(observed.incoming_samples[slot], reference.incoming_samples[slot])
+            with self.assertRaises(KeyError): _ = observed.outgoing_samples[4]
+        observer.reset_mock(); prepare.reset_mock()
+        again = self.pair(sparse, observed_only=True)
+        self.assertEqual(again, actual)
+        observer.assert_not_called(); prepare.assert_not_called()
+
+    def test_role_effects_get_all_real_handles_before_scoring_including_rejection(self):
+        bridge = DirectMemberCinematicBridge('pose_dissolve', False, False, ('attention_scale',), .02, .05, .02)
+        adjustment = lambda clock, left, right, value: replace(value,
+            severe_flags=('attention_scale',), cinematic_bridge=bridge)
+        for bad in (False, True):
+            sparse, observer, prepare = self.store(roles=True, bad_handle=bad)
+            full, _, _ = self.store(bad_handle=bad)
+            actual, expected = self.pair(sparse, adjust=adjustment), self.pair(full, adjust=adjustment)
+            self.assertEqual([item.mismatch for item in actual], [item.mismatch for item in expected])
+            self.assertEqual(sum(len(call.args[2]) for call in observer.call_args_list), 21)
+            self.assertEqual(sum(len(call.args[0]) for call in prepare.call_args_list), 21)
+            self.assertTrue(all((item.mismatch.cinematic_bridge is None) == bad for item in actual))
+            for observed, reference in zip(actual, expected, strict=True):
+                for slot in (3, 4):
+                    self.assertEqual(observed.outgoing_samples[slot], reference.outgoing_samples[slot])
+                    self.assertEqual(observed.incoming_samples[slot], reference.incoming_samples[slot])
+
+    def test_role_read_only_effect_with_unobserved_handles_is_not_published(self):
+        store, observer, prepare = self.store(roles=True)
+        self.pair(store)
+        bridge = DirectMemberCinematicBridge('pose_dissolve', False, False, ('attention_scale',), .02, .05, .02)
+        observer.reset_mock(); prepare.reset_mock()
+        with self.assertRaises(UnobservedBoundarySample):
+            self.pair(store, observed_only=True, adjust=lambda clock, left, right, value:
+                replace(value, severe_flags=('attention_scale',), cinematic_bridge=bridge))
+        observer.assert_not_called(); prepare.assert_not_called()
+
+    def test_role_materialization_keeps_sparse_authority_and_exact_final_offset_scores(self):
+        store, observer, prepare = self.store(roles=True)
+        candidates = self.pair(store)
+        best = min(candidates, key=lambda item: item.mismatch.cost)
+        search = SimpleNamespace(observations=(TransitionObservation(TransitionDemand(0, 0, 3),
+            True, best.mismatch.cost, candidates, policy_evidence=best.mismatch),),
+            endpoint_excluded_demands=frozenset())
+        observer.reset_mock(); prepare.reset_mock()
+        matrices, domains = _materialize_member_observation_domain((store,), search)
+        self.assertEqual(matrices[0][0][3], best.mismatch)
+        for candidate, reference in zip(domains[0], candidates, strict=True):
+            actual = _scored_boundary_search_mismatch(candidate, outgoing_source_index=0,
+                incoming_source_index=3, candidate_count=3, priority_boundary=True,
+                config=DirectMemberVisualConfig())
+            self.assertEqual(actual, reference.mismatch)
+            with self.assertRaises(KeyError): _ = candidate.incoming_future[0]
+            with self.assertRaises(KeyError): _ = candidate.matrix[3][0]
+        observer.assert_not_called(); prepare.assert_not_called()
+
+    def test_role_canonical_then_complete_refinement_preserves_measurements(self):
+        store, observer, _ = self.store(roles=True)
+        first = self.pair(store, stop_after_first_eligible=True)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(sum(len(call.args[2]) for call in observer.call_args_list), 4)
+        full = self.pair(store)
+        self.assertEqual(len(full), 3)
+        self.assertEqual(first[0].raw_mismatch, full[0].raw_mismatch)
+        self.assertEqual(first[0].outgoing_samples, full[0].outgoing_samples)
+        self.assertEqual(first[0].incoming_samples, full[0].incoming_samples)
 
     def test_progressive_offset_then_full_refinement_preserves_every_original_measurement(self):
         store, observer, prepare = self.store()

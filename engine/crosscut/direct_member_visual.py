@@ -31,7 +31,7 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 
 from .member_boundary_observations import (
-    MemberBoundaryObservationPlan, MemberBoundaryObservationStore,
+    MemberBoundaryObservationPlan, MemberBoundaryObservationStore, UnobservedBoundarySample,
 )
 from .member_observation_search import (
     MemberObservationSearch, MemberObservationSearchIncomplete, ObservationState,
@@ -1807,6 +1807,8 @@ def _scored_boundary_search_mismatch(
 ) -> DirectBoundaryMismatch:
     mismatch = candidate.matrix[outgoing_source_index][incoming_source_index]
     def handles(source_index):
+        if mismatch.cinematic_bridge is None:
+            return ()
         return ((candidate.incoming_next[source_index], candidate.incoming_future[source_index])
                 if source_index < len(candidate.incoming_next)
                 and source_index < len(candidate.incoming_future) else ())
@@ -1893,8 +1895,8 @@ def _scored_boundary_pair_mismatch(
 @dataclass(frozen=True, slots=True)
 class _ObservedMemberPairCandidate:
     plan: MemberBoundaryObservationPlan
-    outgoing_samples: tuple[_BoundarySample, ...]
-    incoming_samples: tuple[_BoundarySample, ...]
+    outgoing_samples: Sequence[_BoundarySample]
+    incoming_samples: Sequence[_BoundarySample]
     mismatch: DirectBoundaryMismatch
     raw_mismatch: DirectBoundaryMismatch
 
@@ -1933,17 +1935,36 @@ def _observe_member_boundary_pair(
         raise ValueError("read-only complete pair reuse cannot publish a partial offset domain")
     if stop_after_first_eligible:
         plans = tuple(sorted(plans, key=lambda plan: (abs(plan.offset_frames), plan.offset_frames)))
+    role_samples = observations.supports_sample_demands
+
+    def prepare_pair(needed):
+        if role_samples:
+            observations.prepare_samples((p.offset_frames, source, slot) for p in needed
+                for source, slots in ((outgoing_source_index, (0, 1)), (incoming_source_index, (2, 3)))
+                for slot in slots)
+        else:
+            observations.prepare((p.offset_frames, source) for p in needed
+                for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+
+    def sample_view(plan, source):
+        available = observations.observed_sample_demands
+        return _ObservedIndex(5, {slot: observations.observed_sample(plan.offset_frames, source, slot)
+            for slot in range(5) if (plan.offset_frames, source, slot) in available})
+
     if observed_only:
         # Validate the complete offset domain before scoring. Missing samples
         # cannot trigger preparation, decoding, target inference or defaults.
         for plan in plans:
-            for source in dict.fromkeys((outgoing_source_index, incoming_source_index)):
-                observations.observed_samples(plan.offset_frames, source)
+            if role_samples:
+                for source, slots in ((outgoing_source_index, (0, 1)), (incoming_source_index, (2, 3))):
+                    observations.requested_samples(plan.offset_frames, source, slots, observed_only=True)
+            else:
+                for source in dict.fromkeys((outgoing_source_index, incoming_source_index)):
+                    observations.observed_samples(plan.offset_frames, source)
         samples_for = observations.observed_samples
     else:
         if not stop_after_first_eligible:
-            observations.prepare((plan.offset_frames, source) for plan in plans
-                for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+            prepare_pair(plans)
         samples_for = observations.samples_for
     candidates = []
     for plan_index, plan in enumerate(plans):
@@ -1954,10 +1975,14 @@ def _observe_member_boundary_pair(
             # precisely the hard cases that already dominate runtime.
             pending = (plan,) if plan_index == 0 else plans[1:] if plan_index == 1 else ()
             if pending:
-                observations.prepare((item.offset_frames, source) for item in pending
-                    for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
-        outgoing = samples_for(plan.offset_frames, outgoing_source_index)
-        incoming = samples_for(plan.offset_frames, incoming_source_index)
+                prepare_pair(pending)
+        if role_samples:
+            for source, slots in ((outgoing_source_index, (0, 1)), (incoming_source_index, (2, 3))):
+                observations.requested_samples(plan.offset_frames, source, slots, observed_only=observed_only)
+            outgoing, incoming = (sample_view(plan, source) for source in (outgoing_source_index, incoming_source_index))
+        else:
+            outgoing = samples_for(plan.offset_frames, outgoing_source_index)
+            incoming = samples_for(plan.offset_frames, incoming_source_index)
         mismatch = _boundary_mismatch(outgoing[1], incoming[2], config,
             outgoing_previous=outgoing[0], incoming_next=incoming[3],
             outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
@@ -1969,11 +1994,22 @@ def _observe_member_boundary_pair(
                 outgoing_source_index, incoming_source_index, mismatch)
             if not isinstance(mismatch, DirectBoundaryMismatch):
                 raise TypeError("pair adjustment must return an observed mismatch")
+        if role_samples and mismatch.cinematic_bridge is not None:
+            # An actual effect candidate must have its real overlap handles
+            # before scoring or publication. Hard cuts never use these slots.
+            if not observed_only:
+                observations.prepare_samples((plan.offset_frames, source, slot)
+                    for source in dict.fromkeys((outgoing_source_index, incoming_source_index)) for slot in (3, 4))
+            for source in dict.fromkeys((outgoing_source_index, incoming_source_index)):
+                observations.requested_samples(plan.offset_frames, source, (3, 4), observed_only=observed_only)
+            outgoing, incoming = (sample_view(plan, source) for source in (outgoing_source_index, incoming_source_index))
+        outgoing_handles = (outgoing[3], outgoing[4]) if mismatch.cinematic_bridge is not None else ()
+        incoming_handles = (incoming[3], incoming[4]) if mismatch.cinematic_bridge is not None else ()
         candidates.append(_ObservedMemberPairCandidate(plan, outgoing, incoming,
             _scored_boundary_pair_mismatch(mismatch, offset_frames=plan.offset_frames,
                 outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
                 outgoing_sample=outgoing[1], incoming_sample=incoming[2],
-                outgoing_handles=outgoing[3:], incoming_handles=incoming[3:],
+                outgoing_handles=outgoing_handles, incoming_handles=incoming_handles,
                 candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config),
             mismatch))
         measured = candidates[-1].mismatch
@@ -2032,10 +2068,10 @@ def _materialize_member_observation_domain(stores, search):
     for boundary, store in enumerate(stores):
         candidates = []
         for plan in store.plans:
-            by_source = {source: store.observed_samples(offset, source)
-                for offset, source in store.observed_demands if offset == plan.offset_frames}
             columns = tuple(_ObservedIndex(source_count,
-                {source: samples[slot] for source, samples in by_source.items()}) for slot in range(5))
+                {source: store.observed_sample(offset, source, slot)
+                 for offset, source, observed_slot in store.observed_sample_demands
+                 if offset == plan.offset_frames and observed_slot == slot}) for slot in range(5))
             matrix = _ObservedIndex(source_count, {
                 left: _ObservedIndex(source_count, {right: raw_by_key[(boundary, left, right, plan.offset_frames)]
                     for right in range(source_count)
@@ -13522,22 +13558,23 @@ def select_balanced_direct_member_sources(
             if not boundary_plans or not any(plan.offset_frames == 0 for plan in boundary_plans):
                 raise RuntimeError("boundary local search did not retain its canonical state")
 
-            def observe_boundary_source(plan, source_index):
+            def observe_boundary_samples(plan, source_index, slots):
                 nonlocal sample_count, failed_sample_count, content_invalid_boundary_samples_skipped
                 source = resolved_sources[source_index]
-                local_times = plan.local_times_by_source[source_index]
-                endpoint_eligibility = plan.eligibility_by_source[source_index]
+                local_times = tuple(plan.local_times_by_source[source_index][slot] for slot in slots)
+                master_times = tuple(plan.master_times[slot] for slot in slots)
+                endpoint_eligibility = tuple(plan.eligibility_by_source[source_index][slot] for slot in slots)
                 descriptors = tuple(
                     boundary_provider(source_index, source, local_seconds) if eligible else None
                     for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
                 )
                 sample_count += sum(endpoint_eligibility)
-                content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
+                content_invalid_boundary_samples_skipped += len(slots) - sum(endpoint_eligibility)
                 failed_sample_count += sum(
                     eligible and descriptor is None
                     for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
                 )
-                return tuple(
+                samples = tuple(
                     _boundary_sample_with_focal_geometry(
                         master_seconds=master_seconds,
                         source_local_seconds=local_seconds,
@@ -13554,13 +13591,19 @@ def select_balanced_direct_member_sources(
                     # Only content-invalid samples are represented as missing.
                     # The store keeps an unrequested source/offset absent.
                     for master_seconds, local_seconds, descriptor, eligible in zip(
-                        plan.master_times, local_times, descriptors, endpoint_eligibility, strict=True)
+                        master_times, local_times, descriptors, endpoint_eligibility, strict=True)
                 )
+                return dict(zip(slots, samples, strict=True))
+
+            def observe_boundary_source(plan, source_index):
+                values = observe_boundary_samples(plan, source_index, tuple(range(5)))
+                return tuple(values[slot] for slot in range(5))
 
             prepare_focal = getattr(provider, 'prepare_focal_observations', None)
             observations = MemberBoundaryObservationStore(
                 boundary_plans, observe=observe_boundary_source,
                 prepare=prepare_focal if callable(prepare_focal) else None,
+                observe_samples=observe_boundary_samples if demand_driven_observations else None,
             )
             if demand_driven_observations:
                 observation_stores.append(observations)
@@ -13981,14 +14024,19 @@ def select_balanced_direct_member_sources(
                 complete=(len(candidates) == (1 if left == right else len(observation_stores[boundary].plans))))
         def reuse_observed_pairs(demand):
             store = observation_stores[demand.boundary_index]
-            available = store.observed_demands
+            available = store.observed_sample_demands
             result = []
             for other in observation_search.unobserved_at(demand.boundary_index):
                 left, right = other.outgoing_source_index, other.incoming_source_index
                 plans = tuple(plan for plan in store.plans if left != right or plan.offset_frames == 0)
-                if all((plan.offset_frames, source) in available
-                       for plan in plans for source in (left, right)):
-                    result.append(observe_transition(other, observed_only=True))
+                if all((plan.offset_frames, source, slot) in available for plan in plans
+                       for source, slots in ((left, (0, 1)), (right, (2, 3))) for slot in slots):
+                    try:
+                        result.append(observe_transition(other, observed_only=True))
+                    except UnobservedBoundarySample:
+                        # The base samples can reveal a potential effect whose
+                        # handles were never requested. That pair stays unknown.
+                        pass
             return result
         observed_path = observation_search.run(propose=propose_observation_path,
             observe=observe_transition, reuse_observed=reuse_observed_pairs,
@@ -14402,6 +14450,23 @@ def select_balanced_direct_member_sources(
     ):
         cut_applied = outgoing_index != incoming_index
         selected_candidate = selected_boundary_candidates[boundary_index]
+        retained_roles = None
+        if observation_search is not None:
+            # Final selected samples retain the complete downstream contract,
+            # including every handle even for a currently authored hard cut.
+            # Only unselected/unused roles were deferred during path search.
+            store = observation_stores[boundary_index]
+            chosen_sources = tuple(dict.fromkeys((outgoing_index, incoming_index)))
+            store.prepare((selected_candidate.offset_frames, source) for source in chosen_sources)
+            retained_roles = {source: store.samples_for(selected_candidate.offset_frames, source)
+                              for source in chosen_sources}
+
+        def chosen_sample(slot, source):
+            if retained_roles is not None:
+                return retained_roles[source][slot]
+            return (selected_candidate.outgoing_previous, selected_candidate.outgoing,
+                    selected_candidate.incoming, selected_candidate.incoming_next,
+                    selected_candidate.incoming_future)[slot][source]
         mismatch = (
             selected_boundary_mismatches[boundary_index]
             if cut_applied
@@ -14488,8 +14553,8 @@ def select_balanced_direct_member_sources(
                 ),
                 outgoing_eligible_source_index=outgoing_index,
                 incoming_eligible_source_index=incoming_index,
-                outgoing_sample=retained_sample(selected_candidate.outgoing[outgoing_index], outgoing_index),
-                incoming_sample=retained_sample(selected_candidate.incoming[incoming_index], incoming_index),
+                outgoing_sample=retained_sample(chosen_sample(1, outgoing_index), outgoing_index),
+                incoming_sample=retained_sample(chosen_sample(2, incoming_index), incoming_index),
                 mismatch=mismatch,
                 selected_pair_rank=selected_rank,
                 candidate_pair_count=len(ranked_pairs),
@@ -14511,12 +14576,12 @@ def select_balanced_direct_member_sources(
                 ),
                 cut_applied=cut_applied,
                 outgoing_handle_samples=(
-                    retained_sample(selected_candidate.incoming_next[outgoing_index], outgoing_index),
-                    retained_sample(selected_candidate.incoming_future[outgoing_index], outgoing_index),
+                    retained_sample(chosen_sample(3, outgoing_index), outgoing_index),
+                    retained_sample(chosen_sample(4, outgoing_index), outgoing_index),
                 ),
                 incoming_handle_samples=(
-                    retained_sample(selected_candidate.incoming_next[incoming_index], incoming_index),
-                    retained_sample(selected_candidate.incoming_future[incoming_index], incoming_index),
+                    retained_sample(chosen_sample(3, incoming_index), incoming_index),
+                    retained_sample(chosen_sample(4, incoming_index), incoming_index),
                 ),
             )
         )

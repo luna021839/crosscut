@@ -43,13 +43,13 @@ class MemberEndpointExclusion:
 
 def observed_unresolved_endpoints(store, boundary_index):
     """Read only already-published exact samples; never decode/prepare/infer."""
-    available = store.observed_demands
+    available = store.observed_sample_demands
     certificates = []
-    for source in sorted({source for _offset, source in available}):
-        if not all((plan.offset_frames, source) in available for plan in store.plans):
-            continue
+    for source in sorted({source for _offset, source, _slot in available}):
         for role, slot in (('outgoing', 1), ('incoming', 2)):
-            samples = tuple(store.observed_samples(plan.offset_frames, source)[slot] for plan in store.plans)
+            if not all((plan.offset_frames, source, slot) in available for plan in store.plans):
+                continue
+            samples = tuple(store.observed_sample(plan.offset_frames, source, slot) for plan in store.plans)
             # None means unobserved/legacy authority, not an explicit negative.
             if not all(isinstance(sample.focal_geometry, FocalSelectorGeometry) for sample in samples):
                 continue

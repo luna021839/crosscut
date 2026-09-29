@@ -9,12 +9,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Callable, Generic, Iterable, TypeVar
+from typing import Callable, Generic, Iterable, Mapping, TypeVar
 
 
 Sample = TypeVar("Sample")
 SampleTimes = tuple[float, float, float, float, float]
 Eligibility = tuple[bool, bool, bool, bool, bool]
+
+
+class UnobservedBoundarySample(KeyError):
+    """A read-only role query cannot stand in for an actual observation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +67,7 @@ class MemberBoundaryObservationStore(Generic[Sample]):
         *,
         observe: Callable[[MemberBoundaryObservationPlan, int], tuple[Sample, ...]],
         prepare: Callable[[tuple[tuple[int, float], ...]], None] | None = None,
+        observe_samples: Callable[[MemberBoundaryObservationPlan, int, tuple[int, ...]], Mapping[int, Sample]] | None = None,
     ) -> None:
         self.plans = tuple(plans)
         if not self.plans or not any(plan.offset_frames == 0 for plan in self.plans):
@@ -75,7 +80,70 @@ class MemberBoundaryObservationStore(Generic[Sample]):
             raise ValueError("boundary plans must share a source domain")
         self._observe = observe
         self._prepare = prepare
+        self._observe_samples = observe_samples
         self._samples: dict[tuple[int, int], tuple[Sample, ...]] = {}
+        self._partial: dict[tuple[int, int], dict[int, Sample]] = {}
+
+    @property
+    def supports_sample_demands(self) -> bool:
+        return self._observe_samples is not None
+
+    def _slot_demand(self, offset_frames, source_index, slot):
+        key = self._demand(offset_frames, source_index)
+        if type(slot) is not int or not 0 <= slot < 5:
+            raise ValueError('boundary sample slot must be an integer in 0...4')
+        return (*key, slot)
+
+    def prepare_samples(self, demands: Iterable[tuple[int, int, int]]) -> None:
+        """Prefetch only requested roles; absence still carries no evidence."""
+        keys = tuple(dict.fromkeys(self._slot_demand(*item) for item in demands))
+        if self._prepare is None:
+            return
+        available = self.observed_sample_demands
+        queries = tuple((source, self._plans[offset].local_times_by_source[source][slot])
+            for offset, source, slot in keys if (offset, source, slot) not in available
+            and self._plans[offset].eligibility_by_source[source][slot])
+        if queries:
+            self._prepare(queries)
+
+    def requested_samples(self, offset_frames, source_index, slots, *, observed_only=False):
+        """Atomically publish the exact requested slots, never fake five samples.
+
+        A failed/partial callback publishes nothing from that request. Earlier
+        successful slots remain available. Read-only access never invokes the
+        observer or dependency preparation; unrequested slots raise KeyError.
+        """
+        key = self._demand(offset_frames, source_index)
+        slots = tuple(slots)
+        for slot in slots:
+            self._slot_demand(offset_frames, source_index, slot)
+        values = dict(enumerate(self._samples[key])) if key in self._samples else dict(self._partial.get(key, {}))
+        missing = tuple(dict.fromkeys(slot for slot in slots if slot not in values))
+        if missing and observed_only:
+            raise UnobservedBoundarySample((offset_frames, source_index, missing))
+        if missing and not observed_only:
+            if self._observe_samples is None:
+                values = dict(enumerate(self.samples_for(offset_frames, source_index)))
+            else:
+                observed = self._observe_samples(self._plans[offset_frames], source_index, missing)
+                if (not isinstance(observed, Mapping) or set(observed) != set(missing)
+                        or any(type(slot) is not int for slot in observed)):
+                    raise RuntimeError('boundary sample observer did not return the exact requested slots')
+                values.update(observed)
+                if len(values) == 5:
+                    self._samples[key] = tuple(values[slot] for slot in range(5))
+                    self._partial.pop(key, None)
+                else:
+                    self._partial[key] = values
+        return tuple(values[slot] for slot in slots)
+
+    def observed_sample(self, offset_frames, source_index, slot):
+        return self.requested_samples(offset_frames, source_index, (slot,), observed_only=True)[0]
+
+    @property
+    def observed_sample_demands(self) -> frozenset[tuple[int, int, int]]:
+        return frozenset((*key, slot) for key, values in self._partial.items() for slot in values) | frozenset(
+            (*key, slot) for key in self._samples for slot in range(5))
 
     def _demand(self, offset_frames: int, source_index: int) -> tuple[int, int]:
         if (isinstance(offset_frames, bool) or not isinstance(offset_frames, int)
@@ -90,6 +158,9 @@ class MemberBoundaryObservationStore(Generic[Sample]):
         # Validate the entire demand before invoking any I/O. Do not prepare
         # sources already materialized, including observed missing-target results.
         keys = tuple(dict.fromkeys(self._demand(*demand) for demand in demands))
+        if self.supports_sample_demands:
+            self.prepare_samples((*key, slot) for key in keys for slot in range(5))
+            return
         if self._prepare is None:
             return
         queries = tuple(
@@ -105,6 +176,9 @@ class MemberBoundaryObservationStore(Generic[Sample]):
 
     def samples_for(self, offset_frames: int, source_index: int) -> tuple[Sample, ...]:
         key = self._demand(offset_frames, source_index)
+        if self.supports_sample_demands:
+            self.requested_samples(offset_frames, source_index, range(5))
+            return self._samples[key]
         if key not in self._samples:
             samples = self._observe(self._plans[offset_frames], source_index)
             if not isinstance(samples, tuple) or len(samples) != 5:

@@ -15,6 +15,22 @@ from engine.tests.test_source_first_focal_geometry import geometry
 
 
 class MemberEndpointExclusionTests(unittest.TestCase):
+    def test_partial_roles_prove_only_the_completely_observed_endpoint_side(self):
+        full, observer, _ = self.store()
+        selective = Mock(side_effect=lambda p, source, slots:
+            {slot: full.samples_for(p.offset_frames, source)[slot] for slot in slots})
+        store = MemberBoundaryObservationStore(full.plans, observe=Mock(), observe_samples=selective)
+        for p in store.plans:
+            store.requested_samples(p.offset_frames, 2, (0, 1))
+        selective.reset_mock(); observer.reset_mock()
+        result = observed_unresolved_endpoints(store, 4)
+        self.assertEqual([item.role for item in result], ['outgoing'])
+        self.assertFalse(store.observed_demands)
+        selective.assert_not_called(); observer.assert_not_called()
+        # One incoming offset is still not a whole-domain negative.
+        store.requested_samples(0, 2, (2,))
+        self.assertEqual([item.role for item in observed_unresolved_endpoints(store, 4)], ['outgoing'])
+
     def store(self, modes=lambda offset, source, slot: 'missing' if source == 2 else 'face'):
         plans = tuple(replace(plan(offset), eligibility_by_source=((True,)*5,)*4) for offset in (0, -2, 2))
         def observe(p, source):
