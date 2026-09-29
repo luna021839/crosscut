@@ -97,7 +97,9 @@ class SourceFirstUnresolvedMemo:
                 return self._incomplete('body_frame_unobserved')
             if faces is None or not faces and frame_key not in self.completed_face_frames:
                 return self._incomplete('native_face_decode_unproven')
-            if any(observation.reference_similarity >= .60 and len(observation.pose_screen_xyc) != 8
+            if any((observation.reference_similarity >= .60
+                    or getattr(observation, 'frozen_face_match', False))
+                   and len(observation.pose_screen_xyc) != 8
                    for observation in frame.observations):
                 return self._incomplete('pose_inference_unproven')
         return True

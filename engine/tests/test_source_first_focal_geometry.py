@@ -1,7 +1,11 @@
 from dataclasses import replace
+from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
+import numpy as np
 
 from crosscut.direct_member_target_face import FocalFaceCandidate
 from crosscut.focal_body_track import FocalBodyObservation, FocalBodyTrackResult
@@ -11,6 +15,8 @@ from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvide
 from crosscut.direct_member_visual import _boundary_sample_with_focal_geometry, _boundary_mismatch, DirectMemberVisualConfig
 from crosscut.direct_member_transform import direct_member_source_frame_geometry
 from engine.tests.test_focal_selector_geometry import person, descriptor, BOX
+from engine.tests.test_focal_body_track_provider import FACE, observation
+from crosscut.focal_body_track import FocalBodyFrame
 
 
 def geometry(source=0, *, body_only=False):
@@ -21,6 +27,30 @@ def geometry(source=0, *, body_only=False):
 
 
 class SourceFirstGeometryTests(unittest.TestCase):
+    def test_actual_resolver_uses_exact_face_pose_without_clothing_veto_or_track(self):
+        provider = SourceFirstFocalGeometryProvider.__new__(SourceFirstFocalGeometryProvider)
+        provider.sources = (Path('source'),)
+        provider._identity = lambda _: 'fixed'
+        provider._identities = ('fixed',)
+        provider._persistent = None
+        provider._persistent_key = lambda s, k: str(k)
+        provider._cache = OrderedDict()
+        provider._reasons = {}
+        provider.faces = SimpleNamespace(
+            _samplers=(SimpleNamespace(frame_at=lambda _: np.zeros((100, 100, 3), np.uint8)),),
+            _identity_key=lambda s, sampler, t: (s, t),
+            _ensure_focal_consensus=lambda s: SimpleNamespace(select=lambda _: FACE),
+            _focal_candidates=lambda s, t: (FACE,))
+        provider.bodies = SimpleNamespace(frame_observations=lambda s, t:
+            FocalBodyFrame(s, t, (observation(),)),
+            track_at=Mock(side_effect=AssertionError('direct proof does not need a track')))
+        provider.pose = SimpleNamespace(describe=Mock(side_effect=AssertionError('pose already measured')))
+        geometry = provider.selector_geometry(0, 1.)
+        self.assertEqual(geometry.face_bbox_xywh, FACE.bbox_xywh)
+        self.assertEqual(len(geometry.person.upper_body_keypoints_xyc), 8)
+        self.assertIsNone(geometry.body_track)
+        self.assertEqual(provider._reasons, {'frozen_face_with_exact_pose_agreement': 1})
+
     def test_observed_body_with_hidden_face_keeps_its_own_geometry(self):
         focal=geometry(body_only=True)
         self.assertIsNone(focal.face_bbox_xywh)

@@ -20,7 +20,7 @@ from .body_appearance import BodyAppearanceEncoder
 from .body_pose_2d import BodyPose2DAnalyzer, BodyPose2DEvidence
 from .direct_member_editorial_motion import DirectMemberDenseFaceProvider, DirectMemberFaceSample
 from .direct_member_target_face import FOCAL_FACE_BASIS
-from .focal_body_track_provider import SourceLocalFocalBodyProvider
+from .focal_body_track_provider import SourceLocalFocalBodyProvider, select_direct_focal_observation
 from .focal_body_track import FocalBodyGeometryCertificate
 from .focal_selector_geometry import FocalSelectorGeometry, FOCAL_SELECTOR_BODY_BASIS
 from .native_focal_faces import NativeFocalFaceProvider
@@ -135,21 +135,8 @@ class SourceFirstFocalGeometryProvider:
         candidates = self.faces._focal_candidates(source_index, seconds)
         face = bank.select(candidates) if bank else None
         frame = self.bodies.frame_observations(source_index, seconds)
-        selected = None
+        selected, reason = select_direct_focal_observation(face, candidates, frame)
         track = None
-        reason = 'frozen_face_body_unresolved'
-        if face is not None:
-            associated = [o for o in frame.observations if o.face == face]
-            if len(associated) == 1:
-                candidate = associated[0]
-                competitor = max((o.reference_similarity for o in frame.observations if o is not candidate), default=-1.)
-                if candidate.reference_similarity >= .60 and competitor-candidate.reference_similarity < .10:
-                    selected = candidate
-                    reason = 'frozen_face_with_source_body_agreement'
-            elif not frame.observations and len(candidates) == 1:
-                # A real close-up may have no full-body box. Preserve its
-                # observed face; do not fabricate a body or borrowed joints.
-                reason = 'frozen_solo_face_body_unobserved'
         if selected is None and reason != 'frozen_solo_face_body_unobserved':
             recovered = self.bodies.track_at(source_index, seconds)
             if recovered.observation is not None:

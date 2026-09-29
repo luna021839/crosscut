@@ -42,6 +42,29 @@ class DemandMemberSelectionTests(unittest.TestCase):
         args.update(kwargs)
         return visual.select_balanced_direct_member_sources(**args), provider
 
+    def test_public_selector_excludes_only_the_observed_missing_endpoint_not_whole_source(self):
+        from crosscut.focal_selector_geometry import FocalSelectorGeometry
+        class MissingEndpoint(Provider):
+            def focal_geometry_at(self, source, seconds, raw):
+                result = super().focal_geometry_at(source, seconds, raw)
+                if source == 0 and 2.5 < seconds < 3.5:
+                    return FocalSelectorGeometry(source, seconds, None)
+                return result
+        provider = MissingEndpoint()
+        with patch.object(visual, 'MemberObservationSearch', wraps=visual.MemberObservationSearch) as coordinator:
+            result, _ = self.select(descriptor_provider=provider,
+                config=visual.DirectMemberVisualConfig(beam_width=1000, boundary_search_radius_frames=2,
+                                                       maximum_same_source_hold_count=0))
+        self.assertEqual(result.source_counts, (2,2,2))
+        self.assertNotIn(0, result.source_indices[:2])
+        self.assertIn(0, result.source_indices[2:])
+        audit = result.optimizer_search_diagnostics['demand_driven_observations']
+        self.assertGreater(audit['endpoint_excluded_transition_count'], 0)
+        self.assertGreater(result.boundaries[0].endpoint_excluded_pair_count, 0)
+        self.assertEqual(coordinator.call_args.kwargs['maximum_solver_calls'],
+                         coordinator.call_args.kwargs['maximum_observations']+1)
+        self.assertTrue(all(not boundary.mismatch.severe_flags for boundary in result.boundaries))
+
     def test_public_selector_returns_only_exact_observed_full_policy_samples(self):
         result, provider = self.select()
         full, exhaustive = self.select(demand=False)

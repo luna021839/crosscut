@@ -113,6 +113,15 @@ class UnresolvedMemoTests(unittest.TestCase):
         memo(0,10.)
         self.assertEqual(memo.diagnostics()['records'],1)
 
+    def test_failed_pose_on_low_clothing_frozen_face_is_not_completed_negative(self):
+        key = next(iter(self.bodies._frame_cache))
+        self.bodies._frame_cache[key] = SimpleNamespace(observations=(SimpleNamespace(
+            reference_similarity=.585, frozen_face_match=True, pose_screen_xyc=()),))
+        memo = SourceFirstUnresolvedMemo(self.provider)
+        memo(0, 10.)
+        self.assertEqual(memo.records, 0)
+        self.assertEqual(memo.incomplete_reasons, {'pose_inference_unproven': 1})
+
     def test_native_completion_trace_does_not_record_failure_or_empty_cache_hit(self):
         self.provider.native_faces=SimpleNamespace(inference_frame_count=0)
         def candidates(source,seconds):

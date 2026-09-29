@@ -21,6 +21,31 @@ from .focal_pose import face_associated_person
 from .pose import _NanoDetFormationDetector, _formation_people_descriptor
 
 
+def select_direct_focal_observation(face, candidates, frame):
+    """One exact-frame rule shared by the resolver and dependency scheduler.
+
+    A frozen face plus an independently measured, face-consistent pose binds
+    the body even when its clothing bank is unrepresentative of this pose.
+    Without that proof, retain the existing body-appearance agreement rule.
+    This does not authorize a hidden-face track or a cross-source transition.
+    """
+    if face is not None:
+        associated = [item for item in frame.observations if item.face == face]
+        if len(associated) == 1:
+            candidate = associated[0]
+            if candidate.frozen_face_match and candidate.face_pose_consistent is True:
+                return candidate, 'frozen_face_with_exact_pose_agreement'
+            competitor = max((item.reference_similarity for item in frame.observations
+                              if item is not candidate), default=-1.)
+            if (candidate.face_pose_consistent is not False
+                    and candidate.reference_similarity >= .60
+                    and competitor-candidate.reference_similarity < .10):
+                return candidate, 'frozen_face_with_source_body_agreement'
+        elif not frame.observations and len(candidates) == 1:
+            return None, 'frozen_solo_face_body_unobserved'
+    return None, 'frozen_face_body_unresolved'
+
+
 class SourceLocalFocalBodyProvider:
     def __init__(self, face_provider, encoder: BodyAppearanceEncoder, *, pose_analyzer=None):
         if not getattr(face_provider, '_require_focal_consensus', False):
@@ -74,24 +99,29 @@ class SourceLocalFocalBodyProvider:
         bank = self.face_provider._ensure_focal_consensus(source_index)
         pixels = sampler.frame_at(seconds)
         observations = []
-        if pixels is not None and len(references) >= 3:
+        if pixels is not None and (bank is not None or len(references) >= 3):
             people, features = self._people_and_features(pixels)
             faces = self.face_provider._focal_candidates(source_index, seconds)
             frozen = bank.select(faces) if bank else None
             for person, features in zip(people, features):
                 associated = tuple(face for face in faces if face_associated_person(face.bbox_xywh, people) is person)
                 face = associated[0] if len(associated) == 1 else None
-                similarity = body_reference_similarity(features, references)
+                # Fewer than three body references cannot establish clothing
+                # agreement. They must not suppress independent face/pose proof.
+                similarity = body_reference_similarity(features, references) if len(references) >= 3 else -1.
                 pose = ()
-                if self.pose_analyzer is not None and similarity >= .60:
+                face_pose_consistent = None
+                if self.pose_analyzer is not None and (similarity >= .60 or face is not None and face == frozen):
                     measured = self.pose_analyzer.describe(pixels, bbox_xywh=person.bbox_xywh,
                         face_bbox_xywh=face.bbox_xywh if face else None)
                     if measured.reason == 'observed':
                         pose = measured.upper_body_xyc
+                        face_pose_consistent = measured.face_anchor_consistent
                         if measured.face_anchor_consistent is False:
                             face = None
                 observations.append(FocalBodyObservation(source_index, seconds, person,
-                    features, similarity, face, bool(face is not None and face == frozen), pose))
+                    features, similarity, face, bool(face is not None and face == frozen), pose,
+                    face_pose_consistent))
             self.frame_inference_count += 1
         result = FocalBodyFrame(source_index, seconds, tuple(observations))
         self._frame_cache[key] = result

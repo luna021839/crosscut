@@ -12,6 +12,8 @@ from time import monotonic
 
 import cv2
 
+from .focal_body_track_provider import select_direct_focal_observation
+
 
 def track_dependency_times(sampler, seconds):
     """The tracker's exact native-frame lattice; tested against track_at."""
@@ -35,6 +37,7 @@ class SourceFirstObservationBatch:
         self.progress_callback = progress_callback
         self.batches = self.request_count = self.dependency_frame_count = 0
         self.cached_geometry_count = self.capacity_fallback_count = 0
+        self.direct_resolved_query_count = self.recovery_query_count = 0
         self.elapsed_seconds = 0.
 
     def __call__(self, queries):
@@ -85,17 +88,27 @@ class SourceFirstObservationBatch:
                     continue
                 # Frozen face/body reference banks are the same as the scalar
                 # path, and are established before sorted query observations.
-                provider.faces._ensure_focal_consensus(source)
+                bank = provider.faces._ensure_focal_consensus(source)
                 references = provider.bodies._ensure_references(source)
-                dependencies = dict(pending)
-                if len(references) >= 3:
-                    for seconds in pending.values():
+                dependencies = {}
+                # First observe the exact requested frames, in source order.
+                # Only unresolved queries need the expensive track lattice.
+                # Use the resolver's same pure rule; do not publish geometry
+                # here or substitute adjacent evidence for an exact frame.
+                for _key, seconds in sorted(pending.items(), key=lambda item: item[1]):
+                    faces = provider.faces._focal_candidates(source, seconds)
+                    frame = provider.bodies.frame_observations(source, seconds)
+                    self.dependency_frame_count += 1
+                    face = bank.select(faces) if bank else None
+                    selected, reason = select_direct_focal_observation(face, faces, frame)
+                    if selected is not None or reason == 'frozen_solo_face_body_unobserved':
+                        self.direct_resolved_query_count += 1
+                    elif len(references) >= 3:
+                        self.recovery_query_count += 1
                         for time in track_dependency_times(sampler, seconds):
                             key = provider.faces._identity_key(source, sampler, time)
-                            dependencies.setdefault(key, time)
-                # This lattice can include unused recovery support for an
-                # immediately visible target. No extra support is passed to a
-                # resolver: track_at still selects only its original window.
+                            if key not in pending:
+                                dependencies.setdefault(key, time)
                 for _key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
                     provider.faces._focal_candidates(source, seconds)
                     provider.bodies.frame_observations(source, seconds)
@@ -112,6 +125,8 @@ class SourceFirstObservationBatch:
             batches=self.batches, request_count=self.request_count,
             dependency_frame_count=self.dependency_frame_count,
             cached_geometry_count=self.cached_geometry_count,
+            direct_resolved_query_count=self.direct_resolved_query_count,
+            recovery_query_count=self.recovery_query_count,
             capacity_fallback_count=self.capacity_fallback_count,
             elapsed_seconds=self.elapsed_seconds,
             target_selection_changed=False, query_offsets_removed=False,

@@ -47,6 +47,7 @@ class FocalBodyObservation:
     face: FocalFaceCandidate | None = field(default=None, repr=False)
     frozen_face_match: bool = False
     pose_screen_xyc: tuple[tuple[float, float, float], ...] = field(default=(), repr=False)
+    face_pose_consistent: bool | None = None
 
     def __post_init__(self):
         if (isinstance(self.source_index, bool) or not isinstance(self.source_index, int)
@@ -60,6 +61,8 @@ class FocalBodyObservation:
                 or not -1.000001 <= self.reference_similarity <= 1.000001
                 or not isinstance(self.frozen_face_match, bool)
                 or self.frozen_face_match and self.face is None
+                or self.face_pose_consistent is not None and not isinstance(self.face_pose_consistent, bool)
+                or self.face_pose_consistent is True and (self.face is None or not self.pose_screen_xyc)
                 or self.pose_screen_xyc and (len(self.pose_screen_xyc) != 8
                     or any(len(p)!=3 or any(not math.isfinite(v) for v in p)
                            or not 0<=p[2]<=1 for p in self.pose_screen_xyc))):

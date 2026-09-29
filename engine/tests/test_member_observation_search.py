@@ -140,6 +140,23 @@ class MemberObservationSearchTests(unittest.TestCase):
         proposer.assert_not_called()
         observer.assert_called_once()
 
+    def test_more_than_sixteen_productive_repairs_share_one_nonresetting_observation_budget(self):
+        # Coordinator-only fixture: holds are explicitly permitted by this
+        # fake policy. The actual member policy's independent cadence gates
+        # are covered in test_member_demand_selection, not waived here.
+        search = MemberObservationSearch(((True,)*3,)*21, maximum_observations=40,
+            maximum_solver_calls=41, allow_same_source_holds=True)
+        calls = 0
+        def propose(_):
+            nonlocal calls
+            calls += 1
+            return tuple(2 if position < calls else position%2 for position in range(21))
+        result = search.run(propose=propose,
+            observe=lambda demand: observed(demand, eligible=demand.incoming_source_index == 2))
+        self.assertEqual(result.source_indices, (2,)*21)
+        self.assertEqual(result.observation_count, 40)
+        self.assertEqual(result.solver_call_count, 22)
+
     def test_actual_path_milp_retains_quotas_durations_and_complete_path_no_good(self):
         # Exercise the existing solver, not a mock optimizer, over provisional
         # edge types. This is a synthetic policy/adapter check, not media QA.

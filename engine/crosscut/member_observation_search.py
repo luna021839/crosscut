@@ -14,6 +14,8 @@ import math
 from time import monotonic
 from typing import Callable, Generic, Mapping, Sequence, TypeVar
 
+from .member_endpoint_exclusions import MemberEndpointExclusion
+
 
 Evidence = TypeVar("Evidence")
 
@@ -33,6 +35,7 @@ class TransitionDemand:
 class ObservationState(Enum):
     UNOBSERVED = "unobserved"
     CONTENT_INELIGIBLE = "content_ineligible"
+    ENDPOINT_INELIGIBLE = "observed_endpoint_ineligible"
     ELIGIBLE = "observed_eligible"
     REJECTED = "observed_rejected"
 
@@ -74,6 +77,8 @@ class ProposalEdge:
         if self.severe_flags is None:
             flags = (("content_or_cross_source_policy_ineligible",)
                 if self.state is ObservationState.CONTENT_INELIGIBLE else
+                ("cross_source_focal_subject_unresolved",)
+                if self.state is ObservationState.ENDPOINT_INELIGIBLE else
                 ("observed_transition_rejected",)
                 if self.state is ObservationState.REJECTED else
                 tuple(getattr(self.policy_evidence, 'severe_flags', ())))
@@ -87,7 +92,8 @@ class ProposalEdge:
         if name in {'cinematic_bridge', 'motion_connection', 'transform_repair',
                     'attention_position_mismatch', 'attention_scale_mismatch',
                     'attention_geometry_basis', 'silhouette_mismatch'}:
-            if self.state in {ObservationState.REJECTED, ObservationState.CONTENT_INELIGIBLE}:
+            if self.state in {ObservationState.REJECTED, ObservationState.CONTENT_INELIGIBLE,
+                              ObservationState.ENDPOINT_INELIGIBLE}:
                 return None
             return getattr(self.policy_evidence, name, None)
         raise AttributeError(name)
@@ -104,6 +110,7 @@ class ObservedPathProposal(Generic[Evidence]):
     observation_count: int
     unobserved_transition_count: int
     reused_observation_count: int = 0
+    endpoint_excluded_transition_count: int = 0
 
 
 class MemberObservationSearchIncomplete(RuntimeError):
@@ -168,6 +175,8 @@ class MemberObservationSearch(Generic[Evidence]):
             and self.validity[boundary][left] and self.validity[boundary+1][right]
         )
         self._observed: dict[TransitionDemand, TransitionObservation[Evidence]] = {}
+        self._excluded: dict[TransitionDemand, MemberEndpointExclusion] = {}
+        self._endpoint_certificates: set[MemberEndpointExclusion] = set()
         self._proposal_costs = dict(proposal_costs or {})
         if any(demand not in self._domain or isinstance(cost, bool)
                or not isinstance(cost, (int, float)) or not math.isfinite(cost) or not 0 <= cost <= 1
@@ -182,6 +191,8 @@ class MemberObservationSearch(Generic[Evidence]):
             observed = self._observed.get(demand)
             if demand not in self._domain:
                 return ProposalEdge(ObservationState.CONTENT_INELIGIBLE, 1.0)
+            if demand in self._excluded:
+                return ProposalEdge(ObservationState.ENDPOINT_INELIGIBLE, 1.0)
             if observed is not None and not observed.eligible:
                 return ProposalEdge(ObservationState.REJECTED, 1.0)
             if observed is None:
@@ -194,9 +205,22 @@ class MemberObservationSearch(Generic[Evidence]):
 
     def _incomplete(self, reason: str) -> MemberObservationSearchIncomplete:
         error = MemberObservationSearchIncomplete(reason, solver_calls=self._solver_calls,
-            observations=self._observation_calls, unobserved=len(self._domain)-len(self._observed))
+            observations=self._observation_calls, unobserved=self.unobserved_count)
         error.diagnostics['reused_observation_count'] = self._reused_observations
+        error.diagnostics['endpoint_excluded_transition_count'] = len(self._excluded)
         return error
+
+    @property
+    def unobserved_count(self) -> int:
+        return len(self._domain)-len(self._observed)-len(self._excluded)
+
+    @property
+    def endpoint_excluded_count(self) -> int:
+        return len(self._excluded)
+
+    @property
+    def endpoint_excluded_demands(self) -> frozenset[TransitionDemand]:
+        return frozenset(self._excluded)
 
     @property
     def observations(self) -> tuple[TransitionObservation[Evidence], ...]:
@@ -205,7 +229,8 @@ class MemberObservationSearch(Generic[Evidence]):
     def unobserved_at(self, boundary_index: int) -> tuple[TransitionDemand, ...]:
         """Only legal, unmeasured pairs; no inference or eligibility defaults."""
         return tuple(sorted((demand for demand in self._domain
-            if demand.boundary_index == boundary_index and demand not in self._observed),
+            if demand.boundary_index == boundary_index and demand not in self._observed
+            and demand not in self._excluded),
             key=lambda demand: (demand.outgoing_source_index, demand.incoming_source_index)))
 
     def _emit(self, event, **payload):
@@ -214,7 +239,8 @@ class MemberObservationSearch(Generic[Evidence]):
                 elapsed_seconds=round(monotonic()-self._started, 3),
                 solver_call_count=self._solver_calls, observation_count=self._observation_calls,
                 reused_observation_count=self._reused_observations,
-                unobserved_transition_count=len(self._domain)-len(self._observed), **payload))
+                unobserved_transition_count=self.unobserved_count,
+                endpoint_excluded_transition_count=len(self._excluded), **payload))
 
     def run(
         self,
@@ -222,6 +248,7 @@ class MemberObservationSearch(Generic[Evidence]):
         propose: Callable[[ProposalGraph], Sequence[int] | None],
         observe: Callable[[TransitionDemand], TransitionObservation[Evidence]],
         reuse_observed: Callable[[TransitionDemand], Sequence[TransitionObservation[Evidence]]] | None = None,
+        endpoint_exclusions: Callable[[TransitionDemand], Sequence[MemberEndpointExclusion]] | None = None,
     ) -> ObservedPathProposal[Evidence]:
         while self._solver_calls < self.maximum_solver_calls:
             self._solver_calls += 1
@@ -238,6 +265,8 @@ class MemberObservationSearch(Generic[Evidence]):
                 for index, (left, right) in enumerate(zip(path, path[1:])))
             if any(demand not in self._domain for demand in demands):
                 raise ValueError("proposal violates content validity or cross-source policy")
+            if any(demand in self._excluded for demand in demands):
+                raise ValueError('proposal repeats an exact endpoint exclusion')
             if any(demand in self._observed and not self._observed[demand].eligible for demand in demands):
                 raise ValueError("proposal repeats an observed rejected transition")
             rejected = False
@@ -268,11 +297,30 @@ class MemberObservationSearch(Generic[Evidence]):
                         if (not isinstance(item, TransitionObservation)
                                 or item.demand.boundary_index != demand.boundary_index
                                 or item.demand not in self._domain
-                                or item.demand in self._observed or item.demand in seen):
+                                or item.demand in self._observed or item.demand in self._excluded
+                                or item.demand in seen):
                             raise ValueError('cached pair evidence must be new and boundary-local')
                         seen.add(item.demand)
                     self._observed.update((item.demand, item) for item in related)
                     self._reused_observations += len(related)
+                if endpoint_exclusions is not None:
+                    certificates = tuple(endpoint_exclusions(demand))
+                    if len(certificates) > 2*self.source_count:
+                        raise ValueError('endpoint certificates exceed one boundary domain')
+                    for certificate in certificates:
+                        if (not isinstance(certificate, MemberEndpointExclusion)
+                                or certificate.boundary_index != demand.boundary_index
+                                or certificate.source_index >= self.source_count):
+                            raise ValueError('endpoint certificates must be boundary/source-local')
+                        if certificate in self._endpoint_certificates:
+                            continue
+                        if any(item.eligible and certificate.excludes(item.demand)
+                               for item in self._observed.values()):
+                            raise ValueError('endpoint certificate contradicts eligible paired evidence')
+                        self._endpoint_certificates.add(certificate)
+                        for other in self._domain:
+                            if other not in self._observed and certificate.excludes(other):
+                                self._excluded[other] = certificate
                 self._emit('exact_pair_observed', boundary_index=demand.boundary_index,
                     outgoing_source_index=demand.outgoing_source_index,
                     incoming_source_index=demand.incoming_source_index,
@@ -289,6 +337,6 @@ class MemberObservationSearch(Generic[Evidence]):
             if not rejected and not observation_changed:
                 self._emit('observed_path_policy_verified')
                 return ObservedPathProposal(path, tuple(self._observed[demand] for demand in demands),
-                    self._solver_calls, self._observation_calls, len(self._domain)-len(self._observed),
-                    self._reused_observations)
+                    self._solver_calls, self._observation_calls, self.unobserved_count,
+                    self._reused_observations, len(self._excluded))
         raise self._incomplete("proposal_solver_budget_exhausted")

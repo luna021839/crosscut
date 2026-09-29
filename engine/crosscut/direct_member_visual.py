@@ -38,6 +38,7 @@ from .member_observation_search import (
     ProposalEdge, TransitionDemand, TransitionObservation,
 )
 from .member_path_flow import member_path_flow_rows
+from .member_endpoint_exclusions import observed_unresolved_endpoints
 from .member_bridge_contract import (
     MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
@@ -1729,6 +1730,7 @@ class DirectBoundaryVisualDiagnostic:
     outgoing_handle_samples: tuple[_BoundarySample, ...] = ()
     incoming_handle_samples: tuple[_BoundarySample, ...] = ()
     unobserved_pair_count: int = 0
+    endpoint_excluded_pair_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1759,6 +1761,7 @@ class DirectBoundaryVisualDiagnostic:
             "invalid_content_pair_count": self.invalid_content_pair_count,
             "severe_pair_count": self.severe_pair_count,
             "unobserved_pair_count": self.unobserved_pair_count,
+            "endpoint_excluded_pair_count": self.endpoint_excluded_pair_count,
             "minimum_pair_cost": self.minimum_pair_cost,
             "selected_pair_cost_delta": self.selected_pair_cost_delta,
             "ping_pong_penalty_applied": self.ping_pong_penalty_applied,
@@ -1986,7 +1989,10 @@ def _materialize_member_observation_domain(stores, search):
             raw_by_key[(*key, candidate.plan.offset_frames)] = candidate.raw_mismatch
     unobserved = ProposalEdge(ObservationState.UNOBSERVED, 0.,
                              severe_flags=('transition_not_observed',))
-    matrices = tuple(tuple(tuple(best_by_key.get((boundary, left, right), unobserved)
+    excluded = search.endpoint_excluded_demands
+    endpoint_ineligible = ProposalEdge(ObservationState.ENDPOINT_INELIGIBLE, 1.)
+    matrices = tuple(tuple(tuple(best_by_key.get((boundary, left, right),
+        endpoint_ineligible if TransitionDemand(boundary, left, right) in excluded else unobserved)
         for right in range(source_count)) for left in range(source_count))
         for boundary in range(len(stores)))
     domains = []
@@ -13528,9 +13534,13 @@ def select_balanced_direct_member_sources(
         for span in span_diagnostics
     )
     if demand_driven_observations:
+        maximum_exact_observations = max(1, 4 * (len(spans)-1))
         observation_search = MemberObservationSearch(candidate_validity,
-            maximum_observations=max(1, 4 * (len(spans)-1)),
-            maximum_solver_calls=16, allow_same_source_holds=True,
+            maximum_observations=maximum_exact_observations,
+            # Each new proposal must pay for new observations or terminate.
+            # The final no-new-evidence call is the mandatory policy re-audit.
+            # This bound cannot reset and does not extend the workflow deadline.
+            maximum_solver_calls=maximum_exact_observations+1, allow_same_source_holds=True,
             progress_callback=getattr(provider, 'member_observation_progress', None),
             proposal_costs={TransitionDemand(boundary, left, right): _coarse_member_proposal_prior(
                 span_diagnostics[boundary].sources[left], span_diagnostics[boundary+1].sources[right])
@@ -13850,7 +13860,9 @@ def select_balanced_direct_member_sources(
                     result.append(observe_transition(other, observed_only=True))
             return result
         observed_path = observation_search.run(propose=propose_observation_path,
-            observe=observe_transition, reuse_observed=reuse_observed_pairs)
+            observe=observe_transition, reuse_observed=reuse_observed_pairs,
+            endpoint_exclusions=lambda demand: observed_unresolved_endpoints(
+                observation_stores[demand.boundary_index], demand.boundary_index))
         policy_decision = decisions[-1]
         if policy_decision.path != observed_path.source_indices:
             raise RuntimeError('observed member path lost its final policy audit')
@@ -13867,6 +13879,7 @@ def select_balanced_direct_member_sources(
             'solver_call_count': observed_path.solver_call_count,
             'exact_pair_request_count': observed_path.observation_count,
             'reused_observation_count': observed_path.reused_observation_count,
+            'endpoint_excluded_transition_count': observed_path.endpoint_excluded_transition_count,
             'observed_transition_count': observed_path.observation_count+observed_path.reused_observation_count,
             'unobserved_transition_count': observed_path.unobserved_transition_count,
             'coarse_span_flanks_are_proposal_only': True,
@@ -14285,7 +14298,11 @@ def select_balanced_direct_member_sources(
             and bool(matrices[boundary_index][left][right].severe_flags)
             for left, right in content_valid_pairs
         )
-        unobserved_pair_count = sum(not isinstance(matrices[boundary_index][left][right], DirectBoundaryMismatch)
+        unobserved_pair_count = sum(isinstance(edge := matrices[boundary_index][left][right], ProposalEdge)
+            and edge.state is ObservationState.UNOBSERVED
+            for left, right in content_valid_pairs)
+        endpoint_excluded_pair_count = sum(isinstance(edge := matrices[boundary_index][left][right], ProposalEdge)
+            and edge.state is ObservationState.ENDPOINT_INELIGIBLE
             for left, right in content_valid_pairs)
         ranked_pairs = sorted(
             (
@@ -14346,6 +14363,7 @@ def select_balanced_direct_member_sources(
                 ),
                 severe_pair_count=severe_pair_count,
                 unobserved_pair_count=unobserved_pair_count,
+                endpoint_excluded_pair_count=endpoint_excluded_pair_count,
                 minimum_pair_cost=minimum_cost,
                 selected_pair_cost_delta=(
                     mismatch.cost - minimum_cost if cut_applied else 0.0
