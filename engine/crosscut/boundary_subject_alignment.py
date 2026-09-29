@@ -48,7 +48,7 @@ from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
-ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v2"
+ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v3"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -188,7 +188,7 @@ class BoundarySubjectAlignmentConfig:
     window_frames: int = 14
     analysis_width: int = 854
     analysis_height: int = 480
-    renderer_schema_max_zoom: float = 1.18
+    renderer_schema_max_zoom: float = 2.0
     conservative_1080_max_zoom: float = 1.18
     native_1440_max_zoom: float = 1.33
     native_2160_max_zoom: float = 2.0
@@ -199,7 +199,7 @@ class BoundarySubjectAlignmentConfig:
     minimum_face_visible_fraction: float = 0.995
     minimum_silhouette_visible_fraction: float = 0.92
     minimum_performer_visible_fraction: float = 0.985
-    maximum_face_zoom: float = 1.18
+    maximum_face_zoom: float = 2.0
     maximum_upper_body_zoom: float = 1.16
     maximum_formation_zoom: float = 1.08
     maximum_silhouette_zoom: float = 1.08
@@ -257,8 +257,8 @@ class BoundarySubjectAlignmentConfig:
         )
         if any(not math.isfinite(value) for value in values):
             raise ValueError("boundary alignment configuration must be finite")
-        if not 1.0 < self.renderer_schema_max_zoom <= 1.18:
-            raise ValueError("v1 renderer schema zoom cannot exceed 1.18")
+        if not 1.0 < self.renderer_schema_max_zoom <= 2.0:
+            raise ValueError("native-pixel alignment zoom cannot exceed 2.0")
         if not (
             1.0 < self.conservative_1080_max_zoom
             <= self.native_1440_max_zoom
@@ -585,6 +585,7 @@ class BoundarySubjectAlignmentPlan:
                 ),
                 "group_transition_kind": "hard_cut_only",
                 "legacy_editorial_schema_globally_relaxed": False,
+                "native_zoom_policy": "source_resolution_after_base_crop_face_alignment_only_v1",
                 "close_face_containment": "measured_face_plus_source_clipped_head_margin",
                 "medium_wide_containment": "full_visible_performer_or_formation",
                 "transform_search": "endpoint_valid_strengths_ranked_then_complete_dense_windows_v1",
@@ -1460,6 +1461,7 @@ def _headroom(
     output_height: int,
     base_crop_scale: float,
     settings: BoundarySubjectAlignmentConfig,
+    base_crop_width_scale: float | None = None,
 ) -> SourceResolutionHeadroom:
     if resolution is None:
         profile = "unknown_resolution_conservative"
@@ -1469,7 +1471,11 @@ def _headroom(
         height: int | None = None
     else:
         width, height = resolution
-        native = min(width / output_width, height / output_height) * base_crop_scale
+        width_scale = base_crop_scale if base_crop_width_scale is None else base_crop_width_scale
+        # Match the renderer's decimal expression and even-pixel crop exactly.
+        width_pixels = math.floor(width * float(f'{width_scale:.8f}') / 2.) * 2
+        height_pixels = math.floor(height * float(f'{base_crop_scale:.8f}') / 2.) * 2
+        native = min(width_pixels / output_width, height_pixels / output_height)
         if height >= 2000 and native >= 1.75:
             profile = "2160p_native_crop_headroom"
             profile_max = settings.native_2160_max_zoom
@@ -1480,6 +1486,10 @@ def _headroom(
             profile = "1080p_or_lower_conservative"
             profile_max = settings.conservative_1080_max_zoom
     effective = min(settings.renderer_schema_max_zoom, profile_max)
+    if native is not None and profile in {"2160p_native_crop_headroom", "1440p_native_crop_headroom"}:
+        # A base crop may leave less than the profile's nominal pixel budget.
+        # Larger face matches cannot magnify an already downsampled canvas.
+        effective = min(effective, native)
     if native is not None and native < 1.0:
         # A pre-existing crop already consumes native pixels.  Keep only a very
         # small output-space correction; this is still explicitly reported as
@@ -2008,6 +2018,8 @@ def build_boundary_subject_alignment_plan(
                     if transformed_base_crop is not None
                     else 1.0
                 ),
+                base_crop_width_scale=(transformed_base_crop[2]
+                    if transformed_base_crop is not None else 1.0),
                     settings=settings,
                 ).effective_max_zoom,
                 _subject_zoom_cap(subject_kind, settings),

@@ -830,7 +830,7 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
         self.assertIsNone(plan.track_for(2))
         self.assertEqual(plan.segments[1].boundary_indices, (0,))
 
-    def test_resolution_headroom_is_reported_without_relaxing_v1_schema(self) -> None:
+    def test_resolution_headroom_is_available_only_to_dense_local_alignment(self) -> None:
         timeline = VisualTimelinePlan(
             (_choice(0, 0, start=0.0, end=1.0),),
             1.0,
@@ -853,10 +853,36 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
                 )
                 headroom = plan.source_headroom[0]
                 self.assertAlmostEqual(headroom.quality_profile_max_zoom, profile_max)
-                self.assertLessEqual(headroom.effective_max_zoom, 1.18)
+                self.assertAlmostEqual(headroom.effective_max_zoom, profile_max)
                 self.assertFalse(
                     plan.to_dict()["policy"]["legacy_editorial_schema_globally_relaxed"]
                 )
+
+    def test_4k_face_scale_match_uses_native_pixels_but_1080_keeps_its_cap(self):
+        timeline = VisualTimelinePlan((_choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.)), 1.)
+        for resolution, expected in (((3840,2160), 1.5), ((1920,1080), 1.18),
+                                     ((2560,1440), 1.33), (None, 1.06)):
+            with self.subTest(resolution=resolution):
+                plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+                    sources=(Path('a.mp4'), Path('b.mp4')),
+                    transitions=(RenderTransition(tier='C'),), fps=30.,
+                    frame_provider=lambda index, _seconds: _frame(index),
+                    observation_provider=_observations(source0_box=(.42,.33,.16,.24),
+                        source1_box=(.38,.27,.24,.36)),
+                    source_resolutions=(resolution,resolution))
+                self.assertEqual(plan.eligible_count, 1)
+                self.assertEqual(plan.validated_output_frame_count, 13)
+                self.assertAlmostEqual(plan.decisions[0].outgoing_state.zoom, expected)
+
+    def test_native_headroom_subtracts_existing_base_crop(self):
+        from crosscut.boundary_subject_alignment import _headroom
+        for crop, expected in ((1.,2.), (.9,1.8), (.65,1.3), (.55,1.18), (.4,1.06)):
+            with self.subTest(crop=crop):
+                proof = _headroom(0, (3840,2160), output_width=1920,
+                    output_height=1080, base_crop_scale=crop,
+                    settings=BoundarySubjectAlignmentConfig())
+                self.assertAlmostEqual(proof.effective_max_zoom, expected)
 
     def test_exact_face_overrides_stale_timeline_wide_label(self) -> None:
         timeline = VisualTimelinePlan(

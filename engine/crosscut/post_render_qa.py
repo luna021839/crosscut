@@ -4596,7 +4596,10 @@ def _bound_local_alignment_tracks(
     from .render import quantized_segment_frame_counts
 
     alignment = _mapping(motion.get("boundary_subject_alignment")) or {}
-    if alignment.get("analysis_basis") != "exact_cut_frame_shot_adaptive_subject_alignment_v2":
+    if alignment.get("analysis_basis") not in {
+        "exact_cut_frame_shot_adaptive_subject_alignment_v2",
+        "exact_cut_frame_shot_adaptive_subject_alignment_v3",
+    }:
         return set(), set()
     try:
         typed = render_plan_from_json(dict(plan))
@@ -4664,11 +4667,92 @@ def _bound_local_alignment_tracks(
     return bound_segments, bound_boundaries
 
 
+def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *, runner=_run_command):
+    """Independently probe pixels for larger *bound face* corrections only.
+
+    Serialized 4K labels and planner headroom values grant no permission.
+    The actual selected file must remain unchanged across probing, have
+    no declared anamorphic aspect/rotation, and retain pixels after its exact base
+    crop. Old, decorative, formation and unbound tracks keep the legacy cap.
+    """
+    from .render_plan_serialization import render_plan_from_json
+    alignment = _mapping(motion.get('boundary_subject_alignment')) or {}
+    if alignment.get('analysis_basis') != 'exact_cut_frame_shot_adaptive_subject_alignment_v3':
+        return {}
+    try:
+        typed = render_plan_from_json(dict(plan))
+    except (ValueError, TypeError, KeyError):
+        return {}
+    decisions = {item.get('boundary_index'): item
+        for raw in (_sequence(alignment.get('decisions')) or []) if (item := _mapping(raw))}
+    tracks = {item.get('segment_index'): item
+        for raw in (_sequence(alignment.get('segments')) or []) if (item := _mapping(raw))}
+    probed = {}
+    budgets = {}
+    for index in sorted(bound_segments):
+        segment = typed.segments[index]
+        track = segment.editorial_transform
+        if track is None or max(frame.zoom for frame in track.keyframes) <= config.maximum_editorial_zoom:
+            continue
+        indices = tracks.get(index, {}).get('boundary_indices', [])
+        if not indices or any(decisions.get(boundary, {}).get('subject_kind') != 'face' for boundary in indices):
+            continue
+        source = typed.sources[segment.source_index]
+        if source not in probed:
+            probed[source] = None
+            try:
+                before = source.stat()
+                result = runner((config.ffprobe, '-v', 'error', '-select_streams', 'v:0',
+                    '-show_streams', '-of', 'json', str(source)), min(config.tool_timeout_seconds, 5.))
+                after = source.stat()
+                identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+                streams = json.loads(result.stdout)['streams'] if result.returncode == 0 else []
+                if len(streams) != 1 or identity(before) != identity(after):
+                    continue
+                stream = streams[0]
+                width, height = stream.get('width'), stream.get('height')
+                rotations = [float(side.get('rotation', 0)) for side in stream.get('side_data_list', [])]
+                rotations.append(float(stream.get('tags', {}).get('rotate', 0)))
+                if (type(width) is not int or type(height) is not int or min(width, height) <= 0
+                        # Unspecified SAR is the coded raster; this renderer
+                        # explicitly uses a filled canvas followed by setsar=1.
+                        or stream.get('sample_aspect_ratio', '1:1') not in {'1:1', '1/1'}
+                        or any(not math.isfinite(value) or abs(value) > 1e-9 for value in rotations)):
+                    continue
+                probed[source] = (width, height)
+            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+                continue
+        resolution = probed[source]
+        if resolution is None:
+            continue
+        width, height = resolution
+        if segment.crop is not None:
+            crop_width, crop_height = segment.crop.width, segment.crop.height
+        elif segment.pan_crop is not None:
+            crop_width, crop_height = segment.pan_crop.fixed_crop_size
+        else:
+            crop_width, crop_height = 1., 1.
+        # Match FFmpeg's even-pixel crop rounding, not nominal ratios.
+        pixels_width = math.floor(width * float(f'{crop_width:.8f}') / 2.) * 2
+        pixels_height = math.floor(height * float(f'{crop_height:.8f}') / 2.) * 2
+        native = min(pixels_width / typed.width, pixels_height / typed.height)
+        profile = 2.0 if height >= 2000 and native >= 1.75 else 1.33 if height >= 1300 and native >= 1.20 else config.maximum_editorial_zoom
+        maximum = min(profile, native)
+        if maximum > config.maximum_editorial_zoom:
+            budgets[index] = {'maximum_zoom': maximum, 'source_index': segment.source_index,
+                'source_width': width, 'source_height': height,
+                'post_crop_width': pixels_width, 'post_crop_height': pixels_height,
+                'basis': 'independent_stable_source_probe_and_exact_base_crop_v1'}
+    return budgets
+
+
 def _transform_metrics(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
     config: PostRenderQAConfig,
     collector: _IssueCollector,
+    *,
+    runner: RunCommand = _run_command,
 ) -> dict[str, Any]:
     motion = _mapping(analysis.get("editorial_motion"))
     if motion is None:
@@ -4683,6 +4767,8 @@ def _transform_metrics(
     motion_segments = [_mapping(raw) or {} for raw in segments]
     plan_segments = _sequence(plan.get("segments")) or []
     local_alignment_segments, local_alignment_boundaries = _bound_local_alignment_tracks(motion, plan)
+    native_zoom_budgets = _native_local_alignment_zoom_budgets(
+        motion, plan, local_alignment_segments, config, runner=runner)
     frame_visible_contract = motion.get("event_count_contract") == "frame_visible_active_targets_v1"
     motion_indices = [
         _integer(item.get("segment_index")) for item in motion_segments
@@ -4865,7 +4951,8 @@ def _transform_metrics(
         if (
             min_zoom < 1.0 - 1e-9
             or
-            max_zoom > config.maximum_editorial_zoom + 1e-9
+            max_zoom > native_zoom_budgets.get(segment_index, {}).get(
+                'maximum_zoom', config.maximum_editorial_zoom) + 1e-9
             or max_shift > (
                 max(config.maximum_editorial_center_shift, 0.04)
                 if segment_index in local_alignment_segments
@@ -5303,6 +5390,7 @@ def _transform_metrics(
         "reason_category_entropy_normalized": _normalized_entropy(reason_categories),
         "diversity_threshold_status": "reference_calibration_required",
         "unsafe_keyframes": unsafe_keyframes,
+        "native_resolution_zoom_budgets": native_zoom_budgets,
         "invalid_tracks": invalid_tracks,
         "skipped_boundary_reasons": motion.get("skipped_boundary_reasons"),
     }
@@ -7888,7 +7976,7 @@ def evaluate_post_render_qa(
         plan, settings, collector
     )
     metrics["transforms"] = _transform_metrics(
-        analysis, plan, settings, collector
+        analysis, plan, settings, collector, runner=runner
     )
     metrics["boundary_pose_evidence"] = _boundary_pose_evidence_metrics(
         analysis, selection, collector
