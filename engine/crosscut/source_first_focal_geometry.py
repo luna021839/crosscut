@@ -24,7 +24,10 @@ from .focal_body_track_provider import SourceLocalFocalBodyProvider, select_dire
 from .focal_body_track import FocalBodyGeometryCertificate
 from .focal_selector_geometry import FocalSelectorGeometry, FOCAL_SELECTOR_BODY_BASIS
 from .native_focal_faces import NativeFocalFaceProvider
-from .source_first_published_cache import SourceFirstPublishedGeometryCache as SourceFirstGeometryCache
+from .source_first_published_cache import (
+    SourceFirstPublishedGeometryCache as SourceFirstGeometryCache,
+    decode_equivalent_focal_fingerprints,
+)
 
 
 class SourceFirstFocalGeometryProvider:
@@ -68,9 +71,14 @@ class SourceFirstFocalGeometryProvider:
             self._cache = OrderedDict()
             self._boundary_references = []
             self._reasons = {}
+            observation_fingerprint = self.observation_fingerprint()
             self.observation_namespace = body_observation_namespace(
-                self.observation_fingerprint(), self.encoder, self.body_execution_device)
-            self._persistent = (SourceFirstGeometryCache(feature_cache_directory,self.observation_namespace)
+                observation_fingerprint, self.encoder, self.body_execution_device)
+            compatible_namespaces = tuple(body_observation_namespace(
+                legacy, self.encoder, self.body_execution_device)
+                for legacy in decode_equivalent_focal_fingerprints(observation_fingerprint))
+            self._persistent = (SourceFirstGeometryCache(feature_cache_directory,self.observation_namespace,
+                compatible_namespaces=compatible_namespaces)
                 if feature_cache_directory is not None else None)
             cleanup.pop_all()
 

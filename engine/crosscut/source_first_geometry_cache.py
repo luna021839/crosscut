@@ -56,11 +56,17 @@ def deserialize_focal_geometry(payload,source_index,seconds):
 
 
 class SourceFirstGeometryCache:
-    def __init__(self,root:Path,namespace:str):
+    def __init__(self,root:Path,namespace:str,*,compatible_namespaces=()):
+        if (not isinstance(compatible_namespaces,tuple)
+                or any(not isinstance(item,str) or not item for item in compatible_namespaces)
+                or namespace in compatible_namespaces
+                or len(set(compatible_namespaces))!=len(compatible_namespaces)):
+            raise ValueError('source-first compatible namespaces must be unique predecessors')
         self.root=Path(root)
         if not self.root.is_dir():raise OSError('selected source-first cache is unavailable')
         self.path=self.root/'source-first-geometry-v1.sqlite3'
         self.namespace=namespace
+        self._read_namespaces=(namespace,*compatible_namespaces)
         # ExFAT can assign a different internal file identity while a new
         # SQLite file is initialized. Its creating handle then reports
         # SQLITE_READONLY_DBMOVED on the first INSERT, even though the path
@@ -78,6 +84,7 @@ class SourceFirstGeometryCache:
         self.connection.execute('PRAGMA cache_size=-8192')
         self._file_identity=self._identity()
         self.hits=self.misses=self.invalid_records=self.writes=0
+        self.legacy_hits=0
         self._pending=0
 
     def _identity(self):
@@ -90,8 +97,11 @@ class SourceFirstGeometryCache:
 
     def get(self,key,source_index,seconds):
         self._assert_available()
-        row=self.connection.execute('SELECT digest,payload FROM observations WHERE namespace=? AND frame_key=?',
-            (self.namespace,key)).fetchone()
+        row=None
+        for namespace in self._read_namespaces:
+            row=self.connection.execute('SELECT digest,payload FROM observations WHERE namespace=? AND frame_key=?',
+                (namespace,key)).fetchone()
+            if row is not None:break
         if row is None:
             self.misses+=1;return None
         try:
@@ -104,6 +114,7 @@ class SourceFirstGeometryCache:
         except (ValueError,TypeError,KeyError,OverflowError,zlib.error):
             self.invalid_records+=1;self.misses+=1;return None
         self.hits+=1
+        self.legacy_hits+=int(namespace!=self.namespace)
         return value
 
     def put(self,key,value):
@@ -118,6 +129,7 @@ class SourceFirstGeometryCache:
 
     def diagnostics(self):
         return {'contract':'source_first_scalar_geometry_cache_v1','hits':self.hits,'misses':self.misses,
+            'decode_equivalent_legacy_hits':self.legacy_hits,
             'invalid_records':self.invalid_records,'writes':self.writes,
             'appearance_embeddings_persisted':False,'raw_pixels_persisted':False}
 

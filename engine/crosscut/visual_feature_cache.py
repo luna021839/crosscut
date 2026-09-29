@@ -161,6 +161,18 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Short-gap native RGB materialization now retains only the final LRU
+    # window. Every requested pixel is identical, including backward access
+    # and cache capacities 1..5. This explicit forward edge preserves the
+    # verified predecessor without masking another decoder/runtime change.
+    "fd673124f0f2cde3116f368e0dbdf854edc140d9df967debb9859fb1b7b0bc78": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest="2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762",
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest="ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192",
+            current_descriptor_digest="9034c9611a7fc94f041f95c8a81bb7432ae6f548fc0746824f57b212d055e221",
+        ),
+    ),
     # Shared source ownership preserves all native/working pixels on 870 real
     # queries (eight member and two group sources), plus paired full numeric
     # descriptors. This edge includes the exact shared-reader dependency and

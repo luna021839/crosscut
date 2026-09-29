@@ -533,7 +533,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192",
+            "9034c9611a7fc94f041f95c8a81bb7432ae6f548fc0746824f57b212d055e221",
         )
 
     def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
@@ -546,6 +546,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         # generation, but must still not cross the earlier face-scale change.
         closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
         self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
+            "2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762",
             "b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a",
             "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10",
             "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b", previous))
@@ -585,6 +586,35 @@ class VisualFeatureCacheTests(unittest.TestCase):
             source.write_bytes(b'replaced')
             replaced = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
             self.assertIsNone(replaced.get_by_locator(full.locator))
+
+    def test_short_gap_rgb_optimization_reuses_exact_prior_features_only(self):
+        from dataclasses import replace
+        from crosscut.visual_score import _visual_analyzer_fingerprint
+        current = _visual_analyzer_fingerprint()
+        components = json.loads(json.dumps(current.components))
+        components['code_sha256']['visual_score_descriptor_ast_v1'] = (
+            'ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192')
+        previous = _analyzer_from_components(components)
+        self.assertEqual(previous.digest, '2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'source'; source.write_bytes(b'fixed source')
+            old = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=previous)
+            requests = (_request(), replace(_request(), include_pose=False))
+            for request in requests:
+                self.assertTrue(old.put(request, {'numeric': .123, 'pose': request.include_pose}))
+            new = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source, analyzer=current)
+            for request in requests:
+                self.assertEqual(new.get_by_locator(request.locator), {'numeric': .123, 'pose': request.include_pose})
+            self.assertEqual(new.diagnostics()['decode_free_legacy_hit_count'], 2)
+            for part, name in (('code_sha256', 'visual_score_descriptor_ast_v1'),
+                    ('code_sha256', 'pose.py'), ('runtime', 'numpy'),
+                    ('model_asset_sha256_or_state', 'face:face_detection_yunet_2023mar.onnx')):
+                invalid = json.loads(json.dumps(current.components))
+                invalid[part][name] = '0'*64
+                cache = PersistentVisualFeatureCache(source_cache_directory=root/'cache', source_path=source,
+                    analyzer=_analyzer_from_components(invalid))
+                self.assertIsNone(cache.get_by_locator(_request().locator))
 
     def test_content_feature_split_reuses_unchanged_full_mode_only(self):
         from dataclasses import replace
