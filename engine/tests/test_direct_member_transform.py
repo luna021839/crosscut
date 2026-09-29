@@ -1,9 +1,11 @@
 """Selector transform search must cover feasible scale/position compromises."""
+from dataclasses import replace
 import unittest
 
 from crosscut.direct_member_transform import (
     direct_member_source_frame_geometry,
     find_lossless_boundary_transform_repair,
+    find_resolution_bound_boundary_transform_repair,
 )
 
 
@@ -99,6 +101,52 @@ class LosslessZoomFrontierTests(unittest.TestCase):
         values = arguments()
         values['incoming_face_box'] = (.70, .30, .112, .1344)
         self.assertIsNone(find_lossless_boundary_transform_repair(**values))
+
+
+class ResolutionBoundRepairTests(unittest.TestCase):
+    def values(self):
+        values = arguments()
+        values.update(outgoing_source_geometry=direct_member_source_frame_geometry((1080, 1920)),
+                      incoming_face_box=(.34, .30, .112, .1344),
+                      alignment_geometry_basis='verified_official_fancam_focal_face_correspondence')
+        return values
+
+    def test_hd_focal_resample_is_explicit_not_reported_as_lossless(self):
+        values = self.values()
+        self.assertIsNone(find_lossless_boundary_transform_repair(**values))
+        result = find_resolution_bound_boundary_transform_repair(**values, maximum_upscale_ratio=1.15)
+        self.assertAlmostEqual(result.upscale_ratio, 1.12)
+        self.assertLessEqual(result.upscale_ratio, 1.15)
+        self.assertEqual(result.source_geometry.lossless_zoom_capacity, 1.0)
+        payload = result.to_dict()
+        self.assertEqual(payload['contract'], 'official_member_bounded_resample_subject_transform_v1')
+        self.assertFalse(payload['lossless'])
+        self.assertFalse(payload['rendered_quality_approved'])
+        self.assertTrue(payload['dense_every_output_frame_revalidation_required'])
+        with self.assertRaises(ValueError):
+            replace(result, maximum_upscale_ratio=1.0)
+
+    def test_lossless_result_remains_identical_and_preferred(self):
+        values = arguments()
+        self.assertEqual(find_resolution_bound_boundary_transform_repair(**values, maximum_upscale_ratio=1.15),
+                         find_lossless_boundary_transform_repair(**values))
+
+    def test_explicit_strict_setting_and_unverified_identity_do_not_allow_upscale(self):
+        values = self.values()
+        self.assertIsNone(find_resolution_bound_boundary_transform_repair(**values, maximum_upscale_ratio=1.0))
+        values['alignment_geometry_basis'] = 'unambiguous_dominant_face_bbox_geometry_only'
+        self.assertIsNone(find_resolution_bound_boundary_transform_repair(**values, maximum_upscale_ratio=1.15))
+
+    def test_existing_output_resolution_is_not_lied_about(self):
+        values = self.values()
+        values.update(outgoing_source_geometry=direct_member_source_frame_geometry((720, 1280)),
+                      incoming_source_geometry=direct_member_source_frame_geometry((720, 1280)))
+        self.assertIsNone(find_resolution_bound_boundary_transform_repair(**values, maximum_upscale_ratio=1.15))
+
+    def test_upscale_budget_is_finite_and_capped_by_dense_policy(self):
+        for value in (True, .9, 1.1501, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                find_resolution_bound_boundary_transform_repair(**self.values(), maximum_upscale_ratio=value)
 
 
 if __name__ == '__main__':

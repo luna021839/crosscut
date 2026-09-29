@@ -745,6 +745,9 @@ def _direct_member_editorial_motion_config_from_visual_config(
         maximum_boundary_zoom=(
             visual_config.transform_repair_maximum_zoom
         ),
+        maximum_boundary_upscale_ratio=(
+            visual_config.transform_repair_maximum_upscale_ratio
+        ),
         maximum_center_shift=(
             visual_config.transform_repair_maximum_center_shift
         ),

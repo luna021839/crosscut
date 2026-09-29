@@ -3,8 +3,9 @@
 The optional frozen-source focal provider binds geometry before path choice;
 without it, the legacy non-identifying geometry path remains unchanged. It can authorize a
 short geometry-only crop/zoom/pan repair for an already-authenticated official
-target fancam, but only when source resolution and subject containment prove
-that repair can be rendered without an upscaled working frame. This module
+target fancam. Lossless repairs are preferred; only frozen-target geometry may
+use the explicit small resampling allowance shared with the dense renderer.
+Original pixel capacity and subject containment remain independently checked. This module
 samples every eligible source on both sides of each proposed hard cut and finds
 a balanced, no-repeat source path that minimizes the residual visible jumps.
 
@@ -56,7 +57,7 @@ from .direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     DirectMemberSourceFrameGeometry,
     direct_member_source_frame_geometry,
-    find_lossless_boundary_transform_repair,
+    find_resolution_bound_boundary_transform_repair,
     map_box_to_portrait_fill,
     project_box,
 )
@@ -327,6 +328,9 @@ class DirectMemberVisualConfig:
     static_structure_mismatch_maximum: float = 0.018
     static_color_mismatch_maximum: float = 0.018
     transform_repair_maximum_zoom: float = 1.50
+    # Match the already existing dense-render allowance, only for the frozen
+    # target-member authority. Legacy/unverified geometry stays lossless-only.
+    transform_repair_maximum_upscale_ratio: float = 1.15
     transform_repair_maximum_center_shift: float = 0.160
     transform_repair_maximum_boundary_center_distance: float = 0.30
     transform_repair_maximum_residual_center_distance: float = 0.080
@@ -454,6 +458,11 @@ class DirectMemberVisualConfig:
             raise ValueError("member hold cadence basis is invalid")
         if not 1.02 <= self.transform_repair_maximum_zoom <= 1.50:
             raise ValueError("direct member transform repair zoom is invalid")
+        if (isinstance(self.transform_repair_maximum_upscale_ratio, bool)
+                or not isinstance(self.transform_repair_maximum_upscale_ratio, (int, float))
+                or not math.isfinite(self.transform_repair_maximum_upscale_ratio)
+                or not 1.0 <= self.transform_repair_maximum_upscale_ratio <= 1.15):
+            raise ValueError("direct member transform repair upscale allowance is invalid")
         if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.160:
             raise ValueError("direct member transform repair pan is invalid")
         if not (
@@ -711,6 +720,8 @@ class DirectMemberVisualConfig:
                     "pipeline_verified_official_target_member_fancam_only"
                 ),
                 "maximum_zoom": self.transform_repair_maximum_zoom,
+                "maximum_upscale_ratio": self.transform_repair_maximum_upscale_ratio,
+                "resample_scope": "frozen_target_member_only_lossless_preferred",
                 "maximum_center_shift": (
                     self.transform_repair_maximum_center_shift
                 ),
@@ -3322,7 +3333,12 @@ class DirectMemberVisualSelection:
                     sorted(softened_context.items())
                 ),
                 "dense_every_output_frame_revalidation_required": True,
-                "upscaled_working_frame_authorized": False,
+                "upscaled_working_frame_authorized": any(
+                    item.upscale_ratio > 1.0 + 1e-9 for item in transform_repairs),
+                "bounded_resample_boundary_count": sum(
+                    item.upscale_ratio > 1.0 + 1e-9 for item in transform_repairs),
+                "required_upscale_ratios": _distribution(
+                    [item.upscale_ratio for item in transform_repairs]),
             },
             "sample_count": self.sample_count,
             "failed_sample_count": self.failed_sample_count,
@@ -5638,7 +5654,8 @@ def _boundary_mismatch(
             incoming_subject_box = incoming_attention.bbox_xywh
             outgoing_subject_basis = alignment_geometry_basis
             incoming_subject_basis = alignment_geometry_basis
-        transform_repair = find_lossless_boundary_transform_repair(
+        transform_repair = find_resolution_bound_boundary_transform_repair(
+            maximum_upscale_ratio=(config.transform_repair_maximum_upscale_ratio if focal_mode else 1.0),
             outgoing_face_box=outgoing_attention.bbox_xywh,
             incoming_face_box=incoming_attention.bbox_xywh,
             outgoing_source_index=outgoing_source_index,
@@ -5786,7 +5803,9 @@ def _boundary_mismatch(
     if len(available) < config.minimum_evidence_component_count:
         warning_flags.append("insufficient_geometry_evidence")
     if transform_repair is not None:
-        warning_flags.append("lossless_transform_repair_required")
+        warning_flags.append("lossless_transform_repair_required"
+            if transform_repair.upscale_ratio <= 1.0 + 1e-9
+            else "bounded_resample_transform_repair_required")
 
     severe_flags = [
         name

@@ -169,6 +169,38 @@ class FocalSelectorGeometryTests(unittest.TestCase):
         self.assertIsNotNone(result.transform_repair)
         self.assertEqual(result.transform_repair.alignment_geometry_basis,FOCAL_SELECTOR_FACE_BASIS)
 
+    def test_hd_focal_alignment_uses_the_existing_dense_resample_policy(self):
+        geometry = direct_member_source_frame_geometry((1080, 1920))
+        left = sample()
+        focal = replace(observation(source=1), face_bbox_xywh=(.394, .094, .112, .112), face_scale=.0392)
+        right = _boundary_sample_with_focal_geometry(master_seconds=1., source_local_seconds=1., source_index=1,
+            descriptor=descriptor(), provider=SimpleNamespace(focal_geometry_at=lambda *a: focal))
+        def mismatch(config, official=True):
+            return _boundary_mismatch(left, right, config, outgoing_source_index=0, incoming_source_index=1,
+                outgoing_source_geometry=geometry, incoming_source_geometry=geometry,
+                continuous_official_portrait_fancam_contract=official)
+        old = mismatch(DirectMemberVisualConfig(transform_repair_maximum_upscale_ratio=1.0))
+        actual = mismatch(DirectMemberVisualConfig())
+        self.assertIsNone(old.transform_repair)
+        self.assertIn('cross_source_face_alignment_unrepaired', old.severe_flags)
+        self.assertIsNotNone(actual.transform_repair)
+        self.assertLessEqual(actual.transform_repair.upscale_ratio, 1.15)
+        self.assertNotIn('cross_source_face_alignment_unrepaired', actual.severe_flags)
+        self.assertIn('bounded_resample_transform_repair_required', actual.warning_flags)
+        self.assertNotIn('lossless_transform_repair_required', actual.warning_flags)
+        self.assertIsNone(mismatch(DirectMemberVisualConfig(), official=False).transform_repair)
+
+    def test_selector_and_dense_camera_share_explicit_resample_limit(self):
+        from crosscut.pipeline import _direct_member_editorial_motion_config_from_visual_config
+        for ratio in (1.0, 1.08, 1.15):
+            settings = DirectMemberVisualConfig(transform_repair_maximum_upscale_ratio=ratio)
+            dense = _direct_member_editorial_motion_config_from_visual_config(settings)
+            self.assertEqual(dense.maximum_boundary_upscale_ratio, ratio)
+            self.assertEqual(settings.to_dict()['lossless_transform_repair']['maximum_upscale_ratio'], ratio)
+        for ratio in (True, .99, 1.15001, float('nan')):
+            with self.assertRaises(ValueError):
+                DirectMemberVisualConfig(transform_repair_maximum_upscale_ratio=ratio)
+
 
 if __name__ == '__main__':
     unittest.main()

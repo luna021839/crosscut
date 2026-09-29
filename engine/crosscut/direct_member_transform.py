@@ -5,6 +5,11 @@ face across a hard cut. A repair is admissible only when the source retains
 enough decoded pixels for the enlarged working frame and the transformed face
 and, for widened moves, the complete subject remain inside the camera window.
 
+The strict public lossless resolver retains its original contract. An explicit
+bounded-resample resolver first exhausts that family, then uses the same small
+upscale allowance as the downstream dense camera. Upscaling is never labelled
+lossless and still requires every output frame to be checked downstream.
+
 All inputs and persisted outputs are normalized geometry and scalar capacity;
 this module never decodes pixels and never performs identity inference.
 """
@@ -258,6 +263,7 @@ class DirectMemberBoundaryTransformRepair:
         "unambiguous_dominant_face_bbox_geometry_only"
     )
     repaired_severe_flags: tuple[str, ...] = ()
+    maximum_upscale_ratio: float = 1.0
 
     def __post_init__(self) -> None:
         if self.transformed_side not in {"outgoing", "incoming"}:
@@ -283,8 +289,13 @@ class DirectMemberBoundaryTransformRepair:
         )
         if any(not math.isfinite(value) for value in numeric):
             raise ValueError("direct member repair scalars must be finite")
-        if not 1.0 < self.zoom <= self.source_geometry.lossless_zoom_capacity + 1e-9:
-            raise ValueError("direct member repair exceeds lossless zoom capacity")
+        if (isinstance(self.maximum_upscale_ratio, bool)
+                or not isinstance(self.maximum_upscale_ratio, (int, float))
+                or not math.isfinite(self.maximum_upscale_ratio)
+                or not 1.0 <= self.maximum_upscale_ratio <= 1.15):
+            raise ValueError("direct member repair upscale allowance is invalid")
+        if not 1.0 < self.zoom <= self.source_geometry.lossless_zoom_capacity * self.maximum_upscale_ratio + 1e-9:
+            raise ValueError("direct member repair exceeds declared resolution capacity")
         if self.alignment_geometry_basis not in {
             "unambiguous_dominant_face_bbox_geometry_only",
             "verified_official_fancam_focal_face_correspondence",
@@ -298,6 +309,10 @@ class DirectMemberBoundaryTransformRepair:
     def center_shift(self) -> float:
         return math.hypot(self.center_x - 0.5, self.center_y - 0.5)
 
+    @property
+    def upscale_ratio(self) -> float:
+        return max(1.0, self.zoom / self.source_geometry.lossless_zoom_capacity)
+
     def with_repaired_severe_flags(
         self,
         flags: Sequence[str],
@@ -305,9 +320,11 @@ class DirectMemberBoundaryTransformRepair:
         return replace(self, repaired_severe_flags=tuple(str(flag) for flag in flags))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "contract": (
                 "official_member_lossless_resolution_bound_subject_transform_v2"
+                if self.upscale_ratio <= 1.0 + 1e-9 else
+                "official_member_bounded_resample_subject_transform_v1"
             ),
             "required": True,
             "transformed_side": self.transformed_side,
@@ -338,6 +355,11 @@ class DirectMemberBoundaryTransformRepair:
             "dense_every_output_frame_revalidation_required": True,
             "identity_inference_used": False,
         }
+        if self.upscale_ratio > 1.0 + 1e-9:
+            payload.update(upscale_ratio=self.upscale_ratio,
+                           maximum_upscale_ratio=self.maximum_upscale_ratio,
+                           lossless=False, rendered_quality_approved=False)
+        return payload
 
 
 def _camera_states(
@@ -428,6 +450,46 @@ def find_lossless_boundary_transform_repair(
     ),
 ) -> DirectMemberBoundaryTransformRepair | None:
     """Find one source-side transform that aligns authenticated subject geometry."""
+    return _find_resolution_bound_transform(**locals(), maximum_upscale_ratio=1.0)
+
+
+def find_resolution_bound_boundary_transform_repair(
+    *, maximum_upscale_ratio: float, **arguments: Any,
+) -> DirectMemberBoundaryTransformRepair | None:
+    """Prefer unchanged lossless repairs, then the explicit dense-render allowance.
+
+    This is still only an endpoint proposal. The caller must have authenticated
+    the member; dense face/body visibility, motion, native timing and decoded
+    quality validation remain mandatory. No resolution capacity is fabricated.
+    """
+    if (isinstance(maximum_upscale_ratio, bool)
+            or not isinstance(maximum_upscale_ratio, (int, float))
+            or not math.isfinite(maximum_upscale_ratio)
+            or not 1.0 <= maximum_upscale_ratio <= 1.15):
+        raise ValueError("direct member repair upscale allowance is invalid")
+    strict = find_lossless_boundary_transform_repair(**arguments)
+    if strict is not None or maximum_upscale_ratio == 1.0:
+        return strict
+    if arguments.get('alignment_geometry_basis') not in {
+            'verified_official_fancam_focal_face_correspondence',
+            'frozen_source_focal_body_track_geometry'}:
+        return None
+    return _find_resolution_bound_transform(
+        **arguments, maximum_upscale_ratio=maximum_upscale_ratio)
+
+
+def _find_resolution_bound_transform(
+    *, outgoing_face_box, incoming_face_box, outgoing_source_index,
+    incoming_source_index, outgoing_source_geometry, incoming_source_geometry,
+    outgoing_subject_box, incoming_subject_box, outgoing_subject_basis,
+    incoming_subject_basis, maximum_zoom, maximum_center_shift,
+    maximum_boundary_center_distance, maximum_residual_center_distance,
+    maximum_residual_attention_scale_mismatch, minimum_improvement_fraction,
+    minimum_face_visible_fraction, legacy_face_only_maximum_zoom,
+    legacy_face_only_maximum_center_shift, minimum_subject_visible_fraction,
+    maximum_upscale_ratio,
+    alignment_geometry_basis="unambiguous_dominant_face_bbox_geometry_only",
+) -> DirectMemberBoundaryTransformRepair | None:
 
     left = _validated_box(outgoing_face_box)
     right = _validated_box(incoming_face_box)
@@ -476,13 +538,13 @@ def find_lossless_boundary_transform_repair(
             subject_box,
             subject_basis,
         ) in sides:
-            lossless_limit = min(maximum_zoom, source_geometry.lossless_zoom_capacity)
-            if lossless_limit <= 1.0 + 1e-9:
+            resolution_limit = min(maximum_zoom, source_geometry.lossless_zoom_capacity * maximum_upscale_ratio)
+            if resolution_limit <= 1.0 + 1e-9:
                 continue
             for zoom in _repair_zoom_candidates(
                 box=box,
                 target_box=target_box,
-                lossless_limit=lossless_limit,
+                lossless_limit=resolution_limit,
                 maximum_residual_scale=maximum_residual_attention_scale_mismatch,
                 legacy_face_only_maximum_zoom=legacy_face_only_maximum_zoom,
                 expanded=expanded_zoom_search,
@@ -573,6 +635,7 @@ def find_lossless_boundary_transform_repair(
                             subject_geometry_basis=(subject_basis if widened else None),
                             subject_visible_fraction=(subject_visible if widened else None),
                             alignment_geometry_basis=alignment_geometry_basis,
+                            maximum_upscale_ratio=maximum_upscale_ratio,
                         )
                     )
         if candidates:
@@ -597,6 +660,7 @@ __all__ = [
     "direct_member_source_frame_geometry",
     "face_geometry_mismatch",
     "find_lossless_boundary_transform_repair",
+    "find_resolution_bound_boundary_transform_repair",
     "map_box_to_portrait_fill",
     "project_box",
 ]
