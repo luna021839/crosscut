@@ -533,7 +533,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "9034c9611a7fc94f041f95c8a81bb7432ae6f548fc0746824f57b212d055e221",
+            "a9f194987374a325c822af71736eaacc9bd5d72060d5866c1a4e3c6caacfa1ea",
         )
 
     def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
@@ -546,6 +546,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         # generation, but must still not cross the earlier face-scale change.
         closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
         self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
+            "fd673124f0f2cde3116f368e0dbdf854edc140d9df967debb9859fb1b7b0bc78",
             "2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762",
             "b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a",
             "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10",

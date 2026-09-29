@@ -41,12 +41,14 @@ class SharedSourceFrames:
         self._identity = self._source_identity()
         self.maximum_working_frames = maximum_working_frames
         self._working = OrderedDict()
+        self._working_times = {}
         self._capture = None
         self.reader = None
         self._last_native = self._last_working = None
         self._lock = RLock()
         self.closed = False
         self.native_requests = self.working_requests = self.working_cache_hits = 0
+        self.working_timestamp_alias_hits = 0
         self.working_materializations = 0
         self.working_seconds = 0.
 
@@ -68,6 +70,18 @@ class SharedSourceFrames:
         self.assert_source_available()
         return float(seconds)
 
+    def _working_key(self, seconds):
+        # The reader has proved the complete constant presentation grid and
+        # OpenCV decoder parity. Reuse only exactly the same decoder frame,
+        # using its millisecond round trip; no nearest-neighbor approximation.
+        reader = self.reader
+        if reader is not None and reader.enabled and reader.clock is not None:
+            index = int((seconds * 1000.0 / 1000.0) * reader.frame_rate + 0.5)
+            if 0 <= index < reader.clock.frame_count:
+                return ('verified_native_frame', index)
+        # A disabled/unknown/VFR clock cannot borrow formerly indexed pixels.
+        return ('exact_timestamp', seconds)
+
     def native_at(self, seconds):
         with self._lock:
             key = self._time(seconds)
@@ -86,7 +100,8 @@ class SharedSourceFrames:
                 self._capture, self.reader = capture, reader
             native = self.reader.frame_at(key)
             if native is not None:
-                if key not in self._working:
+                working_key = self._working_key(key)
+                if working_key not in self._working:
                     if native is not self._last_native:
                         started = monotonic()
                         try:
@@ -95,29 +110,34 @@ class SharedSourceFrames:
                             self.working_seconds += monotonic()-started
                         self._last_native = native
                         self.working_materializations += 1
-                    self._working[key] = self._last_working
-                self._working.move_to_end(key)
+                    self._working[working_key] = self._last_working
+                    self._working_times[working_key] = key
+                self._working.move_to_end(working_key)
                 while len(self._working) > self.maximum_working_frames:
-                    self._working.popitem(last=False)
+                    evicted, _ = self._working.popitem(last=False)
+                    self._working_times.pop(evicted, None)
             return native
 
     def working_at(self, seconds):
         with self._lock:
             key = self._time(seconds)
             self.working_requests += 1
-            if key in self._working:
+            working_key = self._working_key(key)
+            if working_key in self._working:
                 self.working_cache_hits += 1
-                self._working.move_to_end(key)
-                return self._working[key]
+                self.working_timestamp_alias_hits += int(self._working_times[working_key] != key)
+                self._working.move_to_end(working_key)
+                return self._working[working_key]
             # native_at also publishes the corresponding exact working pixels.
             self.native_at(key)
-            return self._working.get(key)
+            return self._working.get(self._working_key(key))
 
     def diagnostics(self):
         reader = self.reader
         return dict(contract='shared_native_and_working_source_frames_v1', closed=self.closed,
             initialized=reader is not None, native_requests=self.native_requests,
             working_requests=self.working_requests, working_cache_hits=self.working_cache_hits,
+            working_timestamp_alias_hits=self.working_timestamp_alias_hits,
             working_materializations=self.working_materializations,
             working_seconds=self.working_seconds,
             working_cache_entries=len(self._working), maximum_working_frames=self.maximum_working_frames,
@@ -135,4 +155,5 @@ class SharedSourceFrames:
                 if self.reader is not None:
                     self.reader.frames.clear()
                 self._working.clear()
+                self._working_times.clear()
                 self._last_native = self._last_working = None

@@ -161,6 +161,17 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Working pixels now share exact verified CFR frame keys across timestamp
+    # aliases. Native/working pixels are unchanged; VFR and disabled clocks
+    # retain exact timestamp keys. Unknown dependency identities still miss.
+    "c491f53fd2955bc6a91bfb9286322044bbfb46722fec702adb54ecfff1a47be4": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest="fd673124f0f2cde3116f368e0dbdf854edc140d9df967debb9859fb1b7b0bc78",
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest="9034c9611a7fc94f041f95c8a81bb7432ae6f548fc0746824f57b212d055e221",
+            current_descriptor_digest="a9f194987374a325c822af71736eaacc9bd5d72060d5866c1a4e3c6caacfa1ea",
+        ),
+    ),
     # Short-gap native RGB materialization now retains only the final LRU
     # window. Every requested pixel is identical, including backward access
     # and cache capacities 1..5. This explicit forward edge preserves the

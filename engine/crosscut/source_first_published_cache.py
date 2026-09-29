@@ -13,7 +13,8 @@ def decode_equivalent_focal_fingerprints(current):
 
     The changes are pixel-identical short-gap RGB optimization, read-only
     predecessor lookup, and scalar native-candidate completion receipts. The
-    receipts do not change returned face candidates or positive geometry.
+    receipts and exact CFR working-frame cache aliases do not change returned
+    face candidates or positive geometry.
     The full dependency
     hash still invalidates unknown code/runtime changes. Device/model adapters
     are bound separately by the provider, never aliased across devices.
@@ -23,7 +24,10 @@ def decode_equivalent_focal_fingerprints(current):
         '7256813d75301484a1245a811ce6b2e2449ca78b366b9d5b8e18269964f3f34b',
     )
     receipt_free = '4df743005101022ea8fff0496a251e86b5e7206ba3be181fcef7fc6a0133150a'
-    if current == 'e6de0986993634829207a5c6565d3e032a995ea037e6a4d4be0be1153b5758b6':
+    receipt_bound = 'e6de0986993634829207a5c6565d3e032a995ea037e6a4d4be0be1153b5758b6'
+    if current == '50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd':
+        return (receipt_bound, receipt_free, *predecessors)
+    if current == receipt_bound:
         return (receipt_free, *predecessors)
     if current == receipt_free:
         return predecessors

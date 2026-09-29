@@ -92,6 +92,37 @@ class SharedSourceFrameTests(unittest.TestCase):
         self.assertIs(owner.working_at(1.00001), first)
         self.assertFalse(owner.reader.enabled)
 
+    def test_verified_native_frame_alias_survives_native_raster_eviction(self):
+        owner = self.owner()
+        expected = owner.native_at(1.0)
+        owner.native_at(2.0)  # The native one-frame cache no longer holds frame 30.
+        reads, seeks = owner.reader.read_count, owner.reader.seek_count
+        self.assertIs(owner.working_at(1.01), expected)
+        self.assertEqual(owner.reader.read_count, reads)
+        self.assertEqual(owner.reader.seek_count, seeks)
+        self.assertEqual(owner.working_timestamp_alias_hits, 1)
+        self.assertEqual(len(owner._working), 2)
+        np.testing.assert_array_equal(owner.working_at(1.0166668), 31)
+        self.assertEqual(len(owner._working), 3)
+
+    def test_disabling_clock_does_not_reuse_previously_indexed_working_pixels(self):
+        owner = self.owner()
+        owner.native_at(1.0)
+        seeks = owner.reader.seek_count
+        owner.reader._disable()
+        owner.working_at(1.0)
+        self.assertEqual(owner.reader.seek_count, seeks + 1)
+        self.assertEqual(owner.working_timestamp_alias_hits, 0)
+
+    def test_working_alias_receipts_are_evicted_and_cleared_with_pixels(self):
+        owner = self.owner(maximum_working_frames=2)
+        for seconds in (1., 2., 3.):
+            owner.native_at(seconds)
+        self.assertEqual(len(owner._working_times), 2)
+        self.assertEqual(set(owner._working_times), set(owner._working))
+        owner.close()
+        self.assertFalse(owner._working_times)
+
     def test_changed_missing_or_retargeted_source_cannot_return_cached_pixels(self):
         owner = self.owner(); owner.native_at(1.)
         self.source.write_bytes(b'replaced source')
