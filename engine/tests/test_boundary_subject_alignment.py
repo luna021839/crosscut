@@ -16,6 +16,7 @@ from crosscut.boundary_subject_alignment import (
     _subject,
     _TransformState,
     _project_box,
+    _native_cut_in_boundary_window,
     build_boundary_subject_alignment_plan,
 )
 from crosscut.face_match import FaceMatchPlan, FaceMatchSegment
@@ -98,6 +99,49 @@ def _observations(
 
 
 class BoundarySubjectAlignmentTests(unittest.TestCase):
+    def test_native_cut_scope_uses_only_the_transformed_window(self):
+        choice = replace(_choice(0, 0, start=10., end=12.),
+            internal_scene_cut_master_seconds=(10.3,),
+            face_match_candidate_failure="internal_camera_cut")
+        def conflicts(item, outgoing):
+            return _native_cut_in_boundary_window(item, outgoing=outgoing,
+                frame_count=60, fps=30., window_frames=14)
+        self.assertFalse(conflicts(choice, True))
+        self.assertTrue(conflicts(choice, False))
+        near_exit = replace(choice, internal_scene_cut_master_seconds=(11.7,))
+        self.assertTrue(conflicts(near_exit, True))
+        self.assertFalse(conflicts(near_exit, False))
+        # Unknown clock, invalid clock, and the optical recovery guard do not
+        # gain permission just because the endpoint detector sees a face.
+        self.assertTrue(conflicts(replace(choice, internal_scene_cut_master_seconds=()), True))
+        self.assertTrue(conflicts(replace(choice, internal_scene_cut_master_seconds=(float('nan'),)), True))
+        self.assertTrue(conflicts(replace(choice, internal_scene_cut_master_seconds=(9.,)), True))
+        self.assertTrue(conflicts(replace(choice, internal_scene_cut_master_seconds=(11.50,)), True))
+        self.assertTrue(conflicts(replace(choice, internal_scene_cut_master_seconds=(10.50,)), False))
+        self.assertTrue(conflicts(replace(choice, exit_scene_cut_near=True), True))
+
+    def test_far_native_cut_does_not_discard_real_local_face_alignment(self):
+        timeline = VisualTimelinePlan((
+            replace(_choice(0, 0, start=0., end=2.),
+                internal_scene_cut_master_seconds=(.3,),
+                face_match_candidate_failure="internal_camera_cut"),
+            replace(_choice(1, 1, start=2., end=4.),
+                internal_scene_cut_master_seconds=(3.7,),
+                face_match_candidate_failure="internal_camera_cut")), 1.)
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a.mp4'), Path('b.mp4')),
+            transitions=(RenderTransition(tier='C'),), fps=30.,
+            frame_provider=lambda index, _seconds: _frame(index),
+            observation_provider=_observations(source0_box=(.40,.26,.20,.24),
+                source1_box=(.3875,.23,.225,.27)),
+            source_resolutions=((1920,1080),(1920,1080)))
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertEqual(plan.validated_output_frame_count, 13)
+        track = plan.track_for(0)
+        self.assertIsNotNone(track)
+        self.assertEqual(track.evaluate(.3).zoom, 1.)
+        self.assertGreater(track.evaluate(59/30.).zoom, 1.)
+
     def test_close_face_uses_head_envelope_but_medium_keeps_full_performer(self):
         settings = BoundarySubjectAlignmentConfig()
         observation = BoundarySubjectObservation(face_count=1,

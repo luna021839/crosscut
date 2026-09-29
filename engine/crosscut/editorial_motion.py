@@ -307,6 +307,10 @@ class EditorialMotionPlan:
             "pan_event_count": self.pan_event_count,
             "roll_event_count": self.roll_event_count,
             "authored_event_counts": dict(self.authored_event_counts),
+            "event_count_contract": (
+                "frame_visible_active_targets_v1"
+                if self.authored_event_counts else "legacy_authored_gestures_v1"
+            ),
             "interior_zoom_pulse_count": self.interior_zoom_pulse_count,
             "section_directed": self.section_directed,
             "blocked_dissolve_segment_count": self.blocked_dissolve_segment_count,

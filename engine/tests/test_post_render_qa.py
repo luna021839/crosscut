@@ -967,6 +967,14 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
             "rendered_candidate_selection": selection,
         },
     }
+    # Editorial evidence must describe tracks actually attached to the plan.
+    # The old fixture claimed four motions while its renderer had none.
+    for segment, motion in zip(plan["segments"], analysis["editorial_motion"]["segments"], strict=True):
+        segment["editorial_transform"] = (
+            {"keyframes": deepcopy(motion["keyframes"]),
+             "reason": ",".join(motion["reasons"])}
+            if motion["applied"] else None
+        )
     return artifacts, analysis, plan, selection
 
 
@@ -1197,6 +1205,8 @@ def _install_valid_registered_montage_evidence(
         3: "reference_calibrated_push_in",
         6: "reference_calibrated_pull_out",
     }
+    for segment in plan["segments"]:
+        segment["editorial_transform"] = None
     for segment_index, reason in transform_reasons.items():
         plan["segments"][segment_index]["editorial_transform"] = {
             "keyframes": deepcopy(transform_keyframes),
@@ -3663,6 +3673,11 @@ class PostRenderQATests(unittest.TestCase):
             motion["segments"][7]["reasons"] = [
                 "face_scale_position_matched_hard_cut"
             ]
+            plan["segments"][0]["editorial_transform"] = None
+            plan["segments"][8]["editorial_transform"] = {
+                "keyframes": deepcopy(motion["segments"][8]["keyframes"]),
+                "reason": "face_scale_position_matched_hard_cut",
+            }
 
         with tempfile.TemporaryDirectory() as directory:
             artifacts, _analysis, _plan, _selection = _persist_fixture(

@@ -260,6 +260,12 @@ class RenderedCandidateSelection:
         return len(self.reviews) >= self.minimum_required_candidate_count
 
     def to_dict(self) -> dict[str, Any]:
+        retained_proxy = any(
+            item.review_payload is not None
+            and isinstance(item.review_payload.get("proxy"), Mapping)
+            and item.review_payload["proxy"].get("temporary_proxy_removed_after_review") is False
+            for item in self.reviews
+        )
         payload = {
             "analysis_basis": self.analysis_basis,
             "selection_basis": (
@@ -273,7 +279,8 @@ class RenderedCandidateSelection:
             ),
             "storage_policy": {
                 "one_proxy_at_a_time": True,
-                "temporary_proxy_removed_after_each_review": True,
+                "temporary_proxy_removed_after_each_review": not retained_proxy,
+                "diagnostic_proxy_retained": retained_proxy,
                 "decoded_frames_persisted": False,
             },
             "requested_review_count": self.requested_review_count,

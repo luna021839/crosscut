@@ -557,6 +557,7 @@ class BoundarySubjectAlignmentPlan:
                 "window_frames_each_side": self.window_frames,
                 "orb_required": False,
                 "native_internal_cuts_transformed": False,
+                "native_cut_scope": "active_boundary_window_plus_two_frame_tracking_guard",
                 "dissolve_overlap_transformed": False,
                 "frame_validation": "every_transformed_output_frame_after_base_crop",
                 "shot_policy": (
@@ -781,6 +782,42 @@ def _source_seconds(
         choice.source_local_end,
         choice.source_local_start + frame_index * choice.source_playback_rate / fps,
     )
+
+
+def _native_cut_in_boundary_window(
+    choice: VisualTimelineChoice,
+    *,
+    outgoing: bool,
+    frame_count: int,
+    fps: float,
+    window_frames: int,
+) -> bool:
+    """Exclude cuts touching this ramp, not unrelated cuts in the same span.
+
+    Internal cut times already use the selected span's affine master clock.
+    Include the two frames used by optical recovery and one frame of timing
+    tolerance. An unlocalized camera-cut failure remains unknown/unsafe.
+    """
+    if (choice.exit_scene_cut_near if outgoing else choice.entry_scene_cut_near):
+        return True
+    cuts = choice.internal_scene_cut_master_seconds
+    if not cuts:
+        return choice.face_match_candidate_failure == "internal_camera_cut"
+    if any(
+        not math.isfinite(cut)
+        or not choice.canonical_master_start <= cut <= choice.canonical_master_end
+        for cut in cuts
+    ):
+        return True
+    if outgoing:
+        first = max(0, frame_count - window_frames - 2)
+        last = frame_count - 1
+    else:
+        first = 0
+        last = min(frame_count - 1, window_frames - 1 + 2)
+    start = choice.canonical_master_start + (first - 1) / fps
+    end = choice.canonical_master_start + (last + 1) / fps
+    return any(start - 1e-9 <= cut <= end + 1e-9 for cut in cuts)
 
 
 def _union_box(
@@ -1635,13 +1672,12 @@ def build_boundary_subject_alignment_plan(
             if transition.kind is not TransitionKind.HARD_CUT:
                 decisions.append(rejected(boundary_index, "unreviewed_dissolve_overlap"))
                 continue
-            if (
-                left.internal_scene_cut_master_seconds
-                or right.internal_scene_cut_master_seconds
-                or left.exit_scene_cut_near
-                or right.entry_scene_cut_near
-                or left.face_match_candidate_failure == "internal_camera_cut"
-                or right.face_match_candidate_failure == "internal_camera_cut"
+            if _native_cut_in_boundary_window(
+                left, outgoing=True, frame_count=counts[boundary_index],
+                fps=fps, window_frames=settings.window_frames,
+            ) or _native_cut_in_boundary_window(
+                right, outgoing=False, frame_count=counts[boundary_index + 1],
+                fps=fps, window_frames=settings.window_frames,
             ):
                 decisions.append(rejected(boundary_index, "broadcaster_native_internal_cut"))
                 continue

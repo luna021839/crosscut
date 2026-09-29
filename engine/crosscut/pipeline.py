@@ -156,6 +156,7 @@ from .stage_edit_release_policy import (
     stage_edit_release_policy_payload, select_stage_edit_delivery_cohort,
 )
 from .post_render_qa import (
+    _file_content_fingerprint,
     INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
     PostRenderArtifactSet,
     PostRenderQAEvaluationSnapshot,
@@ -35011,6 +35012,13 @@ def analyze(
                     proxy_metadata["path"] = str(retained_proxy_path) if retained_proxy_path is not None else None
                     proxy_metadata["temporary_proxy_removed_after_review"] = retained_proxy_path is None
                 if retained_proxy_path is not None:
+                    proxy_metadata["retained_artifact"] = {
+                        "contract": "review_first_retained_proxy_v1",
+                        "video": _file_content_fingerprint(retained_proxy_path),
+                        "render_plan": _file_content_fingerprint(
+                            retained_proxy_path.with_suffix(".plan.json")
+                        ),
+                    }
                     _write_analysis_manifest_atomically(
                         retained_proxy_path.with_suffix(".technical-review.json"),
                         {**deepcopy(rendered_proxy_review_payload),
@@ -39235,6 +39243,13 @@ def analyze(
             else None
         ),
         "rendered_candidate_selection": rendered_candidate_selection_payload,
+        # The same immutable human-reference policy applies to deterministic
+        # and learned editors. Do not fabricate StageEdit generation evidence
+        # merely to carry the deterministic editor's profile into final QA.
+        "professional_montage_grammar_profile": (
+            deepcopy(stage_edit_montage_policy.profile_identity)
+            if stage_edit_montage_policy is not None else None
+        ),
         "review_first_visual_selection": (
             deepcopy(review_first_visual_selection_payload)
             if review_first_visual_selection_payload is not None

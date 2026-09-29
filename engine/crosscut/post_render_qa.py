@@ -2063,6 +2063,7 @@ def _decoded_candidate_review_contract_valid(
     expected_boundaries: Sequence[
         tuple[int, int, str, str | None, str | None, bool | None]
     ],
+    retained_proxy_verified: bool = False,
 ) -> bool:
     proxy = _mapping(review.get("proxy")) or {}
     decoded_frames = _integer(proxy.get("decoded_frame_count"))
@@ -2124,8 +2125,10 @@ def _decoded_candidate_review_contract_valid(
     return bool(
         review_contract_valid
         and isinstance(review.get("passed"), bool)
-        and proxy.get("path") is None
-        and proxy.get("temporary_proxy_removed_after_review") is True
+        and (retained_proxy_verified or (
+            proxy.get("path") is None
+            and proxy.get("temporary_proxy_removed_after_review") is True
+        ))
         and expected_decoded_frames is not None
         and decoded_frames == expected_decoded_frames
         and expected_proxy_duration is not None
@@ -2192,6 +2195,42 @@ def _decoded_candidate_review_contract_valid(
     )
 
 
+def _retained_proxy_matches_render_plan(
+    review: Mapping[str, Any], plan: Mapping[str, Any],
+) -> bool:
+    """Storage retention is allowed only for the exact, still-present proxy.
+
+    This does not assert that the decoded review or its editorial verdict
+    passes. It replaces only the former delete-all-proxies storage contract.
+    """
+    from .render_plan_serialization import render_plan_from_json
+    from .rendered_proxy_review import derive_proxy_render_plan
+
+    proxy = _mapping(review.get("proxy")) or {}
+    receipt = _mapping(proxy.get("retained_artifact")) or {}
+    video = _mapping(receipt.get("video")) or {}
+    saved_plan = _mapping(receipt.get("render_plan")) or {}
+    if (receipt.get("contract") != "review_first_retained_proxy_v1"
+            or proxy.get("temporary_proxy_removed_after_review") is not False
+            or not isinstance(proxy.get("path"), str)
+            or not isinstance(video.get("path"), str)
+            or not _declared_path_matches(proxy.get("path"), Path(video["path"]))):
+        return False
+    try:
+        path = Path(proxy["path"])
+        plan_path = Path(saved_plan["path"])
+        if (not path.is_absolute() or not plan_path.is_absolute()
+                or path.parent.resolve() != Path(plan["output"]).parent.resolve()
+                or plan_path.resolve() != path.with_suffix(".plan.json").resolve()
+                or _file_content_fingerprint(path) != video
+                or _file_content_fingerprint(plan_path) != saved_plan):
+            return False
+        expected = derive_proxy_render_plan(render_plan_from_json(dict(plan)), path)
+        return _load_json_object(plan_path) == json.loads(json.dumps(expected.to_json()))
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _validate_selection(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -2203,6 +2242,22 @@ def _validate_selection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     required = config.required_complete_candidate_count
     final_review = _mapping(selection.get("final_selected_review")) or {}
+    retention_allowed = bool(
+        required == 1
+        and review_first_release_binding_valid(
+            selection, _mapping(analysis.get("render")) or {}
+        )
+    )
+    verified_retention: dict[str, bool] = {}
+
+    def retained_proxy_valid(review: Mapping[str, Any]) -> bool:
+        if not retention_allowed:
+            return False
+        metadata = _mapping(review.get("proxy")) or {}
+        key = json.dumps(metadata, sort_keys=True, allow_nan=False)
+        if key not in verified_retention:
+            verified_retention[key] = _retained_proxy_matches_render_plan(review, plan)
+        return verified_retention[key]
     expected_decoded_frames = _integer(plan.get("output_frame_count"))
     expected_proxy_duration = _number(plan.get("render_duration"))
     expected_proxy_fps = _number(plan.get("fps"))
@@ -2318,6 +2373,7 @@ def _validate_selection(
                 expected_transition_count=candidate_transition_count,
                 expected_source_indices=candidate_source_indices,
                 expected_boundaries=candidate_boundaries,
+                retained_proxy_verified=retained_proxy_valid(review),
             )
         )
         successful_candidate_flags.append(successful)
@@ -2329,8 +2385,10 @@ def _validate_selection(
             proxy = _mapping(review.get("proxy")) or {}
             sanitized_proxy_flags = (
                 sanitized_proxy_flags
-                and proxy.get("path") is None
-                and proxy.get("temporary_proxy_removed_after_review") is True
+                and (retained_proxy_valid(review) or (
+                    proxy.get("path") is None
+                    and proxy.get("temporary_proxy_removed_after_review") is True
+                ))
             )
     actual_successful_count = sum(successful_candidate_flags)
     actual_passing_count = sum(
@@ -2376,7 +2434,11 @@ def _validate_selection(
     storage_policy = _mapping(selection.get("storage_policy")) or {}
     checks["one_proxy_at_a_time_storage_policy"] = (
         storage_policy.get("one_proxy_at_a_time") is True
-        and storage_policy.get("temporary_proxy_removed_after_each_review") is True
+        and (storage_policy.get("temporary_proxy_removed_after_each_review") is True
+             or (retention_allowed
+                 and storage_policy.get("diagnostic_proxy_retained") is True
+                 and storage_policy.get("temporary_proxy_removed_after_each_review") is False
+                 and all(successful_candidate_flags)))
         and storage_policy.get("decoded_frames_persisted") is False
     )
     checks["final_selected_review_passed"] = (
@@ -2393,6 +2455,7 @@ def _validate_selection(
             expected_transition_count=expected_transition_count,
             expected_source_indices=expected_source_indices,
             expected_boundaries=expected_boundaries,
+            retained_proxy_verified=retained_proxy_valid(final_review),
         )
     )
     checks["analysis_final_review_matches"] = (
@@ -4521,6 +4584,86 @@ def _normalized_entropy(values: Sequence[str]) -> float | None:
     return entropy / math.log(len(counts))
 
 
+def _bound_local_alignment_tracks(
+    motion: Mapping[str, Any], plan: Mapping[str, Any],
+) -> tuple[set[int], set[int]]:
+    """Identify dense local reports whose tracks are exactly in final pixels.
+
+    This only selects the already-tested local planner's 4% center bound; it
+    cannot grant that bound to decorative or unbound serialized tracks.
+    """
+    from .render_plan_serialization import render_plan_from_json
+    from .render import quantized_segment_frame_counts
+
+    alignment = _mapping(motion.get("boundary_subject_alignment")) or {}
+    if alignment.get("analysis_basis") != "exact_cut_frame_shot_adaptive_subject_alignment_v2":
+        return set(), set()
+    try:
+        typed = render_plan_from_json(dict(plan))
+        counts = quantized_segment_frame_counts(typed.segments, typed.fps)
+    except (ValueError, TypeError, KeyError):
+        return set(), set()
+    decisions = {
+        item.get("boundary_index"): item
+        for raw in (_sequence(alignment.get("decisions")) or [])
+        if (item := _mapping(raw)) is not None
+        and _integer(item.get("boundary_index")) is not None
+    }
+    motion_segments = _sequence(motion.get("segments")) or []
+    bound_segments: set[int] = set()
+    bound_boundaries: set[int] = set()
+    for raw in (_sequence(alignment.get("segments")) or []):
+        item = _mapping(raw) or {}
+        index = _integer(item.get("segment_index"))
+        if item.get("applied") is not True or index is None or not 0 <= index < len(typed.segments):
+            continue
+        segment = typed.segments[index]
+        track = segment.editorial_transform
+        if track is None or index >= len(motion_segments):
+            continue
+        frames = (_mapping(plan["segments"][index].get("editorial_transform")) or {}).get("keyframes")
+        if (item.get("keyframes") != frames
+                or (_mapping(motion_segments[index]) or {}).get("keyframes") != frames):
+            continue
+        active_count = sum(
+            abs((state := track.evaluate(frame / typed.fps)).zoom - 1.) > 1e-8
+            or abs(state.center_x - .5) > 1e-8 or abs(state.center_y - .5) > 1e-8
+            or abs(state.roll_degrees) > 1e-8
+            for frame in range(counts[index])
+        )
+        indices = _sequence(item.get("boundary_indices")) or []
+        valid = bool(indices) and active_count > 0
+        for boundary_index in indices:
+            boundary = decisions.get(boundary_index, {}) if _integer(boundary_index) is not None else {}
+            side = boundary.get("transformed_side")
+            target = boundary.get(f"{side}_segment_index")
+            count = _integer(boundary.get("validated_output_frame_count"))
+            valid = bool(valid and boundary.get("eligible") is True
+                and boundary.get("rejection_reason") is None and target == index
+                and boundary.get("outgoing_segment_index") == boundary_index
+                and boundary.get("incoming_segment_index") == boundary_index + 1
+                and side in {"outgoing", "incoming"}
+                and count is not None and count >= active_count
+                and 0 <= boundary_index < len(typed.transitions)
+                and typed.transitions[boundary_index].kind.value == "hard_cut"
+                and typed.segments[boundary_index].source_index != typed.segments[boundary_index+1].source_index)
+            if not valid:
+                break
+            endpoint = track.evaluate((counts[index]-1)/typed.fps if side == "outgoing" else 0.)
+            declared = _mapping(boundary.get(f"{side}_state")) or {}
+            valid = all(
+                (number := _number(declared.get(name))) is not None
+                and math.isclose(number, getattr(endpoint, name), abs_tol=1e-6, rel_tol=0.)
+                for name in ("zoom", "center_x", "center_y", "roll_degrees")
+            )
+            if not valid:
+                break
+        if valid:
+            bound_segments.add(index)
+            bound_boundaries.update(indices)
+    return bound_segments, bound_boundaries
+
+
 def _transform_metrics(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -4539,6 +4682,8 @@ def _transform_metrics(
     segments = _sequence(motion.get("segments")) or []
     motion_segments = [_mapping(raw) or {} for raw in segments]
     plan_segments = _sequence(plan.get("segments")) or []
+    local_alignment_segments, local_alignment_boundaries = _bound_local_alignment_tracks(motion, plan)
+    frame_visible_contract = motion.get("event_count_contract") == "frame_visible_active_targets_v1"
     motion_indices = [
         _integer(item.get("segment_index")) for item in motion_segments
     ]
@@ -4567,6 +4712,13 @@ def _transform_metrics(
         ),
         "applied_flags_boolean": all(
             isinstance(item.get("applied"), bool) for item in motion_segments
+        ),
+        "keyframes_match_final_render_plan": (
+            len(motion_segments) == len(plan_segments) and all(
+                item.get("keyframes") == (
+                    (_mapping((_mapping(plan_segments[index]) or {}).get("editorial_transform")) or {}).get("keyframes") or []
+                ) for index, item in enumerate(motion_segments)
+            )
         ),
         "event_counts_nonnegative_integers": all(
             (value := _integer(motion.get(field_name))) is not None and value >= 0
@@ -4714,7 +4866,11 @@ def _transform_metrics(
             min_zoom < 1.0 - 1e-9
             or
             max_zoom > config.maximum_editorial_zoom + 1e-9
-            or max_shift > config.maximum_editorial_center_shift + 1e-9
+            or max_shift > (
+                max(config.maximum_editorial_center_shift, 0.04)
+                if segment_index in local_alignment_segments
+                else config.maximum_editorial_center_shift
+            ) + 1e-9
             or max_roll > config.maximum_editorial_roll_degrees + 1e-9
         ):
             unsafe_keyframes.append(
@@ -4924,7 +5080,7 @@ def _transform_metrics(
             for reason in common_reasons
             if reason.endswith("_matched_hard_cut")
         }
-        if matched_reasons:
+        if matched_reasons or boundary_index in local_alignment_boundaries:
             derived_boundary_match_count += 1
         if any(reason.startswith("orb_affine_") for reason in matched_reasons):
             derived_affine_boundary_match_count += 1
@@ -4982,13 +5138,32 @@ def _transform_metrics(
     serialized_boundary_count = _integer(motion.get("boundary_match_count"))
     serialized_affine_count = _integer(motion.get("affine_boundary_match_count"))
     serialized_interior_count = _integer(motion.get("interior_zoom_pulse_count"))
+    authored = _mapping(motion.get("authored_event_counts")) or {}
+    actual_records: dict[str, tuple] | None = None
+    if frame_visible_contract:
+        from .editorial_transform_events import rendered_transform_event_records
+        from .render_plan_serialization import render_plan_from_json
+        try:
+            typed = render_plan_from_json(dict(plan))
+            actual_records = rendered_transform_event_records(typed.segments, typed.fps)
+        except (ValueError, TypeError, KeyError):
+            pass
+        derived_zoom_event_count = len(actual_records["zoom"]) if actual_records is not None else -1
+        derived_pan_event_count = len(actual_records["pan"]) if actual_records is not None else -1
+        derived_roll_event_count = len(actual_records["roll"]) if actual_records is not None else -1
+    gesture_zoom = _integer(authored.get("zoom")) if frame_visible_contract else actual_zoom
+    gesture_pan = _integer(authored.get("pan")) if frame_visible_contract else serialized_pan_count
     count_reconciliation_checks = {
         "zoom_track_evidence": (
+            actual_zoom == derived_zoom_event_count
+            if frame_visible_contract else
+            (
             actual_zoom is not None
             and serialized_roll_count is not None
             and (
                 (actual_zoom + serialized_roll_count > 0)
                 == (derived_zoom_event_count > 0)
+            )
             )
         ),
         "pan_track_evidence": (
@@ -5006,9 +5181,10 @@ def _transform_metrics(
             and serialized_boundary_count is not None
             and serialized_affine_count is not None
             and serialized_interior_count is not None
-            and serialized_affine_count <= serialized_boundary_count <= actual_zoom
-            and serialized_boundary_count + serialized_interior_count <= actual_zoom
-            and serialized_pan_count <= serialized_boundary_count
+            and gesture_zoom is not None and gesture_pan is not None
+            and serialized_affine_count <= serialized_boundary_count <= gesture_zoom
+            and serialized_boundary_count + serialized_interior_count <= gesture_zoom
+            and gesture_pan <= serialized_boundary_count
         ),
         "boundary_event_count_matches_reasons": (
             serialized_boundary_count == derived_boundary_match_count
@@ -5020,7 +5196,7 @@ def _transform_metrics(
             serialized_interior_count == derived_interior_zoom_count
         ),
         "zoom_event_count_matches_reason_events": (
-            actual_zoom == derived_reason_zoom_event_count
+            gesture_zoom == derived_reason_zoom_event_count
         ),
     }
     for name, passed in count_reconciliation_checks.items():
@@ -5069,8 +5245,11 @@ def _transform_metrics(
         "interior_zoom_pulse_count": serialized_interior_count,
         "count_reconciliation_checks": count_reconciliation_checks,
         "serialized_event_subtype_count_status": (
+            "frame_visible_targets_plus_separate_authored_gesture_reconciliation"
+            if frame_visible_contract else
             "exact_from_segment_reason_identity_and_track_excursions"
         ),
+        "bound_local_alignment_segment_indices": sorted(local_alignment_segments),
         "target_zoom_event_count": target_zoom,
         "target_attainment": attainment,
         "target_attainment_basis": "derived_reason_identified_zoom_events",
@@ -7064,7 +7243,7 @@ def _rendered_montage_grammar_metrics(
     generation_profile_raw = (
         generation.get("professional_montage_grammar_profile")
         if generation is not None
-        else None
+        else analysis.get("professional_montage_grammar_profile")
     )
     evidence_valid = True
     configuration_matches = False
