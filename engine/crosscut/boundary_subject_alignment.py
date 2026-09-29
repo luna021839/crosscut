@@ -879,6 +879,11 @@ def _alignment_native_frames(choices, sources, transitions, counts, fps, clocks)
         if not sample.terminal_clone}
 
 
+def _boundary_window_frame_indices(*, outgoing: bool, frame_count: int, window_frames: int):
+    return ((max(0, frame_count-window_frames-2), frame_count-1) if outgoing else
+        (0, min(frame_count-1, window_frames-1+2)))
+
+
 def _native_cut_in_boundary_window(
     choice: VisualTimelineChoice,
     *,
@@ -886,6 +891,8 @@ def _native_cut_in_boundary_window(
     frame_count: int,
     fps: float,
     window_frames: int,
+    native_frame_window: tuple[int, int] | None = None,
+    native_frame_rate: float | None = None,
 ) -> bool:
     """Exclude cuts touching this ramp, not unrelated cuts in the same span.
 
@@ -904,12 +911,24 @@ def _native_cut_in_boundary_window(
         for cut in cuts
     ):
         return True
-    if outgoing:
-        first = max(0, frame_count - window_frames - 2)
-        last = frame_count - 1
-    else:
-        first = 0
-        last = min(frame_count - 1, window_frames - 1 + 2)
+    if native_frame_window is not None:
+        if (len(native_frame_window) != 2
+                or any(type(value) is not int or value < 0 for value in native_frame_window)
+                or native_frame_window[1] < native_frame_window[0]
+                or isinstance(native_frame_rate, bool) or native_frame_rate is None
+                or not math.isfinite(native_frame_rate) or native_frame_rate <= 0):
+            raise ValueError("native cut guard requires a verified forward frame window")
+        first_native, last_native = native_frame_window
+        # Internal cut events were mapped by this selected span's affine
+        # endpoints. Recover their native index and compare against the actual
+        # rendered window. A camera cut AT the first visible incoming frame
+        # is its shot entry, not a camera switch inside an alignment ramp.
+        cut_indices = tuple(int((choice.source_local_start
+            + (cut-choice.canonical_master_start)*choice.source_playback_rate)
+            * native_frame_rate + .5) for cut in cuts)
+        return any(first_native < cut <= last_native for cut in cut_indices)
+    first, last = _boundary_window_frame_indices(outgoing=outgoing,
+        frame_count=frame_count, window_frames=window_frames)
     start = choice.canonical_master_start + (first - 1) / fps
     end = choice.canonical_master_start + (last + 1) / fps
     return any(start - 1e-9 <= cut <= end + 1e-9 for cut in cuts)
@@ -1617,6 +1636,17 @@ def build_boundary_subject_alignment_plan(
             for side,sample in (("outgoing",left),("incoming",right))
             for field in ("native_frame_index","output_frame_index")}
 
+    def native_cut_window_arguments(choice_index, *, outgoing):
+        if not renderer_bound:
+            return {}
+        first, last = _boundary_window_frame_indices(outgoing=outgoing,
+            frame_count=counts[choice_index], window_frames=settings.window_frames)
+        before, after = native_sample_at(choice_index, first), native_sample_at(choice_index, last)
+        if before is None or after is None:
+            return {}  # Unknown/overlap evidence retains the conservative guard.
+        return {'native_frame_window': (before.native_frame_index,after.native_frame_index),
+            'native_frame_rate':float(native_clocks[choices[choice_index].source_index].frame_rate)}
+
     def base_crop_for(choice_index: int, frame_index: int) -> tuple[float, float, float, float] | None:
         match = face_matches.get(choices[choice_index].segment_index)
         if match is None or not match.applied or match.pan_crop is None:
@@ -1843,9 +1873,11 @@ def build_boundary_subject_alignment_plan(
             if _native_cut_in_boundary_window(
                 left, outgoing=True, frame_count=counts[boundary_index],
                 fps=fps, window_frames=settings.window_frames,
+                **native_cut_window_arguments(boundary_index, outgoing=True),
             ) or _native_cut_in_boundary_window(
                 right, outgoing=False, frame_count=counts[boundary_index + 1],
                 fps=fps, window_frames=settings.window_frames,
+                **native_cut_window_arguments(boundary_index+1, outgoing=False),
             ):
                 decisions.append(rejected(boundary_index, "broadcaster_native_internal_cut"))
                 continue

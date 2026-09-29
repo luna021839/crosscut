@@ -1910,18 +1910,29 @@ def _observe_member_boundary_pair(
     config: DirectMemberVisualConfig,
     adjust_mismatch: Callable[[float, int, int, DirectBoundaryMismatch], DirectBoundaryMismatch] | None = None,
     observed_only: bool = False,
+    stop_after_first_eligible: bool = False,
+    cinematic_bridge_enabled: bool = True,
 ) -> tuple[_ObservedMemberPairCandidate, ...]:
-    """Materialize one exact source pair, retaining every allowed cut offset.
+    """Observe exact pair offsets, optionally deferring unused alternatives.
 
     This is observation evidence, not a path or render plan. The caller must
     still apply the complete policy and joint offset/geometry constraints.
     Feedback/obstruction costs can enter through the same measured-edge hook;
     unknown source pairs have no placeholder samples, mismatch or approval.
+    A progressive call may stop only on real eligible evidence; rejection
+    still requires every offset. Selected pairs must later be fully refined
+    before the final policy and joint cut-time solve.
     """
     if len(source_frame_geometries) != observations.source_count:
         raise ValueError("pair geometry domain must match observation sources")
     plans = tuple(plan for plan in observations.plans
         if outgoing_source_index != incoming_source_index or plan.offset_frames == 0)
+    if type(stop_after_first_eligible) is not bool or type(cinematic_bridge_enabled) is not bool:
+        raise ValueError("progressive pair observation and effects must be boolean")
+    if observed_only and stop_after_first_eligible:
+        raise ValueError("read-only complete pair reuse cannot publish a partial offset domain")
+    if stop_after_first_eligible:
+        plans = tuple(sorted(plans, key=lambda plan: (abs(plan.offset_frames), plan.offset_frames)))
     if observed_only:
         # Validate the complete offset domain before scoring. Missing samples
         # cannot trigger preparation, decoding, target inference or defaults.
@@ -1930,11 +1941,21 @@ def _observe_member_boundary_pair(
                 observations.observed_samples(plan.offset_frames, source)
         samples_for = observations.observed_samples
     else:
-        observations.prepare((plan.offset_frames, source) for plan in plans
-            for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+        if not stop_after_first_eligible:
+            observations.prepare((plan.offset_frames, source) for plan in plans
+                for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
         samples_for = observations.samples_for
     candidates = []
-    for plan in plans:
+    for plan_index, plan in enumerate(plans):
+        if stop_after_first_eligible:
+            # Audition the canonical offset first. If it cannot carry this
+            # edit, prepare the remaining domain in ONE source-ordered batch.
+            # Seven separate recovery windows would undo decoder locality on
+            # precisely the hard cases that already dominate runtime.
+            pending = (plan,) if plan_index == 0 else plans[1:] if plan_index == 1 else ()
+            if pending:
+                observations.prepare((item.offset_frames, source) for item in pending
+                    for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
         outgoing = samples_for(plan.offset_frames, outgoing_source_index)
         incoming = samples_for(plan.offset_frames, incoming_source_index)
         mismatch = _boundary_mismatch(outgoing[1], incoming[2], config,
@@ -1955,6 +1976,18 @@ def _observe_member_boundary_pair(
                 outgoing_handles=outgoing[3:], incoming_handles=incoming[3:],
                 candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config),
             mismatch))
+        measured = candidates[-1].mismatch
+        if stop_after_first_eligible and plan_index == 0 and (outgoing_source_index == incoming_source_index
+                or not measured.severe_flags
+                or (cinematic_bridge_enabled and measured.cinematic_bridge is not None)):
+            available = observations.observed_demands
+            if not all((candidate_plan.offset_frames, source) in available
+                    for candidate_plan in plans
+                    for source in (outgoing_source_index,incoming_source_index)):
+                break  # Already cached offsets cost no new inference; keep them.
+    if len(candidates) < len(plans):
+        candidates = [replace(candidate, mismatch=replace(candidate.mismatch,
+            boundary_search_candidate_count=len(candidates))) for candidate in candidates]
     return tuple(candidates)
 
 
@@ -13632,8 +13665,8 @@ def select_balanced_direct_member_sources(
         maximum_exact_observations = max(1, 4 * (len(spans)-1))
         observation_search = MemberObservationSearch(candidate_validity,
             maximum_observations=maximum_exact_observations,
-            # Each new proposal must pay for new observations or terminate.
-            # The final no-new-evidence call is the mandatory policy re-audit.
+            # Each new proposal adds observations, completes already reserved
+            # offsets, or terminates. The final call re-audits current policy.
             # This bound cannot reset and does not extend the workflow deadline.
             maximum_solver_calls=maximum_exact_observations+1, allow_same_source_holds=True,
             progress_callback=getattr(provider, 'member_observation_progress', None),
@@ -13927,7 +13960,7 @@ def select_balanced_direct_member_sources(
                 raise failure from error
             decisions.append(decision)
             return decision.path
-        def observe_transition(demand, *, observed_only=False):
+        def observe_transition(demand, *, observed_only=False, complete_offsets=False):
             boundary, left, right = demand.boundary_index, demand.outgoing_source_index, demand.incoming_source_index
             candidates = _observe_member_boundary_pair(observation_stores[boundary],
                 outgoing_source_index=left, incoming_source_index=right,
@@ -13935,6 +13968,8 @@ def select_balanced_direct_member_sources(
                 continuous_official_portrait_fancam_contract=continuous_official_portrait_fancam_contract,
                 priority_boundary=boundary in priority_boundaries, config=resolved_config,
                 observed_only=observed_only,
+                stop_after_first_eligible=not (observed_only or complete_offsets),
+                cinematic_bridge_enabled=cinematic_bridge_enabled,
                 adjust_mismatch=lambda clock, left, right, mismatch:
                     adjust_boundary_mismatch(boundary, clock, left, right, mismatch))
             best = min(candidates, key=lambda item: (
@@ -13942,7 +13977,8 @@ def select_balanced_direct_member_sources(
                 item.mismatch.cost, abs(item.plan.offset_frames), item.plan.offset_frames))
             return TransitionObservation(demand,
                 left == right or not best.mismatch.severe_flags or best.mismatch.cinematic_bridge is not None,
-                best.mismatch.cost, candidates, policy_evidence=best.mismatch)
+                best.mismatch.cost, candidates, policy_evidence=best.mismatch,
+                complete=(len(candidates) == (1 if left == right else len(observation_stores[boundary].plans))))
         def reuse_observed_pairs(demand):
             store = observation_stores[demand.boundary_index]
             available = store.observed_demands
@@ -13956,6 +13992,7 @@ def select_balanced_direct_member_sources(
             return result
         observed_path = observation_search.run(propose=propose_observation_path,
             observe=observe_transition, reuse_observed=reuse_observed_pairs,
+            refine=lambda previous: observe_transition(previous.demand, complete_offsets=True),
             endpoint_exclusions=lambda demand: observed_unresolved_endpoints(
                 observation_stores[demand.boundary_index], demand.boundary_index))
         policy_decision = decisions[-1]
@@ -13970,15 +14007,19 @@ def select_balanced_direct_member_sources(
             for index, (left, right) in enumerate(zip(policy_decision.path, policy_decision.path[1:]))
             if left != right or policy_decision.usage_policy in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES)
         observation_search_diagnostics = {
-            'contract': 'incumbent_first_exact_member_observations_v1',
+            'contract': 'progressive_exact_member_offsets_with_complete_selected_refinement_v2',
             'solver_call_count': observed_path.solver_call_count,
             'exact_pair_request_count': observed_path.observation_count,
+            'exact_pair_refinement_count': observed_path.refinement_count,
+            'total_exact_pair_work_count': observed_path.observation_count+observed_path.refinement_count,
             'reused_observation_count': observed_path.reused_observation_count,
             'endpoint_excluded_transition_count': observed_path.endpoint_excluded_transition_count,
             'observed_transition_count': observed_path.observation_count+observed_path.reused_observation_count,
             'unobserved_transition_count': observed_path.unobserved_transition_count,
             'coarse_span_flanks_are_proposal_only': True,
-            'selected_transitions_and_all_offsets_observed': True,
+            'selected_transitions_and_all_offsets_observed': all(item.complete for item in observed_path.transitions),
+            'partially_observed_unselected_pair_count': sum(not item.complete
+                for item in observation_search.observations),
             'policy_resolved_after_final_observation': True,
             'global_visual_optimality_claimed': False,
             'visual_gates_relaxed': False,

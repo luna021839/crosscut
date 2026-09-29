@@ -12,7 +12,7 @@ import numpy as np
 
 from crosscut.boundary_subject_alignment import (
     BoundarySubjectObservation, _CaptureProvider, _alignment_native_frames,
-    _frame_counts, build_boundary_subject_alignment_plan,
+    _frame_counts, _native_cut_in_boundary_window, build_boundary_subject_alignment_plan,
 )
 from crosscut.render import RenderPlan, RenderSegment, RenderTransition, TransitionKind, render
 from crosscut.render_boundary_clock import native_frame_clocks_for_output
@@ -40,6 +40,23 @@ def decode_id(frame):
 
 
 class AlignmentClockTests(unittest.TestCase):
+    def test_native_shot_entry_is_not_an_interior_camera_flash(self):
+        original=timeline().choices[2]
+        choice=replace(original, source_local_start=2.344,
+            source_local_end=2.344+original.duration_seconds,
+            internal_scene_cut_master_seconds=(original.canonical_master_start+.006,))
+        arguments=dict(outgoing=False,frame_count=18,fps=30.,window_frames=14)
+        self.assertTrue(_native_cut_in_boundary_window(choice,**arguments))
+        exact=dict(arguments,native_frame_window=(141,171),native_frame_rate=60.)
+        self.assertFalse(_native_cut_in_boundary_window(choice,**exact))
+        interior=replace(choice,internal_scene_cut_master_seconds=(
+            original.canonical_master_start+.006+1/60.,))
+        self.assertTrue(_native_cut_in_boundary_window(interior,**exact))
+        # An unlocalized failure/near-cut flag is not excused by a clock.
+        self.assertTrue(_native_cut_in_boundary_window(replace(choice,entry_scene_cut_near=True),**exact))
+        self.assertTrue(_native_cut_in_boundary_window(replace(choice,
+            internal_scene_cut_master_seconds=(),face_match_candidate_failure='internal_camera_cut'),**exact))
+
     def test_segment_local_clock_is_not_the_coalesced_renderer_frame(self):
         visual=timeline()
         clocks={i:VerifiedRenderFrameClock(Fraction(60),200,'a'*64) for i in range(2)}
@@ -124,6 +141,13 @@ class AlignmentClockPixelTests(unittest.TestCase):
                 'anullsrc=r=48000:cl=mono','-c:v','libx264','-crf','0','-pix_fmt','yuv420p',
                 '-c:a','aac','-shortest',str(source)],input=frames.tobytes(),capture_output=True,check=True)
             visual=timeline()
+            # The source camera starts on the first visible incoming native
+            # frame even though its event is a few milliseconds after the
+            # fractional nominal trim. It must not veto this entire ramp.
+            incoming=visual.choices[2]
+            visual=replace(visual,choices=(*visual.choices[:2],replace(incoming,
+                source_local_start=2.344,source_local_end=2.344+incoming.duration_seconds,
+                internal_scene_cut_master_seconds=(incoming.canonical_master_start+.006,))))
             observed=[]
             def observations(frame):
                 native=decode_id(frame)

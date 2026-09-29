@@ -47,10 +47,13 @@ class TransitionObservation(Generic[Evidence]):
     cost: float
     evidence: Evidence
     policy_evidence: object | None = None
+    complete: bool = True
 
     def __post_init__(self) -> None:
         if type(self.eligible) is not bool:
             raise ValueError("observed eligibility must be boolean")
+        if type(self.complete) is not bool or (not self.eligible and not self.complete):
+            raise ValueError("a rejected pair requires complete offset observations")
         if (isinstance(self.cost, bool) or not isinstance(self.cost, (int, float))
                 or not math.isfinite(self.cost)):
             raise ValueError("observed cost must be finite")
@@ -111,6 +114,7 @@ class ObservedPathProposal(Generic[Evidence]):
     unobserved_transition_count: int
     reused_observation_count: int = 0
     endpoint_excluded_transition_count: int = 0
+    refinement_count: int = 0
 
 
 class MemberObservationSearchIncomplete(RuntimeError):
@@ -184,6 +188,7 @@ class MemberObservationSearch(Generic[Evidence]):
             raise ValueError('coarse proposal priorities must be finite domain-bound values in [0, 1]')
         self._solver_calls = 0
         self._observation_calls = 0
+        self._refinement_calls = 0
         self._reused_observations = 0
 
     def proposal_graph(self) -> ProposalGraph:
@@ -208,6 +213,7 @@ class MemberObservationSearch(Generic[Evidence]):
             observations=self._observation_calls, unobserved=self.unobserved_count)
         error.diagnostics['reused_observation_count'] = self._reused_observations
         error.diagnostics['endpoint_excluded_transition_count'] = len(self._excluded)
+        error.diagnostics['refinement_count'] = self._refinement_calls
         return error
 
     @property
@@ -238,6 +244,7 @@ class MemberObservationSearch(Generic[Evidence]):
             self._progress_callback(dict(phase='member_observation_search', event=event,
                 elapsed_seconds=round(monotonic()-self._started, 3),
                 solver_call_count=self._solver_calls, observation_count=self._observation_calls,
+                refinement_count=self._refinement_calls,
                 reused_observation_count=self._reused_observations,
                 unobserved_transition_count=self.unobserved_count,
                 endpoint_excluded_transition_count=len(self._excluded), **payload))
@@ -247,9 +254,57 @@ class MemberObservationSearch(Generic[Evidence]):
         *,
         propose: Callable[[ProposalGraph], Sequence[int] | None],
         observe: Callable[[TransitionDemand], TransitionObservation[Evidence]],
+        refine: Callable[[TransitionObservation[Evidence]], TransitionObservation[Evidence]] | None = None,
         reuse_observed: Callable[[TransitionDemand], Sequence[TransitionObservation[Evidence]]] | None = None,
         endpoint_exclusions: Callable[[TransitionDemand], Sequence[MemberEndpointExclusion]] | None = None,
     ) -> ObservedPathProposal[Evidence]:
+        def publish_related(demand):
+            if reuse_observed is not None:
+                related = tuple(reuse_observed(demand))
+                if len(related) > self.source_count ** 2:
+                    raise ValueError('cached pair publication exceeded one boundary domain')
+                seen = set()
+                for item in related:
+                    if (not isinstance(item, TransitionObservation)
+                            or not item.complete
+                            or item.demand.boundary_index != demand.boundary_index
+                            or item.demand not in self._domain
+                            or item.demand in self._observed or item.demand in self._excluded
+                            or item.demand in seen):
+                        raise ValueError('cached pair evidence must be new and boundary-local')
+                    seen.add(item.demand)
+                self._observed.update((item.demand, item) for item in related)
+                self._reused_observations += len(related)
+            if endpoint_exclusions is not None:
+                certificates = tuple(endpoint_exclusions(demand))
+                if len(certificates) > 2*self.source_count:
+                    raise ValueError('endpoint certificates exceed one boundary domain')
+                for certificate in certificates:
+                    if (not isinstance(certificate, MemberEndpointExclusion)
+                            or certificate.boundary_index != demand.boundary_index
+                            or certificate.source_index >= self.source_count):
+                        raise ValueError('endpoint certificates must be boundary/source-local')
+                    if certificate in self._endpoint_certificates:
+                        continue
+                    if any(item.eligible and certificate.excludes(item.demand)
+                           for item in self._observed.values()):
+                        raise ValueError('endpoint certificate contradicts eligible paired evidence')
+                    self._endpoint_certificates.add(certificate)
+                    for other in self._domain:
+                        if other not in self._observed and certificate.excludes(other):
+                            self._excluded[other] = certificate
+
+        def charge_observation(*, refining=False):
+            if refining:
+                # The initial demand already reserves this pair's complete
+                # offset domain. Deferring its remaining offsets is not an
+                # additional source-pair authorization or a budget reset.
+                self._refinement_calls += 1
+            else:
+                if self._observation_calls >= self.maximum_observations:
+                    raise self._incomplete('exact_observation_budget_exhausted')
+                self._observation_calls += 1
+
         while self._solver_calls < self.maximum_solver_calls:
             self._solver_calls += 1
             self._emit('policy_proposal_started')
@@ -274,57 +329,21 @@ class MemberObservationSearch(Generic[Evidence]):
             for demand in demands:
                 if demand in self._observed:
                     continue
-                if self._observation_calls >= self.maximum_observations:
-                    raise self._incomplete("exact_observation_budget_exhausted")
                 # Charge before the call so external failures do not reset work
                 # accounting if a caller deliberately resumes this same ledger.
-                self._observation_calls += 1
+                charge_observation()
                 self._emit('exact_pair_started', boundary_index=demand.boundary_index,
                     outgoing_source_index=demand.outgoing_source_index, incoming_source_index=demand.incoming_source_index)
                 observed = observe(demand)
                 if not isinstance(observed, TransitionObservation) or observed.demand != demand:
                     raise ValueError("observer returned evidence for a different transition")
                 self._observed[demand] = observed
-                if reuse_observed is not None:
-                    # The production adapter uses read-only exact samples.
-                    # Re-score other pairs already covered by those samples,
-                    # without paying for another global proposal or inference.
-                    related = tuple(reuse_observed(demand))
-                    if len(related) > self.source_count ** 2:
-                        raise ValueError('cached pair publication exceeded one boundary domain')
-                    seen = set()
-                    for item in related:
-                        if (not isinstance(item, TransitionObservation)
-                                or item.demand.boundary_index != demand.boundary_index
-                                or item.demand not in self._domain
-                                or item.demand in self._observed or item.demand in self._excluded
-                                or item.demand in seen):
-                            raise ValueError('cached pair evidence must be new and boundary-local')
-                        seen.add(item.demand)
-                    self._observed.update((item.demand, item) for item in related)
-                    self._reused_observations += len(related)
-                if endpoint_exclusions is not None:
-                    certificates = tuple(endpoint_exclusions(demand))
-                    if len(certificates) > 2*self.source_count:
-                        raise ValueError('endpoint certificates exceed one boundary domain')
-                    for certificate in certificates:
-                        if (not isinstance(certificate, MemberEndpointExclusion)
-                                or certificate.boundary_index != demand.boundary_index
-                                or certificate.source_index >= self.source_count):
-                            raise ValueError('endpoint certificates must be boundary/source-local')
-                        if certificate in self._endpoint_certificates:
-                            continue
-                        if any(item.eligible and certificate.excludes(item.demand)
-                               for item in self._observed.values()):
-                            raise ValueError('endpoint certificate contradicts eligible paired evidence')
-                        self._endpoint_certificates.add(certificate)
-                        for other in self._domain:
-                            if other not in self._observed and certificate.excludes(other):
-                                self._excluded[other] = certificate
+                publish_related(demand)
                 self._emit('exact_pair_observed', boundary_index=demand.boundary_index,
                     outgoing_source_index=demand.outgoing_source_index,
                     incoming_source_index=demand.incoming_source_index,
                     eligible=observed.eligible,
+                    complete_offsets=observed.complete,
                     severe_flags=list(getattr(observed.policy_evidence, 'severe_flags', ())),
                     effect=getattr(getattr(observed.policy_evidence, 'cinematic_bridge', None), 'style', None))
                 observation_changed = True
@@ -335,8 +354,31 @@ class MemberObservationSearch(Generic[Evidence]):
             # dissolve and change spacing/role/exposure feasibility. A path is
             # never returned under the stale policy that preceded observation.
             if not rejected and not observation_changed:
+                pending = tuple(self._observed[demand] for demand in demands
+                    if not self._observed[demand].complete)
+                if pending:
+                    if refine is None:
+                        raise ValueError('partial selected observations require complete refinement')
+                    for previous in pending:
+                        charge_observation(refining=True)
+                        demand = previous.demand
+                        self._emit('exact_pair_refinement_started', boundary_index=demand.boundary_index,
+                            outgoing_source_index=demand.outgoing_source_index,
+                            incoming_source_index=demand.incoming_source_index)
+                        completed = refine(previous)
+                        if (not isinstance(completed, TransitionObservation)
+                                or completed.demand != demand or not completed.complete
+                                or not completed.eligible):
+                            raise ValueError('refinement must retain eligibility and complete the same pair')
+                        self._observed[demand] = completed
+                        publish_related(demand)
+                        self._emit('exact_pair_refinement_completed', boundary_index=demand.boundary_index)
+                    # Added offsets can change the best cut/effect/spacing and
+                    # its cost. Re-solve the complete policy, never publish the
+                    # stale proposal that preceded selected-pair refinement.
+                    continue
                 self._emit('observed_path_policy_verified')
                 return ObservedPathProposal(path, tuple(self._observed[demand] for demand in demands),
                     self._solver_calls, self._observation_calls, self.unobserved_count,
-                    self._reused_observations, len(self._excluded))
+                    self._reused_observations, len(self._excluded), self._refinement_calls)
         raise self._incomplete("proposal_solver_budget_exhausted")

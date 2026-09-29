@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import Mock
 
 from crosscut.direct_member_visual import (
@@ -32,6 +33,62 @@ class MemberObservationSearchTests(unittest.TestCase):
         self.assertIsInstance(search.proposal_graph()[0][0][1], ProposalEdge)
         self.assertNotIsInstance(search.proposal_graph()[0][0][1], DirectBoundaryMismatch)
         self.assertEqual(search.proposal_graph()[0][1][2].state, ObservationState.UNOBSERVED)
+
+    def test_progressive_path_requires_complete_offsets_and_policy_reaudit(self):
+        search=self.search(observations=3,calls=3)
+        snapshots=[]
+        queries=[]
+        def propose(graph):
+            snapshots.append(tuple(graph[i][a][b].policy_evidence
+                for i,(a,b) in enumerate(zip((0,1,2),(1,2,0)))))
+            return (0,1,2,0)
+        def observe(demand):
+            queries.append(demand)
+            return replace(observed(demand),complete=False,policy_evidence='one verified offset')
+        def refine(previous):
+            return replace(previous,cost=.1,evidence=(*previous.evidence,'remaining exact offsets'),
+                policy_evidence='all verified offsets',complete=True)
+        result=search.run(propose=propose,observe=observe,refine=refine)
+        self.assertEqual(len(queries),3)
+        self.assertEqual(result.observation_count,3)
+        self.assertEqual(result.refinement_count,3)
+        self.assertEqual(result.solver_call_count,3)
+        self.assertTrue(all(item.complete for item in result.transitions))
+        self.assertEqual(snapshots[1],('one verified offset',)*3)
+        self.assertEqual(snapshots[2],('all verified offsets',)*3)
+
+    def test_partial_rejection_and_incomplete_or_changed_refinement_cannot_publish(self):
+        demand=TransitionDemand(0,0,1)
+        with self.assertRaises(ValueError):
+            replace(observed(demand),eligible=False,complete=False)
+        for refine in (None, lambda old:old, lambda old:replace(old,complete=True,eligible=False),
+                lambda old:replace(old,complete=True,demand=TransitionDemand(0,1,0))):
+            with self.subTest(refine=refine),self.assertRaises(ValueError):
+                self.search().run(propose=lambda _:(0,1,2,0),
+                    observe=lambda d:replace(observed(d),complete=False),refine=refine)
+
+    def test_policy_changes_after_refinement_require_new_exact_pairs(self):
+        search=self.search(observations=5,calls=5)
+        queries=[]
+        def propose(graph):
+            return ((0,1,2,0) if graph[0][0][1].policy_evidence != 'completed' else (0,2,1,0))
+        def observe(demand):
+            queries.append(demand)
+            return replace(observed(demand),complete=False)
+        # Two disjoint three-edge paths require six fresh pair reservations;
+        # the five-pair ceiling is not reset by any refinement or re-proposal.
+        with self.assertRaises(MemberObservationSearchIncomplete) as caught:
+            search.run(propose=propose,observe=observe,
+                refine=lambda old:replace(old,complete=True,policy_evidence='completed'))
+        self.assertEqual(caught.exception.diagnostics['observation_count'],5)
+        self.assertEqual(caught.exception.diagnostics['refinement_count'],3)
+        self.assertEqual(len(queries),5)
+        self.assertFalse(caught.exception.diagnostics['render_authorized'])
+
+    def test_partial_reused_pairs_cannot_acquire_unfunded_refinement_authority(self):
+        with self.assertRaisesRegex(ValueError,'boundary-local'):
+            self.search().run(propose=lambda _:(0,1,2,0),observe=observed,
+                reuse_observed=lambda _: (replace(observed(TransitionDemand(0,0,2)),complete=False),))
 
     def test_failure_repairs_path_without_observing_its_tail_or_repeating_good_edges(self):
         search = self.search()
