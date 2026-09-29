@@ -1459,14 +1459,31 @@ def _select_safe_cadence_candidates(
             if role_audit is not None:
                 role_audit["candidate_generation_exhaustion"] = exc.to_dict()
             pool = ()
-        # A first-result request has no alternative-cohort consumer. Its first
-        # viable profile is the same first item the round-robin would retain,
-        # without solving another 47 paths that cannot be selected. Infeasible
-        # profiles still advance to the next profile with identical hard gates.
-        if maximum_results == 1 and pool:
-            return ((pool[0],), (profile.name,))
         pools.append(pool)
     pooled = tuple(pools)
+    if maximum_results == 1:
+        # One retained render does not mean the first (most conservative)
+        # cadence wins without comparison. Evaluate only one DP head per
+        # profile on the already sensed lattice, then use the existing common
+        # review. No extra media sensing, repair or render is performed here.
+        heads = tuple((profile.name, pool[0]) for profile, pool in
+                      zip(profiles, pooled, strict=True) if pool)
+        if heads:
+            source_count = len({candidate.source_id for segment in candidates_by_segment
+                                for candidate in segment})
+            reviews = tuple(review_timeline(result, available_source_count=source_count)
+                            for _name, result in heads)
+            selected = _review_ranked_candidate_indices(reviews)[0]
+            if role_conditioning_audit is not None:
+                summary = {
+                    name: {"passed": review.passed, "hard_failure_count": len(review.hard_failures),
+                           "weighted_score": review.weighted_score, "selected": index == selected}
+                    for index, ((name, _result), review) in enumerate(zip(heads, reviews, strict=True))
+                }
+                for audit in role_conditioning_audit:
+                    audit["singleton_head_comparison"] = summary
+            name, result = heads[selected]
+            return ((result,), (name,))
     candidates: list[TimelineResult] = []
     cadence_profiles: list[str] = []
     signatures: set[tuple[str, ...]] = set()
@@ -7137,11 +7154,11 @@ def _build_visual_timeline(
             "human_reference_role_conditioned_three_cadence_profiles_"
             "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
         )
-    if singleton:
+    if singleton and prescribed_indices is None:
         candidate_generation_basis = (
-            "first_viable_safe_cadence_singleton_then_reference_review_v1"
+            "three_safe_cadence_heads_reviewed_singleton_v2"
             if professional_montage_selection_policy is None else
-            "human_reference_role_conditioned_first_viable_safe_cadence_singleton_v1"
+            "human_reference_role_conditioned_three_heads_reviewed_singleton_v2"
         )
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"

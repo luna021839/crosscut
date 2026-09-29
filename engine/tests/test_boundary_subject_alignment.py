@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,9 @@ from crosscut.boundary_subject_alignment import (
     BoundarySubjectObservation,
     _optical_flow_box,
     _shot_policy,
+    _subject,
+    _TransformState,
+    _project_box,
     build_boundary_subject_alignment_plan,
 )
 from crosscut.face_match import FaceMatchPlan, FaceMatchSegment
@@ -94,6 +98,68 @@ def _observations(
 
 
 class BoundarySubjectAlignmentTests(unittest.TestCase):
+    def test_close_face_uses_head_envelope_but_medium_keeps_full_performer(self):
+        settings = BoundarySubjectAlignmentConfig()
+        observation = BoundarySubjectObservation(face_count=1,
+            face_box_xywh=(.40, .26, .20, .24), detected_person_count=1,
+            formation_boxes_xywh=((.20, .15, .60, .85),))
+        close = _subject(observation, preferred_kind='face', settings=settings)
+        self.assertEqual(_shot_policy(observation), 'close_face')
+        self.assertGreater(close.containment_boxes[0][3], observation.face_box_xywh[3])
+        state = _TransformState(1.15, .5, .5)
+        self.assertGreaterEqual(_project_box(close.containment_boxes[0], state)[1], .995)
+        self.assertLess(_project_box(observation.formation_boxes_xywh[0], state)[1], .995)
+        medium = _subject(replace(observation, face_box_xywh=(.45, .35, .10, .16)),
+            preferred_kind='face', settings=settings)
+        self.assertEqual(medium.containment_boxes, observation.formation_boxes_xywh)
+        jittered = replace(observation, face_box_xywh=(.40, .26, .20, .215))
+        self.assertEqual(_shot_policy(jittered), 'medium_focus')
+        fixed_contract = _subject(jittered, preferred_kind='face', settings=settings,
+            framing_policy='close_face')
+        self.assertLess(fixed_contract.containment_boxes[0][3], .4)
+
+    def test_close_head_margin_cannot_be_cropped_just_because_face_fits(self):
+        observation = BoundarySubjectObservation(face_count=1,
+            face_box_xywh=(.40, .08, .20, .24))
+        subject = _subject(observation, preferred_kind='face',
+            settings=BoundarySubjectAlignmentConfig())
+        state = _TransformState(1.18, .5, .5)
+        self.assertGreaterEqual(_project_box(observation.face_box_xywh, state)[1], .995)
+        self.assertLess(_project_box(subject.containment_boxes[0], state)[1], .995)
+
+    def test_background_faces_need_explicit_dominance_evidence(self):
+        observation = BoundarySubjectObservation(face_count=3,
+            face_box_xywh=(.40, .26, .20, .24), detected_person_count=3)
+        self.assertEqual(_shot_policy(observation), 'wide_formation')
+        self.assertIsNone(_subject(observation, preferred_kind='face',
+            settings=BoundarySubjectAlignmentConfig()))
+        proved = replace(observation, face_is_unambiguous_dominant=True)
+        self.assertEqual(_shot_policy(proved), 'close_face')
+        self.assertIsNotNone(_subject(proved, preferred_kind='face',
+            settings=BoundarySubjectAlignmentConfig()))
+        with self.assertRaises(ValueError):
+            BoundarySubjectObservation(face_count=0, face_is_unambiguous_dominant=True)
+
+    def test_real_planner_accepts_close_scale_match_despite_source_truncated_torso(self):
+        timeline = VisualTimelinePlan((
+            _choice(0, 0, start=0., end=1.),
+            _choice(1, 1, start=1., end=2.)), 1.)
+        def observations(frame):
+            face = ((.40, .26, .20, .24) if float(frame.mean()) < 75
+                    else (.3875, .23, .225, .27))
+            return BoundarySubjectObservation(face_count=1, face_box_xywh=face,
+                face_eye_scale=face[3] * .42, detected_person_count=1,
+                formation_boxes_xywh=((.20, .15, .60, .85),))
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a.mp4'), Path('b.mp4')),
+            transitions=(RenderTransition(tier='C'),), fps=30.,
+            frame_provider=lambda index, _seconds: _frame(index),
+            observation_provider=observations,
+            source_resolutions=((1920,1080),(1920,1080)))
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertGreater(plan.validated_output_frame_count, 0)
+        self.assertAlmostEqual(plan.decisions[0].outgoing_state.zoom, 1.125)
+
     def test_large_face_precedes_background_people_but_small_face_does_not(self) -> None:
         formation = (
             (0.12, 0.30, 0.14, 0.48),

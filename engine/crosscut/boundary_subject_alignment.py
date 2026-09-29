@@ -60,8 +60,17 @@ class BoundarySubjectObservation:
     formation_boxes_xywh: tuple[
         tuple[float, float, float, float], ...
     ] = ()
+    # The descriptor may prove one dominant face while small background faces
+    # are also present. Count alone must not discard that existing evidence.
+    face_is_unambiguous_dominant: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.face_is_unambiguous_dominant, bool):
+            raise ValueError("dominant face flag must be boolean")
+        if self.face_is_unambiguous_dominant and (
+            self.face_count < 1 or self.face_box_xywh is None
+        ):
+            raise ValueError("dominant face requires an observed face box")
         if (
             isinstance(self.face_count, bool)
             or not isinstance(self.face_count, int)
@@ -556,6 +565,8 @@ class BoundarySubjectAlignmentPlan:
                 ),
                 "group_transition_kind": "hard_cut_only",
                 "legacy_editorial_schema_globally_relaxed": False,
+                "close_face_containment": "measured_face_plus_source_clipped_head_margin",
+                "medium_wide_containment": "full_visible_performer_or_formation",
             },
             "decision_count": len(self.decisions),
             "eligible_count": self.eligible_count,
@@ -662,6 +673,7 @@ def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservati
         formation_boxes_xywh=tuple(
             person.bbox_xywh for person in descriptor.formation_people
         ),
+        face_is_unambiguous_dominant=descriptor.primary_face_bbox is not None,
     )
 
 
@@ -843,18 +855,37 @@ def _associated_person_box(
     ))
 
 
+def _has_unambiguous_face(observation: BoundarySubjectObservation) -> bool:
+    return bool(observation.face_box_xywh is not None and (
+        observation.face_count == 1 or observation.face_is_unambiguous_dominant))
+
+
+def _close_face_head_envelope(
+    box: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Protect measured face plus head room, not a frame-truncated torso.
+
+    This is a framing envelope, not inferred anatomy or pose. Only the padding
+    outside the original picture is clipped; no visible face pixel is removed.
+    Medium and wide shots continue to use the full performer envelopes.
+    """
+    x, y, width, height = box
+    left, top = max(0.0, x - .15 * width), max(0.0, y - .25 * height)
+    right, bottom = min(1.0, x + 1.15 * width), min(1.0, y + 1.10 * height)
+    return (left, top, right - left, bottom - top)
+
+
 def _shot_policy(observation: BoundarySubjectObservation) -> str:
     boxes = observation.formation_boxes_xywh
     observed_people = max(observation.detected_person_count, len(boxes))
     if (
-        observation.face_count == 1
-        and observation.face_box_xywh is not None
+        _has_unambiguous_face(observation)
         and observation.face_box_xywh[3] >= 0.2184
     ):
         return "close_face"
     if observed_people >= 3 or len(boxes) >= 3:
         return "wide_formation"
-    if observation.face_count == 1 and observation.face_box_xywh is not None:
+    if _has_unambiguous_face(observation):
         return "medium_focus"
     if boxes:
         if len(boxes) == 1:
@@ -879,14 +910,20 @@ def _subject(
     *,
     preferred_kind: str | None,
     settings: BoundarySubjectAlignmentConfig,
+    framing_policy: str | None = None,
 ) -> _SubjectGeometry | None:
     boxes = observation.formation_boxes_xywh
     if preferred_kind in (None, "face") and (
-        observation.face_count == 1 and observation.face_box_xywh is not None
+        _has_unambiguous_face(observation)
     ):
         face_box = observation.face_box_xywh
+        assert face_box is not None
         performer = _associated_person_box(face_box, boxes)
-        containment = (performer,) if performer is not None else (face_box,)
+        containment = (
+            (_close_face_head_envelope(face_box),)
+            if (framing_policy or _shot_policy(observation)) == "close_face"
+            else (performer,) if performer is not None else (face_box,)
+        )
         return _SubjectGeometry(
             "face",
             face_box,
@@ -1473,6 +1510,7 @@ def build_boundary_subject_alignment_plan(
         choice_index: int,
         frame_index: int,
         preferred_kind: str,
+        framing_policy: str | None = None,
     ) -> _SubjectGeometry | None:
         if preferred_kind not in {"face", "silhouette"}:
             return None
@@ -1493,6 +1531,7 @@ def build_boundary_subject_alignment_plan(
                     reference_observation,
                     preferred_kind=preferred_kind,
                     settings=settings,
+                    framing_policy=framing_policy,
                 )
                 if reference_subject is None:
                     continue
@@ -1985,10 +2024,26 @@ def build_boundary_subject_alignment_plan(
                 if observation is None:
                     failure = "per_frame_decode_or_geometry_failed"
                     break
+                nearest_boundary = min(
+                    touched,
+                    key=lambda boundary_index: (
+                        frame_index if boundary_index == choice_index - 1
+                        else counts[choice_index] - 1 - frame_index),
+                )
+                boundary = candidate_by_boundary[nearest_boundary]
+                framing_policy = (
+                    boundary.outgoing_shot_policy
+                    if boundary.transformed_side == "outgoing"
+                    else boundary.incoming_shot_policy
+                )
+                # Keep the verified endpoint's framing contract through this
+                # short window. Detector-size jitter cannot replace a head
+                # envelope with a whole torso part way through one ramp.
                 subject = _subject(
                     observation,
                     preferred_kind=preferred_kind,
                     settings=settings,
+                    framing_policy=framing_policy,
                 )
                 if subject is None and preferred_kind == "face":
                     # A transient face-detector miss must not become a blind
@@ -2007,6 +2062,7 @@ def build_boundary_subject_alignment_plan(
                         choice_index,
                         frame_index,
                         preferred_kind,
+                        framing_policy,
                     )
                     if subject is not None:
                         optical_flow_validated += 1
@@ -2021,14 +2077,6 @@ def build_boundary_subject_alignment_plan(
                 if visibility + 1e-9 < threshold:
                     failure = "per_frame_subject_containment_failed"
                     break
-                nearest_boundary = min(
-                    touched,
-                    key=lambda boundary_index: (
-                        frame_index
-                        if boundary_index == choice_index - 1
-                        else counts[choice_index] - 1 - frame_index
-                    ),
-                )
                 target_layout = target_layout_by_boundary[nearest_boundary]
                 baseline_frame_layout = _layout_mismatch(
                     subject.layout_boxes,

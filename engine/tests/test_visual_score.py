@@ -273,13 +273,13 @@ class VisualScoreTests(unittest.TestCase):
         self.assertEqual(cadence_profiles.count("reference"), 11)
         self.assertEqual(cadence_profiles.count("dense_safe"), 10)
 
-    def test_singleton_uses_one_path_and_stops_at_first_viable_profile(self) -> None:
+    def test_singleton_compares_one_head_per_profile_and_preserves_exhaustion(self) -> None:
         result = self.timeline_result("0")
         exhausted = NoCompleteTimelinePath("exhausted", reason_code="test_exhaustion")
         for failures in range(3):
             with self.subTest(failures=failures), patch(
                 "crosscut.visual_score.select_timeline_candidates",
-                side_effect=[exhausted] * failures + [(result,)],
+                side_effect=[exhausted] * failures + [(result,)] * (3-failures),
             ) as select:
                 results, profiles = _select_safe_cadence_candidates(
                     ((result.candidates[0],),), preferred_source_ids=None,
@@ -287,8 +287,28 @@ class VisualScoreTests(unittest.TestCase):
                 )
                 self.assertEqual(results, (result,))
                 self.assertEqual(profiles, (("balanced", "reference", "dense_safe")[failures],))
-                self.assertEqual(select.call_count, failures + 1)
+                self.assertEqual(select.call_count, 3)
                 self.assertTrue(all(call.kwargs["maximum_results"] == 1 for call in select.call_args_list))
+
+    def test_singleton_prefers_reviewed_head_over_first_viable_or_raw_dp_score(self):
+        from types import SimpleNamespace
+        heads = tuple(self.timeline_result(str(i)) for i in range(3))
+        reviews = (
+            SimpleNamespace(passed=False, hard_failures=('pose',), weighted_score=95., warnings=()),
+            SimpleNamespace(passed=True, hard_failures=(), weighted_score=80., warnings=()),
+            SimpleNamespace(passed=True, hard_failures=(), weighted_score=82., warnings=()),
+        )
+        with patch('crosscut.visual_score.select_timeline_candidates',
+                   side_effect=[(head,) for head in heads]) as select, patch(
+                   'crosscut.visual_score.review_timeline', side_effect=reviews) as review:
+            result, names = _select_safe_cadence_candidates(
+                (tuple(head.candidates[0] for head in heads),),
+                preferred_source_ids=None, diversity=VisualDiversityConfig(), maximum_results=1)
+        self.assertEqual(result, (heads[2],))
+        self.assertEqual(names, ('dense_safe',))
+        self.assertEqual(select.call_count, 3)
+        self.assertEqual(review.call_count, 3)
+        self.assertTrue(all(call.kwargs['available_source_count'] == 3 for call in review.call_args_list))
 
     def test_singleton_real_builder_materializes_complete_plan(self) -> None:
         descriptor = FrameVisualDescriptor(
