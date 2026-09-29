@@ -19,6 +19,8 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 import numpy as np
 
+from .exact_native_frame_reader import ExactNativeFrameReader
+
 
 SCHEMA_VERSION = 2
 ANALYSIS_BASIS = (
@@ -1385,6 +1387,8 @@ def evaluate_post_render_perceptual_quality(
     for source_index in used_sources:
         indices = candidates.get(source_index, [])
         source_capture = capture_factory(str(sources[source_index]))
+        native_reader = (ExactNativeFrameReader(source_capture, reference_clock.source_clocks[source_index])
+            if reference_clock is not None and source_index in reference_clock.source_clocks else None)
         ratios: list[float] = []
         structure_similarities: list[float] = []
         low_detail = 0
@@ -1409,12 +1413,16 @@ def evaluate_post_render_perceptual_quality(
                     else:
                         source_frame_index = _rendered_source_frame_index(
                             span, relative_time=relative_time, source_fps=source_fps)
-                    source_capture.set(
-                        cv2.CAP_PROP_POS_FRAMES,
-                        source_frame_index,
-                    )
-                    success, source_frame = source_capture.read()
-                    if not success or source_frame is None:
+                    if native_reference is not None:
+                        if native_reader is None:
+                            raise ValueError('verified reference lost its native decoder clock')
+                        source_frame = native_reader.frame_at(source_frame_index)
+                    else:
+                        source_capture.set(cv2.CAP_PROP_POS_FRAMES, source_frame_index)
+                        success, source_frame = source_capture.read()
+                        if not success:
+                            source_frame = None
+                    if source_frame is None:
                         continue
                     decoded += 1
                     decoded_by_segment[span.segment_index] += 1
@@ -1488,6 +1496,7 @@ def evaluate_post_render_perceptual_quality(
         per_source_retention.append(
             {
                 "source_index": source_index,
+                "native_decoder_locality": native_reader.diagnostics() if native_reader is not None else None,
                 "requested_sample_count": len(indices),
                 "decoded_source_sample_count": decoded,
                 "low_detail_excluded_count": low_detail,

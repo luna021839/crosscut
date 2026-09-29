@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from .render import segment_frame_counts
 from .render_boundary_clock import native_frame_clocks_for_output, RenderedBoundaryNativeFrame
-from .render_frame_schedule import FRAME_SCHEDULE_CONTRACT, probe_render_frame_clock
+from .render_frame_schedule import FRAME_SCHEDULE_CONTRACT, VerifiedRenderFrameClock, probe_render_frame_clock
 from .render_plan_serialization import render_plan_from_json
 from .render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, render_clock_path, video_content_sha256
 
@@ -16,6 +16,7 @@ class RenderReferenceClock:
     frames: Mapping[int, RenderedBoundaryNativeFrame]
     source_fps: Mapping[int, float]
     timestamp_fallback_sources: tuple[int, ...]
+    source_clocks: Mapping[int, VerifiedRenderFrameClock]
 
 
 def load_render_reference_clock(
@@ -79,4 +80,4 @@ def load_render_reference_clock(
         clocks[index] = clock
     frames = native_frame_clocks_for_output(plan, clocks, selected,
         allow_pure_frames_in_overlap_plan=True)
-    return RenderReferenceClock(frames, {i: float(c.frame_rate) for i,c in clocks.items()}, tuple(fallback))
+    return RenderReferenceClock(frames, {i: float(c.frame_rate) for i,c in clocks.items()}, tuple(fallback), clocks)

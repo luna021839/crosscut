@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 
 from .face_match import FaceMatchPlan, FaceMatchSegment
+from .exact_native_frame_reader import ExactNativeFrameReader
 from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -629,6 +630,7 @@ class _CaptureProvider:
                for value in (maximum_cache_size, maximum_cache_bytes)):
             raise ValueError("alignment pixel cache limits must be positive integers")
         self._captures: list[cv2.VideoCapture | None] = []
+        self._native_readers: dict[int, ExactNativeFrameReader] = {}
         self._cache: OrderedDict[tuple[int, str, float | int], np.ndarray | None] = OrderedDict()
         self._maximum_cache_size = maximum_cache_size
         self._maximum_cache_bytes = maximum_cache_bytes
@@ -661,6 +663,8 @@ class _CaptureProvider:
         capture = self._captures[source_index]
         frame: np.ndarray | None = None
         if capture is not None:
+            if source_index in self._native_readers:
+                self._native_readers[source_index].invalidate_position()
             capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.)
             success, decoded = capture.read()
             if success and isinstance(decoded, np.ndarray) and decoded.size:
@@ -677,6 +681,9 @@ class _CaptureProvider:
         """
         if type(index) is not int or not 0 <= index < clock.frame_count:
             raise ValueError("alignment native frame is outside the source")
+        reader = self._native_readers.get(source_index)
+        if reader is not None and reader.clock != clock:
+            raise ValueError("alignment source clock changed inside one capture")
         key = (source_index, "native", index)
         if key in self._cache:
             frame = self._cache.pop(key)
@@ -685,20 +692,10 @@ class _CaptureProvider:
         capture = self._captures[source_index]
         frame = None
         if capture is not None:
-            rate = float(clock.frame_rate)
-            reported_rate = capture.get(cv2.CAP_PROP_FPS)
-            ready = (math.isclose(reported_rate, rate, rel_tol=1e-9)
-                and capture.get(cv2.CAP_PROP_FRAME_COUNT) == clock.frame_count)
-            if ready and capture.set(cv2.CAP_PROP_POS_FRAMES, index):
-                success, decoded = capture.read()
-                position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-                pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.
-                pts_tolerance = (1e-6 if clock.grid_basis == "exact_cfr_presentation_grid"
-                    else .5 / rate - 1e-9)
-                if (success and isinstance(decoded, np.ndarray) and decoded.size
-                        and math.isclose(position, index+1, rel_tol=0., abs_tol=1e-6)
-                        and math.isclose(pts, index/rate, rel_tol=0., abs_tol=pts_tolerance)):
-                    frame = decoded
+            if reader is None:
+                reader = ExactNativeFrameReader(capture, clock)
+                self._native_readers[source_index] = reader
+            frame = reader.frame_at(index)
         self._remember(key, frame)
         return None if frame is None else frame.copy()
 
@@ -715,6 +712,7 @@ class _CaptureProvider:
             if capture is not None:
                 capture.release()
         self._captures.clear()
+        self._native_readers.clear()
         self._cache.clear()
         self._cache_bytes = 0
 
