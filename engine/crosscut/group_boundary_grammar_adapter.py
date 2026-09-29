@@ -1388,8 +1388,11 @@ def validate_group_boundary_grammar_plan(
     source_scene_cut_times: Sequence[Sequence[float]],
     timeline_review: TimelineReview | Mapping[str, Any],
     section_plan: SectionPlan | Mapping[str, Any],
-) -> tuple[tuple[int, ...], tuple[float, ...], tuple[MontageSectionWindow, ...]]:
-    """Preflight static source/clock/review contracts before encoding pixels.
+    editorial_motion: EditorialMotionPlan | Mapping[str, Any] | None,
+    dynamic_crop_version: int | None = None,
+    dynamic_crop_motion_v3: DynamicCropMotionTimelineEvidenceV3 | Mapping[str, Any] | None = None,
+) -> tuple[tuple[int, ...], tuple[float, ...], tuple[MontageSectionWindow, ...], EditorialTransformEvidence]:
+    """Preflight all source/clock/review/transform contracts before encoding.
 
     The returned index map, native cut clocks and section windows are validated
     plan context only. They neither replace decoded QA nor approve quality.
@@ -1414,7 +1417,13 @@ def validate_group_boundary_grammar_plan(
         selected_choices=selected_choices,
     )
     sections = _validated_sections(plan=render_plan, section_plan=section_plan)
-    return eligible_to_request, native_cuts, sections
+    transforms = _validated_transforms(
+        plan=render_plan, editorial_motion=editorial_motion,
+        eligible_to_request=eligible_to_request,
+        dynamic_crop_version=dynamic_crop_version,
+        dynamic_crop_motion_v3=dynamic_crop_motion_v3,
+    )
+    return eligible_to_request, native_cuts, sections, transforms
 
 
 def adapt_group_boundary_grammar_evidence(
@@ -1443,24 +1452,20 @@ def adapt_group_boundary_grammar_evidence(
     payload alone, or any disagreement is rejected.
     """
 
-    eligible_to_request, native_cuts, sections = validate_group_boundary_grammar_plan(
+    _eligible_to_request, native_cuts, sections, transforms = validate_group_boundary_grammar_plan(
         render_plan=render_plan,
         source_index_mapping=source_index_mapping,
         selected_timeline=selected_timeline,
         source_scene_cut_times=source_scene_cut_times,
         timeline_review=timeline_review,
         section_plan=section_plan,
+        editorial_motion=editorial_motion,
+        dynamic_crop_version=dynamic_crop_version,
+        dynamic_crop_motion_v3=dynamic_crop_motion_v3,
     )
     continuity = _validated_proxy_continuity(
         plan=render_plan,
         rendered_proxy_review=rendered_proxy_review,
-    )
-    transforms = _validated_transforms(
-        plan=render_plan,
-        editorial_motion=editorial_motion,
-        eligible_to_request=eligible_to_request,
-        dynamic_crop_version=dynamic_crop_version,
-        dynamic_crop_motion_v3=dynamic_crop_motion_v3,
     )
     return ProfessionalBoundaryGrammarEvidence(
         performance_id=performance_id,

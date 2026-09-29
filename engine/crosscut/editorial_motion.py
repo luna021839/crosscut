@@ -16,10 +16,12 @@ from typing import Any, Sequence
 from .boundary_affine_plan import BoundaryAffinePlan
 from .boundary_subject_alignment import BoundarySubjectAlignmentPlan
 from .face_match import FaceMatchPlan, FaceMatchSegment
+from .editorial_transform_events import rendered_transform_event_records
 from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
     PanCropTrack,
+    RenderSegment,
     RenderTransition,
     TransitionKind,
     minimum_roll_safe_zoom,
@@ -198,6 +200,9 @@ class EditorialMotionPlan:
         tuple[int, float, float], ...
     ] = ()
     member_roll_audit: tuple = ()
+    # Authored gestures and frame-visible trajectory targets have different
+    # cardinalities (e.g. one pulse split across two render segments).
+    authored_event_counts: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
         if self.member_roll_audit:
@@ -301,6 +306,7 @@ class EditorialMotionPlan:
             "zoom_event_count": self.zoom_event_count,
             "pan_event_count": self.pan_event_count,
             "roll_event_count": self.roll_event_count,
+            "authored_event_counts": dict(self.authored_event_counts),
             "interior_zoom_pulse_count": self.interior_zoom_pulse_count,
             "section_directed": self.section_directed,
             "blocked_dissolve_segment_count": self.blocked_dissolve_segment_count,
@@ -1911,23 +1917,30 @@ def build_editorial_motion_plan(
         )
         for boundary_index in selected_affine_boundaries
     )
+    final_segments = tuple(item for item in result if item is not None)
+    render_segments = tuple(
+        RenderSegment(
+            source_index=choice.source_index,
+            source_start=choice.source_local_start,
+            master_start=choice.canonical_master_start - choices[0].canonical_master_start,
+            duration=choice.duration_seconds,
+            editorial_transform=motion.track,
+        )
+        for choice, motion in zip(choices, final_segments, strict=True)
+    )
+    events = rendered_transform_event_records(render_segments, fps)
     return EditorialMotionPlan(
-        segments=tuple(item for item in result if item is not None),
+        segments=final_segments,
         boundary_match_count=boundary_match_count,
-        zoom_event_count=(
-            boundary_zoom_events
-            + len(zoom_effects)
-            + len(interior_pulse_effects)
-        ),
-        pan_event_count=pan_event_count,
-        roll_event_count=(
-            actual_decorative_roll_event_count
-            + actual_affine_roll_event_count
-            + (
-                boundary_subject_alignment_plan.roll_event_count
-                if boundary_subject_alignment_plan is not None
-                else 0
-            )
+        zoom_event_count=len(events["zoom"]),
+        pan_event_count=len(events["pan"]),
+        roll_event_count=len(events["roll"]),
+        authored_event_counts=(
+            ("zoom", boundary_zoom_events + len(zoom_effects) + len(interior_pulse_effects)),
+            ("pan", pan_event_count),
+            ("roll", actual_decorative_roll_event_count + actual_affine_roll_event_count
+             + (boundary_subject_alignment_plan.roll_event_count
+                if boundary_subject_alignment_plan is not None else 0)),
         ),
         blocked_dissolve_segment_count=len(blocked),
         affine_boundary_match_count=len(selected_affine_boundaries),

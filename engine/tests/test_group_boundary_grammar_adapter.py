@@ -769,8 +769,9 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
     def test_static_clock_preflight_needs_no_proxy_and_rejects_clock_disagreement(self):
         bundle = self._bundle()
         arguments = {key:bundle[key] for key in ('render_plan', 'source_index_mapping',
-            'selected_timeline', 'source_scene_cut_times', 'timeline_review', 'section_plan')}
-        _mapping, native, _sections = validate_group_boundary_grammar_plan(**arguments)
+            'selected_timeline', 'source_scene_cut_times', 'timeline_review', 'section_plan',
+            'editorial_motion')}
+        _mapping, native, _sections, _transforms = validate_group_boundary_grammar_plan(**arguments)
         self.assertEqual(len(native), 2)
         timeline = bundle['selected_timeline'].to_dict()
         timeline['index_domain'] = 'eligible_source_index'
@@ -923,6 +924,12 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
                 else:
                     motion["segments"].pop()
                 bundle["editorial_motion"] = motion
+                static_arguments = {key: bundle[key] for key in (
+                    'render_plan', 'source_index_mapping', 'selected_timeline',
+                    'source_scene_cut_times', 'timeline_review', 'section_plan',
+                    'editorial_motion')}
+                with self.assertRaises(GroupBoundaryGrammarAdapterError):
+                    validate_group_boundary_grammar_plan(**static_arguments)
                 with self.assertRaises(GroupBoundaryGrammarAdapterError):
                     self._adapt(bundle)
 

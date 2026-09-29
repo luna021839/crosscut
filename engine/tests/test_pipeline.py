@@ -3402,6 +3402,10 @@ class PipelineTests(unittest.TestCase):
         self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
             _model_case="static_contract_error")
 
+    def test_group_review_first_retains_proxy_evidence_on_later_review_error(self):
+        self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+            _model_case="post_proxy_contract_error")
+
     def test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
         self, _cutoff_elapsed=None, _model_case=None,
     ) -> None:
@@ -3599,7 +3603,7 @@ class PipelineTests(unittest.TestCase):
                         baseline_builder.assert_called_once()
                         if _model_case == "discovery_error":
                             raise ValueError("optional registry invalid")
-                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error", "real_producer", "static_contract_error"} else SimpleNamespace()
+                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error", "real_producer", "static_contract_error", "post_proxy_contract_error"} else SimpleNamespace()
                     generation = SimpleNamespace(
                         retained_candidates=tuple(SimpleNamespace(rank=index) for index in range(2)),
                         learned_section_director=SimpleNamespace(section_plan=section_plan))
@@ -3689,6 +3693,14 @@ class PipelineTests(unittest.TestCase):
                             stack.enter_context(patch('crosscut.pipeline._review_first_registered_group_generation', side_effect=model_context))
                         stack.enter_context(patch('crosscut.pipeline._apply_stage_edit_candidate_render_contract', side_effect=ValueError('injected late geometry rejection')))
                         proxy = stack.enter_context(patch('crosscut.pipeline.render_and_review_proxy', side_effect=ReachedDecodedProxy))
+                        if _model_case == "post_proxy_contract_error":
+                            def rendered_proxy(plan, output, **_kwargs):
+                                output.write_bytes(b"synthetic encoded candidate, not a real MP4")
+                                return (pipeline.derive_proxy_render_plan(plan, output),
+                                    SimpleNamespace(payload={"passed": True, "proxy": {"path": str(output)}}))
+                            proxy.side_effect = rendered_proxy
+                            stack.enter_context(patch('crosscut.pipeline._review_stage_edit_bundle_montage',
+                                side_effect=ValueError('injected post-proxy grammar error')))
                         if _model_case == "explicit_registry_error":
                             with self.assertRaisesRegex(ValueError, 'explicit registry invalid'):
                                 analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
@@ -3712,6 +3724,20 @@ class PipelineTests(unittest.TestCase):
                             self.assertEqual(report['error'], 'source-clock preflight failure')
                             self.assertFalse(report['render_authorized'])
                             self.assertEqual(report['selected_timeline']['index_domain'], 'eligible_source_index')
+                        elif _model_case == "post_proxy_contract_error":
+                            with self.assertRaisesRegex(ValueError, 'injected post-proxy grammar error'):
+                                analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
+                            proxy.assert_called_once()
+                            retained = proxy.call_args.args[1]
+                            self.assertTrue(retained.is_file())
+                            self.assertIn('review-proxy', retained.name)
+                            self.assertTrue(retained.with_suffix('.plan.json').is_file())
+                            evidence = json.loads(retained.with_suffix('.technical-review.json').read_text())
+                            self.assertFalse(evidence['quality_approved'])
+                            self.assertFalse(evidence['delivery_completion_message_allowed'])
+                            self.assertEqual(evidence['montage_review_status'], 'pending')
+                            self.assertEqual(evidence['proxy']['path'], str(retained))
+                            self.assertFalse(evidence['proxy']['temporary_proxy_removed_after_review'])
                         else:
                             with self.assertRaises(ReachedDecodedProxy):
                                 analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
@@ -3719,6 +3745,9 @@ class PipelineTests(unittest.TestCase):
                             self.assertIsInstance(plan, RenderPlan)
                             self.assertEqual(plan.sources, tuple(path.resolve() for path in sources))
                             self.assertEqual(plan.output_frame_count, round(8 * plan.fps))
+                            preflight = json.loads(next(automatic_request.output_directory.glob('*-group-plan-preflight.json')).read_text())
+                            self.assertIn('editorial_motion', preflight)
+                            self.assertIn('dynamic_crop_motion_v3', preflight)
                             audit_paths = list(automatic_request.output_directory.glob('*-review-first-selection-audit.json'))
                             self.assertEqual(len(audit_paths), 1)
                             audit = json.loads(audit_paths[0].read_text())

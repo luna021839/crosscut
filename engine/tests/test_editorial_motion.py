@@ -180,7 +180,8 @@ class EditorialMotionTests(unittest.TestCase):
 
         self.assertEqual(plan.boundary_match_count, 1)
         self.assertEqual(plan.affine_boundary_match_count, 1)
-        self.assertEqual(plan.roll_event_count, 1)
+        self.assertEqual(plan.roll_event_count, 0)
+        self.assertEqual(dict(plan.authored_event_counts)["roll"], 1)
         incoming = plan.track_for(1)
         assert incoming is not None
         self.assertAlmostEqual(incoming.keyframes[0].zoom, 1.09)
@@ -456,7 +457,8 @@ class EditorialMotionTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(plan.roll_event_count, 1)
+        self.assertEqual(plan.roll_event_count, 0)
+        self.assertEqual(dict(plan.authored_event_counts)["roll"], 1)
         incoming = plan.track_for(1)
         assert incoming is not None
         self.assertLess(incoming.keyframes[0].roll_degrees, 0.0)
@@ -747,7 +749,8 @@ class EditorialMotionTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.boundary_match_count, 0)
-        self.assertEqual(plan.zoom_event_count, 1)
+        self.assertEqual(plan.zoom_event_count, 2)
+        self.assertEqual(dict(plan.authored_event_counts)["zoom"], 1)
         self.assertEqual(plan.interior_zoom_pulse_count, 1)
         left = plan.track_for(1)
         right = plan.track_for(2)

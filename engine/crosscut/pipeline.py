@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -236,6 +237,7 @@ from .rendered_proxy_review import (
     PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS,
     ProxyReviewConfig,
     RenderedProxyReview,
+    derive_proxy_render_plan,
     render_and_review_proxy,
 )
 from .rendered_montage_grammar_review import (
@@ -27087,10 +27089,17 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         reporter=reporter, warnings=warnings, comparison_render_allowed=True)
     clock = _deterministic_exact_shot_clock_from_timeline(timeline,
         section_plan=section_plan, phrase_times=phrase_times)
+    neutral_motion = EditorialMotionPlan(
+        segments=tuple(EditorialMotionSegment(index, choice.source_index, None,
+            ("review_first_primitive_no_authored_motion",))
+            for index, choice in enumerate(timeline.choices)),
+        boundary_match_count=0, zoom_event_count=0, pan_event_count=0,
+        roll_event_count=0, blocked_dissolve_segment_count=0,
+        analysis_basis="review_first_primitive_explicit_neutral_tracks_v1")
     return _GroupRenderCandidateBundle(candidate_index=0, review_rank=0,
         cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
-        group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=None,
+        group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=neutral_motion,
         render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan)
 
 
@@ -34915,6 +34924,9 @@ def analyze(
                         ),
                         timeline_review=review_first_singleton_bundle.timeline_review,
                         section_plan=final_montage_section_plan,
+                        editorial_motion=review_first_singleton_bundle.editorial_motion_plan,
+                        dynamic_crop_version=review_first_singleton_bundle.stage_edit_dynamic_crop_version,
+                        dynamic_crop_motion_v3=review_first_singleton_bundle.dynamic_crop_motion_timeline_v3,
                     )
                     preflight_path = request.output_directory / f"{base_filename}-group-plan-preflight.json"
                     preflight_report = {
@@ -34929,6 +34941,15 @@ def analyze(
                         },
                         "timeline_review": review_first_singleton_bundle.timeline_review.to_dict(),
                         "section_plan": final_montage_section_plan.to_dict(),
+                        "editorial_motion": (
+                            preflight_inputs["editorial_motion"].to_dict()
+                            if preflight_inputs["editorial_motion"] is not None else None
+                        ),
+                        "dynamic_crop_version": preflight_inputs["dynamic_crop_version"],
+                        "dynamic_crop_motion_v3": (
+                            preflight_inputs["dynamic_crop_motion_v3"].to_dict()
+                            if preflight_inputs["dynamic_crop_motion_v3"] is not None else None
+                        ),
                         "source_index_mapping": preflight_inputs["source_index_mapping"],
                         "source_scene_cut_times": preflight_inputs["source_scene_cut_times"],
                     }
@@ -34945,13 +34966,29 @@ def analyze(
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
                 )
-                with tempfile.TemporaryDirectory(
-                    prefix=".ive-crosscut-proxy-",
-                    dir=request.output_directory,
-                ) as temporary_directory:
+                retained_proxy_path = (
+                    request.output_directory / f"{base_filename}-review-proxy.mp4"
+                    if bool(getattr(request, "review_first_enabled", False)) else None
+                )
+                if retained_proxy_path is not None:
+                    if retained_proxy_path.exists():
+                        raise FileExistsError(f"review proxy already exists: {retained_proxy_path}")
+                    # Keep the actual candidate and its exact render plan even
+                    # when later QA finds an implementation/quality failure.
+                    # These diagnostic artifacts never acquire delivery status.
+                    _write_analysis_manifest_atomically(
+                        retained_proxy_path.with_suffix(".plan.json"),
+                        derive_proxy_render_plan(plan, retained_proxy_path).to_json(),
+                    )
+                proxy_directory = (
+                    nullcontext(request.output_directory)
+                    if retained_proxy_path is not None else tempfile.TemporaryDirectory(
+                        prefix=".ive-crosscut-proxy-", dir=request.output_directory)
+                )
+                with proxy_directory as temporary_directory:
                     _proxy_plan, proxy_review = render_and_review_proxy(
                         plan,
-                        Path(temporary_directory) / "candidate-00.mp4",
+                        retained_proxy_path or Path(temporary_directory) / "candidate-00.mp4",
                         professional_reference_profile=(
                             professional_reference_profile
                         ),
@@ -34971,8 +35008,16 @@ def analyze(
                     rendered_proxy_review_payload = deepcopy(proxy_review.payload)
                 proxy_metadata = rendered_proxy_review_payload.get("proxy")
                 if isinstance(proxy_metadata, dict):
-                    proxy_metadata["path"] = None
-                    proxy_metadata["temporary_proxy_removed_after_review"] = True
+                    proxy_metadata["path"] = str(retained_proxy_path) if retained_proxy_path is not None else None
+                    proxy_metadata["temporary_proxy_removed_after_review"] = retained_proxy_path is None
+                if retained_proxy_path is not None:
+                    _write_analysis_manifest_atomically(
+                        retained_proxy_path.with_suffix(".technical-review.json"),
+                        {**deepcopy(rendered_proxy_review_payload),
+                         "quality_approved": False,
+                         "delivery_completion_message_allowed": False,
+                         "montage_review_status": "pending"},
+                    )
                 if bool(getattr(request, "review_first_enabled", False)):
                     technical_proxy_passed = bool(
                         rendered_proxy_review_payload.get("passed")
