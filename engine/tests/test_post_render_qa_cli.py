@@ -29,6 +29,7 @@ def _complete_artifact_set(root: Path, timestamp: str) -> PostRenderArtifactSet:
     }
     for path in paths.values():
         path.write_bytes(b"fixture")
+    paths["analysis_path"].write_text("{}")
     return PostRenderArtifactSet(
         base_name=base,
         timestamp=timestamp,
@@ -88,6 +89,31 @@ class PostRenderQACLIParserTests(unittest.TestCase):
 
 
 class PostRenderQACLITests(unittest.TestCase):
+    def test_ive_recovery_loads_bound_policy_instead_of_serialized_thresholds(self):
+        from crosscut.professional_montage_policy import load_professional_montage_policy
+        policy = load_professional_montage_policy(crosscut_cli.DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'analysis.json'
+            payload = {'request': {'group':'IVE', 'edit_mode':'group'},
+                'stage_edit_generation': None, 'professional_montage_grammar_profile':policy.profile_identity,
+                'rendered_montage_grammar_review': {'configuration': {'invented_easier_threshold': 1}}}
+            path.write_text(json.dumps(payload))
+            actual = crosscut_cli._post_render_qa_policy_arguments(path)['config']
+            self.assertEqual(actual.rendered_montage_grammar,
+                crosscut_cli._rendered_montage_config_from_policy(policy,
+                    require_complete_role_duration_policy=True))
+            for generation in ({'professional_montage_grammar_profile': None},
+                               {'professional_montage_grammar_profile': {'wrong':'identity'}}):
+                payload['stage_edit_generation'] = generation
+                path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(ValueError, '프로필'):
+                    crosscut_cli._post_render_qa_policy_arguments(path)
+            payload['stage_edit_generation'] = None
+            payload['professional_montage_grammar_profile'] = None
+            path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, '프로필'):
+                crosscut_cli._post_render_qa_policy_arguments(path)
+
     def _run(
         self,
         argv: list[str],

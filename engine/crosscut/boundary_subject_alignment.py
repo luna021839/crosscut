@@ -34,10 +34,14 @@ from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
     PanCropTrack,
+    RenderPlan,
+    RenderSegment,
     RenderTransition,
     TransitionKind,
     minimum_roll_safe_zoom,
 )
+from .render_boundary_clock import native_frame_clocks_for_output
+from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_clock
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
@@ -376,6 +380,10 @@ class BoundarySubjectAlignmentDecision:
     incoming_shot_policy: str | None = None
     baseline_layout_mismatch: float | None = None
     transformed_layout_mismatch: float | None = None
+    outgoing_native_frame_index: int | None = None
+    incoming_native_frame_index: int | None = None
+    outgoing_output_frame_index: int | None = None
+    incoming_output_frame_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.boundary_index < 0 or min(
@@ -450,6 +458,10 @@ class BoundarySubjectAlignmentDecision:
             "incoming_shot_policy": self.incoming_shot_policy,
             "baseline_layout_mismatch": self.baseline_layout_mismatch,
             "transformed_layout_mismatch": self.transformed_layout_mismatch,
+            "outgoing_native_frame_index": self.outgoing_native_frame_index,
+            "incoming_native_frame_index": self.incoming_native_frame_index,
+            "outgoing_output_frame_index": self.outgoing_output_frame_index,
+            "incoming_output_frame_index": self.incoming_output_frame_index,
         }
 
 
@@ -490,6 +502,7 @@ class BoundarySubjectAlignmentPlan:
     source_headroom: tuple[SourceResolutionHeadroom, ...]
     window_frames: int
     analysis_basis: str = ANALYSIS_BASIS
+    sample_clock_basis: str = "unverified_injected_segment_clock_v1"
 
     @property
     def eligible_count(self) -> int:
@@ -552,6 +565,7 @@ class BoundarySubjectAlignmentPlan:
         )
         return {
             "analysis_basis": self.analysis_basis,
+            "sample_clock_basis": self.sample_clock_basis,
             "policy": {
                 "scope": "cross_source_hard_cut_last_and_first_local_windows_only",
                 "window_frames_each_side": self.window_frames,
@@ -609,10 +623,16 @@ class BoundarySubjectAlignmentPlan:
 
 
 class _CaptureProvider:
-    def __init__(self, sources: Sequence[Path], maximum_cache_size: int = 192) -> None:
+    def __init__(self, sources: Sequence[Path], maximum_cache_size: int = 192,
+                 maximum_cache_bytes: int = 64 * 1024 * 1024) -> None:
+        if any(type(value) is not int or value <= 0
+               for value in (maximum_cache_size, maximum_cache_bytes)):
+            raise ValueError("alignment pixel cache limits must be positive integers")
         self._captures: list[cv2.VideoCapture | None] = []
-        self._cache: OrderedDict[tuple[int, int], np.ndarray | None] = OrderedDict()
+        self._cache: OrderedDict[tuple[int, str, float | int], np.ndarray | None] = OrderedDict()
         self._maximum_cache_size = maximum_cache_size
+        self._maximum_cache_bytes = maximum_cache_bytes
+        self._cache_bytes = 0
         try:
             for source in sources:
                 capture = cv2.VideoCapture(str(source))
@@ -630,7 +650,10 @@ class _CaptureProvider:
         return (width, height) if width > 0 and height > 0 else None
 
     def frame_at(self, source_index: int, seconds: float) -> np.ndarray | None:
-        key = (source_index, int(round(max(0.0, seconds) * 1000.0)))
+        # This legacy/test reader must not round across a native half-cell.
+        # Production alignment below uses an explicit verified native index.
+        seconds = max(0.0, float(seconds))
+        key = (source_index, "seconds", seconds)
         if key in self._cache:
             value = self._cache.pop(key)
             self._cache[key] = value
@@ -638,14 +661,54 @@ class _CaptureProvider:
         capture = self._captures[source_index]
         frame: np.ndarray | None = None
         if capture is not None:
-            capture.set(cv2.CAP_PROP_POS_MSEC, key[1])
+            capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.)
             success, decoded = capture.read()
             if success and isinstance(decoded, np.ndarray) and decoded.size:
                 frame = decoded
-        self._cache[key] = frame
-        while len(self._cache) > self._maximum_cache_size:
-            self._cache.popitem(last=False)
+        self._remember(key, frame)
         return None if frame is None else frame.copy()
+
+    def frame_at_native_index(self, source_index: int, index: int,
+                              clock: VerifiedRenderFrameClock) -> np.ndarray | None:
+        """Read exactly one verified source frame, without timestamp fallback.
+
+        Index and presentation position must agree. A failed seek/read cannot
+        lend a neighboring frame to a dense crop/containment approval.
+        """
+        if type(index) is not int or not 0 <= index < clock.frame_count:
+            raise ValueError("alignment native frame is outside the source")
+        key = (source_index, "native", index)
+        if key in self._cache:
+            frame = self._cache.pop(key)
+            self._cache[key] = frame
+            return None if frame is None else frame.copy()
+        capture = self._captures[source_index]
+        frame = None
+        if capture is not None:
+            rate = float(clock.frame_rate)
+            reported_rate = capture.get(cv2.CAP_PROP_FPS)
+            ready = (math.isclose(reported_rate, rate, rel_tol=1e-9)
+                and capture.get(cv2.CAP_PROP_FRAME_COUNT) == clock.frame_count)
+            if ready and capture.set(cv2.CAP_PROP_POS_FRAMES, index):
+                success, decoded = capture.read()
+                position = capture.get(cv2.CAP_PROP_POS_FRAMES)
+                pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.
+                pts_tolerance = (1e-6 if clock.grid_basis == "exact_cfr_presentation_grid"
+                    else .5 / rate - 1e-9)
+                if (success and isinstance(decoded, np.ndarray) and decoded.size
+                        and math.isclose(position, index+1, rel_tol=0., abs_tol=1e-6)
+                        and math.isclose(pts, index/rate, rel_tol=0., abs_tol=pts_tolerance)):
+                    frame = decoded
+        self._remember(key, frame)
+        return None if frame is None else frame.copy()
+
+    def _remember(self, key, frame):
+        self._cache[key] = frame
+        self._cache_bytes += 0 if frame is None else frame.nbytes
+        while (len(self._cache) > self._maximum_cache_size
+                or self._cache_bytes > self._maximum_cache_bytes):
+            _, expired = self._cache.popitem(last=False)
+            self._cache_bytes -= 0 if expired is None else expired.nbytes
 
     def close(self) -> None:
         for capture in self._captures:
@@ -653,6 +716,7 @@ class _CaptureProvider:
                 capture.release()
         self._captures.clear()
         self._cache.clear()
+        self._cache_bytes = 0
 
 
 def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservation:
@@ -783,6 +847,36 @@ def _source_seconds(
         choice.source_local_end,
         choice.source_local_start + frame_index * choice.source_playback_rate / fps,
     )
+
+
+def _alignment_native_frames(choices, sources, transitions, counts, fps, clocks):
+    """Use the renderer's existing coalescing/rounding, not a parallel clock.
+
+    Geometry is applied after the source clock. The numeric plan is never a
+    video job, and only pure frames with verified clocks are addressable.
+    """
+    origin = choices[0].canonical_master_start
+    plan = RenderPlan(tuple(Path(path) for path in sources), tuple(
+        RenderSegment(c.source_index, c.source_local_start, c.duration_seconds,
+            c.canonical_master_start-origin, source_duration=c.source_duration_seconds)
+        for c in choices), 0, "16:9", Path(sources[0]).with_suffix(".alignment-clock-unused.mp4"),
+        transitions=tuple(transitions), fps=fps)
+    output_starts = []
+    cursor = 0
+    wanted = set()
+    for choice, count in zip(choices, counts, strict=True):
+        output_starts.append(cursor)
+        if choice.source_index in clocks:
+            wanted.update(range(cursor, cursor+count))
+        cursor += count
+    for index, transition in enumerate(transitions):
+        if transition.kind.uses_overlap:
+            start = output_starts[index+1]
+            wanted.difference_update(range(start, start+transition.frame_count))
+    samples = native_frame_clocks_for_output(plan, clocks, sorted(wanted),
+        allow_pure_frames_in_overlap_plan=True)
+    return tuple(output_starts), {index:sample for index,sample in samples.items()
+        if not sample.terminal_clone}
 
 
 def _native_cut_in_boundary_window(
@@ -1443,6 +1537,7 @@ def build_boundary_subject_alignment_plan(
     frame_provider: FrameProvider | None = None,
     observation_provider: ObservationProvider | None = None,
     source_resolutions: Sequence[tuple[int, int] | None] | None = None,
+    render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
     """Build exact-cut local tracks and validate every transformed frame."""
@@ -1466,6 +1561,27 @@ def build_boundary_subject_alignment_plan(
 
     counts = _frame_counts(choices, fps)
     face_matches = _face_matches(face_match_plan)
+    renderer_bound = frame_provider is None or render_frame_clocks is not None
+    if render_frame_clocks is not None and (len(render_frame_clocks) != len(sources)
+            or any(clock is not None and not isinstance(clock, VerifiedRenderFrameClock)
+                   for clock in render_frame_clocks)):
+        raise ValueError("alignment render clocks must match the source domain")
+    used_sources = {choice.source_index for choice in choices}
+    if render_frame_clocks is None:
+        native_clocks = ({index:clock for index in sorted(used_sources)
+            if (clock := probe_render_frame_clock(Path(sources[index]))) is not None}
+            if renderer_bound else {})
+    else:
+        native_clocks = {index:clock for index,clock in enumerate(render_frame_clocks)
+            if clock is not None}
+    if renderer_bound:
+        output_starts, native_samples = _alignment_native_frames(
+            choices, sources, transitions, counts, fps, native_clocks)
+        clock_basis = ("renderer_bound_output_ticks_v2" if used_sources <= native_clocks.keys()
+            else "partially_verified_renderer_output_ticks_v2")
+    else:
+        output_starts, native_samples = (), {}
+        clock_basis = "unverified_injected_segment_clock_v1"
     capture: _CaptureProvider | None = None
     if frame_provider is None:
         capture = _CaptureProvider(tuple(Path(item) for item in sources))
@@ -1480,6 +1596,26 @@ def build_boundary_subject_alignment_plan(
         )
     else:
         resolutions = tuple(source_resolutions)
+
+    def native_sample_at(choice_index: int, frame_index: int):
+        if not renderer_bound or not 0 <= frame_index < counts[choice_index]:
+            return None
+        sample = native_samples.get(output_starts[choice_index]+frame_index)
+        return sample if sample is not None and sample.source_index == choices[choice_index].source_index else None
+
+    def source_seconds_at(choice_index: int, frame_index: int) -> float:
+        sample = native_sample_at(choice_index, frame_index)
+        # Missing/overlap clock values are audit coordinates only; they can
+        # never reach frame decoding or authorize an alignment below.
+        return (sample.source_request_seconds if sample is not None else
+            _source_seconds(choices[choice_index], frame_index, fps=fps))
+
+    def boundary_clock_evidence(boundary_index):
+        left = native_sample_at(boundary_index, counts[boundary_index]-1)
+        right = native_sample_at(boundary_index+1, 0)
+        return {f"{side}_{field}":getattr(sample, field) if sample is not None else None
+            for side,sample in (("outgoing",left),("incoming",right))
+            for field in ("native_frame_index","output_frame_index")}
 
     def base_crop_for(choice_index: int, frame_index: int) -> tuple[float, float, float, float] | None:
         match = face_matches.get(choices[choice_index].segment_index)
@@ -1512,8 +1648,14 @@ def build_boundary_subject_alignment_plan(
             value = canonical_frame_cache[key]
             return None if value is None else value.copy()
         choice = choices[choice_index]
-        source_seconds = _source_seconds(choice, frame_index, fps=fps)
-        decoded = frames(choice.source_index, source_seconds)
+        sample = native_sample_at(choice_index, frame_index)
+        if renderer_bound and sample is None:
+            canonical_frame_cache[key] = None
+            return None
+        source_seconds = source_seconds_at(choice_index, frame_index)
+        decoded = (capture.frame_at_native_index(choice.source_index, sample.native_frame_index,
+                native_clocks[choice.source_index])
+            if capture is not None and sample is not None else frames(choice.source_index, source_seconds))
         if decoded is None:
             canonical_frame_cache[key] = None
             return None
@@ -1672,8 +1814,8 @@ def build_boundary_subject_alignment_plan(
             right.segment_index,
             left.source_index,
             right.source_index,
-            _source_seconds(left, counts[boundary_index] - 1, fps=fps),
-            _source_seconds(right, 0, fps=fps),
+            source_seconds_at(boundary_index, counts[boundary_index] - 1),
+            source_seconds_at(boundary_index+1, 0),
             False,
             reason,
             subject_kind=subject_kind,
@@ -1683,6 +1825,7 @@ def build_boundary_subject_alignment_plan(
             incoming_shot_policy=incoming_policy,
             baseline_layout_mismatch=baseline_layout,
             transformed_layout_mismatch=transformed_layout,
+            **boundary_clock_evidence(boundary_index),
         )
 
     try:
@@ -1692,6 +1835,10 @@ def build_boundary_subject_alignment_plan(
             transition = transitions[boundary_index]
             if transition.kind is not TransitionKind.HARD_CUT:
                 decisions.append(rejected(boundary_index, "unreviewed_dissolve_overlap"))
+                continue
+            if renderer_bound and (native_sample_at(boundary_index, counts[boundary_index]-1) is None
+                    or native_sample_at(boundary_index+1, 0) is None):
+                decisions.append(rejected(boundary_index, "unverified_renderer_cut_frame"))
                 continue
             if _native_cut_in_boundary_window(
                 left, outgoing=True, frame_count=counts[boundary_index],
@@ -1984,8 +2131,8 @@ def build_boundary_subject_alignment_plan(
                 right.segment_index,
                 left.source_index,
                 right.source_index,
-                _source_seconds(left, counts[boundary_index] - 1, fps=fps),
-                _source_seconds(right, 0, fps=fps),
+                source_seconds_at(boundary_index, counts[boundary_index] - 1),
+                source_seconds_at(boundary_index+1, 0),
                 True,
                 None,
                 subject_kind,
@@ -2004,6 +2151,7 @@ def build_boundary_subject_alignment_plan(
                 incoming_policy,
                 baseline_layout,
                 transformed_layout,
+                **boundary_clock_evidence(boundary_index),
             )
             decisions.append(candidate)
             candidate_by_boundary[boundary_index] = candidate
@@ -2211,6 +2359,7 @@ def build_boundary_subject_alignment_plan(
             final_segments,
             tuple(headroom_items),
             settings.window_frames,
+            sample_clock_basis=clock_basis,
         )
     finally:
         if capture is not None:

@@ -30,14 +30,18 @@ from crosscut.member_post_render_qa import (
 from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
 from crosscut.pipeline import (
     AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
+    DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH,
+    _rendered_montage_config_from_policy,
     analyze,
 )
 from crosscut.post_render_qa import (
     PostRenderArtifactSet,
+    PostRenderQAConfig,
     PostRenderQAVerdict,
     discover_completed_artifact_sets,
     evaluate_and_write_post_render_qa,
 )
+from crosscut.professional_montage_policy import load_professional_montage_policy
 from crosscut.professional_reference_gate import (
     ProfessionalReferenceProfile,
     evaluate_professional_reference_review,
@@ -319,6 +323,31 @@ def _resolve_post_render_artifact_set(
     return (completed[-1], len(completed))
 
 
+def _post_render_qa_policy_arguments(analysis_path: Path) -> dict:
+    """Recover the same independently loaded IVE policy, not report thresholds.
+
+    A stored review cannot select easier release thresholds. This standalone
+    recovery path accepts only the current shipped profile identity; different
+    or missing identities need an explicit migration, not a default-policy QA.
+    """
+    analysis = json.loads(analysis_path.read_text())
+    if not isinstance(analysis, dict):
+        raise ValueError("post-render analysis must be an object")
+    request = analysis.get("request") or {}
+    if (not isinstance(request, dict)
+            or str(request.get("group", "")).strip().upper() != "IVE"
+            or request.get("edit_mode") != "group"):
+        return {}
+    generation = analysis.get("stage_edit_generation")
+    declared = (generation.get("professional_montage_grammar_profile")
+        if isinstance(generation, dict) else analysis.get("professional_montage_grammar_profile"))
+    policy = load_professional_montage_policy(DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH)
+    if declared != policy.profile_identity:
+        raise ValueError("IVE 후처리 QA 프로필이 현재 검증된 편집 정책과 일치하지 않습니다.")
+    return {"config": PostRenderQAConfig(rendered_montage_grammar=
+        _rendered_montage_config_from_policy(policy, require_complete_role_duration_policy=True))}
+
+
 def _run_post_render_qa(arguments: argparse.Namespace, reporter: EventReporter) -> int:
     reporter.status("완성 렌더의 후처리 QA 대상을 확인하는 중…")
     reporter.progress(0.02, "타임스탬프가 일치하는 산출물 세트를 찾는 중…")
@@ -346,6 +375,7 @@ def _run_post_render_qa(arguments: argparse.Namespace, reporter: EventReporter) 
     report, report_path = evaluate_and_write_post_render_qa(
         artifact_set,
         output_path=arguments.report,
+        **_post_render_qa_policy_arguments(artifact_set.analysis_path),
     )
     payload = report.to_dict()
     reporter.progress(

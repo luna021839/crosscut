@@ -6229,6 +6229,7 @@ def _beat_phrase_metrics(
     offsets: dict[int, int] = {}
     selected_boundary_seconds: dict[int, float] = {}
     nominal_boundary_seconds: dict[int, float] = {}
+    repair_result_by_index: dict[int, Mapping[str, Any]] = {}
     repair_payload_consistency: dict[int, bool] = {}
     for raw in final_repairs:
         repair = _mapping(raw) or {}
@@ -6237,6 +6238,7 @@ def _beat_phrase_metrics(
         offset = _integer(result.get("selected_frame_offset"))
         if index is not None and offset is not None:
             offsets[index] = offset
+            repair_result_by_index[index] = result
             selected_seconds = _number(result.get("selected_boundary_seconds"))
             if selected_seconds is not None:
                 selected_boundary_seconds[index] = selected_seconds
@@ -6318,13 +6320,39 @@ def _beat_phrase_metrics(
                 abs_tol=1e-6,
             )
         )
+        # The renderer-bound producer indexes offsets from the nearest output
+        # tick, not from a fractional music timestamp. Recompute that center
+        # from the final plan's master origin; never trust a serialized center
+        # or waive the timestamp/offset relation with a larger tolerance.
+        from .boundary_repair import RENDERER_BOUND_BOUNDARY_REPAIR_POLICY
+        result = repair_result_by_index[index]
+        renderer_bound = result.get("policy") == RENDERER_BOUND_BOUNDARY_REPAIR_POLICY
+        origin = _number(plan.get("master_audio_start")) if renderer_bound else None
+        center = nominal_seconds
+        clock_contract_valid = True
+        if renderer_bound:
+            clock_contract_valid = (origin is not None and nominal_seconds is not None
+                and fps > 0 and 0 <= origin <= nominal_seconds)
+            center = (origin + round((nominal_seconds-origin)*fps)/fps
+                if clock_contract_valid else None)
+            for field, expected in (("output_timeline_origin_seconds", origin),
+                                    ("search_center_boundary_seconds", center)):
+                # Initial v2 artifacts did not duplicate these values; their
+                # final render plan is still the independent clock authority.
+                if field in result:
+                    declared = _number(result.get(field))
+                    clock_contract_valid = bool(clock_contract_valid and declared is not None
+                        and expected is not None and math.isclose(declared, expected,
+                            rel_tol=0., abs_tol=1e-9))
         offset_time_matches = (
-            nominal_seconds is not None
+            clock_contract_valid
+            and nominal_seconds is not None
             and selected_seconds is not None
+            and center is not None
             and fps > 0.0
             and math.isclose(
                 selected_seconds,
-                nominal_seconds + offset / fps,
+                center + offset / fps,
                 rel_tol=0.0,
                 abs_tol=1e-6,
             )
@@ -6336,6 +6364,9 @@ def _beat_phrase_metrics(
                 "selected_frame_offset": offset,
                 "selected_boundary_seconds": selected_seconds,
                 "nominal_boundary_seconds": nominal_seconds,
+                "output_timeline_origin_seconds": origin,
+                "search_center_boundary_seconds": center,
+                "renderer_bound_output_grid": renderer_bound,
                 "timeline_boundary_seconds": timeline_seconds,
                 "selected_time_matches_timeline": selected_time_matches_timeline,
                 "offset_time_matches": offset_time_matches,
@@ -6378,7 +6409,8 @@ def _beat_phrase_metrics(
                     "selected_frame_offset": offset,
                     "nested_payload_consistent": payload_consistent,
                 },
-                threshold="selected = nominal + frame_offset / fps",
+                threshold=("selected = origin + round((nominal-origin)*fps)/fps + frame_offset/fps"
+                    if renderer_bound else "selected = nominal + frame_offset / fps"),
             )
 
     beat_distribution = _distribution(beat_distances)

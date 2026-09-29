@@ -28,6 +28,9 @@ from .stage_edit_temporal_pose_motion import TemporalPoseMotionThresholds
 BOUNDARY_REPAIR_POLICY = (
     "fixed_source_local_frame_search_scene_safe_visual_primary_soft_beat_v1"
 )
+RENDERER_BOUND_BOUNDARY_REPAIR_POLICY = (
+    "fixed_source_output_tick_search_renderer_bound_flanks_v2"
+)
 
 
 def _finite(value: object, name: str) -> float:
@@ -299,6 +302,8 @@ class BoundaryRepairResult:
     minimum_interior_scene_cut_count: int
     best_visual_cost_at_minimum_scene_risk: float
     visual_shortlist_frame_offsets: tuple[int, ...]
+    output_timeline_origin_seconds: float | None = None
+    search_center_boundary_seconds: float | None = None
 
     @property
     def selected_boundary_seconds(self) -> float:
@@ -331,6 +336,8 @@ class BoundaryRepairResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "policy": self.policy,
+            "output_timeline_origin_seconds": self.output_timeline_origin_seconds,
+            "search_center_boundary_seconds": self.search_center_boundary_seconds,
             "nominal_boundary_seconds": self.nominal_boundary_seconds,
             "selected_boundary_seconds": self.selected_boundary_seconds,
             "selected_frame_offset": self.selected_frame_offset,
@@ -578,7 +585,7 @@ def repair_boundary(
     )
     return BoundaryRepairResult(
         policy=(BOUNDARY_REPAIR_POLICY if origin is None else
-                "fixed_source_output_tick_search_renderer_bound_flanks_v2"),
+                RENDERER_BOUND_BOUNDARY_REPAIR_POLICY),
         nominal_boundary_seconds=request.nominal_boundary_seconds,
         selected=selected,
         candidates=tuple(candidates),
@@ -588,11 +595,14 @@ def repair_boundary(
         visual_shortlist_frame_offsets=tuple(
             candidate.frame_offset for candidate in visual_shortlist
         ),
+        output_timeline_origin_seconds=origin,
+        search_center_boundary_seconds=search_center,
     )
 
 
 __all__ = [
     "BOUNDARY_REPAIR_POLICY",
+    "RENDERER_BOUND_BOUNDARY_REPAIR_POLICY",
     "BoundaryCandidateContext",
     "BoundaryCandidateRejection",
     "BoundaryCandidateScore",
