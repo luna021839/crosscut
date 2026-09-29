@@ -4,6 +4,7 @@ from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
 from .source_first_model_assets import ensure_source_first_model_assets
 from .source_first_unresolved_memo import install_source_first_unresolved_memo
 from .source_first_observation_batch import SourceFirstObservationBatch
+from .source_first_anchor_prefilter import install_source_first_anchor_prefilter
 from .direct_member_visual import _VideoDescriptorProvider
 
 
@@ -39,6 +40,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
         pose_model_path=assets.pose_model_path,body_execution_device=body_execution_device,**arguments)
     try:
         install_source_first_unresolved_memo(focal)
+        install_source_first_anchor_prefilter(focal)
     except BaseException:
         focal.close()
         raise
@@ -55,6 +57,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
                     body_frame_inference_count=focal.bodies.frame_inference_count,
                     native_face_inference_count=focal.native_faces.inference_frame_count,
                     unresolved_query_memo=focal._source_first_unresolved_memo.diagnostics(),
+                    anchor_prefilter=focal._source_first_anchor_prefilter.diagnostics(),
                     decoder_locality=_decoder_locality_diagnostics(focal),
                     persistent=focal._persistent.diagnostics() if focal._persistent else None))
                 last=now

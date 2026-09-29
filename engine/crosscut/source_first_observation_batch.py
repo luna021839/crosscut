@@ -38,6 +38,8 @@ class SourceFirstObservationBatch:
         self.batches = self.request_count = self.dependency_frame_count = 0
         self.cached_geometry_count = self.capacity_fallback_count = 0
         self.direct_resolved_query_count = self.recovery_query_count = 0
+        self.anchor_impossible_query_count = self.skipped_body_dependency_count = 0
+        self.face_first_capacity_fallback_count = 0
         self.elapsed_seconds = 0.
 
     def __call__(self, queries):
@@ -91,6 +93,7 @@ class SourceFirstObservationBatch:
                 bank = provider.faces._ensure_focal_consensus(source)
                 references = provider.bodies._ensure_references(source)
                 dependencies = {}
+                recovery_times = []
                 # First observe the exact requested frames, in source order.
                 # Only unresolved queries need the expensive track lattice.
                 # Use the resolver's same pure rule; do not publish geometry
@@ -105,14 +108,49 @@ class SourceFirstObservationBatch:
                         self.direct_resolved_query_count += 1
                     elif len(references) >= 3:
                         self.recovery_query_count += 1
+                        recovery_times.append(seconds)
                         for time in track_dependency_times(sampler, seconds):
                             key = provider.faces._identity_key(source, sampler, time)
                             if key not in pending:
                                 dependencies.setdefault(key, time)
-                for _key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
-                    provider.faces._focal_candidates(source, seconds)
-                    provider.bodies.frame_observations(source, seconds)
-                    self.dependency_frame_count += 1
+                prefilter = getattr(provider, '_source_first_anchor_prefilter', None)
+                owners = getattr(provider, 'shared_source_frames', None)
+                capacity = owners[source].maximum_working_frames if owners else 0
+                if prefilter is not None and len(dependencies) + len(pending) <= capacity:
+                    # Faces establish an upper bound on possible identity
+                    # anchors. Keep the corresponding working pixels inside
+                    # the existing bounded cache for any body work still needed.
+                    for _key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
+                        provider.faces._focal_candidates(source, seconds)
+                        self.dependency_frame_count += 1
+                    # Materialize the body/pose only where the frozen face
+                    # could support an anchor (or face evidence is unknown).
+                    # Then keep the full trajectory only for windows that
+                    # can still supply two independently observed anchors.
+                    anchor_body_keys = set()
+                    for key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
+                        if prefilter.anchor_state(source, seconds) is not False:
+                            provider.bodies.frame_observations(source, seconds)
+                            anchor_body_keys.add(key)
+                    required = set()
+                    for seconds in recovery_times:
+                        if prefilter.cannot_resolve(source, seconds):
+                            self.anchor_impossible_query_count += 1
+                        else:
+                            required.update(provider.faces._identity_key(source, sampler, time)
+                                for time in track_dependency_times(sampler, seconds))
+                    for key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
+                        if key in required and key not in anchor_body_keys:
+                            provider.bodies.frame_observations(source, seconds)
+                        elif key not in required and key not in anchor_body_keys:
+                            self.skipped_body_dependency_count += 1
+                else:
+                    if prefilter is not None:
+                        self.face_first_capacity_fallback_count += 1
+                    for _key, seconds in sorted(dependencies.items(), key=lambda item: item[1]):
+                        provider.faces._focal_candidates(source, seconds)
+                        provider.bodies.frame_observations(source, seconds)
+                        self.dependency_frame_count += 1
                 if self.progress_callback is not None:
                     self.progress_callback(dict(phase='focal_observation_batch',
                         source_index=source, batch_seconds=monotonic()-started,
@@ -127,6 +165,9 @@ class SourceFirstObservationBatch:
             cached_geometry_count=self.cached_geometry_count,
             direct_resolved_query_count=self.direct_resolved_query_count,
             recovery_query_count=self.recovery_query_count,
+            anchor_impossible_query_count=self.anchor_impossible_query_count,
+            skipped_body_dependency_count=self.skipped_body_dependency_count,
+            face_first_capacity_fallback_count=self.face_first_capacity_fallback_count,
             capacity_fallback_count=self.capacity_fallback_count,
             elapsed_seconds=self.elapsed_seconds,
             target_selection_changed=False, query_offsets_removed=False,
