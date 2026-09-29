@@ -14,6 +14,7 @@ from engine.crosscut.editorial_motion import (
 from engine.crosscut.group_boundary_grammar_adapter import (
     GroupBoundaryGrammarAdapterError,
     adapt_group_boundary_grammar_evidence,
+    validate_group_boundary_grammar_plan,
 )
 from engine.crosscut.ive import AspectRatio
 from engine.crosscut.professional_montage_grammar import (
@@ -764,6 +765,18 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
         bundle["selected_timeline"] = timeline
         with self.assertRaises(GroupBoundaryGrammarAdapterError):
             self._adapt(bundle)
+
+    def test_static_clock_preflight_needs_no_proxy_and_rejects_clock_disagreement(self):
+        bundle = self._bundle()
+        arguments = {key:bundle[key] for key in ('render_plan', 'source_index_mapping',
+            'selected_timeline', 'source_scene_cut_times', 'timeline_review', 'section_plan')}
+        _mapping, native, _sections = validate_group_boundary_grammar_plan(**arguments)
+        self.assertEqual(len(native), 2)
+        timeline = bundle['selected_timeline'].to_dict()
+        timeline['index_domain'] = 'eligible_source_index'
+        timeline['choices'][0]['internal_scene_cut_master_seconds'][0] += .0000033
+        with self.assertRaisesRegex(GroupBoundaryGrammarAdapterError, 'render authority'):
+            validate_group_boundary_grammar_plan(**{**arguments, 'selected_timeline':timeline})
 
     def test_non_identity_source_mapping_is_required_and_fail_closed(self) -> None:
         for case in (

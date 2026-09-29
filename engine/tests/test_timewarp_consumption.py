@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
 import unittest
@@ -161,6 +162,45 @@ def _choice(
 class VisualTimeWarpConsumptionTests(unittest.TestCase):
     def setUp(self) -> None:
         _RecordingSampler.calls = {}
+
+    def test_native_cut_across_control_point_uses_actual_affine_render_clock(self):
+        from crosscut.group_boundary_grammar_adapter import _validate_selected_timeline_and_map_native_cuts
+        mapped = replace(_timewarp(.5, 1.004), control_points=(
+            TimeWarpControlPoint(12., 12.5), TimeWarpControlPoint(21., 21.504),
+            TimeWarpControlPoint(108., 108.5)))
+        source_cut = mapped.master_to_source(21.25)
+        sources = (Path('scalar.mp4'), Path('warped.mp4'))
+        with patch('crosscut.visual_score._VideoSampler', _RecordingSampler), patch(
+                'crosscut.visual_score.describe_frame', return_value=_descriptor()):
+            selected = build_visual_timeline(sources=sources, canonical_spans=((20.,22.),),
+                audio_offsets=(0.,.5), sync_scores=(0.,1.),
+                scene_cut_times=((21.25,), (source_cut,)), source_timewarps=(None,mapped),
+                maximum_results=1)
+        self.assertEqual(selected.choices[0].source_index, 1)
+        segment = aligned_render_segment(source_index=1, reference_start=20., common_master_start=20.,
+            source_offset=.5, duration=2., timewarp=mapped)
+        expected = 20. + (source_cut-segment.source_start)/segment.source_playback_rate
+        # The previous inverse-map result is a different clock, not float
+        # formatting noise. Do not make the adapter's tolerance looser.
+        self.assertGreater(abs(expected-mapped.source_to_master(source_cut)), 1e-6)
+        self.assertAlmostEqual(selected.choices[0].internal_scene_cut_master_seconds[0], expected, places=10)
+        plan = RenderPlan(sources=sources, segments=(segment,), reference_source=0,
+                          aspect_ratio=AspectRatio.LANDSCAPE, output=Path('out.mp4'), master_audio_start=20.)
+        clocks, _ = _validate_selected_timeline_and_map_native_cuts(plan=plan,
+            selected_timeline=selected, source_scene_cut_times=((21.25,), (source_cut,)),
+            eligible_to_request=(0,1))
+        self.assertAlmostEqual(clocks[0], expected-20., places=10)
+
+    def test_render_span_clock_keeps_exact_domain_and_rejects_invalid_numbers(self):
+        from crosscut.render_span_clock import rendered_internal_cut_master_times as mapped_cuts
+        args = dict(source_start=10., source_end=12.002, master_start=100., master_end=102.)
+        result = mapped_cuts((9., 10., 11., 11., 12.002, 13.), **args)
+        self.assertEqual(result, (100.+1./1.001,))
+        for invalid in (float('nan'), float('inf'), True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                mapped_cuts((invalid,), **args)
+        with self.assertRaises(ValueError):
+            mapped_cuts((), **{**args, 'source_end':10.})
 
     def test_visual_sampling_and_persisted_span_use_local_clock_map(self) -> None:
         mapped = _timewarp(0.5, 1.004)

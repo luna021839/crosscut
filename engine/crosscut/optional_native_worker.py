@@ -5,6 +5,7 @@ and no raw descriptor, face vector, or model result is persisted for IPC.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
+from collections import deque
 from functools import wraps
 import copyreg
 import importlib
@@ -12,15 +13,55 @@ import inspect
 import io
 import math
 import os
+from pathlib import Path
 import pickle
 import signal
 import subprocess
 import sys
+from threading import Thread
 from time import monotonic
 from types import MappingProxyType
 
 _optional_deadline = ContextVar("optional_native_deadline", default=None)
 _WORKER_MODULE = "crosscut.optional_native_worker"
+
+
+def _worker_environment():
+    # `python engine/crosscut_cli.py` adds engine only to that interpreter's
+    # sys.path. A fresh `python -m crosscut...` does not inherit it. Bind both
+    # guardian and execute to this checkout, independently of cwd/test setup.
+    environment = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parent.parent)
+    inherited = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = package_root + (os.pathsep + inherited if inherited else "")
+    return environment
+
+
+class _WorkerStderrTail:
+    """Drain native diagnostics without unbounded buffers or disk persistence."""
+    def __init__(self):
+        self.read_fd, self.write_fd = os.pipe()
+        self.chunks = deque(maxlen=8)
+        self.thread = Thread(target=self._drain, daemon=True)
+        self.thread.start()
+
+    def _drain(self):
+        with os.fdopen(self.read_fd, "rb", buffering=0) as stream:
+            while chunk := stream.read(1024):
+                self.chunks.append(chunk)
+
+    def close_writer(self):
+        if self.write_fd is not None:
+            os.close(self.write_fd)
+            self.write_fd = None
+
+    def text(self):
+        self.thread.join(timeout=.25)
+        return b"".join(tuple(self.chunks)).decode("utf-8", errors="replace").strip()
+
+    def close(self):
+        self.close_writer()
+        self.thread.join(timeout=1.)
 
 
 def _restore_readonly_mapping(value):
@@ -107,9 +148,13 @@ def _communicate_isolated(request: bytes, deadline: float):
     from .review_first_runtime import ReviewFirstSearchCutoff
     from .workflow_supervisor import terminate_owned_process_group
     command = [sys.executable, "-m", _WORKER_MODULE, "guard", repr(deadline), str(os.getpid())]
-    worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, start_new_session=True)
+    diagnostics = _WorkerStderrTail()
+    worker = None
     try:
+        worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=diagnostics.write_fd, start_new_session=True,
+                                  env=_worker_environment())
+        diagnostics.close_writer()
         try:
             result, _ = worker.communicate(input=request, timeout=max(.001, deadline-monotonic()))
         except subprocess.TimeoutExpired as exc:
@@ -117,7 +162,11 @@ def _communicate_isolated(request: bytes, deadline: float):
         if worker.returncode != 0 or not result:
             if monotonic() >= deadline:
                 raise ReviewFirstSearchCutoff("optional native worker deadline")
-            raise RuntimeError(f"optional native worker failed with exit code {worker.returncode}")
+            # Leave room for the error prefix inside the controller's 2KB
+            # audit field; the actual fatal line is normally at the end.
+            detail = diagnostics.text()[-1500:]
+            raise RuntimeError(f"optional native worker failed with exit code {worker.returncode}"
+                               + (f"; stderr: {detail}" if detail else ""))
         ok, payload = pickle.loads(result)
         if not ok:
             raise RuntimeError(f"optional native call failed: {payload}")
@@ -126,15 +175,17 @@ def _communicate_isolated(request: bytes, deadline: float):
         # Includes a worker blocked in MLX/ONNX and inherited-pipe descendants.
         # No second communicate() can wait indefinitely on a surviving pipe.
         try:
-            terminate_owned_process_group(worker)
+            if worker is not None:
+                terminate_owned_process_group(worker)
         finally:
-            if worker.stdin:
+            if worker is not None and worker.stdin:
                 try:
                     worker.stdin.close()
                 except BrokenPipeError:
                     pass
-            if worker.stdout:
+            if worker is not None and worker.stdout:
                 worker.stdout.close()
+            diagnostics.close()
 
 
 def _execute():

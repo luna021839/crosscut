@@ -120,6 +120,7 @@ from .group_output_look import (
 )
 from .group_boundary_grammar_adapter import (
     adapt_group_boundary_grammar_evidence,
+    validate_group_boundary_grammar_plan,
 )
 from .draft import DraftSegment, GroupDraftTimeline, build_group_draft
 from .ive import AspectRatio, EditMode, SourceMode
@@ -34903,6 +34904,44 @@ def analyze(
                         "review-first GROUP candidate lacks mandatory decoded "
                         "montage evidence before proxy render"
                     )
+                if review_first_singleton_bundle is not None:
+                    preflight_inputs = dict(
+                        render_plan=plan,
+                        source_index_mapping=_source_index_mapping(request.sources, eligible_indices),
+                        selected_timeline=review_first_singleton_bundle.visual_timeline,
+                        source_scene_cut_times=tuple(
+                            tuple(float(change["timestamp_seconds"]) for change in payload["changes"])
+                            for payload in scene_payloads
+                        ),
+                        timeline_review=review_first_singleton_bundle.timeline_review,
+                        section_plan=final_montage_section_plan,
+                    )
+                    preflight_path = request.output_directory / f"{base_filename}-group-plan-preflight.json"
+                    preflight_report = {
+                        "contract": "group_static_render_contract_preflight_v1",
+                        "status": "checking",
+                        "render_authorized": False,
+                        "quality_approved": False,
+                        "render_plan": plan.to_json(),
+                        "selected_timeline": {
+                            **review_first_singleton_bundle.visual_timeline.to_dict(),
+                            "index_domain": ELIGIBLE_SOURCE_INDEX_DOMAIN,
+                        },
+                        "timeline_review": review_first_singleton_bundle.timeline_review.to_dict(),
+                        "section_plan": final_montage_section_plan.to_dict(),
+                        "source_index_mapping": preflight_inputs["source_index_mapping"],
+                        "source_scene_cut_times": preflight_inputs["source_scene_cut_times"],
+                    }
+                    # Preserve exact scalar plan inputs on failure so a clock
+                    # contract can be reproduced without another media pass.
+                    try:
+                        validate_group_boundary_grammar_plan(**preflight_inputs)
+                    except Exception as exc:
+                        preflight_report.update(status="failed", error_type=type(exc).__name__, error=str(exc))
+                        _write_analysis_manifest_atomically(preflight_path, preflight_report)
+                        raise
+                    preflight_report["status"] = "static_contract_validated"
+                    _write_analysis_manifest_atomically(preflight_path, preflight_report)
                 reporter.status(
                     "480p 후보 영상을 실제 렌더해 컷 전후를 검수하는 중…"
                 )

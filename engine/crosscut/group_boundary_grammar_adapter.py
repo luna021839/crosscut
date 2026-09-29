@@ -1382,6 +1382,41 @@ def _validated_transforms(
     )
 
 
+def validate_group_boundary_grammar_plan(
+    *, render_plan: RenderPlan, source_index_mapping: Mapping[str, Any],
+    selected_timeline: VisualTimelinePlan | Mapping[str, Any],
+    source_scene_cut_times: Sequence[Sequence[float]],
+    timeline_review: TimelineReview | Mapping[str, Any],
+    section_plan: SectionPlan | Mapping[str, Any],
+) -> tuple[tuple[int, ...], tuple[float, ...], tuple[MontageSectionWindow, ...]]:
+    """Preflight static source/clock/review contracts before encoding pixels.
+
+    The returned index map, native cut clocks and section windows are validated
+    plan context only. They neither replace decoded QA nor approve quality.
+    """
+    if not isinstance(render_plan, RenderPlan):
+        raise GroupBoundaryGrammarAdapterError("render_plan must be a RenderPlan")
+    if not render_plan.segments:
+        raise GroupBoundaryGrammarAdapterError("render_plan has no segments")
+    if _finite(render_plan.duration, "render_plan.duration") <= 0.0:
+        raise GroupBoundaryGrammarAdapterError("render duration must be positive")
+    eligible_to_request = _validated_source_index_mapping(
+        plan=render_plan, source_index_mapping=source_index_mapping,
+    )
+    native_cuts, selected_choices = _validate_selected_timeline_and_map_native_cuts(
+        plan=render_plan, selected_timeline=selected_timeline,
+        source_scene_cut_times=source_scene_cut_times,
+        eligible_to_request=eligible_to_request,
+    )
+    _validate_timeline_review(
+        plan=render_plan, timeline_review=timeline_review,
+        native_cut_times=native_cuts, eligible_to_request=eligible_to_request,
+        selected_choices=selected_choices,
+    )
+    sections = _validated_sections(plan=render_plan, section_plan=section_plan)
+    return eligible_to_request, native_cuts, sections
+
+
 def adapt_group_boundary_grammar_evidence(
     *,
     performance_id: str,
@@ -1408,32 +1443,14 @@ def adapt_group_boundary_grammar_evidence(
     payload alone, or any disagreement is rejected.
     """
 
-    if not isinstance(render_plan, RenderPlan):
-        raise GroupBoundaryGrammarAdapterError("render_plan must be a RenderPlan")
-    if not render_plan.segments:
-        raise GroupBoundaryGrammarAdapterError("render_plan has no segments")
-    duration = _finite(render_plan.duration, "render_plan.duration")
-    if duration <= 0.0:
-        raise GroupBoundaryGrammarAdapterError("render duration must be positive")
-
-    eligible_to_request = _validated_source_index_mapping(
-        plan=render_plan,
+    eligible_to_request, native_cuts, sections = validate_group_boundary_grammar_plan(
+        render_plan=render_plan,
         source_index_mapping=source_index_mapping,
-    )
-    native_cuts, selected_choices = _validate_selected_timeline_and_map_native_cuts(
-        plan=render_plan,
         selected_timeline=selected_timeline,
         source_scene_cut_times=source_scene_cut_times,
-        eligible_to_request=eligible_to_request,
-    )
-    _validate_timeline_review(
-        plan=render_plan,
         timeline_review=timeline_review,
-        native_cut_times=native_cuts,
-        eligible_to_request=eligible_to_request,
-        selected_choices=selected_choices,
+        section_plan=section_plan,
     )
-    sections = _validated_sections(plan=render_plan, section_plan=section_plan)
     continuity = _validated_proxy_continuity(
         plan=render_plan,
         rendered_proxy_review=rendered_proxy_review,
@@ -1447,7 +1464,7 @@ def adapt_group_boundary_grammar_evidence(
     )
     return ProfessionalBoundaryGrammarEvidence(
         performance_id=performance_id,
-        duration_seconds=duration,
+        duration_seconds=render_plan.duration,
         source_switch_times_seconds=_source_switch_times(render_plan),
         native_internal_cut_times_seconds=native_cuts,
         sections=sections,
@@ -1459,4 +1476,5 @@ def adapt_group_boundary_grammar_evidence(
 __all__ = [
     "GroupBoundaryGrammarAdapterError",
     "adapt_group_boundary_grammar_evidence",
+    "validate_group_boundary_grammar_plan",
 ]

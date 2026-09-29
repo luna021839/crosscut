@@ -3398,6 +3398,10 @@ class PipelineTests(unittest.TestCase):
         self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
             _model_case="baseline_error")
 
+    def test_group_review_first_static_grammar_failure_precedes_encoding(self):
+        self.test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
+            _model_case="static_contract_error")
+
     def test_automatic_group_blocks_failed_review_but_comparison_opt_in_and_local_render(
         self, _cutoff_elapsed=None, _model_case=None,
     ) -> None:
@@ -3595,7 +3599,7 @@ class PipelineTests(unittest.TestCase):
                         baseline_builder.assert_called_once()
                         if _model_case == "discovery_error":
                             raise ValueError("optional registry invalid")
-                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error", "real_producer"} else SimpleNamespace()
+                        return None if _model_case in {"missing", "assembly_error", "malformed_boundary", "late_clock_error", "real_producer", "static_contract_error"} else SimpleNamespace()
                     generation = SimpleNamespace(
                         retained_candidates=tuple(SimpleNamespace(rank=index) for index in range(2)),
                         learned_section_director=SimpleNamespace(section_plan=section_plan))
@@ -3621,6 +3625,9 @@ class PipelineTests(unittest.TestCase):
                         stack.enter_context(patch.dict("os.environ", {}, clear=True))
                         if _model_case == "baseline_error":
                             baseline_builder.side_effect = ValueError("original visual producer failure")
+                        if _model_case == "static_contract_error":
+                            stack.enter_context(patch('crosscut.pipeline.validate_group_boundary_grammar_plan',
+                                side_effect=ValueError('source-clock preflight failure')))
                         if _model_case == "real_producer":
                             from crosscut.visual_score import build_visual_timeline, FrameVisualDescriptor
                             descriptor = FrameVisualDescriptor(
@@ -3694,6 +3701,17 @@ class PipelineTests(unittest.TestCase):
                             failures = list(automatic_request.output_directory.glob('*-visual-selection-failure.json'))
                             self.assertEqual(len(failures), 1)
                             self.assertEqual(json.loads(failures[0].read_text())['status'], 'baseline_unavailable')
+                        elif _model_case == "static_contract_error":
+                            with self.assertRaisesRegex(ValueError, 'source-clock preflight failure'):
+                                analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)
+                            proxy.assert_not_called()
+                            reports = list(automatic_request.output_directory.glob('*-group-plan-preflight.json'))
+                            self.assertEqual(len(reports), 1)
+                            report = json.loads(reports[0].read_text())
+                            self.assertEqual(report['status'], 'failed')
+                            self.assertEqual(report['error'], 'source-clock preflight failure')
+                            self.assertFalse(report['render_authorized'])
+                            self.assertEqual(report['selected_timeline']['index_domain'], 'eligible_source_index')
                         else:
                             with self.assertRaises(ReachedDecodedProxy):
                                 analyze(replace(automatic_request, review_first_enabled=True), reporter, review_rendered_proxies=True)

@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 
 from .face_identity import SFACE_BACKEND, extract_sface_embedding
+from .render_span_clock import rendered_internal_cut_master_times
 from .seek_locality import SeekLocalityReader, probe_constant_frame_clock
 from .pose import (
     FormationPersonDescriptor,
@@ -6801,19 +6802,9 @@ def _build_visual_timeline(
                 cuts = tuple(
                     sorted({float(value) for value in scene_cut_times[source_index]})
                 )
-                internal_scene_cut_master_seconds = tuple(
-                    master_cut
-                    for source_cut in cuts
-                    if source_start + 1e-6 < source_cut < source_end - 1e-6
-                    for master_cut in (
-                        _master_clock_time(
-                            source_cut,
-                            source_index=source_index,
-                            audio_offsets=audio_offsets,
-                            source_timewarps=observation_clocks,
-                        ),
-                    )
-                    if master_start + 1e-6 < master_cut < master_end - 1e-6
+                internal_scene_cut_master_seconds = rendered_internal_cut_master_times(
+                    cuts, source_start=source_start, source_end=source_end,
+                    master_start=master_start, master_end=master_end,
                 )
                 tolerance = min(0.14, max(0.06, duration * 0.12))
                 boundary_risk_window = max(0.16, tolerance)

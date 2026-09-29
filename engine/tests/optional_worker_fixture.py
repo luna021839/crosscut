@@ -34,6 +34,13 @@ def fail():
     raise ValueError("injected model failure")
 
 
+def native_exit_with_stderr():
+    import os
+    os.write(2, b'x' * 200_000)
+    os.write(2, b'\nnative startup diagnostic retained\n')
+    os._exit(7)
+
+
 def unserializable_result():
     return lambda: 'unsupported callback result'
 

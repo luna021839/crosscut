@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .ive import AspectRatio
+from .render_span_clock import rendered_internal_cut_master_times
 from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from .editorial_transform_events import rendered_transform_event_records
 from .joint_boundary_provider import (
@@ -81,7 +82,6 @@ from .visual_score import (
     VisualTimelineOptimizerSeed,
     VisualTimelinePlan,
     _candidate_review_summary,
-    _master_clock_time,
     _missing_candidate_face_metadata,
     _missing_candidate_subject_metadata,
     _review_ranked_candidate_indices,
@@ -1267,23 +1267,10 @@ def _shift_joint_timeline_result(
                 audio_offsets=candidate_set.audio_offsets,
                 source_timewarps=candidate_set.source_timewarps,
             )
-            internal_scene_cut_master_seconds = tuple(
-                master_cut
-                for source_cut in candidate_set.scene_cut_times[source_index]
-                if source_start + _SCENE_CUT_INTERIOR_EPSILON_SECONDS
-                < source_cut
-                < source_end - _SCENE_CUT_INTERIOR_EPSILON_SECONDS
-                for master_cut in (
-                    _master_clock_time(
-                        source_cut,
-                        source_index=source_index,
-                        audio_offsets=candidate_set.audio_offsets,
-                        source_timewarps=candidate_set.source_timewarps,
-                    ),
-                )
-                if start + _SCENE_CUT_INTERIOR_EPSILON_SECONDS
-                < master_cut
-                < end - _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+            internal_scene_cut_master_seconds = rendered_internal_cut_master_times(
+                candidate_set.scene_cut_times[source_index],
+                source_start=source_start, source_end=source_end,
+                master_start=start, master_end=end,
             )
         else:
             internal_scene_cut_master_seconds = tuple(

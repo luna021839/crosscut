@@ -15,6 +15,30 @@ from tests.process_fixture import assert_group_member_stopped
 
 @unittest.skipUnless(os.name == "posix", "native workers require POSIX")
 class OptionalNativeWorkerTests(unittest.TestCase):
+    def test_script_style_parent_without_pythonpath_or_project_cwd(self):
+        engine_root = Path(__file__).resolve().parents[1]
+        code = (
+            "import sys,time; "
+            f"sys.path.insert(0,{str(engine_root)!r}); "
+            "from crosscut.optional_native_worker import run_isolated_python_call; "
+            "print(run_isolated_python_call('builtins','str',{'object':'bootstrap-ok'},"
+            "deadline=time.monotonic()+8.))"
+        )
+        environment = os.environ.copy()
+        environment.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, '-c', code], cwd=directory,
+                                    env=environment, capture_output=True, text=True, timeout=10.)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'bootstrap-ok')
+
+    def test_native_failure_keeps_bounded_stderr_without_corrupting_ipc(self):
+        with self.assertRaisesRegex(RuntimeError, 'native startup diagnostic retained') as caught:
+            run_isolated_python_call('tests.optional_worker_fixture', 'native_exit_with_stderr',
+                                     {}, deadline=monotonic()+8.)
+        self.assertIn('exit code 7', str(caught.exception))
+        self.assertLess(len(str(caught.exception)), 8500)
+
     def test_actual_member_camera_entry_owns_provider_outside_analysis(self):
         from types import SimpleNamespace
         from crosscut.member_camera_worker import propose_member_camera_in_worker

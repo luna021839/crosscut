@@ -39,6 +39,7 @@ from .timeline import (
 )
 from .timeline_review import TimelineReview, TimelineReviewConfig, review_timeline
 from .timewarp import TimeWarpMap
+from .render_span_clock import rendered_internal_cut_master_times
 from .stage_edit_temporal_pose_motion import (
     TemporalPoseMotionBoundaryAnalysis,
     TemporalPoseMotionThresholds,
@@ -2054,28 +2055,16 @@ def repair_visual_timeline_boundaries(
             return master_seconds + float(audio_offsets[source_index])
         return timewarp.master_to_source(master_seconds)
 
-    def master_time(source_index: int, source_seconds: float) -> float:
-        timewarp = clock_maps[source_index]
-        if timewarp is None:
-            return source_seconds - float(audio_offsets[source_index])
-        return timewarp.source_to_master(source_seconds)
-
     def internal_cut_times(
         source_index: int,
         start_seconds: float,
         end_seconds: float,
     ) -> tuple[float, ...]:
-        return tuple(
-            sorted(
-                {
-                    mapped
-                    for source_cut in scene_cut_times[source_index]
-                    for mapped in (
-                        master_time(source_index, float(source_cut)),
-                    )
-                    if start_seconds + 1e-6 < mapped < end_seconds - 1e-6
-                }
-            )
+        return rendered_internal_cut_master_times(
+            scene_cut_times[source_index],
+            source_start=source_time(source_index, start_seconds),
+            source_end=source_time(source_index, end_seconds),
+            master_start=start_seconds, master_end=end_seconds,
         )
 
     samplers: dict[int, _VideoSampler] = {}
