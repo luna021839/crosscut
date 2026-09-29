@@ -298,6 +298,8 @@ PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY = 0.65
 # observed run ceiling and 12.8--14.1 switches/minute on the XOXZ development sample,
 # versus the reviewer's 12.5 hard minimum and 13.5--17.5 preferred band.
 PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS = 5.2
+_HIGHLIGHT_SWITCH_OPPORTUNITY_BASIS = "hard_gate_admitted_endpoint_pairs_then_temporal_spread_v1"
+_ROLE_AWARE_SINGLETON_HEAD_BASIS = "reference_role_attainment_before_unapproved_geometry_repair_v1"
 
 
 def _quality_soft_floor_policy() -> dict[str, Any]:
@@ -986,6 +988,59 @@ def _candidate_role_shot_samples(
     return (tuple(samples), formation_proven)
 
 
+def _highlight_switch_opportunities(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    section_plan: SectionPlan,
+    subject_metadata_by_candidate: Mapping[str, "_CandidateSubjectMetadata"],
+    timeline_config: TimelineConfig,
+    reachable_candidate_keys: set[tuple[int, str]],
+    forbidden_boundary_edges: TimelineNoGoodSet,
+) -> dict[int, float]:
+    """Rank existing, admitted endpoint pairs, not isolated close-up shots.
+
+    This is a soft scheduling preference only. Full-path reachability is an
+    upper bound before the DP's hold/diversity state; no edge, transform, or
+    final-output quality is certified here. Unknown or one-sided shot evidence
+    cannot advertise a matched non-wide switch.
+    """
+    preferences: dict[int, float] = {}
+    broadcast_slots = dict(timeline_config.source_broadcast_slots)
+    for position in range(1, len(candidates_by_segment)):
+        lefts, rights = candidates_by_segment[position - 1:position + 1]
+        directive = section_plan.directive_at(rights[0].start_seconds)
+        if directive.role is not SectionRole.CHORUS_LIKE:
+            continue
+        best = 0.0
+        for left in lefts:
+            if (left.segment_index, left.source_id) not in reachable_candidate_keys:
+                continue
+            left_shot = _candidate_role_shot_samples(
+                left, subject_metadata_by_candidate)[0][-1]
+            if left_shot not in {"close", "medium"}:
+                continue
+            for right in rights:
+                if (left.source_id == right.source_id
+                        or (right.segment_index, right.source_id) not in reachable_candidate_keys):
+                    continue
+                right_shot = _candidate_role_shot_samples(
+                    right, subject_metadata_by_candidate)[0][0]
+                if right_shot not in {"close", "medium"}:
+                    continue
+                if (forbidden_boundary_edges and build_timeline_no_good_edge_key(
+                        position - 1, left, right) in forbidden_boundary_edges):
+                    continue
+                if not timeline_transition_hard_gates_admit(left, right, config=timeline_config):
+                    continue
+                preference = 2.0 if left_shot == right_shot == "close" else 1.0
+                slot = broadcast_slots.get(left.source_id)
+                if slot is not None and slot == broadcast_slots.get(right.source_id):
+                    preference *= timeline_config.same_broadcast_switch_bonus_multiplier
+                best = max(best, preference)
+        preferences[rights[0].segment_index] = best
+    return preferences
+
+
 def _role_conditioned_visual_controls(
     candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
     *,
@@ -1182,6 +1237,14 @@ def _role_conditioned_visual_controls(
             2.40 * highlight_rate,
         )
     highlight_bonus = min(highlight_bonus, strength)
+    switch_opportunities = _highlight_switch_opportunities(
+        candidates_by_segment,
+        section_plan=section_plan,
+        subject_metadata_by_candidate=subject_metadata_by_candidate,
+        timeline_config=settings,
+        reachable_candidate_keys=reachable_candidate_keys,
+        forbidden_boundary_edges=forbidden_boundary_edges,
+    )
     highlight_segments_by_section: dict[int, list[TimelineCandidate]] = {}
     for segment in candidates_by_segment:
         reference = segment[0]
@@ -1205,9 +1268,17 @@ def _role_conditioned_visual_controls(
                 int(math.ceil(highlight_rate * duration / 60.0 - 1e-12)),
             ),
         )
-        local_positions = _evenly_spaced_positions(
-            tuple(range(1, len(references))),
-            target_count,
+        positions = tuple(range(1, len(references)))
+        preferences = {position: switch_opportunities.get(
+            references[position].segment_index, 0.0) for position in positions}
+        # Keep the former rhythmic spread when observations give no basis for
+        # preferring one position. Otherwise allocate this same bounded bonus
+        # budget to actual compatible close/medium pairs before wide-only cuts.
+        local_positions = (
+            _evenly_spaced_positions(positions, target_count)
+            if len(set(preferences.values())) <= 1 else
+            _preferred_spread_positions(positions, target_count,
+                preference_by_position=preferences)
         )
         target_segment_indices = tuple(
             references[position].segment_index
@@ -1222,6 +1293,12 @@ def _role_conditioned_visual_controls(
                 "target_source_switches_per_minute": highlight_rate,
                 "target_source_switch_count": target_count,
                 "bonus_segment_indices": list(target_segment_indices),
+                "admitted_nonwide_opportunity_segment_indices": [
+                    references[position].segment_index for position in positions
+                    if preferences[position] > 0.0
+                ],
+                "switch_position_basis": _HIGHLIGHT_SWITCH_OPPORTUNITY_BASIS,
+                "bonus_budget_increased": False,
             }
         )
     return adjustments, switch_bonus, {
@@ -1386,6 +1463,47 @@ def _role_conditioned_candidate_outcomes(
     return tuple(outcomes)
 
 
+def _role_aware_singleton_head_index(
+    reviews: Sequence[TimelineReview],
+    outcomes: Sequence[Mapping[str, Any]],
+) -> tuple[int, str]:
+    """Choose an unapproved repair proposal without losing editorial intent.
+
+    A passing review always wins. If none passes, existing geometry-only
+    repair proposals compete on the reference's weakest highlight coverage
+    before their raw, pre-crop geometry score. Missing identity, unreadable
+    evidence, source/cadence failures and unknown failure codes receive no
+    such preference. Neither the review nor any later gate is changed.
+    """
+    default = _review_ranked_candidate_indices(reviews)[0]
+    if reviews[default].passed or not outcomes:
+        return default, "unchanged_timeline_review_order"
+    geometry_codes = {
+        "scale_mismatch_exceeded", "focus_mismatch_exceeded",
+        "formation_mismatch_exceeded",
+    }
+    eligible = []
+    by_index = {item['candidate_index']: item for item in outcomes}
+    for index, review in enumerate(reviews):
+        codes = {issue.code for issue in review.hard_failures}
+        item = by_index.get(index)
+        if (not codes or not codes <= geometry_codes or item is None
+                or item.get('highlight_metadata_floor_count', 0) <= 0):
+            continue
+        values = (item.get('minimum_highlight_metadata_attainment_score'),
+                  item.get('metadata_role_attainment_score'))
+        if any(type(value) not in (int, float) or not math.isfinite(value)
+               or not 0.0 <= value <= 1.0 for value in values):
+            continue
+        eligible.append((index, values))
+    if not eligible:
+        return default, "unchanged_timeline_review_order"
+    selected, _ = max(eligible, key=lambda row: (
+        *row[1], reviews[row[0]].weighted_score,
+        -len(reviews[row[0]].hard_failures), -row[0]))
+    return selected, _ROLE_AWARE_SINGLETON_HEAD_BASIS
+
+
 def _select_safe_cadence_candidates(
     candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
     *,
@@ -1479,10 +1597,23 @@ def _select_safe_cadence_candidates(
             reviews = tuple(review_timeline(result, available_source_count=source_count)
                             for _name, result in heads)
             selected = _review_ranked_candidate_indices(reviews)[0]
+            selection_basis = "unchanged_timeline_review_order"
+            outcomes = ()
+            if professional_montage_policy is not None:
+                assert section_plan is not None
+                outcomes = _role_conditioned_candidate_outcomes(tuple(
+                    VisualTimelineCandidateRecord(index, name, result, review, index)
+                    for index, ((name, result), review) in enumerate(zip(heads, reviews, strict=True))),
+                    section_plan=section_plan, policy=professional_montage_policy,
+                    subject_metadata_by_candidate=metadata)
+                selected, selection_basis = _role_aware_singleton_head_index(reviews, outcomes)
             if role_conditioning_audit is not None:
                 summary = {
                     name: {"passed": review.passed, "hard_failure_count": len(review.hard_failures),
-                           "weighted_score": review.weighted_score, "selected": index == selected}
+                           "weighted_score": review.weighted_score, "selected": index == selected,
+                           "selection_basis": selection_basis,
+                           "role_attainment": outcomes[index] if outcomes else None,
+                           "decoded_output_authority": False}
                     for index, ((name, _result), review) in enumerate(zip(heads, reviews, strict=True))
                 }
                 for audit in role_conditioning_audit:
@@ -2142,6 +2273,13 @@ def _visual_optimizer_input_identity(
             for segment in segments
         ],
         "selection_context": {
+            "highlight_switch_scheduling_basis": (
+                _HIGHLIGHT_SWITCH_OPPORTUNITY_BASIS if professional_montage_policy is not None else None
+            ),
+            "unapproved_singleton_head_selection_basis": (
+                _ROLE_AWARE_SINGLETON_HEAD_BASIS
+                if professional_montage_policy is not None and maximum_results == 1 else None
+            ),
             "preferred_source_ids": _optimizer_identity_value(
                 None
                 if preferred_source_ids is None
@@ -7163,7 +7301,7 @@ def _build_visual_timeline(
         candidate_generation_basis = (
             "three_safe_cadence_heads_reviewed_singleton_v2"
             if professional_montage_selection_policy is None else
-            "human_reference_role_conditioned_three_heads_reviewed_singleton_v2"
+            "human_reference_endpoint_opportunities_three_heads_repair_proposal_singleton_v3"
         )
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"

@@ -17,6 +17,7 @@ from crosscut.timeline import (
     NoCompleteTimelinePath,
     ShotType,
     TimelineCandidate,
+    TimelineConfig,
     TimelineChoice,
     TimelineMode,
     TimelineResult,
@@ -41,12 +42,14 @@ from crosscut.visual_score import (
     _dark_foreground_obstruction_score,
     _dissolve_evidence_window,
     _candidate_role_shot_samples,
+    _highlight_switch_opportunities,
     _normalized_face_metadata,
     _professional_intentional_transition_anchor_basis,
     _review_visual_timeline_candidates,
     _role_conditioned_candidate_outcomes,
     _role_conditioned_selection_payload,
     _role_conditioned_visual_controls,
+    _role_aware_singleton_head_index,
     _role_target_categories,
     _safe_cadence_profiles,
     _select_safe_cadence_candidates,
@@ -100,6 +103,108 @@ def professional_policy() -> ProfessionalMontageSelectionPolicy:
 
 
 class VisualScoreTests(unittest.TestCase):
+    @staticmethod
+    def highlight_opportunity_fixture():
+        section = SectionPlan(sections=(SectionDirective(
+            section_index=0, role=SectionRole.CHORUS_LIKE,
+            start_seconds=0., end_seconds=6., energy_score=.9, confidence=.9,
+            phrase_count=1, preferred_source_hold_beats=2,
+            target_source_switches_per_minute=18., camera_motion_budget=.8,
+            target_roll_events_per_minute=.3, establish_with_wide_shot=True,
+            protect_last_beat_from_extra_cut=False),))
+        candidates = tuple(tuple(TimelineCandidate(
+            segment_index=index, source_id=source, start_seconds=float(index),
+            end_seconds=float(index+1), candidate_id=f'{index}:{source}', shot_id=f'{source}:shot',
+            shot_type=ShotType.GROUP_WIDE,
+            entry_shot_type=ShotType.CLOSE_UP if index in {2, 5} else ShotType.GROUP_WIDE,
+            exit_shot_type=ShotType.CLOSE_UP if index in {1, 4} else ShotType.GROUP_WIDE,
+            entry_face_identity_embedding=(1., 0.), exit_face_identity_embedding=(1., 0.),
+        ) for source in ('a', 'b')) for index in range(6))
+        return section, candidates
+
+    def test_highlight_bonus_moves_to_admitted_close_endpoints_without_increasing_budget(self):
+        section, candidates = self.highlight_opportunity_fixture()
+        _, bonuses, audit = _role_conditioned_visual_controls(
+            candidates, section_plan=section, phrase_times=(0., 6.),
+            policy=professional_policy(), cadence_profile='reference',
+            subject_metadata_by_candidate={},
+            timeline_config=TimelineConfig(minimum_cross_source_face_similarity=.36))
+        self.assertEqual(len(bonuses), 3)
+        self.assertIn(2, bonuses)  # The old evenly spaced 1/3/5 omitted this pair.
+        self.assertIn(5, bonuses)
+        row = audit['highlight_source_switch_targets'][0]
+        self.assertEqual(row['admitted_nonwide_opportunity_segment_indices'], [2, 5])
+        self.assertFalse(row['bonus_budget_increased'])
+        self.assertFalse(audit['hard_visual_gate_relaxed'])
+
+    def test_highlight_opportunities_require_exact_pair_reachability_and_all_gates(self):
+        from crosscut.timeline_no_good import TimelineNoGoodSet, build_timeline_no_good_edge_key
+        section, candidates = self.highlight_opportunity_fixture()
+        keys = {(c.segment_index, c.source_id) for segment in candidates for c in segment}
+        def inspect(lattice=candidates, reachable=keys, no_goods=TimelineNoGoodSet(), **config):
+            return _highlight_switch_opportunities(lattice, section_plan=section,
+                subject_metadata_by_candidate={}, timeline_config=TimelineConfig(
+                    minimum_cross_source_face_similarity=.36, **config),
+                reachable_candidate_keys=reachable, forbidden_boundary_edges=no_goods)
+        self.assertEqual(inspect()[2], 2.)
+        forbidden = TimelineNoGoodSet(tuple(build_timeline_no_good_edge_key(1, a, b)
+            for a in candidates[1] for b in candidates[2] if a.source_id != b.source_id))
+        self.assertEqual(inspect(no_goods=forbidden)[2], 0.)
+        self.assertEqual(inspect(reachable=keys-{(2, 'a'), (2, 'b')})[2], 0.)
+        for changes in ({'entry_face_identity_embedding': (-1., 0.)},
+                        {'entry_face_identity_embedding': ()},
+                        {'entry_scene_cut_near': True},
+                        {'entry_shot_type': ShotType.GROUP_WIDE}):
+            with self.subTest(changes=changes):
+                changed = tuple(tuple(replace(c, **changes) for c in segment) if index == 2
+                    else segment for index, segment in enumerate(candidates))
+                self.assertEqual(inspect(lattice=changed)[2], 0.)
+        self.assertEqual(inspect(source_broadcast_slots=(('a', 'same'), ('b', 'same')))[2], .5)
+
+    def test_unknown_endpoint_metadata_does_not_advertise_nonwide_opportunity(self):
+        from types import SimpleNamespace
+        from crosscut.timeline_no_good import TimelineNoGoodSet
+        section, candidates = self.highlight_opportunity_fixture()
+        candidates = tuple(tuple(replace(c,
+            entry_shot_type=ShotType.MEDIUM, exit_shot_type=ShotType.MEDIUM)
+            for c in segment) for segment in candidates)
+        metadata = {c.candidate_id: SimpleNamespace(
+            shot_scale_bases=('unknown_no_subject_geometry',)*3,
+            formation_person_counts=(0,)*3, formation_upper_body_counts=(0,)*3)
+            for segment in candidates for c in segment}
+        values = _highlight_switch_opportunities(candidates, section_plan=section,
+            subject_metadata_by_candidate=metadata, timeline_config=TimelineConfig(),
+            reachable_candidate_keys={(c.segment_index,c.source_id)
+                for segment in candidates for c in segment}, forbidden_boundary_edges=TimelineNoGoodSet())
+        self.assertEqual(set(values.values()), {0.})
+
+    def test_singleton_unapproved_geometry_proposal_retains_reference_role_intent(self):
+        from types import SimpleNamespace
+        def review(*codes, score=80.):
+            return SimpleNamespace(passed=not codes, hard_failures=tuple(
+                SimpleNamespace(code=code) for code in codes), weighted_score=score, warnings=())
+        def attainment(index, value):
+            return dict(candidate_index=index, highlight_metadata_floor_count=2,
+                minimum_highlight_metadata_attainment_score=value,
+                metadata_role_attainment_score=value)
+        less_active = review('focus_mismatch_exceeded', score=88.)
+        more_active = review('focus_mismatch_exceeded', 'formation_mismatch_exceeded', score=74.)
+        outcomes = (attainment(0, .65), attainment(1, .92))
+        selected, basis = _role_aware_singleton_head_index((less_active, more_active), outcomes)
+        self.assertEqual(selected, 1)
+        self.assertIn('unapproved_geometry_repair', basis)
+        self.assertFalse(more_active.passed)
+        for protected in (review(score=70.), review('face_identity_mismatch'),
+                          review('missing_visual_evidence'), review('new_unknown_code'),
+                          review('insufficient_source_diversity')):
+            with self.subTest(protected=protected):
+                pair = (protected, more_active) if protected.passed else (less_active, protected)
+                self.assertEqual(_role_aware_singleton_head_index(pair, outcomes)[0], 0)
+        for invalid in (None, float('nan'), True, 1.1):
+            with self.subTest(invalid=invalid):
+                broken = (outcomes[0], {**outcomes[1], 'minimum_highlight_metadata_attainment_score': invalid})
+                self.assertEqual(_role_aware_singleton_head_index((less_active, more_active), broken)[0], 0)
+
     @staticmethod
     def maximum_source_run(sources: list[int]) -> int:
         maximum = run = 0
