@@ -25,6 +25,7 @@ import math
 from pathlib import Path
 from statistics import median
 from time import monotonic
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 import cv2
@@ -32,6 +33,11 @@ import cv2
 from .member_boundary_observations import (
     MemberBoundaryObservationPlan, MemberBoundaryObservationStore,
 )
+from .member_observation_search import (
+    MemberObservationSearch, MemberObservationSearchIncomplete, ObservationState,
+    ProposalEdge, TransitionDemand, TransitionObservation,
+)
+from .member_path_flow import member_path_flow_rows
 from .member_bridge_contract import (
     MAXIMUM_FOCAL_BRIDGE_HANDLE_POSE_MISMATCH,
     member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
@@ -1722,6 +1728,7 @@ class DirectBoundaryVisualDiagnostic:
     cut_applied: bool = True
     outgoing_handle_samples: tuple[_BoundarySample, ...] = ()
     incoming_handle_samples: tuple[_BoundarySample, ...] = ()
+    unobserved_pair_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1751,6 +1758,7 @@ class DirectBoundaryVisualDiagnostic:
             "raw_cross_source_pair_count": self.raw_cross_source_pair_count,
             "invalid_content_pair_count": self.invalid_content_pair_count,
             "severe_pair_count": self.severe_pair_count,
+            "unobserved_pair_count": self.unobserved_pair_count,
             "minimum_pair_cost": self.minimum_pair_cost,
             "selected_pair_cost_delta": self.selected_pair_cost_delta,
             "ping_pong_penalty_applied": self.ping_pong_penalty_applied,
@@ -1885,6 +1893,7 @@ class _ObservedMemberPairCandidate:
     outgoing_samples: tuple[_BoundarySample, ...]
     incoming_samples: tuple[_BoundarySample, ...]
     mismatch: DirectBoundaryMismatch
+    raw_mismatch: DirectBoundaryMismatch
 
 
 def _observe_member_boundary_pair(
@@ -1897,6 +1906,7 @@ def _observe_member_boundary_pair(
     priority_boundary: bool,
     config: DirectMemberVisualConfig,
     adjust_mismatch: Callable[[float, int, int, DirectBoundaryMismatch], DirectBoundaryMismatch] | None = None,
+    observed_only: bool = False,
 ) -> tuple[_ObservedMemberPairCandidate, ...]:
     """Materialize one exact source pair, retaining every allowed cut offset.
 
@@ -1909,12 +1919,21 @@ def _observe_member_boundary_pair(
         raise ValueError("pair geometry domain must match observation sources")
     plans = tuple(plan for plan in observations.plans
         if outgoing_source_index != incoming_source_index or plan.offset_frames == 0)
-    observations.prepare((plan.offset_frames, source) for plan in plans
-        for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+    if observed_only:
+        # Validate the complete offset domain before scoring. Missing samples
+        # cannot trigger preparation, decoding, target inference or defaults.
+        for plan in plans:
+            for source in dict.fromkeys((outgoing_source_index, incoming_source_index)):
+                observations.observed_samples(plan.offset_frames, source)
+        samples_for = observations.observed_samples
+    else:
+        observations.prepare((plan.offset_frames, source) for plan in plans
+            for source in dict.fromkeys((outgoing_source_index, incoming_source_index)))
+        samples_for = observations.samples_for
     candidates = []
     for plan in plans:
-        outgoing = observations.samples_for(plan.offset_frames, outgoing_source_index)
-        incoming = observations.samples_for(plan.offset_frames, incoming_source_index)
+        outgoing = samples_for(plan.offset_frames, outgoing_source_index)
+        incoming = samples_for(plan.offset_frames, incoming_source_index)
         mismatch = _boundary_mismatch(outgoing[1], incoming[2], config,
             outgoing_previous=outgoing[0], incoming_next=incoming[3],
             outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
@@ -1931,8 +1950,81 @@ def _observe_member_boundary_pair(
                 outgoing_source_index=outgoing_source_index, incoming_source_index=incoming_source_index,
                 outgoing_sample=outgoing[1], incoming_sample=incoming[2],
                 outgoing_handles=outgoing[3:], incoming_handles=incoming[3:],
-                candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config)))
+                candidate_count=len(observations.plans), priority_boundary=priority_boundary, config=config),
+            mismatch))
     return tuple(candidates)
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedIndex:
+    """Sparse source-indexed evidence. Unobserved indices have no fake value."""
+    domain_size: int
+    values: Mapping[int, Any]
+
+    def __post_init__(self):
+        object.__setattr__(self, 'values', MappingProxyType(dict(self.values)))
+
+    def __len__(self):
+        return self.domain_size
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+
+def _materialize_member_observation_domain(stores, search):
+    """Publish only actual observed pairs/samples to the final cut-time solve."""
+    source_count = stores[0].source_count
+    best_by_key = {}
+    raw_by_key = {}
+    for observation in search.observations:
+        demand = observation.demand
+        if not isinstance(observation.policy_evidence, DirectBoundaryMismatch):
+            raise TypeError('final member observation needs its measured policy evidence')
+        key = (demand.boundary_index, demand.outgoing_source_index, demand.incoming_source_index)
+        best_by_key[key] = observation.policy_evidence
+        for candidate in observation.evidence:
+            raw_by_key[(*key, candidate.plan.offset_frames)] = candidate.raw_mismatch
+    unobserved = ProposalEdge(ObservationState.UNOBSERVED, 0.,
+                             severe_flags=('transition_not_observed',))
+    matrices = tuple(tuple(tuple(best_by_key.get((boundary, left, right), unobserved)
+        for right in range(source_count)) for left in range(source_count))
+        for boundary in range(len(stores)))
+    domains = []
+    for boundary, store in enumerate(stores):
+        candidates = []
+        for plan in store.plans:
+            by_source = {source: store.observed_samples(offset, source)
+                for offset, source in store.observed_demands if offset == plan.offset_frames}
+            columns = tuple(_ObservedIndex(source_count,
+                {source: samples[slot] for source, samples in by_source.items()}) for slot in range(5))
+            matrix = _ObservedIndex(source_count, {
+                left: _ObservedIndex(source_count, {right: raw_by_key[(boundary, left, right, plan.offset_frames)]
+                    for right in range(source_count)
+                    if (boundary, left, right, plan.offset_frames) in raw_by_key})
+                for left in range(source_count)})
+            candidates.append(_DirectBoundarySearchCandidate(plan.offset_frames, plan.cut_master_seconds,
+                columns[0], columns[1], columns[2], columns[3], matrix, columns[4]))
+        domains.append(tuple(candidates))
+    return matrices, domains
+
+
+def _coarse_member_proposal_prior(left, right):
+    """Non-authoritative ranking from already observed span flanks.
+
+    Their original clocks remain unchanged. These are not target observations
+    or cut-frame/pose proof and can neither approve nor reject an exact cut.
+    """
+    if not left.samples or not right.samples:
+        return .5
+    outgoing, incoming = left.samples[-1].attention, right.samples[0].attention
+    if outgoing is None or incoming is None:
+        return .5
+    position = math.dist(outgoing.centroid_xy, incoming.centroid_xy)
+    scale = .5
+    if (outgoing.scale_area_proxy is not None and incoming.scale_area_proxy is not None
+            and outgoing.scale_area_proxy > 0 and incoming.scale_area_proxy > 0):
+        scale = min(1., abs(math.log(outgoing.scale_area_proxy/incoming.scale_area_proxy)))
+    return min(1., .6*position+.4*scale)
 
 
 def _best_boundary_search_edge(
@@ -6150,6 +6242,24 @@ _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS = 45.0
 _DIRECT_MEMBER_MILP_INFEASIBILITY_PROBE_TIME_LIMIT_SECONDS = 4.0
 
 
+def _member_milp_solve_limits(matrices, *, lexicographic: bool = False):
+    """Do not prove artificial observation priorities globally optimal.
+
+    ProposalEdge is not a visual measurement. A provisional witness still
+    passes the exact same independent hard-constraint audit and every chosen
+    transition must be measured before delivery. Counterfactual infeasibility
+    requires an actual solver proof; a time limit never supplies that proof.
+    Real measured matrices retain the original quality optimization settings.
+    Keep the role-aware lexicographic objective exact even for proposals.
+    """
+    proposal_only = bool(matrices) and all(isinstance(edge, ProposalEdge)
+        for matrix in matrices for row in matrix for edge in row)
+    return {
+        'time_limit': 4.0 if proposal_only else _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+        'mip_rel_gap': .10 if proposal_only and not lexicographic else 0.0,
+    }
+
+
 def _prefer_direct_member_milp(
     candidate_validity: Sequence[Sequence[bool]],
 ) -> bool:
@@ -6288,6 +6398,9 @@ def _milp_feasibility_lifeline(
     lower_bounds = np.zeros(variable_count, dtype=np.float64)
     upper_bounds = np.ones(variable_count, dtype=np.float64)
     integrality = np.ones(variable_count, dtype=np.int32)
+    # Flow fixes edge values once the one-hot source variables are integral.
+    # The AND rows likewise fix ping-pong helpers exactly; no extra branching.
+    integrality[edge_base:duration_slack_base] = 0
     order_rank = {
         source_index: rank for rank, source_index in enumerate(source_order)
     }
@@ -6393,31 +6506,9 @@ def _milp_feasibility_lifeline(
             target,
             target,
         )
-    for boundary_index, edge_indices in enumerate(edges_by_boundary):
-        add_constraint(
-            tuple((edge_base + edge_index, 1.0) for edge_index in edge_indices),
-            1.0,
-            1.0,
-        )
-        for edge_index in edge_indices:
-            _boundary, left, right, _severe, _cost = edge_specs[edge_index]
-            edge_variable = edge_base + edge_index
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    (boundary_index * source_count + left, -1.0),
-                ),
-                -math.inf,
-                0.0,
-            )
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    ((boundary_index + 1) * source_count + right, -1.0),
-                ),
-                -math.inf,
-                0.0,
-            )
+    for terms in member_path_flow_rows(edge_specs, source_count=source_count,
+            boundary_count=span_count-1, edge_base=edge_base):
+        add_constraint(terms, 0.0, 0.0)
     for ping_index, (position, source_index) in enumerate(ping_specs):
         ping_variable = ping_base + ping_index
         current = position * source_count + source_index
@@ -6463,6 +6554,7 @@ def _milp_feasibility_lifeline(
         ),
         shape=(len(constraint_lower), variable_count),
     ).tocsr()
+    solve_limits = _member_milp_solve_limits(matrices)
     result = milp(
         objective,
         integrality=integrality,
@@ -6475,9 +6567,8 @@ def _milp_feasibility_lifeline(
         options={
             "disp": False,
             "presolve": True,
-            "time_limit": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+            **solve_limits,
             "node_limit": int(max(1, state_limit)),
-            "mip_rel_gap": 0.0,
         },
     )
     status = int(result.status)
@@ -6488,7 +6579,9 @@ def _milp_feasibility_lifeline(
         "message": str(result.message),
         "success": bool(result.success),
         "variable_count": variable_count,
-        "binary_variable_count": duration_slack_base,
+        "binary_variable_count": int(np.count_nonzero(integrality)),
+        "continuous_determined_path_variable_count": len(edge_specs) + len(ping_specs),
+        "edge_link_formulation": "source_marginal_flow_equalities_v1",
         "continuous_duration_slack_variable_count": 2 * source_count,
         "constraint_count": len(constraint_lower),
         "edge_variable_count": len(edge_specs),
@@ -6502,7 +6595,8 @@ def _milp_feasibility_lifeline(
         "objective_value": (
             float(result.fun) if getattr(result, "fun", None) is not None else None
         ),
-        "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+        "time_limit_seconds": solve_limits['time_limit'],
+        "requested_mip_relative_gap": solve_limits['mip_rel_gap'],
         "duration_state_quantization_applied": False,
         "postsolve_path_audit_required": True,
         "forbidden_source_path_count": len(
@@ -8354,6 +8448,7 @@ def _milp_bounded_same_source_hold_visual_path(
     lower_bounds = np.zeros(variable_count, dtype=np.float64)
     upper_bounds = np.ones(variable_count, dtype=np.float64)
     integrality = np.ones(variable_count, dtype=np.int32)
+    integrality[edge_base:duration_slack_base] = 0
     order_rank = {
         source_index: rank for rank, source_index in enumerate(source_order)
     }
@@ -8454,31 +8549,9 @@ def _milp_bounded_same_source_hold_visual_path(
             target,
             target,
         )
-    for boundary_index, edge_indices in enumerate(edges_by_boundary):
-        add_constraint(
-            tuple((edge_base + edge_index, 1.0) for edge_index in edge_indices),
-            1.0,
-            1.0,
-        )
-        for edge_index in edge_indices:
-            _boundary, left, right, _is_hold, _cost = edge_specs[edge_index]
-            edge_variable = edge_base + edge_index
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    (boundary_index * source_count + left, -1.0),
-                ),
-                -math.inf,
-                0.0,
-            )
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    ((boundary_index + 1) * source_count + right, -1.0),
-                ),
-                -math.inf,
-                0.0,
-            )
+    for terms in member_path_flow_rows(edge_specs, source_count=source_count,
+            boundary_count=boundary_count, edge_base=edge_base):
+        add_constraint(terms, 0.0, 0.0)
     for ping_index, (position, source_index) in enumerate(ping_specs):
         ping_variable = ping_base + ping_index
         current = position * source_count + source_index
@@ -8574,6 +8647,7 @@ def _milp_bounded_same_source_hold_visual_path(
         ),
         shape=(len(constraint_lower), variable_count),
     ).tocsr()
+    solve_limits = _member_milp_solve_limits(matrices)
     result = milp(
         objective,
         integrality=integrality,
@@ -8586,9 +8660,8 @@ def _milp_bounded_same_source_hold_visual_path(
         options={
             "disp": False,
             "presolve": True,
-            "time_limit": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+            **solve_limits,
             "node_limit": int(max(1, config.feasibility_lifeline_state_limit)),
-            "mip_rel_gap": 0.0,
         },
     )
     status = int(result.status)
@@ -8599,7 +8672,9 @@ def _milp_bounded_same_source_hold_visual_path(
         "message": str(result.message),
         "success": bool(result.success),
         "variable_count": variable_count,
-        "binary_variable_count": duration_slack_base,
+        "binary_variable_count": int(np.count_nonzero(integrality)),
+        "continuous_determined_path_variable_count": len(edge_specs) + len(ping_specs),
+        "edge_link_formulation": "source_marginal_flow_equalities_v1",
         "constraint_count": len(constraint_lower),
         "edge_variable_count": len(edge_specs),
         "hold_edge_variable_count": sum(
@@ -8616,7 +8691,8 @@ def _milp_bounded_same_source_hold_visual_path(
         "objective_value": (
             float(result.fun) if getattr(result, "fun", None) is not None else None
         ),
-        "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+        "time_limit_seconds": solve_limits['time_limit'],
+        "requested_mip_relative_gap": solve_limits['mip_rel_gap'],
         "postsolve_path_audit_required": True,
         "forbidden_source_path_count": len(
             normalized_forbidden_paths
@@ -9957,6 +10033,7 @@ def _heterogeneous_cinematic_visual_path(
     upper_bounds = np.ones(variable_count, dtype=np.float64)
     upper_bounds[:x_count] = np.asarray(upper_x, dtype=np.float64)
     integrality = np.ones(variable_count, dtype=np.int32)
+    integrality[edge_base:used_source_base] = 0
     order_rank = {
         source_index: rank for rank, source_index in enumerate(source_order)
     }
@@ -10158,34 +10235,9 @@ def _heterogeneous_cinematic_visual_path(
             float(len(active_sources)),
             family="minimum_distinct_source_count",
         )
-    for boundary_index, edge_indices in enumerate(edges_by_boundary):
-        add_constraint(
-            tuple((edge_base + edge_index, 1.0) for edge_index in edge_indices),
-            1.0,
-            1.0,
-            family="edge_one_hot",
-        )
-        for edge_index in edge_indices:
-            _boundary, left, right, _hold, _bridge, _cost = edge_specs[edge_index]
-            edge_variable = edge_base + edge_index
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    (boundary_index * source_count + left, -1.0),
-                ),
-                -math.inf,
-                0.0,
-                family="edge_flow",
-            )
-            add_constraint(
-                (
-                    (edge_variable, 1.0),
-                    ((boundary_index + 1) * source_count + right, -1.0),
-                ),
-                -math.inf,
-                0.0,
-                family="edge_flow",
-            )
+    for terms in member_path_flow_rows(edge_specs, source_count=source_count,
+            boundary_count=boundary_count, edge_base=edge_base):
+        add_constraint(terms, 0.0, 0.0, family="edge_flow")
     # A landscape facecam outside an annotated highlight is available only as
     # a frame-proven effect insert.  Merely being adjacent to some exceptional
     # candidate must not let the optimizer start or coast on that source
@@ -10462,6 +10514,7 @@ def _heterogeneous_cinematic_visual_path(
         ),
         shape=(len(constraint_lower), variable_count),
     ).tocsr()
+    solve_limits = _member_milp_solve_limits(matrices, lexicographic=True)
     result = milp(
         objective,
         integrality=integrality,
@@ -10474,9 +10527,8 @@ def _heterogeneous_cinematic_visual_path(
         options={
             "disp": False,
             "presolve": True,
-            "time_limit": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+            **solve_limits,
             "node_limit": int(max(1, config.feasibility_lifeline_state_limit)),
-            "mip_rel_gap": 0.0,
         },
     )
     status = int(result.status)
@@ -10491,6 +10543,9 @@ def _heterogeneous_cinematic_visual_path(
         "source_usage_binary_variable_count": (
             used_source_variable_count
         ),
+        "binary_variable_count": int(np.count_nonzero(integrality)),
+        "continuous_determined_path_variable_count": len(edge_specs) + len(ping_specs),
+        "edge_link_formulation": "source_marginal_flow_equalities_v1",
         "constraint_count": len(constraint_lower),
         "edge_variable_count": len(edge_specs),
         "bridge_candidate_edge_count": sum(
@@ -10572,7 +10627,8 @@ def _heterogeneous_cinematic_visual_path(
             silhouette_outlier_lexicographic_penalty
         ),
         "secondary_objective_upper_bound": secondary_objective_upper_bound,
-        "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
+        "time_limit_seconds": solve_limits['time_limit'],
+        "requested_mip_relative_gap": solve_limits['mip_rel_gap'],
         "postsolve_path_audit_required": True,
         "forbidden_source_path_count": len(
             normalized_forbidden_paths
@@ -11963,1302 +12019,48 @@ def _boundary_endpoint_content_eligibility(outgoing_valid: bool, incoming_valid:
     return outgoing_valid, outgoing_valid, incoming_valid, handle_valid, handle_valid
 
 
-def select_balanced_direct_member_sources(
+@dataclass(frozen=True, slots=True)
+class _DirectMemberPathDecision:
+    path: tuple[int, ...]
+    optimizer_cost: float
+    optimizer_search_diagnostics: dict[str, Any]
+    usage_policy: str
+    selected_source_targets: tuple[int, ...]
+    selected_count_minimums: tuple[int, ...]
+    selected_count_maximums: tuple[int, ...]
+    selected_duration_targets: tuple[float, ...] | None
+    selected_duration_minimums: tuple[float, ...]
+    selected_duration_maximums: tuple[float, ...]
+    quota_assignment_provenance: dict[str, Any]
+
+
+def _decide_direct_member_path_policy(
+    matrices,
     *,
-    sources: Sequence[Path],
-    canonical_spans: Sequence[tuple[float, float]],
-    audio_offsets: Sequence[float],
-    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
-    source_scene_cut_times: Sequence[Sequence[float]] | None = None,
-    source_frame_sizes: Sequence[tuple[int, int]] | None = None,
-    output_frame_size: tuple[int, int] = (1080, 1920),
-    continuous_official_portrait_fancam_contract: bool = False,
-    cinematic_bridge_enabled: bool = False,
-    required_distinct_source_count: int | None = None,
-    preferred_source_order: Sequence[int] | None = None,
-    extra_quota_source_indices: Sequence[int] | None = None,
-    priority_cut_boundary_indices: Sequence[int] = (),
-    forbidden_same_source_hold_boundary_indices: Sequence[int] = (),
-    maximum_priority_cut_hold_count: int = 0,
-    render_infeasible_transition_edges: Sequence[
-        tuple[float, int, int]
-    ] = (),
-    render_penalized_transition_edges: Sequence[
-        tuple[float, int, int, float]
-    ] = (),
-    joint_camera_failed_proposals: Sequence[tuple[float, int, int, float]] = (),
-    forbidden_source_paths: Sequence[Sequence[int]] = (),
-    decoded_proxy_preferred_source_path: Sequence[int] | None = None,
-    decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
-    decoded_proxy_source_deviation_penalty: float = (
-        _DECODED_PROXY_LOCAL_REPAIR_SOURCE_DEVIATION_PENALTY
-    ),
-    config: DirectMemberVisualConfig | None = None,
-    descriptor_provider: DescriptorProvider | None = None,
-) -> DirectMemberVisualSelection:
-    """Select a balanced visual path over already-fixed musical spans.
-
-    Every eligible source is decoded immediately before and after every coarse
-    boundary. Source-local sample times and source-native scene cuts are mapped
-    through the accepted ``TimeWarpMap`` when present and retain scalar offsets
-    otherwise. Any native cut that survives strictly inside a coarsened span is
-    a hard-invalid source/span candidate even when six sampled frames miss it.
-    The exact verified continuous official portrait-fancam contract may suppress
-    only a raw detector event whose non-identifying flank evidence proves a
-    continuous performance; generic/manual callers retain the strict policy.
-    ``extra_quota_source_indices`` changes only which sources receive the
-    remainder slots of an otherwise exactly balanced quota.  It never changes
-    source search order, content validity, severe-edge, or duration gates.
-    ``priority_cut_boundary_indices`` identifies section-critical cuts whose
-    no-cut continuations are separately capped by
-    ``maximum_priority_cut_hold_count``.
-    ``forbidden_same_source_hold_boundary_indices`` carries exact failed
-    post-alignment cadence witnesses back into the path search. Only those
-    observed boundaries are forced to cut; the ordinary compensated-hold
-    budget remains available everywhere else.
-    ``source_frame_sizes`` authorizes geometry repair only by proving that the
-    post-portrait-fill working frame remains no larger than decoded source
-    pixels. Missing sizes retain the historical no-repair hard gates.
-    ``cinematic_bridge_enabled`` authorizes a terminal role-aware allocation
-    for official member fancams, including portrait-only sets, only after strict
-    balanced and bounded no-cut paths are proven infeasible. Its framing-only
-    severe edges remain forbidden as hard cuts and must be materialized as
-    audited effects.
-    ``render_infeasible_transition_edges`` carries dense-render certificates
-    from a prior motion solve.  A certified source pair is removed only near
-    its measured canonical boundary; the optimizer must choose another source
-    pair or a meaningfully different cut time instead of relaxing geometry.
-    ``render_penalized_transition_edges`` carries decoded-output continuity
-    feedback.  Unlike a camera-solve failure, a visually poor decoded edge is
-    still renderable, so its bounded finite cost may steer the path without
-    disconnecting an otherwise viable source graph.
-    ``joint_camera_failed_proposals`` is separate run-local camera feedback:
-    costs apply at the exact failed clock only. At that boundary, interleaved
-    frames omitted by the coarse search are measured within the SAME window.
-    No camera failure is promoted to source exclusion or decoded-QA evidence.
-    ``forbidden_source_paths`` contains exact source sequences already rendered
-    and rejected under this same musical partition.  Each no-good constraint
-    excludes only the complete repeated sequence; its individual sources and
-    transitions remain eligible in every other combination.
-    ``decoded_proxy_preferred_source_path`` supplies the last decoded path only
-    during a bounded continuity repair. Source positions adjacent to a failed
-    boundary remain free; changing any other position adds a finite Hamming
-    cost. This keeps successful editing decisions stable without hard-locking
-    the graph or weakening visual validity, cadence, or source-usage gates.
-    ``required_distinct_source_count`` may be lower than the analyzed source
-    count only for an explicitly bounded quality-proof render. Every source is
-    still decoded and scored; the exact represented subset is selected from
-    validity, quality, and non-severe transition connectivity. Ordinary/full
-    song callers omit it and retain mandatory all-source coverage.
-    """
-
-    from .member_camera_search_feedback import MemberCameraSearchFeedback
-    camera_feedback = MemberCameraSearchFeedback(tuple(joint_camera_failed_proposals))
-    resolved_sources = tuple(Path(source) for source in sources)
-    if not isinstance(continuous_official_portrait_fancam_contract, bool):
-        raise TypeError(
-            "continuous_official_portrait_fancam_contract must be boolean"
-        )
-    if not isinstance(cinematic_bridge_enabled, bool):
-        raise TypeError("cinematic_bridge_enabled must be boolean")
-    source_count = len(resolved_sources)
-    if source_count < 2:
-        raise ValueError("direct visual selection needs at least two sources")
-    represented_source_count = (
-        source_count
-        if required_distinct_source_count is None
-        else required_distinct_source_count
-    )
-    if (
-        isinstance(represented_source_count, bool)
-        or not isinstance(represented_source_count, int)
-        or not 2 <= represented_source_count <= source_count
-    ):
-        raise ValueError(
-            "required_distinct_source_count must be between two and the "
-            "analyzed source count"
-        )
-    if len(output_frame_size) != 2:
-        raise ValueError("direct visual output frame size needs width and height")
-    output_width, output_height = output_frame_size
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value <= 0
-        for value in (output_width, output_height)
-    ):
-        raise ValueError("direct visual output frame size is invalid")
-    if source_frame_sizes is None:
-        source_frame_geometries: tuple[
-            DirectMemberSourceFrameGeometry | None,
-            ...,
-        ] = (None,) * source_count
-    else:
-        if len(source_frame_sizes) != source_count:
-            raise ValueError("direct visual source frame sizes must match sources")
-        source_frame_geometries = tuple(
-            direct_member_source_frame_geometry(
-                size,
-                output_size=(output_width, output_height),
-            )
-            for size in source_frame_sizes
-        )
-    spans = tuple((float(start), float(end)) for start, end in canonical_spans)
-    if len(spans) < represented_source_count:
-        raise ValueError(
-            "direct visual selection needs at least one span per represented source"
-        )
-    for index, (start, end) in enumerate(spans):
-        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
-            raise ValueError("direct visual spans must be finite and positive")
-        if index and not math.isclose(
-            spans[index - 1][1],
-            start,
-            rel_tol=0.0,
-            abs_tol=1e-7,
-        ):
-            raise ValueError("direct visual spans must be contiguous")
-    normalized_forbidden_paths = _normalized_forbidden_source_paths(
-        forbidden_source_paths,
-        span_count=len(spans),
-        source_count=source_count,
-    )
-    preferred_proxy_path = (
-        ()
-        if decoded_proxy_preferred_source_path is None
-        else tuple(decoded_proxy_preferred_source_path)
-    )
-    proxy_repair_targets = tuple(
-        decoded_proxy_repair_target_boundary_indices
-    )
-    if preferred_proxy_path and (
-        len(preferred_proxy_path) != len(spans)
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not 0 <= value < source_count
-            for value in preferred_proxy_path
-        )
-    ):
-        raise ValueError("decoded-proxy preferred source path is invalid")
-    if (
-        any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not 0 <= value < len(spans) - 1
-            for value in proxy_repair_targets
-        )
-        or len(set(proxy_repair_targets)) != len(proxy_repair_targets)
-    ):
-        raise ValueError("decoded-proxy local repair targets are invalid")
-    if bool(preferred_proxy_path) != bool(proxy_repair_targets):
-        raise ValueError(
-            "decoded-proxy path and repair targets must be supplied together"
-        )
-    if (
-        len(proxy_repair_targets)
-        > _DECODED_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT
-    ):
-        raise ValueError("decoded-proxy local repair target limit exceeded")
-    if (
-        isinstance(decoded_proxy_source_deviation_penalty, bool)
-        or not isinstance(
-            decoded_proxy_source_deviation_penalty,
-            (int, float),
-        )
-        or not math.isfinite(float(decoded_proxy_source_deviation_penalty))
-        or not 0.0 < float(decoded_proxy_source_deviation_penalty)
-        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
-    ):
-        raise ValueError("decoded-proxy source deviation penalty is invalid")
-    proxy_repair_span_indices = frozenset(
-        span_index
-        for boundary_index in proxy_repair_targets
-        for span_index in (boundary_index, boundary_index + 1)
-    )
-    proxy_protected_span_indices = frozenset(
-        span_index
-        for span_index in range(len(spans))
-        if span_index not in proxy_repair_span_indices
-    )
-    total_duration_seconds = spans[-1][1] - spans[0][0]
-    short_proof_source_exposure_tolerance_applied = bool(
-        represented_source_count < source_count
-        or total_duration_seconds
-        <= _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS + 1e-9
-    )
-    priority_boundaries = tuple(
-        int(value) for value in priority_cut_boundary_indices
-    )
-    forbidden_hold_boundaries = tuple(
-        int(value) for value in forbidden_same_source_hold_boundary_indices
-    )
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value < len(spans) - 1
-        for value in priority_cut_boundary_indices
-    ):
-        raise ValueError("priority cut boundary indices are invalid")
-    if len(set(priority_boundaries)) != len(priority_boundaries):
-        raise ValueError("priority cut boundary indices must be unique")
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value < len(spans) - 1
-        for value in forbidden_same_source_hold_boundary_indices
-    ):
-        raise ValueError("forbidden same-source hold boundaries are invalid")
-    if len(set(forbidden_hold_boundaries)) != len(forbidden_hold_boundaries):
-        raise ValueError("forbidden same-source hold boundaries must be unique")
-    if (
-        isinstance(maximum_priority_cut_hold_count, bool)
-        or not isinstance(maximum_priority_cut_hold_count, int)
-        or maximum_priority_cut_hold_count < 0
-    ):
-        raise ValueError("maximum priority cut hold count is invalid")
-    if len(audio_offsets) != source_count:
-        raise ValueError("direct visual audio_offsets must match sources")
-    offsets = tuple(float(value) for value in audio_offsets)
-    if any(not math.isfinite(value) for value in offsets):
-        raise ValueError("direct visual audio offsets must be finite")
-    clocks = (
-        (None,) * source_count
-        if source_timewarps is None
-        else tuple(source_timewarps)
-    )
-    if len(clocks) != source_count:
-        raise ValueError("direct visual source_timewarps must match sources")
-    for index, timewarp in enumerate(clocks):
-        if timewarp is None:
-            continue
-        if not isinstance(timewarp, TimeWarpMap):
-            raise TypeError("direct visual source_timewarps entries must be maps")
-        if not math.isclose(
-            timewarp.global_offset_seconds,
-            offsets[index],
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ):
-            raise ValueError("direct visual timewarp offset does not match audio offset")
-    scene_cut_evidence_available = source_scene_cut_times is not None
-    local_scene_cuts = (
-        ((),) * source_count
-        if source_scene_cut_times is None
-        else tuple(tuple(float(value) for value in cuts) for cuts in source_scene_cut_times)
-    )
-    if len(local_scene_cuts) != source_count:
-        raise ValueError("direct visual scene cut times must match sources")
-    for source_index, cuts in enumerate(local_scene_cuts):
-        if any(not math.isfinite(value) or value < 0.0 for value in cuts):
-            raise ValueError("direct visual scene cut times must be finite and non-negative")
-        if any(left >= right for left, right in zip(cuts, cuts[1:])):
-            raise ValueError(
-                f"direct visual scene cut times for source {source_index} "
-                "must be strictly increasing"
-            )
-    mapped_scene_cuts = tuple(
-        tuple(
-            (
-                source_seconds,
-                _source_master_time(
-                    source_seconds,
-                    source_index=source_index,
-                    audio_offsets=offsets,
-                    source_timewarps=clocks,
-                ),
-            )
-            for source_seconds in cuts
-        )
-        for source_index, cuts in enumerate(local_scene_cuts)
-    )
-    order = (
-        tuple(range(source_count))
-        if preferred_source_order is None
-        else tuple(int(index) for index in preferred_source_order)
-    )
-    if len(order) != source_count or set(order) != set(range(source_count)):
-        raise ValueError("preferred_source_order must be a source permutation")
-    if (
-        represented_source_count < source_count
-        and extra_quota_source_indices is not None
-    ):
-        raise ValueError(
-            "extra_quota_source_indices cannot override a quality-ranked "
-            "proof subset"
-        )
-    initial_active_order = order[:represented_source_count]
-    _base_quota, extra_quota_count = divmod(
-        len(spans), represented_source_count
-    )
-    if extra_quota_source_indices is None:
-        quota_order = order
-        explicit_extra_quota_sources = tuple(order[:extra_quota_count])
-        quota_assignment_basis = "preferred_source_order_default"
-    else:
-        explicit_extra_quota_sources = tuple(
-            int(index) for index in extra_quota_source_indices
-        )
-        if (
-            len(explicit_extra_quota_sources) != extra_quota_count
-            or len(set(explicit_extra_quota_sources))
-            != len(explicit_extra_quota_sources)
-            or any(
-                not 0 <= index < source_count
-                for index in explicit_extra_quota_sources
-            )
-        ):
-            raise ValueError(
-                "extra_quota_source_indices must contain exactly the balanced "
-                "remainder source set"
-            )
-        explicit_set = set(explicit_extra_quota_sources)
-        quota_order = explicit_extra_quota_sources + tuple(
-            index for index in order if index not in explicit_set
-        )
-        quota_assignment_basis = "explicit_extra_quota_source_set"
-    base_config = config or DirectMemberVisualConfig()
-    resolved_config = (
-        replace(
-            base_config,
-            maximum_source_duration_relative_deviation=max(
-                base_config.maximum_source_duration_relative_deviation,
-                _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_SOURCE_DURATION_RELATIVE_DEVIATION,
-            ),
-        )
-        if short_proof_source_exposure_tolerance_applied
-        else base_config
-    )
-    render_infeasible_edges: tuple[tuple[float, int, int], ...] = tuple(
-        (
-            float(boundary_seconds),
-            int(outgoing_source_index),
-            int(incoming_source_index),
-        )
-        for boundary_seconds, outgoing_source_index, incoming_source_index
-        in render_infeasible_transition_edges
-    )
-    if any(
-        not math.isfinite(boundary_seconds)
-        or boundary_seconds < spans[0][0] - 1e-9
-        or boundary_seconds > spans[-1][1] + 1e-9
-        or not 0 <= outgoing_source_index < source_count
-        or not 0 <= incoming_source_index < source_count
-        or outgoing_source_index == incoming_source_index
-        for boundary_seconds, outgoing_source_index, incoming_source_index
-        in render_infeasible_edges
-    ):
-        raise ValueError("render-infeasible transition edge is invalid")
-    if len(set(render_infeasible_edges)) != len(render_infeasible_edges):
-        raise ValueError("render-infeasible transition edges must be unique")
-    render_penalized_edges: tuple[tuple[float, int, int, float], ...] = tuple(
-        (
-            float(boundary_seconds),
-            int(outgoing_source_index),
-            int(incoming_source_index),
-            float(penalty),
-        )
-        for (
-            boundary_seconds,
-            outgoing_source_index,
-            incoming_source_index,
-            penalty,
-        ) in render_penalized_transition_edges
-    )
-    if any(
-        not math.isfinite(boundary_seconds)
-        or boundary_seconds < spans[0][0] - 1e-9
-        or boundary_seconds > spans[-1][1] + 1e-9
-        or not 0 <= outgoing_source_index < source_count
-        or not 0 <= incoming_source_index < source_count
-        or outgoing_source_index == incoming_source_index
-        or not math.isfinite(penalty)
-        or not 0.0 < penalty
-        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
-        for (
-            boundary_seconds,
-            outgoing_source_index,
-            incoming_source_index,
-            penalty,
-        ) in render_penalized_edges
-    ):
-        raise ValueError("render-penalized transition edge is invalid")
-    render_penalized_keys = tuple(
-        (boundary_seconds, outgoing_source_index, incoming_source_index)
-        for (
-            boundary_seconds,
-            outgoing_source_index,
-            incoming_source_index,
-            _penalty,
-        ) in render_penalized_edges
-    )
-    if len(set(render_penalized_keys)) != len(render_penalized_keys):
-        raise ValueError("render-penalized transition edges must be unique")
-    if any(cut < spans[0][0]-1e-9 or cut > spans[-1][1]+1e-9
-           or left >= source_count or right >= source_count
-           for cut, left, right, _ in camera_feedback.proposals):
-        raise ValueError('camera feedback is outside the selected source/time domain')
-    quotas = (
-        _balanced_quotas(len(spans), source_count, quota_order)
-        if represented_source_count == source_count
-        else _balanced_subset_quotas(
-            len(spans), source_count, initial_active_order
-        )
-    )
-    heterogeneous_cinematic_authorized = bool(
-        cinematic_bridge_enabled
-        and continuous_official_portrait_fancam_contract
-        and all(geometry is not None for geometry in source_frame_geometries)
-        and any(
-            geometry is not None
-            and geometry.source_width <= geometry.source_height
-            for geometry in source_frame_geometries
-        )
-    )
-    quota_assignment_provenance = {
-        "contract": "strict_balanced_extra_quota_assignment_v1",
-        "basis": quota_assignment_basis,
-        "span_count": len(spans),
-        "source_count": source_count,
-        "required_distinct_source_count": represented_source_count,
-        "base_quota": _base_quota,
-        "extra_quota_count": extra_quota_count,
-        "extra_quota_source_indices": list(explicit_extra_quota_sources),
-        "source_search_order": list(order),
-        "source_search_order_changed": False,
-        "counts_differ_by_at_most_one": True,
-        "all_analyzed_sources_required": (
-            represented_source_count == source_count
-        ),
-        "source_duration_balance_policy": (
-            "short_proof_exact_count_flexible_exposure_v1"
-            if short_proof_source_exposure_tolerance_applied
-            else "ordinary_full_song_exact_count_strict_exposure_v1"
-        ),
-        "short_proof_maximum_duration_seconds": (
-            _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS
-        ),
-        "total_duration_seconds": total_duration_seconds,
-        "maximum_source_duration_relative_deviation": (
-            resolved_config.maximum_source_duration_relative_deviation
-        ),
-        "ordinary_full_song_maximum_source_duration_relative_deviation": (
-            DirectMemberVisualConfig().maximum_source_duration_relative_deviation
-        ),
-        "visual_thresholds_changed": False,
-        "visual_gates_relaxed": False,
-    }
-
-    owned_provider: _VideoDescriptorProvider | None = None
-    provider = descriptor_provider
-    if provider is None:
-        owned_provider = _VideoDescriptorProvider(resolved_sources)
-        provider = owned_provider
-    # Custom providers keep their existing contract. Only this explicit
-    # content endpoint can omit joints. Focal proposals may separately defer
-    # unrelated generic joints, but every cut still uses exact target pose;
-    # all retained endpoint/effect descriptors are hydrated before returning.
-    content_provider = getattr(provider, 'content_at', None) or provider
-    focal_proposal_provider = (getattr(provider, 'focal_proposal_at', None)
-        if callable(getattr(provider, 'focal_geometry_at', None)) else None)
-    boundary_provider = focal_proposal_provider or provider
-    scene_cut_artifact_cache: dict[tuple[int, int], bool] = {}
-
-    def _scene_cut_is_transient_portrait_fancam_artifact(
-        *,
-        source_index: int,
-        source_seconds: float,
-        master_seconds: float,
-    ) -> bool:
-        if not continuous_official_portrait_fancam_contract:
-            return False
-        key = (source_index, int(round(source_seconds * 1_000_000.0)))
-        cached = scene_cut_artifact_cache.get(key)
-        if cached is not None:
-            return cached
-        far = max(
-            resolved_config.portrait_fancam_scene_cut_continuity_window_seconds,
-            3.0 * resolved_config.sample_frame_step_seconds,
-        )
-        near = resolved_config.sample_frame_step_seconds
-        probe_master_seconds = (
-            master_seconds - far,
-            master_seconds - near,
-            master_seconds,
-            master_seconds + near,
-            master_seconds + far,
-        )
-        probe_source_seconds = tuple(
-            (
-                source_seconds
-                if index == 2
-                else _source_local_time(
-                    probe_master,
-                    source_index=source_index,
-                    audio_offsets=offsets,
-                    source_timewarps=clocks,
-                )
-            )
-            for index, probe_master in enumerate(probe_master_seconds)
-        )
-        descriptors = tuple(
-            content_provider(
-                source_index,
-                resolved_sources[source_index],
-                max(0.0, local_seconds),
-            )
-            for local_seconds in probe_source_seconds
-        )
-        result = _continuous_portrait_fancam_scene_cut_is_transient_artifact(
-            descriptors,  # type: ignore[arg-type]
-            resolved_config,
-        )
-        scene_cut_artifact_cache[key] = result
-        return result
-    boundary_search_candidates: list[
-        tuple[_DirectBoundarySearchCandidate, ...]
-    ] = []
-    matrices: list[tuple[tuple[DirectBoundaryMismatch, ...], ...]] = []
-    span_diagnostics: list[DirectSpanVisualDiagnostic] = []
-    sample_count = 0
-    failed_sample_count = 0
-    content_invalid_boundary_samples_skipped = 0
-    try:
-        for segment_index, (span_start, span_end) in enumerate(spans):
-            duration = span_end - span_start
-            exit_inset = min(
-                resolved_config.span_interior_inset_seconds,
-                duration * 0.20,
-            )
-            # The first content sample is deliberately the actual cut plus one
-            # output frame.  A rig that clears 0.2 seconds later is still a
-            # visible bad cut and must not be hidden by the deeper interior
-            # sample used historically.
-            entry_inset = min(
-                resolved_config.sample_frame_step_seconds,
-                duration * 0.08,
-            )
-            # The second sample distinguishes a one-frame flash from a stage
-            # light or near-lens obstruction that visibly persists after the
-            # cut but clears before the quarter-span sample.
-            early_interior_inset = min(
-                resolved_config.early_interior_sample_seconds,
-                duration * 0.18,
-            )
-            master_times = (
-                span_start + entry_inset,
-                span_start + early_interior_inset,
-                span_start + duration * 0.25,
-                (span_start + span_end) / 2.0,
-                span_start + duration * 0.75,
-                span_end - exit_inset,
-            )
-            source_validity: list[DirectSpanSourceValidity] = []
-            for source_index, source in enumerate(resolved_sources):
-                cut_tolerance = min(
-                    resolved_config.native_scene_cut_boundary_tolerance_seconds,
-                    duration * 0.20,
-                )
-                internal_native_cuts = tuple(
-                    (source_seconds, master_seconds)
-                    for source_seconds, master_seconds in mapped_scene_cuts[source_index]
-                    if span_start + cut_tolerance
-                    < master_seconds
-                    < span_end - cut_tolerance
-                )
-                suppressed_portrait_fancam_scene_cuts = tuple(
-                    cut
-                    for cut in internal_native_cuts
-                    if _scene_cut_is_transient_portrait_fancam_artifact(
-                        source_index=source_index,
-                        source_seconds=cut[0],
-                        master_seconds=cut[1],
-                    )
-                )
-                confirmed_internal_native_cuts = tuple(
-                    cut
-                    for cut in internal_native_cuts
-                    if cut not in suppressed_portrait_fancam_scene_cuts
-                )
-                samples: list[_BoundarySample] = []
-                for master_seconds in master_times:
-                    local_seconds = _source_local_time(
-                        master_seconds,
-                        source_index=source_index,
-                        audio_offsets=offsets,
-                        source_timewarps=clocks,
-                    )
-                    descriptor = content_provider(source_index, source, local_seconds)
-                    sample_count += 1
-                    failed_sample_count += int(descriptor is None)
-                    # These six samples only detect blank/obstructed/static
-                    # content and exposure, not who should match at a cut.
-                    # Running target tracking here paid for thousands of
-                    # unused identity/pose observations before any boundary.
-                    # Every exact cut/motion sample below STILL uses the
-                    # shared target authority; content is never cut proof.
-                    samples.append(_BoundarySample(
-                        master_seconds=master_seconds,
-                        source_local_seconds=local_seconds,
-                        descriptor=descriptor,
-                        attention=_attention_geometry(descriptor),
-                    ))
-                def content_probe(master_seconds: float) -> _BoundarySample:
-                    nonlocal sample_count, failed_sample_count
-                    local_seconds = _source_local_time(
-                        master_seconds, source_index=source_index,
-                        audio_offsets=offsets, source_timewarps=clocks,
-                    )
-                    descriptor = content_provider(source_index, source, local_seconds)
-                    sample_count += 1
-                    failed_sample_count += int(descriptor is None)
-                    return _BoundarySample(
-                        master_seconds=master_seconds, source_local_seconds=local_seconds,
-                        descriptor=descriptor, attention=_attention_geometry(descriptor),
-                    )
-                transient_obstruction_review = _review_transient_partial_obstruction(
-                    samples, span_start=span_start, span_end=span_end,
-                    sample_at=content_probe, config=resolved_config,
-                )
-                source_validity.append(
-                    _span_source_validity(
-                        source_index=source_index,
-                        samples=tuple(samples),  # type: ignore[arg-type]
-                        native_scene_cuts=confirmed_internal_native_cuts,
-                        suppressed_portrait_fancam_scene_cuts=(
-                            suppressed_portrait_fancam_scene_cuts
-                        ),
-                        continuous_official_portrait_fancam_contract=(
-                            continuous_official_portrait_fancam_contract
-                        ),
-                        config=resolved_config,
-                        transient_obstruction_review=transient_obstruction_review,
-                    )
-                )
-            span_diagnostics.append(
-                DirectSpanVisualDiagnostic(
-                    segment_index=segment_index,
-                    canonical_master_start=span_start,
-                    canonical_master_end=span_end,
-                    sources=tuple(source_validity),
-                )
-            )
-
-        empty_content_spans = tuple(span.segment_index for span in span_diagnostics
-                                    if not any(source.valid for source in span.sources))
-        if empty_content_spans:
-            # No cut geometry, quota reassignment or cinematic effect can put
-            # a source into a span where every source failed content validity.
-            # Prove that impossibility before paying for all boundary NNs.
-            content_counts = [sum(span.sources[index].valid for span in span_diagnostics)
-                              for index in range(source_count)]
-            raise DirectMemberVisualSelectionError(
-                'direct member content validity cannot cover every span',
-                {'failure': 'content_validity_quota_precheck_failed',
-                 'empty_segment_indices': list(empty_content_spans),
-                 'span_content_validity': [span.to_dict() for span in span_diagnostics],
-                 'valid_count_by_source': [
-                     {'eligible_source_index': index, 'quota': quotas[index],
-                      'valid_span_count': content_counts[index],
-                      'invalid_span_count': len(spans) - content_counts[index],
-                      'valid_segment_indices': [span.segment_index for span in span_diagnostics
-                                                if span.sources[index].valid]}
-                     for index in range(source_count)],
-                 'quota_shortfalls': [
-                     {'eligible_source_index': index, 'quota': quotas[index],
-                      'valid_span_count': content_counts[index]}
-                     for index in range(source_count) if content_counts[index] < quotas[index]],
-                 'quota_basis': 'initial_assignment_before_optional_source_subset_ranking',
-                 'source_quota_assignment': quota_assignment_provenance,
-                 'constraint_infeasibility_proven': True,
-                 'visual_gates_relaxed': False,
-                 'observation_work': {
-                     'boundary_observations_evaluated': False,
-                     'reason': 'no_content_valid_source_for_required_span',
-                     'sample_count': sample_count,
-                 }},
-            )
-
-        frame_offsets = _boundary_search_frame_offsets(resolved_config)
-        for boundary_index in range(len(spans) - 1):
-            canonical_boundary = spans[boundary_index][1]
-            candidates: list[_DirectBoundarySearchCandidate] = []
-            local_frame_offsets = camera_feedback.frame_offsets(
-                canonical_cut=canonical_boundary, ordinary_offsets=frame_offsets,
-                frame_step=resolved_config.sample_frame_step_seconds)
-            boundary_plans = []
-            for offset_frames in local_frame_offsets:
-                boundary = (
-                    canonical_boundary
-                    + offset_frames
-                    * resolved_config.sample_frame_step_seconds
-                )
-                outgoing_master = max(
-                    spans[boundary_index][0],
-                    boundary - resolved_config.sample_frame_step_seconds,
-                )
-                outgoing_previous_master = max(
-                    spans[boundary_index][0],
-                    boundary
-                    - 2.0 * resolved_config.sample_frame_step_seconds,
-                )
-                # A hard cut renders the incoming segment's first frame at the
-                # selected boundary itself.  Sampling boundary+1 frame here
-                # used to hide the exact entry image that viewers actually
-                # see, and could approve a visually disconnected cut when the
-                # following frame happened to match.  Bind the audit to the
-                # real outgoing-last/incoming-first frame pair.
-                incoming_master = boundary
-                incoming_next_master = min(
-                    spans[boundary_index + 1][1],
-                    boundary
-                    + resolved_config.sample_frame_step_seconds,
-                )
-                incoming_future_master = min(
-                    spans[boundary_index + 1][1],
-                    boundary
-                    + resolved_config.early_interior_sample_seconds,
-                )
-                if not (
-                    outgoing_previous_master < outgoing_master < boundary
-                    and math.isclose(
-                        incoming_master,
-                        boundary,
-                        rel_tol=0.0,
-                        abs_tol=1e-12,
-                    )
-                    and incoming_master < incoming_next_master
-                    and incoming_next_master < incoming_future_master
-                ):
-                    continue
-                master_times = (
-                    outgoing_previous_master, outgoing_master, incoming_master,
-                    incoming_next_master, incoming_future_master,
-                )
-                boundary_plans.append(MemberBoundaryObservationPlan(
-                    offset_frames=offset_frames,
-                    cut_master_seconds=boundary,
-                    master_times=master_times,
-                    local_times_by_source=tuple(tuple(
-                        _source_local_time(master_seconds, source_index=source_index,
-                            audio_offsets=offsets, source_timewarps=clocks)
-                        for master_seconds in master_times)
-                        for source_index in range(source_count)),
-                    eligibility_by_source=tuple(
-                        _boundary_endpoint_content_eligibility(
-                            span_diagnostics[boundary_index].sources[source_index].valid,
-                            span_diagnostics[boundary_index+1].sources[source_index].valid)
-                        for source_index in range(source_count)),
-                ))
-            if not boundary_plans or not any(plan.offset_frames == 0 for plan in boundary_plans):
-                raise RuntimeError("boundary local search did not retain its canonical state")
-
-            def observe_boundary_source(plan, source_index):
-                nonlocal sample_count, failed_sample_count, content_invalid_boundary_samples_skipped
-                source = resolved_sources[source_index]
-                local_times = plan.local_times_by_source[source_index]
-                endpoint_eligibility = plan.eligibility_by_source[source_index]
-                descriptors = tuple(
-                    boundary_provider(source_index, source, local_seconds) if eligible else None
-                    for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
-                )
-                sample_count += sum(endpoint_eligibility)
-                content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
-                failed_sample_count += sum(
-                    eligible and descriptor is None
-                    for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
-                )
-                return tuple(
-                    _boundary_sample_with_focal_geometry(
-                        master_seconds=master_seconds,
-                        source_local_seconds=local_seconds,
-                        source_index=source_index,
-                        descriptor=descriptor,
-                        provider=provider,
-                    )
-                    if eligible else _BoundarySample(
-                        master_seconds=master_seconds,
-                        source_local_seconds=local_seconds,
-                        descriptor=None,
-                        attention=None,
-                    )
-                    # Only content-invalid samples are represented as missing.
-                    # The store keeps an unrequested source/offset absent.
-                    for master_seconds, local_seconds, descriptor, eligible in zip(
-                        plan.master_times, local_times, descriptors, endpoint_eligibility, strict=True)
-                )
-
-            prepare_focal = getattr(provider, 'prepare_focal_observations', None)
-            observations = MemberBoundaryObservationStore(
-                boundary_plans, observe=observe_boundary_source,
-                prepare=prepare_focal if callable(prepare_focal) else None,
-            )
-            # Full-domain mode is retained until the path/evidence coordinator
-            # also covers holds, cinematic bridges and joint offset constraints.
-            # Observation storage itself is now demand-addressable and does not
-            # interpret an unrequested source as a failed target observation.
-            observations.prepare((plan.offset_frames, source_index)
-                for plan in boundary_plans for source_index in range(source_count))
-            for plan in boundary_plans:
-                offset_frames, boundary = plan.offset_frames, plan.cut_master_seconds
-                outgoing_previous: list[_BoundarySample] = []
-                outgoing: list[_BoundarySample] = []
-                incoming: list[_BoundarySample] = []
-                incoming_next: list[_BoundarySample] = []
-                incoming_future: list[_BoundarySample] = []
-                for source_index in range(source_count):
-                    samples = observations.samples_for(offset_frames, source_index)
-                    outgoing_previous.append(samples[0])
-                    outgoing.append(samples[1])
-                    incoming.append(samples[2])
-                    incoming_next.append(samples[3])
-                    incoming_future.append(samples[4])
-                outgoing_previous_tuple = tuple(outgoing_previous)
-                outgoing_tuple = tuple(outgoing)
-                incoming_tuple = tuple(incoming)
-                incoming_next_tuple = tuple(incoming_next)
-                incoming_future_tuple = tuple(incoming_future)
-                candidate_matrix = tuple(
-                    tuple(
-                        _boundary_mismatch(
-                            outgoing_tuple[left_index],
-                            incoming_tuple[right_index],
-                            resolved_config,
-                            outgoing_previous=(
-                                outgoing_previous_tuple[left_index]
-                            ),
-                            incoming_next=incoming_next_tuple[right_index],
-                            outgoing_source_index=left_index,
-                            incoming_source_index=right_index,
-                            outgoing_source_geometry=(
-                                source_frame_geometries[left_index]
-                            ),
-                            incoming_source_geometry=(
-                                source_frame_geometries[right_index]
-                            ),
-                            continuous_official_portrait_fancam_contract=(
-                                continuous_official_portrait_fancam_contract
-                            ),
-                        )
-                        for right_index in range(source_count)
-                    )
-                    for left_index in range(source_count)
-                )
-                # A tolerated interior occlusion is not equivalent to clean
-                # footage. Charge each selected span once across every solver
-                # and offset variant; never change its measured cut geometry.
-                def obstruction_penalty(segment: int, source: int) -> float:
-                    audit = span_diagnostics[segment].sources[source].transient_obstruction_review
-                    return float(audit["selection_penalty"]) if audit else 0.0
-                candidate_matrix = tuple(tuple(
-                    replace(mismatch, cost=mismatch.cost
-                        + obstruction_penalty(boundary_index+1, right_index)
-                        + (obstruction_penalty(0, left_index) if boundary_index == 0 else 0.0))
-                    for right_index, mismatch in enumerate(row))
-                    for left_index, row in enumerate(candidate_matrix))
-                if camera_feedback.proposals:
-                    candidate_matrix = tuple(tuple(replace(mismatch,
-                        cost=mismatch.cost+camera_feedback.penalty(boundary, left_index, right_index))
-                        for right_index, mismatch in enumerate(row))
-                        for left_index, row in enumerate(candidate_matrix))
-                if render_penalized_edges:
-                    candidate_matrix = tuple(
-                        tuple(
-                            replace(
-                                mismatch,
-                                cost=(
-                                    mismatch.cost
-                                    + sum(
-                                        penalty
-                                        for (
-                                            penalized_seconds,
-                                            penalized_left,
-                                            penalized_right,
-                                            penalty,
-                                        ) in render_penalized_edges
-                                        if left_index == penalized_left
-                                        and right_index == penalized_right
-                                        and abs(
-                                            boundary - penalized_seconds
-                                        )
-                                        <= _DECODED_PROXY_PENALTY_RADIUS_SECONDS
-                                        + 1e-9
-                                    )
-                                ),
-                            )
-                            for right_index, mismatch in enumerate(row)
-                        )
-                        for left_index, row in enumerate(candidate_matrix)
-                    )
-                if preferred_proxy_path:
-                    candidate_matrix = tuple(
-                        tuple(
-                            replace(
-                                mismatch,
-                                cost=(
-                                    mismatch.cost
-                                    + float(
-                                        decoded_proxy_source_deviation_penalty
-                                    )
-                                    * (
-                                        int(
-                                            boundary_index == 0
-                                            and 0
-                                            in proxy_protected_span_indices
-                                            and left_index
-                                            != preferred_proxy_path[0]
-                                        )
-                                        + int(
-                                            boundary_index + 1
-                                            in proxy_protected_span_indices
-                                            and right_index
-                                            != preferred_proxy_path[
-                                                boundary_index + 1
-                                            ]
-                                        )
-                                    )
-                                ),
-                            )
-                            for right_index, mismatch in enumerate(row)
-                        )
-                        for left_index, row in enumerate(candidate_matrix)
-                    )
-                if render_infeasible_edges:
-                    candidate_matrix = tuple(
-                        tuple(
-                            (
-                                replace(
-                                    mismatch,
-                                    cost=(
-                                        mismatch.cost
-                                        + resolved_config.missing_descriptor_cost
-                                    ),
-                                    warning_flags=tuple(
-                                        dict.fromkeys(
-                                            mismatch.warning_flags
-                                            + (_DENSE_RENDER_INFEASIBLE_EDGE_FLAG,)
-                                        )
-                                    ),
-                                    severe_flags=tuple(
-                                        dict.fromkeys(
-                                            mismatch.severe_flags
-                                            + (_DENSE_RENDER_INFEASIBLE_EDGE_FLAG,)
-                                        )
-                                    ),
-                                    dense_attention_validation_required=False,
-                                    transform_repair=None,
-                                    cinematic_bridge=None,
-                                )
-                                if any(
-                                    left_index == forbidden_left
-                                    and right_index == forbidden_right
-                                    and abs(boundary - forbidden_seconds)
-                                    <= _DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS
-                                    + 1e-9
-                                    for (
-                                        forbidden_seconds,
-                                        forbidden_left,
-                                        forbidden_right,
-                                    ) in render_infeasible_edges
-                                )
-                                else mismatch
-                            )
-                            for right_index, mismatch in enumerate(row)
-                        )
-                        for left_index, row in enumerate(candidate_matrix)
-                    )
-                candidates.append(
-                    _DirectBoundarySearchCandidate(
-                        offset_frames=offset_frames,
-                        cut_master_seconds=boundary,
-                        outgoing_previous=outgoing_previous_tuple,
-                        outgoing=outgoing_tuple,
-                        incoming=incoming_tuple,
-                        incoming_next=incoming_next_tuple,
-                        matrix=candidate_matrix,
-                        incoming_future=incoming_future_tuple,
-                    )
-                )
-            if not candidates or not any(
-                candidate.offset_frames == 0 for candidate in candidates
-            ):
-                raise RuntimeError(
-                    "boundary local search did not retain its canonical state"
-                )
-            candidate_tuple = tuple(candidates)
-            boundary_search_candidates.append(candidate_tuple)
-            matrices.append(
-                tuple(
-                    tuple(
-                        _best_boundary_search_edge(
-                            candidate_tuple,
-                            outgoing_source_index=left_index,
-                            incoming_source_index=right_index,
-                            priority_boundary=(
-                                boundary_index in priority_boundaries
-                            ),
-                            config=resolved_config,
-                        )[1]
-                        for right_index in range(source_count)
-                    )
-                    for left_index in range(source_count)
-                )
-            )
-    finally:
-        if owned_provider is not None:
-            owned_provider.close()
-
-    candidate_validity = tuple(
-        tuple(source.valid for source in span.sources)
-        for span in span_diagnostics
-    )
-    hard_boundary_connectivity = _hard_boundary_connectivity_diagnostics(
-        matrices,
-        candidate_validity,
-    )
-    valid_counts = tuple(
-        sum(span[source_index] for span in candidate_validity)
-        for source_index in range(source_count)
-    )
-    represented_source_indices = tuple(range(source_count))
-    omitted_source_indices: tuple[int, ...] = ()
-    ranked_source_indices = order
-    if represented_source_count < source_count:
-        order_rank = {
-            source_index: rank
-            for rank, source_index in enumerate(order)
-        }
-        source_fitness: list[dict[str, Any]] = []
-        for source_index in range(source_count):
-            quality_values = tuple(
-                float(source.mean_quality_score)
-                for span in span_diagnostics
-                for source in (span.sources[source_index],)
-                if source.mean_quality_score is not None
-                and math.isfinite(float(source.mean_quality_score))
-            )
-            nonsevere_connectivity = 0
-            for boundary_index, matrix in enumerate(matrices):
-                for other_source_index in range(source_count):
-                    if other_source_index == source_index:
-                        continue
-                    if (
-                        candidate_validity[boundary_index][source_index]
-                        and candidate_validity[boundary_index + 1][
-                            other_source_index
-                        ]
-                        and not matrix[source_index][
-                            other_source_index
-                        ].severe_flags
-                    ):
-                        nonsevere_connectivity += 1
-                    if (
-                        candidate_validity[boundary_index][other_source_index]
-                        and candidate_validity[boundary_index + 1][source_index]
-                        and not matrix[other_source_index][
-                            source_index
-                        ].severe_flags
-                    ):
-                        nonsevere_connectivity += 1
-            obstruction_sample_count = sum(
-                span.sources[source_index].foreground_obstruction_sample_count
-                for span in span_diagnostics
-            )
-            source_fitness.append(
-                {
-                    "eligible_source_index": source_index,
-                    "valid_span_count": int(valid_counts[source_index]),
-                    "nonsevere_boundary_connectivity_count": int(
-                        nonsevere_connectivity
-                    ),
-                    "mean_quality_score": (
-                        sum(quality_values) / len(quality_values)
-                        if quality_values
-                        else 0.0
-                    ),
-                    "foreground_obstruction_sample_count": int(
-                        obstruction_sample_count
-                    ),
-                    "preferred_order_rank": int(order_rank[source_index]),
-                }
-            )
-        ranked_source_indices = tuple(
-            item["eligible_source_index"]
-            for item in sorted(
-                source_fitness,
-                key=lambda item: (
-                    -item["valid_span_count"],
-                    -item["nonsevere_boundary_connectivity_count"],
-                    -item["mean_quality_score"],
-                    item["foreground_obstruction_sample_count"],
-                    item["preferred_order_rank"],
-                ),
-            )
-        )
-        represented_source_indices = ranked_source_indices[
-            :represented_source_count
-        ]
-        omitted_source_indices = ranked_source_indices[
-            represented_source_count:
-        ]
-        quotas = _balanced_subset_quotas(
-            len(spans),
-            source_count,
-            represented_source_indices,
-        )
-        _base_quota, extra_quota_count = divmod(
-            len(spans), represented_source_count
-        )
-        explicit_extra_quota_sources = represented_source_indices[
-            :extra_quota_count
-        ]
-        quota_assignment_provenance = {
-            "contract": "quality_ranked_exact_subset_quota_v1",
-            "basis": (
-                "bounded_quality_proof_all_sources_analyzed_then_ranked"
-            ),
-            "span_count": len(spans),
-            "source_count": source_count,
-            "required_distinct_source_count": represented_source_count,
-            "base_quota": _base_quota,
-            "extra_quota_count": extra_quota_count,
-            "extra_quota_source_indices": list(
-                explicit_extra_quota_sources
-            ),
-            "represented_source_indices": list(
-                represented_source_indices
-            ),
-            "omitted_source_indices": list(omitted_source_indices),
-            "source_fitness": source_fitness,
-            "fitness_order": list(ranked_source_indices),
-            "fitness_order_criteria": [
-                "valid_span_count_descending",
-                "nonsevere_boundary_connectivity_descending",
-                "mean_quality_score_descending",
-                "foreground_obstruction_count_ascending",
-                "preferred_source_order_tiebreak",
-            ],
-            "source_search_order": list(order),
-            "source_search_order_changed": False,
-            "counts_differ_by_at_most_one_among_represented_sources": True,
-            "all_sources_decoded_and_scored": True,
-            "all_analyzed_sources_required": False,
-            "source_duration_balance_policy": (
-                "short_proof_exact_count_flexible_exposure_v1"
-            ),
-            "maximum_source_duration_relative_deviation": (
-                resolved_config.maximum_source_duration_relative_deviation
-            ),
-            "ordinary_full_song_maximum_source_duration_relative_deviation": (
-                DirectMemberVisualConfig().maximum_source_duration_relative_deviation
-            ),
-            "visual_thresholds_changed": False,
-            "visual_gates_relaxed": False,
-        }
-    valid_count_by_source = [
-        {
-            "eligible_source_index": source_index,
-            "quota": int(quotas[source_index]),
-            "valid_span_count": int(valid_counts[source_index]),
-            "invalid_span_count": int(len(spans) - valid_counts[source_index]),
-            "valid_segment_indices": [
-                segment_index
-                for segment_index, validity in enumerate(candidate_validity)
-                if validity[source_index]
-            ],
-        }
-        for source_index in range(source_count)
-    ]
-    quota_shortfalls = tuple(
-        {
-            "eligible_source_index": source_index,
-            "quota": quotas[source_index],
-            "valid_span_count": valid_counts[source_index],
-        }
-        for source_index in range(source_count)
-        if valid_counts[source_index] < quotas[source_index]
-    )
-    empty_spans = tuple(
-        index for index, validity in enumerate(candidate_validity) if not any(validity)
-    )
-    if empty_spans or (
-        quota_shortfalls and not heterogeneous_cinematic_authorized
-    ):
-        raise DirectMemberVisualSelectionError(
-            "direct member content validity cannot satisfy balanced source quotas",
-            {
-                "failure": "content_validity_quota_precheck_failed",
-                "quota_shortfalls": list(quota_shortfalls),
-                "empty_segment_indices": list(empty_spans),
-                "span_content_validity": [
-                    span.to_dict() for span in span_diagnostics
-                ],
-                "valid_count_by_source": valid_count_by_source,
-                "hard_boundary_connectivity": hard_boundary_connectivity,
-                "source_quota_assignment": quota_assignment_provenance,
-            },
-        )
-    forward_exhaustion_boundary = (
-        _hard_boundary_forward_exhaustion_boundary(
-            hard_boundary_connectivity
-        )
-        if resolved_config.maximum_same_source_hold_count == 0
-        else None
-    )
-    if (
-        forward_exhaustion_boundary is not None
-        and not heterogeneous_cinematic_authorized
-    ):
-        failed_segment_index = forward_exhaustion_boundary + 1
-        failure_matrix = matrices[forward_exhaustion_boundary]
-        raise DirectMemberVisualSelectionError(
-            "direct member transition graph is disconnected before optimization",
-            {
-                "failure": "boundary_connectivity_path_exhausted",
-                "failed_at_segment_index": failed_segment_index,
-                "source_quotas": list(quotas),
-                "valid_source_indices": [
-                    index
-                    for index, valid in enumerate(
-                        candidate_validity[failed_segment_index]
-                    )
-                    if valid
-                ],
-                "severe_edge_pair_count": sum(
-                    bool(failure_matrix[left][right].severe_flags)
-                    for left in range(source_count)
-                    for right in range(source_count)
-                    if left != right
-                ),
-                "severe_edges_are_ineligible": True,
-                "constraint_infeasibility_proven": True,
-                "visual_gates_relaxed": False,
-                "search": {
-                    "strategy": (
-                        "exact_quota_independent_nonsevere_connectivity_precheck"
-                    ),
-                    "selection_basis": None,
-                    "adaptive_widening_used": False,
-                    "attempted_beam_widths": [],
-                    "attempts": [],
-                    "exact_lifeline": {
-                        "invoked": False,
-                        "skipped_by_stronger_quota_independent_proof": True,
-                        "path_found": False,
-                        "state_capacity_exhausted": False,
-                        "duration_state_quantization_applied": False,
-                    },
-                    "search_capacity_exhausted": False,
-                    "constraint_infeasibility_proven": True,
-                },
-                "span_content_validity": [
-                    span.to_dict() for span in span_diagnostics
-                ],
-                "valid_count_by_source": valid_count_by_source,
-                "hard_boundary_connectivity": hard_boundary_connectivity,
-                "source_quota_assignment": quota_assignment_provenance,
-            },
-        )
+    represented_source_count,
+    source_count,
+    quotas,
+    order,
+    candidate_validity,
+    spans,
+    resolved_config,
+    normalized_forbidden_paths,
+    priority_boundaries,
+    forbidden_hold_boundaries,
+    maximum_priority_cut_hold_count,
+    source_frame_geometries,
+    render_infeasible_edges,
+    ranked_source_indices,
+    represented_source_indices,
+    quota_assignment_provenance,
+    heterogeneous_cinematic_authorized,
+    span_diagnostics,
+    valid_count_by_source,
+    hard_boundary_connectivity,
+    cinematic_bridge_enabled,
+    continuous_official_portrait_fancam_contract,
+) -> _DirectMemberPathDecision:
+    """Shared strict, bounded-hold and role-aware cinematic policy; no observations."""
     usage_policy = (
         "short_proof_quality_ranked_subset_quota_v1"
         if represented_source_count < source_count
@@ -13733,9 +12535,1368 @@ def select_balanced_direct_member_sources(
                     str(primary_fallback_error),
                     diagnostics,
                 ) from primary_fallback_error
+    return _DirectMemberPathDecision(
+        path=path,
+        optimizer_cost=optimizer_cost,
+        optimizer_search_diagnostics=optimizer_search_diagnostics,
+        usage_policy=usage_policy,
+        selected_source_targets=selected_source_targets,
+        selected_count_minimums=selected_count_minimums,
+        selected_count_maximums=selected_count_maximums,
+        selected_duration_targets=selected_duration_targets,
+        selected_duration_minimums=selected_duration_minimums,
+        selected_duration_maximums=selected_duration_maximums,
+        quota_assignment_provenance=quota_assignment_provenance,
+    )
+
+
+def select_balanced_direct_member_sources(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    source_scene_cut_times: Sequence[Sequence[float]] | None = None,
+    source_frame_sizes: Sequence[tuple[int, int]] | None = None,
+    output_frame_size: tuple[int, int] = (1080, 1920),
+    continuous_official_portrait_fancam_contract: bool = False,
+    cinematic_bridge_enabled: bool = False,
+    required_distinct_source_count: int | None = None,
+    preferred_source_order: Sequence[int] | None = None,
+    extra_quota_source_indices: Sequence[int] | None = None,
+    priority_cut_boundary_indices: Sequence[int] = (),
+    forbidden_same_source_hold_boundary_indices: Sequence[int] = (),
+    maximum_priority_cut_hold_count: int = 0,
+    render_infeasible_transition_edges: Sequence[
+        tuple[float, int, int]
+    ] = (),
+    render_penalized_transition_edges: Sequence[
+        tuple[float, int, int, float]
+    ] = (),
+    joint_camera_failed_proposals: Sequence[tuple[float, int, int, float]] = (),
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
+    decoded_proxy_preferred_source_path: Sequence[int] | None = None,
+    decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
+    decoded_proxy_source_deviation_penalty: float = (
+        _DECODED_PROXY_LOCAL_REPAIR_SOURCE_DEVIATION_PENALTY
+    ),
+    config: DirectMemberVisualConfig | None = None,
+    descriptor_provider: DescriptorProvider | None = None,
+    demand_driven_observations: bool = False,
+) -> DirectMemberVisualSelection:
+    """Select a balanced visual path over already-fixed musical spans.
+
+    Legacy mode decodes every eligible source around each coarse boundary.
+    ``demand_driven_observations`` instead proposes a complete all-source path,
+    observes exact selected pairs at every allowed offset, then re-solves the
+    same strict/hold/cinematic policy before joint cut-time validation. Unseen
+    pairs are neither visual approval nor visual rejection, and bounded search
+    failure cannot authorize another expensive partition replay.
+    Source-local sample times and source-native scene cuts are mapped
+    through the accepted ``TimeWarpMap`` when present and retain scalar offsets
+    otherwise. Any native cut that survives strictly inside a coarsened span is
+    a hard-invalid source/span candidate even when six sampled frames miss it.
+    The exact verified continuous official portrait-fancam contract may suppress
+    only a raw detector event whose non-identifying flank evidence proves a
+    continuous performance; generic/manual callers retain the strict policy.
+    ``extra_quota_source_indices`` changes only which sources receive the
+    remainder slots of an otherwise exactly balanced quota.  It never changes
+    source search order, content validity, severe-edge, or duration gates.
+    ``priority_cut_boundary_indices`` identifies section-critical cuts whose
+    no-cut continuations are separately capped by
+    ``maximum_priority_cut_hold_count``.
+    ``forbidden_same_source_hold_boundary_indices`` carries exact failed
+    post-alignment cadence witnesses back into the path search. Only those
+    observed boundaries are forced to cut; the ordinary compensated-hold
+    budget remains available everywhere else.
+    ``source_frame_sizes`` authorizes geometry repair only by proving that the
+    post-portrait-fill working frame remains no larger than decoded source
+    pixels. Missing sizes retain the historical no-repair hard gates.
+    ``cinematic_bridge_enabled`` authorizes a terminal role-aware allocation
+    for official member fancams, including portrait-only sets, only after strict
+    balanced and bounded no-cut paths are proven infeasible. Its framing-only
+    severe edges remain forbidden as hard cuts and must be materialized as
+    audited effects.
+    ``render_infeasible_transition_edges`` carries dense-render certificates
+    from a prior motion solve.  A certified source pair is removed only near
+    its measured canonical boundary; the optimizer must choose another source
+    pair or a meaningfully different cut time instead of relaxing geometry.
+    ``render_penalized_transition_edges`` carries decoded-output continuity
+    feedback.  Unlike a camera-solve failure, a visually poor decoded edge is
+    still renderable, so its bounded finite cost may steer the path without
+    disconnecting an otherwise viable source graph.
+    ``joint_camera_failed_proposals`` is separate run-local camera feedback:
+    costs apply at the exact failed clock only. At that boundary, interleaved
+    frames omitted by the coarse search are measured within the SAME window.
+    No camera failure is promoted to source exclusion or decoded-QA evidence.
+    ``forbidden_source_paths`` contains exact source sequences already rendered
+    and rejected under this same musical partition.  Each no-good constraint
+    excludes only the complete repeated sequence; its individual sources and
+    transitions remain eligible in every other combination.
+    ``decoded_proxy_preferred_source_path`` supplies the last decoded path only
+    during a bounded continuity repair. Source positions adjacent to a failed
+    boundary remain free; changing any other position adds a finite Hamming
+    cost. This keeps successful editing decisions stable without hard-locking
+    the graph or weakening visual validity, cadence, or source-usage gates.
+    ``required_distinct_source_count`` may be lower than the analyzed source
+    count only for an explicitly bounded quality-proof render. Every source is
+    still decoded and scored; the exact represented subset is selected from
+    validity, quality, and non-severe transition connectivity. Ordinary/full
+    song callers omit it and retain mandatory all-source coverage.
+    """
+
+    from .member_camera_search_feedback import MemberCameraSearchFeedback
+    camera_feedback = MemberCameraSearchFeedback(tuple(joint_camera_failed_proposals))
+    if type(demand_driven_observations) is not bool:
+        raise TypeError("demand-driven observations must be boolean")
+    resolved_sources = tuple(Path(source) for source in sources)
+    if not isinstance(continuous_official_portrait_fancam_contract, bool):
+        raise TypeError(
+            "continuous_official_portrait_fancam_contract must be boolean"
+        )
+    if not isinstance(cinematic_bridge_enabled, bool):
+        raise TypeError("cinematic_bridge_enabled must be boolean")
+    source_count = len(resolved_sources)
+    if source_count < 2:
+        raise ValueError("direct visual selection needs at least two sources")
+    represented_source_count = (
+        source_count
+        if required_distinct_source_count is None
+        else required_distinct_source_count
+    )
+    if (
+        isinstance(represented_source_count, bool)
+        or not isinstance(represented_source_count, int)
+        or not 2 <= represented_source_count <= source_count
+    ):
+        raise ValueError(
+            "required_distinct_source_count must be between two and the "
+            "analyzed source count"
+        )
+    if len(output_frame_size) != 2:
+        raise ValueError("direct visual output frame size needs width and height")
+    output_width, output_height = output_frame_size
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        for value in (output_width, output_height)
+    ):
+        raise ValueError("direct visual output frame size is invalid")
+    if source_frame_sizes is None:
+        source_frame_geometries: tuple[
+            DirectMemberSourceFrameGeometry | None,
+            ...,
+        ] = (None,) * source_count
+    else:
+        if len(source_frame_sizes) != source_count:
+            raise ValueError("direct visual source frame sizes must match sources")
+        source_frame_geometries = tuple(
+            direct_member_source_frame_geometry(
+                size,
+                output_size=(output_width, output_height),
+            )
+            for size in source_frame_sizes
+        )
+    spans = tuple((float(start), float(end)) for start, end in canonical_spans)
+    if len(spans) < represented_source_count:
+        raise ValueError(
+            "direct visual selection needs at least one span per represented source"
+        )
+    for index, (start, end) in enumerate(spans):
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError("direct visual spans must be finite and positive")
+        if index and not math.isclose(
+            spans[index - 1][1],
+            start,
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        ):
+            raise ValueError("direct visual spans must be contiguous")
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=len(spans),
+        source_count=source_count,
+    )
+    preferred_proxy_path = (
+        ()
+        if decoded_proxy_preferred_source_path is None
+        else tuple(decoded_proxy_preferred_source_path)
+    )
+    proxy_repair_targets = tuple(
+        decoded_proxy_repair_target_boundary_indices
+    )
+    if preferred_proxy_path and (
+        len(preferred_proxy_path) != len(spans)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < source_count
+            for value in preferred_proxy_path
+        )
+    ):
+        raise ValueError("decoded-proxy preferred source path is invalid")
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(spans) - 1
+            for value in proxy_repair_targets
+        )
+        or len(set(proxy_repair_targets)) != len(proxy_repair_targets)
+    ):
+        raise ValueError("decoded-proxy local repair targets are invalid")
+    if bool(preferred_proxy_path) != bool(proxy_repair_targets):
+        raise ValueError(
+            "decoded-proxy path and repair targets must be supplied together"
+        )
+    if (
+        len(proxy_repair_targets)
+        > _DECODED_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT
+    ):
+        raise ValueError("decoded-proxy local repair target limit exceeded")
+    if (
+        isinstance(decoded_proxy_source_deviation_penalty, bool)
+        or not isinstance(
+            decoded_proxy_source_deviation_penalty,
+            (int, float),
+        )
+        or not math.isfinite(float(decoded_proxy_source_deviation_penalty))
+        or not 0.0 < float(decoded_proxy_source_deviation_penalty)
+        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+    ):
+        raise ValueError("decoded-proxy source deviation penalty is invalid")
+    proxy_repair_span_indices = frozenset(
+        span_index
+        for boundary_index in proxy_repair_targets
+        for span_index in (boundary_index, boundary_index + 1)
+    )
+    proxy_protected_span_indices = frozenset(
+        span_index
+        for span_index in range(len(spans))
+        if span_index not in proxy_repair_span_indices
+    )
+    total_duration_seconds = spans[-1][1] - spans[0][0]
+    short_proof_source_exposure_tolerance_applied = bool(
+        represented_source_count < source_count
+        or total_duration_seconds
+        <= _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS + 1e-9
+    )
+    priority_boundaries = tuple(
+        int(value) for value in priority_cut_boundary_indices
+    )
+    forbidden_hold_boundaries = tuple(
+        int(value) for value in forbidden_same_source_hold_boundary_indices
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(spans) - 1
+        for value in priority_cut_boundary_indices
+    ):
+        raise ValueError("priority cut boundary indices are invalid")
+    if len(set(priority_boundaries)) != len(priority_boundaries):
+        raise ValueError("priority cut boundary indices must be unique")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(spans) - 1
+        for value in forbidden_same_source_hold_boundary_indices
+    ):
+        raise ValueError("forbidden same-source hold boundaries are invalid")
+    if len(set(forbidden_hold_boundaries)) != len(forbidden_hold_boundaries):
+        raise ValueError("forbidden same-source hold boundaries must be unique")
+    if (
+        isinstance(maximum_priority_cut_hold_count, bool)
+        or not isinstance(maximum_priority_cut_hold_count, int)
+        or maximum_priority_cut_hold_count < 0
+    ):
+        raise ValueError("maximum priority cut hold count is invalid")
+    if len(audio_offsets) != source_count:
+        raise ValueError("direct visual audio_offsets must match sources")
+    offsets = tuple(float(value) for value in audio_offsets)
+    if any(not math.isfinite(value) for value in offsets):
+        raise ValueError("direct visual audio offsets must be finite")
+    clocks = (
+        (None,) * source_count
+        if source_timewarps is None
+        else tuple(source_timewarps)
+    )
+    if len(clocks) != source_count:
+        raise ValueError("direct visual source_timewarps must match sources")
+    for index, timewarp in enumerate(clocks):
+        if timewarp is None:
+            continue
+        if not isinstance(timewarp, TimeWarpMap):
+            raise TypeError("direct visual source_timewarps entries must be maps")
+        if not math.isclose(
+            timewarp.global_offset_seconds,
+            offsets[index],
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError("direct visual timewarp offset does not match audio offset")
+    scene_cut_evidence_available = source_scene_cut_times is not None
+    local_scene_cuts = (
+        ((),) * source_count
+        if source_scene_cut_times is None
+        else tuple(tuple(float(value) for value in cuts) for cuts in source_scene_cut_times)
+    )
+    if len(local_scene_cuts) != source_count:
+        raise ValueError("direct visual scene cut times must match sources")
+    for source_index, cuts in enumerate(local_scene_cuts):
+        if any(not math.isfinite(value) or value < 0.0 for value in cuts):
+            raise ValueError("direct visual scene cut times must be finite and non-negative")
+        if any(left >= right for left, right in zip(cuts, cuts[1:])):
+            raise ValueError(
+                f"direct visual scene cut times for source {source_index} "
+                "must be strictly increasing"
+            )
+    mapped_scene_cuts = tuple(
+        tuple(
+            (
+                source_seconds,
+                _source_master_time(
+                    source_seconds,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                ),
+            )
+            for source_seconds in cuts
+        )
+        for source_index, cuts in enumerate(local_scene_cuts)
+    )
+    order = (
+        tuple(range(source_count))
+        if preferred_source_order is None
+        else tuple(int(index) for index in preferred_source_order)
+    )
+    if len(order) != source_count or set(order) != set(range(source_count)):
+        raise ValueError("preferred_source_order must be a source permutation")
+    if (
+        represented_source_count < source_count
+        and extra_quota_source_indices is not None
+    ):
+        raise ValueError(
+            "extra_quota_source_indices cannot override a quality-ranked "
+            "proof subset"
+        )
+    initial_active_order = order[:represented_source_count]
+    _base_quota, extra_quota_count = divmod(
+        len(spans), represented_source_count
+    )
+    if extra_quota_source_indices is None:
+        quota_order = order
+        explicit_extra_quota_sources = tuple(order[:extra_quota_count])
+        quota_assignment_basis = "preferred_source_order_default"
+    else:
+        explicit_extra_quota_sources = tuple(
+            int(index) for index in extra_quota_source_indices
+        )
+        if (
+            len(explicit_extra_quota_sources) != extra_quota_count
+            or len(set(explicit_extra_quota_sources))
+            != len(explicit_extra_quota_sources)
+            or any(
+                not 0 <= index < source_count
+                for index in explicit_extra_quota_sources
+            )
+        ):
+            raise ValueError(
+                "extra_quota_source_indices must contain exactly the balanced "
+                "remainder source set"
+            )
+        explicit_set = set(explicit_extra_quota_sources)
+        quota_order = explicit_extra_quota_sources + tuple(
+            index for index in order if index not in explicit_set
+        )
+        quota_assignment_basis = "explicit_extra_quota_source_set"
+    base_config = config or DirectMemberVisualConfig()
+    resolved_config = (
+        replace(
+            base_config,
+            maximum_source_duration_relative_deviation=max(
+                base_config.maximum_source_duration_relative_deviation,
+                _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_SOURCE_DURATION_RELATIVE_DEVIATION,
+            ),
+        )
+        if short_proof_source_exposure_tolerance_applied
+        else base_config
+    )
+    render_infeasible_edges: tuple[tuple[float, int, int], ...] = tuple(
+        (
+            float(boundary_seconds),
+            int(outgoing_source_index),
+            int(incoming_source_index),
+        )
+        for boundary_seconds, outgoing_source_index, incoming_source_index
+        in render_infeasible_transition_edges
+    )
+    if any(
+        not math.isfinite(boundary_seconds)
+        or boundary_seconds < spans[0][0] - 1e-9
+        or boundary_seconds > spans[-1][1] + 1e-9
+        or not 0 <= outgoing_source_index < source_count
+        or not 0 <= incoming_source_index < source_count
+        or outgoing_source_index == incoming_source_index
+        for boundary_seconds, outgoing_source_index, incoming_source_index
+        in render_infeasible_edges
+    ):
+        raise ValueError("render-infeasible transition edge is invalid")
+    if len(set(render_infeasible_edges)) != len(render_infeasible_edges):
+        raise ValueError("render-infeasible transition edges must be unique")
+    render_penalized_edges: tuple[tuple[float, int, int, float], ...] = tuple(
+        (
+            float(boundary_seconds),
+            int(outgoing_source_index),
+            int(incoming_source_index),
+            float(penalty),
+        )
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) in render_penalized_transition_edges
+    )
+    if any(
+        not math.isfinite(boundary_seconds)
+        or boundary_seconds < spans[0][0] - 1e-9
+        or boundary_seconds > spans[-1][1] + 1e-9
+        or not 0 <= outgoing_source_index < source_count
+        or not 0 <= incoming_source_index < source_count
+        or outgoing_source_index == incoming_source_index
+        or not math.isfinite(penalty)
+        or not 0.0 < penalty
+        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) in render_penalized_edges
+    ):
+        raise ValueError("render-penalized transition edge is invalid")
+    render_penalized_keys = tuple(
+        (boundary_seconds, outgoing_source_index, incoming_source_index)
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            _penalty,
+        ) in render_penalized_edges
+    )
+    if len(set(render_penalized_keys)) != len(render_penalized_keys):
+        raise ValueError("render-penalized transition edges must be unique")
+    if any(cut < spans[0][0]-1e-9 or cut > spans[-1][1]+1e-9
+           or left >= source_count or right >= source_count
+           for cut, left, right, _ in camera_feedback.proposals):
+        raise ValueError('camera feedback is outside the selected source/time domain')
+    quotas = (
+        _balanced_quotas(len(spans), source_count, quota_order)
+        if represented_source_count == source_count
+        else _balanced_subset_quotas(
+            len(spans), source_count, initial_active_order
+        )
+    )
+    heterogeneous_cinematic_authorized = bool(
+        cinematic_bridge_enabled
+        and continuous_official_portrait_fancam_contract
+        and all(geometry is not None for geometry in source_frame_geometries)
+        and any(
+            geometry is not None
+            and geometry.source_width <= geometry.source_height
+            for geometry in source_frame_geometries
+        )
+    )
+    quota_assignment_provenance = {
+        "contract": "strict_balanced_extra_quota_assignment_v1",
+        "basis": quota_assignment_basis,
+        "span_count": len(spans),
+        "source_count": source_count,
+        "required_distinct_source_count": represented_source_count,
+        "base_quota": _base_quota,
+        "extra_quota_count": extra_quota_count,
+        "extra_quota_source_indices": list(explicit_extra_quota_sources),
+        "source_search_order": list(order),
+        "source_search_order_changed": False,
+        "counts_differ_by_at_most_one": True,
+        "all_analyzed_sources_required": (
+            represented_source_count == source_count
+        ),
+        "source_duration_balance_policy": (
+            "short_proof_exact_count_flexible_exposure_v1"
+            if short_proof_source_exposure_tolerance_applied
+            else "ordinary_full_song_exact_count_strict_exposure_v1"
+        ),
+        "short_proof_maximum_duration_seconds": (
+            _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS
+        ),
+        "total_duration_seconds": total_duration_seconds,
+        "maximum_source_duration_relative_deviation": (
+            resolved_config.maximum_source_duration_relative_deviation
+        ),
+        "ordinary_full_song_maximum_source_duration_relative_deviation": (
+            DirectMemberVisualConfig().maximum_source_duration_relative_deviation
+        ),
+        "visual_thresholds_changed": False,
+        "visual_gates_relaxed": False,
+    }
+
+    owned_provider: _VideoDescriptorProvider | None = None
+    if demand_driven_observations and (
+        not callable(getattr(descriptor_provider, 'focal_geometry_at', None))
+        or represented_source_count != source_count
+    ):
+        raise ValueError("demand-driven selection requires exact focal authority and the complete source set")
+    provider = descriptor_provider
+    if provider is None:
+        owned_provider = _VideoDescriptorProvider(resolved_sources)
+        provider = owned_provider
+    # Custom providers keep their existing contract. Only this explicit
+    # content endpoint can omit joints. Focal proposals may separately defer
+    # unrelated generic joints, but every cut still uses exact target pose;
+    # all retained endpoint/effect descriptors are hydrated before returning.
+    content_provider = getattr(provider, 'content_at', None) or provider
+    focal_proposal_provider = (getattr(provider, 'focal_proposal_at', None)
+        if callable(getattr(provider, 'focal_geometry_at', None)) else None)
+    boundary_provider = focal_proposal_provider or provider
+    scene_cut_artifact_cache: dict[tuple[int, int], bool] = {}
+
+    def _scene_cut_is_transient_portrait_fancam_artifact(
+        *,
+        source_index: int,
+        source_seconds: float,
+        master_seconds: float,
+    ) -> bool:
+        if not continuous_official_portrait_fancam_contract:
+            return False
+        key = (source_index, int(round(source_seconds * 1_000_000.0)))
+        cached = scene_cut_artifact_cache.get(key)
+        if cached is not None:
+            return cached
+        far = max(
+            resolved_config.portrait_fancam_scene_cut_continuity_window_seconds,
+            3.0 * resolved_config.sample_frame_step_seconds,
+        )
+        near = resolved_config.sample_frame_step_seconds
+        probe_master_seconds = (
+            master_seconds - far,
+            master_seconds - near,
+            master_seconds,
+            master_seconds + near,
+            master_seconds + far,
+        )
+        probe_source_seconds = tuple(
+            (
+                source_seconds
+                if index == 2
+                else _source_local_time(
+                    probe_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
+            )
+            for index, probe_master in enumerate(probe_master_seconds)
+        )
+        descriptors = tuple(
+            content_provider(
+                source_index,
+                resolved_sources[source_index],
+                max(0.0, local_seconds),
+            )
+            for local_seconds in probe_source_seconds
+        )
+        result = _continuous_portrait_fancam_scene_cut_is_transient_artifact(
+            descriptors,  # type: ignore[arg-type]
+            resolved_config,
+        )
+        scene_cut_artifact_cache[key] = result
+        return result
+    def adjust_boundary_mismatch(boundary_index, boundary, left_index, right_index, mismatch):
+        def obstruction_penalty(segment, source):
+            audit = span_diagnostics[segment].sources[source].transient_obstruction_review
+            return float(audit['selection_penalty']) if audit else 0.0
+        mismatch = replace(mismatch, cost=mismatch.cost
+            + obstruction_penalty(boundary_index+1, right_index)
+            + (obstruction_penalty(0, left_index) if boundary_index == 0 else 0.0))
+        if camera_feedback.proposals:
+            mismatch = replace(mismatch,
+                cost=mismatch.cost+camera_feedback.penalty(boundary, left_index, right_index))
+        if render_penalized_edges:
+            mismatch = replace(mismatch, cost=mismatch.cost + sum(
+                penalty for penalized_seconds, penalized_left, penalized_right, penalty in render_penalized_edges
+                if left_index == penalized_left and right_index == penalized_right
+                and abs(boundary-penalized_seconds) <= _DECODED_PROXY_PENALTY_RADIUS_SECONDS+1e-9))
+        if preferred_proxy_path:
+            mismatch = replace(mismatch, cost=mismatch.cost
+                + float(decoded_proxy_source_deviation_penalty) * (
+                    int(boundary_index == 0 and 0 in proxy_protected_span_indices
+                        and left_index != preferred_proxy_path[0])
+                    + int(boundary_index+1 in proxy_protected_span_indices
+                        and right_index != preferred_proxy_path[boundary_index+1])))
+        if any(left_index == left and right_index == right
+               and abs(boundary-seconds) <= _DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS+1e-9
+               for seconds, left, right in render_infeasible_edges):
+            mismatch = replace(mismatch,
+                cost=mismatch.cost+resolved_config.missing_descriptor_cost,
+                warning_flags=tuple(dict.fromkeys((*mismatch.warning_flags, _DENSE_RENDER_INFEASIBLE_EDGE_FLAG))),
+                severe_flags=tuple(dict.fromkeys((*mismatch.severe_flags, _DENSE_RENDER_INFEASIBLE_EDGE_FLAG))),
+                dense_attention_validation_required=False, transform_repair=None, cinematic_bridge=None)
+        return mismatch
+
+    observation_stores = []
+    observation_search = None
+    observation_search_diagnostics = None
+    boundary_search_candidates: list[
+        tuple[_DirectBoundarySearchCandidate, ...]
+    ] = []
+    matrices: list[tuple[tuple[DirectBoundaryMismatch, ...], ...]] = []
+    span_diagnostics: list[DirectSpanVisualDiagnostic] = []
+    sample_count = 0
+    failed_sample_count = 0
+    content_invalid_boundary_samples_skipped = 0
+    try:
+        for segment_index, (span_start, span_end) in enumerate(spans):
+            duration = span_end - span_start
+            exit_inset = min(
+                resolved_config.span_interior_inset_seconds,
+                duration * 0.20,
+            )
+            # The first content sample is deliberately the actual cut plus one
+            # output frame.  A rig that clears 0.2 seconds later is still a
+            # visible bad cut and must not be hidden by the deeper interior
+            # sample used historically.
+            entry_inset = min(
+                resolved_config.sample_frame_step_seconds,
+                duration * 0.08,
+            )
+            # The second sample distinguishes a one-frame flash from a stage
+            # light or near-lens obstruction that visibly persists after the
+            # cut but clears before the quarter-span sample.
+            early_interior_inset = min(
+                resolved_config.early_interior_sample_seconds,
+                duration * 0.18,
+            )
+            master_times = (
+                span_start + entry_inset,
+                span_start + early_interior_inset,
+                span_start + duration * 0.25,
+                (span_start + span_end) / 2.0,
+                span_start + duration * 0.75,
+                span_end - exit_inset,
+            )
+            source_validity: list[DirectSpanSourceValidity] = []
+            for source_index, source in enumerate(resolved_sources):
+                cut_tolerance = min(
+                    resolved_config.native_scene_cut_boundary_tolerance_seconds,
+                    duration * 0.20,
+                )
+                internal_native_cuts = tuple(
+                    (source_seconds, master_seconds)
+                    for source_seconds, master_seconds in mapped_scene_cuts[source_index]
+                    if span_start + cut_tolerance
+                    < master_seconds
+                    < span_end - cut_tolerance
+                )
+                suppressed_portrait_fancam_scene_cuts = tuple(
+                    cut
+                    for cut in internal_native_cuts
+                    if _scene_cut_is_transient_portrait_fancam_artifact(
+                        source_index=source_index,
+                        source_seconds=cut[0],
+                        master_seconds=cut[1],
+                    )
+                )
+                confirmed_internal_native_cuts = tuple(
+                    cut
+                    for cut in internal_native_cuts
+                    if cut not in suppressed_portrait_fancam_scene_cuts
+                )
+                samples: list[_BoundarySample] = []
+                for master_seconds in master_times:
+                    local_seconds = _source_local_time(
+                        master_seconds,
+                        source_index=source_index,
+                        audio_offsets=offsets,
+                        source_timewarps=clocks,
+                    )
+                    descriptor = content_provider(source_index, source, local_seconds)
+                    sample_count += 1
+                    failed_sample_count += int(descriptor is None)
+                    # These six samples only detect blank/obstructed/static
+                    # content and exposure, not who should match at a cut.
+                    # Running target tracking here paid for thousands of
+                    # unused identity/pose observations before any boundary.
+                    # Every exact cut/motion sample below STILL uses the
+                    # shared target authority; content is never cut proof.
+                    samples.append(_BoundarySample(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        descriptor=descriptor,
+                        attention=_attention_geometry(descriptor),
+                    ))
+                def content_probe(master_seconds: float) -> _BoundarySample:
+                    nonlocal sample_count, failed_sample_count
+                    local_seconds = _source_local_time(
+                        master_seconds, source_index=source_index,
+                        audio_offsets=offsets, source_timewarps=clocks,
+                    )
+                    descriptor = content_provider(source_index, source, local_seconds)
+                    sample_count += 1
+                    failed_sample_count += int(descriptor is None)
+                    return _BoundarySample(
+                        master_seconds=master_seconds, source_local_seconds=local_seconds,
+                        descriptor=descriptor, attention=_attention_geometry(descriptor),
+                    )
+                transient_obstruction_review = _review_transient_partial_obstruction(
+                    samples, span_start=span_start, span_end=span_end,
+                    sample_at=content_probe, config=resolved_config,
+                )
+                source_validity.append(
+                    _span_source_validity(
+                        source_index=source_index,
+                        samples=tuple(samples),  # type: ignore[arg-type]
+                        native_scene_cuts=confirmed_internal_native_cuts,
+                        suppressed_portrait_fancam_scene_cuts=(
+                            suppressed_portrait_fancam_scene_cuts
+                        ),
+                        continuous_official_portrait_fancam_contract=(
+                            continuous_official_portrait_fancam_contract
+                        ),
+                        config=resolved_config,
+                        transient_obstruction_review=transient_obstruction_review,
+                    )
+                )
+            span_diagnostics.append(
+                DirectSpanVisualDiagnostic(
+                    segment_index=segment_index,
+                    canonical_master_start=span_start,
+                    canonical_master_end=span_end,
+                    sources=tuple(source_validity),
+                )
+            )
+
+        empty_content_spans = tuple(span.segment_index for span in span_diagnostics
+                                    if not any(source.valid for source in span.sources))
+        if empty_content_spans:
+            # No cut geometry, quota reassignment or cinematic effect can put
+            # a source into a span where every source failed content validity.
+            # Prove that impossibility before paying for all boundary NNs.
+            content_counts = [sum(span.sources[index].valid for span in span_diagnostics)
+                              for index in range(source_count)]
+            raise DirectMemberVisualSelectionError(
+                'direct member content validity cannot cover every span',
+                {'failure': 'content_validity_quota_precheck_failed',
+                 'empty_segment_indices': list(empty_content_spans),
+                 'span_content_validity': [span.to_dict() for span in span_diagnostics],
+                 'valid_count_by_source': [
+                     {'eligible_source_index': index, 'quota': quotas[index],
+                      'valid_span_count': content_counts[index],
+                      'invalid_span_count': len(spans) - content_counts[index],
+                      'valid_segment_indices': [span.segment_index for span in span_diagnostics
+                                                if span.sources[index].valid]}
+                     for index in range(source_count)],
+                 'quota_shortfalls': [
+                     {'eligible_source_index': index, 'quota': quotas[index],
+                      'valid_span_count': content_counts[index]}
+                     for index in range(source_count) if content_counts[index] < quotas[index]],
+                 'quota_basis': 'initial_assignment_before_optional_source_subset_ranking',
+                 'source_quota_assignment': quota_assignment_provenance,
+                 'constraint_infeasibility_proven': True,
+                 'visual_gates_relaxed': False,
+                 'observation_work': {
+                     'boundary_observations_evaluated': False,
+                     'reason': 'no_content_valid_source_for_required_span',
+                     'sample_count': sample_count,
+                 }},
+            )
+
+        frame_offsets = _boundary_search_frame_offsets(resolved_config)
+        for boundary_index in range(len(spans) - 1):
+            canonical_boundary = spans[boundary_index][1]
+            candidates: list[_DirectBoundarySearchCandidate] = []
+            local_frame_offsets = camera_feedback.frame_offsets(
+                canonical_cut=canonical_boundary, ordinary_offsets=frame_offsets,
+                frame_step=resolved_config.sample_frame_step_seconds)
+            boundary_plans = []
+            for offset_frames in local_frame_offsets:
+                boundary = (
+                    canonical_boundary
+                    + offset_frames
+                    * resolved_config.sample_frame_step_seconds
+                )
+                outgoing_master = max(
+                    spans[boundary_index][0],
+                    boundary - resolved_config.sample_frame_step_seconds,
+                )
+                outgoing_previous_master = max(
+                    spans[boundary_index][0],
+                    boundary
+                    - 2.0 * resolved_config.sample_frame_step_seconds,
+                )
+                # A hard cut renders the incoming segment's first frame at the
+                # selected boundary itself.  Sampling boundary+1 frame here
+                # used to hide the exact entry image that viewers actually
+                # see, and could approve a visually disconnected cut when the
+                # following frame happened to match.  Bind the audit to the
+                # real outgoing-last/incoming-first frame pair.
+                incoming_master = boundary
+                incoming_next_master = min(
+                    spans[boundary_index + 1][1],
+                    boundary
+                    + resolved_config.sample_frame_step_seconds,
+                )
+                incoming_future_master = min(
+                    spans[boundary_index + 1][1],
+                    boundary
+                    + resolved_config.early_interior_sample_seconds,
+                )
+                if not (
+                    outgoing_previous_master < outgoing_master < boundary
+                    and math.isclose(
+                        incoming_master,
+                        boundary,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    and incoming_master < incoming_next_master
+                    and incoming_next_master < incoming_future_master
+                ):
+                    continue
+                master_times = (
+                    outgoing_previous_master, outgoing_master, incoming_master,
+                    incoming_next_master, incoming_future_master,
+                )
+                boundary_plans.append(MemberBoundaryObservationPlan(
+                    offset_frames=offset_frames,
+                    cut_master_seconds=boundary,
+                    master_times=master_times,
+                    local_times_by_source=tuple(tuple(
+                        _source_local_time(master_seconds, source_index=source_index,
+                            audio_offsets=offsets, source_timewarps=clocks)
+                        for master_seconds in master_times)
+                        for source_index in range(source_count)),
+                    eligibility_by_source=tuple(
+                        _boundary_endpoint_content_eligibility(
+                            span_diagnostics[boundary_index].sources[source_index].valid,
+                            span_diagnostics[boundary_index+1].sources[source_index].valid)
+                        for source_index in range(source_count)),
+                ))
+            if not boundary_plans or not any(plan.offset_frames == 0 for plan in boundary_plans):
+                raise RuntimeError("boundary local search did not retain its canonical state")
+
+            def observe_boundary_source(plan, source_index):
+                nonlocal sample_count, failed_sample_count, content_invalid_boundary_samples_skipped
+                source = resolved_sources[source_index]
+                local_times = plan.local_times_by_source[source_index]
+                endpoint_eligibility = plan.eligibility_by_source[source_index]
+                descriptors = tuple(
+                    boundary_provider(source_index, source, local_seconds) if eligible else None
+                    for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
+                )
+                sample_count += sum(endpoint_eligibility)
+                content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
+                failed_sample_count += sum(
+                    eligible and descriptor is None
+                    for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
+                )
+                return tuple(
+                    _boundary_sample_with_focal_geometry(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        source_index=source_index,
+                        descriptor=descriptor,
+                        provider=provider,
+                    )
+                    if eligible else _BoundarySample(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        descriptor=None,
+                        attention=None,
+                    )
+                    # Only content-invalid samples are represented as missing.
+                    # The store keeps an unrequested source/offset absent.
+                    for master_seconds, local_seconds, descriptor, eligible in zip(
+                        plan.master_times, local_times, descriptors, endpoint_eligibility, strict=True)
+                )
+
+            prepare_focal = getattr(provider, 'prepare_focal_observations', None)
+            observations = MemberBoundaryObservationStore(
+                boundary_plans, observe=observe_boundary_source,
+                prepare=prepare_focal if callable(prepare_focal) else None,
+            )
+            if demand_driven_observations:
+                observation_stores.append(observations)
+                continue
+            observations.prepare((plan.offset_frames, source_index)
+                for plan in boundary_plans for source_index in range(source_count))
+            for plan in boundary_plans:
+                offset_frames, boundary = plan.offset_frames, plan.cut_master_seconds
+                outgoing_previous: list[_BoundarySample] = []
+                outgoing: list[_BoundarySample] = []
+                incoming: list[_BoundarySample] = []
+                incoming_next: list[_BoundarySample] = []
+                incoming_future: list[_BoundarySample] = []
+                for source_index in range(source_count):
+                    samples = observations.samples_for(offset_frames, source_index)
+                    outgoing_previous.append(samples[0])
+                    outgoing.append(samples[1])
+                    incoming.append(samples[2])
+                    incoming_next.append(samples[3])
+                    incoming_future.append(samples[4])
+                outgoing_previous_tuple = tuple(outgoing_previous)
+                outgoing_tuple = tuple(outgoing)
+                incoming_tuple = tuple(incoming)
+                incoming_next_tuple = tuple(incoming_next)
+                incoming_future_tuple = tuple(incoming_future)
+                candidate_matrix = tuple(
+                    tuple(
+                        _boundary_mismatch(
+                            outgoing_tuple[left_index],
+                            incoming_tuple[right_index],
+                            resolved_config,
+                            outgoing_previous=(
+                                outgoing_previous_tuple[left_index]
+                            ),
+                            incoming_next=incoming_next_tuple[right_index],
+                            outgoing_source_index=left_index,
+                            incoming_source_index=right_index,
+                            outgoing_source_geometry=(
+                                source_frame_geometries[left_index]
+                            ),
+                            incoming_source_geometry=(
+                                source_frame_geometries[right_index]
+                            ),
+                            continuous_official_portrait_fancam_contract=(
+                                continuous_official_portrait_fancam_contract
+                            ),
+                        )
+                        for right_index in range(source_count)
+                    )
+                    for left_index in range(source_count)
+                )
+                candidate_matrix = tuple(tuple(
+                    adjust_boundary_mismatch(boundary_index, boundary, left_index, right_index, mismatch)
+                    for right_index, mismatch in enumerate(row))
+                    for left_index, row in enumerate(candidate_matrix))
+                candidates.append(
+                    _DirectBoundarySearchCandidate(
+                        offset_frames=offset_frames,
+                        cut_master_seconds=boundary,
+                        outgoing_previous=outgoing_previous_tuple,
+                        outgoing=outgoing_tuple,
+                        incoming=incoming_tuple,
+                        incoming_next=incoming_next_tuple,
+                        matrix=candidate_matrix,
+                        incoming_future=incoming_future_tuple,
+                    )
+                )
+            if not candidates or not any(
+                candidate.offset_frames == 0 for candidate in candidates
+            ):
+                raise RuntimeError(
+                    "boundary local search did not retain its canonical state"
+                )
+            candidate_tuple = tuple(candidates)
+            boundary_search_candidates.append(candidate_tuple)
+            matrices.append(
+                tuple(
+                    tuple(
+                        _best_boundary_search_edge(
+                            candidate_tuple,
+                            outgoing_source_index=left_index,
+                            incoming_source_index=right_index,
+                            priority_boundary=(
+                                boundary_index in priority_boundaries
+                            ),
+                            config=resolved_config,
+                        )[1]
+                        for right_index in range(source_count)
+                    )
+                    for left_index in range(source_count)
+                )
+            )
+    finally:
+        if owned_provider is not None:
+            owned_provider.close()
+
+    candidate_validity = tuple(
+        tuple(source.valid for source in span.sources)
+        for span in span_diagnostics
+    )
+    if demand_driven_observations:
+        observation_search = MemberObservationSearch(candidate_validity,
+            maximum_observations=max(1, 4 * (len(spans)-1)),
+            maximum_solver_calls=16, allow_same_source_holds=True,
+            progress_callback=getattr(provider, 'member_observation_progress', None),
+            proposal_costs={TransitionDemand(boundary, left, right): _coarse_member_proposal_prior(
+                span_diagnostics[boundary].sources[left], span_diagnostics[boundary+1].sources[right])
+                for boundary in range(len(spans)-1)
+                for left in range(source_count) for right in range(source_count)
+                if candidate_validity[boundary][left] and candidate_validity[boundary+1][right]})
+        matrices = observation_search.proposal_graph()
+    hard_boundary_connectivity = _hard_boundary_connectivity_diagnostics(
+        matrices,
+        candidate_validity,
+    )
+    valid_counts = tuple(
+        sum(span[source_index] for span in candidate_validity)
+        for source_index in range(source_count)
+    )
+    represented_source_indices = tuple(range(source_count))
+    omitted_source_indices: tuple[int, ...] = ()
+    ranked_source_indices = order
+    if represented_source_count < source_count:
+        order_rank = {
+            source_index: rank
+            for rank, source_index in enumerate(order)
+        }
+        source_fitness: list[dict[str, Any]] = []
+        for source_index in range(source_count):
+            quality_values = tuple(
+                float(source.mean_quality_score)
+                for span in span_diagnostics
+                for source in (span.sources[source_index],)
+                if source.mean_quality_score is not None
+                and math.isfinite(float(source.mean_quality_score))
+            )
+            nonsevere_connectivity = 0
+            for boundary_index, matrix in enumerate(matrices):
+                for other_source_index in range(source_count):
+                    if other_source_index == source_index:
+                        continue
+                    if (
+                        candidate_validity[boundary_index][source_index]
+                        and candidate_validity[boundary_index + 1][
+                            other_source_index
+                        ]
+                        and not matrix[source_index][
+                            other_source_index
+                        ].severe_flags
+                    ):
+                        nonsevere_connectivity += 1
+                    if (
+                        candidate_validity[boundary_index][other_source_index]
+                        and candidate_validity[boundary_index + 1][source_index]
+                        and not matrix[other_source_index][
+                            source_index
+                        ].severe_flags
+                    ):
+                        nonsevere_connectivity += 1
+            obstruction_sample_count = sum(
+                span.sources[source_index].foreground_obstruction_sample_count
+                for span in span_diagnostics
+            )
+            source_fitness.append(
+                {
+                    "eligible_source_index": source_index,
+                    "valid_span_count": int(valid_counts[source_index]),
+                    "nonsevere_boundary_connectivity_count": int(
+                        nonsevere_connectivity
+                    ),
+                    "mean_quality_score": (
+                        sum(quality_values) / len(quality_values)
+                        if quality_values
+                        else 0.0
+                    ),
+                    "foreground_obstruction_sample_count": int(
+                        obstruction_sample_count
+                    ),
+                    "preferred_order_rank": int(order_rank[source_index]),
+                }
+            )
+        ranked_source_indices = tuple(
+            item["eligible_source_index"]
+            for item in sorted(
+                source_fitness,
+                key=lambda item: (
+                    -item["valid_span_count"],
+                    -item["nonsevere_boundary_connectivity_count"],
+                    -item["mean_quality_score"],
+                    item["foreground_obstruction_sample_count"],
+                    item["preferred_order_rank"],
+                ),
+            )
+        )
+        represented_source_indices = ranked_source_indices[
+            :represented_source_count
+        ]
+        omitted_source_indices = ranked_source_indices[
+            represented_source_count:
+        ]
+        quotas = _balanced_subset_quotas(
+            len(spans),
+            source_count,
+            represented_source_indices,
+        )
+        _base_quota, extra_quota_count = divmod(
+            len(spans), represented_source_count
+        )
+        explicit_extra_quota_sources = represented_source_indices[
+            :extra_quota_count
+        ]
+        quota_assignment_provenance = {
+            "contract": "quality_ranked_exact_subset_quota_v1",
+            "basis": (
+                "bounded_quality_proof_all_sources_analyzed_then_ranked"
+            ),
+            "span_count": len(spans),
+            "source_count": source_count,
+            "required_distinct_source_count": represented_source_count,
+            "base_quota": _base_quota,
+            "extra_quota_count": extra_quota_count,
+            "extra_quota_source_indices": list(
+                explicit_extra_quota_sources
+            ),
+            "represented_source_indices": list(
+                represented_source_indices
+            ),
+            "omitted_source_indices": list(omitted_source_indices),
+            "source_fitness": source_fitness,
+            "fitness_order": list(ranked_source_indices),
+            "fitness_order_criteria": [
+                "valid_span_count_descending",
+                "nonsevere_boundary_connectivity_descending",
+                "mean_quality_score_descending",
+                "foreground_obstruction_count_ascending",
+                "preferred_source_order_tiebreak",
+            ],
+            "source_search_order": list(order),
+            "source_search_order_changed": False,
+            "counts_differ_by_at_most_one_among_represented_sources": True,
+            "all_sources_decoded_and_scored": True,
+            "all_analyzed_sources_required": False,
+            "source_duration_balance_policy": (
+                "short_proof_exact_count_flexible_exposure_v1"
+            ),
+            "maximum_source_duration_relative_deviation": (
+                resolved_config.maximum_source_duration_relative_deviation
+            ),
+            "ordinary_full_song_maximum_source_duration_relative_deviation": (
+                DirectMemberVisualConfig().maximum_source_duration_relative_deviation
+            ),
+            "visual_thresholds_changed": False,
+            "visual_gates_relaxed": False,
+        }
+    valid_count_by_source = [
+        {
+            "eligible_source_index": source_index,
+            "quota": int(quotas[source_index]),
+            "valid_span_count": int(valid_counts[source_index]),
+            "invalid_span_count": int(len(spans) - valid_counts[source_index]),
+            "valid_segment_indices": [
+                segment_index
+                for segment_index, validity in enumerate(candidate_validity)
+                if validity[source_index]
+            ],
+        }
+        for source_index in range(source_count)
+    ]
+    quota_shortfalls = tuple(
+        {
+            "eligible_source_index": source_index,
+            "quota": quotas[source_index],
+            "valid_span_count": valid_counts[source_index],
+        }
+        for source_index in range(source_count)
+        if valid_counts[source_index] < quotas[source_index]
+    )
+    empty_spans = tuple(
+        index for index, validity in enumerate(candidate_validity) if not any(validity)
+    )
+    if empty_spans or (
+        quota_shortfalls and not heterogeneous_cinematic_authorized
+    ):
+        raise DirectMemberVisualSelectionError(
+            "direct member content validity cannot satisfy balanced source quotas",
+            {
+                "failure": "content_validity_quota_precheck_failed",
+                "quota_shortfalls": list(quota_shortfalls),
+                "empty_segment_indices": list(empty_spans),
+                "span_content_validity": [
+                    span.to_dict() for span in span_diagnostics
+                ],
+                "valid_count_by_source": valid_count_by_source,
+                "hard_boundary_connectivity": hard_boundary_connectivity,
+                "source_quota_assignment": quota_assignment_provenance,
+            },
+        )
+    forward_exhaustion_boundary = (
+        _hard_boundary_forward_exhaustion_boundary(
+            hard_boundary_connectivity
+        )
+        if resolved_config.maximum_same_source_hold_count == 0
+        else None
+    )
+    if (
+        forward_exhaustion_boundary is not None
+        and not heterogeneous_cinematic_authorized
+    ):
+        failed_segment_index = forward_exhaustion_boundary + 1
+        failure_matrix = matrices[forward_exhaustion_boundary]
+        raise DirectMemberVisualSelectionError(
+            "direct member transition graph is disconnected before optimization",
+            {
+                "failure": "boundary_connectivity_path_exhausted",
+                "failed_at_segment_index": failed_segment_index,
+                "source_quotas": list(quotas),
+                "valid_source_indices": [
+                    index
+                    for index, valid in enumerate(
+                        candidate_validity[failed_segment_index]
+                    )
+                    if valid
+                ],
+                "severe_edge_pair_count": sum(
+                    bool(failure_matrix[left][right].severe_flags)
+                    for left in range(source_count)
+                    for right in range(source_count)
+                    if left != right
+                ),
+                "severe_edges_are_ineligible": True,
+                "constraint_infeasibility_proven": True,
+                "visual_gates_relaxed": False,
+                "search": {
+                    "strategy": (
+                        "exact_quota_independent_nonsevere_connectivity_precheck"
+                    ),
+                    "selection_basis": None,
+                    "adaptive_widening_used": False,
+                    "attempted_beam_widths": [],
+                    "attempts": [],
+                    "exact_lifeline": {
+                        "invoked": False,
+                        "skipped_by_stronger_quota_independent_proof": True,
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    },
+                    "search_capacity_exhausted": False,
+                    "constraint_infeasibility_proven": True,
+                },
+                "span_content_validity": [
+                    span.to_dict() for span in span_diagnostics
+                ],
+                "valid_count_by_source": valid_count_by_source,
+                "hard_boundary_connectivity": hard_boundary_connectivity,
+                "source_quota_assignment": quota_assignment_provenance,
+            },
+        )
+    policy_context = dict(
+        represented_source_count=represented_source_count,
+        source_count=source_count,
+        quotas=quotas,
+        order=order,
+        candidate_validity=candidate_validity,
+        spans=spans,
+        resolved_config=resolved_config,
+        normalized_forbidden_paths=normalized_forbidden_paths,
+        priority_boundaries=priority_boundaries,
+        forbidden_hold_boundaries=forbidden_hold_boundaries,
+        maximum_priority_cut_hold_count=maximum_priority_cut_hold_count,
+        source_frame_geometries=source_frame_geometries,
+        render_infeasible_edges=render_infeasible_edges,
+        ranked_source_indices=ranked_source_indices,
+        represented_source_indices=represented_source_indices,
+        quota_assignment_provenance=quota_assignment_provenance,
+        heterogeneous_cinematic_authorized=heterogeneous_cinematic_authorized,
+        span_diagnostics=span_diagnostics,
+        valid_count_by_source=valid_count_by_source,
+        hard_boundary_connectivity=hard_boundary_connectivity,
+        cinematic_bridge_enabled=cinematic_bridge_enabled,
+        continuous_official_portrait_fancam_contract=continuous_official_portrait_fancam_contract,
+    )
+    if observation_search is None:
+        policy_decision = _decide_direct_member_path_policy(matrices, **policy_context)
+    else:
+        decisions = []
+        def propose_observation_path(graph):
+            try:
+                decision = _decide_direct_member_path_policy(graph, **policy_context)
+            except DirectMemberVisualSelectionError as error:
+                failure = observation_search._incomplete('complete_policy_proposal_unavailable')
+                failure.diagnostics['proposal_failure'] = error.diagnostics
+                raise failure from error
+            decisions.append(decision)
+            return decision.path
+        def observe_transition(demand, *, observed_only=False):
+            boundary, left, right = demand.boundary_index, demand.outgoing_source_index, demand.incoming_source_index
+            candidates = _observe_member_boundary_pair(observation_stores[boundary],
+                outgoing_source_index=left, incoming_source_index=right,
+                source_frame_geometries=source_frame_geometries,
+                continuous_official_portrait_fancam_contract=continuous_official_portrait_fancam_contract,
+                priority_boundary=boundary in priority_boundaries, config=resolved_config,
+                observed_only=observed_only,
+                adjust_mismatch=lambda clock, left, right, mismatch:
+                    adjust_boundary_mismatch(boundary, clock, left, right, mismatch))
+            best = min(candidates, key=lambda item: (
+                0 if not item.mismatch.severe_flags else 1 if item.mismatch.cinematic_bridge is not None else 2,
+                item.mismatch.cost, abs(item.plan.offset_frames), item.plan.offset_frames))
+            return TransitionObservation(demand,
+                left == right or not best.mismatch.severe_flags or best.mismatch.cinematic_bridge is not None,
+                best.mismatch.cost, candidates, policy_evidence=best.mismatch)
+        def reuse_observed_pairs(demand):
+            store = observation_stores[demand.boundary_index]
+            available = store.observed_demands
+            result = []
+            for other in observation_search.unobserved_at(demand.boundary_index):
+                left, right = other.outgoing_source_index, other.incoming_source_index
+                plans = tuple(plan for plan in store.plans if left != right or plan.offset_frames == 0)
+                if all((plan.offset_frames, source) in available
+                       for plan in plans for source in (left, right)):
+                    result.append(observe_transition(other, observed_only=True))
+            return result
+        observed_path = observation_search.run(propose=propose_observation_path,
+            observe=observe_transition, reuse_observed=reuse_observed_pairs)
+        policy_decision = decisions[-1]
+        if policy_decision.path != observed_path.source_indices:
+            raise RuntimeError('observed member path lost its final policy audit')
+        priority_graph = observation_search.proposal_graph()
+        matrices, boundary_search_candidates = _materialize_member_observation_domain(
+            observation_stores, observation_search)
+        # All policy objectives are linear in selected edge cost. Exact-quota
+        # holds use a fixed penalty instead; role-aware holds retain edge cost.
+        cost_delta = sum(matrices[index][left][right].cost-priority_graph[index][left][right].cost
+            for index, (left, right) in enumerate(zip(policy_decision.path, policy_decision.path[1:]))
+            if left != right or policy_decision.usage_policy in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES)
+        observation_search_diagnostics = {
+            'contract': 'incumbent_first_exact_member_observations_v1',
+            'solver_call_count': observed_path.solver_call_count,
+            'exact_pair_request_count': observed_path.observation_count,
+            'reused_observation_count': observed_path.reused_observation_count,
+            'observed_transition_count': observed_path.observation_count+observed_path.reused_observation_count,
+            'unobserved_transition_count': observed_path.unobserved_transition_count,
+            'coarse_span_flanks_are_proposal_only': True,
+            'selected_transitions_and_all_offsets_observed': True,
+            'policy_resolved_after_final_observation': True,
+            'global_visual_optimality_claimed': False,
+            'visual_gates_relaxed': False,
+            'proposal_priority_cost': policy_decision.optimizer_cost,
+            'measured_edge_cost_restoration_delta': cost_delta,
+        }
+        policy_decision = replace(policy_decision, optimizer_cost=policy_decision.optimizer_cost+cost_delta)
+        hard_boundary_connectivity = {
+            **_hard_boundary_connectivity_diagnostics(matrices, candidate_validity),
+            'domain': 'observed_edges_only', 'unobserved_is_not_failed': True,
+        }
+    path = policy_decision.path
+    optimizer_cost = policy_decision.optimizer_cost
+    optimizer_search_diagnostics = policy_decision.optimizer_search_diagnostics
+    usage_policy = policy_decision.usage_policy
+    selected_source_targets = policy_decision.selected_source_targets
+    selected_count_minimums = policy_decision.selected_count_minimums
+    selected_count_maximums = policy_decision.selected_count_maximums
+    selected_duration_targets = policy_decision.selected_duration_targets
+    selected_duration_minimums = policy_decision.selected_duration_minimums
+    selected_duration_maximums = policy_decision.selected_duration_maximums
+    quota_assignment_provenance = policy_decision.quota_assignment_provenance
     optimizer_search_diagnostics = {
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,
+        "demand_driven_observations": observation_search_diagnostics,
         "source_quota_assignment": quota_assignment_provenance,
         "source_usage_policy": usage_policy,
         "required_distinct_source_count": represented_source_count,
@@ -13850,22 +14011,29 @@ def select_balanced_direct_member_sources(
         base_maximum_selected_run_seconds
         + boundary_alignment_run_extension_seconds
     )
-    (
-        selected_boundary_candidates,
-        selected_boundary_mismatches,
-        boundary_search_diagnostics,
-    ) = _joint_boundary_search_assignment(
-        candidates_by_boundary=boundary_search_candidates,
-        path=path,
-        spans=spans,
-        source_duration_targets=joint_duration_targets,
-        source_duration_minimums=joint_duration_minimums,
-        source_duration_maximums=joint_duration_maximums,
-        maximum_same_source_run_seconds=maximum_selected_run_seconds,
-        usage_policy=usage_policy,
-        priority_boundary_indices=frozenset(priority_boundaries),
-        config=resolved_config,
-    )
+    try:
+        (
+            selected_boundary_candidates,
+            selected_boundary_mismatches,
+            boundary_search_diagnostics,
+        ) = _joint_boundary_search_assignment(
+            candidates_by_boundary=boundary_search_candidates,
+            path=path,
+            spans=spans,
+            source_duration_targets=joint_duration_targets,
+            source_duration_minimums=joint_duration_minimums,
+            source_duration_maximums=joint_duration_maximums,
+            maximum_same_source_run_seconds=maximum_selected_run_seconds,
+            usage_policy=usage_policy,
+            priority_boundary_indices=frozenset(priority_boundaries),
+            config=resolved_config,
+        )
+    except DirectMemberVisualSelectionError as error:
+        if observation_search is None:
+            raise
+        failure = observation_search._incomplete('joint_cut_time_assignment_incomplete')
+        failure.diagnostics['selected_path_failure'] = error.diagnostics
+        raise failure from error
     selected_boundary_master_seconds = tuple(
         candidate.cut_master_seconds
         for candidate in selected_boundary_candidates
@@ -14113,9 +14281,12 @@ def select_balanced_direct_member_sources(
             and candidate_validity[boundary_index + 1][right]
         )
         severe_pair_count = sum(
-            bool(matrices[boundary_index][left][right].severe_flags)
+            isinstance(matrices[boundary_index][left][right], DirectBoundaryMismatch)
+            and bool(matrices[boundary_index][left][right].severe_flags)
             for left, right in content_valid_pairs
         )
+        unobserved_pair_count = sum(not isinstance(matrices[boundary_index][left][right], DirectBoundaryMismatch)
+            for left, right in content_valid_pairs)
         ranked_pairs = sorted(
             (
                 (matrices[boundary_index][left][right].cost, left, right)
@@ -14174,6 +14345,7 @@ def select_balanced_direct_member_sources(
                     raw_cross_source_pair_count - len(content_valid_pairs)
                 ),
                 severe_pair_count=severe_pair_count,
+                unobserved_pair_count=unobserved_pair_count,
                 minimum_pair_cost=minimum_cost,
                 selected_pair_cost_delta=(
                     mismatch.cost - minimum_cost if cut_applied else 0.0
@@ -14198,7 +14370,9 @@ def select_balanced_direct_member_sources(
         'contract': 'focal_proposals_full_retained_effect_samples_v1',
         'enabled': focal_proposal_provider is not None,
         'retained_full_descriptor_query_count': len(hydrated_descriptors),
-        'exact_target_pose_queries_omitted': False,
+        'exact_target_pose_queries_omitted': demand_driven_observations,
+        'omission_scope': 'unselected_unobserved_transitions_only' if demand_driven_observations else None,
+        'selected_exact_target_pose_queries_omitted': False,
         'boundary_offsets_or_sources_removed': False,
         'full_effect_handle_features_required': True,
     }

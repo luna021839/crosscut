@@ -803,14 +803,24 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         for node in ast.walk(syntax):
             if not isinstance(node, ast.Try) or not node.handlers:
                 continue
-            cut_local_calls = [
-                item
-                for statement in node.body
-                for item in ast.walk(statement)
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == "analyze_cut_local_sync"
-            ]
+            # Inspect this try's own work, not calls protected by a nested try
+            # or defined in another function. The outer review-first wrapper
+            # has its own cutoff handler and is not the storage-loss owner.
+            class OwnedCalls(ast.NodeVisitor):
+                def __init__(self): self.calls = []
+                def visit_Try(self, node): pass
+                def visit_FunctionDef(self, node): pass
+                def visit_AsyncFunctionDef(self, node): pass
+                def visit_ClassDef(self, node): pass
+                def visit_Lambda(self, node): pass
+                def visit_Call(self, node):
+                    if isinstance(node.func, ast.Name) and node.func.id == 'analyze_cut_local_sync':
+                        self.calls.append(node)
+                    self.generic_visit(node)
+            owned = OwnedCalls()
+            for statement in node.body:
+                owned.visit(statement)
+            cut_local_calls = owned.calls
             if not cut_local_calls:
                 continue
             first_handler = node.handlers[0]

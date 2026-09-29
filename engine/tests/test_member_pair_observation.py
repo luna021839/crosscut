@@ -29,12 +29,37 @@ class MemberPairObservationTests(unittest.TestCase):
         observer, prepare = Mock(side_effect=observe), Mock()
         return MemberBoundaryObservationStore(plans, observe=observer, prepare=prepare), observer, prepare
 
-    def pair(self, store, left=0, right=3, adjust=None):
+    def pair(self, store, left=0, right=3, adjust=None, observed_only=False):
         return _observe_member_boundary_pair(store,
             outgoing_source_index=left, incoming_source_index=right,
             source_frame_geometries=(None,)*4,
             continuous_official_portrait_fancam_contract=True,
-            priority_boundary=True, config=DirectMemberVisualConfig(), adjust_mismatch=adjust)
+            priority_boundary=True, config=DirectMemberVisualConfig(), adjust_mismatch=adjust,
+            observed_only=observed_only)
+
+    def test_read_only_pair_reuses_real_samples_without_preparation_or_inference(self):
+        store, observer, prepare = self.store()
+        with self.assertRaises(KeyError): self.pair(store, observed_only=True)
+        observer.assert_not_called()
+        prepare.assert_not_called()
+        expected = self.pair(store)
+        observer.reset_mock()
+        prepare.reset_mock()
+        self.assertEqual(self.pair(store, observed_only=True), expected)
+        self.pair(store, left=3, right=0, observed_only=True)
+        with self.assertRaises(KeyError): self.pair(store, left=0, right=2, observed_only=True)
+        observer.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_partial_cached_offset_is_not_a_complete_cross_source_observation(self):
+        store, observer, prepare = self.store()
+        self.pair(store, left=0, right=0)
+        self.pair(store, left=3, right=3)
+        observer.reset_mock()
+        prepare.reset_mock()
+        with self.assertRaises(KeyError): self.pair(store, observed_only=True)
+        observer.assert_not_called()
+        prepare.assert_not_called()
 
     def test_exact_pair_scores_and_handles_equal_full_matrix_without_other_source_observations(self):
         sparse, observer, prepare = self.store()
@@ -89,7 +114,7 @@ class MemberPairObservationTests(unittest.TestCase):
     def test_coordinator_observes_complete_proposed_path_with_actual_pair_scorer(self):
         stores = [self.store() for _ in range(3)]
         search = MemberObservationSearch(((True,)*4,)*4,
-            maximum_observations=6, maximum_solver_calls=1)
+            maximum_observations=6, maximum_solver_calls=2)
         def observe(demand):
             candidates = self.pair(stores[demand.boundary_index][0],
                 left=demand.outgoing_source_index, right=demand.incoming_source_index)

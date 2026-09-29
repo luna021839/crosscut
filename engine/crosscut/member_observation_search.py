@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Callable, Generic, Sequence, TypeVar
+from time import monotonic
+from typing import Callable, Generic, Mapping, Sequence, TypeVar
 
 
 Evidence = TypeVar("Evidence")
@@ -42,6 +43,7 @@ class TransitionObservation(Generic[Evidence]):
     eligible: bool
     cost: float
     evidence: Evidence
+    policy_evidence: object | None = None
 
     def __post_init__(self) -> None:
         if type(self.eligible) is not bool:
@@ -65,13 +67,30 @@ class ProposalEdge:
     """
     state: ObservationState
     cost: float
+    severe_flags: tuple[str, ...] | None = None
+    policy_evidence: object | None = None
 
-    @property
-    def severe_flags(self) -> tuple[str, ...]:
-        # Adapter to the existing bounded path MILP; no sample/geometry fields.
-        if self.state is ObservationState.CONTENT_INELIGIBLE:
-            return ("content_or_cross_source_policy_ineligible",)
-        return ("observed_transition_rejected",) if self.state is ObservationState.REJECTED else ()
+    def __post_init__(self) -> None:
+        if self.severe_flags is None:
+            flags = (("content_or_cross_source_policy_ineligible",)
+                if self.state is ObservationState.CONTENT_INELIGIBLE else
+                ("observed_transition_rejected",)
+                if self.state is ObservationState.REJECTED else
+                tuple(getattr(self.policy_evidence, 'severe_flags', ())))
+            object.__setattr__(self, 'severe_flags', flags)
+
+    def __getattr__(self, name: str):
+        # These are only policy scalars/real measured effect certificates. No
+        # pose, sample or optimistic effect certificate is ever manufactured.
+        # The shared solver may optimistically consider an unknown hard edge;
+        # all selected demands must be observed and the policy solved AGAIN.
+        if name in {'cinematic_bridge', 'motion_connection', 'transform_repair',
+                    'attention_position_mismatch', 'attention_scale_mismatch',
+                    'attention_geometry_basis', 'silhouette_mismatch'}:
+            if self.state in {ObservationState.REJECTED, ObservationState.CONTENT_INELIGIBLE}:
+                return None
+            return getattr(self.policy_evidence, name, None)
+        raise AttributeError(name)
 
 
 ProposalGraph = tuple[tuple[tuple[ProposalEdge, ...], ...], ...]
@@ -84,6 +103,7 @@ class ObservedPathProposal(Generic[Evidence]):
     solver_call_count: int
     observation_count: int
     unobserved_transition_count: int
+    reused_observation_count: int = 0
 
 
 class MemberObservationSearchIncomplete(RuntimeError):
@@ -106,10 +126,8 @@ class MemberObservationSearchIncomplete(RuntimeError):
 class MemberObservationSearch(Generic[Evidence]):
     """Run-local demand ledger with a finite progress and work contract.
 
-    The current proposal adapter is cross-source only. Do not enable it as a
-    replacement for the production selector until its policy adapter covers
-    the existing hold/cinematic and joint-offset contracts too. In particular,
-    `propose` returning None cannot prove that those other policies are infeasible.
+    Holds require an explicit policy adapter; they are disabled by default.
+    `propose` returning None cannot prove the complete edit domain infeasible.
     Provider/SSD/cancellation errors escape directly, without a retry loop.
     """
     def __init__(
@@ -118,6 +136,9 @@ class MemberObservationSearch(Generic[Evidence]):
         *,
         maximum_observations: int,
         maximum_solver_calls: int,
+        allow_same_source_holds: bool = False,
+        proposal_costs: Mapping[TransitionDemand, float] | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.validity = tuple(tuple(row) for row in candidate_validity)
         if len(self.validity) < 2 or len(self.validity[0]) < 2:
@@ -131,16 +152,30 @@ class MemberObservationSearch(Generic[Evidence]):
                 raise ValueError("observation/solver budgets must be positive integers")
         self.maximum_observations = maximum_observations
         self.maximum_solver_calls = maximum_solver_calls
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError('observation progress callback must be callable')
+        self._progress_callback = progress_callback
+        self._started = monotonic()
+        if type(allow_same_source_holds) is not bool:
+            raise ValueError("same-source policy must be explicit")
+        self.allow_same_source_holds = allow_same_source_holds
         self._domain = frozenset(
             TransitionDemand(boundary, left, right)
             for boundary in range(len(self.validity)-1)
             for left in range(self.source_count)
             for right in range(self.source_count)
-            if left != right and self.validity[boundary][left] and self.validity[boundary+1][right]
+            if (left != right or allow_same_source_holds)
+            and self.validity[boundary][left] and self.validity[boundary+1][right]
         )
         self._observed: dict[TransitionDemand, TransitionObservation[Evidence]] = {}
+        self._proposal_costs = dict(proposal_costs or {})
+        if any(demand not in self._domain or isinstance(cost, bool)
+               or not isinstance(cost, (int, float)) or not math.isfinite(cost) or not 0 <= cost <= 1
+               for demand, cost in self._proposal_costs.items()):
+            raise ValueError('coarse proposal priorities must be finite domain-bound values in [0, 1]')
         self._solver_calls = 0
         self._observation_calls = 0
+        self._reused_observations = 0
 
     def proposal_graph(self) -> ProposalGraph:
         def edge(demand: TransitionDemand) -> ProposalEdge:
@@ -150,25 +185,47 @@ class MemberObservationSearch(Generic[Evidence]):
             if observed is not None and not observed.eligible:
                 return ProposalEdge(ObservationState.REJECTED, 1.0)
             if observed is None:
-                return ProposalEdge(ObservationState.UNOBSERVED, 1.0)
+                return ProposalEdge(ObservationState.UNOBSERVED, 1.0+self._proposal_costs.get(demand, 0.))
             priority = .25 * (.5 + math.atan(observed.cost) / math.pi)
-            return ProposalEdge(ObservationState.ELIGIBLE, priority)
+            return ProposalEdge(ObservationState.ELIGIBLE, priority, policy_evidence=observed.policy_evidence)
         return tuple(tuple(tuple(edge(TransitionDemand(boundary, left, right))
             for right in range(self.source_count)) for left in range(self.source_count))
             for boundary in range(len(self.validity)-1))
 
     def _incomplete(self, reason: str) -> MemberObservationSearchIncomplete:
-        return MemberObservationSearchIncomplete(reason, solver_calls=self._solver_calls,
+        error = MemberObservationSearchIncomplete(reason, solver_calls=self._solver_calls,
             observations=self._observation_calls, unobserved=len(self._domain)-len(self._observed))
+        error.diagnostics['reused_observation_count'] = self._reused_observations
+        return error
+
+    @property
+    def observations(self) -> tuple[TransitionObservation[Evidence], ...]:
+        return tuple(self._observed.values())
+
+    def unobserved_at(self, boundary_index: int) -> tuple[TransitionDemand, ...]:
+        """Only legal, unmeasured pairs; no inference or eligibility defaults."""
+        return tuple(sorted((demand for demand in self._domain
+            if demand.boundary_index == boundary_index and demand not in self._observed),
+            key=lambda demand: (demand.outgoing_source_index, demand.incoming_source_index)))
+
+    def _emit(self, event, **payload):
+        if self._progress_callback is not None:
+            self._progress_callback(dict(phase='member_observation_search', event=event,
+                elapsed_seconds=round(monotonic()-self._started, 3),
+                solver_call_count=self._solver_calls, observation_count=self._observation_calls,
+                reused_observation_count=self._reused_observations,
+                unobserved_transition_count=len(self._domain)-len(self._observed), **payload))
 
     def run(
         self,
         *,
         propose: Callable[[ProposalGraph], Sequence[int] | None],
         observe: Callable[[TransitionDemand], TransitionObservation[Evidence]],
+        reuse_observed: Callable[[TransitionDemand], Sequence[TransitionObservation[Evidence]]] | None = None,
     ) -> ObservedPathProposal[Evidence]:
         while self._solver_calls < self.maximum_solver_calls:
             self._solver_calls += 1
+            self._emit('policy_proposal_started')
             proposed = propose(self.proposal_graph())
             if proposed is None:
                 raise self._incomplete("proposal_solver_returned_no_path")
@@ -184,6 +241,7 @@ class MemberObservationSearch(Generic[Evidence]):
             if any(demand in self._observed and not self._observed[demand].eligible for demand in demands):
                 raise ValueError("proposal repeats an observed rejected transition")
             rejected = False
+            observation_changed = False
             for demand in demands:
                 if demand in self._observed:
                     continue
@@ -192,14 +250,45 @@ class MemberObservationSearch(Generic[Evidence]):
                 # Charge before the call so external failures do not reset work
                 # accounting if a caller deliberately resumes this same ledger.
                 self._observation_calls += 1
+                self._emit('exact_pair_started', boundary_index=demand.boundary_index,
+                    outgoing_source_index=demand.outgoing_source_index, incoming_source_index=demand.incoming_source_index)
                 observed = observe(demand)
                 if not isinstance(observed, TransitionObservation) or observed.demand != demand:
                     raise ValueError("observer returned evidence for a different transition")
                 self._observed[demand] = observed
+                if reuse_observed is not None:
+                    # The production adapter uses read-only exact samples.
+                    # Re-score other pairs already covered by those samples,
+                    # without paying for another global proposal or inference.
+                    related = tuple(reuse_observed(demand))
+                    if len(related) > self.source_count ** 2:
+                        raise ValueError('cached pair publication exceeded one boundary domain')
+                    seen = set()
+                    for item in related:
+                        if (not isinstance(item, TransitionObservation)
+                                or item.demand.boundary_index != demand.boundary_index
+                                or item.demand not in self._domain
+                                or item.demand in self._observed or item.demand in seen):
+                            raise ValueError('cached pair evidence must be new and boundary-local')
+                        seen.add(item.demand)
+                    self._observed.update((item.demand, item) for item in related)
+                    self._reused_observations += len(related)
+                self._emit('exact_pair_observed', boundary_index=demand.boundary_index,
+                    outgoing_source_index=demand.outgoing_source_index,
+                    incoming_source_index=demand.incoming_source_index,
+                    eligible=observed.eligible,
+                    severe_flags=list(getattr(observed.policy_evidence, 'severe_flags', ())),
+                    effect=getattr(getattr(observed.policy_evidence, 'cinematic_bridge', None), 'style', None))
+                observation_changed = True
                 if not observed.eligible:
                     rejected = True
                     break  # Repair this path before observing its unused tail.
-            if not rejected:
+            # New evidence can turn an optimistic hard edge into a required
+            # dissolve and change spacing/role/exposure feasibility. A path is
+            # never returned under the stale policy that preceded observation.
+            if not rejected and not observation_changed:
+                self._emit('observed_path_policy_verified')
                 return ObservedPathProposal(path, tuple(self._observed[demand] for demand in demands),
-                    self._solver_calls, self._observation_calls, len(self._domain)-len(self._observed))
+                    self._solver_calls, self._observation_calls, len(self._domain)-len(self._observed),
+                    self._reused_observations)
         raise self._incomplete("proposal_solver_budget_exhausted")

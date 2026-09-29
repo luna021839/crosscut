@@ -65,6 +65,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
             shared_source_frames=getattr(focal, 'shared_source_frames', None),**arguments)
         visual.prepare_focal_observations = SourceFirstObservationBatch(focal,
             progress_callback=progress_callback)
+        visual.member_observation_progress = progress_callback
     except BaseException:
         focal.close()
         raise

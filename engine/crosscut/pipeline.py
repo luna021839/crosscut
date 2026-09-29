@@ -9986,6 +9986,8 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("source_first_member_session.py"),
                 Path(__file__).with_name("source_first_observation_batch.py"),
                 Path(__file__).with_name("member_boundary_observations.py"),
+                Path(__file__).with_name("member_observation_search.py"),
+                Path(__file__).with_name("member_path_flow.py"),
                 Path(__file__).with_name("source_first_unresolved_memo.py"),
                 Path(__file__).with_name("source_first_execution.py"),
                 Path(__file__).with_name("source_first_published_cache.py"),
@@ -16391,11 +16393,16 @@ def _select_direct_member_partition_profile(
         extra_quota_source_indices: Sequence[int] | None = None,
         allow_safe_hold_search: bool = False,
     ) -> DirectMemberVisualSelection:
-        """Run one partition, deferring no-cut holds unless explicitly terminal."""
+        """Run one partition with the complete bounded policy in demand mode."""
 
+        demand_driven_observations = bool(
+            callable(getattr(provider, 'focal_geometry_at', None))
+            and represented_source_count == len(eligible_sources)
+        )
         defer_safe_hold_search = bool(
             continuous_official_portrait_fancam_contract
             and not allow_safe_hold_search
+            and not demand_driven_observations
         )
         profile_duration_seconds = sum(
             span.duration_seconds for span in profile.spans
@@ -16476,7 +16483,8 @@ def _select_direct_member_partition_profile(
                         continuous_official_portrait_fancam_contract
                     ),
                     cinematic_bridge_enabled=bool(
-                        allow_safe_hold_search and cinematic_bridge_enabled
+                        (allow_safe_hold_search or demand_driven_observations)
+                        and cinematic_bridge_enabled
                     ),
                     required_distinct_source_count=represented_source_count,
                     preferred_source_order=source_cycle,
@@ -16519,6 +16527,7 @@ def _select_direct_member_partition_profile(
                     ),
                     config=effective_config,
                     descriptor_provider=provider,
+                    demand_driven_observations=demand_driven_observations,
                 )
             except DirectMemberVisualSelectionError as error:
                 if highlight_hold_repair_attempts:

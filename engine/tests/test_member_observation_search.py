@@ -35,7 +35,7 @@ class MemberObservationSearchTests(unittest.TestCase):
 
     def test_failure_repairs_path_without_observing_its_tail_or_repeating_good_edges(self):
         search = self.search()
-        proposals = iter(((0, 1, 2, 0), (0, 1, 0, 2)))
+        proposals = iter(((0, 1, 2, 0), (0, 1, 0, 2), (0, 1, 0, 2)))
         queries = []
         failed = TransitionDemand(1, 1, 2)
         def observe(demand):
@@ -65,6 +65,34 @@ class MemberObservationSearchTests(unittest.TestCase):
         self.assertFalse(error.diagnostics['render_authorized'])
         self.assertEqual(error.diagnostics['observation_count'], 1)
         observer.assert_called_once()
+
+    def test_cached_pair_reuse_repairs_without_reobserving_its_samples(self):
+        search = self.search(spans=3, observations=2)
+        proposals = iter(((0, 1, 2), (0, 2, 1), (0, 2, 1)))
+        queries = []
+        rejected = TransitionDemand(0, 0, 1)
+        reused = TransitionDemand(0, 0, 2)
+        def observe(demand):
+            queries.append(demand)
+            return observed(demand, demand != rejected)
+        def reuse(demand):
+            self.assertNotIn(demand, search.unobserved_at(demand.boundary_index))
+            return (observed(reused),) if demand == rejected else ()
+        result = search.run(propose=lambda _: next(proposals), observe=observe, reuse_observed=reuse)
+        self.assertEqual(result.source_indices, (0, 2, 1))
+        self.assertEqual(queries, [rejected, TransitionDemand(1, 2, 1)])
+        self.assertEqual(result.observation_count, 2)
+        self.assertEqual(result.reused_observation_count, 1)
+        self.assertEqual(result.unobserved_transition_count, 9)
+        self.assertEqual(search.proposal_graph()[0][0][2].state, ObservationState.ELIGIBLE)
+
+    def test_cached_reuse_cannot_publish_another_boundary_or_overwrite_known_evidence(self):
+        for cached in ((observed(TransitionDemand(1, 0, 2)),),
+                       (observed(TransitionDemand(0, 0, 1)),),
+                       (observed(TransitionDemand(0, 1, 2)),)*2):
+            with self.assertRaisesRegex(ValueError, 'boundary-local'):
+                self.search().run(propose=lambda _: (0, 1, 2, 0), observe=observed,
+                                  reuse_observed=lambda _: cached)
 
     def test_no_path_is_not_full_visual_infeasibility_even_without_observations(self):
         observer = Mock()
