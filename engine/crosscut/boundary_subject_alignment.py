@@ -587,6 +587,7 @@ class BoundarySubjectAlignmentPlan:
                 "legacy_editorial_schema_globally_relaxed": False,
                 "native_zoom_policy": "source_resolution_after_base_crop_face_alignment_only_v1",
                 "close_face_containment": "measured_face_plus_source_clipped_head_margin",
+                "paired_tight_medium_containment": "bilateral_central_landmark_face_and_source_truncated_torso_head_envelope_v1",
                 "medium_wide_containment": "full_visible_performer_or_formation",
                 "transform_search": "endpoint_valid_strengths_ranked_then_complete_dense_windows_v1",
                 "maximum_track_candidates_per_segment": 35,
@@ -1062,6 +1063,37 @@ def _shot_policy(observation: BoundarySubjectObservation) -> str:
     return "unknown"
 
 
+def _paired_framing_policies(outgoing, incoming):
+    """Recognize a shared tight composition, not an arbitrary medium crop.
+
+    A frame-truncated torso is not a measured full body/feet envelope. Only
+    two dominant, landmark-backed faces belonging to the central performers
+    can use the head-framing envelope for this pair. Full bodies, off-center
+    background faces and one-sided/ambiguous evidence keep their old policy.
+    The selected policy is fixed through the complete dense motion window.
+    """
+    policies = (_shot_policy(outgoing), _shot_policy(incoming))
+    def tight(observation):
+        if (not _has_unambiguous_face(observation)
+                or observation.face_landmarks_xy is None
+                or len(observation.face_landmarks_xy) != 5
+                or observation.face_eye_scale is None):
+            return False
+        face = observation.face_box_xywh
+        assert face is not None
+        if face[3] < .14 or not .30 <= _center(face)[0] <= .70:
+            return False
+        person = _associated_person_box(face, observation.formation_boxes_xywh)
+        if person is None or person != _central_person_box(observation.formation_boxes_xywh):
+            return False
+        return (person[1] + person[3] >= .965 and face[3] / person[3] >= .20
+                and _center(face)[1] <= person[1] + .55 * person[3])
+    if all(policy in {'close_face', 'medium_focus'} for policy in policies) and all(
+            tight(observation) for observation in (outgoing, incoming)):
+        return tuple('tight_medium_face' if policy == 'medium_focus' else policy for policy in policies)
+    return policies
+
+
 def _subject(
     observation: BoundarySubjectObservation,
     *,
@@ -1078,7 +1110,7 @@ def _subject(
         performer = _associated_person_box(face_box, boxes)
         containment = (
             (_close_face_head_envelope(face_box),)
-            if (framing_policy or _shot_policy(observation)) == "close_face"
+            if (framing_policy or _shot_policy(observation)) in {"close_face", "tight_medium_face"}
             else (performer,) if performer is not None else (face_box,)
         )
         return _SubjectGeometry(
@@ -1130,8 +1162,7 @@ def _common_subjects(
     *,
     settings: BoundarySubjectAlignmentConfig,
 ) -> tuple[_SubjectGeometry | None, _SubjectGeometry | None, str | None]:
-    outgoing_policy = _shot_policy(outgoing)
-    incoming_policy = _shot_policy(incoming)
+    outgoing_policy, incoming_policy = _paired_framing_policies(outgoing, incoming)
     outgoing_wide = outgoing_policy == "wide_formation"
     incoming_wide = incoming_policy == "wide_formation"
     if outgoing_wide != incoming_wide:
@@ -1142,8 +1173,8 @@ def _common_subjects(
     else:
         preferred = ("face", "upper_body", "silhouette")
     for kind in preferred:
-        left = _subject(outgoing, preferred_kind=kind, settings=settings)
-        right = _subject(incoming, preferred_kind=kind, settings=settings)
+        left = _subject(outgoing, preferred_kind=kind, settings=settings, framing_policy=outgoing_policy)
+        right = _subject(incoming, preferred_kind=kind, settings=settings, framing_policy=incoming_policy)
         if left is not None and right is not None:
             return (left, right, None)
     return (None, None, "exact_common_subject_geometry_unavailable")
@@ -1914,8 +1945,8 @@ def build_boundary_subject_alignment_plan(
             if outgoing_observation is None or incoming_observation is None:
                 decisions.append(rejected(boundary_index, "exact_cut_frame_decode_or_geometry_failed"))
                 continue
-            outgoing_policy = _shot_policy(outgoing_observation)
-            incoming_policy = _shot_policy(incoming_observation)
+            outgoing_policy, incoming_policy = _paired_framing_policies(
+                outgoing_observation, incoming_observation)
             outgoing_subject, incoming_subject, subject_failure = _common_subjects(
                 outgoing_observation,
                 incoming_observation,

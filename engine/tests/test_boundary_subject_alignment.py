@@ -13,6 +13,7 @@ from crosscut.boundary_subject_alignment import (
     BoundarySubjectObservation,
     _optical_flow_box,
     _shot_policy,
+    _paired_framing_policies,
     _subject,
     _TransformState,
     _project_box,
@@ -100,6 +101,70 @@ def _observations(
 
 
 class BoundarySubjectAlignmentTests(unittest.TestCase):
+    @staticmethod
+    def _tight_observation(*, small=False):
+        face = (.44,.30,.12,.16) if small else (.42,.26,.16,.21)
+        x,y,w,h = face
+        return BoundarySubjectObservation(face_count=1, face_box_xywh=face,
+            face_eye_scale=h*.42,
+            face_landmarks_xy=((x+.3*w,y+.3*h),(x+.7*w,y+.3*h),
+                (x+.5*w,y+.5*h),(x+.3*w,y+.8*h),(x+.7*w,y+.8*h)),
+            detected_person_count=1, formation_boxes_xywh=((.30,.23,.40,.77),))
+
+    def test_paired_tight_medium_framing_requires_two_central_measured_truncated_subjects(self):
+        large, small = self._tight_observation(), self._tight_observation(small=True)
+        self.assertEqual(_shot_policy(small), 'medium_focus')
+        self.assertEqual(_paired_framing_policies(large,small), ('tight_medium_face',)*2)
+        full_body = replace(small, formation_boxes_xywh=((.30,.23,.40,.65),))
+        ambiguous = replace(small, face_count=2)
+        unmeasured = replace(small, face_landmarks_xy=None)
+        peripheral = replace(small, face_box_xywh=(.10,.30,.12,.16),
+            detected_person_count=2, formation_boxes_xywh=((.02,.23,.27,.77),(.35,.03,.30,.97)))
+        for unproved in (full_body, ambiguous, unmeasured, peripheral):
+            with self.subTest(unproved=unproved):
+                self.assertNotIn('tight_medium_face', _paired_framing_policies(large, unproved))
+        # The unpaired API does not silently widen all medium shot crops.
+        self.assertEqual(_subject(small, preferred_kind='face',
+            settings=BoundarySubjectAlignmentConfig()).containment_boxes, small.formation_boxes_xywh)
+
+    def test_tight_medium_face_match_validates_every_frame_and_retains_head_margin(self):
+        timeline = VisualTimelinePlan((_choice(0,0,start=0.,end=1.),
+            _choice(1,1,start=1.,end=2.)),1.)
+        def observe(frame):
+            return self._tight_observation(small=float(frame.mean())<75)
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a.mp4'),Path('b.mp4')), transitions=(RenderTransition(tier='C'),),
+            fps=30., frame_provider=lambda index,_seconds:_frame(index),
+            observation_provider=observe, source_resolutions=((3840,2160),)*2)
+        self.assertEqual(plan.eligible_count,1)
+        self.assertEqual(plan.validated_output_frame_count,13)
+        self.assertEqual(plan.decisions[0].outgoing_shot_policy,'tight_medium_face')
+        self.assertGreater(plan.decisions[0].outgoing_state.zoom,1.18)
+        subject = _subject(self._tight_observation(small=True), preferred_kind='face',
+            settings=BoundarySubjectAlignmentConfig(), framing_policy='tight_medium_face')
+        self.assertGreater(subject.containment_boxes[0][3],.16)
+        for frame in range(30):
+            value = plan.track_for(0).evaluate(frame/30.)
+            state = _TransformState(value.zoom,value.center_x,value.center_y,value.roll_degrees)
+            self.assertGreaterEqual(_project_box(subject.containment_boxes[0],state)[1],.995)
+
+    def test_tight_medium_permission_does_not_skip_an_intervening_clipped_head(self):
+        timeline = VisualTimelinePlan((_choice(0,0,start=0.,end=1.),
+            _choice(1,1,start=1.,end=2.)),1.)
+        def observe(frame):
+            marker = float(frame.mean())
+            if 74 < marker < 76:
+                return replace(self._tight_observation(small=True), face_box_xywh=(.86,.30,.12,.16))
+            return self._tight_observation(small=marker<75)
+        plan = build_boundary_subject_alignment_plan(visual_timeline=timeline,
+            sources=(Path('a.mp4'),Path('b.mp4')), transitions=(RenderTransition(tier='C'),),
+            fps=30., frame_provider=lambda index,seconds: _frame(index,
+                75 if index==0 and abs(seconds-24/30.)<1e-5 else None),
+            observation_provider=observe, source_resolutions=((3840,2160),)*2)
+        self.assertEqual(plan.eligible_count,0)
+        self.assertEqual(plan.decisions[0].rejection_reason,'per_frame_subject_containment_failed')
+        self.assertIsNone(plan.track_for(0))
+
     def test_native_cut_scope_uses_only_the_transformed_window(self):
         choice = replace(_choice(0, 0, start=10., end=12.),
             internal_scene_cut_master_seconds=(10.3,),
