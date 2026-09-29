@@ -176,6 +176,27 @@ class SeekLocalityTests(unittest.TestCase):
         self.assertGreaterEqual(reader.decode_seconds, 0.)
         self.assertGreaterEqual(reader.process_seconds, 0.)
 
+    def test_short_gap_only_materializes_frames_that_can_survive_cache_eviction(self):
+        for capacity in (1,2,3,4,5):
+            processed = []
+            capture = FakeCapture()
+            reader = SeekLocalityReader(capture, clock=ConstantFrameClock(Fraction(30),300),
+                maximum_cached_frames=capacity,
+                process_frame=lambda frame: processed.append(int(frame[0,0,0])) or frame)
+            for index in (20,25):
+                np.testing.assert_array_equal(reader.frame_at(index/30),index)
+            expected = list(range(26-capacity,26))
+            self.assertEqual(processed,[20,*expected])
+            self.assertEqual(list(reader.frames),expected)
+            self.assertEqual(reader.materialized_frame_count,1+capacity)
+            self.assertEqual(reader.skipped_materialization_count,5-capacity)
+            self.assertEqual(reader.seek_count,1)
+            np.testing.assert_array_equal(reader.frame_at(25/30),25)
+            self.assertEqual(reader.pixel_cache_hit_count,1)
+            # An evicted requested frame is really sought, never substituted.
+            np.testing.assert_array_equal(reader.frame_at(20/30),20)
+            self.assertEqual(reader.seek_count,2)
+
     def test_skipped_frame_clock_divergence_still_disables_reuse(self):
         capture = FakeCapture()
         reader = self.make_reader(capture)
@@ -281,7 +302,7 @@ class ActualDecoderLocalityTests(unittest.TestCase):
             )
             cls.files[name] = output
 
-    def compare_requests(self, path, clock):
+    def compare_requests(self, path, clock, *, maximum_cached_frames=32, values=None):
         baseline = cv2.VideoCapture(str(path))
         accelerated = cv2.VideoCapture(str(path))
         self.addCleanup(baseline.release)
@@ -290,10 +311,12 @@ class ActualDecoderLocalityTests(unittest.TestCase):
             self.skipTest('FFmpeg decoder backend required')
         reader = SeekLocalityReader(
             accelerated, clock=clock, process_frame=lambda frame: frame,
+            maximum_cached_frames=maximum_cached_frames,
         )
         rate = baseline.get(cv2.CAP_PROP_FPS)
-        values = [0, -1, 1, 2, 2.49, 2.5, 2.51, 3, 8, 12, 5, 30, 32, 31,
-                  48, 49, 55, 51, 56, 20, 21, 100, 1]
+        if values is None:
+            values = [0, -1, 1, 2, 2.49, 2.5, 2.51, 3, 8, 12, 5, 30, 32, 31,
+                      48, 49, 55, 51, 56, 20, 21, 100, 1]
         for value in values:
             seconds = value / rate
             baseline.set(cv2.CAP_PROP_POS_MSEC, max(0, seconds) * 1000)
@@ -316,6 +339,16 @@ class ActualDecoderLocalityTests(unittest.TestCase):
                 reader = self.compare_requests(self.files[name], clock)
                 self.assertLess(reader.seek_count, 23)
                 self.assertGreater(reader.pixel_cache_hit_count, 0)
+
+    def test_one_frame_native_cache_preserves_real_av1_pixels_across_short_gaps(self):
+        for name in ('cfr','ntsc'):
+            with self.subTest(name=name):
+                clock=probe_constant_frame_clock(self.files[name],ffprobe=self.ffprobe)
+                self.assertIsNotNone(clock)
+                reader=self.compare_requests(self.files[name],clock,maximum_cached_frames=1,
+                    values=(0,1,5,9,13,17,17,18,14,15,19,23,27,31))
+                self.assertGreater(reader.skipped_materialization_count,0)
+                self.assertEqual(reader.fallback_count,0)
 
     def test_real_vfr_is_not_aliasable_and_preserves_original_seeking(self):
         clock = probe_constant_frame_clock(self.files['vfr'], ffprobe=self.ffprobe)

@@ -249,7 +249,13 @@ never borrows a neighbor.
         retain_small_gap = target - self.next_index <= 4
         while self.next_index <= target:
             frame_index = self.next_index
-            materialize = retain_small_gap or frame_index == target
+            # A one-frame native cache used to convert every short-gap frame
+            # to a full 4K RGB raster, then evict it before any consumer could
+            # see it. Retain exactly the same final cache window, but advance
+            # earlier intermediate frames without allocating those pixels.
+            materialize = frame_index == target or (
+                retain_small_gap and frame_index > target-self.maximum_cached_frames
+            )
             success, frame = self._advance(materialize=materialize)
             if (
                 not success
