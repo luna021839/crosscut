@@ -20909,6 +20909,49 @@ def _adaptive_post_repair_boundary_indices(
     )
 
 
+def _review_first_wide_boundary_repair(
+    earlier: VisualBoundaryRepairPlan,
+    *,
+    sources: Sequence[Path],
+    **repair_arguments: Any,
+) -> VisualBoundaryRepairPlan | None:
+    """One bounded wider timing audition, not another source search/render.
+
+    The first-result path previously skipped the wider repair used by the
+    ordinary candidate path. A successful cut five frames away was therefore
+    invisible to its three-frame audition. Inspect at most four localized
+    failures once; retain the incumbent unless the whole review improves.
+    """
+    before = review_timeline(earlier.timeline, available_source_count=len(sources))
+    targets = _adaptive_post_repair_boundary_indices(before)[:4]
+    if not targets:
+        return None
+    later = repair_visual_timeline_boundaries(
+        visual_timeline=earlier.timeline, sources=sources,
+        boundary_indices=targets,
+        config=BoundaryRepairConfig(search_radius_frames=8, interior_scene_cut_guard_frames=9),
+        **repair_arguments,
+    )
+    old, new = earlier.timeline.choices, later.timeline.choices
+    if (len(new) != len(old)
+            or tuple(c.source_index for c in new) != tuple(c.source_index for c in old)
+            or abs(new[0].canonical_master_start-old[0].canonical_master_start) > 1e-9
+            or abs(new[-1].canonical_master_end-old[-1].canonical_master_end) > 1e-9
+            or any(abs(a.canonical_master_end-b.canonical_master_end) > 1e-9
+                   for index, (a,b) in enumerate(zip(old,new)) if index not in targets)):
+        raise ValueError('targeted timing repair changed the source path or unrelated boundary')
+    after = review_timeline(later.timeline, available_source_count=len(sources))
+    def failures(review):
+        return {(issue.code, occurrence) for issue in review.hard_failures
+                for occurrence in (issue.occurrences or (None,))}
+    if (not failures(after) < failures(before)
+            or after.source_switch_count != before.source_switch_count
+            or after.weighted_score < before.weighted_score-1e-9):
+        return None
+    return _merge_visual_boundary_repair_plans(earlier, later,
+        analysis_suffix='review_first_single_targeted_eight_frame_repair_v1')
+
+
 def _output_geometry_deferred_boundary_indices(
     review: TimelineReview | None,
 ) -> tuple[int, ...]:
@@ -33850,6 +33893,23 @@ def analyze(
                         f"{visual_boundary_repairs.changed_count}개 컷시점 보정 · "
                         f"{len(visual_boundary_repairs.failures)}개 원위치 유지"
                     )
+                    if group_first is not None:
+                        # One optional pass, inside the existing runtime budget.
+                        # No repeated rendering, candidate stream or threshold
+                        # relaxation, and no replacement on a failed proposal.
+                        widened = optional_group_refinement('targeted_wide_boundary_repair', lambda:
+                            _review_first_wide_boundary_repair(visual_boundary_repairs,
+                                sources=tuple(request.sources[index] for index in eligible_indices),
+                                audio_offsets=offsets, scene_cut_times=scene_cut_times,
+                                beat_period_seconds=group_draft.beat_period_seconds,
+                                source_timewarps=eligible_timewarps,
+                                **_visual_feature_cache_arguments(request)),
+                            validate=validate_boundary_repair)
+                        if widened is not None:
+                            reporter.log('실패 경계만 앞뒤 8프레임 재검증 · 소스·전환 수 유지 · '
+                                f'추가 보정 {widened.changed_count-visual_boundary_repairs.changed_count}개')
+                            visual_boundary_repairs = widened
+                            visual_timeline = widened.timeline
             except (ValueError, cv2.error) as exc:
                 warnings.append(
                     "국소 컷시점 보정에 실패해 전역 선택 경계를 유지함: "
