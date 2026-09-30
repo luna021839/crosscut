@@ -27352,6 +27352,7 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         timewarps,scene_cut_times,phrase_times,model_path=None):
     """Promote only an owned timeline/camera/review transaction before look fit."""
     from .group_motion_camera_refinement import refine_group_motion_camera
+    from .boundary_subject_alignment import ANALYSIS_BASIS
     from .editorial_transform_events import rendered_transform_event_records
     from .post_render_qa import _bound_local_alignment_tracks
     motion=bundle.editorial_motion_plan
@@ -27360,6 +27361,8 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
             or bundle.dynamic_crop_application is not None
             or tuple(eligible_indices)!=tuple(range(len(bundle.render_plan.sources)))):
         return None
+    if motion.boundary_subject_alignment_plan.analysis_basis != ANALYSIS_BASIS:
+        raise ValueError('motion/camera incumbent has an unsupported subject-alignment authority')
     if model_path is None:
         cache=getattr(request,'source_cache_directory',None)
         if cache is None:
@@ -27372,6 +27375,10 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     if not result.proposals:
         return None
     prior_alignment=alignment=motion.boundary_subject_alignment_plan
+    if any(proposal.alignment.analysis_basis != ANALYSIS_BASIS for proposal in result.proposals):
+        # Replacing just the decisions below retains the incumbent plan's
+        # header. Never relabel an experimental/local-focal receipt as v5.
+        raise ValueError('motion/camera proposal has an unsupported subject-alignment authority')
     decisions={item.boundary_index:item for item in alignment.decisions}
     alignment_segments=list(alignment.segments)
     changed=set()

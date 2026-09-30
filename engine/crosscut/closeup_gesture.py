@@ -339,17 +339,14 @@ class CloseupGestureProvider:
             return None
         from .visual_score import _working_frame
         frame = _working_frame(frame, maximum_width=960)
-        basis = GLOBAL_FOCAL_BASIS
-        if face is None:
-            from .group_focal_attention import observe_central_focal_face
-            focal = observe_central_focal_face(frame, descriptor.formation_people)
-            if focal is not None:
-                face, body, basis = focal.bbox_xywh, focal.person, CENTRAL_FOCAL_BASIS
-        if body is None:
+        from .group_focal_attention import resolve_group_focal_subject
+        focal = resolve_group_focal_subject(frame, descriptor)
+        if focal is None:
             self.cache[key] = None
             if len(self.cache) > 256:
                 self.cache.popitem(last=False)
             return None
+        face, body, basis = focal.bbox_xywh, focal.person, focal.basis
         measured = self.pose.describe(frame, bbox_xywh=body.bbox_xywh, face_bbox_xywh=face)
         result = index, measured, basis
         self.cache[key] = result

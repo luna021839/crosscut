@@ -171,6 +171,21 @@ class MotionCameraBundleTests(unittest.TestCase):
             with self.subTest(values=values):
                 self.assertIsNone(self.run_bundle(replace(bundle, **values), request, result))
 
+    def test_experimental_subject_authority_cannot_be_relabelled_as_the_incumbent(self):
+        from crosscut.boundary_subject_alignment import FOCAL_EXPERIMENT_BASIS
+        bundle, request, result = self.fixture()
+        proposal = result.proposals[0]
+        for basis in (FOCAL_EXPERIMENT_BASIS,'unknown_new_basis'):
+            changed = replace(result,proposals=(replace(proposal,
+                alignment=replace(proposal.alignment,analysis_basis=basis)),))
+            with self.subTest(basis=basis), self.assertRaisesRegex(ValueError,'authority'):
+                self.run_bundle(bundle,request,changed)
+        old_basis = replace(bundle,editorial_motion_plan=replace(bundle.editorial_motion_plan,
+            boundary_subject_alignment_plan=replace(bundle.editorial_motion_plan.boundary_subject_alignment_plan,
+                analysis_basis='exact_cut_frame_shot_adaptive_subject_alignment_v4')))
+        with self.assertRaisesRegex(ValueError,'authority'):
+            self.run_bundle(old_basis,request,result)
+
 
 if __name__ == '__main__':
     unittest.main()

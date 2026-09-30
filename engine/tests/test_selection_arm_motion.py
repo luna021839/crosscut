@@ -143,6 +143,31 @@ class SelectionArmMotionTests(unittest.TestCase):
                 options['source_times'],options['master_times'])))
         self.assertIn('sampled_directional_focal_arm_selection_v1',plan.candidate_generation_basis)
 
+    def test_optional_selector_and_exact_gesture_share_central_face_body_resolution(self):
+        from crosscut.group_focal_attention import CENTRAL_FOCAL_BASIS, GroupFocalSubject
+        class Sampler:
+            path=Path('/synthetic/central.mp4')
+            def frame_identity(self,seconds):
+                return CanonicalFrameIdentity.from_seconds(seconds,frame_rate=30.)
+            def frame_at(self,seconds):
+                return np.zeros((96,160,3),np.uint8)
+        body=FormationPersonDescriptor((.2,.1,.6,.8),(.5,.5),.9)
+        descriptor=SimpleNamespace(primary_face_bbox=None,formation_people=(body,))
+        focal=GroupFocalSubject((.4,.12,.15,.16),None,None,None,body,2,CENTRAL_FOCAL_BASIS)
+        with patch('crosscut.body_pose_2d.BodyPose2DAnalyzer') as analyzer, patch(
+                'crosscut.group_focal_attention.resolve_group_focal_subject',return_value=focal) as resolve, patch(
+                'crosscut.closeup_gesture.observed_arm_articulation',
+                return_value=((1.,0.),(1.,0.),None,None)):
+            sampler=SelectionArmSampler(Path('/not-loaded.onnx'))
+            first=sampler._observe(Sampler(),1.,descriptor)
+            again=sampler._observe(Sampler(),1.,descriptor)
+            self.assertEqual(first,again)
+            resolve.assert_called_once()
+            self.assertEqual(analyzer.return_value.describe.call_args.kwargs,
+                dict(bbox_xywh=body.bbox_xywh,face_bbox_xywh=focal.bbox_xywh))
+            self.assertEqual(sampler.inference_count,1)
+            self.assertIsNone(descriptor.primary_face_bbox)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -106,10 +106,10 @@ class SelectionArmSampler:
             return None
         face = descriptor.primary_face_bbox
         person = face_associated_person(face, descriptor.formation_people)
-        if person is None:
+        if face is not None and person is None:
             return None
         identity = sampler.frame_identity(seconds)
-        key = (str(sampler.path), identity, face, person.bbox_xywh)
+        key = (str(sampler.path), identity, face, tuple(descriptor.formation_people))
         if key in self.cache:
             self.cache_hits += 1
             self.cache.move_to_end(key)
@@ -117,6 +117,14 @@ class SelectionArmSampler:
         frame = sampler.frame_at(seconds)
         if frame is None:
             return None
+        from .group_focal_attention import resolve_group_focal_subject
+        focal = resolve_group_focal_subject(frame, descriptor)
+        if focal is None:
+            self.cache[key] = None
+            if len(self.cache) > 256:
+                self.cache.popitem(last=False)
+            return None
+        face, person = focal.bbox_xywh, focal.person
         self.inference_count += 1
         arms = observed_arm_articulation(self.pose.describe(frame,
             bbox_xywh=person.bbox_xywh, face_bbox_xywh=face))

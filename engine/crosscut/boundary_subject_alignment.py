@@ -32,6 +32,10 @@ import cv2
 import numpy as np
 
 from .face_match import FaceMatchPlan, FaceMatchSegment
+from .group_focal_attention import (
+    CENTRAL_FOCAL_BASIS, GLOBAL_FOCAL_BASIS, GroupFocalSubject,
+    focal_landmarks_track, resolve_group_focal_subject,
+)
 from .exact_native_frame_reader import ExactNativeFrameReader
 from .render import (
     EditorialTransformKeyframe,
@@ -49,6 +53,11 @@ from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
 ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v5"
+# Deliberately not accepted by final-QA's production binding allowlist. Local
+# attention must not inherit v5's global-primary authority merely by looking
+# like a face. This opt-in remains a measured experiment until independently
+# validated and connected to all production consumers.
+FOCAL_EXPERIMENT_BASIS = "exact_cut_frame_local_focal_alignment_experiment_v1"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -70,6 +79,7 @@ class BoundarySubjectObservation:
     # The descriptor may prove one dominant face while small background faces
     # are also present. Count alone must not discard that existing evidence.
     face_is_unambiguous_dominant: bool = False
+    selected_focal_subject: GroupFocalSubject | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.face_is_unambiguous_dominant, bool):
@@ -154,6 +164,25 @@ class BoundarySubjectObservation:
         if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             raise ValueError("silhouette confidence must be normalized")
         object.__setattr__(self, "silhouette_confidence", confidence)
+        focal = self.selected_focal_subject
+        if focal is not None:
+            if (not isinstance(focal, GroupFocalSubject)
+                    or focal.basis not in {CENTRAL_FOCAL_BASIS, GLOBAL_FOCAL_BASIS}
+                    or focal.bbox_xywh != self.face_box_xywh
+                    or focal.landmarks_xy != self.face_landmarks_xy
+                    or focal.roll_radians != self.face_head_roll_radians
+                    or focal.eye_scale != self.face_eye_scale
+                    or focal.detected_face_count != self.face_count
+                    or self.formation_boxes_xywh.count(focal.person.bbox_xywh) != 1
+                    or focal.person.detection_confidence < .50):
+                raise ValueError('local focal evidence must describe this exact observed face and body')
+            if focal.basis == CENTRAL_FOCAL_BASIS and (
+                    self.face_is_unambiguous_dominant
+                    or focal.landmarks_xy is None or len(focal.landmarks_xy) != 5
+                    or focal.roll_radians is None or focal.eye_scale is None
+                    or focal.bbox_xywh[3] < .0924
+                    or not .30 <= focal.bbox_xywh[0]+focal.bbox_xywh[2]/2 <= .70):
+                raise ValueError('central focal evidence cannot forge global dominance or missing geometry')
 
 
 ObservationProvider = Callable[[np.ndarray], BoundarySubjectObservation]
@@ -594,6 +623,17 @@ class BoundarySubjectAlignmentPlan:
         )
         return {
             "analysis_basis": self.analysis_basis,
+            **({"local_focal_experiment": {
+                "subject_selection": "shared_source_local_face_unique_body_resolver",
+                "central_face_authority": "not_global_dominance",
+                "central_temporal_validation": "adjacent_forward_backward_lk_box_or_four_measured_landmarks",
+                "tracked_face_minimum_iou": .60,
+                "landmark_maximum_return_error_pixels": 1.25,
+                "landmark_minimum_inlier_count": 4,
+                "production_binding_supported": False,
+                "cross_camera_identity_proven": False,
+                "quality_approved": False,
+            }} if self.analysis_basis == FOCAL_EXPERIMENT_BASIS else {}),
             "sample_clock_basis": self.sample_clock_basis,
             "policy": {
                 "scope": "cross_source_hard_cut_last_and_first_local_windows_only",
@@ -765,6 +805,10 @@ def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservati
         include_subject_geometry=True,
         include_formation_pose=False,
     )
+    return _observation_from_descriptor(descriptor)
+
+
+def _observation_from_descriptor(descriptor) -> BoundarySubjectObservation:
     return BoundarySubjectObservation(
         face_count=descriptor.face_count,
         face_box_xywh=descriptor.primary_face_bbox,
@@ -779,6 +823,21 @@ def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservati
         ),
         face_is_unambiguous_dominant=descriptor.primary_face_bbox is not None,
     )
+
+
+def _local_focal_observation_provider(frame: np.ndarray) -> BoundarySubjectObservation:
+    from .visual_score import describe_frame
+    descriptor = describe_frame(frame, include_subject_geometry=True,
+                                include_formation_pose=False)
+    original = _observation_from_descriptor(descriptor)
+    focal = resolve_group_focal_subject(frame, descriptor)
+    if focal is None:
+        return original
+    return replace(original, face_count=focal.detected_face_count,
+        face_box_xywh=focal.bbox_xywh, face_landmarks_xy=focal.landmarks_xy,
+        face_head_roll_radians=focal.roll_radians, face_eye_scale=focal.eye_scale,
+        face_is_unambiguous_dominant=focal.basis == GLOBAL_FOCAL_BASIS,
+        selected_focal_subject=focal)
 
 
 def _frame_counts(
@@ -1046,7 +1105,8 @@ def _associated_person_box(
 
 def _has_unambiguous_face(observation: BoundarySubjectObservation) -> bool:
     return bool(observation.face_box_xywh is not None and (
-        observation.face_count == 1 or observation.face_is_unambiguous_dominant))
+        observation.face_count == 1 or observation.face_is_unambiguous_dominant
+        or observation.selected_focal_subject is not None))
 
 
 def _close_face_head_envelope(
@@ -1148,7 +1208,9 @@ def _subject(
     ):
         face_box = observation.face_box_xywh
         assert face_box is not None
-        performer = _associated_person_box(face_box, boxes)
+        performer = (observation.selected_focal_subject.person.bbox_xywh
+            if observation.selected_focal_subject is not None
+            else _associated_person_box(face_box, boxes))
         containment = (
             (_close_face_head_envelope(face_box),)
             if (framing_policy or _shot_policy(observation)) in {"close_face", "tight_medium_face"}
@@ -1705,10 +1767,17 @@ def build_boundary_subject_alignment_plan(
     boundary_indices: Sequence[int] | None = None,
     preserved_editorial_tracks: Sequence[EditorialTransformTrack | None] | None = None,
     preserved_track_time_shifts: Sequence[float] | None = None,
+    local_focal_attention: bool = False,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
-    """Build exact-cut local tracks and validate every transformed frame."""
+    """Build exact-cut local tracks and validate every transformed frame.
 
+    The local-focal opt-in uses a separate, non-production report basis. It
+    cannot authorize ordinary v5 framing or skip independent final-pixel QA.
+    """
+
+    if type(local_focal_attention) is not bool:
+        raise ValueError('local focal attention must be explicitly boolean')
     settings = config or BoundarySubjectAlignmentConfig()
     choices = visual_timeline.choices
     if not choices:
@@ -1773,7 +1842,8 @@ def build_boundary_subject_alignment_plan(
         frames = capture.frame_at
     else:
         frames = frame_provider
-    observations = observation_provider or _default_observation_provider
+    observations = observation_provider or (_local_focal_observation_provider
+        if local_focal_attention else _default_observation_provider)
     if source_resolutions is None:
         resolutions = tuple(
             capture.resolution(index) if capture is not None else None
@@ -1885,10 +1955,46 @@ def build_boundary_subject_alignment_plan(
             return None
         try:
             result = observations(canonical)
+            if result is not None and result.selected_focal_subject is not None and not local_focal_attention:
+                raise ValueError('local focal evidence requires the separate experimental contract')
         except (TypeError, ValueError, cv2.error):
             result = None
         observation_cache[key] = result
         return result
+
+    @lru_cache(maxsize=2048)
+    def tracks_endpoint_focal(choice_index, anchor, frame_index):
+        """Bind a central endpoint to the SAME local head on each adjacent frame.
+
+        Centrality alone is not a temporal track. A changed central performer,
+        missing face/body owner, or failed forward/backward flow cannot borrow
+        the endpoint's crop authority. No cross-camera identity is asserted.
+        """
+        endpoint = observation_at(choice_index, anchor)
+        focal = endpoint.selected_focal_subject if endpoint is not None else None
+        if focal is None or focal.basis != CENTRAL_FOCAL_BASIS:
+            return True
+        if frame_index == anchor:
+            return True
+        if abs(frame_index-anchor) > settings.window_frames:
+            return False  # A distant preserved ramp needs its own authority.
+        previous = frame_index + (1 if frame_index < anchor else -1)
+        if not tracks_endpoint_focal(choice_index, anchor, previous):
+            return False
+        first, second = observation_at(choice_index, previous), observation_at(choice_index, frame_index)
+        if (first is None or second is None or first.selected_focal_subject is None
+                or second.selected_focal_subject is None):
+            return False
+        reference, target = canonical_frame_at(choice_index, previous), canonical_frame_at(choice_index, frame_index)
+        tracked = _optical_flow_box(reference, target, first.face_box_xywh)
+        current = second.face_box_xywh
+        if tracked is not None:
+            overlap = max(0., min(tracked[0]+tracked[2],current[0]+current[2])-max(tracked[0],current[0]))
+            overlap *= max(0., min(tracked[1]+tracked[3],current[1]+current[3])-max(tracked[1],current[1]))
+            union = tracked[2]*tracked[3]+current[2]*current[3]-overlap
+            if union > 0 and overlap/union >= .60:
+                return True
+        return focal_landmarks_track(reference,target,first.face_landmarks_xy,second.face_landmarks_xy)
 
     def optical_subject_at(
         choice_index: int,
@@ -2468,6 +2574,10 @@ def build_boundary_subject_alignment_plan(
                     if choice_index == nearest_boundary
                     else boundary.incoming_shot_policy
                 )
+                anchor = counts[choice_index]-1 if choice_index == nearest_boundary else 0
+                if preferred_kind == 'face' and not tracks_endpoint_focal(choice_index, anchor, frame_index):
+                    failure = 'per_frame_local_focal_ownership_unverified'
+                    break
                 # Keep the verified endpoint's framing contract through this
                 # short window. Detector-size jitter cannot replace a head
                 # envelope with a whole torso part way through one ramp.
@@ -2754,6 +2864,7 @@ def build_boundary_subject_alignment_plan(
             final_segments,
             tuple(headroom_items),
             settings.window_frames,
+            analysis_basis=FOCAL_EXPERIMENT_BASIS if local_focal_attention else ANALYSIS_BASIS,
             sample_clock_basis=clock_basis,
             dense_track_candidate_attempt_count=dense_attempts,
         )
@@ -2764,6 +2875,7 @@ def build_boundary_subject_alignment_plan(
 
 __all__ = [
     "ANALYSIS_BASIS",
+    "FOCAL_EXPERIMENT_BASIS",
     "BoundarySubjectAlignmentConfig",
     "BoundarySubjectAlignmentDecision",
     "BoundarySubjectAlignmentPlan",
