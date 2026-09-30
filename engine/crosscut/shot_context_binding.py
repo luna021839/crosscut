@@ -151,6 +151,48 @@ def shot_context_binding_valid(payload, plan):
         return False
 
 
+def assert_unchanged_camera_context(before, after, index, last):
+    """Reuse sensing only when the local output and native domains are exact.
+
+    The legacy digest deliberately includes every shot's frame count. An
+    unrelated two-cell retime can change that digest without changing this
+    camera. Do not rerun sensing or simply bless the new digest: prove the
+    complete camera and both fixed neighbors, absolute output ticks, source
+    domain and output/audio geometry first. Grading in this context is also
+    preserved; this is not a color-only receipt migration.
+    """
+    fields=('sources','reference_source','master_audio_start','fps','width',
+        'height','aspect_ratio','member_pose_dissolve_requested',
+        'member_pose_dissolve_effective','member_pose_dissolve_count')
+    if (type(index) is not int or type(last) is not int
+            or not 0<index<=last<len(before.segments)-1
+            or len(before.segments)!=len(after.segments)
+            or any(getattr(before,name)!=getattr(after,name) for name in fields)
+            or before.segments[index-1:last+2]!=after.segments[index-1:last+2]
+            or before.transitions[index-1:last+1]!=after.transitions[index-1:last+1]):
+        raise ValueError('camera context changed; prior sensing cannot be reused')
+    old,new=segment_frame_counts(before),segment_frame_counts(after)
+    if (sum(old)!=sum(new) or sum(old[:index-1])!=sum(new[:index-1])
+            or old[index-1:last+2]!=new[index-1:last+2]):
+        raise ValueError('camera context output clock changed; prior sensing cannot be reused')
+
+
+def rebind_unchanged_shot_context(payload, before, after):
+    """Retain a valid receipt across an unrelated edit, never create evidence."""
+    from .visual_boundary_repair import _thaw_audit_value
+    row=json.loads(json.dumps(_thaw_audit_value(payload),allow_nan=False))
+    if not shot_context_binding_valid(row,before):
+        raise ValueError('prior shot-context receipt is not independently valid')
+    index=row['segment_index'];last=row.get('last_segment_index',index)
+    assert_unchanged_camera_context(before,after,index,last)
+    row['geometry_identity']=shot_context_geometry_identity(after,index,last)
+    row['content_sha256']=_digest({k:v for k,v in row.items() if k!='content_sha256'})
+    # Independently recalculate native ticks and EVERY transformed head box.
+    if not shot_context_binding_valid(row,after):
+        raise ValueError('unchanged shot-context receipt failed final independent validation')
+    return row
+
+
 def bound_shot_context_cameras(motion, plan):
     if not isinstance(motion,Mapping):return {}
     rows=motion.get('shot_context_cameras',())

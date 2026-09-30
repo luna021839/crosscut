@@ -8,7 +8,8 @@ import numpy as np
 
 from crosscut.boundary_subject_alignment import _track_for_segment,_TransformState,_project_box,_close_face_head_envelope
 from crosscut.coupled_shot_camera import CoupledShotProposal,propose_coupled_shot_camera
-from crosscut.coupled_shot_binding import build_coupled_shot_binding,coupled_shot_binding_valid,coupled_geometry_identity
+from crosscut.coupled_shot_binding import (build_coupled_shot_binding,coupled_shot_binding_valid,
+    coupled_geometry_identity,rebind_unchanged_coupled_shot)
 from crosscut.cut_anchored_containment import CutAnchoredContainment,ContainmentSample
 from crosscut.render import RenderSegment,RenderTransition
 from crosscut.shot_context_refinement import attach_shot_context_proposal,attach_coupled_shot_proposal
@@ -159,6 +160,33 @@ class CoupledShotCameraTests(unittest.TestCase):
             call.assert_called_once()
             self.assertEqual(result.changed_segments,(1,) if failed else (1,2))
             self.assertEqual(len(result.motion.coupled_shot_cameras),0 if failed else 1)
+
+
+    def test_unrelated_tail_retime_reuses_atomic_pair_without_changing_any_evidence(self):
+        _,_,pair=self.fixture()
+        before=replace(pair.plan,segments=(*pair.plan.segments,RenderSegment(0,4.,1.,4.),
+            RenderSegment(0,5.,1.,5.)),transitions=(*pair.plan.transitions,RenderTransition(),RenderTransition()))
+        pair=replace(pair,outgoing=replace(pair.outgoing,plan=before))
+        good=build_coupled_shot_binding(pair);parts=list(before.segments);delta=4/30.
+        parts[4]=replace(parts[4],duration=1.-delta)
+        parts[5]=replace(parts[5],master_start=5.-delta,source_start=5.-delta,duration=1.+delta)
+        after=replace(before,segments=tuple(parts))
+        self.assertFalse(coupled_shot_binding_valid(good,after))
+        rebound=rebind_unchanged_coupled_shot(good,before,after)
+        self.assertTrue(coupled_shot_binding_valid(rebound,after))
+        self.assertEqual(rebound['incoming_head_evidence'],good['incoming_head_evidence'])
+        self.assertEqual(rebound['incoming_native_frame_ids'],good['incoming_native_frame_ids'])
+        self.assertEqual(rebound['outgoing']['head_evidence'],good['outgoing']['head_evidence'])
+        self.assertFalse(rebound['professional_quality_approved'])
+        for index in (0,1,2,3):
+            damaged=list(after.segments)
+            damaged[index]=replace(damaged[index],source_start=damaged[index].source_start+.1)
+            with self.subTest(index=index),self.assertRaisesRegex(ValueError,'context'):
+                rebind_unchanged_coupled_shot(good,before,replace(after,segments=tuple(damaged)))
+        damaged=deepcopy(good);damaged['incoming_head_evidence'][0]['basis']='pixel_flow_plus_observed_geometry'
+        damaged['content_sha256']=_digest({k:v for k,v in damaged.items() if k!='content_sha256'})
+        with self.assertRaisesRegex(ValueError,'prior'):
+            rebind_unchanged_coupled_shot(damaged,before,after)
 
 
 if __name__=='__main__':unittest.main()

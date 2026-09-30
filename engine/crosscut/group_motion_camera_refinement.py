@@ -97,11 +97,15 @@ def focal_boundary_shortlist(timeline):
 def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,scene_cut_times,
         model_path,source_index_map=None,feature_cache_directory=None,
         feature_derived_cache_directory=None,require_persistent_feature_cache=False,
-        maximum_boundaries=4,maximum_camera_candidates=2):
+        maximum_boundaries=4,maximum_camera_candidates=2,protected_segment_indices=()):
     if type(maximum_boundaries) is not int or not 1 <= maximum_boundaries <= 4:
         raise ValueError('motion/camera refinement permits at most four boundaries')
     if type(maximum_camera_candidates) is not int or not 1 <= maximum_camera_candidates <= 2:
         raise ValueError('motion/camera refinement permits at most two camera candidates per boundary')
+    protected=tuple(protected_segment_indices)
+    if (len(set(protected))!=len(protected)
+            or any(type(index) is not int or not 0<=index<len(plan.segments) for index in protected)):
+        raise ValueError('motion/camera protected segment domain is invalid')
     mapping=tuple(range(len(plan.sources))) if source_index_map is None else tuple(source_index_map)
     if (not len(mapping)==len(audio_offsets)==len(source_timewarps)==len(scene_cut_times)
             or len(set(mapping))!=len(mapping)
@@ -118,6 +122,13 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     if plan.aspect_ratio.value != '16:9' or any(t.kind.uses_overlap for t in plan.transitions):
         raise ValueError('motion/camera refinement requires landscape hard cuts')
     started=monotonic()
+    shortlist=focal_boundary_shortlist(timeline)
+    targets=tuple(index for index in shortlist if not {index,index+1}.intersection(protected))
+    attempts=[dict(stage='protected_context',boundary_index=index,admitted=False,
+        reason='independently_bound_whole_shot_or_fixed_neighbor_not_a_two_cell_edit')
+        for index in shortlist if index not in targets]
+    if not targets:
+        return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
     clocks={i:probe_render_frame_clock(source) for i,source in enumerate(plan.sources)}
     provider=CloseupGestureProvider(plan.sources,Path(model_path))
     samplers={}
@@ -162,9 +173,10 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 size=(candidate.width,candidate.height))
             boxes.append(_default_geometry_provider(output).face_bbox_xywh)
         return _box_discontinuity(*boxes) if all(box is not None for box in boxes) else None
-    targets=focal_boundary_shortlist(timeline)
+    # These cameras belong to an independent complete context transaction.
+    # Editing one of its fixed neighbors is not a proposal this stage can
+    # compose. Avoid decoding/ranking a candidate known to lose its receipt.
     triage=[]
-    attempts=[]
     selected=[]
     try:
         for boundary in targets:
@@ -231,7 +243,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 try:
                     proposal=build_group_cut_camera_proposal(plan=plan,timeline=timeline,boundary_index=boundary,
                         shifted_segments=pair,source_clocks=clocks,scene_cut_times=scene_cut_times,
-                        source_index_map=mapping)
+                        source_index_map=mapping,preserved_boundary_frames=4)
                     final_native=hard_cut_boundary_sample_clocks(proposal.plan,clocks,boundary_index=boundary)
                     if any((a.source_index,a.native_frame_index,a.output_frame_index)!=(b.source_index,b.native_frame_index,b.output_frame_index)
                            for a,b in zip(native,final_native,strict=True)):
@@ -259,6 +271,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     refreshed=replace(proposal.clock_timeline,choices=tuple(choices))
                     failures=_new_hard_failures(review_timeline(timeline,available_source_count=len(mapping)),
                         review_timeline(refreshed,available_source_count=len(mapping)))
+                    row['raw_new_failures']=failures
                     # These remain reported RAW failures; actual output face
                     # bounds and complete dense containment govern this proposal.
                     if any(failure['code'] not in {'scale_mismatch_exceeded','focus_mismatch_exceeded','layout_mismatch_exceeded'}

@@ -393,6 +393,18 @@ class TimelineReviewCadenceTests(unittest.TestCase):
             {warning.code for warning in review.warnings},
         )
 
+    def test_readable_short_source_hold_is_not_rejected_by_duration_alone(self) -> None:
+        # The local motion/camera constructor permits >= .55s. Its final
+        # duration review must agree, without dropping separate continuity
+        # failures or silently exempting a true sub-floor flash.
+        for duration in (.50,.55,.633333333,.70):
+            choices=[json_choice(0,"A",0.,2.5),
+                json_choice(1,"B",2.5,2.5+duration),
+                json_choice(2,"C",2.5+duration,6.)]
+            review=review_timeline(choices)
+            self.assertEqual(bool(review.short_flash_run_indices),duration<.55)
+            self.assertEqual('short_source_flash' in {i.code for i in review.hard_failures},duration<.55)
+
     def test_long_hold_diversity_and_dominance_are_explicit_failures(self) -> None:
         choices = [
             json_choice(index, "only", float(index), float(index + 1))

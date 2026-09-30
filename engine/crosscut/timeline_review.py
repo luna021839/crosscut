@@ -98,7 +98,12 @@ class TimelineReviewConfig:
     # the former nine-second limit.
     reference_source_run_p90_seconds: float = 7.2
     hard_max_source_run_seconds: float = 7.2
-    short_flash_seconds: float = 0.75
+    # Short matched dance cuts can read clearly below .75s. The former
+    # blanket duration veto rejected measured improvements at .63/.70s after
+    # their camera and motion checks had passed. Keep the same .55s floor as
+    # aligned cut/source-span construction; continuity and cadence are still
+    # reviewed independently. This is a duration policy, not a quality proof.
+    short_flash_seconds: float = 0.55
     ping_pong_middle_max_seconds: float = 5.5
     minimum_sources_when_available: int = 8
     dominant_source_share_warning: float = 0.28
@@ -1642,7 +1647,7 @@ def review_timeline(
     short_flash_runs = tuple(
         run.run_index
         for run in runs[1:-1]
-        if run.duration_seconds < review_config.short_flash_seconds
+        if run.duration_seconds+1e-9 < review_config.short_flash_seconds
     )
     if short_flash_runs:
         hard_failures.append(

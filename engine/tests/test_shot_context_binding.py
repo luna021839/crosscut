@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from crosscut.editorial_motion import EditorialMotionPlan,EditorialMotionSegment
 from crosscut.post_render_qa import _bound_local_alignment_tracks,_transform_metrics,_IssueCollector,PostRenderQAConfig
-from crosscut.shot_context_binding import build_shot_context_binding,shot_context_binding_valid,_digest
+from crosscut.shot_context_binding import (build_shot_context_binding,shot_context_binding_valid,
+    rebind_unchanged_shot_context,_digest)
+from crosscut.render import RenderSegment,RenderTransition
 from crosscut.shot_context_refinement import attach_shot_context_proposal,both_boundary_framings_improve
 import engine.tests.test_shot_context_camera as camera_tests
 
@@ -131,6 +133,56 @@ class ShotContextBindingTests(unittest.TestCase):
             self.assertEqual(_native_local_alignment_zoom_budgets(raw,
                 json.loads(json.dumps(plan.to_json())),{1},PostRenderQAConfig(),runner=probe),{})
             probe.assert_not_called()
+
+
+class UnchangedShotContextReuseTests(unittest.TestCase):
+    def fixture(self):
+        source=camera_tests.ShotContextProposalTests();args=source.fixture();plan=args['plan']
+        plan=replace(plan,segments=(RenderSegment(0,0.,1.,0.),RenderSegment(0,1.,1.,1.),
+            *(replace(segment,master_start=segment.master_start+2.) for segment in plan.segments)),
+            transitions=(RenderTransition(),)*4)
+        proposal=source.run_proposal(dict(args,plan=plan,segment_index=3))
+        before=proposal.plan;parts=list(before.segments);delta=4/30.
+        parts[0]=replace(parts[0],duration=parts[0].duration-delta)
+        parts[1]=replace(parts[1],master_start=parts[1].master_start-delta,
+            source_start=parts[1].source_start-delta,duration=parts[1].duration+delta)
+        return before,replace(before,segments=tuple(parts)),build_shot_context_binding(proposal)
+
+    def test_unrelated_retime_reuses_every_native_and_head_row_without_new_sensing(self):
+        before,after,row=self.fixture();snapshot=deepcopy(row)
+        self.assertFalse(shot_context_binding_valid(row,after))
+        rebound=rebind_unchanged_shot_context(row,before,after)
+        self.assertTrue(shot_context_binding_valid(rebound,after))
+        self.assertNotEqual(rebound['geometry_identity'],row['geometry_identity'])
+        for key in row:
+            if key not in ('geometry_identity','content_sha256'):
+                self.assertEqual(row[key],rebound[key],key)
+        self.assertEqual(row,snapshot)
+        self.assertFalse(rebound['professional_quality_approved'])
+        self.assertFalse(rebound['identity_or_gesture_certified'])
+
+    def test_changed_source_neighbor_camera_audio_or_geometry_cannot_reuse_receipt(self):
+        before,after,row=self.fixture()
+        mutations=[replace(after,master_audio_start=.1),replace(after,width=1280,height=720),
+            replace(after,fps=29.97),replace(after,sources=tuple(Path('other')/p for p in after.sources))]
+        for index in (2,3,4):
+            parts=list(after.segments);parts[index]=replace(parts[index],source_start=parts[index].source_start+.1)
+            mutations.append(replace(after,segments=tuple(parts)))
+        parts=list(after.segments);parts[3]=replace(parts[3],editorial_transform=None)
+        mutations.append(replace(after,segments=tuple(parts)))
+        for mutated in mutations:
+            with self.subTest(plan=mutated),self.assertRaisesRegex(ValueError,'context'):
+                rebind_unchanged_shot_context(row,before,mutated)
+
+    def test_invalid_prior_receipt_cannot_be_rehashed_into_valid_authority(self):
+        before,after,row=self.fixture()
+        for key,value in (('professional_quality_approved',True),('native_frame_ids',[30]*30),
+                ('source_clock',None),('head_evidence',[]),('content_sha256','0'*64)):
+            bad=deepcopy(row);bad[key]=value
+            if key!='content_sha256':
+                bad['content_sha256']=_digest({k:v for k,v in bad.items() if k!='content_sha256'})
+            with self.subTest(key=key),self.assertRaisesRegex(ValueError,'prior'):
+                rebind_unchanged_shot_context(bad,before,after)
 
 
 if __name__=='__main__':unittest.main()

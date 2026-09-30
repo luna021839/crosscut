@@ -27355,6 +27355,8 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     from .boundary_subject_alignment import ANALYSIS_BASIS
     from .editorial_transform_events import rendered_transform_event_records
     from .post_render_qa import _bound_local_alignment_tracks
+    from .shot_context_binding import rebind_unchanged_shot_context
+    from .coupled_shot_binding import rebind_unchanged_coupled_shot
     motion=bundle.editorial_motion_plan
     if (motion is None or motion.boundary_subject_alignment_plan is None
             or bundle.boundary_look_match is not None or bundle.cut_local_sync is not None
@@ -27363,6 +27365,17 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         return None
     if motion.boundary_subject_alignment_plan.analysis_basis != ANALYSIS_BASIS:
         raise ValueError('motion/camera incumbent has an unsupported subject-alignment authority')
+    # Validate existing context authority before media work, and exclude edits
+    # this two-cell stage cannot safely compose with its fixed neighbors.
+    raw_motion=motion.to_dict()
+    protected=set()
+    for row in raw_motion.get('shot_context_cameras',()):
+        rebind_unchanged_shot_context(row,bundle.render_plan,bundle.render_plan)
+        protected.update(range(row['segment_index']-1,
+            row.get('last_segment_index',row['segment_index'])+2))
+    for row in raw_motion.get('coupled_shot_cameras',()):
+        rebind_unchanged_coupled_shot(row,bundle.render_plan,bundle.render_plan)
+        protected.update(range(row['segment_index']-1,row['segment_index']+3))
     if model_path is None:
         cache=getattr(request,'source_cache_directory',None)
         if cache is None:
@@ -27371,9 +27384,15 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         model_path=ensure_source_first_model_assets(cache).pose_model_path
     result=refine_group_motion_camera(plan=bundle.render_plan,timeline=bundle.visual_timeline,
         audio_offsets=offsets,source_timewarps=timewarps,scene_cut_times=scene_cut_times,
-        source_index_map=eligible_indices,model_path=model_path,**_visual_feature_cache_arguments(request))
+        source_index_map=eligible_indices,model_path=model_path,
+        protected_segment_indices=tuple(sorted(protected)),**_visual_feature_cache_arguments(request))
     if not result.proposals:
-        return None
+        # Keep the measured reasons on the actual owned bundle. Returning
+        # None discarded an entire optional pass's evidence and encouraged
+        # repeating the same expensive failures without a changed hypothesis.
+        return replace(bundle,candidate_lineage=(*bundle.candidate_lineage,
+            {'stage':'bounded_joint_motion_camera_refinement','applied':False,
+             'status':'no_complete_camera_candidate',**result.to_dict()}))
     prior_alignment=alignment=motion.boundary_subject_alignment_plan
     if any(proposal.alignment.analysis_basis != ANALYSIS_BASIS for proposal in result.proposals):
         # Replacing just the decisions below retains the incumbent plan's
@@ -27410,6 +27429,10 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     authored['zoom']+=alignment.eligible_count-prior_alignment.eligible_count
     authored['pan']+=alignment.pan_event_count-prior_alignment.pan_event_count
     authored['roll']+=alignment.roll_event_count-prior_alignment.roll_event_count
+    contexts=tuple(rebind_unchanged_shot_context(row,bundle.render_plan,result.plan)
+        for row in motion.shot_context_cameras)
+    coupled=tuple(rebind_unchanged_coupled_shot(row,bundle.render_plan,result.plan)
+        for row in motion.coupled_shot_cameras)
     motion=replace(motion,segments=tuple(replace(item,
         track=result.plan.segments[index].editorial_transform,
         reasons=(*item.reasons,'joint_common_clock_motion_camera_refinement') if index in changed else item.reasons)
@@ -27417,6 +27440,7 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         boundary_subject_alignment_plan=alignment,
         boundary_match_count=motion.boundary_match_count+alignment.eligible_count-prior_alignment.eligible_count,
         zoom_event_count=len(events['zoom']),pan_event_count=len(events['pan']),roll_event_count=len(events['roll']),
+        shot_context_cameras=contexts,coupled_shot_cameras=coupled,
         authored_event_counts=tuple((name,authored[name]) for name in ('zoom','pan','roll')))
     # A composed receipt can cover the whole shared segment. Every old paired
     # neighbor must still meet its own endpoint state in the final curves.
@@ -27441,7 +27465,9 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         stage_edit_exact_shot_clock=_deterministic_exact_shot_clock_from_timeline(result.timeline,
             section_plan=bundle.section_plan,phrase_times=phrase_times),
         candidate_lineage=(*bundle.candidate_lineage,{'stage':'bounded_joint_motion_camera_refinement',
-            'supersedes_legacy_repair_endpoint_metadata':True,**result.to_dict()}))
+            'supersedes_legacy_repair_endpoint_metadata':True,
+            'unchanged_shot_context_receipts_rebound':len(contexts),
+            'unchanged_coupled_shot_receipts_rebound':len(coupled),**result.to_dict()}))
     _validate_review_first_group_bundle(updated,eligible_indices=eligible_indices,offsets=offsets,
         timewarps=timewarps,common_start=bundle.render_plan.master_audio_start)
     return updated

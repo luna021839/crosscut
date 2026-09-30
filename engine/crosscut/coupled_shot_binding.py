@@ -15,6 +15,7 @@ from .render_frame_schedule import VerifiedRenderFrameClock
 from .shot_context_binding import (
     _digest, _numeric, build_shot_context_binding, shot_context_binding_valid,
     shot_context_geometry_identity, RUN_CONTRACT,
+    assert_unchanged_camera_context, rebind_unchanged_shot_context,
 )
 
 CONTRACT='native_coupled_whole_shot_and_entry_handle_binding_v1'
@@ -121,6 +122,22 @@ def bound_coupled_shot_cameras(motion,plan):
                     or item.get('keyframes')!=list(serialized[i]['editorial_transform']['keyframes'])):return {}
             result[i]=row
     return result
+
+
+def rebind_unchanged_coupled_shot(payload,before,after):
+    """Keep BOTH cameras and fixed neighbors after an unrelated cut retime."""
+    from .visual_boundary_repair import _thaw_audit_value
+    row=json.loads(json.dumps(_thaw_audit_value(payload),allow_nan=False))
+    if not coupled_shot_binding_valid(row,before):
+        raise ValueError('prior coupled-shot receipt is not independently valid')
+    index=row['segment_index']
+    assert_unchanged_camera_context(before,after,index,index+1)
+    row['outgoing']=rebind_unchanged_shot_context(row['outgoing'],before,after)
+    row['geometry_identity']=coupled_geometry_identity(after,index)
+    row['content_sha256']=_digest({k:v for k,v in row.items() if k!='content_sha256'})
+    if not coupled_shot_binding_valid(row,after):
+        raise ValueError('unchanged coupled-shot receipt failed final independent validation')
+    return row
 
 
 def context_boundary_indices(contexts):

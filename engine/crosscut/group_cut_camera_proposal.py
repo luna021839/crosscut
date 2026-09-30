@@ -40,10 +40,12 @@ def retime_base_pan(track, *, relative_shift, duration):
         track, max(0., time+relative_shift)))) for time in times))
 
 
-def splice_boundary_camera(old_track, new_track, *, relative_shift, frame_count, fps, outgoing):
+def splice_boundary_camera(old_track, new_track, *, relative_shift, frame_count, fps, outgoing,
+                           preserved_boundary_frames=14):
     """Keep the other cut's camera exactly; never bridge nonneutral states."""
     if (type(frame_count) is not int or frame_count < 2 or type(outgoing) is not bool
-            or not math.isfinite(fps) or fps <= 0 or not math.isfinite(relative_shift)):
+            or not math.isfinite(fps) or fps <= 0 or not math.isfinite(relative_shift)
+            or type(preserved_boundary_frames) is not int or not 4<=preserved_boundary_frames<=14):
         raise ValueError('camera splice requires a valid output clock and side')
     last = (frame_count-1)/fps
     new_track = new_track or EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),))
@@ -70,7 +72,8 @@ def splice_boundary_camera(old_track, new_track, *, relative_shift, frame_count,
         keys += [old_at(time) for time in sorted(old_times) if time > seam]
     result = EditorialTransformTrack(tuple(keys), reason='camera_conditioned_cut_with_neutral_neighbor_seam_v1')
     # Do not permit a seam that quietly discards the other cut's active ramp.
-    protected = range(min(14,frame_count)) if outgoing else range(max(0,frame_count-14),frame_count)
+    protected = (range(min(preserved_boundary_frames,frame_count)) if outgoing else
+        range(max(0,frame_count-preserved_boundary_frames),frame_count))
     for frame in protected:
         time = frame/fps
         if any(not math.isclose(a,b,rel_tol=0.,abs_tol=1e-9)
@@ -87,13 +90,16 @@ class GroupCutCameraProposal:
     boundary_index: int
     timing_offset_frames: int
     preserved_neighbor_boundaries: tuple[int, ...]
+    preserved_boundary_frames: int = 14
+    preserved_same_source_seams: tuple[int, ...] = ()
 
     def to_dict(self):
         return dict(contract='bounded_clock_preserving_group_cut_camera_proposal_v1',
             boundary_index=self.boundary_index,
             timing_offset_frames=self.timing_offset_frames,
             preserved_neighbor_boundaries=list(self.preserved_neighbor_boundaries),
-            preserved_output_frames_per_neighbor_side=14,
+            preserved_output_frames_per_neighbor_side=self.preserved_boundary_frames,
+            preserved_same_source_seams=list(self.preserved_same_source_seams),
             neighbor_preservation_basis='native_frame_ids_and_numeric_camera_states_not_encoded_pixel_identity',
             subject_alignment=self.alignment.to_dict(),
             source_reference_alignment_authority='caller_supplied_not_proven_by_camera_geometry',
@@ -102,7 +108,8 @@ class GroupCutCameraProposal:
 
 def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_segments,
                                    source_clocks, scene_cut_times, source_index_map=None,
-                                   local_focal_attention=False, action_framing_model_path=None):
+                                   local_focal_attention=False, action_framing_model_path=None,
+                                   preserved_boundary_frames=14):
     """Bind one proposed aligned pair to dense local geometry and its neighbors.
 
     ``clock_timeline`` deliberately is NOT a refreshed visual selection or
@@ -114,6 +121,8 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
     if (type(boundary_index) is not int or not 0 <= boundary_index < len(plan.segments)-1
             or len(timeline.choices) != len(plan.segments) or len(shifted_segments) != 2):
         raise ValueError('camera proposal must replace one adjacent pair')
+    if type(preserved_boundary_frames) is not int or not 4<=preserved_boundary_frames<=14:
+        raise ValueError('camera proposal must retain at least the four measured neighbor ticks')
     if plan.aspect_ratio.value != '16:9' or any(t.kind.uses_overlap for t in plan.transitions):
         raise ValueError('camera proposal currently requires landscape hard cuts')
     source_index_map = tuple(range(len(plan.sources))) if source_index_map is None else tuple(source_index_map)
@@ -179,10 +188,11 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         for i,choice in enumerate(choices)),None,2.,(.5,.5))
     numeric_plan = replace(plan,segments=tuple(segments))
     counts = segment_frame_counts(numeric_plan)
-    # Reserve the opposite boundary's complete 14-frame window before
-    # authoring either ramp. The neutral join frame can be shared. This is a
-    # deterministic window choice, not repeated weaker-containment retries.
-    window_frames = min(14,*(counts[index]-14+1
+    # A cut's four measured motion ticks need exact preservation. Fourteen
+    # ticks is still the legacy default, but an explicitly requested four-tick
+    # splice can use the remainder of a short shot for its validated camera.
+    # Every transformed frame still receives the same dense containment check.
+    window_frames = min(14,*(counts[index]-preserved_boundary_frames+1
         for index in (boundary_index,boundary_index+1)))
     if window_frames < 8:
         raise ValueError('camera proposal has no disjoint validated ramp window')
@@ -194,6 +204,7 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         preserved_editorial_tracks=tuple(segment.editorial_transform for segment in plan.segments),
         preserved_track_time_shifts=tuple(new.master_start-old.master_start
             for old,new in zip(plan.segments,segments,strict=True)),
+        preserved_boundary_frames=preserved_boundary_frames,
         local_focal_attention=local_focal_attention,
         action_framing_model_path=action_framing_model_path,
         config=BoundarySubjectAlignmentConfig(window_frames=window_frames))
@@ -206,36 +217,64 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         if track is None:
             retained=splice_boundary_camera(old.editorial_transform,None,
                 relative_shift=new.master_start-old.master_start,frame_count=counts[index],
-                fps=plan.fps,outgoing=index==boundary_index)
+                fps=plan.fps,outgoing=index==boundary_index,
+                preserved_boundary_frames=preserved_boundary_frames)
             if any(not _neutral(retained.evaluate(frame/plan.fps)) for frame in range(counts[index])):
                 raise ValueError('untransformed side retains a camera outside the new dense receipt')
         segments[index] = replace(new,editorial_transform=track)
     proposal = replace(plan,segments=tuple(segments))
     preserved = assert_preserved_output_boundaries(plan,proposal,source_clocks,
-        (boundary_index-1,boundary_index+1))
-    return GroupCutCameraProposal(proposal,clock_timeline,alignment,boundary_index,round(movement_frames),preserved)
+        (boundary_index-1,boundary_index+1),preserved_boundary_frames=preserved_boundary_frames,
+        changed_segment_indices=(boundary_index,boundary_index+1),
+        allow_same_source_seams=preserved_boundary_frames==4)
+    same_source=tuple(i for i in preserved if plan.segments[i].source_index==plan.segments[i+1].source_index)
+    return GroupCutCameraProposal(proposal,clock_timeline,alignment,boundary_index,round(movement_frames),
+        preserved,preserved_boundary_frames,same_source)
 
 
-def assert_preserved_output_boundaries(plan, proposal, source_clocks, neighbors):
+def assert_preserved_output_boundaries(plan, proposal, source_clocks, neighbors, *,
+        preserved_boundary_frames=14, changed_segment_indices=None, allow_same_source_seams=False):
     """Prove the unchanged outer windows of a local proposal, never its new cuts."""
+    if (type(preserved_boundary_frames) is not int or not 4<=preserved_boundary_frames<=14
+            or type(allow_same_source_seams) is not bool):
+        raise ValueError('invalid exact neighbor preservation window')
     if any(getattr(plan,name)!=getattr(proposal,name) for name in (
             'sources','fps','width','height','transitions','master_audio_start','reference_source')):
         raise ValueError('camera proposal changed the output or source domain')
     before_counts,after_counts = segment_frame_counts(plan),segment_frame_counts(proposal)
     if plan.output_frame_count != proposal.output_frame_count:
         raise ValueError('camera proposal changed total output frames')
+    if allow_same_source_seams:
+        if (not isinstance(changed_segment_indices,tuple) or len(changed_segment_indices)!=2
+                or any(type(i) is not int or not 0<=i<len(plan.segments) for i in changed_segment_indices)
+                or changed_segment_indices[1]!=changed_segment_indices[0]+1):
+            raise ValueError('same-source seam preservation needs one complete changed pair')
+        first,last=changed_segment_indices
+        if (len(plan.segments)!=len(proposal.segments) or any(a!=b
+                for i,(a,b) in enumerate(zip(plan.segments,proposal.segments)) if not first<=i<=last)):
+            raise ValueError('camera proposal changed a segment outside its complete pair')
+        begin,end=sum(before_counts[:first]),sum(before_counts[:last+1])
+        if (begin,end)!=(sum(after_counts[:first]),sum(after_counts[:last+1])):
+            raise ValueError('camera proposal changed the outer pair clock')
+        wanted=(*range(begin),*range(end,plan.output_frame_count))
+        before=native_frame_clocks_for_output(plan,source_clocks,wanted)
+        after=native_frame_clocks_for_output(proposal,source_clocks,wanted)
+        for n in wanted:
+            a,b=before[n],after[n]
+            if (a.source_index,a.native_frame_index,a.terminal_clone)!=(b.source_index,b.native_frame_index,b.terminal_clone):
+                raise ValueError('camera proposal changed native frames outside its complete pair')
     preserved = []
     for neighbor in neighbors:
         if not 0 <= neighbor < len(plan.segments)-1:
             continue
-        if plan.segments[neighbor].source_index == plan.segments[neighbor+1].source_index:
+        if not allow_same_source_seams and plan.segments[neighbor].source_index == plan.segments[neighbor+1].source_index:
             # Coalesced source runs need their own interior-clock validation.
             raise ValueError('camera proposal touches an unvalidated same-source neighboring seam')
         cut=sum(before_counts[:neighbor+1])
         if (cut != sum(after_counts[:neighbor+1]) or min(
-                *before_counts[neighbor:neighbor+2],*after_counts[neighbor:neighbor+2]) < 14):
-            raise ValueError('camera proposal lacks complete neighboring fourteen-frame windows')
-        wanted=tuple(range(cut-14,cut+14))
+                *before_counts[neighbor:neighbor+2],*after_counts[neighbor:neighbor+2]) < preserved_boundary_frames):
+            raise ValueError('camera proposal lacks complete neighboring preservation windows')
+        wanted=tuple(range(cut-preserved_boundary_frames,cut+preserved_boundary_frames))
         before=native_frame_clocks_for_output(plan,source_clocks,wanted)
         after=native_frame_clocks_for_output(proposal,source_clocks,wanted)
         for frame_index in wanted:

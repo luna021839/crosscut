@@ -19,6 +19,7 @@ from crosscut.pipeline import (
     _validate_review_first_group_bundle,
 )
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
+from crosscut.render import RenderSegment
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.visual_score import VisualTimelinePlan
 from crosscut.timeline import ShotType
@@ -82,6 +83,25 @@ class MotionCameraRankTests(unittest.TestCase):
         targets=focal_boundary_shortlist(VisualTimelinePlan(choices,1.))
         self.assertEqual(targets[0],13)
         self.assertEqual(len(targets),12)
+
+    def test_protected_contexts_are_not_decoded_and_invalid_domains_fail_early(self):
+        plan,_=produced_plan(Path('/synthetic'))
+        timeline=VisualTimelinePlan(tuple(_choice(i,i,start=float(i),end=float(i+1))
+            for i in range(2)),1.)
+        arguments=dict(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
+            source_timewarps=(None,None),scene_cut_times=((),()),model_path='unused')
+        with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock') as probe, \
+                patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider') as provider, \
+                patch('crosscut.group_motion_camera_refinement.focal_boundary_shortlist',return_value=(0,)):
+            result=refine_group_motion_camera(**arguments,protected_segment_indices=(1,))
+            self.assertEqual(result.plan,plan)
+            self.assertEqual(result.timeline,timeline)
+            self.assertEqual(result.proposals,())
+            self.assertEqual(result.attempts[0]['stage'],'protected_context')
+            for protected in ((True,),(-1,),(2,),(1,1)):
+                with self.subTest(protected=protected),self.assertRaises(ValueError):
+                    refine_group_motion_camera(**arguments,protected_segment_indices=protected)
+            probe.assert_not_called();provider.assert_not_called()
 
 
 class MotionCameraBundleTests(unittest.TestCase):
@@ -151,6 +171,23 @@ class MotionCameraBundleTests(unittest.TestCase):
         self.assertTrue(all(metrics['count_reconciliation_checks'].values()),
                         metrics['count_reconciliation_checks'])
 
+    def test_empty_optional_pass_retains_failure_evidence_without_editing_the_plan(self):
+        bundle,request,_=self.fixture()
+        result=GroupMotionCameraRefinement(bundle.render_plan,bundle.visual_timeline,(),
+            ({'stage':'complete_camera_candidate','boundary_index':0,'admitted':False,
+              'reason':'per_frame_head_unobserved'},),.4)
+        after=self.run_bundle(bundle,request,result)
+        self.assertEqual(after.render_plan,bundle.render_plan)
+        self.assertEqual(after.visual_timeline,bundle.visual_timeline)
+        self.assertEqual(after.editorial_motion_plan,bundle.editorial_motion_plan)
+        self.assertEqual(after.stage_edit_exact_shot_clock,bundle.stage_edit_exact_shot_clock)
+        self.assertIs(after.timeline_review,bundle.timeline_review)
+        audit=after.candidate_lineage[-1]
+        self.assertFalse(audit['applied'])
+        self.assertEqual(audit['changed_boundary_count'],0)
+        self.assertEqual(audit['attempts'][0]['reason'],'per_frame_head_unobserved')
+        self.assertFalse(audit['quality_approved'])
+
     def test_stale_clock_or_incomplete_dense_receipt_cannot_promote(self):
         bundle, request, result = self.fixture()
         proposal = result.proposals[0]
@@ -185,6 +222,75 @@ class MotionCameraBundleTests(unittest.TestCase):
                 analysis_basis='exact_cut_frame_shot_adaptive_subject_alignment_v4')))
         with self.assertRaisesRegex(ValueError,'authority'):
             self.run_bundle(old_basis,request,result)
+
+    def test_unrelated_retime_keeps_independently_bound_context_in_real_bundle(self):
+        import engine.tests.test_shot_context_camera as cameras
+        from crosscut.editorial_motion import build_editorial_motion_plan
+        from crosscut.shot_context_refinement import attach_shot_context_proposal
+        from crosscut.shot_context_binding import bound_shot_context_cameras
+        from crosscut.post_render_qa import _bound_local_alignment_tracks
+        import json
+        fixture=cameras.ShotContextProposalTests();args=fixture.fixture();sources=args['plan'].sources
+        source_order=(0,2,0,1,2)
+        timeline=VisualTimelinePlan(tuple(_choice(i,source,start=float(i),end=float(i+1))
+            for i,source in enumerate(source_order)),1.)
+        transitions=tuple(args['plan'].transitions[0] for _ in range(4))
+        def align(**arguments):
+            return build_boundary_subject_alignment_plan(**arguments,
+                frame_provider=lambda index,_seconds:_frame(index),
+                observation_provider=_observations(source0_box=(.35,.23,.225,.27),
+                    source1_box=(.40,.26,.20,.24)),source_resolutions=((1920,1080),)*3)
+        alignment=align(visual_timeline=timeline,sources=sources,transitions=transitions,
+            fps=30.,boundary_indices=(0,))
+        motion=build_editorial_motion_plan(visual_timeline=timeline,transitions=transitions,
+            fps=30.,boundary_subject_alignment_plan=alignment)
+        plan=replace(args['plan'],segments=tuple(RenderSegment(source,float(i),1.,float(i),
+            editorial_transform=motion.track_for(i)) for i,source in enumerate(source_order)),
+            transitions=transitions)
+        context=fixture.run_proposal(dict(args,plan=plan,segment_index=3))
+        motion=attach_shot_context_proposal(plan,motion,context);plan=context.plan
+        request=SimpleNamespace(sources=sources,reference_source=0,aspect_ratio=AspectRatio.LANDSCAPE)
+        section=SectionPlan((SectionDirective(0,SectionRole.BUILD,0.,5.,.5,.5,
+            1,4,15.,.4,.1,False,False),))
+        bundle=_review_first_group_bundle(timeline=timeline,request=request,
+            eligible_indices=(0,1,2),offsets=(0.,)*3,timewarps=(None,)*3,common_start=0.,
+            section_plan=section,phrase_times=(0.,5.),output=plan.output,
+            reporter=SimpleNamespace(log=lambda *_a,**_k:None),warnings=[])
+        bundle=replace(bundle,render_plan=plan,editorial_motion_plan=motion,
+            group_transition_plan=replace(bundle.group_transition_plan,transitions=transitions))
+        delta=2/30.;left,right=plan.segments[:2]
+        pair=(replace(left,duration=1.+delta,editorial_transform=None),
+            replace(right,master_start=1.+delta,source_start=1.+delta,duration=1.-delta,
+                editorial_transform=None))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=align):
+            proposal=build_group_cut_camera_proposal(plan=plan,timeline=timeline,boundary_index=0,
+                shifted_segments=pair,source_clocks={i:VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)
+                    for i in range(3)},scene_cut_times=((),)*3,preserved_boundary_frames=4)
+        result=GroupMotionCameraRefinement(proposal.plan,proposal.clock_timeline,(proposal,),(),.2)
+        with patch('crosscut.group_motion_camera_refinement.refine_group_motion_camera',return_value=result) as refine:
+            changed=_review_first_group_motion_camera_bundle(bundle,request=request,
+                eligible_indices=(0,1,2),offsets=(0.,)*3,timewarps=(None,)*3,
+                scene_cut_times=((),)*3,phrase_times=(0.,5.),model_path=Path('unused'))
+        self.assertEqual(refine.call_args.kwargs['protected_segment_indices'],(2,3,4))
+        raw=changed.editorial_motion_plan.to_dict()
+        self.assertEqual(set(bound_shot_context_cameras(raw,changed.render_plan)),{3})
+        self.assertEqual(plan.segments[2:],changed.render_plan.segments[2:])
+        old_bound=_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(plan.to_json())))
+        new_bound=_bound_local_alignment_tracks(raw,json.loads(json.dumps(changed.render_plan.to_json())))
+        self.assertTrue(old_bound[0]<=new_bound[0]);self.assertTrue(old_bound[1]<=new_bound[1])
+        self.assertEqual(changed.candidate_lineage[-1]['unchanged_shot_context_receipts_rebound'],1)
+        self.assertFalse(changed.candidate_lineage[-1]['quality_approved'])
+
+    def test_invalid_existing_context_is_rejected_before_expensive_refinement(self):
+        bundle,request,result=self.fixture()
+        corrupted=replace(bundle,editorial_motion_plan=replace(bundle.editorial_motion_plan,
+            shot_context_cameras=({'contract':'unverified_context'},)))
+        with patch('crosscut.group_motion_camera_refinement.refine_group_motion_camera') as refine:
+            with self.assertRaisesRegex(ValueError,'prior'):
+                _review_first_group_motion_camera_bundle(corrupted,request=request,
+                    eligible_indices=(0,1),offsets=(0.,0.),timewarps=(None,None),
+                    scene_cut_times=((),()),phrase_times=(0.,2.),model_path=Path('unused'))
+            refine.assert_not_called()
 
 
 if __name__ == '__main__':

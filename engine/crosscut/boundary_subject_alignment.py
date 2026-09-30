@@ -1981,6 +1981,7 @@ def build_boundary_subject_alignment_plan(
     boundary_indices: Sequence[int] | None = None,
     preserved_editorial_tracks: Sequence[EditorialTransformTrack | None] | None = None,
     preserved_track_time_shifts: Sequence[float] | None = None,
+    preserved_boundary_frames: int = 14,
     local_focal_attention: bool = False,
     action_framing_model_path: Path | None = None,
     config: BoundarySubjectAlignmentConfig | None = None,
@@ -2012,6 +2013,8 @@ def build_boundary_subject_alignment_plan(
         raise ValueError("alignment boundary indices must be unique valid integers")
     if (preserved_editorial_tracks is None) != (preserved_track_time_shifts is None):
         raise ValueError('preserved cameras require their relative output-clock shifts')
+    if type(preserved_boundary_frames) is not int or not 4<=preserved_boundary_frames<=14:
+        raise ValueError('preserved cameras require at least four neighboring output ticks')
     if preserved_editorial_tracks is not None and (
         requested is None or len(requested) != 1
         or len(preserved_editorial_tracks) != len(choices)
@@ -2951,7 +2954,8 @@ def build_boundary_subject_alignment_plan(
             from .group_cut_camera_proposal import splice_boundary_camera
             combined = splice_boundary_camera(preserved_editorial_tracks[choice_index],track,
                 relative_shift=preserved_track_time_shifts[choice_index],
-                frame_count=counts[choice_index],fps=fps,outgoing=choice_index==requested[0])
+                frame_count=counts[choice_index],fps=fps,outgoing=choice_index==requested[0],
+                preserved_boundary_frames=preserved_boundary_frames)
             for boundary_index,decision in trial.items():
                 outgoing=choice_index==boundary_index
                 expected=decision.outgoing_state if outgoing else decision.incoming_state

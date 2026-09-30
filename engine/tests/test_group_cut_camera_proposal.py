@@ -8,6 +8,7 @@ from unittest.mock import patch
 from crosscut.boundary_subject_alignment import _fixed_crop_at
 from crosscut.group_cut_camera_proposal import (
     build_group_cut_camera_proposal,retime_base_pan,splice_boundary_camera,vars_for_state,
+    assert_preserved_output_boundaries,
 )
 from crosscut.render import (
     EditorialTransformKeyframe as Key,EditorialTransformTrack as Track,NormalizedCrop,
@@ -111,6 +112,63 @@ class GroupCutCameraProposalTests(unittest.TestCase):
         self.assertEqual(result.clock_timeline.choices[2].canonical_master_start,3.8)
         self.assertIs(result.plan.segments[0],args['plan'].segments[0])
         self.assertIs(result.plan.segments[3],args['plan'].segments[3])
+
+    def test_short_shot_can_use_interior_ticks_after_preserving_measured_cut_motion(self):
+        args=self.fixture();times=(0.,2.,2.+21/30.,6.,8.)
+        args['plan']=replace(args['plan'],segments=tuple(RenderSegment(i,times[i],
+            times[i+1]-times[i],times[i]) for i in range(4)))
+        args['timeline']=VisualTimelinePlan(tuple(_choice(i,i,start=times[i],end=times[i+1])
+            for i in range(4)),1.)
+        left,right=args['plan'].segments[1:3]
+        args['shifted_segments']=(replace(left,duration=15/30.),
+            replace(right,master_start=2.+15/30.,source_start=2.+15/30.,duration=right.duration+6/30.))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
+            with self.assertRaisesRegex(ValueError,'disjoint'):
+                build_group_cut_camera_proposal(**args)
+            result=build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
+        self.assertEqual(self.window_frames,12)
+        self.assertEqual(result.preserved_boundary_frames,4)
+        self.assertEqual(result.plan.output_frame_count,args['plan'].output_frame_count)
+        self.assertEqual(result.preserved_neighbor_boundaries,(0,2))
+        # The new ramp may use shot interiors, but not the four native/camera
+        # ticks that measure the unchanged neighboring motion.
+        old=Track((Key(0.,1.),))
+        new=Track((Key(0.,1.),Key(3/30.,1.),Key(14/30.,1.2)))
+        actual=splice_boundary_camera(old,new,relative_shift=0.,frame_count=15,fps=30.,
+            outgoing=True,preserved_boundary_frames=4)
+        for frame in range(4):self.assertEqual(actual.evaluate(frame/30.).zoom,1.)
+        self.assertGreater(actual.evaluate(14/30.).zoom,1.)
+
+    def test_shared_source_neighbor_requires_complete_clock_proof_outside_pair(self):
+        args=self.fixture();plan=args['plan']
+        plan=replace(plan,segments=(*plan.segments[:3],replace(plan.segments[3],source_index=2)))
+        choices=(*args['timeline'].choices[:3],replace(args['timeline'].choices[3],source_index=2))
+        args.update(plan=plan,timeline=replace(args['timeline'],choices=choices))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
+            with self.assertRaisesRegex(ValueError,'same-source'):
+                build_group_cut_camera_proposal(**args)
+            result=build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
+        self.assertEqual(result.preserved_same_source_seams,(2,))
+        # Same-source coalescing must not be used to hide mutation outside the
+        # two changed logical cells, even far away from the inspected seam.
+        changed=replace(result.plan,segments=(replace(result.plan.segments[0],source_start=.1),
+            *result.plan.segments[1:]))
+        with self.assertRaisesRegex(ValueError,'outside its complete pair'):
+            assert_preserved_output_boundaries(plan,changed,args['source_clocks'],(0,2),
+                preserved_boundary_frames=4,changed_segment_indices=(1,2),allow_same_source_seams=True)
+
+    def test_four_tick_splice_cannot_bypass_dense_geometry_failure(self):
+        args=self.fixture()
+        rejected=SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=False))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',return_value=rejected), \
+                self.assertRaisesRegex(ValueError,'dense local subject'):
+            build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
+        for frames in (True,0,3,15,4.0):
+            with self.subTest(frames=frames), \
+                    patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan') as align, \
+                    self.assertRaisesRegex(ValueError,'four measured'):
+                build_group_cut_camera_proposal(**args,preserved_boundary_frames=frames)
+            align.assert_not_called()
 
     def test_newly_exposed_native_cut_is_refreshed_before_geometry(self):
         args=self.fixture()
