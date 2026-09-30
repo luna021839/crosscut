@@ -394,6 +394,7 @@ class BoundarySubjectAlignmentDecision:
     outgoing_validated_output_frame_count: int = 0
     incoming_validated_output_frame_count: int = 0
     replaced_one_sided_geometry_mismatch: float | None = None
+    preserved_one_sided_boundary_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.boundary_index < 0 or min(
@@ -438,6 +439,13 @@ class BoundarySubjectAlignmentDecision:
                 or self.transformed_geometry_mismatch is None
                 or not 0 <= self.transformed_geometry_mismatch < previous <= 1):
             raise ValueError('paired replacement requires a strictly improved measured incumbent')
+        neighbors = tuple(self.preserved_one_sided_boundary_indices)
+        if (neighbors != tuple(sorted(set(neighbors)))
+                or any(type(index) is not int or index < 0
+                       or abs(index-self.boundary_index) != 1 for index in neighbors)
+                or neighbors and (not self.eligible or self.transformed_side != 'both')):
+            raise ValueError('paired neighbors must be adjacent, distinct preserved one-sided cuts')
+        object.__setattr__(self, 'preserved_one_sided_boundary_indices', neighbors)
 
     @property
     def uses_pan(self) -> bool:
@@ -447,6 +455,8 @@ class BoundarySubjectAlignmentDecision:
     def to_dict(self) -> dict[str, Any]:
         return {
             "boundary_index": self.boundary_index,
+            **({'preserved_one_sided_boundary_indices': list(self.preserved_one_sided_boundary_indices)}
+               if self.preserved_one_sided_boundary_indices else {}),
             "outgoing_segment_index": self.outgoing_segment_index,
             "incoming_segment_index": self.incoming_segment_index,
             "outgoing_source_index": self.outgoing_source_index,
@@ -609,6 +619,7 @@ class BoundarySubjectAlignmentPlan:
                 "dense_observations_reused_across_strengths": True,
                 "paired_framing_fallback": "common_face_scale_center_on_two_unused_segments_v1",
                 "paired_framing_competition": "replace_only_own_isolated_one_sided_ramp_after_strict_gain_and_two_dense_windows_v1",
+                "paired_neighbor_composition": "disjoint_neutral_return_preserving_one_sided_neighbors_v1",
                 "maximum_paired_framing_candidates_per_boundary": 5,
                 "paired_framing_publication": "both_complete_dense_windows_or_neither",
                 "paired_face_center_shift_cap": 0.10,
@@ -2582,16 +2593,33 @@ def build_boundary_subject_alignment_plan(
 
         # A passing one-sided crop is an incumbent, not necessarily the best
         # camera match. Compare the bounded bilateral family when both segments
-        # are unused OR occupied solely by this cut. Neighbors are immutable;
+        # are unused, occupied solely by this cut, or have a disjoint one-sided
+        # neighbor. The neighbor's complete active window remains immutable;
         # failed candidates retain the complete incumbent, and publication is
         # atomic only after BOTH visible windows pass the same dense gates.
         initial_decisions = {item.boundary_index: item for item in decisions}
         for boundary_index, options in sorted(joint_options.items()):
             current = candidate_by_boundary.get(boundary_index, initial_decisions[boundary_index])
             sides = (boundary_index, boundary_index+1)
-            if (not options or any(choices[index].segment_index in segment_tracks
-                    and set(segment_boundaries[choices[index].segment_index]) != {boundary_index}
-                    for index in sides)):
+            if not options:
+                continue
+            neighbors_by_side = {}
+            for index in sides:
+                existing = segment_boundaries.get(choices[index].segment_index, ())
+                neighbors = tuple(other for other in existing if other != boundary_index)
+                if neighbors:
+                    # Short ramps must not silently turn a preserved settle
+                    # into a new interpolation through another cut's camera.
+                    if ((counts[index]-1) <= 2*(settings.window_frames-1)
+                            or len(neighbors) != 1):
+                        break
+                    other = candidate_by_boundary[neighbors[0]]
+                    expected_side = 'incoming' if neighbors[0] == index-1 else 'outgoing'
+                    if (not other.eligible or other.transformed_side != expected_side
+                            or getattr(other, expected_side+'_segment_index') != choices[index].segment_index):
+                        break
+                neighbors_by_side[index] = {other:candidate_by_boundary[other] for other in neighbors}
+            if len(neighbors_by_side) != 2:
                 continue
             for candidate in options:
                 previous = current.transformed_geometry_mismatch if current.eligible else None
@@ -2605,33 +2633,60 @@ def build_boundary_subject_alignment_plan(
                         continue
                 tracks = []
                 counts_by_side = []
+                flows_by_side = []
+                trials_by_side = []
                 flow_count = 0
                 for index in sides:
-                    outgoing = index == boundary_index
+                    trial = {**neighbors_by_side[index], boundary_index:candidate}
+                    entry = trial.get(index-1)
+                    exit = trial.get(index)
                     dense_attempts += 1
                     track = _track_for_segment(last_frame_time=(counts[index]-1)/fps,
                         ramp_frames=settings.window_frames, fps=fps,
-                        entry=None if outgoing else (boundary_index, candidate.incoming_state),
-                        exit=(boundary_index, candidate.outgoing_state) if outgoing else None)
+                        entry=(entry.boundary_index,entry.incoming_state) if entry else None,
+                        exit=(exit.boundary_index,exit.outgoing_state) if exit else None)
                     if track is None:
                         break
-                    failure, validated, tracked = validate_track(index, track, {boundary_index: candidate})
+                    previous_track = segment_tracks.get(choices[index].segment_index)
+                    preserved = True
+                    for other in neighbors_by_side[index]:
+                        neighbor_frames = (range(settings.window_frames) if other == index-1 else
+                                           range(counts[index]-settings.window_frames, counts[index]))
+                        if previous_track is None or any(any(
+                            abs(getattr(track.evaluate(frame/fps), name)-getattr(previous_track.evaluate(frame/fps), name)) > 1e-9
+                            for name in ('zoom','center_x','center_y','roll_degrees')) for frame in neighbor_frames):
+                            preserved = False
+                            break
+                    if not preserved:
+                        break
+                    failure, validated, tracked = validate_track(index, track, trial)
                     if failure is not None:
                         break
                     tracks.append(track)
+                    trials_by_side.append(trial)
                     counts_by_side.append(validated)
+                    flows_by_side.append(tracked)
                     flow_count += tracked
                 if len(tracks) != 2:
                     continue
-                for index, track in zip(sides, tracks):
+                for index, track, trial, validated, tracked in zip(
+                        sides, tracks, trials_by_side, counts_by_side, flows_by_side):
                     segment_tracks[choices[index].segment_index] = track
-                    segment_boundaries[choices[index].segment_index] = (boundary_index,)
+                    segment_boundaries[choices[index].segment_index] = tuple(sorted(trial))
+                    for other, neighbor in neighbors_by_side[index].items():
+                        # A one-sided receipt covers its complete composed
+                        # segment, including the newly reviewed distant ramp.
+                        candidate_by_boundary[other] = replace(neighbor,
+                            validated_output_frame_count=validated,
+                            optical_flow_containment_frame_count=tracked)
                 candidate_by_boundary[boundary_index] = replace(candidate,
                     validated_output_frame_count=sum(counts_by_side),
                     optical_flow_containment_frame_count=flow_count,
                     outgoing_validated_output_frame_count=counts_by_side[0],
                     incoming_validated_output_frame_count=counts_by_side[1],
-                    replaced_one_sided_geometry_mismatch=previous)
+                    replaced_one_sided_geometry_mismatch=previous,
+                    preserved_one_sided_boundary_indices=tuple(sorted(
+                        other for neighbors in neighbors_by_side.values() for other in neighbors)))
                 break
 
         final_decisions = tuple(

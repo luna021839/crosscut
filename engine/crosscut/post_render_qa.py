@@ -4617,6 +4617,56 @@ def _bound_local_alignment_tracks(
     motion_segments = _sequence(motion.get("segments")) or []
     bound_segments: set[int] = set()
     bound_boundaries: set[int] = set()
+
+    def paired_indices_match(boundary, boundary_index, index, indices, track):
+        neighbors = _sequence(boundary.get('preserved_one_sided_boundary_indices', []))
+        if neighbors is None:
+            return False
+        if not neighbors:
+            return indices == [boundary_index]
+        if (any(_integer(other) is None or other < 0 or abs(other-boundary_index) != 1 for other in neighbors)
+                or neighbors != sorted(set(neighbors))
+                or (_mapping(alignment.get('policy')) or {}).get('paired_neighbor_composition')
+                    != 'disjoint_neutral_return_preserving_one_sided_neighbors_v1'):
+            return False
+        expected_indices = [boundary_index]
+        for other in neighbors:
+            neighbor = decisions.get(other, {})
+            side = 'incoming' if other == boundary_index-1 else 'outgoing'
+            target = boundary_index if side == 'incoming' else boundary_index+1
+            if (neighbor.get('eligible') is not True or neighbor.get('rejection_reason') is not None
+                    or neighbor.get('transformed_side') != side
+                    or neighbor.get(side+'_segment_index') != target):
+                return False
+            if target == index:
+                expected_indices.append(other)
+        if indices != sorted(expected_indices):
+            return False
+        if len(indices) == 1:
+            return True
+        window = _integer((_mapping(alignment.get('policy')) or {}).get('window_frames_each_side'))
+        if window is None or not 8 <= window <= 24 or counts[index]-1 <= 2*(window-1):
+            return False
+        # Independently reconstruct the two disjoint ramps and their neutral
+        # middle. A receipt cannot authorize a changed neighbor or hidden zoom.
+        from .boundary_subject_alignment import _track_for_segment, _TransformState
+        ends = []
+        for other, side in ((index-1,'incoming'),(index,'outgoing')):
+            state = _mapping(decisions.get(other, {}).get(side+'_state')) or {}
+            names = ('zoom','center_x','center_y','roll_degrees')
+            if set(state) != set(names) or any(_number(state.get(name)) is None for name in names):
+                return False
+            ends.append((other,_TransformState(**state)))
+        try:
+            expected = _track_for_segment(last_frame_time=(counts[index]-1)/typed.fps,
+                ramp_frames=window,fps=typed.fps,entry=ends[0],exit=ends[1])
+        except (ValueError,TypeError):
+            return False
+        return bool(expected is not None and len(track.keyframes) == len(expected.keyframes)
+            and all(all(math.isclose(getattr(left,name),getattr(right,name),abs_tol=1e-7,rel_tol=0)
+                for name in ('time_seconds','zoom','center_x','center_y','roll_degrees'))
+                for left,right in zip(track.keyframes,expected.keyframes)))
+
     for raw in (_sequence(alignment.get("segments")) or []):
         item = _mapping(raw) or {}
         index = _integer(item.get("segment_index"))
@@ -4659,7 +4709,7 @@ def _bound_local_alignment_tracks(
             if paired:
                 side_counts = tuple(_integer(boundary.get(f'{name}_validated_output_frame_count'))
                                     for name in ('outgoing', 'incoming'))
-                valid = bool(valid and indices == [boundary_index]
+                valid = bool(valid and paired_indices_match(boundary,boundary_index,index,indices,track)
                     and all(value is not None and value > 0 for value in side_counts)
                     and boundary.get('validated_output_frame_count') == sum(value or 0 for value in side_counts))
             if not valid:

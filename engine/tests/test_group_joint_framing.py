@@ -123,16 +123,67 @@ class GroupJointFramingTests(unittest.TestCase):
         self.assertEqual(decision.to_dict()['replaced_one_sided_geometry_mismatch'],
                          decision.replaced_one_sided_geometry_mismatch)
 
-    def test_bilateral_competition_cannot_overwrite_a_neighboring_ramp(self):
+    def test_disjoint_paired_camera_keeps_the_neighbors_entire_ramp_unchanged(self):
         choices=(_choice(0,0,start=0.,end=1.), _choice(1,1,start=1.,end=2.),
                  _choice(2,0,start=2.,end=3.))
         with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
             before,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
-        after,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,motion,plan=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
         self.assertEqual(before.eligible_count,2)
         self.assertEqual(before.segments[1].boundary_indices,(0,1))
+        self.assertEqual(after.eligible_count,2)
+        self.assertEqual(before.decisions[1],after.decisions[1])
+        self.assertEqual(after.decisions[0].transformed_side,'both')
+        self.assertEqual(after.decisions[0].preserved_one_sided_boundary_indices,(1,))
+        self.assertLess(after.decisions[0].transformed_geometry_mismatch,before.decisions[0].transformed_geometry_mismatch)
+        for frame in range(16,30):
+            self.assertEqual(before.segments[1].track.evaluate(frame/30),after.segments[1].track.evaluate(frame/30))
+        self.assertEqual(_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(plan.to_json()))),
+                         ({0,1},{0,1}))
+
+    def test_overlapping_neighbor_windows_do_not_acquire_composition_authority(self):
+        choices=(_choice(0,0,start=0.,end=1.),_choice(1,1,start=1.,end=1.5),
+                 _choice(2,0,start=1.5,end=2.5))
+        with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
+            before,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
         self.assertEqual(before.decisions,after.decisions)
         self.assertEqual(before.segments,after.segments)
+
+    def test_failed_new_outer_window_keeps_both_old_neighbor_corrections(self):
+        choices=(_choice(0,0,start=0.,end=1.),_choice(1,1,start=1.,end=2.),
+                 _choice(2,0,start=2.,end=3.))
+        frames=lambda source,seconds:None if source==0 and any(abs(seconds-t)<1e-8
+            for t in (25/30.,2.+4/30.)) else _frame(source)
+        with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
+            before,_,_=produce(choices=choices,frames=frames,observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,_,_=produce(choices=choices,frames=frames,observe=self._one_sided_fixture,resolution=(3840,2160))
+        self.assertEqual(before.decisions,after.decisions)
+        self.assertEqual(before.segments,after.segments)
+
+    def test_composed_receipt_requires_neighbor_evidence_and_the_exact_neutral_middle(self):
+        choices=(_choice(0,0,start=0.,end=1.),_choice(1,1,start=1.,end=2.),
+                 _choice(2,0,start=2.,end=3.))
+        _,motion,plan=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
+        for corruption in ('missing_receipt','wrong_neighbor','boolean_neighbor','null_receipt','missing_contract','low_neighbor_count','hidden_middle_zoom'):
+            with self.subTest(corruption=corruption):
+                payload=deepcopy(motion.to_dict())
+                candidate=json.loads(json.dumps(plan.to_json()))
+                alignment=payload['boundary_subject_alignment']
+                if corruption=='missing_receipt':alignment['decisions'][0].pop('preserved_one_sided_boundary_indices')
+                elif corruption=='wrong_neighbor':alignment['decisions'][0]['preserved_one_sided_boundary_indices']=[2]
+                elif corruption=='boolean_neighbor':alignment['decisions'][0]['preserved_one_sided_boundary_indices']=[True]
+                elif corruption=='null_receipt':alignment['decisions'][0]['preserved_one_sided_boundary_indices']=None
+                elif corruption=='missing_contract':alignment['policy'].pop('paired_neighbor_composition')
+                elif corruption=='low_neighbor_count':alignment['decisions'][1]['validated_output_frame_count']=1
+                else:
+                    for frames in (candidate['segments'][1]['editorial_transform']['keyframes'],
+                                   payload['segments'][1]['keyframes'],alignment['segments'][1]['keyframes']):
+                        frames[1]['zoom']=1.001
+                    alignment['decisions'][1]['validated_output_frame_count']=999
+                    alignment['decisions'][0]['incoming_validated_output_frame_count']=999
+                    alignment['decisions'][0]['validated_output_frame_count']=1012
+                self.assertEqual(_bound_local_alignment_tracks(payload,candidate),(set(),set()))
 
     def test_missing_frame_on_either_side_publishes_neither_transform(self):
         for source,seconds in ((0,25/30.),(1,1.+4/30.)):
