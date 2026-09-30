@@ -4735,7 +4735,25 @@ def _bound_local_alignment_tracks(
             if boundary.get('transformed_side') != 'both':
                 continue
             pair = {boundary.get('outgoing_segment_index'), boundary.get('incoming_segment_index')}
-            if not pair <= bound_segments:
+            endpoints_match = pair <= bound_segments
+            if endpoints_match:
+                # A shared segment can be fully validated by an adjacent
+                # composed camera receipt. That receipt is not permission to
+                # change this paired cut's OTHER measured endpoint.
+                for side in ('outgoing','incoming'):
+                    index=boundary.get(side+'_segment_index')
+                    track=typed.segments[index].editorial_transform
+                    if track is None:
+                        endpoints_match=False
+                        break
+                    actual=track.evaluate((counts[index]-1)/typed.fps if side=='outgoing' else 0.)
+                    declared=_mapping(boundary.get(side+'_state')) or {}
+                    if not all((value:=_number(declared.get(name))) is not None
+                        and math.isclose(value,getattr(actual,name),rel_tol=0.,abs_tol=1e-6)
+                        for name in ('zoom','center_x','center_y','roll_degrees')):
+                        endpoints_match=False
+                        break
+            if not endpoints_match:
                 bound_segments.difference_update(pair)
         if bound_segments == previous_bound:
             break
@@ -4823,7 +4841,9 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
         pixels_width = math.floor(width * float(f'{crop_width:.8f}') / 2.) * 2
         pixels_height = math.floor(height * float(f'{crop_height:.8f}') / 2.) * 2
         native = min(pixels_width / typed.width, pixels_height / typed.height)
-        profile = 2.0 if height >= 2000 and native >= 1.75 else 1.33 if height >= 1300 and native >= 1.20 else config.maximum_editorial_zoom
+        # Independently probed, post-crop native pixels fund a continuous
+        # budget. A 4K raster with 1.70x left is not a 1.33x-only camera.
+        profile = 2.0 if height >= 2000 and native > 1.0 else 1.33 if height >= 1300 and native > 1.0 else config.maximum_editorial_zoom
         maximum = min(profile, native, subject_cap)
         if maximum > config.maximum_editorial_zoom:
             budgets[index] = {'maximum_zoom': maximum, 'source_index': segment.source_index,

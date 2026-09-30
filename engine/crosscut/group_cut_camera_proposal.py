@@ -10,7 +10,8 @@ from dataclasses import dataclass, replace
 import math
 
 from .boundary_subject_alignment import (
-    BoundarySubjectAlignmentPlan, _fixed_crop_at, build_boundary_subject_alignment_plan,
+    BoundarySubjectAlignmentConfig, BoundarySubjectAlignmentPlan,
+    _fixed_crop_at, build_boundary_subject_alignment_plan,
 )
 from .face_match import FaceMatchPlan, FaceMatchSegment
 from .render import (
@@ -175,22 +176,37 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
     face_plan = FaceMatchPlan(tuple(FaceMatchSegment(i,choice.source_index,
         segments[i].pan_crop is not None,None,None,None,None,None,segments[i].pan_crop)
         for i,choice in enumerate(choices)),None,2.,(.5,.5))
+    numeric_plan = replace(plan,segments=tuple(segments))
+    counts = segment_frame_counts(numeric_plan)
+    # Reserve the opposite boundary's complete 14-frame window before
+    # authoring either ramp. The neutral join frame can be shared. This is a
+    # deterministic window choice, not repeated weaker-containment retries.
+    window_frames = min(14,*(counts[index]-14+1
+        for index in (boundary_index,boundary_index+1)))
+    if window_frames < 8:
+        raise ValueError('camera proposal has no disjoint validated ramp window')
     alignment = build_boundary_subject_alignment_plan(visual_timeline=clock_timeline,
         sources=local_sources,transitions=plan.transitions,face_match_plan=face_plan,
         fps=plan.fps,output_width=plan.width,output_height=plan.height,
         render_frame_clocks=tuple(source_clocks.get(index) for index in source_index_map),
-        boundary_indices=(boundary_index,))
+        boundary_indices=(boundary_index,),
+        preserved_editorial_tracks=tuple(segment.editorial_transform for segment in plan.segments),
+        preserved_track_time_shifts=tuple(new.master_start-old.master_start
+            for old,new in zip(plan.segments,segments,strict=True)),
+        config=BoundarySubjectAlignmentConfig(window_frames=window_frames))
     decision = alignment.decision_for(boundary_index)
     if decision is None or not decision.eligible:
         raise ValueError('camera proposal lacks dense local subject alignment')
-    numeric_plan = replace(plan,segments=tuple(segments))
-    counts = segment_frame_counts(numeric_plan)
     for index in (boundary_index,boundary_index+1):
         old,new = plan.segments[index],segments[index]
-        segments[index] = replace(new,editorial_transform=splice_boundary_camera(
-            old.editorial_transform,alignment.track_for(index),
-            relative_shift=new.master_start-old.master_start,frame_count=counts[index],
-            fps=plan.fps,outgoing=index==boundary_index))
+        track=alignment.track_for(index)
+        if track is None:
+            retained=splice_boundary_camera(old.editorial_transform,None,
+                relative_shift=new.master_start-old.master_start,frame_count=counts[index],
+                fps=plan.fps,outgoing=index==boundary_index)
+            if any(not _neutral(retained.evaluate(frame/plan.fps)) for frame in range(counts[index])):
+                raise ValueError('untransformed side retains a camera outside the new dense receipt')
+        segments[index] = replace(new,editorial_transform=track)
     proposal = replace(plan,segments=tuple(segments))
     before_counts,after_counts = segment_frame_counts(plan),segment_frame_counts(proposal)
     if plan.output_frame_count != proposal.output_frame_count:

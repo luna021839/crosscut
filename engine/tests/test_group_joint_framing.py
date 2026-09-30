@@ -220,6 +220,41 @@ class GroupJointFramingTests(unittest.TestCase):
                 else: candidate['segments'][0 if mode=='left_track' else 1]['editorial_transform']=None
                 self.assertEqual(_bound_local_alignment_tracks(payload,candidate),(set(),set()))
 
+    def test_adjacent_complete_receipt_cannot_change_the_other_paired_endpoint(self):
+        choices=tuple(_choice(i,i%2,start=2.*i,end=2.*(i+1)) for i in range(3))
+        timeline=VisualTimelinePlan(choices,1.)
+        sources=(Path('/tmp/joint-source-a.mp4'),Path('/tmp/joint-source-b.mp4'))
+        transitions=(RenderTransition(tier='C'),)*2
+        args=dict(visual_timeline=timeline,sources=sources,transitions=transitions,fps=30.,
+            frame_provider=lambda source,_seconds:_frame(source),
+            observation_provider=lambda frame:observed(int(frame.mean()>75)),
+            source_resolutions=((1920,1080),)*2)
+        first=build_boundary_subject_alignment_plan(**args,boundary_indices=(0,))
+        second=build_boundary_subject_alignment_plan(**args,boundary_indices=(1,),
+            preserved_editorial_tracks=tuple(item.track for item in first.segments),
+            preserved_track_time_shifts=(0.,)*3)
+        self.assertTrue(all(item.eligible and item.transformed_side=='both'
+            for item in (*first.decisions,*second.decisions)))
+        combined=replace(first,decisions=(*first.decisions,*second.decisions),
+            segments=(first.segments[0],*second.segments[1:]))
+        motion=build_editorial_motion_plan(visual_timeline=timeline,transitions=transitions,
+            fps=30.,boundary_subject_alignment_plan=combined)
+        plan=RenderPlan(sources=sources,reference_source=0,aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path('/tmp/unused-shared-receipt.mp4'),fps=30.,transitions=transitions,
+            segments=tuple(RenderSegment(i%2,2.*i,2.,2.*i,editorial_transform=motion.track_for(i))
+                for i in range(3)))
+        payload=motion.to_dict()
+        candidate=json.loads(json.dumps(plan.to_json()))
+        self.assertEqual(_bound_local_alignment_tracks(payload,candidate),({0,1,2},{0,1}))
+        # Segment 1's complete dense receipt is now owned by boundary 1.
+        # Its incoming endpoint still owes boundary 0 the measured paired state.
+        self.assertEqual(payload['boundary_subject_alignment']['segments'][1]['boundary_indices'],[1])
+        for keys in (candidate['segments'][1]['editorial_transform']['keyframes'],
+                     payload['segments'][1]['keyframes'],
+                     payload['boundary_subject_alignment']['segments'][1]['keyframes']):
+            keys[0]['center_x']+=.001
+        self.assertEqual(_bound_local_alignment_tracks(payload,candidate),(set(),set()))
+
     def test_larger_bilateral_pan_keeps_native_zoom_and_unbound_track_checks(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

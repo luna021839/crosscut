@@ -130,6 +130,13 @@ class CurrentGroupContractTests(unittest.TestCase):
             metrics, codes = evaluate()
             self.assertEqual(metrics['native_resolution_zoom_budgets'][1]['maximum_zoom'], 2.)
             self.assertNotIn('editorial_transform_safety_bound_exceeded', codes)
+            # 85% of a true 4K raster still funds 1.70x. It must not drop
+            # discontinuously to the unrelated 1440p 1.33x cap after cropping.
+            cropped_native = replace(plan,segments=(plan.segments[0],replace(plan.segments[1],
+                crop=NormalizedCrop(.075,.075,.85,.85))))
+            metrics,codes=evaluate(candidate=json.loads(json.dumps(cropped_native.to_json())))
+            self.assertAlmostEqual(metrics['native_resolution_zoom_budgets'][1]['maximum_zoom'],1.7)
+            self.assertNotIn('editorial_transform_safety_bound_exceeded',codes)
             for probe in (runner(1920,1080), runner(2560,1440), runner(sar='N/A'),
                           runner(sar='4:3'), runner(rotation=90), runner(rotation=float('nan')),
                           runner(mutate=True)):

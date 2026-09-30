@@ -1603,10 +1603,13 @@ def _headroom(
         width_pixels = math.floor(width * float(f'{width_scale:.8f}') / 2.) * 2
         height_pixels = math.floor(height * float(f'{base_crop_scale:.8f}') / 2.) * 2
         native = min(width_pixels / output_width, height_pixels / output_height)
-        if height >= 2000 and native >= 1.75:
+        # Cropping a 2160p source to 1.70 output rasters still funds 1.70x
+        # without upscaling. Do not bucket it down to the 1440p 1.33 cap just
+        # because the remaining raster is below an arbitrary 1.75 boundary.
+        if height >= 2000 and native > 1.0:
             profile = "2160p_native_crop_headroom"
             profile_max = settings.native_2160_max_zoom
-        elif height >= 1300 and native >= 1.20:
+        elif height >= 1300 and native > 1.0:
             profile = "1440p_native_crop_headroom"
             profile_max = settings.native_1440_max_zoom
         else:
@@ -1700,6 +1703,8 @@ def build_boundary_subject_alignment_plan(
     source_resolutions: Sequence[tuple[int, int] | None] | None = None,
     render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
     boundary_indices: Sequence[int] | None = None,
+    preserved_editorial_tracks: Sequence[EditorialTransformTrack | None] | None = None,
+    preserved_track_time_shifts: Sequence[float] | None = None,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
     """Build exact-cut local tracks and validate every transformed frame."""
@@ -1716,6 +1721,18 @@ def build_boundary_subject_alignment_plan(
         for index in requested
     )):
         raise ValueError("alignment boundary indices must be unique valid integers")
+    if (preserved_editorial_tracks is None) != (preserved_track_time_shifts is None):
+        raise ValueError('preserved cameras require their relative output-clock shifts')
+    if preserved_editorial_tracks is not None and (
+        requested is None or len(requested) != 1
+        or len(preserved_editorial_tracks) != len(choices)
+        or len(preserved_track_time_shifts) != len(choices)
+        or any(track is not None and not isinstance(track,EditorialTransformTrack)
+               for track in preserved_editorial_tracks)
+        or any(type(value) not in (float,int) or not math.isfinite(value)
+               for value in preserved_track_time_shifts)
+    ):
+        raise ValueError('camera preservation requires one boundary and complete typed track clocks')
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("boundary alignment fps must be positive and finite")
     if output_width < 320 or output_height < 180:
@@ -2534,6 +2551,22 @@ def build_boundary_subject_alignment_plan(
                     break
             return failure, validated, optical_flow_validated
 
+        def compose_preserved_track(choice_index, track, trial):
+            if preserved_editorial_tracks is None:
+                return track
+            from .group_cut_camera_proposal import splice_boundary_camera
+            combined = splice_boundary_camera(preserved_editorial_tracks[choice_index],track,
+                relative_shift=preserved_track_time_shifts[choice_index],
+                frame_count=counts[choice_index],fps=fps,outgoing=choice_index==requested[0])
+            for boundary_index,decision in trial.items():
+                outgoing=choice_index==boundary_index
+                expected=decision.outgoing_state if outgoing else decision.incoming_state
+                actual=combined.evaluate((counts[choice_index]-1)/fps if outgoing else 0.)
+                if any(abs(getattr(actual,name)-getattr(expected,name)) > 1e-7
+                       for name in ('zoom','center_x','center_y','roll_degrees')):
+                    raise ValueError('preserved camera altered the measured target endpoint')
+            return combined
+
         # Each cut transforms exactly one side, so a boundary belongs to one
         # segment only. Try its endpoint-valid strengths against the COMPLETE
         # visible settle, including any neighboring ramp. Choosing a weaker
@@ -2577,6 +2610,7 @@ def build_boundary_subject_alignment_plan(
                     )
                     if track is None:
                         raise ValueError("non-neutral candidates produced no track")
+                    track = compose_preserved_track(choice_index,track,trial)
                 except ValueError:
                     failure = "composite_track_renderer_safety_rejection"
                 else:
@@ -2655,6 +2689,10 @@ def build_boundary_subject_alignment_plan(
                         entry=(entry.boundary_index,entry.incoming_state) if entry else None,
                         exit=(exit.boundary_index,exit.outgoing_state) if exit else None)
                     if track is None:
+                        break
+                    try:
+                        track = compose_preserved_track(index,track,trial)
+                    except ValueError:
                         break
                     previous_track = segment_tracks.get(choices[index].segment_index)
                     preserved = True

@@ -27348,6 +27348,98 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
             raise ValueError('GROUP bundle shot progress is invalid')
 
 
+def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices,offsets,
+        timewarps,scene_cut_times,phrase_times,model_path=None):
+    """Promote only an owned timeline/camera/review transaction before look fit."""
+    from .group_motion_camera_refinement import refine_group_motion_camera
+    from .editorial_transform_events import rendered_transform_event_records
+    from .post_render_qa import _bound_local_alignment_tracks
+    motion=bundle.editorial_motion_plan
+    if (motion is None or motion.boundary_subject_alignment_plan is None
+            or bundle.boundary_look_match is not None or bundle.cut_local_sync is not None
+            or bundle.dynamic_crop_application is not None
+            or tuple(eligible_indices)!=tuple(range(len(bundle.render_plan.sources)))):
+        return None
+    if model_path is None:
+        cache=getattr(request,'source_cache_directory',None)
+        if cache is None:
+            return None
+        from .source_first_model_assets import ensure_source_first_model_assets
+        model_path=ensure_source_first_model_assets(cache).pose_model_path
+    result=refine_group_motion_camera(plan=bundle.render_plan,timeline=bundle.visual_timeline,
+        audio_offsets=offsets,source_timewarps=timewarps,scene_cut_times=scene_cut_times,
+        source_index_map=eligible_indices,model_path=model_path,**_visual_feature_cache_arguments(request))
+    if not result.proposals:
+        return None
+    prior_alignment=alignment=motion.boundary_subject_alignment_plan
+    decisions={item.boundary_index:item for item in alignment.decisions}
+    alignment_segments=list(alignment.segments)
+    changed=set()
+    for proposal in result.proposals:
+        decisions.update({item.boundary_index:item for item in proposal.alignment.decisions})
+        for index in (proposal.boundary_index,proposal.boundary_index+1):
+            alignment_segments[index]=proposal.alignment.segments[index]
+            changed.add(index)
+    replaced_boundaries={proposal.boundary_index for proposal in result.proposals}
+    for index,item in tuple(decisions.items()):
+        if index not in replaced_boundaries and item.preserved_one_sided_boundary_indices:
+            # The retained paired endpoint keeps exactly its old pixels/camera
+            # window. Its shared segment is now covered by the new COMPLETE
+            # dense receipt; the former one-sided neighbor recipe is stale.
+            # Final binding below still requires both actual paired endpoints
+            # and every previous bound boundary. This does not rerate geometry.
+            decisions[index]=replace(item,preserved_one_sided_boundary_indices=tuple(
+                neighbor for neighbor in item.preserved_one_sided_boundary_indices
+                if neighbor not in replaced_boundaries))
+    alignment=replace(alignment,decisions=tuple(decisions[index] for index in sorted(decisions)),
+        segments=tuple(alignment_segments),dense_track_candidate_attempt_count=(
+            alignment.dense_track_candidate_attempt_count+sum(p.alignment.dense_track_candidate_attempt_count for p in result.proposals)))
+    events=rendered_transform_event_records(result.plan.segments,result.plan.fps)
+    # An authored boundary gesture can be two ramps, while an incoming settle
+    # may create no new frame-visible target. These are different inventories.
+    # Replacing a camera does not erase unrelated decorative/interior gestures.
+    authored=dict(motion.authored_event_counts) or dict(zoom=motion.zoom_event_count,
+        pan=motion.pan_event_count,roll=motion.roll_event_count)
+    authored['zoom']+=alignment.eligible_count-prior_alignment.eligible_count
+    authored['pan']+=alignment.pan_event_count-prior_alignment.pan_event_count
+    authored['roll']+=alignment.roll_event_count-prior_alignment.roll_event_count
+    motion=replace(motion,segments=tuple(replace(item,
+        track=result.plan.segments[index].editorial_transform,
+        reasons=(*item.reasons,'joint_common_clock_motion_camera_refinement') if index in changed else item.reasons)
+        for index,item in enumerate(motion.segments)),
+        boundary_subject_alignment_plan=alignment,
+        boundary_match_count=motion.boundary_match_count+alignment.eligible_count-prior_alignment.eligible_count,
+        zoom_event_count=len(events['zoom']),pan_event_count=len(events['pan']),roll_event_count=len(events['roll']),
+        authored_event_counts=tuple((name,authored[name]) for name in ('zoom','pan','roll')))
+    # A composed receipt can cover the whole shared segment. Every old paired
+    # neighbor must still meet its own endpoint state in the final curves.
+    old_bound=_bound_local_alignment_tracks(bundle.editorial_motion_plan.to_dict(),
+        json.loads(json.dumps(bundle.render_plan.to_json())))
+    new_bound=_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(result.plan.to_json())))
+    transformed_changed={index for index in changed
+        if result.plan.segments[index].editorial_transform is not None}
+    if (not old_bound[0].issubset(new_bound[0]) or not old_bound[1].issubset(new_bound[1])
+            or not transformed_changed.issubset(new_bound[0])):
+        raise ValueError('motion/camera proposal lost a prior or composed dense camera binding')
+    face_match=bundle.face_match_plan
+    if face_match is not None:
+        face_match=replace(face_match,segments=tuple(replace(item,
+            pan_crop=result.plan.segments[index].pan_crop,
+            alignment_purpose='retimed_existing_absolute_output_pan_curve') if index in changed else item
+            for index,item in enumerate(face_match.segments)))
+    review=review_timeline(result.timeline,available_source_count=len(eligible_indices))
+    updated=replace(bundle,render_plan=result.plan,visual_timeline=result.timeline,
+        timeline_review=review,pre_render_score=float(review.weighted_score),face_match_plan=face_match,
+        editorial_motion_plan=motion,boundary_repairs=None,boundary_affine_plan=None,
+        stage_edit_exact_shot_clock=_deterministic_exact_shot_clock_from_timeline(result.timeline,
+            section_plan=bundle.section_plan,phrase_times=phrase_times),
+        candidate_lineage=(*bundle.candidate_lineage,{'stage':'bounded_joint_motion_camera_refinement',
+            'supersedes_legacy_repair_endpoint_metadata':True,**result.to_dict()}))
+    _validate_review_first_group_bundle(updated,eligible_indices=eligible_indices,offsets=offsets,
+        timewarps=timewarps,common_start=bundle.render_plan.master_audio_start)
+    return updated
+
+
 def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):
     """Preserve the complete incumbent and add only decoded-admitted look ramps."""
     from .review_first_boundary_look import refine_review_first_boundary_look
@@ -35172,6 +35264,17 @@ def analyze(
                     proposal = group_first.run_optional("final_geometry_plan", complete_group_bundle)
                     if proposal is not None:
                         group_first.promote(proposal, plan=proposal.render_plan, authority=proposal.cadence_profile)
+                camera_bundle = group_first.run_optional(
+                    "joint_motion_camera_refinement",
+                    lambda: _review_first_group_motion_camera_bundle(group_first.incumbent,
+                        request=request,eligible_indices=eligible_indices,offsets=offsets,
+                        timewarps=eligible_timewarps,scene_cut_times=scene_cut_times,phrase_times=phrase_times),
+                    validate=lambda value: _validate_review_first_group_bundle(value,
+                        eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
+                        common_start=common_start) if value is not None else None)
+                if camera_bundle is not None:
+                    group_first.promote(camera_bundle,plan=camera_bundle.render_plan,
+                        authority=camera_bundle.cadence_profile)
                 # Look matching used to exist only in the legacy multi-candidate
                 # path. Apply it once to the actual retained final geometry;
                 # failure/cutoff must not discard that incumbent or rerun cuts.

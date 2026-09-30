@@ -68,7 +68,38 @@ class GroupCutCameraProposalTests(unittest.TestCase):
     def alignment(self,**kwargs):
         self.boundary=kwargs['boundary_indices']
         self.aligned_timeline=kwargs['visual_timeline']
+        self.window_frames=kwargs['config'].window_frames
         return SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=True),track_for=lambda _:None)
+
+    def test_shortened_ramp_reserves_complete_opposite_fourteen_frame_window(self):
+        args=self.fixture()
+        times=(0.,2.,2.+32/30.,4.+32/30.,6.+32/30.)
+        choices=tuple(_choice(i,i,start=times[i],end=times[i+1]) for i in range(4))
+        plan=replace(args['plan'],segments=tuple(RenderSegment(i,times[i],
+            times[i+1]-times[i],times[i]) for i in range(4)))
+        def candidate(shift):
+            left,right=plan.segments[1:3]
+            return dict(args,plan=plan,timeline=VisualTimelinePlan(choices,1.),
+                shifted_segments=(replace(left,duration=left.duration-shift),
+                    replace(right,master_start=right.master_start-shift,
+                        source_start=right.source_start-shift,duration=right.duration+shift)))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
+            result=build_group_cut_camera_proposal(**candidate(6/30.))
+            self.assertEqual(self.window_frames,13)
+            self.assertEqual(result.preserved_neighbor_boundaries,(0,2))
+        # A 21-frame segment cannot become 13 frames and retain two windows.
+        short=replace(plan,segments=(plan.segments[0],replace(plan.segments[1],duration=21/30.),
+            replace(plan.segments[2],source_start=2.+21/30.,master_start=2.+21/30.,
+                duration=2.+11/30.),plan.segments[3]))
+        changed_choices=list(choices)
+        changed_choices[1]=replace(choices[1],source_local_end=2.+21/30.,canonical_master_end=2.+21/30.)
+        changed_choices[2]=replace(choices[2],source_local_start=2.+21/30.,canonical_master_start=2.+21/30.)
+        args.update(plan=short,timeline=VisualTimelinePlan(tuple(changed_choices),1.),
+            shifted_segments=(replace(short.segments[1],duration=15/30.),
+                replace(short.segments[2],master_start=2.+15/30.,source_start=2.+15/30.,
+                    duration=short.segments[2].duration+6/30.)))
+        with self.assertRaisesRegex(ValueError,'disjoint'):
+            build_group_cut_camera_proposal(**args)
 
     def test_complete_proposal_preserves_both_neighbors_but_does_not_claim_fresh_descriptors(self):
         args=self.fixture()

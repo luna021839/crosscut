@@ -28,6 +28,8 @@ from crosscut.render import (
     NormalizedCrop,
     PanCropKeyframe,
     PanCropTrack,
+    EditorialTransformTrack,
+    EditorialTransformKeyframe,
     RenderTransition,
     TransitionKind,
 )
@@ -103,6 +105,35 @@ def _observations(
 
 
 class BoundarySubjectAlignmentTests(unittest.TestCase):
+    def test_preserved_camera_is_composed_before_complete_dense_validation(self):
+        timeline=VisualTimelinePlan((_choice(0,0,start=0.,end=2.),_choice(1,1,start=2.,end=4.)),1.)
+        tail=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),
+            EditorialTransformKeyframe(1.5,1.),EditorialTransformKeyframe(59/30.,1.1)))
+        observed=_observations(source0_box=(.38,.27,.24,.36),source1_box=(.42,.33,.16,.24))
+        common=dict(visual_timeline=timeline,sources=(Path('a.mp4'),Path('b.mp4')),
+            transitions=(RenderTransition(tier='C'),),fps=30.,
+            frame_provider=lambda index,seconds:_frame(index),
+            observation_provider=observed,source_resolutions=((3840,2160),)*2,
+            boundary_indices=(0,),preserved_editorial_tracks=(None,tail),preserved_track_time_shifts=(0.,0.))
+        plan=build_boundary_subject_alignment_plan(**common)
+        self.assertTrue(plan.decisions[0].eligible)
+        track=plan.track_for(1)
+        active=sum(abs(track.evaluate(frame/30.).zoom-1.)>1e-8 for frame in range(60))
+        self.assertGreater(active,13)
+        self.assertEqual(plan.decisions[0].validated_output_frame_count,active)
+        for frame in range(46,60):
+            self.assertAlmostEqual(track.evaluate(frame/30.).zoom,tail.evaluate(frame/30.).zoom)
+        def clipped(frame):
+            value=observed(frame)
+            if float(frame.mean())>105:
+                return replace(value,face_box_xywh=(.42,.001,.16,.24))
+            return value
+        broken=build_boundary_subject_alignment_plan(**{**common,
+            'frame_provider':lambda index,seconds:_frame(index,marker=110 if index==1 and seconds>=3.7 else None),
+            'observation_provider':clipped})
+        self.assertFalse(broken.decisions[0].eligible,
+            'the old distant ramp must not escape the newly claimed dense receipt')
+
     def test_requested_boundaries_keep_full_timeline_clock_without_decoding_others(self):
         timeline = VisualTimelinePlan(tuple(_choice(i, i, start=float(i), end=float(i+1))
             for i in range(4)), 1.)
@@ -1025,7 +1056,7 @@ class BoundarySubjectAlignmentTests(unittest.TestCase):
 
     def test_native_headroom_subtracts_existing_base_crop(self):
         from crosscut.boundary_subject_alignment import _headroom
-        for crop, expected in ((1.,2.), (.9,1.8), (.65,1.3), (.55,1.18), (.4,1.06)):
+        for crop, expected in ((1.,2.), (.9,1.8), (.85,1.7), (.65,1.3), (.55,1.1), (.4,1.06)):
             with self.subTest(crop=crop):
                 proof = _headroom(0, (3840,2160), output_width=1920,
                     output_height=1080, base_crop_scale=crop,
