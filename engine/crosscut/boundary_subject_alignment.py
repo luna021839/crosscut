@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 from .face_match import FaceMatchPlan, FaceMatchSegment
+from .body_pose_2d import BodyPose2DAnalyzer, BodyPose2DEvidence
 from .group_focal_attention import (
     CENTRAL_FOCAL_BASIS, GLOBAL_FOCAL_BASIS, GroupFocalSubject,
     focal_landmarks_track, resolve_group_focal_subject,
@@ -58,6 +59,7 @@ ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v5"
 # like a face. This opt-in remains a measured experiment until independently
 # validated and connected to all production consumers.
 FOCAL_EXPERIMENT_BASIS = "exact_cut_frame_local_focal_alignment_experiment_v1"
+ACTION_EXPERIMENT_BASIS = "exact_cut_frame_head_arms_framing_experiment_v1"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -80,6 +82,8 @@ class BoundarySubjectObservation:
     # are also present. Count alone must not discard that existing evidence.
     face_is_unambiguous_dominant: bool = False
     selected_focal_subject: GroupFocalSubject | None = None
+    # Transient measured pose, never a serialized identity or crop certificate.
+    action_pose: BodyPose2DEvidence | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.face_is_unambiguous_dominant, bool):
@@ -183,6 +187,10 @@ class BoundarySubjectObservation:
                     or focal.bbox_xywh[3] < .0924
                     or not .30 <= focal.bbox_xywh[0]+focal.bbox_xywh[2]/2 <= .70):
                 raise ValueError('central focal evidence cannot forge global dominance or missing geometry')
+        if self.action_pose is not None and (
+                focal is None or not isinstance(self.action_pose, BodyPose2DEvidence)
+                or self.action_pose.bbox_xywh != focal.person.bbox_xywh):
+            raise ValueError('action pose must belong to this exact face-owned body')
 
 
 ObservationProvider = Callable[[np.ndarray], BoundarySubjectObservation]
@@ -633,7 +641,16 @@ class BoundarySubjectAlignmentPlan:
                 "production_binding_supported": False,
                 "cross_camera_identity_proven": False,
                 "quality_approved": False,
-            }} if self.analysis_basis == FOCAL_EXPERIMENT_BASIS else {}),
+            }} if self.analysis_basis in {FOCAL_EXPERIMENT_BASIS, ACTION_EXPERIMENT_BASIS} else {}),
+            **({"action_framing_experiment": {
+                "intent": "match_close_face_with_measured_head_shoulders_elbows_wrists_not_full_body",
+                "minimum_joint_confidence": .30,
+                "required_observed_arm_joint_count": 6,
+                "hand_margin_face_heights": .40,
+                "missing_joint_policy": "pixel_linked_head_body_roi_reinference_or_all_six_joint_tracks_within_two_frames",
+                "production_binding_supported": False,
+                "quality_approved": False,
+            }} if self.analysis_basis == ACTION_EXPERIMENT_BASIS else {}),
             "sample_clock_basis": self.sample_clock_basis,
             "policy": {
                 "scope": "cross_source_hard_cut_last_and_first_local_windows_only",
@@ -838,6 +855,15 @@ def _local_focal_observation_provider(frame: np.ndarray) -> BoundarySubjectObser
         face_head_roll_radians=focal.roll_radians, face_eye_scale=focal.eye_scale,
         face_is_unambiguous_dominant=focal.basis == GLOBAL_FOCAL_BASIS,
         selected_focal_subject=focal)
+
+
+def _action_observation_provider(frame, analyzer):
+    observed = _local_focal_observation_provider(frame)
+    focal = observed.selected_focal_subject
+    if focal is None:
+        return observed
+    return replace(observed, action_pose=analyzer.describe(frame,
+        bbox_xywh=focal.person.bbox_xywh, face_bbox_xywh=focal.bbox_xywh))
 
 
 def _frame_counts(
@@ -1124,6 +1150,64 @@ def _close_face_head_envelope(
     return (left, top, right - left, bottom - top)
 
 
+def _measured_action_points(observation):
+    return _observed_pose_action_points(observation.action_pose)
+
+
+def _observed_pose_action_points(pose):
+    if (pose is None or pose.reason != 'observed'
+            or pose.face_anchor_consistent is not True
+            or len(pose.upper_body_xyc) != 8):
+        return None
+    points = np.asarray(pose.upper_body_xyc[:6], dtype=float)
+    if (points.shape != (6,3) or not np.isfinite(points).all()
+            or (points[:,2] < .30).any() or (points[:,2] > 1.).any()
+            or (points[:,:2] < 0.).any() or (points[:,:2] >= 1.).any()):
+        return None
+    return tuple(tuple(float(v) for v in point) for point in points[:,:2])
+
+
+def _action_envelope(face, points):
+    # A wrist is not a fingertip. Preserve a hand-sized margin, in isotropic
+    # screen pixels, as well as the measured head. This is explicit upper-body
+    # framing intent, not a claim that the complete original person fits.
+    head = _close_face_head_envelope(face)
+    margin_y = .40 * face[3]
+    margin_x = margin_y / (16./9.)
+    left = max(0., min(head[0], min(p[0] for p in points)-margin_x))
+    top = max(0., min(head[1], min(p[1] for p in points)-margin_y))
+    right = min(1., max(head[0]+head[2], max(p[0] for p in points)+margin_x))
+    bottom = min(1., max(head[1]+head[3], max(p[1] for p in points)+margin_y))
+    return (left,top,right-left,bottom-top)
+
+
+def _track_action_points(reference, target, points):
+    """Track all six joints independently, not a rigid torso-box transform."""
+    if reference.shape != target.shape or len(points) != 6:
+        return None
+    size = np.asarray((reference.shape[1],reference.shape[0]),dtype=np.float32)
+    initial = np.asarray(points,dtype=np.float32)
+    if initial.shape != (6,2) or not np.isfinite(initial).all():
+        return None
+    a,b = (cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY) for frame in (reference,target))
+    initial = (initial*size).reshape(-1,1,2)
+    options = dict(winSize=(21,21),maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,.01))
+    forward,good,_ = cv2.calcOpticalFlowPyrLK(a,b,initial,None,**options)
+    if forward is None or good is None or not good.all():
+        return None
+    backward,returned,_ = cv2.calcOpticalFlowPyrLK(b,a,forward,None,**options)
+    if backward is None or returned is None or not returned.all():
+        return None
+    normalized = forward.reshape(-1,2)/size
+    if (not np.isfinite(normalized).all() or not np.isfinite(backward).all()
+            or (np.linalg.norm(backward.reshape(-1,2)-initial.reshape(-1,2),axis=1)>1.25).any()
+            or (np.linalg.norm(normalized-initial.reshape(-1,2)/size,axis=1)>.12).any()
+            or (normalized<0.).any() or (normalized>=1.).any()):
+        return None
+    return tuple(tuple(float(v) for v in point) for point in normalized)
+
+
 def _shot_policy(observation: BoundarySubjectObservation) -> str:
     boxes = observation.formation_boxes_xywh
     observed_people = max(observation.detected_person_count, len(boxes))
@@ -1192,6 +1276,13 @@ def _paired_framing_policies(outgoing, incoming):
     if all(policy in {'close_face', 'medium_focus'} for policy in policies) and all(
             tight(observation) for observation in (outgoing, incoming)):
         return tuple('tight_medium_face' if policy == 'medium_focus' else policy for policy in policies)
+    # Deliberate close/medium reconstruction needs actual arms, not inferred
+    # hips/feet or a universally relaxed medium-shot containment rule.
+    if 'close_face' in policies and all(p in {'close_face','medium_focus'} for p in policies):
+        return tuple('action_medium_face' if policy == 'medium_focus'
+            and observation.face_box_xywh is not None and observation.face_box_xywh[3] >= .0924
+            and _measured_action_points(observation) is not None else policy
+            for policy,observation in zip(policies,(outgoing,incoming)))
     return policies
 
 
@@ -1211,6 +1302,15 @@ def _subject(
         performer = (observation.selected_focal_subject.person.bbox_xywh
             if observation.selected_focal_subject is not None
             else _associated_person_box(face_box, boxes))
+        if framing_policy == 'action_medium_face':
+            points = _measured_action_points(observation)
+            if points is None:
+                return None
+            # Layout compares like-for-like heads; containment independently
+            # protects every measured arm joint plus its hand margin.
+            return _SubjectGeometry('face',face_box,
+                observation.face_eye_scale or face_box[3],observation.face_head_roll_radians,
+                (_action_envelope(face_box,points),),(_close_face_head_envelope(face_box),))
         containment = (
             (_close_face_head_envelope(face_box),)
             if (framing_policy or _shot_policy(observation)) in {"close_face", "tight_medium_face"}
@@ -1768,6 +1868,7 @@ def build_boundary_subject_alignment_plan(
     preserved_editorial_tracks: Sequence[EditorialTransformTrack | None] | None = None,
     preserved_track_time_shifts: Sequence[float] | None = None,
     local_focal_attention: bool = False,
+    action_framing_model_path: Path | None = None,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
     """Build exact-cut local tracks and validate every transformed frame.
@@ -1778,6 +1879,8 @@ def build_boundary_subject_alignment_plan(
 
     if type(local_focal_attention) is not bool:
         raise ValueError('local focal attention must be explicitly boolean')
+    if action_framing_model_path is not None and not local_focal_attention:
+        raise ValueError('action framing requires the separate local-focal experiment')
     settings = config or BoundarySubjectAlignmentConfig()
     choices = visual_timeline.choices
     if not choices:
@@ -1842,8 +1945,11 @@ def build_boundary_subject_alignment_plan(
         frames = capture.frame_at
     else:
         frames = frame_provider
-    observations = observation_provider or (_local_focal_observation_provider
-        if local_focal_attention else _default_observation_provider)
+    action_analyzer = (BodyPose2DAnalyzer(action_framing_model_path)
+        if action_framing_model_path is not None and observation_provider is None else None)
+    observations = observation_provider or (
+        (lambda frame: _action_observation_provider(frame,action_analyzer)) if action_analyzer is not None
+        else _local_focal_observation_provider if local_focal_attention else _default_observation_provider)
     if source_resolutions is None:
         resolutions = tuple(
             capture.resolution(index) if capture is not None else None
@@ -1957,6 +2063,8 @@ def build_boundary_subject_alignment_plan(
             result = observations(canonical)
             if result is not None and result.selected_focal_subject is not None and not local_focal_attention:
                 raise ValueError('local focal evidence requires the separate experimental contract')
+            if result is not None and result.action_pose is not None and action_framing_model_path is None:
+                raise ValueError('action pose cannot bypass its explicit experimental opt-in')
         except (TypeError, ValueError, cv2.error):
             result = None
         observation_cache[key] = result
@@ -2011,6 +2119,23 @@ def build_boundary_subject_alignment_plan(
             for reference_index in (frame_index - distance, frame_index + distance):
                 if not 0 <= reference_index < counts[choice_index]:
                     continue
+                if framing_policy == 'action_medium_face':
+                    choice = choices[choice_index]
+                    if renderer_bound:
+                        ticks = (native_sample_at(choice_index,reference_index),
+                            native_sample_at(choice_index,frame_index))
+                        if any(tick is None for tick in ticks):
+                            continue
+                        low,high = sorted(tick.native_frame_index for tick in ticks)
+                        native_fps = float(native_clocks[choice.source_index].frame_rate)
+                        if any(low < int((choice.source_local_start
+                                +(cut-choice.canonical_master_start)*choice.source_playback_rate)*native_fps+.5) <= high
+                                for cut in choice.internal_scene_cut_master_seconds):
+                            continue
+                    elif any(choice.canonical_master_start+min(reference_index,frame_index)/fps < cut
+                            <= choice.canonical_master_start+max(reference_index,frame_index)/fps
+                            for cut in choice.internal_scene_cut_master_seconds):
+                        continue
                 reference_observation = observation_at(
                     choice_index,
                     reference_index,
@@ -2033,6 +2158,43 @@ def build_boundary_subject_alignment_plan(
                     target,
                     reference_subject.alignment_box,
                 )
+                if framing_policy == 'action_medium_face':
+                    # An articulated arm cannot borrow a rigid torso flow.
+                    # Track each measured joint, and independently link the
+                    # head to the target observation when one exists.
+                    current = observation_at(choice_index,frame_index)
+                    if current is not None and current.face_box_xywh is not None:
+                        if not _has_unambiguous_face(current) or not focal_landmarks_track(
+                                reference,target,reference_observation.face_landmarks_xy,current.face_landmarks_xy):
+                            continue
+                        tracked_box = current.face_box_xywh
+                    if tracked_box is None:
+                        continue
+                    tracked_points = None
+                    focal = reference_observation.selected_focal_subject
+                    if action_analyzer is not None and focal is not None:
+                        # A person-box detector dropout need not discard a
+                        # pixel-tracked head. Re-infer on its moved ROI; old
+                        # arm coordinates never count as a new observation.
+                        old_face = reference_subject.alignment_box
+                        scale = math.sqrt(tracked_box[2]*tracked_box[3]/(old_face[2]*old_face[3]))
+                        if .85 <= scale <= 1.18:
+                            bx,by,bw,bh = focal.person.bbox_xywh
+                            old_cx,old_cy = _center(old_face)
+                            cx,cy = _center(tracked_box)
+                            x0,y0 = max(0.,cx+(bx-old_cx)*scale),max(0.,cy+(by-old_cy)*scale)
+                            x1,y1 = min(1.,cx+(bx+bw-old_cx)*scale),min(1.,cy+(by+bh-old_cy)*scale)
+                            if x1>x0 and y1>y0:
+                                fresh = action_analyzer.describe(target,bbox_xywh=(x0,y0,x1-x0,y1-y0),
+                                    face_bbox_xywh=tracked_box)
+                                tracked_points = _observed_pose_action_points(fresh)
+                    if tracked_points is None:
+                        points = _measured_action_points(reference_observation)
+                        tracked_points = _track_action_points(reference,target,points) if points is not None else None
+                    if tracked_points is None:
+                        continue
+                    return _SubjectGeometry('face',tracked_box,tracked_box[3],None,
+                        (_action_envelope(tracked_box,tracked_points),),(_close_face_head_envelope(tracked_box),))
                 if tracked_box is None:
                     continue
                 # Preserve every envelope proved on the reference frame.  A
@@ -2101,6 +2263,8 @@ def build_boundary_subject_alignment_plan(
             )
             if tracked is not None:
                 return tracked, True
+            if framing_policy == 'action_medium_face':
+                return None, False  # A coarse silhouette cannot replace unknown hands.
             # A verified whole-performer envelope can guard containment on a
             # transient face miss. It is not treated as a newly identified face.
             subject = _subject(observation, preferred_kind="silhouette", settings=settings)
@@ -2864,7 +3028,8 @@ def build_boundary_subject_alignment_plan(
             final_segments,
             tuple(headroom_items),
             settings.window_frames,
-            analysis_basis=FOCAL_EXPERIMENT_BASIS if local_focal_attention else ANALYSIS_BASIS,
+            analysis_basis=(ACTION_EXPERIMENT_BASIS if action_framing_model_path is not None
+                else FOCAL_EXPERIMENT_BASIS if local_focal_attention else ANALYSIS_BASIS),
             sample_clock_basis=clock_basis,
             dense_track_candidate_attempt_count=dense_attempts,
         )
@@ -2876,6 +3041,7 @@ def build_boundary_subject_alignment_plan(
 __all__ = [
     "ANALYSIS_BASIS",
     "FOCAL_EXPERIMENT_BASIS",
+    "ACTION_EXPERIMENT_BASIS",
     "BoundarySubjectAlignmentConfig",
     "BoundarySubjectAlignmentDecision",
     "BoundarySubjectAlignmentPlan",

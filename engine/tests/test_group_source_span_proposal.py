@@ -57,6 +57,28 @@ class SourceSpanProposalTests(unittest.TestCase):
         self.assertFalse(result.clock_timeline.choices[2].exit_scene_cut_near,
             'the excluded future broadcaster cut is not a visible outgoing jump')
 
+    def test_larger_editorial_timing_window_is_explicit_and_keeps_outer_proof(self):
+        args=self.fixture()
+        with self.assertRaises(ValueError):
+            build_group_source_span_proposal(**dict(args,entry_offset_frames=12))
+        result=build_group_source_span_proposal(**dict(args,entry_offset_frames=12,
+            exit_offset_frames=-12,maximum_shift_frames=18))
+        self.assertEqual(result.plan.output_frame_count,args['plan'].output_frame_count)
+        self.assertEqual(result.preserved_neighbor_boundaries,(0,3))
+        self.assertEqual(result.to_dict()['maximum_shift_frames'],18)
+        self.assertFalse(result.to_dict()['production_selected'])
+        # Neither a larger search window nor a one-second cap overrides the
+        # visible shot floor or the complete neighboring fourteen-frame proof.
+        with self.assertRaises(ValueError):
+            build_group_source_span_proposal(**dict(args,entry_offset_frames=26,
+                exit_offset_frames=-26,maximum_shift_frames=30))
+        for radius in (True,0,31,18.0):
+            with self.assertRaises(ValueError):
+                build_group_source_span_proposal(**dict(args,maximum_shift_frames=radius))
+        with self.assertRaisesRegex(ValueError,'at most one second'):
+            build_group_source_span_proposal(**dict(args,plan=replace(args['plan'],fps=29.97),
+                maximum_shift_frames=30))
+
     def test_invalid_domains_stale_clocks_and_unbounded_offsets_rejected(self):
         args=self.fixture()
         for change in (dict(source_index=2),dict(source_index=1),dict(source_index=True),

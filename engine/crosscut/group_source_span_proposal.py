@@ -26,11 +26,13 @@ class GroupSourceSpanProposal:
     entry_offset_frames: int
     exit_offset_frames: int
     preserved_neighbor_boundaries: tuple[int, ...]
+    maximum_shift_frames: int = 8
 
     def to_dict(self):
         return dict(contract='coupled_group_source_span_clock_proposal_v1',
             segment_index=self.segment_index,source_index=self.source_index,
             entry_offset_frames=self.entry_offset_frames,exit_offset_frames=self.exit_offset_frames,
+            maximum_shift_frames=self.maximum_shift_frames,
             preserved_neighbor_boundaries=list(self.preserved_neighbor_boundaries),
             preserved_output_frames_per_neighbor_side=14,
             timeline_descriptors_refreshed=False,camera_geometry_validated=False,
@@ -40,7 +42,7 @@ class GroupSourceSpanProposal:
 
 def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
         entry_offset_frames,exit_offset_frames,audio_offsets,source_timewarps,
-        scene_cut_times,source_clocks):
+        scene_cut_times,source_clocks,maximum_shift_frames=8):
     """Identity source domain; conserve outer clocks and every untouched pixel input.
 
     Do not copy the previous source's crop, zoom, grade or face observations as
@@ -49,9 +51,11 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
     """
     if not isinstance(plan,RenderPlan) or not isinstance(timeline,VisualTimelinePlan):
         raise TypeError('source span proposal needs a complete plan and timeline')
+    if (type(maximum_shift_frames) is not int or not 1 <= maximum_shift_frames <= math.floor(plan.fps)):
+        raise ValueError('source span search radius must be an explicit positive budget of at most one second')
     if (type(segment_index) is not int or not 1 <= segment_index < len(plan.segments)-1
             or type(source_index) is not int or not 0 <= source_index < len(plan.sources)
-            or any(type(value) is not int or abs(value)>8
+            or any(type(value) is not int or abs(value)>maximum_shift_frames
                    for value in (entry_offset_frames,exit_offset_frames))):
         raise ValueError('source span proposal needs one interior shot and bounded whole-frame shifts')
     if (not len(audio_offsets)==len(source_timewarps)==len(scene_cut_times)==len(plan.sources)
@@ -125,4 +129,4 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
     preserved=assert_preserved_output_boundaries(plan,proposed,source_clocks,(i-2,i+1))
     return GroupSourceSpanProposal(proposed,replace(timeline,choices=tuple(choices),
         analysis_basis='UNREFRESHED_source_span_clock_proposal_not_a_selected_timeline'),i,source_index,
-        entry_offset_frames,exit_offset_frames,preserved)
+        entry_offset_frames,exit_offset_frames,preserved,maximum_shift_frames)
