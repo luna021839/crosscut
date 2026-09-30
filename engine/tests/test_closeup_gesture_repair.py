@@ -103,3 +103,28 @@ class CloseupGestureRepairTests(unittest.TestCase):
              patch('crosscut.source_first_model_assets.ensure_source_first_model_assets') as assets:
             self.assertIsNone(_review_first_closeup_gesture_repair(earlier,sources=(Path('a'),Path('b'))))
         repair.assert_not_called(); assets.assert_not_called()
+
+    def test_medium_foreground_pairs_receive_same_bounded_exact_audition(self):
+        timeline=replace(self.timeline, choices=tuple(replace(c,shot_type=ShotType.MEDIUM)
+                                                     for c in self.timeline.choices))
+        earlier=VisualBoundaryRepairPlan(timeline,(timeline,),(),0,())
+        kwargs={k:v for k,v in self.arguments.items() if k not in ('visual_timeline','boundary_indices')}
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=self.compare
+            result=_review_first_closeup_gesture_repair(earlier,**kwargs)
+        self.assertIsNotNone(result)
+        self.assertEqual(tuple(c.source_index for c in timeline.choices),
+                         tuple(c.source_index for c in result.timeline.choices))
+
+    def test_more_medium_pairs_do_not_increase_twelve_boundary_work_limit(self):
+        choices=tuple(replace(_choice(i,i%2),shot_type=ShotType.MEDIUM) for i in range(30))
+        choices=choices[:7]+tuple(replace(c,shot_type=ShotType.CLOSE_UP) for c in choices[7:9])+choices[9:]
+        timeline=VisualTimelinePlan(choices,1.)
+        earlier=VisualBoundaryRepairPlan(timeline,(timeline,),(),0,())
+        with patch('crosscut.pipeline.repair_visual_timeline_boundaries',return_value=earlier) as repair:
+            result=_review_first_closeup_gesture_repair(earlier,sources=(Path('a'),Path('b')),
+                                                      closeup_gesture_model_path=Path('pose.onnx'))
+        self.assertIsNone(result)
+        targets=repair.call_args.kwargs['boundary_indices']
+        self.assertEqual(12,len(targets))
+        self.assertIn(7,targets)

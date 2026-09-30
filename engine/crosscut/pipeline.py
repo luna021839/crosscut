@@ -20965,20 +20965,29 @@ def _review_first_closeup_gesture_repair(
     """One exact-arm audition, preserving sources/cuts and music/source clocks.
 
     This is not a render retry or a missing-pose veto on source availability.
-    At most twelve existing tight-shot boundaries are sampled once; all other
+    At most twelve existing tight/medium boundaries are sampled once; all other
     boundaries stay fixed. Complete exact arms rank only candidates admitted
     by the unchanged production gates. No reanalysis of the whole sources.
     """
     from .timeline import ShotType
     choices = earlier.timeline.choices
+    focal_types = {ShotType.CLOSE_UP, ShotType.MEDIUM}
     targets = tuple(i for i,(left,right) in enumerate(zip(choices, choices[1:]))
         if left.source_index != right.source_index
-        and (left.exit_shot_type or left.shot_type) is ShotType.CLOSE_UP
-        and (right.entry_shot_type or right.shot_type) is ShotType.CLOSE_UP)
+        and (left.exit_shot_type or left.shot_type) in focal_types
+        and (right.entry_shot_type or right.shot_type) in focal_types)
     if not targets:
         return None
     if len(targets) > 12:
-        targets = tuple(targets[round(i*(len(targets)-1)/11)] for i in range(12))
+        # Keep the work ceiling unchanged. Prioritize actual tight pairs, then
+        # the larger minimum observed shot scale; a tiny background face cannot
+        # steal an audition from a foreground close-up.
+        def priority(index):
+            left, right = choices[index:index+2]
+            tight = ((left.exit_shot_type or left.shot_type) is ShotType.CLOSE_UP
+                     and (right.entry_shot_type or right.shot_type) is ShotType.CLOSE_UP)
+            return (-int(tight), -min(left.shot_scale, right.shot_scale), index)
+        targets = tuple(sorted(sorted(targets, key=priority)[:12]))
     if closeup_gesture_model_path is None:
         cache = repair_arguments.get('feature_cache_directory')
         if cache is None:
@@ -21007,7 +21016,7 @@ def _review_first_closeup_gesture_repair(
             or after.source_switch_count != before.source_switch_count):
         return None
     return _merge_visual_boundary_repair_plans(earlier, later,
-        analysis_suffix='single_exact_closeup_arm_articulation_refinement_v1')
+        analysis_suffix='single_exact_closeup_arm_articulation_with_central_medium_v2')
 
 
 def _output_geometry_deferred_boundary_indices(

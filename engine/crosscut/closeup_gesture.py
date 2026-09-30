@@ -16,6 +16,7 @@ import numpy as np
 
 from .body_pose_2d import BodyPose2DAnalyzer, BodyPose2DEvidence
 from .focal_pose import face_associated_person
+from .group_focal_attention import CENTRAL_FOCAL_BASIS, GLOBAL_FOCAL_BASIS
 
 
 CONTRACT = 'exact_face_owned_four_arm_bone_articulation_v1'
@@ -27,8 +28,13 @@ class CloseupGestureEvidence:
     outgoing_native_frame: int
     incoming_native_frame: int
     bone_mismatches: tuple[float, ...]
+    outgoing_focal_basis: str = GLOBAL_FOCAL_BASIS
+    incoming_focal_basis: str = GLOBAL_FOCAL_BASIS
 
     def __post_init__(self):
+        if any(basis not in (GLOBAL_FOCAL_BASIS, CENTRAL_FOCAL_BASIS)
+               for basis in (self.outgoing_focal_basis, self.incoming_focal_basis)):
+            raise ValueError('gesture focal basis must describe the measured selection')
         if (any(type(index) is not int or index < 0 for index in
                 (self.outgoing_native_frame, self.incoming_native_frame))
                 or len(self.bone_mismatches) != 4
@@ -48,6 +54,9 @@ class CloseupGestureEvidence:
             incoming_native_frame=self.incoming_native_frame,
             bone_count=4, bone_mismatches=list(self.bone_mismatches),
             mismatch=self.mismatch, aggregation='maximum_bone_angular_mismatch',
+            outgoing_focal_basis=self.outgoing_focal_basis,
+            incoming_focal_basis=self.incoming_focal_basis,
+            cross_camera_identity_proven=False,
             temporal_phase_proven=False, quality_approved=False)
 
 
@@ -79,7 +88,9 @@ def arm_articulation(observation: BodyPose2DEvidence | None):
     return tuple(result)
 
 
-def compare_arm_articulation(left, right, *, outgoing_native_frame, incoming_native_frame):
+def compare_arm_articulation(left, right, *, outgoing_native_frame, incoming_native_frame,
+                            outgoing_focal_basis=GLOBAL_FOCAL_BASIS,
+                            incoming_focal_basis=GLOBAL_FOCAL_BASIS):
     a, b = arm_articulation(left), arm_articulation(right)
     if a is None or b is None:
         return None
@@ -88,7 +99,8 @@ def compare_arm_articulation(left, right, *, outgoing_native_frame, incoming_nat
         raise ValueError('gesture comparison requires exact native frame IDs')
     values = tuple(min(1., max(0., (1.-sum(x*y for x,y in zip(v,w)))/2.))
                    for v,w in zip(a,b))
-    return CloseupGestureEvidence(outgoing_native_frame, incoming_native_frame, values)
+    return CloseupGestureEvidence(outgoing_native_frame, incoming_native_frame, values,
+                                  outgoing_focal_basis, incoming_focal_basis)
 
 
 class CloseupGestureProvider:
@@ -117,22 +129,37 @@ class CloseupGestureProvider:
             return None
         face = descriptor.primary_face_bbox
         body = face_associated_person(face, descriptor.formation_people)
-        if body is None:
+        if face is not None and body is None:
             return None
-        key = source_index, index, face, body.bbox_xywh
+        # Cache by exact input evidence, including the unknown-primary case.
+        # A central focal supplement is local to this optional arm measurement;
+        # it never re-labels a persistent descriptor or proves member identity.
+        key = source_index, index, face, tuple(descriptor.formation_people)
         if key in self.cache:
             self.cache.move_to_end(key)
-            return index, self.cache[key]
+            return self.cache[key]
         frame = self.capture.frame_at_native_index(source_index, index, clock)
         if frame is None:
             return None
         from .visual_score import _working_frame
         frame = _working_frame(frame, maximum_width=960)
+        basis = GLOBAL_FOCAL_BASIS
+        if face is None:
+            from .group_focal_attention import observe_central_focal_face
+            focal = observe_central_focal_face(frame, descriptor.formation_people)
+            if focal is not None:
+                face, body, basis = focal.bbox_xywh, focal.person, CENTRAL_FOCAL_BASIS
+        if body is None:
+            self.cache[key] = None
+            if len(self.cache) > 256:
+                self.cache.popitem(last=False)
+            return None
         measured = self.pose.describe(frame, bbox_xywh=body.bbox_xywh, face_bbox_xywh=face)
-        self.cache[key] = measured
+        result = index, measured, basis
+        self.cache[key] = result
         if len(self.cache) > 256:
             self.cache.popitem(last=False)
-        return index, measured
+        return result
 
     def compare(self, outgoing, incoming):
         # Each tuple is (source, exact request time, verified clock, descriptor).
@@ -140,7 +167,8 @@ class CloseupGestureProvider:
         if left is None or right is None:
             return None
         return compare_arm_articulation(left[1], right[1],
-            outgoing_native_frame=left[0], incoming_native_frame=right[0])
+            outgoing_native_frame=left[0], incoming_native_frame=right[0],
+            outgoing_focal_basis=left[2], incoming_focal_basis=right[2])
 
     def close(self):
         self.capture.close()
