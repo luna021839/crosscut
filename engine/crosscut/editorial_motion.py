@@ -210,6 +210,7 @@ class EditorialMotionPlan:
     # Complete-shot containment has its own clock/geometry binding. It must
     # never inherit the older boundary-local planner's analysis header.
     shot_context_cameras: tuple = ()
+    coupled_shot_cameras: tuple = ()
 
     def __post_init__(self):
         failures = tuple((index, tuple(reasons), context) for index, reasons, context in self.required_boundary_failures)
@@ -224,6 +225,10 @@ class EditorialMotionPlan:
             from .visual_boundary_repair import _freeze_audit_value
             object.__setattr__(self, 'shot_context_cameras',
                 tuple(_freeze_audit_value(row) for row in self.shot_context_cameras))
+        if self.coupled_shot_cameras:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self, 'coupled_shot_cameras',
+                tuple(_freeze_audit_value(row) for row in self.coupled_shot_cameras))
         if self.member_containment_trial_audit:
             from .visual_boundary_repair import _freeze_audit_value
             object.__setattr__(self, 'member_containment_trial_audit',
@@ -369,6 +374,8 @@ class EditorialMotionPlan:
                if self.member_containment_trial_audit else {}),
             **({'shot_context_cameras': _thaw_audit_value(self.shot_context_cameras)}
                if self.shot_context_cameras else {}),
+            **({'coupled_shot_cameras': _thaw_audit_value(self.coupled_shot_cameras)}
+               if self.coupled_shot_cameras else {}),
         }
 
 

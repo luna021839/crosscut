@@ -135,6 +135,41 @@ def attach_shot_context_proposal(plan,motion,proposal):
         authored_event_counts=tuple((key,authored[key]) for key in ('zoom','pan','roll')))
 
 
+def attach_coupled_shot_proposal(plan,motion,proposal):
+    """Replace one context receipt with an atomic pair, retaining all others."""
+    import json
+    from .post_render_qa import _bound_local_alignment_tracks,_bound_context_cameras
+    from .coupled_shot_binding import build_coupled_shot_binding
+    index=proposal.segment_index;candidate=proposal.plan;changed_indices={index,index+1}
+    singles=bound_shot_context_cameras(motion.to_dict(),plan)
+    if index not in singles or not both_boundary_framings_improve(proposal.outgoing):
+        raise ValueError('coupled camera needs an existing bound shot and improved framing')
+    if (replace(candidate,segments=plan.segments)!=plan
+            or len(candidate.segments)!=len(plan.segments)
+            or any(a!=b for i,(a,b) in enumerate(zip(plan.segments,candidate.segments)) if i not in changed_indices)
+            or any(replace(candidate.segments[i],editorial_transform=plan.segments[i].editorial_transform)!=plan.segments[i]
+                for i in changed_indices)
+            or plan.segments[index+1].editorial_transform is not None
+            or candidate.segments[index].editorial_transform.evaluate(0.)!=plan.segments[index].editorial_transform.evaluate(0.)):
+        raise ValueError('coupled camera changed source/audio timing or an unrelated camera')
+    receipt=build_coupled_shot_binding(proposal)
+    events=rendered_transform_event_records(candidate.segments,candidate.fps)
+    changed=replace(motion,segments=tuple(replace(item,track=candidate.segments[i].editorial_transform,
+        reasons=(*item.reasons,'coupled_whole_shot_and_tracked_entry_framing') if i in changed_indices else item.reasons)
+        for i,item in enumerate(motion.segments)),
+        shot_context_cameras=tuple(row for row in motion.shot_context_cameras if row['segment_index']!=index),
+        coupled_shot_cameras=(*motion.coupled_shot_cameras,receipt),
+        zoom_event_count=len(events['zoom']),pan_event_count=len(events['pan']),roll_event_count=len(events['roll']))
+    before=_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(plan.to_json())))
+    after=_bound_local_alignment_tracks(changed.to_dict(),json.loads(json.dumps(candidate.to_json())))
+    contexts=_bound_context_cameras(changed.to_dict(),json.loads(json.dumps(candidate.to_json())))
+    if (not before[0]<=after[0] or not before[1]<=after[1] or not changed_indices<=after[0]
+            or len(contexts)!=len(changed.shot_context_cameras)+2*len(changed.coupled_shot_cameras)):
+        raise ValueError('coupled camera invalidated a complete camera binding')
+    # The same two cut events are refined, not counted again as new matches.
+    return changed
+
+
 @isolated_optional()
 def refine_shot_context_cameras(*,plan,timeline,motion,scene_cut_times,
         maximum_attempts=24,maximum_runtime_seconds=120.):
@@ -144,8 +179,10 @@ def refine_shot_context_cameras(*,plan,timeline,motion,scene_cut_times,
         raise ValueError('invalid bounded shot-context refinement budget')
     if len(scene_cut_times)!=len(plan.sources):
         raise ValueError('shot-context cuts must cover the full render source domain')
-    started=monotonic();attempts=[];changed=[]
+    started=monotonic();attempts=[];changed=[];coupled_attempts=0
     existing={row['segment_index'] for row in motion.to_dict().get('shot_context_cameras',())}
+    existing.update(i for row in motion.to_dict().get('coupled_shot_cameras',())
+        for i in (row['segment_index'],row['segment_index']+1))
     for index in shot_context_shortlist(plan,timeline):
         if len(attempts)>=maximum_attempts or monotonic()-started>=maximum_runtime_seconds:
             break
@@ -161,6 +198,25 @@ def refine_shot_context_cameras(*,plan,timeline,motion,scene_cut_times,
             next_motion=attach_shot_context_proposal(plan,motion,proposal)
             plan,motion=proposal.plan,next_motion
             changed.append(index);row['status']='geometry_admitted_pending_encoded_qa'
+            # Refine a remaining visible position jump only after the whole
+            # shot succeeds. Keep already matched/liked contexts unchanged.
+            # This shares the same stage deadline; there is no retry loop.
+            residual=proposal.pixel_boundary_framing[-1]['after'][1]
+            from .boundary_subject_alignment import BoundarySubjectAlignmentConfig
+            unmatched_position=2.*BoundarySubjectAlignmentConfig().already_matched_center_distance
+            if (residual>unmatched_position and coupled_attempts<6 and index+2<len(plan.segments)
+                    and not any(abs(index+1-other)<=1 for other in (*existing,*changed) if other!=index)
+                    and maximum_runtime_seconds-(monotonic()-started)>.1):
+                from .coupled_shot_camera import propose_coupled_shot_camera
+                coupled_attempts+=1
+                try:
+                    coupled=propose_coupled_shot_camera(previous=proposal,scene_cut_times=scene_cut_times,
+                        maximum_runtime_seconds=min(20.,maximum_runtime_seconds-(monotonic()-started)))
+                    paired_motion=attach_coupled_shot_proposal(plan,motion,coupled)
+                    plan,motion=coupled.plan,paired_motion;changed.append(index+1)
+                    row['coupled_entry']=coupled.to_dict()
+                except (ValueError,OSError) as exc:
+                    row['coupled_entry']=dict(status='unavailable',reason=str(exc))
         except (ValueError,OSError) as exc:
             row.update(status='unavailable',reason=str(exc))
         attempts.append(row)

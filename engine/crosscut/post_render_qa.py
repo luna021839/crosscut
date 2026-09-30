@@ -4587,7 +4587,8 @@ def _normalized_entropy(values: Sequence[str]) -> float | None:
 def _bound_local_alignment_tracks(motion, plan):
     """Combine separate, fully bound local and whole-shot camera contracts."""
     contexts = _bound_context_cameras(motion, plan)
-    boundaries = {boundary for index in contexts for boundary in (index-1,index)}
+    from .coupled_shot_binding import context_boundary_indices
+    boundaries = context_boundary_indices(contexts)
     segments, local = _bound_boundary_local_alignment_tracks(motion, plan,
         context_boundaries=boundaries)
     return segments | set(contexts), local | boundaries
@@ -4596,8 +4597,13 @@ def _bound_local_alignment_tracks(motion, plan):
 def _bound_context_cameras(motion, plan):
     from .render_plan_serialization import render_plan_from_json
     from .shot_context_binding import bound_shot_context_cameras
+    from .coupled_shot_binding import bound_coupled_shot_cameras
     try:
-        return bound_shot_context_cameras(motion, render_plan_from_json(dict(plan)))
+        typed=render_plan_from_json(dict(plan))
+        single=bound_shot_context_cameras(motion,typed)
+        paired=bound_coupled_shot_cameras(motion,typed)
+        if set(single)&set(paired):return {}
+        return {**single,**paired}
     except (ValueError, TypeError, KeyError):
         return {}
 
@@ -4931,7 +4937,9 @@ def _transform_metrics(
     motion_contract_checks = {
         "shot_context_bindings_complete": (
             isinstance(motion.get('shot_context_cameras', []), (list, tuple))
+            and isinstance(motion.get('coupled_shot_cameras', []), (list, tuple))
             and len(context_cameras) == len(motion.get('shot_context_cameras', []))
+                +2*len(motion.get('coupled_shot_cameras', []))
         ),
         "one_motion_segment_per_plan_segment": (
             motion_indices == list(range(len(plan_segments)))
