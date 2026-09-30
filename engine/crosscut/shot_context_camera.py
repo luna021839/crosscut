@@ -34,11 +34,13 @@ class ShotContextCamera:
     minimum_head_visible_fraction: float
     frame_count: int
     face_scale_basis: str
+    endpoint_scale_policy: str = 'exact'
 
     def to_dict(self):
         return dict(analysis_basis=SHOT_CAMERA_EXPERIMENT_BASIS,
             policy='one_native_shot_against_both_fixed_composed_neighbors_v1',
-            face_scale_basis=self.face_scale_basis,entry=self.entry.to_dict(),exit=self.exit.to_dict(),
+            face_scale_basis=self.face_scale_basis,endpoint_scale_policy=self.endpoint_scale_policy,
+            entry=self.entry.to_dict(),exit=self.exit.to_dict(),
             frame_count=self.frame_count,minimum_head_visible_fraction=self.minimum_head_visible_fraction,
             head_input_provenance_validated_by_this_geometry_function=False,
             source_clock_validated_by_this_geometry_function=False,
@@ -46,7 +48,8 @@ class ShotContextCamera:
             production_binding_supported=False,quality_approved=False)
 
 
-def fixed_neighbor_face_state(source, target, *, maximum_zoom, scale_basis='face_box_height'):
+def fixed_neighbor_face_state(source, target, *, maximum_zoom, scale_basis='face_box_height',
+        endpoint_scale_policy='exact'):
     """Solve a feasible native-pixel crop, not an identity/phase assertion.
 
     Eye span changes with yaw and detector regression. It is not interchangeable
@@ -55,6 +58,8 @@ def fixed_neighbor_face_state(source, target, *, maximum_zoom, scale_basis='face
     """
     if scale_basis not in {'face_box_height', 'eye_span'}:
         raise ValueError('unknown fixed-neighbor face scale basis')
+    if endpoint_scale_policy not in {'exact','bounded_residual'}:
+        raise ValueError('unknown fixed-neighbor endpoint scale policy')
     if type(maximum_zoom) not in (float,int) or not math.isfinite(maximum_zoom) or not 1.<=maximum_zoom<=2.:
         raise ValueError('fixed-neighbor camera needs a verified native zoom budget')
     for observed in (source,target):
@@ -66,8 +71,14 @@ def fixed_neighbor_face_state(source, target, *, maximum_zoom, scale_basis='face
             raise ValueError('fixed-neighbor endpoint needs an observed unambiguous five-point face')
     zoom=(target.face_box_xywh[3]/source.face_box_xywh[3] if scale_basis=='face_box_height'
         else target.face_eye_scale/source.face_eye_scale)
-    if not 1.<=zoom<=maximum_zoom:
+    if endpoint_scale_policy=='exact' and not 1.<=zoom<=maximum_zoom:
         raise ValueError('fixed-neighbor scale would exceed native pixel budget or invent outside pixels')
+    # Exact equality is not a requirement for a useful camera: an already
+    # almost-matched endpoint may need 0.985x while the other benefits from
+    # 1.65x. Clamp only the proposal to real pixels. BOTH residuals still face
+    # analytic and independently redetected output-pixel admission afterward.
+    # This does not enlarge a native zoom budget or invent outside pixels.
+    zoom=min(maximum_zoom,max(1.,zoom))
     roll=max(-1.6,min(1.6,math.degrees(target.face_head_roll_radians-source.face_head_roll_radians)))
     state,_=_target_state(box=source.face_box_xywh,target_box=target.face_box_xywh,
         zoom=zoom,roll_degrees=roll,maximum_center_shift=.10,settings=BoundarySubjectAlignmentConfig())
@@ -77,7 +88,7 @@ def fixed_neighbor_face_state(source, target, *, maximum_zoom, scale_basis='face
 
 
 def build_shot_context_camera(*, source_endpoints, neighbor_endpoints, head_envelopes,
-        fps, maximum_zoom, scale_basis='face_box_height'):
+        fps, maximum_zoom, scale_basis='face_box_height',endpoint_scale_policy='exact'):
     """Join both cut states through the source's measured, nonlinear head path.
 
     Head-envelope input provenance is the caller's separate responsibility.
@@ -91,7 +102,8 @@ def build_shot_context_camera(*, source_endpoints, neighbor_endpoints, head_enve
     heads=tuple(head_envelopes)
     if not 2<=len(heads)<=300:
         raise ValueError('shot camera permits 2..300 provided head envelopes')
-    entry,exit_state=(fixed_neighbor_face_state(source,target,maximum_zoom=maximum_zoom,scale_basis=scale_basis)
+    entry,exit_state=(fixed_neighbor_face_state(source,target,maximum_zoom=maximum_zoom,scale_basis=scale_basis,
+        endpoint_scale_policy=endpoint_scale_policy)
         for source,target in zip(source_endpoints,neighbor_endpoints))
     straight=_track_for_segment(last_frame_time=(len(heads)-1)/fps,ramp_frames=14,fps=fps,
         entry=(0,entry),exit=(1,exit_state),settle_policy='shot_continuous')
@@ -106,7 +118,7 @@ def build_shot_context_camera(*, source_endpoints, neighbor_endpoints, head_enve
         if amount<.995:
             raise ValueError(f'fixed-neighbor camera clips provided head envelope at frame {index}')
         visible.append(amount)
-    return ShotContextCamera(track,entry,exit_state,min(visible),len(heads),scale_basis)
+    return ShotContextCamera(track,entry,exit_state,min(visible),len(heads),scale_basis,endpoint_scale_policy)
 
 
 def observe_shot_head(frame):
@@ -166,7 +178,8 @@ class ShotContextProposal:
 
 
 def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
-        experimental=False, maximum_runtime_seconds=30., scale_basis='face_box_height'):
+        experimental=False, maximum_runtime_seconds=30., scale_basis='face_box_height',
+        endpoint_scale_policy='bounded_residual'):
     """Bounded reusable native-clock proposal; does not render or auto-publish.
 
     Only one cross-source-bounded native shot is touched. Callers still need
@@ -266,7 +279,7 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
             reference_frames=[i for i,_ in support],face_landmarks_observed=False,head_envelope_xywh=heads[-1]))
     camera=build_shot_context_camera(source_endpoints=(observations[0],observations[-1]),
         neighbor_endpoints=neighbors,head_envelopes=heads,fps=plan.fps,maximum_zoom=maximum_zoom,
-        scale_basis=scale_basis)
+        scale_basis=scale_basis,endpoint_scale_policy=endpoint_scale_policy)
     from .rendered_proxy_review import _box_discontinuity
     framing=[]
     for n,source,target,state in ((0,observations[0],neighbors[0],camera.entry),

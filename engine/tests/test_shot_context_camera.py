@@ -20,6 +20,31 @@ def face(h=.2,eye=.07,x=.44,y=.3):
 
 
 class ShotContextCameraTests(unittest.TestCase):
+    def test_bounded_residual_can_keep_one_native_endpoint_while_matching_the_other(self):
+        # The desired exit scale is physically impossible but the raw exit is
+        # already close. Keep it native; do not discard the independent entry.
+        source=face();target=face(.197,.069)
+        with self.assertRaisesRegex(ValueError,'pixel budget'):
+            fixed_neighbor_face_state(source,target,maximum_zoom=2.)
+        fixed=fixed_neighbor_face_state(source,target,maximum_zoom=2.,endpoint_scale_policy='bounded_residual')
+        self.assertEqual((fixed.zoom,fixed.center_x,fixed.center_y,fixed.roll_degrees),(1.,.5,.5,0.))
+        heads=(_close_face_head_envelope(source.face_box_xywh),)*31
+        camera=build_shot_context_camera(source_endpoints=(source,source),
+            neighbor_endpoints=(face(.30,.1),target),head_envelopes=heads,fps=30.,maximum_zoom=2.,
+            endpoint_scale_policy='bounded_residual')
+        self.assertAlmostEqual(camera.entry.zoom,1.5)
+        self.assertEqual(camera.exit.zoom,1.)
+        self.assertEqual(camera.to_dict()['endpoint_scale_policy'],'bounded_residual')
+        self.assertGreaterEqual(camera.minimum_head_visible_fraction,.995)
+
+    def test_bounded_residual_does_not_increase_native_budget_or_claim_a_match(self):
+        state=fixed_neighbor_face_state(face(),face(.30,.1),maximum_zoom=1.18,
+            endpoint_scale_policy='bounded_residual')
+        self.assertEqual(state.zoom,1.18)
+        self.assertLess(state.zoom*face().face_box_xywh[3],face(.30,.1).face_box_xywh[3])
+        with self.assertRaisesRegex(ValueError,'scale policy'):
+            fixed_neighbor_face_state(face(),face(),maximum_zoom=2.,endpoint_scale_policy='always_pass')
+
     def test_face_height_and_eye_span_are_explicit_different_objectives(self):
         source,target=face(),face(.26,.077)
         head=fixed_neighbor_face_state(source,target,maximum_zoom=2.)

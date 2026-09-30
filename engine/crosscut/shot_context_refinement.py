@@ -17,7 +17,7 @@ from .shot_context_binding import build_shot_context_binding, bound_shot_context
 from .timeline import ShotType
 
 
-def _framing_rows_improve(proposal,rows,basis):
+def _framing_rows_improve(proposal,rows,basis,*,position_tolerance=1e-6):
     if len(rows)!=2 or [r.get('boundary_index') for r in rows]!=[proposal.segment_index-1,proposal.segment_index]:
         return False
     gains=[]
@@ -31,7 +31,7 @@ def _framing_rows_improve(proposal,rows,basis):
                     for v in (*before,*after))):
             return False
         # Neither cut nor scale/position can buy a regression in the other.
-        if any(a>b+1e-6 for b,a in zip(before,after)):
+        if after[0]>before[0]+1e-6 or after[1]>before[1]+position_tolerance:
             return False
         gains.append(sum(before)-sum(after))
     return sum(gains)>.01
@@ -41,7 +41,15 @@ def both_boundary_framings_improve(proposal):
     return (_framing_rows_improve(proposal,proposal.boundary_framing,
         'same_native_face_projected_through_both_camera_plans_not_encoded_qa')
         and _framing_rows_improve(proposal,proposal.pixel_boundary_framing,
-        'redetected_full_output_coordinate_pixels_not_encoded_qa'))
+        'redetected_full_output_coordinate_pixels_not_encoded_qa',
+        # The pixel path may have a different peak-zoom intermediate raster
+        # even when this endpoint is exactly neutral. Do not turn subpixel
+        # detector jitter into a regression. Analytic geometry must still be
+        # nonworse, scale stays strict, and total improvement must be > .01.
+        # _box_discontinuity normalizes center distance by half a frame.
+        # Use the longer edge so this never admits more than one output pixel
+        # on either axis, including landscape and portrait outputs.
+        position_tolerance=2./max(proposal.plan.width,proposal.plan.height)))
 
 
 def shot_context_shortlist(plan,timeline):

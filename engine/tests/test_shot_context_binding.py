@@ -91,6 +91,18 @@ class ShotContextBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'both boundary'):
             attach_shot_context_proposal(before,motion_for(before),bad)
 
+    def test_subpixel_redetection_jitter_does_not_erase_large_other_cut_improvement(self):
+        _,proposal=self.fixture()
+        rows=deepcopy(proposal.pixel_boundary_framing)
+        rows[1].update(before=[.0053275,.1572266],after=[.0047464,.1573536])
+        self.assertTrue(both_boundary_framings_improve(replace(proposal,pixel_boundary_framing=rows)))
+        rows[1]['after'][1]=rows[1]['before'][1]+2.1/proposal.plan.width
+        self.assertFalse(both_boundary_framings_improve(replace(proposal,pixel_boundary_framing=rows)))
+        rows[1]['after'][1]=rows[1]['before'][1]+2.1/proposal.plan.height
+        self.assertFalse(both_boundary_framings_improve(replace(proposal,pixel_boundary_framing=rows)))
+        rows[1]['after']=[rows[1]['before'][0]+.001,rows[1]['before'][1]]
+        self.assertFalse(both_boundary_framings_improve(replace(proposal,pixel_boundary_framing=rows)))
+
     def test_native_budget_is_still_independently_probed(self):
         before,proposal=self.fixture()
         with tempfile.TemporaryDirectory() as tmp:
