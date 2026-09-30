@@ -214,7 +214,9 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         config=BoundarySubjectAlignmentConfig(window_frames=window_frames))
     decision = alignment.decision_for(boundary_index)
     if decision is None or not decision.eligible:
-        raise ValueError('camera proposal lacks dense local subject alignment')
+        reason = ('missing_boundary_decision' if decision is None else
+            decision.rejection_reason or 'ineligible_boundary_decision')
+        raise ValueError(f'camera proposal lacks dense local subject alignment: {reason}')
     for index in (boundary_index,boundary_index+1):
         old,new = plan.segments[index],segments[index]
         track=alignment.track_for(index)

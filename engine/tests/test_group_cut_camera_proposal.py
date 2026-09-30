@@ -159,9 +159,10 @@ class GroupCutCameraProposalTests(unittest.TestCase):
 
     def test_four_tick_splice_cannot_bypass_dense_geometry_failure(self):
         args=self.fixture()
-        rejected=SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=False))
+        rejected=SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=False,
+            rejection_reason='per_frame_subject_containment_failed'))
         with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',return_value=rejected), \
-                self.assertRaisesRegex(ValueError,'dense local subject'):
+                self.assertRaisesRegex(ValueError,'dense local subject alignment: per_frame_subject_containment_failed'):
             build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
         for frames in (True,0,3,15,4.0):
             with self.subTest(frames=frames), \
@@ -169,6 +170,14 @@ class GroupCutCameraProposalTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError,'four measured'):
                 build_group_cut_camera_proposal(**args,preserved_boundary_frames=frames)
             align.assert_not_called()
+
+    def test_absent_alignment_decision_reports_unknown_without_retry_or_camera(self):
+        args=self.fixture()
+        rejected=SimpleNamespace(decision_for=lambda _:None)
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',return_value=rejected) as align, \
+                self.assertRaisesRegex(ValueError,'dense local subject alignment: missing_boundary_decision'):
+            build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
+        self.assertEqual(1,align.call_count)
 
     def test_newly_exposed_native_cut_is_refreshed_before_geometry(self):
         args=self.fixture()

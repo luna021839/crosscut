@@ -71,12 +71,31 @@ def measured_motion_improves(candidate, before):
         and candidate.ranking_cost < before.ranking_cost-1e-6)
 
 
-def focal_boundary_shortlist(timeline):
+def measured_output_face_box(frame):
+    """A bounded fresh GLOBAL face observation, never a central-person guess.
+
+    The ordinary proxy detector may miss a small/rolled visible face. Use the
+    same 854px global-dominance reacquisition as the complete-camera proposer;
+    do not relabel a local body owner or a missing face as globally dominant.
+    These pixels rank a candidate; they do not grant a dense camera binding.
+    """
+    box=_default_geometry_provider(frame).face_bbox_xywh
+    if box is not None:return box
+    import cv2
+    from .visual_score import _working_frame
+    from .shot_context_camera import observe_shot_head
+    observed=observe_shot_head(cv2.resize(_working_frame(frame,maximum_width=960),(854,480)))
+    return observed.face_box_xywh if observed.face_is_unambiguous_dominant else None
+
+
+def focal_boundary_shortlist(timeline, *, maximum_candidates=12):
     """Rank the actual cut endpoints, not the unrelated middle of each shot.
 
     A medium -> close cut can be just as face-dominant as two close-up labels.
     Discrete label priority must not exclude it before motion is measured.
     """
+    if type(maximum_candidates) is not int or not 1<=maximum_candidates<=48:
+        raise ValueError('focal shortlist permits 1..48 bounded cached candidates')
     focal={ShotType.CLOSE_UP,ShotType.MEDIUM}
     targets=[]
     for index,(left,right) in enumerate(zip(timeline.choices,timeline.choices[1:])):
@@ -90,18 +109,23 @@ def focal_boundary_shortlist(timeline):
                for value in scales):
             continue
         targets.append((-min(scales),index))
-    return tuple(index for _,index in sorted(targets)[:12])
+    return tuple(index for _,index in sorted(targets)[:maximum_candidates])
 
 
 @isolated_optional()
 def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,scene_cut_times,
         model_path,source_index_map=None,feature_cache_directory=None,
         feature_derived_cache_directory=None,require_persistent_feature_cache=False,
-        maximum_boundaries=4,maximum_camera_candidates=2,protected_segment_indices=()):
+        maximum_boundaries=4,maximum_camera_candidates=2,protected_segment_indices=(),
+        maximum_candidate_boundaries=32,maximum_measured_boundaries=12):
     if type(maximum_boundaries) is not int or not 1 <= maximum_boundaries <= 4:
         raise ValueError('motion/camera refinement permits at most four boundaries')
     if type(maximum_camera_candidates) is not int or not 1 <= maximum_camera_candidates <= 2:
         raise ValueError('motion/camera refinement permits at most two camera candidates per boundary')
+    if (type(maximum_candidate_boundaries) is not int or not 1<=maximum_candidate_boundaries<=48
+            or type(maximum_measured_boundaries) is not int
+            or not 1<=maximum_measured_boundaries<=maximum_candidate_boundaries):
+        raise ValueError('motion/camera refinement requires bounded cached and measured candidate budgets')
     protected=tuple(protected_segment_indices)
     if (len(set(protected))!=len(protected)
             or any(type(index) is not int or not 0<=index<len(plan.segments) for index in protected)):
@@ -122,7 +146,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     if plan.aspect_ratio.value != '16:9' or any(t.kind.uses_overlap for t in plan.transitions):
         raise ValueError('motion/camera refinement requires landscape hard cuts')
     started=monotonic()
-    shortlist=focal_boundary_shortlist(timeline)
+    shortlist=focal_boundary_shortlist(timeline,maximum_candidates=maximum_candidate_boundaries)
     targets=tuple(index for index in shortlist if not {index,index+1}.intersection(protected))
     attempts=[dict(stage='protected_context',boundary_index=index,admitted=False,
         reason='independently_bound_whole_shot_or_fixed_neighbor_not_a_two_cell_edit')
@@ -171,7 +195,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
             relative=(sample.output_frame_index-sum(counts[:index]))/candidate.fps
             output=_reference_view_for_span(frame,geometry.span,relative_time=relative,
                 size=(candidate.width,candidate.height))
-            boxes.append(_default_geometry_provider(output).face_bbox_xywh)
+            boxes.append(measured_output_face_box(output))
         return _box_discontinuity(*boxes) if all(box is not None for box in boxes) else None
     # These cameras belong to an independent complete context transaction.
     # Editing one of its fixed neighbors is not a proposal this stage can
@@ -180,31 +204,32 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     selected=[]
     try:
         for boundary in targets:
+            if len(triage)>=maximum_measured_boundaries:
+                break
             try:
-                gesture,_,_=measured(plan,boundary)
+                gesture,_,samples=measured(plan,boundary)
+                baseline_faces=(faces(plan,boundary,samples) if gesture is not None
+                    and gesture.motion is not None and samples is not None else None)
             except ValueError as error:
                 attempts.append(dict(stage='baseline_motion',boundary_index=boundary,
                     admitted=False,reason=str(error)))
                 continue
-            if gesture is not None and gesture.motion is not None:
-                triage.append((gesture.ranking_cost,boundary))
+            baseline_rank=camera_motion_rank(gesture,baseline_faces,enforce_face_limits=False)
+            if baseline_rank is not None:
+                # Cached face scale only orders sensing; missing four-frame
+                # motion/output faces do not consume a measured repair slot.
+                # Keep these exact measurements rather than decode them again.
+                triage.append((gesture.ranking_cost,boundary,gesture,samples,baseline_faces,baseline_rank))
             attempts.append(dict(stage='baseline_motion',boundary_index=boundary,admitted=False,
-                motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None))
-        for _,boundary in sorted(triage,reverse=True)[:maximum_boundaries]:
+                motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
+                output_face_metrics=baseline_faces,complete_measured_candidate=baseline_rank is not None))
+        attempts.append(dict(stage='bounded_measured_focal_frontier',admitted=False,
+            cached_candidate_budget=maximum_candidate_boundaries,measured_candidate_budget=maximum_measured_boundaries,
+            cached_eligible_boundaries=len(shortlist),measured_candidate_count=len(triage),
+            measured_boundary_indices=[row[1] for row in triage],
+            cached_geometry_used_only_for_sensing_order=True,quality_approved=False))
+        for _,boundary,before,samples,before_faces,before_rank in sorted(triage,key=lambda row:row[:2],reverse=True)[:maximum_boundaries]:
             if any(abs(boundary-proposal.boundary_index)<=1 for proposal in selected):
-                continue
-            before,_,samples=measured(plan,boundary)
-            if before is None or before.motion is None or samples is None:
-                continue
-            before_faces=faces(plan,boundary,samples)
-            # A known bad incumbent is precisely what refinement can repair.
-            # Only candidates owe the old output-face limits; missing baseline
-            # evidence is still unknown and cannot become a numeric advantage.
-            before_rank=camera_motion_rank(before,before_faces,enforce_face_limits=False)
-            if before_rank is None:
-                attempts.append(dict(stage='baseline_output_face',boundary_index=boundary,
-                    admitted=False,reason='missing_or_out_of_bounds_baseline_output_face',
-                    before_output_face_metrics=before_faces))
                 continue
             offsets=[]
             for offset in (-6,-4,-2,2,4,6):

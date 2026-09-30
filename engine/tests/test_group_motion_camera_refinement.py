@@ -4,14 +4,16 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import numpy as np
 
-from crosscut.boundary_subject_alignment import build_boundary_subject_alignment_plan
+from crosscut.boundary_subject_alignment import BoundarySubjectObservation,build_boundary_subject_alignment_plan
 from crosscut.closeup_gesture import CloseupGestureEvidence, ObservedArmMotion
 from crosscut.group_cut_camera_proposal import build_group_cut_camera_proposal
 from crosscut.group_motion_camera_refinement import (
     GroupMotionCameraRefinement, camera_motion_rank, refine_group_motion_camera,
     focal_boundary_shortlist,
     measured_motion_improves,
+    measured_output_face_box,
 )
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (
@@ -19,7 +21,7 @@ from crosscut.pipeline import (
     _validate_review_first_group_bundle,
 )
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
-from crosscut.render import RenderSegment
+from crosscut.render import RenderPlan,RenderSegment,RenderTransition
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.visual_score import VisualTimelinePlan
 from crosscut.timeline import ShotType
@@ -39,6 +41,21 @@ class MotionCameraRankTests(unittest.TestCase):
                              (gesture, None), (gesture, (float('nan'), .1)),
                              (gesture, (.1, True)), (gesture, (-.1, .1))):
             self.assertIsNone(camera_motion_rank(value, faces))
+
+    def test_output_face_reacquisition_does_not_invent_dominance_or_replace_known_geometry(self):
+        frame=np.zeros((1080,1920,3),np.uint8);box=(.4,.2,.1,.15)
+        with patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
+                    SimpleNamespace(face_bbox_xywh=box)), \
+                patch('crosscut.shot_context_camera.observe_shot_head') as observe:
+            self.assertEqual(measured_output_face_box(frame),box);observe.assert_not_called()
+        for dominant in (False,True):
+            observation=BoundarySubjectObservation(face_count=2,face_box_xywh=box,
+                face_is_unambiguous_dominant=dominant)
+            with patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
+                        SimpleNamespace(face_bbox_xywh=None)), \
+                    patch('crosscut.shot_context_camera.observe_shot_head',return_value=observation) as observe:
+                self.assertEqual(measured_output_face_box(frame),box if dominant else None)
+                self.assertEqual(observe.call_args.args[0].shape,(480,854,3))
 
     def test_joint_rank_accounts_for_framing_and_keeps_existing_face_limits(self):
         better_motion = self.gesture(pose=.1, velocity=.05)
@@ -71,6 +88,61 @@ class MotionCameraRankTests(unittest.TestCase):
                     refine_group_motion_camera(plan=None, timeline=None, audio_offsets=(),
                         source_timewarps=(), scene_cut_times=(), model_path='unused', **options)
             probe.assert_not_called()
+
+    def test_bounded_candidate_frontier_does_not_limit_sensing_to_the_first_twelve_scales(self):
+        choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
+            shot_type=ShotType.MEDIUM,shot_scale=.8-i*.01,
+            exit_shot_type=ShotType.MEDIUM,exit_shot_scale=.8-i*.01,
+            entry_shot_type=ShotType.MEDIUM,entry_shot_scale=.8-i*.01) for i in range(30))
+        timeline=VisualTimelinePlan(choices,1.)
+        self.assertNotIn(15,focal_boundary_shortlist(timeline))
+        self.assertIn(15,focal_boundary_shortlist(timeline,maximum_candidates=32))
+        self.assertEqual(len(focal_boundary_shortlist(timeline,maximum_candidates=20)),20)
+        for value in (True,0,49):
+            with self.assertRaises(ValueError):focal_boundary_shortlist(timeline,maximum_candidates=value)
+        with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock') as probe:
+            for options in ({'maximum_candidate_boundaries':49},{'maximum_candidate_boundaries':True},
+                    {'maximum_measured_boundaries':0},{'maximum_measured_boundaries':True},
+                    {'maximum_candidate_boundaries':4,'maximum_measured_boundaries':5}):
+                with self.subTest(options=options),self.assertRaises(ValueError):
+                    refine_group_motion_camera(plan=None,timeline=None,audio_offsets=(),source_timewarps=(),
+                        scene_cut_times=(),model_path='unused',**options)
+            probe.assert_not_called()
+
+    def test_unknown_motion_does_not_consume_the_complete_measured_frontier(self):
+        choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
+            entry_shot_type=ShotType.MEDIUM,exit_shot_type=ShotType.MEDIUM,
+            entry_shot_scale=.8-i*.01,exit_shot_scale=.8-i*.01) for i in range(16))
+        plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),
+            tuple(RenderSegment(i%2,float(i),1.,float(i)) for i in range(16)),0,
+            '16:9',Path('unused.mp4'),fps=30.,transitions=(RenderTransition(),)*15)
+        calls=0
+        def compare(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            return None if calls<=12 else self.gesture()
+        sampler=SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)
+        capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8))
+        provider=SimpleNamespace(compare_motion=compare,capture=capture,close=lambda:None)
+        with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',return_value=
+                    VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
+                patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
+                patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=sampler), \
+                patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
+                    SimpleNamespace(face_bbox_xywh=(.4,.25,.1,.15))) as observed, \
+                patch('crosscut.group_motion_camera_refinement.measured_motion_improves',return_value=False):
+            result=refine_group_motion_camera(plan=plan,timeline=VisualTimelinePlan(choices,1.),
+                audio_offsets=(0.,0.),source_timewarps=(None,None),scene_cut_times=((),()),
+                model_path='unused',maximum_measured_boundaries=1)
+        baseline=[r for r in result.attempts if r['stage']=='baseline_motion']
+        self.assertEqual([r['boundary_index'] for r in baseline],list(range(13)))
+        self.assertFalse(any(r['complete_measured_candidate'] for r in baseline[:12]))
+        self.assertTrue(baseline[12]['complete_measured_candidate'])
+        observed.assert_called();self.assertEqual(observed.call_count,2,'unknown motion did not trigger output face sensing')
+        budget=next(r for r in result.attempts if r['stage']=='bounded_measured_focal_frontier')
+        self.assertEqual(budget['measured_boundary_indices'],[12])
+        self.assertEqual(result.proposals,())
+        self.assertEqual(result.plan,plan)
 
     def test_shortlist_uses_cut_endpoint_sizes_not_interior_labels(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
