@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (_review_first_group_bundle, _validate_review_first_group_bundle,
-    _stage_edit_montage_analysis_payload)
+    _stage_edit_montage_analysis_payload, _review_first_group_boundary_look_bundle)
+from crosscut.boundary_look_match import analyze_boundary_look_match
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.visual_score import VisualTimelinePlan
 from crosscut.visual_boundary_repair import _thaw_audit_value
@@ -47,6 +48,22 @@ class GroupFirstResultBundleTests(unittest.TestCase):
         self.assertEqual(copied['stage_edit_exact_shot_clock']['shots'][0]['source_index'], 0)
         payload['stage_edit_exact_shot_clock']['shots'][0]['source_index'] = 88
         self.assertEqual(owned.stage_edit_exact_shot_clock['shots'][0]['source_index'], 0)
+
+    def test_look_bundle_keeps_timeline_geometry_review_and_exact_clock_owners(self):
+        bundle = self.make_bundle()
+        result = analyze_boundary_look_match(bundle.render_plan, group_16x9_safe=False)
+        with patch('crosscut.review_first_boundary_look.refine_review_first_boundary_look',
+                   return_value=(bundle.render_plan, result)) as worker:
+            changed = _review_first_group_boundary_look_bundle(bundle, group_16x9_safe=False)
+        self.validate(changed)
+        worker.assert_called_once_with(bundle.render_plan, group_16x9_safe=False)
+        self.assertEqual(changed.render_plan, bundle.render_plan)
+        for name in ('visual_timeline', 'timeline_review', 'section_plan',
+                     'stage_edit_exact_shot_clock', 'editorial_motion_plan'):
+            self.assertEqual(getattr(changed, name), getattr(bundle, name))
+        self.assertIs(changed.boundary_look_match, result)
+        self.assertFalse(changed.candidate_lineage[-1]['whole_output_quality_approved'])
+        self.assertEqual(bundle.candidate_lineage, ())
 
     def test_review_section_source_and_progress_faults_cannot_promote(self):
         bundle = self.make_bundle()

@@ -27310,6 +27310,22 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
             raise ValueError('GROUP bundle shot progress is invalid')
 
 
+def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):
+    """Preserve the complete incumbent and add only decoded-admitted look ramps."""
+    from .review_first_boundary_look import refine_review_first_boundary_look
+    plan, result = refine_review_first_boundary_look(
+        bundle.render_plan, group_16x9_safe=group_16x9_safe)
+    return replace(bundle, render_plan=plan, boundary_look_match=result,
+        candidate_lineage=(*bundle.candidate_lineage, {
+            "stage": "bounded_review_first_boundary_look_admission",
+            "maximum_verified_boundaries": result.render_admission_maximum_boundaries,
+            "applied_boundary_count": result.applied_count,
+            "render_verified_boundary_count": result.render_verified_count,
+            "source_path_clock_and_geometry_changed": False,
+            "whole_output_quality_approved": False,
+        }))
+
+
 def _review_first_registered_group_generation(*, request, alignment, alignment_eligibility,
         source_timewarps, scene_cut_times, group_draft, rhythm, section_plan, local_durations,
         offsets, eligible_timewarps, eligible_indices, source_derivatives, output):
@@ -35118,6 +35134,21 @@ def analyze(
                     proposal = group_first.run_optional("final_geometry_plan", complete_group_bundle)
                     if proposal is not None:
                         group_first.promote(proposal, plan=proposal.render_plan, authority=proposal.cadence_profile)
+                # Look matching used to exist only in the legacy multi-candidate
+                # path. Apply it once to the actual retained final geometry;
+                # failure/cutoff must not discard that incumbent or rerun cuts.
+                if group_first.incumbent.boundary_look_match is None:
+                    look_bundle = group_first.run_optional(
+                        "boundary_look_match_render_admission",
+                        lambda: _review_first_group_boundary_look_bundle(
+                            group_first.incumbent,
+                            group_16x9_safe=source_aspects_are_editorial_safe),
+                        validate=lambda value: _validate_review_first_group_bundle(
+                            value, eligible_indices=eligible_indices, offsets=offsets,
+                            timewarps=eligible_timewarps, common_start=common_start))
+                    if look_bundle is not None:
+                        group_first.promote(look_bundle, plan=look_bundle.render_plan,
+                                            authority=look_bundle.cadence_profile)
                 # Consume one owned bundle, including clock/review/geometry.
                 # A rejected proposal cannot leak any of its local metadata.
                 kept = review_first_singleton_bundle = group_first.incumbent

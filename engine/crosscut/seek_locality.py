@@ -222,6 +222,13 @@ never borrows a neighbor.
         if not math.isfinite(seconds):
             raise ValueError('frame timestamp must be finite')
         timestamp_ms = max(0.0, float(seconds)) * 1000.0
+        return self.frame_at_milliseconds(timestamp_ms)
+
+    def frame_at_milliseconds(self, timestamp_ms: float) -> np.ndarray | None:
+        """Preserve callers' original POS_MSEC arithmetic without a round trip."""
+        if not math.isfinite(timestamp_ms):
+            raise ValueError('frame timestamp must be finite')
+        timestamp_ms = max(0.0, float(timestamp_ms))
         if not self.enabled:
             return self._seek_read(timestamp_ms)
         assert self.clock is not None

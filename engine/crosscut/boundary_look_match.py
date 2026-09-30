@@ -33,6 +33,7 @@ from .render import (
     RenderPlan,
     SourceLookAdjustment,
     TransitionKind,
+    quantized_segment_frame_counts,
     segment_frame_counts,
 )
 from .source_look_match import (
@@ -40,6 +41,7 @@ from .source_look_match import (
     LookResidualVector,
     measure_frame_look,
 )
+from .seek_locality import SeekLocalityReader, probe_constant_frame_clock
 
 
 ANALYSIS_BASIS = (
@@ -371,6 +373,8 @@ class BoundaryLookDecision:
     predicted_distance_before: float | None = None
     predicted_distance_after: float | None = None
     render_verification: BoundaryLookRenderVerification | None = None
+    render_verification_attempts: tuple[tuple[float, BoundaryLookRenderVerification], ...] = ()
+    render_admitted_strength: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         def adjustment_payload(value: SourceLookAdjustment) -> dict[str, Any]:
@@ -417,6 +421,11 @@ class BoundaryLookDecision:
                 if self.render_verification is not None
                 else None
             ),
+            "render_admitted_strength": self.render_admitted_strength,
+            "render_verification_attempts": [
+                {"proposed_strength_fraction": strength, "verification": verification.to_dict()}
+                for strength, verification in self.render_verification_attempts
+            ],
         }
 
 
@@ -432,6 +441,8 @@ class BoundaryLookMatchResult:
     render_admission_config: BoundaryLookRenderAdmissionConfig | None = None
     render_admission_encode_settings: tuple[tuple[str, str], ...] = ()
     render_admission_encode_settings_sha256: str | None = None
+    render_admission_maximum_boundaries: int | None = None
+    render_admission_clipping_backoff_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.enabled and self.blocked_reason is not None:
@@ -562,6 +573,9 @@ class BoundaryLookMatchResult:
             ),
             "render_domain_admission": {
                 "enabled": self.render_admission_config is not None,
+                "maximum_verified_boundaries": self.render_admission_maximum_boundaries,
+                "clipping_backoff_enabled": self.render_admission_clipping_backoff_enabled,
+                "maximum_adjusted_encodes_per_boundary": 2 if self.render_admission_clipping_backoff_enabled else 1,
                 "config": (
                     self.render_admission_config.to_dict()
                     if self.render_admission_config is not None
@@ -673,17 +687,15 @@ class BoundaryLookMeasurementCache:
                 capture = cv2.VideoCapture(str(source))
                 if not capture.isOpened():
                     raise ValueError("could not open boundary look source")
+                reader = SeekLocalityReader(capture,
+                    clock=probe_constant_frame_clock(source),
+                    process_frame=lambda frame: frame, maximum_cached_frames=1)
                 for microseconds in missing:
                     metric: LookMetricVector | None = None
                     try:
-                        capture.set(
-                            cv2.CAP_PROP_POS_MSEC,
-                            microseconds / 1000.0,
-                        )
-                        success, frame = capture.read()
+                        frame = reader.frame_at_milliseconds(microseconds / 1000.0)
                         if (
-                            success
-                            and isinstance(frame, np.ndarray)
+                            isinstance(frame, np.ndarray)
                             and frame.size > 0
                         ):
                             height, width = frame.shape[:2]
@@ -1143,6 +1155,8 @@ def _boundary_pair_render_plan(
     left = plan.segments[index]
     right = plan.segments[index + 1]
     counts = segment_frame_counts(plan)
+    if quantized_segment_frame_counts((left, right), plan.fps) != counts[index:index + 2]:
+        raise ValueError("isolated boundary render changes the original global frame clock")
     left_track = (
         _track_for_segment(
             frame_count=counts[index],
@@ -1463,11 +1477,19 @@ def verify_boundary_look_match_render_domain(
     ffmpeg: str = "ffmpeg",
     video_codec: str = "libx264",
     review_function: BoundaryRenderReviewFunction | None = None,
+    maximum_verified_boundaries: int | None = None,
+    clipping_backoff_enabled: bool = False,
 ) -> BoundaryLookMatchResult:
     """Retain a proposed correction only after matched proxy render proof."""
 
     if len(result.segment_tracks) != len(plan.segments):
         raise ValueError("boundary look result does not match render plan")
+    if maximum_verified_boundaries is not None and (
+        type(maximum_verified_boundaries) is not int or maximum_verified_boundaries < 1
+    ):
+        raise ValueError("maximum verified boundaries must be a positive integer")
+    if type(clipping_backoff_enabled) is not bool:
+        raise ValueError("clipping backoff flag must be boolean")
     settings = BoundaryLookRenderAdmissionConfig() if config is None else config
     if video_codec != "libx264":
         raise ValueError("render admission requires deterministic libx264")
@@ -1482,11 +1504,20 @@ def verify_boundary_look_match_render_domain(
             render_admission_config=settings,
             render_admission_encode_settings=encode_settings,
             render_admission_encode_settings_sha256=encode_settings_sha256,
+            render_admission_maximum_boundaries=maximum_verified_boundaries,
+            render_admission_clipping_backoff_enabled=clipping_backoff_enabled,
         )
     output_parent = plan.output.parent
     output_parent.mkdir(parents=True, exist_ok=True)
     reviewer = review_function
     decisions: list[BoundaryLookDecision] = []
+    # Rank the measured scalar proposals before any paired encode. The limit
+    # bounds work only: unexamined proposals are explicit no-ops, never passes.
+    ranked = sorted((item for item in result.decisions if item.applied),
+        key=lambda item: (-(float(item.predicted_distance_before or 0.)
+                           - float(item.predicted_distance_after or 0.)),
+                          item.boundary_index))
+    selected = {item.boundary_index for item in ranked[:maximum_verified_boundaries]}
     with tempfile.TemporaryDirectory(
         prefix=".boundary-look-admission-", dir=output_parent
     ) as temporary_directory:
@@ -1495,6 +1526,14 @@ def verify_boundary_look_match_render_domain(
             if not decision.applied:
                 decisions.append(decision)
                 continue
+            if decision.boundary_index not in selected:
+                decisions.append(replace(decision, applied=False,
+                    reason="render_verification_work_limit",
+                    outgoing_adjustment=SourceLookAdjustment(),
+                    incoming_adjustment=SourceLookAdjustment(), render_verification=None))
+                continue
+            attempts: list[tuple[float, BoundaryLookRenderVerification]] = []
+            strength = 1.0
             try:
                 base_plan = _boundary_pair_render_plan(
                     plan,
@@ -1535,6 +1574,42 @@ def verify_boundary_look_match_render_domain(
                     after_review,
                     settings,
                 )
+                attempts.append((strength, verification))
+                # One predeclared backoff, not an open-ended render search. It
+                # is reserved for a useful correction rejected ONLY for lost
+                # tone detail. Timing, geometry and every QA cap stay fixed.
+                if (clipping_backoff_enabled
+                        and verification.reason == "hard_component_regression:clipped_pixels"
+                        and verification.weighted_cost_before - verification.weighted_cost_after
+                        >= settings.minimum_weighted_improvement):
+                    def half(adjustment):
+                        return SourceLookAdjustment(
+                            brightness=adjustment.brightness*.5,
+                            contrast=1. + (adjustment.contrast-1.)*.5,
+                            saturation=1. + (adjustment.saturation-1.)*.5,
+                            temperature_balance=adjustment.temperature_balance*.5)
+                    half_decision = replace(decision,
+                        outgoing_adjustment=half(decision.outgoing_adjustment),
+                        incoming_adjustment=half(decision.incoming_adjustment))
+                    half_plan = _boundary_pair_render_plan(plan, half_decision,
+                        output=root/f"boundary-{decision.boundary_index}-half.mp4",
+                        adjusted=True, config=result.analysis_config, admission=settings)
+                    strength = .5
+                    half_review = (_render_and_review_boundary(half_plan, cut_frame_index,
+                        ffmpeg=ffmpeg, video_codec=video_codec) if reviewer is None
+                        else reviewer(half_plan, cut_frame_index))
+                    verification = _verification_from_reviews(before_review, half_review, settings)
+                    attempts.append((strength, verification))
+                    if verification.passed:
+                        window = decision.synchronized_residual_window
+                        predicted_after = None
+                        if window is not None:
+                            residual = window.median
+                            predicted_after = _proxy_distance_from_residual(_residual_after_adjustments(
+                                (residual.luma_delta, residual.contrast_log_ratio,
+                                 residual.saturation_log_ratio, residual.temperature_log_red_blue_delta),
+                                half_decision.outgoing_adjustment, half_decision.incoming_adjustment))
+                        decision = replace(half_decision, predicted_distance_after=predicted_after)
             except (
                 cv2.error,
                 KeyError,
@@ -1547,9 +1622,11 @@ def verify_boundary_look_match_render_domain(
                     passed=False,
                     reason=f"render_verification_error:{type(exc).__name__}",
                 )
+                attempts.append((strength, verification))
             if verification.passed:
                 decisions.append(
-                    replace(decision, render_verification=verification)
+                    replace(decision, render_verification=verification,
+                        render_verification_attempts=tuple(attempts), render_admitted_strength=strength)
                 )
             else:
                 decisions.append(
@@ -1560,6 +1637,7 @@ def verify_boundary_look_match_render_domain(
                         outgoing_adjustment=SourceLookAdjustment(),
                         incoming_adjustment=SourceLookAdjustment(),
                         render_verification=verification,
+                        render_verification_attempts=tuple(attempts), render_admitted_strength=None,
                     )
                 )
     checked_decisions = tuple(decisions)
@@ -1574,6 +1652,8 @@ def verify_boundary_look_match_render_domain(
         render_admission_config=settings,
         render_admission_encode_settings=encode_settings,
         render_admission_encode_settings_sha256=encode_settings_sha256,
+        render_admission_maximum_boundaries=maximum_verified_boundaries,
+        render_admission_clipping_backoff_enabled=clipping_backoff_enabled,
     )
 
 
