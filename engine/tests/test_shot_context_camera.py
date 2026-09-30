@@ -101,7 +101,7 @@ class ShotContextProposalTests(unittest.TestCase):
         capture=SimpleNamespace(close=lambda:None,
             frame_at_native_index=lambda source,*_:np.full((180,320,3),source,np.uint8))
         clock=VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)
-        def composed(frame,segment,time,size):
+        def composed(frame,segment,time,size,**options):
             from crosscut.boundary_subject_alignment import _project_box,_TransformState
             observed=face() if frame.mean()==1 else face(.26,.09)
             if segment.editorial_transform:
@@ -139,6 +139,16 @@ class ShotContextProposalTests(unittest.TestCase):
         for index in (0,2,True):
             with self.assertRaises(ValueError):self.run_proposal(args,segment_index=index)
         with self.assertRaises(ValueError):self.run_proposal(args,maximum_runtime_seconds=float('nan'))
+
+    def test_neutral_and_unknown_endpoints_do_not_trigger_dense_sensing(self):
+        for unknown in (False,True):
+            calls=[]
+            def observe(frame):
+                calls.append(float(frame.mean()))
+                return BoundarySubjectObservation() if unknown and frame.mean()==0 else face()
+            with self.assertRaisesRegex(ValueError,'observed unambiguous|already neutral'):
+                self.run_proposal(self.fixture(),observer=observe)
+            self.assertLessEqual(len(calls),4)
 
     def test_missing_interior_head_does_not_become_success_from_good_endpoints(self):
         args=self.fixture();calls=0

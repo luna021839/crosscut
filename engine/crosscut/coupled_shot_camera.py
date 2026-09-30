@@ -71,7 +71,7 @@ def propose_coupled_shot_camera(*, previous, scene_cut_times,
     plan=previous.plan;index=previous.segment_index;counts=segment_frame_counts(plan)
     if (type(maximum_runtime_seconds) not in (float,int)
             or not math.isfinite(maximum_runtime_seconds) or not 0<maximum_runtime_seconds<=60
-            or not 0<index<len(plan.segments)-2
+            or previous.end_segment_index!=index or not 0<index<len(plan.segments)-2
             or len(scene_cut_times)!=len(plan.sources)):
         raise ValueError('invalid bounded coupled-shot request')
     incoming=plan.segments[index+1]

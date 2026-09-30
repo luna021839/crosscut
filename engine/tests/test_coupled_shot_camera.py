@@ -151,6 +151,7 @@ class CoupledShotCameraTests(unittest.TestCase):
         previous=replace(previous,pixel_boundary_framing=rows)
         for failed in (False,True):
             with patch('crosscut.shot_context_refinement.shot_context_shortlist',return_value=(1,)), \
+                    patch('crosscut.shot_context_refinement.multi_cell_shot_context_shortlist',return_value=()), \
                     patch('crosscut.shot_context_refinement.propose_shot_context_camera',return_value=previous), \
                     patch('crosscut.coupled_shot_camera.propose_coupled_shot_camera',
                         side_effect=ValueError('tracked face unavailable') if failed else None,return_value=pair) as call:

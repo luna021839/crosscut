@@ -4938,8 +4938,8 @@ def _transform_metrics(
         "shot_context_bindings_complete": (
             isinstance(motion.get('shot_context_cameras', []), (list, tuple))
             and isinstance(motion.get('coupled_shot_cameras', []), (list, tuple))
-            and len(context_cameras) == len(motion.get('shot_context_cameras', []))
-                +2*len(motion.get('coupled_shot_cameras', []))
+            and len({id(row) for row in context_cameras.values()})
+                == len(motion.get('shot_context_cameras', []))+len(motion.get('coupled_shot_cameras', []))
         ),
         "one_motion_segment_per_plan_segment": (
             motion_indices == list(range(len(plan_segments)))

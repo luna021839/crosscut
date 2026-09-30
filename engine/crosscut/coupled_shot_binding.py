@@ -14,7 +14,7 @@ from .render_boundary_clock import native_frame_clocks_for_output
 from .render_frame_schedule import VerifiedRenderFrameClock
 from .shot_context_binding import (
     _digest, _numeric, build_shot_context_binding, shot_context_binding_valid,
-    shot_context_geometry_identity,
+    shot_context_geometry_identity, RUN_CONTRACT,
 )
 
 CONTRACT='native_coupled_whole_shot_and_entry_handle_binding_v1'
@@ -125,4 +125,4 @@ def bound_coupled_shot_cameras(motion,plan):
 
 def context_boundary_indices(contexts):
     return {boundary for index,row in contexts.items()
-        for boundary in (row['boundary_indices'] if row.get('contract')==CONTRACT else (index-1,index))}
+        for boundary in (row['boundary_indices'] if row.get('contract') in {CONTRACT,RUN_CONTRACT} else (index-1,index))}
