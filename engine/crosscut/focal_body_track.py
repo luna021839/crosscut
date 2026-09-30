@@ -25,6 +25,7 @@ from .pose import FormationPersonDescriptor
 
 
 FOCAL_BODY_ANCHOR_POLICY = 'frozen_clothing_or_unique_exact_face_pose_with_observed_body_edges_v2'
+MINIMUM_TRAJECTORY_BODY_REFERENCE_SIMILARITY = .60
 
 
 def _cos(left, right) -> float:
@@ -165,6 +166,20 @@ def deduplicate_body_observations(observations: Sequence[FocalBodyObservation]) 
     return tuple(retained)
 
 
+def query_body_recovery_impossible(frame: FocalBodyFrame) -> bool:
+    """A necessary condition for ANY neighboring anchor to reach this query.
+
+    The query cannot corroborate itself. Every route from another frame must
+    enter a body through the trajectory edge's unchanged appearance floor.
+    This does not replace direct exact-face/pose admission, declare a missing
+    model successful, or authorize a cut. Use only after observing the query.
+    """
+    if not isinstance(frame, FocalBodyFrame):
+        raise TypeError('query-body bound requires an actual focal body frame')
+    return all(item.reference_similarity < MINIMUM_TRAJECTORY_BODY_REFERENCE_SIMILARITY
+               for item in deduplicate_body_observations(frame.observations))
+
+
 def focal_body_anchor_indices(observations: Sequence[FocalBodyObservation], *,
                               allow_exact_pose_anchors: bool = True) -> tuple[int, ...]:
     """Shared necessary-condition authority for a deduplicated observed frame.
@@ -230,7 +245,7 @@ def _resolve_focal_body_track(
         delta = abs(right.source_seconds-left.source_seconds)
         if not .01 <= delta <= .26:
             return None
-        if min(left.reference_similarity, right.reference_similarity) < .60:
+        if min(left.reference_similarity, right.reference_similarity) < MINIMUM_TRAJECTORY_BODY_REFERENCE_SIMILARITY:
             return None
         similarity = _cos(left.appearance, right.appearance)
         if similarity < .70:

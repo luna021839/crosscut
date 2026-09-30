@@ -71,8 +71,12 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     self.assertIsNone(actual.observation)
                     original.assert_not_called()
-                    provider.bodies.frame_observations.assert_called_once_with(0, 10.)
-                    self.assertEqual(prefilter.skipped_tracks, 1)
+                    if empty:
+                        provider.bodies.frame_observations.assert_not_called()
+                    else:
+                        provider.bodies.frame_observations.assert_called_once_with(0, 10.)
+                    self.assertEqual(prefilter.skipped_tracks, int(not empty))
+                    self.assertEqual(prefilter.disconnected_query_tracks, int(empty))
 
     def test_two_possible_anchors_never_skip_the_original_tracker(self):
         provider = self.provider(face_times=(9.6, 10.4))
@@ -126,6 +130,11 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
     def test_cached_clothing_and_competitor_proof_matches_full_resolver(self):
         for score in (.3, .585, .60, .67, .679999, .68, .8):
             provider = self.provider(face_times=(9.6, 10.4), reference_score=score)
+            # Exercise the anchor bound independently of the query-edge bound.
+            key = provider.faces._identity_key(0, provider.faces._samplers[0], 10.)
+            query = provider.bodies._frame_cache[key]
+            provider.bodies._frame_cache[key] = replace(query, observations=tuple(
+                replace(item, reference_similarity=.8) for item in query.observations))
             for t in (9.6, 10.4):
                 provider.bodies.frame_observations(0, t)
             prefilter = SourceFirstAnchorPrefilter(provider)
@@ -150,6 +159,10 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
     def test_sparse_anchor_body_pass_skips_nonanchor_trajectory_only_after_disproof(self):
         for score in (.585, .8):
             provider = self.provider(face_times=(9.6, 10.4), reference_score=score)
+            key = provider.faces._identity_key(0, provider.faces._samplers[0], 10.)
+            query = provider.bodies._frame_cache[key]
+            provider.bodies._frame_cache[key] = replace(query, observations=tuple(
+                replace(item, reference_similarity=.8) for item in query.observations))
             install_source_first_anchor_prefilter(provider)
             batch = SourceFirstObservationBatch(provider)
             batch(((0, 10.),))
@@ -172,6 +185,65 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
             original = provider.bodies.track_at
             SourceFirstAnchorPrefilter(provider).track_at(0, 10.)
             original.assert_called_once_with(0, 10.)
+
+    def test_disconnected_query_skips_unobserved_neighbors_but_never_the_point_six_boundary(self):
+        for score in (.585, .599999, .60, .8):
+            provider = self.provider(face_times=(9.6, 10.4), reference_score=.8)
+            key = provider.faces._identity_key(0, provider.faces._samplers[0], 10.)
+            query = provider.bodies._frame_cache[key]
+            provider.bodies._frame_cache[key] = replace(query, observations=tuple(
+                replace(item, reference_similarity=score) for item in query.observations))
+            baseline = provider.bodies.track_at(0, 10.)
+            # Discard all neighboring observations; none may be inferred just
+            # to confirm an already disconnected exact query.
+            provider.bodies._frame_cache = OrderedDict({key: provider.bodies._frame_cache[key]})
+            provider.faces._focal_candidate_cache = {key: ()}
+            provider._source_first_unresolved_memo.completed_face_frames = {key: True}
+            original = provider.bodies.track_at
+            original.reset_mock()
+            bound = SourceFirstAnchorPrefilter(provider)
+            actual = bound.track_at(0, 10.)
+            self.assertEqual(actual.observation, baseline.observation)
+            if score < .60:
+                original.assert_not_called()
+                self.assertEqual(actual.reason, 'query_body_edges_unreachable')
+                self.assertEqual(bound.disconnected_query_tracks, 1)
+            else:
+                original.assert_called_once_with(0, 10.)
+                self.assertEqual(actual, baseline)
+
+    def test_batch_skips_only_disconnected_recovery_and_keeps_direct_face_pose(self):
+        for direct in (False, True):
+            provider = self.provider(face_times=(10.,) if direct else (), reference_score=.585)
+            key = provider.faces._identity_key(0, provider.faces._samplers[0], 10.)
+            if direct:
+                query = provider.bodies._frame_cache[key]
+                provider.bodies._frame_cache[key] = replace(query, observations=tuple(
+                    replace(item, face_pose_consistent=True) for item in query.observations))
+            provider.faces._focal_candidate_cache = {key: (FACE,) if direct else ()}
+            provider._source_first_unresolved_memo.completed_face_frames = {key: True}
+            install_source_first_anchor_prefilter(provider)
+            batch = SourceFirstObservationBatch(provider)
+            batch(((0, 10.),))
+            self.assertEqual(provider.bodies.frame_observations.call_count, 1)
+            self.assertEqual(provider.faces._focal_candidates.call_count, 1)
+            self.assertEqual(batch.recovery_query_count, 0)
+            self.assertEqual(batch.disconnected_query_dependency_skip_count, int(not direct))
+            self.assertEqual(batch.direct_resolved_query_count, int(direct))
+
+    def test_query_bound_requires_the_same_cached_source_frame_namespace_and_existing_authority(self):
+        for mode in ('missing', 'wrong_source', 'wrong_frame', 'namespace', 'existing_track', 'untyped', 'bad_clock'):
+            provider = self.provider(reference_score=.585)
+            key = provider.faces._identity_key(0, provider.faces._samplers[0], 10.)
+            query = provider.bodies._frame_cache[key]
+            if mode == 'missing': provider.bodies._frame_cache.clear()
+            elif mode == 'wrong_source': provider.bodies._frame_cache[key] = FocalBodyFrame(1, 10., ())
+            elif mode == 'wrong_frame': provider.bodies._frame_cache[key] = FocalBodyFrame(0, 11., ())
+            elif mode == 'namespace': provider.observation_namespace = 'other'
+            elif mode == 'existing_track': provider.bodies._track_cache[key] = object()
+            elif mode == 'bad_clock': provider.faces._samplers[0].capture.get = lambda _: 0
+            else: provider.bodies._frame_cache[key] = object()
+            self.assertFalse(SourceFirstAnchorPrefilter(provider).query_body_cannot_recover(0, 10.))
 
     def test_invalid_inputs_and_changed_source_are_not_negative_proof(self):
         provider = self.provider()
@@ -229,7 +301,7 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
         install_source_first_anchor_prefilter(provider)
         self.assertIs(first, provider._source_first_anchor_prefilter)
         self.assertFalse(first.diagnostics()['negative_observations_persisted'])
-        self.assertFalse(first.diagnostics()['positive_observation_namespace_changed'])
+        self.assertFalse(first.diagnostics()['positive_geometry_decisions_changed'])
 
 
 if __name__ == '__main__':

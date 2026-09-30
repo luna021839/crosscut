@@ -10054,6 +10054,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("source_first_model_assets.py"),
                 Path(__file__).with_name("source_first_member_session.py"),
                 Path(__file__).with_name("source_first_observation_batch.py"),
+                Path(__file__).with_name("source_first_anchor_prefilter.py"),
                 Path(__file__).with_name("member_boundary_observations.py"),
                 Path(__file__).with_name("member_observation_search.py"),
                 Path(__file__).with_name("member_cached_observations.py"),

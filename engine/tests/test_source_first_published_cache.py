@@ -29,14 +29,22 @@ class PublishedGeometryCacheTests(unittest.TestCase):
         self.assertNotEqual(legacy_mps, body_observation_namespace(previous[-1], encoder, 'mps'))
 
     def test_pose_anchor_expansion_reuses_positive_incumbents_not_decode_equivalence(self):
-        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
-        current=SourceFirstFocalGeometryProvider.observation_fingerprint()
+        current='1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f'
         previous='50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd'
         self.assertNotEqual(current,previous)
         self.assertEqual(decode_equivalent_focal_fingerprints(current),())
         self.assertEqual(published_focal_geometry_predecessors(current),
                          (previous,*decode_equivalent_focal_fingerprints(previous)))
         self.assertEqual(published_focal_geometry_predecessors('0'*64),())
+
+    def test_query_only_disconnection_bound_preserves_exact_positive_predecessor(self):
+        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
+        current=SourceFirstFocalGeometryProvider.observation_fingerprint()
+        previous='1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f'
+        self.assertNotEqual(current,previous)
+        self.assertEqual(decode_equivalent_focal_fingerprints(current),())
+        self.assertEqual(published_focal_geometry_predecessors(current),
+                         (previous,*published_focal_geometry_predecessors(previous)))
 
     def test_predecessor_lookup_preserves_original_rows_and_new_namespace(self):
         with tempfile.TemporaryDirectory() as directory:

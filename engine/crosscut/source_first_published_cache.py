@@ -44,6 +44,13 @@ def published_focal_geometry_predecessors(current):
     to reuse negative results. All other code/device/model changes remain bound
     to their own namespace, and no existing database row is rewritten.
     """
+    # Extracting the unchanged .60 trajectory-edge floor into a shared
+    # query-only necessary condition cannot change any positive observation.
+    # Only this exact dependency identity may read its proven predecessor;
+    # negative observations and unknown code/runtime changes remain excluded.
+    if current == '2759d59d3d4410aa980ae47f105df1b909493b14b6247bc6d0acb29b9c373555':
+        previous='1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f'
+        return (previous,*published_focal_geometry_predecessors(previous))
     if current == '1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f':
         previous='50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd'
         return (previous,*decode_equivalent_focal_fingerprints(previous))

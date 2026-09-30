@@ -40,6 +40,7 @@ class SourceFirstObservationBatch:
         self.direct_resolved_query_count = self.recovery_query_count = 0
         self.anchor_impossible_query_count = self.skipped_body_dependency_count = 0
         self.proven_missing_query_body_skip_count = 0
+        self.disconnected_query_dependency_skip_count = 0
         self.face_first_capacity_fallback_count = 0
         self.elapsed_seconds = 0.
 
@@ -116,6 +117,8 @@ class SourceFirstObservationBatch:
                     selected, reason = select_direct_focal_observation(face, faces, frame)
                     if selected is not None or reason == 'frozen_solo_face_body_unobserved':
                         self.direct_resolved_query_count += 1
+                    elif prefilter is not None and prefilter.query_body_cannot_recover(source, seconds):
+                        self.disconnected_query_dependency_skip_count += 1
                     elif len(references) >= 3:
                         self.recovery_query_count += 1
                         recovery_times.append(seconds)
@@ -177,6 +180,7 @@ class SourceFirstObservationBatch:
             anchor_impossible_query_count=self.anchor_impossible_query_count,
             skipped_body_dependency_count=self.skipped_body_dependency_count,
             proven_missing_query_body_skip_count=self.proven_missing_query_body_skip_count,
+            disconnected_query_dependency_skip_count=self.disconnected_query_dependency_skip_count,
             face_first_capacity_fallback_count=self.face_first_capacity_fallback_count,
             capacity_fallback_count=self.capacity_fallback_count,
             elapsed_seconds=self.elapsed_seconds,

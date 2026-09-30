@@ -5,6 +5,7 @@ from dataclasses import replace
 from crosscut.direct_member_target_face import FocalFaceCandidate
 from crosscut.focal_body_track import (FocalBodyFrame, FocalBodyObservation,
     body_reference_similarity, deduplicate_body_observations, focal_body_anchor_indices,
+    query_body_recovery_impossible,
     resolve_focal_body_track)
 from crosscut.pose import FormationPersonDescriptor
 
@@ -38,6 +39,26 @@ class FocalBodyTrackTests(unittest.TestCase):
         self.assertIsNone(result.observation.face)
         self.assertGreaterEqual(len(result.support_seconds), 2)
         self.assertFalse(result.to_dict()['face_geometry_extrapolated'])
+
+    def test_query_body_bound_matches_full_graph_on_both_sides_of_the_exact_floor(self):
+        for score in (-1., .0, .59, .599999999, .60, .600000001, .64, .9):
+            for query_anchor in (False, True):
+                frames = self.window()
+                frames[2] = frame(2., observation(2., score=score, anchor=query_anchor))
+                result = self.resolve(frames)
+                impossible = query_body_recovery_impossible(frames[2])
+                self.assertEqual(impossible, score < .60)
+                self.assertEqual(result.observation is None, impossible)
+        self.assertTrue(query_body_recovery_impossible(frame(2.)))
+        with self.assertRaises(TypeError): query_body_recovery_impossible(None)
+
+    def test_query_body_bound_uses_the_same_duplicate_and_competitor_domain(self):
+        weak = observation(2., score=.59)
+        duplicate = replace(weak, reference_similarity=.9,
+                            person=replace(weak.person, detection_confidence=.8))
+        self.assertTrue(query_body_recovery_impossible(frame(2., weak, duplicate)))
+        rival = replace(duplicate, appearance=(0., 1.))
+        self.assertFalse(query_body_recovery_impossible(frame(2., weak, rival)))
 
     def test_wrong_frozen_face_on_conflicting_costume_cannot_be_anchor(self):
         frames = []

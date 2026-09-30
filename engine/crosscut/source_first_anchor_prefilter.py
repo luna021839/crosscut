@@ -5,12 +5,14 @@ This necessary-condition check never identifies a person or admits a cut. It
 only reads the same exact native face observations, frozen bank and completed
 body observations the tracker would consume. Missing decodes/models and
 incomplete windows stay unknown.
-Positive geometry and its persistent measurement namespace are unchanged.
+Positive geometry decisions are unchanged. The extracted query-edge floor
+changes the dependency identity; only its exact verified positive predecessor
+is reusable, through the ordinary published-geometry cache contract.
 """
 import math
 
-from .focal_body_track import (deduplicate_body_observations,
-    focal_body_anchor_indices, resolve_focal_body_track)
+from .focal_body_track import (FocalBodyFrame, FocalBodyTrackResult, deduplicate_body_observations,
+    focal_body_anchor_indices, query_body_recovery_impossible, resolve_focal_body_track)
 
 
 class SourceFirstAnchorPrefilter:
@@ -18,6 +20,41 @@ class SourceFirstAnchorPrefilter:
         self.provider = provider
         self.original_track_at = provider.bodies.track_at
         self.checked_windows = self.impossible_windows = self.skipped_tracks = 0
+        self.disconnected_query_tracks = 0
+
+    def query_body_cannot_recover(self, source, seconds):
+        """Read only the exact cached query; never reject direct face admission.
+
+        This can avoid an unused recovery lattice even when its face-anchor
+        windows are still unobserved. Existing track results keep priority;
+        unknown/mismatched query frames supply no disproof. No negative is
+        persisted, and the normal resolver still decides the query geometry.
+        """
+        provider = self.provider
+        if (type(source) is not int or not 0 <= source < len(provider.sources)
+                or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0):
+            return False
+        if provider._identity(provider.sources[source]) != provider._identities[source]:
+            raise OSError('source-first focal source changed during analysis')
+        sampler = provider.faces._samplers[source]
+        memo = getattr(provider, '_source_first_unresolved_memo', None)
+        if sampler is None or memo is None or memo.namespace != provider.observation_namespace:
+            return False
+        key = provider.faces._identity_key(source, sampler, seconds)
+        query = provider.bodies._frame_cache.get(key)
+        if key in provider.bodies._track_cache or not isinstance(query, FocalBodyFrame):
+            return False
+        if (query.source_index != source
+                or provider.faces._identity_key(source, sampler, query.source_seconds) != key):
+            return False
+        # Do not turn the ordinary tracker's unavailable-clock error into a
+        # negative target observation merely because one old frame is cached.
+        from .source_first_observation_batch import track_dependency_times
+        try:
+            track_dependency_times(sampler, seconds)
+        except ValueError:
+            return False
+        return query_body_recovery_impossible(query)
 
     def anchor_state(self, source, seconds):
         """True means possible, False disproved, None missing observation."""
@@ -116,6 +153,17 @@ class SourceFirstAnchorPrefilter:
             return self.original_track_at(source, seconds)
         key = provider.faces._identity_key(source, sampler, seconds)
         query = provider.bodies._frame_cache.get(key)
+        if self.query_body_cannot_recover(source, seconds):
+            # No synthetic anchors: the query-only necessary condition proves
+            # that every possible route in the full graph is disconnected.
+            result = FocalBodyTrackResult(source, seconds, None,
+                'query_body_edges_unreachable' if query.observations else 'query_body_unobserved')
+            self.disconnected_query_tracks += 1
+            provider.bodies._track_cache[key] = result
+            provider.bodies._track_cache.move_to_end(key)
+            if len(provider.bodies._track_cache) > 4096:
+                provider.bodies._track_cache.popitem(last=False)
+            return result
         if (key in provider.bodies._track_cache or query is None
                 or not self.cannot_resolve(source, seconds)):
             return self.original_track_at(source, seconds)
@@ -136,7 +184,8 @@ class SourceFirstAnchorPrefilter:
         return dict(contract='complete_native_face_anchor_upper_bound_v1',
             checked_windows=self.checked_windows, impossible_windows=self.impossible_windows,
             skipped_tracks=self.skipped_tracks, new_identity_decisions=False,
-            positive_observation_namespace_changed=False, negative_observations_persisted=False)
+            disconnected_query_tracks=self.disconnected_query_tracks,
+            positive_geometry_decisions_changed=False, negative_observations_persisted=False)
 
 
 def install_source_first_anchor_prefilter(provider):
