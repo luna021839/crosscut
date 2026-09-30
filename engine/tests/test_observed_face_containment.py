@@ -58,6 +58,33 @@ class ObservedFaceContainmentTests(unittest.TestCase):
                 self.assertIsNone(recover_observed_face_step(before,self.frame,box,observations))
             detect.assert_not_called()
 
+    def test_detector_resolution_is_explicit_bounded_and_does_not_bypass_identity(self):
+        observations=((self.box,self.landmarks),)
+        for size in (480,960):
+            with patch('crosscut.observed_face_containment._observations',side_effect=[
+                    (self.frame,observations),(self.frame,observations)]) as detect, \
+                    patch('crosscut.observed_face_containment.extract_sface_embedding',
+                        side_effect=[(1.,0.),(0.,1.)]):
+                self.assertIsNone(recover_observed_face_step(self.frame,self.frame,self.box,
+                    (self.box,),maximum_detection_width=size))
+            self.assertEqual([call.kwargs for call in detect.call_args_list],
+                [{'maximum_width':size}]*2)
+        with patch('crosscut.observed_face_containment._observations') as detect:
+            for size in (True,0,479,480.,961,1920):
+                with self.subTest(size=size),self.assertRaises(ValueError):
+                    recover_observed_face_step(self.frame,self.frame,self.box,(self.box,),
+                        maximum_detection_width=size)
+            detect.assert_not_called()
+
+    def test_high_resolution_path_keeps_the_original_pixels_when_already_small_enough(self):
+        from crosscut.observed_face_containment import _observations
+        frame=np.zeros((480,854,3),np.uint8)
+        with patch('crosscut.observed_face_containment._detect_faces',return_value=((),'yunet')) as detect:
+            working,observations=_observations(frame,maximum_width=960)
+        self.assertIs(working,frame)
+        self.assertEqual(detect.call_args.args[0].shape,frame.shape)
+        self.assertEqual(observations,())
+
 
 if __name__=='__main__':
     unittest.main()

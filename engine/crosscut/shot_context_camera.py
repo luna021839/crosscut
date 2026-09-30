@@ -50,7 +50,8 @@ def _focal_pixel_path_step(reference,target,before,after):
     # local geometry + appearance check; this cannot synthesize missing faces
     # or search for a similar person elsewhere in the image.
     from .observed_face_containment import recover_observed_face_step
-    if recover_observed_face_step(reference,target,before.face_box_xywh,(after.face_box_xywh,)) is not None:
+    if recover_observed_face_step(reference,target,before.face_box_xywh,(after.face_box_xywh,),
+            maximum_detection_width=960) is not None:
         return 'observed_local_face_geometry_and_appearance'
     return None
 

@@ -31,7 +31,8 @@ class ShotContextFocalPathTests(unittest.TestCase):
                     patch('crosscut.shot_context_camera._optical_flow_box',return_value=None), \
                     patch('crosscut.observed_face_containment.recover_observed_face_step',return_value=recovered) as recover:
                 result=_focal_pixel_path_step(frame,frame,observed,observed)
-            recover.assert_called_once_with(frame,frame,observed.face_box_xywh,(observed.face_box_xywh,))
+            recover.assert_called_once_with(frame,frame,observed.face_box_xywh,(observed.face_box_xywh,),
+                maximum_detection_width=960)
             self.assertEqual(result,'observed_local_face_geometry_and_appearance' if recovered else None)
 
     def test_central_face_needs_explicit_mode_without_forging_global_dominance(self):

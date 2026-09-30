@@ -40,8 +40,8 @@ def _iou(a: Box, b: Box) -> float:
     return area/max(1e-12,a[2]*a[3]+b[2]*b[3]-area)
 
 
-def _observations(frame):
-    working=_working_frame(frame)
+def _observations(frame, *, maximum_width=480):
+    working=_working_frame(frame,maximum_width=maximum_width)
     faces,backend=_detect_faces(working,cv2.cvtColor(working,cv2.COLOR_BGR2GRAY))
     if backend != 'yunet':
         return working, ()
@@ -66,6 +66,7 @@ def _unique_near(observations, reference_box, minimum_iou):
 def recover_observed_face_step(
     reference_frame: np.ndarray, target_frame: np.ndarray,
     reference_box: Box, observed_target_boxes: Sequence[Box],
+    *, maximum_detection_width: int = 480,
 ) -> ObservedFaceRecovery | None:
     """Use appearance only for an already geometrically associated local face.
 
@@ -73,7 +74,13 @@ No appearance-based search over other image locations is performed. The target
 must also coincide with a face observed by the caller's native-resolution path.
 The .55 identity, .08 displacement and .85..1.18 scale limits retain the existing
 track identity/motion bounds; they do not change the cross-source identity gate.
+The opt-in 960px check preserves the camera planner's observed 854px geometry.
+Downscaling it again can change YuNet's box enough to fail the independent
+native-box agreement even when the same fresh face is plainly visible. The
+legacy default and every geometry/appearance threshold are unchanged.
 """
+    if type(maximum_detection_width) is not int or maximum_detection_width not in (480,960):
+        raise ValueError('observed face recovery permits only the bounded 480/960px detector paths')
     if (not _valid_box(reference_box) or not observed_target_boxes
             or any(not _valid_box(box) for box in observed_target_boxes)):
         return None
@@ -83,8 +90,8 @@ track identity/motion bounds; they do not change the cross-source identity gate.
         return None
     if reference_frame.shape != target_frame.shape:
         return None
-    before, left_faces=_observations(reference_frame)
-    after, right_faces=_observations(target_frame)
+    before, left_faces=_observations(reference_frame,maximum_width=maximum_detection_width)
+    after, right_faces=_observations(target_frame,maximum_width=maximum_detection_width)
     left=_unique_near(left_faces,reference_box,.7)
     right=_unique_near(right_faces,reference_box,.55)
     if left is None or right is None:
