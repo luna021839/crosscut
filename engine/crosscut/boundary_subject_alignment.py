@@ -47,6 +47,7 @@ from .render import (
     RenderTransition,
     TransitionKind,
     minimum_roll_safe_zoom,
+    _rotated_crop_is_inside_frame,
 )
 from .render_boundary_clock import native_frame_clocks_for_output
 from .render_frame_schedule import VerifiedRenderFrameClock, probe_render_frame_clock
@@ -60,7 +61,12 @@ ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v5"
 # validated and connected to all production consumers.
 FOCAL_EXPERIMENT_BASIS = "exact_cut_frame_local_focal_alignment_experiment_v1"
 ACTION_EXPERIMENT_BASIS = "exact_cut_frame_head_arms_framing_experiment_v1"
+SHOT_CAMERA_EXPERIMENT_BASIS = "exact_cut_frame_shot_continuous_camera_experiment_v1"
 FrameProvider = Callable[[int, float], np.ndarray | None]
+
+
+class _FacePathUnavailable(ValueError):
+    """Missing subject evidence is not a renderer/crop arithmetic failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,8 +257,17 @@ class BoundarySubjectAlignmentConfig:
     minimum_geometry_improvement_fraction: float = 0.10
     already_matched_scale_ratio: float = 1.015
     already_matched_center_distance: float = 0.025
+    settle_policy: str = "boundary_local"
+    reframe_closeups: bool = False
+    follow_face_path: bool = False
 
     def __post_init__(self) -> None:
+        if self.settle_policy not in {'boundary_local','shot_continuous'}:
+            raise ValueError('unknown camera settle policy')
+        if type(self.reframe_closeups) is not bool or self.reframe_closeups and self.settle_policy != 'shot_continuous':
+            raise ValueError('close-up reframing requires the explicit shot-continuous experiment')
+        if type(self.follow_face_path) is not bool or self.follow_face_path and self.settle_policy != 'shot_continuous':
+            raise ValueError('face-path following requires the explicit shot-continuous experiment')
         if (
             isinstance(self.window_frames, bool)
             or not isinstance(self.window_frames, int)
@@ -569,6 +584,17 @@ class BoundarySubjectAlignmentPlan:
     analysis_basis: str = ANALYSIS_BASIS
     sample_clock_basis: str = "unverified_injected_segment_clock_v1"
     dense_track_candidate_attempt_count: int = 0
+    settle_policy: str = "boundary_local"
+    reframe_closeups: bool = False
+    follow_face_path: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.settle_policy not in {'boundary_local','shot_continuous'}
+                or type(self.reframe_closeups) is not bool or type(self.follow_face_path) is not bool):
+            raise ValueError('invalid camera scope metadata')
+        if (self.settle_policy == 'shot_continuous' and self.analysis_basis != SHOT_CAMERA_EXPERIMENT_BASIS
+                or self.settle_policy != 'shot_continuous' and (self.reframe_closeups or self.follow_face_path)):
+            raise ValueError('shot-continuous camera cannot inherit ordinary production authority')
 
     @property
     def eligible_count(self) -> int:
@@ -631,6 +657,19 @@ class BoundarySubjectAlignmentPlan:
         )
         return {
             "analysis_basis": self.analysis_basis,
+            "settle_policy": self.settle_policy,
+            **({"shot_continuous_experiment": {
+                "camera_curve": "entry_to_exit_over_complete_visible_segment_without_forced_neutral_middle",
+                "validation": "all_transformed_output_frames_and_all_native_cuts_in_segment",
+                "closeup_reframing": self.reframe_closeups,
+                "closeup_protected_geometry": "measured_face_and_head_margin",
+                "closeup_body_crop_intentional": self.reframe_closeups,
+                "hand_retention_or_gesture_continuity_certified": False,
+                "follow_face_path": self.follow_face_path,
+                "trajectory_model": "measured_geometry_not_transformer_inference",
+                "production_binding_supported": False,
+                "quality_approved": False,
+            }} if self.analysis_basis == SHOT_CAMERA_EXPERIMENT_BASIS else {}),
             **({"local_focal_experiment": {
                 "subject_selection": "shared_source_local_face_unique_body_resolver",
                 "central_face_authority": "not_global_dominance",
@@ -653,11 +692,14 @@ class BoundarySubjectAlignmentPlan:
             }} if self.analysis_basis == ACTION_EXPERIMENT_BASIS else {}),
             "sample_clock_basis": self.sample_clock_basis,
             "policy": {
-                "scope": "cross_source_hard_cut_last_and_first_local_windows_only",
+                "scope": ("complete_visible_segment_between_measured_cut_states"
+                    if self.settle_policy == 'shot_continuous'
+                    else "cross_source_hard_cut_last_and_first_local_windows_only"),
                 "window_frames_each_side": self.window_frames,
                 "orb_required": False,
                 "native_internal_cuts_transformed": False,
-                "native_cut_scope": "active_boundary_window_plus_two_frame_tracking_guard",
+                "native_cut_scope": ("complete_transformed_segment" if self.settle_policy == 'shot_continuous'
+                    else "active_boundary_window_plus_two_frame_tracking_guard"),
                 "dissolve_overlap_transformed": False,
                 "frame_validation": "every_transformed_output_frame_after_base_crop",
                 "layout_validation": "cross_source_at_cut_then_adjacent_source_local_motion_v1",
@@ -1248,7 +1290,7 @@ def _shot_policy(observation: BoundarySubjectObservation) -> str:
     return "unknown"
 
 
-def _paired_framing_policies(outgoing, incoming):
+def _paired_framing_policies(outgoing, incoming, *, reframe_closeups=False):
     """Recognize a shared tight composition, not an arbitrary medium crop.
 
     A frame-truncated torso is not a measured full body/feet envelope. Only
@@ -1258,6 +1300,21 @@ def _paired_framing_policies(outgoing, incoming):
     The selected policy is fixed through the complete dense motion window.
     """
     policies = (_shot_policy(outgoing), _shot_policy(incoming))
+    if reframe_closeups and 'close_face' in policies and all(
+            policy in {'close_face','medium_focus'} for policy in policies):
+        # Classify the requested OUTPUT composition, not only the native shot.
+        # A source medium shot may be deliberately reconstructed as a close-up.
+        # This protects the head, not a claim that every hand/foot stays visible;
+        # motion and intentional body cropping still need decoded edit review.
+        def close_target(observation):
+            face = observation.face_box_xywh
+            return bool(_has_unambiguous_face(observation) and face is not None
+                and face[3] >= .14 and .30 <= _center(face)[0] <= .70
+                and observation.face_landmarks_xy is not None and len(observation.face_landmarks_xy) == 5
+                and observation.face_eye_scale is not None
+                and _associated_person_box(face,observation.formation_boxes_xywh) is not None)
+        if all(close_target(observation) for observation in (outgoing,incoming)):
+            return tuple('matched_close_face' if policy=='medium_focus' else policy for policy in policies)
     def tight(observation):
         if (not _has_unambiguous_face(observation)
                 or observation.face_landmarks_xy is None
@@ -1313,7 +1370,7 @@ def _subject(
                 (_action_envelope(face_box,points),),(_close_face_head_envelope(face_box),))
         containment = (
             (_close_face_head_envelope(face_box),)
-            if (framing_policy or _shot_policy(observation)) in {"close_face", "tight_medium_face"}
+            if (framing_policy or _shot_policy(observation)) in {"close_face", "tight_medium_face", "matched_close_face"}
             else (performer,) if performer is not None else (face_box,)
         )
         return _SubjectGeometry(
@@ -1365,7 +1422,8 @@ def _common_subjects(
     *,
     settings: BoundarySubjectAlignmentConfig,
 ) -> tuple[_SubjectGeometry | None, _SubjectGeometry | None, str | None]:
-    outgoing_policy, incoming_policy = _paired_framing_policies(outgoing, incoming)
+    outgoing_policy, incoming_policy = _paired_framing_policies(outgoing, incoming,
+        reframe_closeups=settings.reframe_closeups)
     outgoing_wide = outgoing_policy == "wide_formation"
     incoming_wide = incoming_policy == "wide_formation"
     if outgoing_wide != incoming_wide:
@@ -1815,7 +1873,10 @@ def _track_for_segment(
     fps: float,
     entry: tuple[int, _TransformState] | None,
     exit: tuple[int, _TransformState] | None,
+    settle_policy: str = "boundary_local",
 ) -> EditorialTransformTrack | None:
+    if settle_policy not in {'boundary_local','shot_continuous'}:
+        raise ValueError('unknown camera settle policy')
     if entry is None and exit is None:
         return None
     ramp = (ramp_frames - 1) / fps
@@ -1825,7 +1886,9 @@ def _track_for_segment(
         points.append((0.0, entry[1]))
     else:
         points.append((0.0, neutral))
-    if entry is not None and exit is not None:
+    if settle_policy == 'shot_continuous':
+        pass  # Endpoints below define one complete-shot interpolation.
+    elif entry is not None and exit is not None:
         if last_frame_time > 2.0 * ramp + 1e-9:
             points.extend(((ramp, neutral), (last_frame_time - ramp, neutral)))
         # A short segment interpolates directly between its two verified cut
@@ -1848,6 +1911,57 @@ def _track_for_segment(
             + "_b".join(str(index) for index in reason_indices)
         ),
     )
+
+
+def _follow_face_camera_path(track, boxes, *, fps, maximum_center_shift):
+    """Follow measured nonlinear head motion while retaining both cut states.
+
+    Smoothing is a proposal, not a containment waiver. The caller must validate
+    the final interpolated curve on every real output frame afterward.
+    """
+    if (not isinstance(track,EditorialTransformTrack) or len(boxes)<2
+            or not math.isfinite(fps) or fps<=0
+            or not math.isfinite(maximum_center_shift) or not 0<maximum_center_shift<=.1
+            or any(box is None or len(box)!=4 or any(not math.isfinite(v) for v in box)
+                or box[2]<=0 or box[3]<=0 or box[0]<0 or box[1]<0
+                or box[0]+box[2]>1.000001 or box[1]+box[3]>1.000001 for box in boxes)):
+        raise ValueError('face following requires a complete measured frame path')
+    count=len(boxes)
+    original=[track.evaluate(frame/fps) for frame in range(count)]
+    targets=tuple(_project_point(_center(box),_TransformState(key.zoom,key.center_x,key.center_y,key.roll_degrees))
+        for box,key in ((boxes[0],original[0]),(boxes[-1],original[-1])))
+    centers=[]
+    for frame,(box,key) in enumerate(zip(boxes,original)):
+        progress=frame/(count-1)
+        target=tuple(a*(1-progress)+b*progress for a,b in zip(*targets))
+        rotated=_project_point(_center(box),_TransformState(1.,.5,.5,key.roll_degrees))
+        centers.append((rotated[0]-(target[0]-.5)/key.zoom,rotated[1]-(target[1]-.5)/key.zoom))
+    values=np.asarray(centers)
+    padded=np.pad(values,((2,2),(0,0)),mode='edge')
+    smoothed=sum(weight*padded[offset:offset+count] for offset,weight in enumerate((1.,2.,3.,2.,1.)))/9.
+    # Correct both smoothing endpoint errors, not a sudden one-frame reset.
+    progress=np.linspace(0.,1.,count)[:,None]
+    smoothed+=(1-progress)*(values[0]-smoothed[0])+progress*(values[-1]-smoothed[-1])
+    keys=[]
+    for frame,(center,key) in enumerate(zip(smoothed,original)):
+        if frame in (0,count-1):
+            keys.append(key)
+            continue
+        cx,cy=_clamp_center(*center,zoom=key.zoom,maximum_shift=maximum_center_shift)
+        if not _rotated_crop_is_inside_frame(zoom=key.zoom,center_x=cx,center_y=cy,roll_degrees=key.roll_degrees):
+            # Axis-aligned clamping is insufficient when the image is rolled.
+            # Project into the renderer's actual convex safe-center domain,
+            # retaining its zoom, roll, aspect and chroma-edge constraints.
+            low,high=0.,1.
+            for _ in range(20):
+                amount=(low+high)/2.
+                safe=_rotated_crop_is_inside_frame(zoom=key.zoom,center_x=.5+amount*(cx-.5),
+                    center_y=.5+amount*(cy-.5),roll_degrees=key.roll_degrees)
+                if safe:low=amount
+                else:high=amount
+            cx,cy=.5+low*.999*(cx-.5),.5+low*.999*(cy-.5)
+        keys.append(EditorialTransformKeyframe(frame/fps,key.zoom,cx,cy,key.roll_degrees))
+    return EditorialTransformTrack(tuple(keys),reason='measured_face_path_complete_shot_fixed_cut_endpoints_v1')
 
 
 @isolated_optional()
@@ -1882,6 +1996,9 @@ def build_boundary_subject_alignment_plan(
     if action_framing_model_path is not None and not local_focal_attention:
         raise ValueError('action framing requires the separate local-focal experiment')
     settings = config or BoundarySubjectAlignmentConfig()
+    if settings.settle_policy == 'shot_continuous' and (
+            preserved_editorial_tracks is not None or action_framing_model_path is not None or local_focal_attention):
+        raise ValueError('shot-continuous experiment cannot inherit local preservation or focal-action authority')
     choices = visual_timeline.choices
     if not choices:
         raise ValueError("visual timeline cannot be empty")
@@ -1982,7 +2099,8 @@ def build_boundary_subject_alignment_plan(
         if not renderer_bound:
             return {}
         first, last = _boundary_window_frame_indices(outgoing=outgoing,
-            frame_count=counts[choice_index], window_frames=settings.window_frames)
+            frame_count=counts[choice_index], window_frames=(counts[choice_index]
+                if settings.settle_policy == 'shot_continuous' else settings.window_frames))
         before, after = native_sample_at(choice_index, first), native_sample_at(choice_index, last)
         if before is None or after is None:
             return {}  # Unknown/overlap evidence retains the conservative guard.
@@ -2329,12 +2447,14 @@ def build_boundary_subject_alignment_plan(
                 continue
             outgoing_cut = _native_cut_in_boundary_window(
                 left, outgoing=True, frame_count=counts[boundary_index],
-                fps=fps, window_frames=settings.window_frames,
+                fps=fps, window_frames=(counts[boundary_index]
+                    if settings.settle_policy == 'shot_continuous' else settings.window_frames),
                 **native_cut_window_arguments(boundary_index, outgoing=True),
             )
             incoming_cut = _native_cut_in_boundary_window(
                 right, outgoing=False, frame_count=counts[boundary_index + 1],
-                fps=fps, window_frames=settings.window_frames,
+                fps=fps, window_frames=(counts[boundary_index+1]
+                    if settings.settle_policy == 'shot_continuous' else settings.window_frames),
                 **native_cut_window_arguments(boundary_index+1, outgoing=False),
             )
             cut_sides = ((left, outgoing_cut), (right, incoming_cut))
@@ -2362,7 +2482,7 @@ def build_boundary_subject_alignment_plan(
                 decisions.append(rejected(boundary_index, "exact_cut_frame_decode_or_geometry_failed"))
                 continue
             outgoing_policy, incoming_policy = _paired_framing_policies(
-                outgoing_observation, incoming_observation)
+                outgoing_observation, incoming_observation,reframe_closeups=settings.reframe_closeups)
             outgoing_subject, incoming_subject, subject_failure = _common_subjects(
                 outgoing_observation,
                 incoming_observation,
@@ -2841,6 +2961,22 @@ def build_boundary_subject_alignment_plan(
                     raise ValueError('preserved camera altered the measured target endpoint')
             return combined
 
+        def follow_measured_face(choice_index, track, trial):
+            if not settings.follow_face_path or any(d.subject_kind!='face' for d in trial.values()):
+                return track
+            boxes=[]
+            for frame_index in range(counts[choice_index]):
+                nearest=min(trial,key=lambda boundary:frame_index if boundary==choice_index-1
+                    else counts[choice_index]-1-frame_index)
+                decision=trial[nearest]
+                policy=decision.outgoing_shot_policy if choice_index==nearest else decision.incoming_shot_policy
+                subject,_=dense_subject_at(choice_index,frame_index,'face',policy)
+                if subject is None or subject.kind!='face':
+                    raise _FacePathUnavailable('complete-shot face path is unobserved')
+                boxes.append(subject.alignment_box)
+            return _follow_face_camera_path(track,boxes,fps=fps,
+                maximum_center_shift=settings.maximum_paired_face_center_shift)
+
         # Each cut transforms exactly one side, so a boundary belongs to one
         # segment only. Try its endpoint-valid strengths against the COMPLETE
         # visible settle, including any neighboring ramp. Choosing a weaker
@@ -2881,10 +3017,14 @@ def build_boundary_subject_alignment_plan(
                               if entry_decision is not None else None,
                         exit=(exit_decision.boundary_index, exit_decision.outgoing_state)
                              if exit_decision is not None else None,
+                        settle_policy=settings.settle_policy,
                     )
                     if track is None:
                         raise ValueError("non-neutral candidates produced no track")
+                    track = follow_measured_face(choice_index,track,trial)
                     track = compose_preserved_track(choice_index,track,trial)
+                except _FacePathUnavailable:
+                    failure = "per_frame_face_path_unobserved"
                 except ValueError:
                     failure = "composite_track_renderer_safety_rejection"
                 else:
@@ -2961,10 +3101,12 @@ def build_boundary_subject_alignment_plan(
                     track = _track_for_segment(last_frame_time=(counts[index]-1)/fps,
                         ramp_frames=settings.window_frames, fps=fps,
                         entry=(entry.boundary_index,entry.incoming_state) if entry else None,
-                        exit=(exit.boundary_index,exit.outgoing_state) if exit else None)
+                        exit=(exit.boundary_index,exit.outgoing_state) if exit else None,
+                        settle_policy=settings.settle_policy)
                     if track is None:
                         break
                     try:
+                        track = follow_measured_face(index,track,trial)
                         track = compose_preserved_track(index,track,trial)
                     except ValueError:
                         break
@@ -3028,10 +3170,14 @@ def build_boundary_subject_alignment_plan(
             final_segments,
             tuple(headroom_items),
             settings.window_frames,
-            analysis_basis=(ACTION_EXPERIMENT_BASIS if action_framing_model_path is not None
+            analysis_basis=(SHOT_CAMERA_EXPERIMENT_BASIS if settings.settle_policy == 'shot_continuous'
+                else ACTION_EXPERIMENT_BASIS if action_framing_model_path is not None
                 else FOCAL_EXPERIMENT_BASIS if local_focal_attention else ANALYSIS_BASIS),
             sample_clock_basis=clock_basis,
             dense_track_candidate_attempt_count=dense_attempts,
+            settle_policy=settings.settle_policy,
+            reframe_closeups=settings.reframe_closeups,
+            follow_face_path=settings.follow_face_path,
         )
     finally:
         if capture is not None:
@@ -3042,6 +3188,7 @@ __all__ = [
     "ANALYSIS_BASIS",
     "FOCAL_EXPERIMENT_BASIS",
     "ACTION_EXPERIMENT_BASIS",
+    "SHOT_CAMERA_EXPERIMENT_BASIS",
     "BoundarySubjectAlignmentConfig",
     "BoundarySubjectAlignmentDecision",
     "BoundarySubjectAlignmentPlan",
