@@ -427,7 +427,7 @@ class BoundaryVisualEvidence:
 
     @property
     def selection_cost(self) -> float:
-        return self.closeup_gesture.mismatch if self.closeup_gesture is not None else self.total_cost
+        return self.closeup_gesture.ranking_cost if self.closeup_gesture is not None else self.total_cost
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -463,7 +463,10 @@ class BoundaryVisualEvidence:
         if self.closeup_gesture is not None:
             payload["closeup_gesture"] = self.closeup_gesture.to_dict()
             payload["selection_cost"] = self.selection_cost
-            payload["selection_cost_basis"] = "exact_arm_articulation_after_unchanged_production_gates"
+            payload["selection_cost_basis"] = (
+                "exact_four_frame_arm_motion_after_unchanged_production_gates"
+                if self.closeup_gesture.motion is not None else
+                "exact_arm_articulation_after_unchanged_production_gates")
         return payload
 
 
@@ -538,10 +541,7 @@ class VisualBoundaryRepair:
             if not isinstance(baseline_payload, Mapping):
                 raise ValueError('selected repair lost incumbent gesture observations')
             try:
-                baseline_gesture = CloseupGestureEvidence(
-                    baseline_payload['outgoing_native_frame'], baseline_payload['incoming_native_frame'],
-                    tuple(baseline_payload['bone_mismatches']),
-                    baseline_payload['outgoing_focal_basis'], baseline_payload['incoming_focal_basis'])
+                baseline_gesture = CloseupGestureEvidence.from_dict(_thaw_audit_value(baseline_payload))
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError('selected repair has invalid incumbent gesture observations') from exc
             if not self.selected_visual_evidence.closeup_gesture.improves_over(baseline_gesture):
@@ -2023,6 +2023,7 @@ def repair_visual_timeline_boundaries(
     boundary_indices: Sequence[int] | None = None,
     render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
     closeup_gesture_model_path: Path | None = None,
+    closeup_gesture_motion_enabled: bool = False,
 ) -> VisualBoundaryRepairPlan:
     """Return locally repaired timing for every or only requested boundaries.
 
@@ -2033,6 +2034,10 @@ def repair_visual_timeline_boundaries(
 
     if not isinstance(require_persistent_feature_cache, bool):
         raise TypeError("require_persistent_feature_cache must be boolean")
+    if type(closeup_gesture_motion_enabled) is not bool:
+        raise TypeError('closeup gesture motion switch must be boolean')
+    if closeup_gesture_motion_enabled and closeup_gesture_model_path is None:
+        raise ValueError('closeup motion requires an explicit gesture model')
     if require_persistent_feature_cache:
         if feature_derived_cache_directory is None:
             raise PersistentVisualFeatureCacheInitializationError(
@@ -2368,6 +2373,7 @@ def repair_visual_timeline_boundaries(
                 int,
                 tuple[BoundaryVisualEvidence, FrameVisualDescriptor, FrameVisualDescriptor],
             ] = {}
+            gesture_motion_objective = False
 
             def candidate_evidence_audit() -> tuple[dict[str, Any], ...]:
                 """Serialize every requested offset, including decode gaps."""
@@ -2433,7 +2439,7 @@ def repair_visual_timeline_boundaries(
                 return tuple(audit)
 
             def visual_cost(context: BoundaryCandidateContext) -> float | None:
-                nonlocal gesture_provider
+                nonlocal gesture_provider, gesture_motion_objective
                 frame_seconds = 1.0 / output_fps
                 side_sample_span_seconds = 3.0 * frame_seconds
                 outgoing_exact_seconds = (
@@ -2573,6 +2579,22 @@ def repair_visual_timeline_boundaries(
                         (incoming.source_index, incoming_exact_seconds, incoming_clock, incoming_descriptor))
                     if gesture is None:
                         return None
+                    if closeup_gesture_motion_enabled and (context.frame_offset == 0 or gesture_motion_objective):
+                        moving = gesture_provider.compare_motion(
+                            (outgoing.source_index,outgoing_preceding_seconds,outgoing_clock,outgoing_preceding_descriptor),
+                            (outgoing.source_index,outgoing_exact_seconds,outgoing_clock,outgoing_descriptor),
+                            (incoming.source_index,incoming_exact_seconds,incoming_clock,incoming_descriptor),
+                            (incoming.source_index,incoming_following_seconds,incoming_clock,incoming_following_descriptor),
+                            output_fps=output_fps)
+                        if context.frame_offset == 0:
+                            # Choose ONE comparison domain at the incumbent.
+                            # An unknown later motion cannot compete with a
+                            # measured velocity under a cheaper static score.
+                            gesture_motion_objective = moving is not None
+                        if gesture_motion_objective:
+                            if moving is None:
+                                return None
+                            gesture = moving
                     # Keep legacy geometric and temporal-motion costs intact.
                     # Articulation is a separately named ranking objective, not
                     # a fake calibrated temporal-motion bonus or pass signal.
@@ -2581,7 +2603,8 @@ def repair_visual_timeline_boundaries(
                     original = evidence_by_offset.get(0)
                     if (context.frame_offset != 0 and original is not None
                             and original[0].closeup_gesture is not None
-                            and not gesture.preserves_observations_of(original[0].closeup_gesture)):
+                            and (not gesture.preserves_observations_of(original[0].closeup_gesture)
+                                 or not gesture.preserves_pose_continuity_of(original[0].closeup_gesture))):
                         return None  # A hidden mismatched hand cannot improve the score.
                     if (context.frame_offset != 0 and original is not None
                             and not _gesture_preserves_visual_comparison(evidence.to_dict(), original[0].to_dict())):
@@ -2810,6 +2833,7 @@ def repair_visual_timeline_boundaries(
             "complete_success_offset_audit_v1+"
             "temporal_pose_motion_audit_v1+renderer_bound_output_tick_audition_v2"
             + ("+exact_closeup_observed_arm_articulation_refinement_v2" if closeup_gesture_model_path is not None else "")
+            + ("+exact_four_frame_arm_motion_ranking_v1" if closeup_gesture_motion_enabled else "")
         ),
         selected_candidate_index=visual_timeline.selected_candidate_index,
         candidate_generation_basis=visual_timeline.candidate_generation_basis,

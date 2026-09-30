@@ -20965,6 +20965,7 @@ def _review_first_closeup_gesture_repair(
     *,
     sources: Sequence[Path],
     closeup_gesture_model_path: Path | None = None,
+    closeup_gesture_motion_enabled: bool = False,
     **repair_arguments: Any,
 ) -> VisualBoundaryRepairPlan | None:
     """One exact-arm audition, preserving sources/cuts and music/source clocks.
@@ -20975,6 +20976,8 @@ def _review_first_closeup_gesture_repair(
     admitted by the unchanged production gates, retaining the incumbent's bone
     coverage and existing visual costs. No reanalysis of the whole sources.
     """
+    if type(closeup_gesture_motion_enabled) is not bool:
+        raise TypeError('closeup gesture motion switch must be boolean')
     from .timeline import ShotType
     choices = earlier.timeline.choices
     focal_types = {ShotType.CLOSE_UP, ShotType.MEDIUM}
@@ -20984,26 +20987,42 @@ def _review_first_closeup_gesture_repair(
         and (right.entry_shot_type or right.shot_type) in focal_types)
     if not targets:
         return None
-    if len(targets) > 12:
-        # Keep the work ceiling unchanged. Prioritize actual tight pairs, then
-        # the larger minimum observed shot scale; a tiny background face cannot
-        # steal an audition from a foreground close-up.
-        def priority(index):
-            left, right = choices[index:index+2]
-            tight = ((left.exit_shot_type or left.shot_type) is ShotType.CLOSE_UP
-                     and (right.entry_shot_type or right.shot_type) is ShotType.CLOSE_UP)
-            return (-int(tight), -min(left.shot_scale, right.shot_scale), index)
-        targets = tuple(sorted(sorted(targets, key=priority)[:12]))
     if closeup_gesture_model_path is None:
         cache = repair_arguments.get('feature_cache_directory')
         if cache is None:
             return None
         from .source_first_model_assets import ensure_source_first_model_assets
         closeup_gesture_model_path = ensure_source_first_model_assets(cache).pose_model_path
+    if len(targets) > 12:
+        motion_priorities = {}
+        if closeup_gesture_motion_enabled:
+            from .closeup_gesture import boundary_motion_priorities
+            origin=choices[0].canonical_master_start
+            audit_plan=RenderPlan(tuple(Path(p) for p in sources),tuple(
+                RenderSegment(c.source_index,c.source_local_start,c.duration_seconds,
+                    c.canonical_master_start-origin,source_duration=c.source_duration_seconds)
+                for c in choices),0,'16:9',Path('unused-motion-priority-plan.mp4'),
+                fps=repair_arguments.get('output_fps',29.97))
+            motion_priorities=boundary_motion_priorities(audit_plan,targets,
+                model_path=closeup_gesture_model_path,scene_cut_times=repair_arguments['scene_cut_times'],
+                **{name:repair_arguments[name] for name in (
+                    'feature_cache_directory','feature_derived_cache_directory',
+                    'require_persistent_feature_cache') if name in repair_arguments})
+        # One nominal four-frame triage, then at most twelve existing offset
+        # auditions. Missing motion is not zero-quality or a source veto;
+        # tied/unobserved priorities preserve the former face-size ordering.
+        def priority(index):
+            left, right = choices[index:index+2]
+            tight = ((left.exit_shot_type or left.shot_type) is ShotType.CLOSE_UP
+                     and (right.entry_shot_type or right.shot_type) is ShotType.CLOSE_UP)
+            return (-motion_priorities.get(index,0.),-int(tight),
+                    -min(left.shot_scale, right.shot_scale), index)
+        targets = tuple(sorted(sorted(targets, key=priority)[:12]))
     later = repair_visual_timeline_boundaries(
         visual_timeline=earlier.timeline, sources=sources, boundary_indices=targets,
         config=BoundaryRepairConfig(search_radius_frames=8, interior_scene_cut_guard_frames=9),
-        closeup_gesture_model_path=closeup_gesture_model_path, **repair_arguments)
+        closeup_gesture_model_path=closeup_gesture_model_path,
+        closeup_gesture_motion_enabled=closeup_gesture_motion_enabled, **repair_arguments)
     old, new = earlier.timeline.choices, later.timeline.choices
     if (len(new) != len(old) or tuple(c.source_index for c in new) != tuple(c.source_index for c in old)
             or abs(new[0].canonical_master_start-old[0].canonical_master_start) > 1e-9

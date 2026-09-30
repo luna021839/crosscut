@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from crosscut.closeup_gesture import CloseupGestureEvidence
+from crosscut.closeup_gesture import CloseupGestureEvidence, ObservedArmMotion
 from crosscut.pipeline import _review_first_closeup_gesture_repair
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.timeline import ShotType
@@ -15,6 +15,86 @@ from tests.test_visual_boundary_repair import _choice, _descriptor
 
 
 class CloseupGestureRepairTests(unittest.TestCase):
+    @staticmethod
+    def moving(before,left,right,after,**kwargs):
+        first=round(right[1]*30)
+        cost={58:.6,59:.01}.get(first,.4)
+        ids=tuple(round(sample[1]*30) for sample in (before,left,right,after))
+        motion=ObservedArmMotion(ids,(.1,1/30,.1),(cost,)*4,(0.,)*4)
+        return CloseupGestureEvidence(ids[1],ids[2],(.2,)*4,motion=motion)
+
+    def test_motion_audition_rejects_static_winner_that_moves_the_wrong_way(self):
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=self.compare
+            provider.return_value.compare_motion.side_effect=self.moving
+            result=repair_visual_timeline_boundaries(**self.arguments,closeup_gesture_motion_enabled=True)
+        self.assertEqual(-1,result.repairs[0].result.selected_frame_offset)
+        evidence=result.repairs[0].selected_visual_evidence
+        self.assertIsNotNone(evidence.closeup_gesture.motion)
+        self.assertEqual('exact_four_frame_arm_motion_after_unchanged_production_gates',
+                         evidence.to_dict()['selection_cost_basis'])
+        self.assertFalse(evidence.temporal_pose_motion.analysis_executed)
+        self.assertFalse(evidence.closeup_gesture.to_dict()['temporal_phase_proven'])
+
+    def test_missing_candidate_motion_cannot_win_with_static_fallback(self):
+        def moving(before,left,right,after,**kwargs):
+            if round(right[1]*30)==58:return None
+            return self.moving(before,left,right,after,**kwargs)
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=self.compare
+            provider.return_value.compare_motion.side_effect=moving
+            result=repair_visual_timeline_boundaries(**self.arguments,closeup_gesture_motion_enabled=True)
+        self.assertEqual(-1,result.repairs[0].result.selected_frame_offset)
+
+    def test_missing_incumbent_motion_keeps_separate_existing_static_objective(self):
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=self.compare
+            provider.return_value.compare_motion.return_value=None
+            result=repair_visual_timeline_boundaries(**self.arguments,closeup_gesture_motion_enabled=True)
+            for call in provider.return_value.compare_motion.call_args_list:
+                self.assertEqual(60,round(call.args[2][1]*30))
+        self.assertEqual(-2,result.repairs[0].result.selected_frame_offset)
+        self.assertIsNone(result.repairs[0].selected_visual_evidence.closeup_gesture.motion)
+
+    def test_motion_switch_cannot_run_without_model_or_as_untyped_flag(self):
+        with self.assertRaises(TypeError):
+            repair_visual_timeline_boundaries(**self.arguments,closeup_gesture_motion_enabled=1)
+        args=dict(self.arguments,closeup_gesture_model_path=None)
+        with self.assertRaises(ValueError):
+            repair_visual_timeline_boundaries(**args,closeup_gesture_motion_enabled=True)
+
+    def test_nominal_motion_priority_does_not_leave_large_faces_permanently_first(self):
+        choices=tuple(replace(_choice(i,i%2),shot_type=ShotType.MEDIUM,shot_scale=.1)
+                      for i in range(30))
+        choices=tuple(replace(c,shot_type=ShotType.CLOSE_UP,shot_scale=.5) if i<20 else c
+                      for i,c in enumerate(choices))
+        timeline=VisualTimelinePlan(choices,1.)
+        earlier=VisualBoundaryRepairPlan(timeline,(timeline,),(),0,())
+        with patch('crosscut.closeup_gesture.boundary_motion_priorities',return_value={25:.8}) as motion, \
+             patch('crosscut.pipeline.repair_visual_timeline_boundaries',return_value=earlier) as repair:
+            result=_review_first_closeup_gesture_repair(earlier,sources=(Path('a'),Path('b')),
+                closeup_gesture_model_path=Path('pose.onnx'),closeup_gesture_motion_enabled=True,
+                scene_cut_times=((),()))
+        self.assertIsNone(result)
+        self.assertEqual(1,motion.call_count)
+        self.assertEqual(29,len(motion.call_args.args[1]))
+        self.assertEqual(12,len(repair.call_args.kwargs['boundary_indices']))
+        self.assertIn(25,repair.call_args.kwargs['boundary_indices'])
+        self.assertTrue(repair.call_args.kwargs['closeup_gesture_motion_enabled'])
+
+    def test_velocity_improvement_cannot_promote_worse_pose_jump(self):
+        def moving(before,left,right,after,**kwargs):
+            first=round(right[1]*30)
+            ids=tuple(round(sample[1]*30) for sample in (before,left,right,after))
+            jump,velocity=(.8,.1) if first==58 else (.1,1.) if first==59 else (.6,1.3)
+            return CloseupGestureEvidence(ids[1],ids[2],(.2,)*4,motion=ObservedArmMotion(
+                ids,(.1,1/30,.1),(jump,)*4,(velocity,)*4))
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=self.compare
+            provider.return_value.compare_motion.side_effect=moving
+            result=repair_visual_timeline_boundaries(**self.arguments,closeup_gesture_motion_enabled=True)
+        self.assertEqual(-1,result.repairs[0].result.selected_frame_offset)
+
     def test_arm_preference_cannot_trade_away_existing_visual_cost_or_coverage(self):
         before=dict(total_cost=.2,base_total_cost=.2,focus_mismatch=.1)
         self.assertTrue(_gesture_preserves_visual_comparison(dict(before,total_cost=.1),before))
