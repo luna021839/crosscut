@@ -70,7 +70,11 @@ def splice_boundary_camera(old_track, new_track, *, relative_shift, frame_count,
     else:
         keys = [new_track.evaluate(time) for time in sorted(new_times|{seam}) if time <= seam]
         keys += [old_at(time) for time in sorted(old_times) if time > seam]
-    result = EditorialTransformTrack(tuple(keys), reason='camera_conditioned_cut_with_neutral_neighbor_seam_v1')
+    canvas=max(old_track.effective_sampling_canvas_zoom,new_track.effective_sampling_canvas_zoom)
+    explicit=(canvas if old_track.sampling_canvas_zoom is not None or new_track.sampling_canvas_zoom is not None
+        or max(k.zoom for k in keys)<canvas else None)
+    result = EditorialTransformTrack(tuple(keys), reason='camera_conditioned_cut_with_neutral_neighbor_seam_v1',
+        sampling_canvas_zoom=explicit)
     # Do not permit a seam that quietly discards the other cut's active ramp.
     protected = (range(min(preserved_boundary_frames,frame_count)) if outgoing else
         range(max(0,frame_count-preserved_boundary_frames),frame_count))

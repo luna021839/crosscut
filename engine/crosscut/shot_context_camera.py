@@ -18,7 +18,8 @@ from .boundary_subject_alignment import (
     _default_observation_provider, _close_face_head_envelope, _optical_flow_box,
     _local_focal_observation_provider,
 )
-from .render import EditorialTransformTrack, RenderPlan, segment_frame_counts, _can_share_source_clock
+from .render import (EditorialTransformKeyframe, EditorialTransformTrack, NormalizedCrop,
+    PanCropKeyframe, PanCropTrack, RenderPlan, segment_frame_counts, _can_share_source_clock)
 from .render_boundary_clock import native_frame_clocks_for_output
 from .render_frame_schedule import probe_render_frame_clock,VerifiedRenderFrameClock
 from .render_geometry import reproject_editorial_frame
@@ -173,6 +174,94 @@ def build_shot_context_camera(*, source_endpoints, neighbor_endpoints, head_enve
     return ShotContextCamera(track,entry,exit_state,min(visible),len(heads),scale_basis,endpoint_scale_policy)
 
 
+def retain_opposite_cut_camera(segment, native_track, *, head_envelopes, fps,
+        outgoing=False, preserved_boundary_frames=4, ramp_frames=14):
+    """Keep one cut's existing nonneutral camera, not just its final keypoint.
+
+    A complete native-coordinate candidate can use a different base pan from
+    the incumbent. Reparameterize its unrolled viewport into the incumbent's
+    fixed-size pan; move that pan only enough to contain the desired viewport.
+    Smoothly return to the incumbent BEFORE the opposite comparison window,
+    then retain every original pan/editorial state in that window exactly.
+    This is a bounded geometry proposal: every native head envelope is checked,
+    but neither pixel identity after encoding nor editorial quality is claimed.
+    """
+    heads=tuple(head_envelopes);count=len(heads)
+    if (not isinstance(native_track,EditorialTransformTrack)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0
+            or type(outgoing) is not bool or type(preserved_boundary_frames) is not int
+            or not 4<=preserved_boundary_frames<=14 or type(ramp_frames) is not int
+            or not 4<=ramp_frames<=30 or not 2*preserved_boundary_frames+ramp_frames<=count<=80
+            or abs(segment.duration-count/fps)>1/fps+1e-8
+            or segment.crop is not None or segment.outgoing_overlap_transform is not None
+            or segment.editorial_transform is None
+            or any(abs(k.roll_degrees)>1e-9 for k in native_track.keyframes)
+            or segment.editorial_transform is not None
+                and any(abs(k.roll_degrees)>1e-9 for k in segment.editorial_transform.keyframes)):
+        raise ValueError('opposite-cut retention needs a bounded complete unrolled native shot')
+    if segment.pan_crop is None:width=height=1.
+    else:width,height=segment.pan_crop.fixed_crop_size
+    if abs(width-height)>1e-9:
+        raise ValueError('native viewport retention cannot change the base crop aspect')
+    original=segment.editorial_transform
+    keys=[];pan_keys=[]
+    def retained(n):
+        return n<preserved_boundary_frames if outgoing else n>=count-preserved_boundary_frames
+    for n,head in enumerate(heads):
+        if (head is None or len(head)!=4 or any(type(v) not in (int,float) or not math.isfinite(v) for v in head)
+                or head[0]<0 or head[1]<0 or head[2]<=0 or head[3]<=0
+                or head[0]+head[2]>1.000001 or head[1]+head[3]>1.000001):
+            raise ValueError('opposite-cut retention needs every measured native head envelope')
+        time=n/fps
+        x,y,_,_=_fixed_crop_at(segment.pan_crop,time) if segment.pan_crop else (0.,0.,1.,1.)
+        old=original.evaluate(time);new=native_track.evaluate(time)
+        if retained(n):
+            key=replace(old,time_seconds=time)
+        else:
+            # Quintic easing has zero endpoint velocity/acceleration. There is
+            # no one-frame reset from a new camera to the protected old one.
+            distance=n-preserved_boundary_frames+1 if outgoing else count-preserved_boundary_frames-n
+            progress=max(0.,min(1.,distance/ramp_frames))
+            amount=progress**3*(10.+progress*(-15.+6.*progress))
+            old_native=(old.zoom/width,x+width*old.center_x,y+height*old.center_y)
+            zoom,cx,cy=(a*(1.-amount)+b*amount for a,b in
+                zip(old_native,(new.zoom,new.center_x,new.center_y)))
+            local_zoom=zoom*width
+            if local_zoom<1.-1e-9:
+                raise ValueError('native candidate needs pixels outside the fixed-size base pan')
+            local_zoom=max(1.,local_zoom)
+            radius=.5/zoom
+            # Preserve the old pan when it already contains the viewport.
+            # Otherwise choose the closest containing pan, never outside pixels.
+            left_low,left_high=max(0.,cx+radius-width),min(1.-width,cx-radius)
+            top_low,top_high=max(0.,cy+radius-height),min(1.-height,cy-radius)
+            if left_low>left_high+1e-9 or top_low>top_high+1e-9:
+                raise ValueError('native candidate viewport cannot fit inside real source pixels')
+            x=min(left_high,max(left_low,x));y=min(top_high,max(top_low,y))
+            key=EditorialTransformKeyframe(time,local_zoom,(cx-x)/width,(cy-y)/height,0.)
+        transformed=((head[0]-x)/width,(head[1]-y)/height,head[2]/width,head[3]/height)
+        state=_TransformState(key.zoom,key.center_x,key.center_y,key.roll_degrees)
+        if _project_box(transformed,state)[1]<.995:
+            raise ValueError(f'opposite-cut retention clips measured head at frame {n}')
+        keys.append(key)
+        if segment.pan_crop is not None:
+            pan_keys.append(PanCropKeyframe(time,NormalizedCrop(x,y,width,height)))
+    track=EditorialTransformTrack(tuple(keys),reason='complete_native_camera_with_preserved_opposite_cut_window_v1',
+        sampling_canvas_zoom=max(original.effective_sampling_canvas_zoom,max(k.zoom for k in keys)))
+    pan=PanCropTrack(tuple(pan_keys)) if pan_keys else None
+    result=replace(segment,pan_crop=pan,editorial_transform=track)
+    for n in range(count):
+        if not retained(n):continue
+        time=n/fps
+        actual=result.editorial_transform.evaluate(time);expected=original.evaluate(time)
+        if (any(abs(getattr(actual,name)-getattr(expected,name))>1e-9 for name in
+                    ('zoom','center_x','center_y','roll_degrees'))
+                or segment.pan_crop is not None and any(abs(a-b)>1e-9 for a,b in
+                    zip(_fixed_crop_at(result.pan_crop,time),_fixed_crop_at(segment.pan_crop,time)))):
+            raise ValueError('opposite-cut retention changed a protected output camera state')
+    return result
+
+
 def observe_shot_head(frame):
     """Experimental native-resolution pass, then bounded roll reacquisition."""
     original=_default_observation_provider(frame)
@@ -248,8 +337,11 @@ def slice_shot_camera_track(track, *, frame_offset, frame_count, fps):
     if (type(frame_offset) is not int or frame_offset<0 or type(frame_count) is not int
             or frame_count<1 or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0):
         raise ValueError('invalid source-run camera slice')
-    return EditorialTransformTrack(tuple(replace(track.evaluate((frame_offset+n)/fps),
-        time_seconds=n/fps) for n in range(frame_count)),reason=track.reason)
+    keys=tuple(replace(track.evaluate((frame_offset+n)/fps),time_seconds=n/fps) for n in range(frame_count))
+    canvas=track.sampling_canvas_zoom
+    if canvas is None and max(k.zoom for k in keys)<track.effective_sampling_canvas_zoom:
+        canvas=track.effective_sampling_canvas_zoom
+    return EditorialTransformTrack(keys,reason=track.reason,sampling_canvas_zoom=canvas)
 
 
 def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
@@ -331,7 +423,7 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
                 key=old.editorial_transform.evaluate(time)
                 frame=reproject_editorial_frame(frame,size=(854,480),zoom=key.zoom,center_x=key.center_x,
                     center_y=key.center_y,roll_degrees=key.roll_degrees,
-                    maximum_zoom=max(k.zoom for k in old.editorial_transform.keyframes))
+                    maximum_zoom=old.editorial_transform.effective_sampling_canvas_zoom)
             neighbor=observe_shot_head(frame)
             if local_focal_attention and not _usable_shot_face(neighbor):neighbor=observer(frame)
             neighbors.append(neighbor)

@@ -940,7 +940,8 @@ def _boundary_editorial_track_from_serialized(
         if any(value is None for value in values.values()):
             raise ValueError(f"{label} keyframe is incomplete")
         keyframes.append(EditorialTransformKeyframe(**values))
-    return EditorialTransformTrack(tuple(keyframes), reason=reason)
+    return EditorialTransformTrack(tuple(keyframes), reason=reason,
+        sampling_canvas_zoom=payload.get('sampling_canvas_zoom'))
 
 
 def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
@@ -4702,7 +4703,10 @@ def _bound_boundary_local_alignment_tracks(
         if track is None or index >= len(motion_segments):
             continue
         frames = (_mapping(plan["segments"][index].get("editorial_transform")) or {}).get("keyframes")
+        canvas=(_mapping(plan['segments'][index].get('editorial_transform')) or {}).get('sampling_canvas_zoom')
         if (item.get("keyframes") != frames
+                or item.get('sampling_canvas_zoom')!=canvas
+                or (_mapping(motion_segments[index]) or {}).get('sampling_canvas_zoom')!=canvas
                 or (_mapping(motion_segments[index]) or {}).get("keyframes") != frames):
             continue
         active_count = sum(

@@ -20079,6 +20079,9 @@ def _final_render_segments_payload(
                 if segment.editorial_transform is not None
                 else 0
             ),
+            **({'editorial_sampling_canvas_zoom':segment.editorial_transform.sampling_canvas_zoom}
+                if segment.editorial_transform is not None
+                    and segment.editorial_transform.sampling_canvas_zoom is not None else {}),
             "source_look_adjustment": (
                 {
                     "brightness": segment.look_adjustment.brightness,

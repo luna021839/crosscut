@@ -676,6 +676,12 @@ def _reference_view_for_span(
     )
     from .render_geometry import reproject_editorial_frame
     maximum_zoom = max(float(item["zoom"]) for item in span.editorial_transform["keyframes"])
+    sampling_canvas=span.editorial_transform.get('sampling_canvas_zoom')
+    if sampling_canvas is not None:
+        if (type(sampling_canvas) not in (int,float) or not math.isfinite(sampling_canvas)
+                or not maximum_zoom<=sampling_canvas<=2.):
+            raise ValueError('editorial sampling canvas is outside the renderer contract')
+        maximum_zoom=sampling_canvas
     # A rotation on the analysis canvas is not the rendered camera: even
     # maximum-zoom dimensions and integer crop positions change with resolution.
     # Reconstruct rolled tracks on the real output canvas, then downsample just

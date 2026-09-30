@@ -38,7 +38,7 @@ class PrescribedGeometrySampler:
         self.source_clock = PrescribedRenderClock(segment, master_start)
         self.frame_rate = getattr(sampler, "frame_rate", 29.97)
         def serialized(value):
-            return json.loads(json.dumps(asdict(value))) if value is not None else None
+            return json.loads(json.dumps(value.to_dict() if hasattr(value,'to_dict') else asdict(value))) if value is not None else None
         self.span = _Span(
             segment_index=0, source_index=segment.source_index,
             start_frame=0, end_frame=1, run_index=0,

@@ -119,6 +119,7 @@ def bound_coupled_shot_cameras(motion,plan):
             if (not isinstance(item,Mapping) or item.get('segment_index')!=i
                     or item.get('source_index')!=plan.segments[i].source_index
                     or item.get('applied') is not True
+                    or item.get('sampling_canvas_zoom')!=serialized[i]['editorial_transform'].get('sampling_canvas_zoom')
                     or item.get('keyframes')!=list(serialized[i]['editorial_transform']['keyframes'])):return {}
             result[i]=row
     return result

@@ -210,6 +210,7 @@ def bound_shot_context_cameras(motion, plan):
             if (not isinstance(item,Mapping) or item.get('segment_index')!=index
                     or item.get('source_index')!=plan.segments[index].source_index
                     or item.get('applied') is not True
+                    or item.get('sampling_canvas_zoom')!=serialized[index]['editorial_transform'].get('sampling_canvas_zoom')
                     or item.get('keyframes')!=list(serialized[index]['editorial_transform']['keyframes'])):return {}
             result[index]=row
     # Adjacent replaced shots alter each other's supposedly fixed targets.

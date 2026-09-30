@@ -322,10 +322,18 @@ class EditorialTransformTrack:
 
     keyframes: tuple[EditorialTransformKeyframe, ...]
     reason: str = "subject_scale_matched_hard_cut"
+    # Sampling floor, not extra crop authority. None retains legacy pixels.
+    sampling_canvas_zoom: float | None = None
 
     def __post_init__(self) -> None:
         if not self.keyframes:
             raise ValueError("group transform track needs at least one keyframe")
+        if self.sampling_canvas_zoom is not None and (
+            type(self.sampling_canvas_zoom) not in (int, float)
+            or not math.isfinite(self.sampling_canvas_zoom)
+            or not max(k.zoom for k in self.keyframes)<=self.sampling_canvas_zoom<=2.0
+        ):
+            raise ValueError("editorial sampling canvas must cover the camera peak within 2x")
         if abs(self.keyframes[0].time_seconds) > 1e-9:
             raise ValueError("group transform track must start at segment time zero")
         previous = -1.0
@@ -368,6 +376,17 @@ class EditorialTransformTrack:
     @property
     def final_keyframe(self) -> EditorialTransformKeyframe:
         return self.keyframes[-1]
+
+    @property
+    def effective_sampling_canvas_zoom(self) -> float:
+        return (self.sampling_canvas_zoom if self.sampling_canvas_zoom is not None
+            else max(k.zoom for k in self.keyframes))
+
+    def to_dict(self) -> dict[str, object]:
+        payload=asdict(self)
+        if self.sampling_canvas_zoom is None:
+            payload.pop('sampling_canvas_zoom')
+        return payload
 
     def evaluate(self, time_seconds: float) -> EditorialTransformKeyframe:
         """Evaluate the exact linear state used by FFmpeg at one frame time."""
@@ -1358,6 +1377,9 @@ class RenderPlan:
         serialized_segments: list[dict[str, object]] = []
         for segment in self.segments:
             payload = asdict(segment)
+            for name in ('editorial_transform','outgoing_overlap_transform'):
+                if getattr(segment,name) is not None:
+                    payload[name]=getattr(segment,name).to_dict()
             if segment.outgoing_overlap_transform is None:
                 payload.pop("outgoing_overlap_transform", None)
             serialized_look = payload.get("look_adjustment")
@@ -1604,7 +1626,7 @@ def _editorial_transform_filters(
             time_variable=output_clock,
         )
     )
-    maximum_zoom = max(keyframe.zoom for keyframe in track.keyframes)
+    maximum_zoom = track.effective_sampling_canvas_zoom
     # Preserve source detail through the authored camera move. Scaling to the
     # final canvas before zoompan would discard 4K pixels and then enlarge the
     # already-downsampled 1080p frame. The larger even working canvas makes a
@@ -1976,6 +1998,7 @@ def _dissolve_handle_video_chain(
                 ),
             ),
             reason=f"{segment.editorial_transform.reason}_dissolve_handle_hold",
+            sampling_canvas_zoom=segment.editorial_transform.sampling_canvas_zoom,
         )
     return _video_chain(
         source_index=segment.source_index,
@@ -2118,6 +2141,8 @@ def _editorial_transform_track_is_identity(
 
     if track is None:
         return True
+    if track.effective_sampling_canvas_zoom>1.+1e-9:
+        return False
     return all(
         math.isclose(keyframe.zoom, 1.0, rel_tol=0.0, abs_tol=1e-9)
         and math.isclose(

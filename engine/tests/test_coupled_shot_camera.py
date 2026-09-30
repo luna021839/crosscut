@@ -58,6 +58,16 @@ class CoupledShotCameraTests(unittest.TestCase):
             damaged=deepcopy(raw);damaged['segments'][index]['keyframes']=[]
             self.assertEqual(_bound_local_alignment_tracks(damaged,json.loads(json.dumps(pair.plan.to_json()))),(set(),set()))
 
+    def test_sampling_canvas_is_retained_in_an_atomic_pair_and_cannot_be_dropped(self):
+        from crosscut.coupled_shot_binding import bound_coupled_shot_cameras
+        previous,motion,pair=self.fixture();parts=list(pair.plan.segments)
+        parts[2]=replace(parts[2],editorial_transform=replace(parts[2].editorial_transform,sampling_canvas_zoom=1.52))
+        pair=replace(pair,outgoing=replace(pair.outgoing,plan=replace(pair.plan,segments=tuple(parts))))
+        raw=attach_coupled_shot_proposal(previous.plan,motion,pair).to_dict()
+        self.assertEqual(set(bound_coupled_shot_cameras(raw,pair.plan)),{1,2})
+        bad=deepcopy(raw);bad['segments'][2].pop('sampling_canvas_zoom')
+        self.assertEqual(bound_coupled_shot_cameras(bad,pair.plan),{})
+
     def test_content_clock_subject_claims_and_cut_domain_are_not_forgeable_by_rehashing(self):
         _,_,pair=self.fixture();good=build_coupled_shot_binding(pair)
         mutations=(('incoming_native_frame_ids',[60]*14),('boundary_indices',[0,1,2]),

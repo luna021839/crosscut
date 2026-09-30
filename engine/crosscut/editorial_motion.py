@@ -174,6 +174,8 @@ class EditorialMotionSegment:
                 if self.track is not None
                 else []
             ),
+            **({'sampling_canvas_zoom':self.track.sampling_canvas_zoom}
+                if self.track is not None and self.track.sampling_canvas_zoom is not None else {}),
         }
 
 

@@ -39,6 +39,22 @@ class ShotContextBindingTests(unittest.TestCase):
         self.assertEqual(metrics['bound_shot_context_segment_indices'],[1])
         with self.assertRaises(TypeError):motion.shot_context_cameras[0]['frame_count']=0
 
+    def test_sampling_canvas_is_part_of_both_plan_and_motion_binding(self):
+        from crosscut.shot_context_binding import bound_shot_context_cameras
+        before,proposal=self.fixture()
+        track=replace(proposal.camera.track,sampling_canvas_zoom=1.8)
+        parts=list(proposal.plan.segments);parts[1]=replace(parts[1],editorial_transform=track)
+        proposal=replace(proposal,plan=replace(proposal.plan,segments=tuple(parts)),
+            camera=replace(proposal.camera,track=track))
+        motion=attach_shot_context_proposal(before,motion_for(before),proposal).to_dict()
+        self.assertEqual(set(bound_shot_context_cameras(motion,proposal.plan)),{1})
+        bad=deepcopy(motion);bad['segments'][1].pop('sampling_canvas_zoom')
+        self.assertEqual(bound_shot_context_cameras(bad,proposal.plan),{})
+        changed=list(proposal.plan.segments)
+        changed[1]=replace(changed[1],editorial_transform=replace(track,sampling_canvas_zoom=1.9))
+        self.assertFalse(shot_context_binding_valid(motion['shot_context_cameras'][0],
+            replace(proposal.plan,segments=tuple(changed))))
+
     def test_camera_clock_context_and_provenance_cannot_be_tampered_or_relabelled(self):
         _,proposal=self.fixture();good=build_shot_context_binding(proposal)
         for key,value in (('contract','exact_cut_frame_shot_adaptive_subject_alignment_v5'),

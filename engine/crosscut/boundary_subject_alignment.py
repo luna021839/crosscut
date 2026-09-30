@@ -572,6 +572,8 @@ class BoundarySubjectAlignmentSegment:
                 if self.track is not None
                 else []
             ),
+            **({'sampling_canvas_zoom':self.track.sampling_canvas_zoom}
+                if self.track is not None and self.track.sampling_canvas_zoom is not None else {}),
         }
 
 
@@ -1961,7 +1963,8 @@ def _follow_face_camera_path(track, boxes, *, fps, maximum_center_shift):
                 else:high=amount
             cx,cy=.5+low*.999*(cx-.5),.5+low*.999*(cy-.5)
         keys.append(EditorialTransformKeyframe(frame/fps,key.zoom,cx,cy,key.roll_degrees))
-    return EditorialTransformTrack(tuple(keys),reason='measured_face_path_complete_shot_fixed_cut_endpoints_v1')
+    return EditorialTransformTrack(tuple(keys),reason='measured_face_path_complete_shot_fixed_cut_endpoints_v1',
+        sampling_canvas_zoom=track.sampling_canvas_zoom)
 
 
 @isolated_optional()
