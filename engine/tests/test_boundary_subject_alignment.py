@@ -103,6 +103,31 @@ def _observations(
 
 
 class BoundarySubjectAlignmentTests(unittest.TestCase):
+    def test_requested_boundaries_keep_full_timeline_clock_without_decoding_others(self):
+        timeline = VisualTimelinePlan(tuple(_choice(i, i, start=float(i), end=float(i+1))
+            for i in range(4)), 1.)
+        sampled = []
+        def frames(index, seconds):
+            sampled.append(index)
+            return _frame(index)
+        args = dict(visual_timeline=timeline, sources=tuple(Path(f'{i}.mp4') for i in range(4)),
+            transitions=(RenderTransition(tier='C'),)*3, fps=30., frame_provider=frames,
+            observation_provider=lambda _: self._tight_observation(),
+            source_resolutions=((3840,2160),)*4)
+        plan = build_boundary_subject_alignment_plan(**args, boundary_indices=(1,))
+        self.assertEqual([item.boundary_index for item in plan.decisions], [1])
+        self.assertEqual(len(plan.segments), 4)
+        self.assertEqual(set(sampled), {1, 2})
+        self.assertIsNone(plan.track_for(0))
+        self.assertIsNone(plan.track_for(3))
+        sampled.clear()
+        empty = build_boundary_subject_alignment_plan(**args, boundary_indices=())
+        self.assertFalse(sampled)
+        self.assertFalse(empty.decisions)
+        for invalid in ((-1,), (3,), (True,), (1,1)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                build_boundary_subject_alignment_plan(**args, boundary_indices=invalid)
+
     @staticmethod
     def _tight_observation(*, small=False):
         face = (.44,.30,.12,.16) if small else (.42,.26,.16,.21)

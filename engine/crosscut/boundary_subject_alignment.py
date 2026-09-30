@@ -1699,6 +1699,7 @@ def build_boundary_subject_alignment_plan(
     observation_provider: ObservationProvider | None = None,
     source_resolutions: Sequence[tuple[int, int] | None] | None = None,
     render_frame_clocks: Sequence[VerifiedRenderFrameClock | None] | None = None,
+    boundary_indices: Sequence[int] | None = None,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
     """Build exact-cut local tracks and validate every transformed frame."""
@@ -1709,6 +1710,12 @@ def build_boundary_subject_alignment_plan(
         raise ValueError("visual timeline cannot be empty")
     if len(transitions) != len(choices) - 1:
         raise ValueError("boundary alignment needs one transition per boundary")
+    requested = None if boundary_indices is None else tuple(boundary_indices)
+    if requested is not None and (len(set(requested)) != len(requested) or any(
+        type(index) is not int or not 0 <= index < len(choices) - 1
+        for index in requested
+    )):
+        raise ValueError("alignment boundary indices must be unique valid integers")
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("boundary alignment fps must be positive and finite")
     if output_width < 320 or output_height < 180:
@@ -2021,6 +2028,8 @@ def build_boundary_subject_alignment_plan(
 
     try:
         for boundary_index, (left, right) in enumerate(zip(choices, choices[1:])):
+            if requested is not None and boundary_index not in requested:
+                continue
             if left.source_index == right.source_index:
                 continue
             transition = transitions[boundary_index]
