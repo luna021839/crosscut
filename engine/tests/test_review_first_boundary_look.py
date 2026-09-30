@@ -3,18 +3,22 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from fractions import Fraction
 import unittest
 from unittest.mock import patch
 
 from crosscut.boundary_look_match import (
     BoundaryLookDecision, BoundaryLookMatchConfig, BoundaryLookRenderAdmissionConfig,
     BoundaryLookMeasurementCache, _boundary_pair_render_plan,
+    _frame_at_original_milliseconds,
     analyze_boundary_look_match, verify_boundary_look_match_render_domain,
 )
 from crosscut.ive import AspectRatio
 from crosscut.render import RenderPlan, RenderSegment
 from crosscut.review_first_boundary_look import refine_review_first_boundary_look
 from tests.test_boundary_look_match import _MetricCache, _metric
+from tests.test_seek_locality import FakeCapture
+from crosscut.seek_locality import ConstantFrameClock, SeekLocalityReader
 
 
 def _review(plan, _cut_frame):
@@ -29,6 +33,21 @@ def _review(plan, _cut_frame):
 
 
 class ReviewFirstBoundaryLookTests(unittest.TestCase):
+    def test_millisecond_rounding_fallback_retains_exact_seek_and_invalidates_cursor(self):
+        milliseconds = next(index / 1000. for index in range(1, 10000)
+            if (index / 1000. / 1000.) * 1000. != index / 1000.)
+        capture = FakeCapture()
+        reader = SeekLocalityReader(capture, clock=ConstantFrameClock(Fraction(30), 300),
+                                    process_frame=lambda frame: frame)
+        reader.frame_at(1.)
+        _frame_at_original_milliseconds(reader, milliseconds)
+        self.assertEqual(capture.seek_calls[-1], milliseconds)
+        self.assertIsNone(reader.next_index)
+        self.assertFalse(reader.frames)
+        reader.frame_at(1.)
+        self.assertTrue(reader.enabled)
+        self.assertEqual(reader.next_index, 31)
+
     def test_pair_admission_cannot_approve_a_different_global_frame_clock(self):
         plan = RenderPlan(sources=tuple(Path(f'/synthetic/{i}.mp4') for i in range(3)),
             segments=tuple(RenderSegment(i, 0., .24, i*.24) for i in range(3)),

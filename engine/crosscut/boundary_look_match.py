@@ -638,6 +638,21 @@ class BoundaryLookMatchResult:
         }
 
 
+def _frame_at_original_milliseconds(reader: SeekLocalityReader, timestamp_ms: float):
+    """Do not change the shared decoder/cache fingerprint for a look-only pass.
+
+Usually milliseconds round-trip exactly through the reader's seconds API. On
+the exceptional floating-point values, retain the original timestamp seek and
+discard the reader's now-stale position/pixel window before its next request.
+"""
+    seconds = timestamp_ms / 1000.0
+    if seconds * 1000.0 == timestamp_ms:
+        return reader.frame_at(seconds)
+    reader.next_index = None
+    reader.frames.clear()
+    return reader._seek_read(timestamp_ms)
+
+
 @dataclass(slots=True)
 class BoundaryLookMeasurementCache:
     """Ephemeral scalar-only cache shared by the eight candidate plans."""
@@ -693,7 +708,7 @@ class BoundaryLookMeasurementCache:
                 for microseconds in missing:
                     metric: LookMetricVector | None = None
                     try:
-                        frame = reader.frame_at_milliseconds(microseconds / 1000.0)
+                        frame = _frame_at_original_milliseconds(reader, microseconds / 1000.0)
                         if (
                             isinstance(frame, np.ndarray)
                             and frame.size > 0
