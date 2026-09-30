@@ -1506,8 +1506,8 @@ def _piecewise_linear_expression(
     clock = time_variable if time_variable.isidentifier() else f"({time_variable})"
     if len(positions) == 1:
         return f"{positions[0][coordinate_index]:.10f}"
-    expression = f"{positions[-1][coordinate_index]:.10f}"
-    for left, right in reversed(tuple(zip(positions, positions[1:]))):
+    leaves = []
+    for left, right in zip(positions, positions[1:]):
         start_time = left[0]
         end_time = right[0]
         start_value = left[coordinate_index]
@@ -1517,10 +1517,18 @@ def _piecewise_linear_expression(
             f"({start_value:.10f}+({slope:.10f})*"
             f"({clock}-{start_time:.10f}))"
         )
-        expression = (
-            f"if(lt({clock},{end_time:.10f}),{linear},{expression})"
-        )
-    return expression
+        leaves.append(linear)
+    leaves.append(f"{positions[-1][coordinate_index]:.10f}")
+    # Dense whole-shot cameras can have hundreds of targets. Linear nesting
+    # exhausts FFmpeg's expression parser; a balanced tree preserves exactly
+    # the same interval/endpoint semantics with logarithmic nesting depth.
+    def tree(first: int, end: int) -> str:
+        if end-first == 1:
+            return leaves[first]
+        middle = (first+end)//2
+        return (f"if(lt({clock},{positions[middle][0]:.10f}),"
+                f"{tree(first,middle)},{tree(middle,end)})")
+    return tree(0,len(leaves))
 
 
 def quantized_segment_frame_counts(

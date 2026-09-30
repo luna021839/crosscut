@@ -76,7 +76,16 @@ class ShotContextProposalTests(unittest.TestCase):
         capture=SimpleNamespace(close=lambda:None,
             frame_at_native_index=lambda source,*_:np.full((180,320,3),source,np.uint8))
         clock=VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)
+        def composed(frame,segment,time,size):
+            from crosscut.boundary_subject_alignment import _project_box,_TransformState
+            observed=face() if frame.mean()==1 else face(.26,.09)
+            if segment.editorial_transform:
+                key=segment.editorial_transform.evaluate(time)
+                observed=replace(observed,face_box_xywh=_project_box(observed.face_box_xywh,
+                    _TransformState(key.zoom,key.center_x,key.center_y,key.roll_degrees))[0])
+            return observed
         with patch('crosscut.shot_context_camera._CaptureProvider',return_value=capture), \
+                patch('crosscut.shot_context_camera._observe_composed_head',side_effect=composed), \
                 patch('crosscut.shot_context_camera.probe_render_frame_clock',return_value=clock), \
                 patch('crosscut.shot_context_camera.probe_media',return_value=SimpleNamespace(
                     video_streams=(SimpleNamespace(width=3840,height=2160),))), \

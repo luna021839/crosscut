@@ -8,6 +8,7 @@ the shot has no native camera cut, and validate the resulting encoded pixels.
 from dataclasses import dataclass, replace
 import math
 from time import monotonic
+import cv2
 
 from .boundary_subject_alignment import (
     BoundarySubjectAlignmentConfig, BoundarySubjectObservation,
@@ -18,7 +19,7 @@ from .boundary_subject_alignment import (
 )
 from .render import EditorialTransformTrack, RenderPlan, segment_frame_counts
 from .render_boundary_clock import native_frame_clocks_for_output
-from .render_frame_schedule import probe_render_frame_clock
+from .render_frame_schedule import probe_render_frame_clock,VerifiedRenderFrameClock
 from .render_geometry import reproject_editorial_frame
 from .media import probe_media
 from .roll_aware_face_geometry import detect_roll_aware_faces
@@ -123,6 +124,22 @@ def observe_shot_head(frame):
         face_is_unambiguous_dominant=box is not None)
 
 
+def _observe_composed_head(frame, segment, time, size):
+    """Redetect in actual output-coordinate pixels, not a transformed box.
+
+    Face inference is not scale equivariant. Projecting one native bounding
+    box can promise an improvement that disappears after the crop is decoded.
+    This is a pre-encode pixel check; it still does not replace encoded QA.
+    """
+    from .prescribed_render_geometry import PrescribedGeometrySampler
+    from .post_render_perceptual_quality import _reference_view_for_span
+    from .visual_score import _working_frame
+    geometry=PrescribedGeometrySampler(None,segment,master_start=0.)
+    pixels=_reference_view_for_span(frame,geometry.span,relative_time=time,size=size)
+    working=_working_frame(pixels,maximum_width=960)
+    return observe_shot_head(cv2.resize(working,(854,480)))
+
+
 @dataclass(frozen=True)
 class ShotContextProposal:
     plan: RenderPlan
@@ -131,11 +148,17 @@ class ShotContextProposal:
     head_evidence: tuple[dict, ...]
     native_frame_ids: tuple[int, ...]
     elapsed_seconds: float
+    source_clock: VerifiedRenderFrameClock | None = None
+    boundary_framing: tuple[dict, ...] = ()
+    pixel_boundary_framing: tuple[dict, ...] = ()
 
     def to_dict(self):
         return dict(analysis_basis=SHOT_CAMERA_EXPERIMENT_BASIS,segment_index=self.segment_index,
             camera=self.camera.to_dict(),head_evidence=list(self.head_evidence),
             native_frame_ids=list(self.native_frame_ids),elapsed_seconds=self.elapsed_seconds,
+            source_clock=self.source_clock.to_dict() if self.source_clock else None,
+            boundary_framing=list(self.boundary_framing),
+            pixel_boundary_framing=list(self.pixel_boundary_framing),
             all_sampled_native_clocks_unchanged=True,audio_and_source_phase_unchanged=True,
             other_segment_cameras_unchanged=True,native_cuts_in_changed_shot=0,
             source_local_performer_identity_certified=False,production_binding_supported=False,
@@ -148,7 +171,8 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
 
     Only one cross-source-bounded native shot is touched. Callers still need
     independent decoded framing/motion QA and an explicit experimental consumer;
-    ordinary production bindings must not accept this geometry report.
+    boundary-local production bindings must not accept this geometry report.
+    App callers use a separate complete-shot binding plus output-pixel checks.
     """
     if experimental is not True:
         raise ValueError('shot-context proposal requires an explicit experimental consumer')
@@ -176,11 +200,17 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
     def deadline():
         if monotonic()-started>maximum_runtime_seconds:
             raise ValueError('shot-context proposal exhausted its work budget')
-    clocks={i:probe_render_frame_clock(path) for i,path in enumerate(plan.sources)}
+    clocks={}
+    for i in sorted({segment.source_index for segment in adjacent}):
+        deadline()
+        clocks[i]=probe_render_frame_clock(plan.sources[i],
+            timeout_seconds=max(.01,min(10.,maximum_runtime_seconds-(monotonic()-started))))
     if any(clocks[s.source_index] is None for s in adjacent):
         raise ValueError('shot-context source frame clock is unverified')
     begin,end=sum(counts[:index]),sum(counts[:index+1])
     samples=native_frame_clocks_for_output(plan,clocks,range(begin-1,end+1))
+    if any(tick.terminal_clone for tick in samples.values()):
+        raise ValueError('shot-context camera requires actually observed source frames, not terminal clones')
     first,last=samples[begin],samples[end-1]
     native_fps=float(clocks[middle.source_index].frame_rate)
     if any(first.native_frame_index/native_fps < cut <= last.native_frame_index/native_fps for cut in cuts):
@@ -190,13 +220,14 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
         raise ValueError('shot-context native resolution is unknown')
     maximum_zoom=min(2.,video[0].width/plan.width,video[0].height/plan.height)
     capture=_CaptureProvider(plan.sources)
-    frames=[];observations=[];neighbors=[]
+    frames=[];observations=[];neighbors=[];neighbor_pixels=[];source_end_pixels=[]
     try:
         for i,n in ((index-1,begin-1),(index+1,end)):
             deadline();tick=samples[n];old=plan.segments[i]
             time=(counts[i]-1)/plan.fps if i<index else 0.
             raw=capture.frame_at_native_index(tick.source_index,tick.native_frame_index,clocks[tick.source_index])
             if raw is None:raise ValueError('shot-context neighbor frame is unavailable')
+            neighbor_pixels.append(raw)
             frame=_canonical_frame(raw,width=854,height=480,
                 base_crop=_fixed_crop_at(old.pan_crop,time) if old.pan_crop else None)
             if old.editorial_transform:
@@ -209,6 +240,7 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
             deadline();tick=samples[n]
             raw=capture.frame_at_native_index(tick.source_index,tick.native_frame_index,clocks[tick.source_index])
             if raw is None:raise ValueError('shot-context source frame is unavailable')
+            if n in (begin,end-1):source_end_pixels.append(raw)
             frame=_canonical_frame(raw,width=854,height=480,base_crop=None)
             frames.append(frame);observations.append(observe_shot_head(frame))
     finally:capture.close()
@@ -217,7 +249,7 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
         deadline()
         if observed.face_is_unambiguous_dominant:
             heads.append(_close_face_head_envelope(observed.face_box_xywh))
-            evidence.append(dict(frame=n,basis='observed_face_head_envelope'))
+            evidence.append(dict(frame=n,basis='observed_face_head_envelope',head_envelope_xywh=heads[-1]))
             continue
         support=[]
         for ref in range(max(0,n-2),min(len(frames),n+3)):
@@ -231,17 +263,51 @@ def propose_shot_context_camera(*, plan, segment_index, scene_cut_times,
         right=max(b[0]+b[2] for _,b in support);bottom=max(b[1]+b[3] for _,b in support)
         heads.append((x,y,right-x,bottom-y))
         evidence.append(dict(frame=n,basis='two_neighbor_pixel_tracked_head_union',
-            reference_frames=[i for i,_ in support],face_landmarks_observed=False))
+            reference_frames=[i for i,_ in support],face_landmarks_observed=False,head_envelope_xywh=heads[-1]))
     camera=build_shot_context_camera(source_endpoints=(observations[0],observations[-1]),
         neighbor_endpoints=neighbors,head_envelopes=heads,fps=plan.fps,maximum_zoom=maximum_zoom,
         scale_basis=scale_basis)
+    from .rendered_proxy_review import _box_discontinuity
+    framing=[]
+    for n,source,target,state in ((0,observations[0],neighbors[0],camera.entry),
+            (counts[index]-1,observations[-1],neighbors[-1],camera.exit)):
+        before=source.face_box_xywh
+        time=n/plan.fps
+        if middle.pan_crop:
+            x,y,w,h=_fixed_crop_at(middle.pan_crop,time)
+            if abs(w-h)>1e-6:
+                raise ValueError('shot-context comparison requires an isotropic existing base crop')
+            before=((before[0]-x)/w,(before[1]-y)/h,before[2]/w,before[3]/h)
+        if middle.editorial_transform:
+            old=middle.editorial_transform.evaluate(time)
+            before=_project_box(before,_TransformState(old.zoom,old.center_x,old.center_y,old.roll_degrees))[0]
+        after=_project_box(source.face_box_xywh,state)[0]
+        framing.append(dict(boundary_index=index-1 if n==0 else index,
+            before=list(_box_discontinuity(before,target.face_box_xywh)),
+            after=list(_box_discontinuity(after,target.face_box_xywh)),
+            basis='same_native_face_projected_through_both_camera_plans_not_encoded_qa'))
     changed=list(plan.segments)
     changed[index]=replace(middle,pan_crop=None,editorial_transform=camera.track)
     candidate=replace(plan,segments=tuple(changed))
+    pixel_framing=[]
+    for side,(neighbor_index,native,neighbor) in enumerate(zip((index-1,index+1),source_end_pixels,neighbor_pixels)):
+        deadline()
+        middle_time=0. if side==0 else (counts[index]-1)/plan.fps
+        neighbor_time=(counts[neighbor_index]-1)/plan.fps if side==0 else 0.
+        target=_observe_composed_head(neighbor,plan.segments[neighbor_index],neighbor_time,(plan.width,plan.height))
+        observed=[_observe_composed_head(native,version.segments[index],middle_time,(plan.width,plan.height))
+            for version in (plan,candidate)]
+        if any(not item.face_is_unambiguous_dominant or item.face_box_xywh is None for item in (target,*observed)):
+            raise ValueError('shot-context composed endpoint face is unobserved')
+        pixel_framing.append(dict(boundary_index=index-1 if side==0 else index,
+            before=list(_box_discontinuity(observed[0].face_box_xywh,target.face_box_xywh)),
+            after=list(_box_discontinuity(observed[1].face_box_xywh,target.face_box_xywh)),
+            basis='redetected_full_output_coordinate_pixels_not_encoded_qa'))
     after=native_frame_clocks_for_output(candidate,clocks,range(begin-1,end+1))
     if any((a.source_index,a.native_frame_index)!=(after[n].source_index,after[n].native_frame_index)
             for n,a in samples.items()):
         raise ValueError('shot-context composition changed the scheduled native frame clock')
     deadline()
     return ShotContextProposal(candidate,index,camera,tuple(evidence),
-        tuple(samples[n].native_frame_index for n in range(begin,end)),monotonic()-started)
+        tuple(samples[n].native_frame_index for n in range(begin,end)),monotonic()-started,
+        clocks[middle.source_index],tuple(framing),tuple(pixel_framing))

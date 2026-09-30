@@ -27447,6 +27447,29 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     return updated
 
 
+def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
+    """Apply two-sided whole-shot framing before grading, without retiming."""
+    from .shot_context_refinement import refine_shot_context_cameras
+    if (bundle.editorial_motion_plan is None or bundle.boundary_look_match is not None
+            or bundle.cut_local_sync is not None or bundle.dynamic_crop_application is not None):
+        return None
+    result=refine_shot_context_cameras(plan=bundle.render_plan,timeline=bundle.visual_timeline,
+        motion=bundle.editorial_motion_plan,scene_cut_times=scene_cut_times)
+    changed=set(result.changed_segments)
+    face_match=bundle.face_match_plan
+    if face_match is not None and changed:
+        face_match=replace(face_match,segments=tuple(replace(item,pan_crop=None,
+            applied=False,applied_zoom=None,fallback_reason='superseded_by_bound_whole_shot_camera',
+            alignment_purpose='two_sided_whole_shot_camera') if index in changed else item
+            for index,item in enumerate(face_match.segments)))
+    return replace(bundle,render_plan=result.plan,editorial_motion_plan=result.motion,
+        face_match_plan=face_match,
+        boundary_repairs=None if changed else bundle.boundary_repairs,
+        boundary_affine_plan=None if changed else bundle.boundary_affine_plan,
+        candidate_lineage=(*bundle.candidate_lineage,{'stage':'two_sided_shot_context_framing',
+            **result.to_dict()}))
+
+
 def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):
     """Preserve the complete incumbent and add only decoded-admitted look ramps."""
     from .review_first_boundary_look import refine_review_first_boundary_look
@@ -35282,6 +35305,19 @@ def analyze(
                 if camera_bundle is not None:
                     group_first.promote(camera_bundle,plan=camera_bundle.render_plan,
                         authority=camera_bundle.cadence_profile)
+                context_bundle = group_first.run_optional(
+                    "two_sided_shot_context_framing",
+                    lambda: _review_first_group_shot_context_bundle(group_first.incumbent,
+                        # RenderPlan keeps request-domain source indices even
+                        # when acquisition/alignment excludes some sources.
+                        scene_cut_times=tuple(tuple(float(change['timestamp_seconds'])
+                            for change in payload['changes']) for payload in scene_payloads)),
+                    validate=lambda value: _validate_review_first_group_bundle(value,
+                        eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
+                        common_start=common_start) if value is not None else None)
+                if context_bundle is not None:
+                    group_first.promote(context_bundle,plan=context_bundle.render_plan,
+                        authority=context_bundle.cadence_profile)
                 # Look matching used to exist only in the legacy multi-candidate
                 # path. Apply it once to the actual retained final geometry;
                 # failure/cutoff must not discard that incumbent or rerun cuts.

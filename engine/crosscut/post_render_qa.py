@@ -4584,8 +4584,27 @@ def _normalized_entropy(values: Sequence[str]) -> float | None:
     return entropy / math.log(len(counts))
 
 
-def _bound_local_alignment_tracks(
+def _bound_local_alignment_tracks(motion, plan):
+    """Combine separate, fully bound local and whole-shot camera contracts."""
+    contexts = _bound_context_cameras(motion, plan)
+    boundaries = {boundary for index in contexts for boundary in (index-1,index)}
+    segments, local = _bound_boundary_local_alignment_tracks(motion, plan,
+        context_boundaries=boundaries)
+    return segments | set(contexts), local | boundaries
+
+
+def _bound_context_cameras(motion, plan):
+    from .render_plan_serialization import render_plan_from_json
+    from .shot_context_binding import bound_shot_context_cameras
+    try:
+        return bound_shot_context_cameras(motion, render_plan_from_json(dict(plan)))
+    except (ValueError, TypeError, KeyError):
+        return {}
+
+
+def _bound_boundary_local_alignment_tracks(
     motion: Mapping[str, Any], plan: Mapping[str, Any],
+    *, context_boundaries=frozenset(),
 ) -> tuple[set[int], set[int]]:
     """Identify dense local reports whose tracks are exactly in final pixels.
 
@@ -4732,6 +4751,11 @@ def _bound_local_alignment_tracks(
         previous_bound = set(bound_segments)
         for boundary_index in tuple(bound_boundaries):
             boundary = decisions[boundary_index]
+            if boundary_index in context_boundaries:
+                # The new binding covers the changed whole shot AND the exact
+                # unchanged neighboring camera. That supersedes this paired
+                # endpoint relation, not the neighbor's own dense-track checks.
+                continue
             if boundary.get('transformed_side') != 'both':
                 continue
             pair = {boundary.get('outgoing_segment_index'), boundary.get('incoming_segment_index')}
@@ -4758,7 +4782,7 @@ def _bound_local_alignment_tracks(
         if bound_segments == previous_bound:
             break
     bound_boundaries = {boundary for boundary in bound_boundaries
-        if ({decisions[boundary].get('outgoing_segment_index'), decisions[boundary].get('incoming_segment_index')}
+        if boundary in context_boundaries or ({decisions[boundary].get('outgoing_segment_index'), decisions[boundary].get('incoming_segment_index')}
             if decisions[boundary].get('transformed_side') == 'both' else
             {decisions[boundary].get(f"{decisions[boundary].get('transformed_side')}_segment_index")}) <= bound_segments}
     return bound_segments, bound_boundaries
@@ -4776,11 +4800,12 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
     from .render_plan_serialization import render_plan_from_json
     alignment = _mapping(motion.get('boundary_subject_alignment')) or {}
     basis = alignment.get('analysis_basis')
+    contexts = _bound_context_cameras(motion, plan)
     subject_caps = {'face': 2.0}
     if basis in {'exact_cut_frame_shot_adaptive_subject_alignment_v4',
                  'exact_cut_frame_shot_adaptive_subject_alignment_v5'}:
         subject_caps['formation'] = 1.33
-    elif basis != 'exact_cut_frame_shot_adaptive_subject_alignment_v3':
+    elif basis != 'exact_cut_frame_shot_adaptive_subject_alignment_v3' and not contexts:
         return {}
     try:
         typed = render_plan_from_json(dict(plan))
@@ -4793,12 +4818,19 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
     probed = {}
     budgets = {}
     for index in sorted(bound_segments):
+        if index not in contexts and basis not in {
+                'exact_cut_frame_shot_adaptive_subject_alignment_v3',
+                'exact_cut_frame_shot_adaptive_subject_alignment_v4',
+                'exact_cut_frame_shot_adaptive_subject_alignment_v5'}:
+            # One new context receipt cannot upgrade unrelated legacy v2
+            # cameras to native-funded v3+ zoom authority.
+            continue
         segment = typed.segments[index]
         track = segment.editorial_transform
         if track is None or max(frame.zoom for frame in track.keyframes) <= config.maximum_editorial_zoom:
             continue
         indices = tracks.get(index, {}).get('boundary_indices', [])
-        kinds = [decisions.get(boundary, {}).get('subject_kind') for boundary in indices]
+        kinds = ['face'] if index in contexts else [decisions.get(boundary, {}).get('subject_kind') for boundary in indices]
         if not kinds or any(kind not in subject_caps for kind in kinds):
             continue
         subject_cap = min(subject_caps[kind] for kind in kinds)
@@ -4874,8 +4906,9 @@ def _transform_metrics(
     motion_segments = [_mapping(raw) or {} for raw in segments]
     plan_segments = _sequence(plan.get("segments")) or []
     local_alignment_segments, local_alignment_boundaries = _bound_local_alignment_tracks(motion, plan)
+    context_cameras = _bound_context_cameras(motion, plan)
     alignment_report = _mapping(motion.get('boundary_subject_alignment')) or {}
-    paired_alignment_segments = {
+    paired_alignment_segments = set(context_cameras) | {
         segment for raw in (_sequence(alignment_report.get('decisions')) or [])
         if (item := _mapping(raw)) is not None and item.get('transformed_side') == 'both'
         and item.get('boundary_index') in local_alignment_boundaries
@@ -4896,6 +4929,10 @@ def _transform_metrics(
         for segment_index in (transition_index, transition_index + 1)
     }
     motion_contract_checks = {
+        "shot_context_bindings_complete": (
+            isinstance(motion.get('shot_context_cameras', []), (list, tuple))
+            and len(context_cameras) == len(motion.get('shot_context_cameras', []))
+        ),
         "one_motion_segment_per_plan_segment": (
             motion_indices == list(range(len(plan_segments)))
         ),
@@ -5471,6 +5508,7 @@ def _transform_metrics(
             "exact_from_segment_reason_identity_and_track_excursions"
         ),
         "bound_local_alignment_segment_indices": sorted(local_alignment_segments),
+        "bound_shot_context_segment_indices": sorted(context_cameras),
         "target_zoom_event_count": target_zoom,
         "target_attainment": attainment,
         "target_attainment_basis": "derived_reason_identified_zoom_events",
