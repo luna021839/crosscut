@@ -4,7 +4,8 @@ from dataclasses import replace
 
 from crosscut.direct_member_target_face import FocalFaceCandidate
 from crosscut.focal_body_track import (FocalBodyFrame, FocalBodyObservation,
-    body_reference_similarity, deduplicate_body_observations, resolve_focal_body_track)
+    body_reference_similarity, deduplicate_body_observations, focal_body_anchor_indices,
+    resolve_focal_body_track)
 from crosscut.pose import FormationPersonDescriptor
 
 
@@ -19,6 +20,11 @@ def frame(t, *observations):
 
 
 class FocalBodyTrackTests(unittest.TestCase):
+    @staticmethod
+    def pose_owned(item):
+        return replace(item,face_pose_consistent=True,
+            pose_screen_xyc=tuple((.30+.02*i,.20+.04*i,.9) for i in range(8)))
+
     def window(self):
         return [frame(t, observation(t, anchor=t!=2.)) for t in (1.76, 1.88, 2., 2.12, 2.24)]
 
@@ -45,6 +51,65 @@ class FocalBodyTrackTests(unittest.TestCase):
         frames = [frame(t, observation(t, x=.68, anchor=True, score=.55))
                   for t in (1.76, 1.88, 2., 2.12, 2.24)]
         self.assertIsNone(self.resolve(frames).observation)
+
+    def test_two_exact_pose_owned_anchors_resolve_without_changing_observed_scores(self):
+        frames=[]
+        for t in (1.76,1.88,2.,2.12,2.24):
+            target=observation(t,anchor=t!=2.,score=.64)
+            if t!=2.: target=self.pose_owned(target)
+            rival=observation(t,x=.68,score=.68,appearance=(0.,1.))
+            frames.append(frame(t,target,rival))
+        result=self.resolve(frames)
+        self.assertIsNotNone(result.observation)
+        self.assertEqual(result.observation.person.bbox_xywh[0],.2)
+        self.assertEqual(result.observation.reference_similarity,.64)
+        self.assertIsNone(result.observation.face)
+        self.assertGreaterEqual(len(result.support_seconds),2)
+        self.assertIn('unique_exact_face_pose',result.to_dict()['anchor_policy'])
+
+    def test_new_anchor_family_cannot_replace_an_existing_resolved_identity(self):
+        from crosscut.focal_body_track import _resolve_focal_body_track
+        frames=[]
+        for t in (1.76,1.88,2.,2.12,2.24):
+            target=observation(t,anchor=t<2.,score=.82)
+            rival=observation(t,x=.68,score=.95 if t==2. else .64,
+                              anchor=t>2.,appearance=(0.,1.))
+            if t>2.: rival=self.pose_owned(rival)
+            frames.append(frame(t,target,rival))
+        legacy=_resolve_focal_body_track(frames,source_index=0,query_seconds=2.,
+                                         allow_exact_pose_anchors=False)
+        expanded=_resolve_focal_body_track(frames,source_index=0,query_seconds=2.,
+                                           allow_exact_pose_anchors=True)
+        self.assertEqual(legacy.observation.person.bbox_xywh[0],.2)
+        self.assertEqual(expanded.observation.person.bbox_xywh[0],.68)
+        self.assertEqual(self.resolve(frames),legacy)
+
+    def test_exact_pose_anchor_cannot_use_missing_ambiguous_or_conflicting_evidence(self):
+        target=self.pose_owned(observation(1.76,anchor=True,score=.64))
+        self.assertEqual(focal_body_anchor_indices((target,)),(0,))
+        for value in (replace(target,face_pose_consistent=None),
+                      replace(target,face_pose_consistent=False),
+                      replace(target,reference_similarity=.599999),
+                      replace(target,frozen_face_match=False)):
+            with self.subTest(value=value):
+                self.assertEqual(focal_body_anchor_indices((value,)),())
+        rival=self.pose_owned(observation(1.76,x=.68,anchor=True,score=.64,appearance=(0.,1.)))
+        self.assertEqual(focal_body_anchor_indices((target,rival)),())
+
+    def test_exact_pose_anchors_do_not_bridge_empty_wrong_body_or_single_anchor(self):
+        for failure in ('empty','wrong_body','single_anchor','weak_query_body'):
+            frames=[]
+            for t in (1.76,1.88,2.):
+                target=observation(t,anchor=t!=2.,score=.64)
+                if t!=2. and not (failure=='single_anchor' and t==1.76):
+                    target=self.pose_owned(target)
+                if t==2. and failure=='wrong_body':
+                    target=replace(target,appearance=(0.,1.))
+                if t==2. and failure=='weak_query_body':
+                    target=replace(target,reference_similarity=.59)
+                frames.append(frame(t,*(() if failure=='empty' and t==1.88 else (target,))))
+            with self.subTest(failure=failure):
+                self.assertIsNone(self.resolve(frames).observation)
 
     def test_occluded_query_never_substitutes_visible_neighbor(self):
         frames = self.window()

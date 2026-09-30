@@ -9,7 +9,8 @@ Positive geometry and its persistent measurement namespace are unchanged.
 """
 import math
 
-from .focal_body_track import deduplicate_body_observations, resolve_focal_body_track
+from .focal_body_track import (deduplicate_body_observations,
+    focal_body_anchor_indices, resolve_focal_body_track)
 
 
 class SourceFirstAnchorPrefilter:
@@ -26,13 +27,10 @@ class SourceFirstAnchorPrefilter:
         body = provider.bodies._frame_cache.get(key)
         if body is not None and body.observations:
             # These are the same cached observations the full resolver uses,
-            # after the same duplicate-body removal. A face alone is not an
-            # anchor when body appearance/competition already disproves it.
+            # after the same duplicate-body removal. Exact pose-owned anchors
+            # must not be erased by the old clothing-only upper bound.
             observed = deduplicate_body_observations(body.observations)
-            return any(item.frozen_face_match and item.reference_similarity >= .68
-                and item.reference_similarity - max(
-                    (other.reference_similarity for k, other in enumerate(observed) if k != i),
-                    default=-1.) >= .06 for i, item in enumerate(observed))
+            return bool(focal_body_anchor_indices(observed))
         return self.native_face_anchor_state(source, seconds)
 
     def native_face_anchor_state(self, source, seconds, *, require_complete=False):

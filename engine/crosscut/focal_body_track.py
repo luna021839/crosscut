@@ -6,6 +6,10 @@ module requires distinct frozen-face/body anchors and connected observed body
 trajectories. It may recover an observed body with no visible face; it never
 manufactures a face box or updates the frozen identity gallery.
 
+An unambiguous frozen face with independent exact-frame pose ownership is also
+an anchor, as in direct-frame admission. This does not waive the .60 clothing
+floor or the appearance/motion edges needed to reach an occluded query.
+
 All inference inputs are transient. Serialized results contain geometry and
 scalar evidence, not face/body vectors or named-identity probabilities.
 """
@@ -18,6 +22,9 @@ from typing import Sequence
 from .direct_member_target_face import FocalFaceCandidate
 from .face_identity import cosine_similarity
 from .pose import FormationPersonDescriptor
+
+
+FOCAL_BODY_ANCHOR_POLICY = 'frozen_clothing_or_unique_exact_face_pose_with_observed_body_edges_v2'
 
 
 def _cos(left, right) -> float:
@@ -81,6 +88,7 @@ class FocalBodyTrackResult:
     def to_dict(self) -> dict:
         observation = self.observation
         return {'contract': 'source_local_frozen_face_body_track_v1',
+            'anchor_policy': FOCAL_BODY_ANCHOR_POLICY,
             'source_index': self.source_index, 'source_seconds': self.source_seconds,
             'reason': self.reason, 'anchor_seconds': self.support_seconds,
             'path_margin': self.path_margin,
@@ -157,9 +165,33 @@ def deduplicate_body_observations(observations: Sequence[FocalBodyObservation]) 
     return tuple(retained)
 
 
-def resolve_focal_body_track(
+def focal_body_anchor_indices(observations: Sequence[FocalBodyObservation], *,
+                              allow_exact_pose_anchors: bool = True) -> tuple[int, ...]:
+    """Shared necessary-condition authority for a deduplicated observed frame.
+
+    Preserve every legacy face/clothing anchor. A new pose-owned route needs
+    exactly ONE frozen-face body in the frame, real pose agreement and the same
+    clothing floor as every trajectory edge. Similar costumes cannot veto an
+    independently owned face, but ambiguous ownership and missing pose cannot
+    use this route. Neither route alone approves a trajectory or a cut.
+    """
+    frozen = tuple(i for i, item in enumerate(observations) if item.frozen_face_match)
+    anchors = []
+    for i, item in enumerate(observations):
+        margin = item.reference_similarity-max((other.reference_similarity
+            for j, other in enumerate(observations) if j != i), default=-1.)
+        clothing_anchor = item.frozen_face_match and item.reference_similarity >= .68 and margin >= .06
+        pose_anchor = (allow_exact_pose_anchors and frozen == (i,) and item.face_pose_consistent is True
+                       and item.reference_similarity >= .60)
+        if clothing_anchor or pose_anchor:
+            anchors.append(i)
+    return tuple(anchors)
+
+
+def _resolve_focal_body_track(
     frames: Sequence[FocalBodyFrame], *, source_index: int,
     query_seconds: float, maximum_window_seconds: float = 1.25,
+    allow_exact_pose_anchors: bool,
 ) -> FocalBodyTrackResult:
     """Resolve a bounded observed path supported by at least two face/body anchors.
 
@@ -189,15 +221,8 @@ def resolve_focal_body_track(
     if query is None or not prepared[query]:
         return fail('query_body_unobserved')
 
-    # Face and source-local clothing must agree at independent anchors. A
-    # face on a body contradicted by the target clothing bank is not a seed.
-    anchors = []
-    for i, frame in enumerate(prepared):
-        for j, o in enumerate(frame):
-            competitors = [x.reference_similarity for k, x in enumerate(frame) if k != j]
-            margin = o.reference_similarity-max(competitors, default=-1.)
-            if o.frozen_face_match and o.reference_similarity >= .68 and margin >= .06:
-                anchors.append((i, j))
+    anchors = [(i, j) for i, frame in enumerate(prepared)
+               for j in focal_body_anchor_indices(frame,allow_exact_pose_anchors=allow_exact_pose_anchors)]
     if len({prepared[i][j].source_seconds for i, j in anchors}) < 2:
         return fail('independent_face_body_anchors_missing')
 
@@ -277,3 +302,22 @@ def resolve_focal_body_track(
     _, j, times = ranked[0]
     return FocalBodyTrackResult(source_index, query_seconds, prepared[query][j],
         'observed_target_body_track', times, margin)
+
+
+def resolve_focal_body_track(
+    frames: Sequence[FocalBodyFrame], *, source_index: int,
+    query_seconds: float, maximum_window_seconds: float = 1.25,
+) -> FocalBodyTrackResult:
+    """Preserve a resolved legacy track; inspect pose-owned anchors only on failure.
+
+    Both passes consume the SAME in-memory observations. No extra decoding,
+    model inference or bank updates happen here. This strict incumbent-first
+    rule also preserves already published positive source geometry; negatives
+    are never persistent and are reconsidered under the new observer identity.
+    """
+    arguments=dict(source_index=source_index,query_seconds=query_seconds,
+                   maximum_window_seconds=maximum_window_seconds)
+    incumbent=_resolve_focal_body_track(frames,allow_exact_pose_anchors=False,**arguments)
+    if incumbent.observation is not None or incumbent.reason=='query_body_unobserved':
+        return incumbent
+    return _resolve_focal_body_track(frames,allow_exact_pose_anchors=True,**arguments)

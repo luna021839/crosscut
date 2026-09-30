@@ -109,6 +109,20 @@ class SourceFirstAnchorPrefilterTests(unittest.TestCase):
             provider.faces._focal_candidate_cache.pop(key)
         self.assertFalse(SourceFirstAnchorPrefilter(provider).cannot_resolve(0, 10.))
 
+    def test_exact_pose_anchor_is_shared_with_the_full_resolver(self):
+        provider=self.provider(face_times=(9.6,10.4),reference_score=.64)
+        for t in (9.6,10.4):
+            current=provider.bodies.frame_observations(0,t)
+            key=provider.faces._identity_key(0,provider.faces._samplers[0],t)
+            provider.bodies._frame_cache[key]=replace(current,observations=tuple(
+                replace(item,face_pose_consistent=True) for item in current.observations))
+        prefilter=SourceFirstAnchorPrefilter(provider)
+        self.assertFalse(prefilter.cannot_resolve(0,10.))
+        result=prefilter.track_at(0,10.)
+        self.assertIsNotNone(result.observation)
+        self.assertEqual(result,provider.bodies.track_at(0,10.))
+        self.assertEqual(prefilter.skipped_tracks,0)
+
     def test_cached_clothing_and_competitor_proof_matches_full_resolver(self):
         for score in (.3, .585, .60, .67, .679999, .68, .8):
             provider = self.provider(face_times=(9.6, 10.4), reference_score=score)

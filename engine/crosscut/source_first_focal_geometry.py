@@ -26,7 +26,7 @@ from .focal_selector_geometry import FocalSelectorGeometry, FOCAL_SELECTOR_BODY_
 from .native_focal_faces import NativeFocalFaceProvider
 from .source_first_published_cache import (
     SourceFirstPublishedGeometryCache as SourceFirstGeometryCache,
-    decode_equivalent_focal_fingerprints,
+    published_focal_geometry_predecessors,
 )
 
 
@@ -76,7 +76,7 @@ class SourceFirstFocalGeometryProvider:
                 observation_fingerprint, self.encoder, self.body_execution_device)
             compatible_namespaces = tuple(body_observation_namespace(
                 legacy, self.encoder, self.body_execution_device)
-                for legacy in decode_equivalent_focal_fingerprints(observation_fingerprint))
+                for legacy in published_focal_geometry_predecessors(observation_fingerprint))
             self._persistent = (SourceFirstGeometryCache(feature_cache_directory,self.observation_namespace,
                 compatible_namespaces=compatible_namespaces)
                 if feature_cache_directory is not None else None)

@@ -34,7 +34,29 @@ def decode_equivalent_focal_fingerprints(current):
     return ()
 
 
+def published_focal_geometry_predecessors(current):
+    """Reuse only proven positive geometry across an incumbent-preserving expansion.
+
+    The exact-pose anchor fallback first executes the unchanged legacy graph
+    and returns its resolved result verbatim. Only unresolved queries reach the
+    new family, and the persistent store never contains unresolved geometry.
+    This is positive-result compatibility, NOT decode equivalence or permission
+    to reuse negative results. All other code/device/model changes remain bound
+    to their own namespace, and no existing database row is rewritten.
+    """
+    if current == '1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f':
+        previous='50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd'
+        return (previous,*decode_equivalent_focal_fingerprints(previous))
+    return decode_equivalent_focal_fingerprints(current)
+
+
 class SourceFirstPublishedGeometryCache(SourceFirstGeometryCache):
+    def diagnostics(self):
+        payload=super().diagnostics()
+        payload['compatible_published_geometry_hits']=payload.pop('decode_equivalent_legacy_hits')
+        payload['predecessor_lookup_scope']='positive_geometry_only_not_unresolved_or_decode_equivalence'
+        return payload
+
     def put(self, key, value):
         writes_before = self.writes
         try:

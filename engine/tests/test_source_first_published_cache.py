@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from crosscut.source_first_published_cache import (
     SourceFirstPublishedGeometryCache, decode_equivalent_focal_fingerprints,
+    published_focal_geometry_predecessors,
 )
 from crosscut.source_first_execution import body_observation_namespace
 from engine.tests.test_source_first_focal_geometry import geometry
@@ -13,8 +14,7 @@ from engine.tests.test_source_first_focal_geometry import geometry
 
 class PublishedGeometryCacheTests(unittest.TestCase):
     def test_exact_forward_aliases_keep_device_model_and_unknown_code_bound(self):
-        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
-        current = SourceFirstFocalGeometryProvider.observation_fingerprint()
+        current = '50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd'
         previous = decode_equivalent_focal_fingerprints(current)
         self.assertEqual(len(previous), 4)
         self.assertEqual(decode_equivalent_focal_fingerprints(previous[0]), previous[1:])
@@ -28,6 +28,16 @@ class PublishedGeometryCacheTests(unittest.TestCase):
         encoder.fingerprint.return_value = {'model': 'changed', 'adapter': 'mps-v1'}
         self.assertNotEqual(legacy_mps, body_observation_namespace(previous[-1], encoder, 'mps'))
 
+    def test_pose_anchor_expansion_reuses_positive_incumbents_not_decode_equivalence(self):
+        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
+        current=SourceFirstFocalGeometryProvider.observation_fingerprint()
+        previous='50bc2a90b6bc5fb0582316f88e3feb7de12410890dd2496e7492ebcb4b4876bd'
+        self.assertNotEqual(current,previous)
+        self.assertEqual(decode_equivalent_focal_fingerprints(current),())
+        self.assertEqual(published_focal_geometry_predecessors(current),
+                         (previous,*decode_equivalent_focal_fingerprints(previous)))
+        self.assertEqual(published_focal_geometry_predecessors('0'*64),())
+
     def test_predecessor_lookup_preserves_original_rows_and_new_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -39,7 +49,7 @@ class PublishedGeometryCacheTests(unittest.TestCase):
                 self.assertEqual(current.get('same-source-frame', 0, 1.), old.get('same-source-frame', 0, 1.))
                 self.assertIsNone(current.get('different-source-frame', 0, 1.))
                 self.assertIsNone(unrelated.get('same-source-frame', 0, 1.))
-                self.assertEqual(current.diagnostics()['decode_equivalent_legacy_hits'], 1)
+                self.assertEqual(current.diagnostics()['compatible_published_geometry_hits'], 1)
                 self.assertEqual(current.writes, 0)
                 current.put('new-frame', geometry(body_only=True))
                 self.assertIsNone(old.get('new-frame', 0, 1.))
