@@ -99,15 +99,39 @@ class FocalBracketContainmentTests(unittest.TestCase):
         self.assertTrue(all(r['upper_body_visible_fraction']<.98 and not r['passed'] for r in rows))
         self.assertFalse(review['passed'])
 
-    def test_rotated_camera_does_not_use_unrotated_bracket_bounds(self):
+    def test_rotated_camera_measures_bracket_support_in_rotated_pixel_geometry(self):
+        from crosscut.member_roll_geometry import box_visible_fraction
         camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1,roll_degrees=.5),EditorialTransformKeyframe(1.,1.1,roll_degrees=.5)))
         calls=[]
         def provider(s,t):calls.append((s,t));return support(s,t)
         review=review_joint_dissolve_containment(segments=(RenderSegment(0,10.,1.,0.,editorial_transform=camera),),
             transitions=(),source_geometries={0:direct_member_source_frame_geometry((1080,1920),output_size=(1080,1920))},
             geometry_provider=lambda *a:None,bracketed_body_containment_provider=provider,fps=30.)
+        self.assertTrue(review['passed'])
+        self.assertEqual(len(calls), review['examined_frame_count'])
+        for row in review['frames']:
+            self.assertFalse(row['face_detection_claimed'])
+            self.assertFalse(row['cross_source_pose_authority'])
+            state = camera.evaluate(row['output_local_seconds'])
+            body = tuple(row['observed_body_box'])
+            expected = box_visible_fraction((*body[:3], body[3]*.25), state, output_size=(1080,1920))
+            self.assertAlmostEqual(row['upper_body_visible_fraction'], expected)
+
+    def test_rotated_bracket_upper_body_clipping_is_not_hidden_by_axis_aligned_bounds(self):
+        from crosscut.direct_member_transform import box_visible_fraction
+        body = (.3, 1/22, .4, .1)
+        camera = EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1,roll_degrees=1.2),
+                                         EditorialTransformKeyframe(1.,1.1,roll_degrees=1.2)))
+        plain = box_visible_fraction((*body[:3], body[3]*.25), zoom=1.1, center_x=.5, center_y=.5)
+        self.assertGreater(plain, .999)
+        review = review_joint_dissolve_containment(
+            segments=(RenderSegment(0,10.,1.,0.,editorial_transform=camera),), transitions=(),
+            source_geometries={0:direct_member_source_frame_geometry((1080,1920))},
+            geometry_provider=lambda *a: None,
+            bracketed_body_containment_provider=lambda s,t: support(s,t,boxes=(body,),
+                anchors=((s,t-.04,sample(body)),(s,t+.04,sample(body)))), fps=30.)
         self.assertFalse(review['passed'])
-        self.assertEqual(calls,[])
+        self.assertTrue(all(row['upper_body_visible_fraction'] < .98 for row in review['frames']))
 
 
 if __name__=='__main__':unittest.main()

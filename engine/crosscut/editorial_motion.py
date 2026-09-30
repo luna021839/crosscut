@@ -206,6 +206,7 @@ class EditorialMotionPlan:
     # A partial proposal must not discard the exact reasons a required camera
     # was withheld. This is diagnostic evidence, never acceptance authority.
     required_boundary_failures: tuple[tuple[int, tuple[str, ...], str | None], ...] = ()
+    member_containment_trial_audit: tuple = ()
 
     def __post_init__(self):
         failures = tuple((index, tuple(reasons), context) for index, reasons, context in self.required_boundary_failures)
@@ -216,6 +217,10 @@ class EditorialMotionPlan:
                        for index, reasons, context in failures)):
             raise ValueError('required camera failures must name valid boundaries and diagnostic reasons')
         object.__setattr__(self, 'required_boundary_failures', failures)
+        if self.member_containment_trial_audit:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self, 'member_containment_trial_audit',
+                tuple(_freeze_audit_value(row) for row in self.member_containment_trial_audit))
         if self.member_roll_audit:
             from .visual_boundary_repair import _freeze_audit_value
             object.__setattr__(self,'member_roll_audit',tuple(_freeze_audit_value(row) for row in self.member_roll_audit))
@@ -353,6 +358,8 @@ class EditorialMotionPlan:
                 for index, reasons, context in self.required_boundary_failures
             ]} if self.required_boundary_failures else {}),
             **({'member_roll_audit':_thaw_audit_value(self.member_roll_audit)} if self.member_roll_audit else {}),
+            **({'member_containment_trial_audit': _thaw_audit_value(self.member_containment_trial_audit)}
+               if self.member_containment_trial_audit else {}),
         }
 
 

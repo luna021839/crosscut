@@ -10045,6 +10045,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("joint_dissolve_pose.py"),
                 Path(__file__).with_name("focal_pixel_containment_support.py"),
                 Path(__file__).with_name("focal_bracket_containment.py"),
+                Path(__file__).with_name("member_dense_containment.py"),
                 Path(__file__).with_name("disjoint_member_cameras.py"),
                 Path(__file__).with_name("visible_hard_ramp.py"),
                 Path(__file__).with_name("rendered_proxy_review.py"),
@@ -27201,6 +27202,10 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
         return dense_face_provider.paired_samples(outgoing, source_local(outgoing, outgoing_time),
                                                   incoming, source_local(incoming, incoming_time))
     direct_member_geometry_provider.paired_samples = paired
+    from .member_dense_containment import attach_member_dense_containment, selected_source_native_cuts
+    attach_member_dense_containment(direct_member_geometry_provider, focal_provider=dense_face_provider,
+        source_local_time=source_local, native_scene_cut_times=selected_source_native_cuts(
+            direct_visual_selection, len(eligible_indices)), fps=primitive_plan.fps)
     config = _direct_member_editorial_motion_config_from_visual_config(
         direct_visual_selection.config)
     dense_face_provider.begin_focal_boundary_reference_capture()
@@ -36945,6 +36950,14 @@ def analyze(
                             direct_visual_config
                         )
                     )
+                    from .member_dense_containment import attach_member_dense_containment, selected_source_native_cuts
+                    def containment_source_time(source, master):
+                        warp = source_timewarps[eligible_indices[source]]
+                        return warp.master_to_source(master) if warp is not None else master + offsets[source]
+                    attach_member_dense_containment(direct_member_geometry_provider,
+                        focal_provider=dense_face_provider, source_local_time=containment_source_time,
+                        native_scene_cut_times=selected_source_native_cuts(direct_visual_selection, len(eligible_indices)),
+                        fps=29.97)
                     dense_face_provider.begin_focal_boundary_reference_capture()
                     try:
                         candidate_member_motion_plan = (

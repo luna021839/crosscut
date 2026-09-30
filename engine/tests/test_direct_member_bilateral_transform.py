@@ -200,6 +200,20 @@ class BilateralDensePublicationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.build()
 
+    def test_incoming_missing_tail_can_end_at_neutral_without_changing_cut(self):
+        def provider(source, seconds):
+            if source == 1 and 2.19 < seconds < 2.4:
+                return None
+            return self.sample(source, seconds)
+        plan = self.build(provider)
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        track = plan.track_for(1)
+        self.assertIsNotNone(plan.track_for(0))
+        self.assertAlmostEqual(track.keyframes[0].zoom, self.repair.incoming.zoom)
+        self.assertEqual(track.evaluate(.7).zoom, 1.)
+        self.assertGreaterEqual(track.keyframes[1].time_seconds, .55)
+        self.assertLess(track.keyframes[1].time_seconds, .75)
+
     def test_short_ramp_does_not_publish_only_one_of_the_cameras(self):
         plan = self.build(durations=(.4, 1.5))
         self.assertEqual(plan.accepted_boundary_indices, ())

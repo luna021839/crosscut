@@ -2117,7 +2117,9 @@ def _dense_tracking_camera_track(
     for frame_index in active_frame_indices:
         local_time = frame_index / fps
         canonical_time = common_master_start + segment.master_start + local_time
-        sample = geometry_provider(eligible_source_index, canonical_time)
+        from .member_dense_containment import dense_camera_sample
+        sample = dense_camera_sample(geometry_provider, eligible_source_index, canonical_time,
+                                     interior=0 < frame_index < frame_count - 1)
         if sample is None:
             if diagnostic_callback is not None:
                 diagnostic_callback(
@@ -2482,9 +2484,11 @@ def _track_is_dense_face_safe(
     for frame_index in ordered_frames:
         local_time = frame_index / fps
         canonical_time = common_master_start + segment.master_start + local_time
-        sample = geometry_provider(eligible_source_index, canonical_time)
+        from .member_dense_containment import dense_camera_sample
+        sample = dense_camera_sample(geometry_provider, eligible_source_index, canonical_time,
+                                     interior=0 < frame_index < frame_count - 1)
         if sample is None:
-            return reject("dense_geometry_missing")
+            return reject("dense_geometry_missing", f"source={eligible_source_index},frame={frame_index}")
         box = (
             map_box_to_portrait_fill(
                 sample.bbox_xywh,
@@ -2810,6 +2814,7 @@ def _track_is_dense_face_safe(
                     "pphumanseg_full_subject_silhouette",
                     "face_associated_formation_person_box",
                     "source_local_focal_body_track",
+                    "bracketed_observed_body_containment_only",
                 }
             ):
                 return reject("dense_widened_subject_evidence_missing")
@@ -3112,6 +3117,10 @@ def build_direct_member_editorial_motion_plan(
             right_sample = geometry_provider(right_source, right_time)
         if left_sample is None or right_sample is None:
             reject_boundary("dense_boundary_face_missing")
+            continue
+        from .member_dense_containment import MemberDenseContainmentSample
+        if isinstance(left_sample, MemberDenseContainmentSample) or isinstance(right_sample, MemberDenseContainmentSample):
+            reject_boundary("containment_only_endpoint_forbidden")
             continue
         focal_face_pair = bool(
             left_sample.alignment_geometry_basis == FOCAL_FACE_BASIS
@@ -3919,40 +3928,39 @@ def build_direct_member_editorial_motion_plan(
                 )
                 if track is None:
                     return None
-                track = _dense_tracking_camera_track(
-                    eligible_source_index=source_path[index],
-                    segment=renders[index],
-                    track=track,
-                    frame_count=frame_counts[index],
-                    common_master_start=common_master_start,
-                    geometry_provider=geometry_provider,
-                    fps=fps,
-                    config=settings,
-                    source_frame_geometry=source_frame_geometries[
-                        source_path[index]
-                    ],
-                    alignment_geometry_basis=review_basis,
-                    diagnostic_callback=dense_rejection_details.add,
-                )
-                if not _track_is_dense_face_safe(
-                    segment_index=index,
-                    eligible_source_index=source_path[index],
-                    segment=renders[index],
-                    track=track,
-                    frame_count=frame_counts[index],
-                    common_master_start=common_master_start,
-                    geometry_provider=geometry_provider,
-                    fps=fps,
-                    config=settings,
-                    source_frame_geometry=source_frame_geometries[
-                        source_path[index]
-                    ],
-                    alignment_geometry_basis=review_basis,
-                    rejection_callback=dense_rejection_reasons.add,
-                    rejection_detail_callback=dense_rejection_details.add,
-                ):
-                    return None
-                return track
+
+                def reviewed(proposal):
+                    followed = _dense_tracking_camera_track(
+                        eligible_source_index=source_path[index], segment=renders[index],
+                        track=proposal, frame_count=frame_counts[index], common_master_start=common_master_start,
+                        geometry_provider=geometry_provider, fps=fps, config=settings,
+                        source_frame_geometry=source_frame_geometries[source_path[index]],
+                        alignment_geometry_basis=review_basis, diagnostic_callback=dense_rejection_details.add,
+                    )
+                    safe = _track_is_dense_face_safe(
+                        segment_index=index, eligible_source_index=source_path[index], segment=renders[index],
+                        track=followed, frame_count=frame_counts[index], common_master_start=common_master_start,
+                        geometry_provider=geometry_provider, fps=fps, config=settings,
+                        source_frame_geometry=source_frame_geometries[source_path[index]],
+                        alignment_geometry_basis=review_basis, rejection_callback=dense_rejection_reasons.add,
+                        rejection_detail_callback=dense_rejection_details.add,
+                    )
+                    return followed if safe else None
+
+                verified = reviewed(track)
+                if verified is not None:
+                    return verified
+                # Use the same single bounded alternative as one-sided hard
+                # cuts. Preserve the exact cut camera and .55 s/velocity floor;
+                # an unobserved tail remains neutral, not fabricated geometry.
+                from .member_dense_containment import dense_camera_sample
+                from .visible_hard_ramp import shorten_hard_ramp_to_observations
+                shortened = shorten_hard_ramp_to_observations(track, fps=fps,
+                    frame_count=frame_counts[index], frame_available=lambda frame:
+                    dense_camera_sample(geometry_provider, source_path[index],
+                        common_master_start + renders[index].master_start + frame/fps,
+                        interior=0 < frame < frame_counts[index]-1) is not None)
+                return reviewed(shortened) if shortened is not None else None
 
             left_track = bilateral_track(left_index, left_bases)
             right_track = bilateral_track(right_index, right_bases)
@@ -4522,6 +4530,10 @@ def build_direct_member_editorial_motion_plan(
             (index, tuple(sorted(required_rejection_reasons.get(index,
                 {"required_candidate_missing_without_reason"}))), required_rejection_context.get(index))
             for index in missing_required
+        ),
+        member_containment_trial_audit=(
+            geometry_provider.interior_containment_audit()
+            if callable(getattr(geometry_provider, 'interior_containment_audit', None)) else ()
         ),
     )
     from .direct_member_roll import apply_direct_member_roll
