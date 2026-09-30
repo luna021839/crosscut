@@ -2099,6 +2099,11 @@ def _candidate_review_summary(
 ) -> dict[str, Any]:
     """Return the stable compact summary already exposed by timeline plans."""
 
+    from .selection_arm_motion import selection_arm_cost
+    arm_edges = [(index, selection_arm_cost(left.candidate.exit_arm_window,
+        right.candidate.entry_arm_window)) for index, (left, right) in enumerate(
+            zip(candidate.choices, candidate.choices[1:]))
+        if left.candidate.source_id != right.candidate.source_id]
     return {
         "candidate_index": candidate_index,
         "cadence_profile": cadence_profile,
@@ -2119,6 +2124,15 @@ def _candidate_review_summary(
         "source_run_median_seconds": review.source_run_median_seconds,
         "visual_shot_median_seconds": review.visual_shot_median_seconds,
         "ping_pong_count": len(review.ping_pongs),
+        "selection_arm_motion": {
+            "basis": "sampled_focal_arm_direction_selection_v1",
+            "measured_switch_count": sum(value is not None for _, value in arm_edges),
+            "unmeasured_switch_count": sum(value is None for _, value in arm_edges),
+            "edges": [{"boundary_index": index, **value.to_dict()}
+                      for index, value in arm_edges if value is not None],
+            "missing_evidence_is_match": False,
+            "raw_pose_vectors_persisted": False,
+        },
     }
 
 
@@ -6706,6 +6720,7 @@ def _build_visual_timeline(
     maximum_candidate_results: int,
     candidate_set_only: bool,
     optimizer_seed_only: bool = False,
+    selection_arm_model_path: Path | None = None,
 ) -> (
     VisualTimelinePlan
     | VisualTimelineCandidateSet
@@ -6728,6 +6743,8 @@ def _build_visual_timeline(
             "optimizer_seed_only requires candidate_set_only output mode"
         )
     singleton = not candidate_set_only and maximum_candidate_results == 1
+    if selection_arm_model_path is not None and (optimizer_seed_only or prescribed_render_segments is not None):
+        raise ValueError('sampled arm selection is for the ordinary source lattice, not exact joint/prescribed geometry')
     _validate_visual_result_limit(
         maximum_candidate_results, singleton=singleton,
         name="maximum_candidate_results",
@@ -6811,6 +6828,8 @@ def _build_visual_timeline(
     candidates_by_segment: list[list[TimelineCandidate]] = []
     face_metadata_by_candidate: dict[str, _CandidateFaceMetadata] = {}
     subject_metadata_by_candidate: dict[str, _CandidateSubjectMetadata] = {}
+    from .selection_arm_motion import SelectionArmSampler
+    arm_sampler = SelectionArmSampler(selection_arm_model_path) if selection_arm_model_path is not None else None
     try:
         for segment_index, (master_start, master_end) in enumerate(canonical_spans):
             if master_end <= master_start:
@@ -7026,6 +7045,19 @@ def _build_visual_timeline(
                     for cut in cuts
                 )
                 boundary_score = 0.92 if safely_aligned_boundary else 0.52
+                entry_arm_window = exit_arm_window = None
+                if arm_sampler is not None:
+                    focal_types = (ShotType.MEDIUM, ShotType.CLOSE_UP)
+                    if entry.shot_type in focal_types and not entry_scene_cut_near:
+                        entry_arm_window = arm_sampler.window(sampler, source_id=str(source_index),
+                            master_times=(entry_master, entry_following_master),
+                            source_times=(entry_time, entry_following_time),
+                            descriptors=(entry, entry_following_descriptor), scene_cut_times=cuts)
+                    if exit_descriptor.shot_type in focal_types and not exit_scene_cut_near:
+                        exit_arm_window = arm_sampler.window(sampler, source_id=str(source_index),
+                            master_times=(exit_preceding_master, exit_master),
+                            source_times=(exit_preceding_time, exit_time),
+                            descriptors=(exit_preceding_descriptor, exit_descriptor), scene_cut_times=cuts)
                 shot_number = bisect_right(cuts, middle_time)
                 internal_start = _source_clock_time(
                     master_start + tolerance,
@@ -7271,6 +7303,8 @@ def _build_visual_timeline(
                         motion=middle.motion,
                         entry_motion=entry.motion,
                         exit_motion=exit_motion,
+                        entry_arm_window=entry_arm_window,
+                        exit_arm_window=exit_arm_window,
                         candidate_id=candidate_id,
                         shot_id=f"{source_index}:shot-{shot_number}",
                     )
@@ -7303,6 +7337,8 @@ def _build_visual_timeline(
             if professional_montage_selection_policy is None else
             "human_reference_endpoint_opportunities_three_heads_repair_proposal_singleton_v3"
         )
+    if arm_sampler is not None:
+        candidate_generation_basis += '+sampled_directional_focal_arm_selection_v1'
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"
         if prescribed_render_segments is not None else
@@ -7439,6 +7475,7 @@ def build_visual_timeline(
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
+    selection_arm_model_path: Path | None = None,
 ) -> VisualTimelinePlan:
     """Build a selected plan, optionally requesting only one complete path.
 
@@ -7466,6 +7503,7 @@ def build_visual_timeline(
         require_persistent_feature_cache=require_persistent_feature_cache,
         maximum_candidate_results=maximum_results,
         candidate_set_only=False,
+        selection_arm_model_path=selection_arm_model_path,
     )
     if not isinstance(result, VisualTimelinePlan):  # pragma: no cover - invariant
         raise TypeError("selected visual timeline builder returned a candidate set")

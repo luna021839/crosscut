@@ -208,11 +208,21 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
                 raise ValueError('untransformed side retains a camera outside the new dense receipt')
         segments[index] = replace(new,editorial_transform=track)
     proposal = replace(plan,segments=tuple(segments))
+    preserved = assert_preserved_output_boundaries(plan,proposal,source_clocks,
+        (boundary_index-1,boundary_index+1))
+    return GroupCutCameraProposal(proposal,clock_timeline,alignment,boundary_index,round(movement_frames),preserved)
+
+
+def assert_preserved_output_boundaries(plan, proposal, source_clocks, neighbors):
+    """Prove the unchanged outer windows of a local proposal, never its new cuts."""
+    if any(getattr(plan,name)!=getattr(proposal,name) for name in (
+            'sources','fps','width','height','transitions','master_audio_start','reference_source')):
+        raise ValueError('camera proposal changed the output or source domain')
     before_counts,after_counts = segment_frame_counts(plan),segment_frame_counts(proposal)
     if plan.output_frame_count != proposal.output_frame_count:
         raise ValueError('camera proposal changed total output frames')
     preserved = []
-    for neighbor in (boundary_index-1,boundary_index+1):
+    for neighbor in neighbors:
         if not 0 <= neighbor < len(plan.segments)-1:
             continue
         if plan.segments[neighbor].source_index == plan.segments[neighbor+1].source_index:
@@ -234,6 +244,9 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
             ta = (a.output_frame_index-sum(before_counts[:index]))/plan.fps
             tb = (b.output_frame_index-sum(after_counts[:index]))/plan.fps
             old,new = plan.segments[index],proposal.segments[index]
+            if any(getattr(old,name)!=getattr(new,name) for name in (
+                    'crop','look_adjustment','boundary_look_track','outgoing_overlap_transform')):
+                raise ValueError('camera proposal changed neighboring crop, grade or overlap')
             ca = _fixed_crop_at(old.pan_crop,ta) if old.pan_crop else (0.,0.,1.,1.)
             cb = _fixed_crop_at(new.pan_crop,tb) if new.pan_crop else (0.,0.,1.,1.)
             ka = old.editorial_transform.evaluate(ta) if old.editorial_transform else EditorialTransformKeyframe(ta,1.)
@@ -243,7 +256,7 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
                    for ar,br in zip(va,vb) for x,y in zip(ar,br)):
                 raise ValueError('camera proposal changed neighboring crop or camera')
         preserved.append(neighbor)
-    return GroupCutCameraProposal(proposal,clock_timeline,alignment,boundary_index,round(movement_frames),tuple(preserved))
+    return tuple(preserved)
 
 
 def vars_for_state(keyframe):

@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 from .face_identity import cosine_similarity
 from .ive import EditMode, IVEMember
 from .pose import FormationPersonDescriptor
+from .selection_arm_motion import SelectionArmWindow, selection_arm_cost
 from .timeline_no_good import (
     TimelineNoGoodEdgeKey,
     TimelineNoGoodSet,
@@ -384,10 +385,18 @@ class TimelineCandidate:
     # separate so exact-offset comparison does not fabricate duplicate frames.
     entry_face_geometry_exact: tuple[float, ...] = field(default=(), repr=False)
     exit_face_geometry_exact: tuple[float, ...] = field(default=(), repr=False)
+    entry_arm_window: SelectionArmWindow | None = field(default=None, repr=False)
+    exit_arm_window: SelectionArmWindow | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.segment_index < 0:
             raise ValueError("segment_index must be non-negative")
+        for window in (self.entry_arm_window, self.exit_arm_window):
+            if window is not None and (not isinstance(window, SelectionArmWindow)
+                    or window.source_id != self.source_id
+                    or window.master_times[0] < self.start_seconds - 1e-7
+                    or window.master_times[1] > self.end_seconds + 1e-7):
+                raise ValueError('selection arm evidence must belong to this source and segment clock')
         if not self.source_id:
             raise ValueError("source_id cannot be empty")
         if self.start_seconds < 0 or self.end_seconds <= self.start_seconds:
@@ -1715,14 +1724,15 @@ def _transition_score(
             previous_silhouette,
             current_silhouette,
         )
-        score -= config.motion_transition_weight * _motion_mismatch(
+        arm_motion = selection_arm_cost(previous.exit_arm_window, current.entry_arm_window)
+        score -= config.motion_transition_weight * (arm_motion.cost if arm_motion is not None else _motion_mismatch(
             previous.exit_motion
             if previous_has_boundary_descriptor
             else previous.motion,
             current.entry_motion
             if current_has_boundary_descriptor
             else current.motion,
-        )
+        ))
         previous_scale = (
             previous.exit_shot_scale
             if previous.exit_shot_scale is not None
