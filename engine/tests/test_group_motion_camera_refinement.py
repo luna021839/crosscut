@@ -8,12 +8,14 @@ import numpy as np
 
 from crosscut.boundary_subject_alignment import BoundarySubjectObservation,build_boundary_subject_alignment_plan
 from crosscut.closeup_gesture import CloseupGestureEvidence, ObservedArmMotion
+from crosscut.observed_head_motion import HeadMotionEvidence,ObservedHeadMotion,HEAD_MOTION_BASIS
 from crosscut.group_cut_camera_proposal import build_group_cut_camera_proposal
 from crosscut.group_motion_camera_refinement import (
     GroupMotionCameraRefinement, camera_motion_rank, refine_group_motion_camera,
     focal_boundary_shortlist,
     measured_motion_improves,
     measured_output_face_box,
+    retimed_incumbent_camera_preview,
 )
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (
@@ -21,7 +23,7 @@ from crosscut.pipeline import (
     _validate_review_first_group_bundle,
 )
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
-from crosscut.render import RenderPlan,RenderSegment,RenderTransition
+from crosscut.render import RenderPlan,RenderSegment,RenderTransition,EditorialTransformTrack,EditorialTransformKeyframe
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.visual_score import VisualTimelinePlan
 from crosscut.timeline import ShotType
@@ -89,6 +91,33 @@ class MotionCameraRankTests(unittest.TestCase):
                         source_timewarps=(), scene_cut_times=(), model_path='unused', **options)
             probe.assert_not_called()
 
+    def test_ranking_preview_keeps_absolute_incumbent_curve_and_sampling_raster(self):
+        outgoing=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),
+            EditorialTransformKeyframe(.7,1.2),EditorialTransformKeyframe(1.,1.)))
+        incoming=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),
+            EditorialTransformKeyframe(.5,1.),EditorialTransformKeyframe(1.,1.)))
+        segments=(RenderSegment(0,0.,1.,0.,editorial_transform=outgoing),
+            RenderSegment(1,1.,1.,1.,editorial_transform=incoming),RenderSegment(0,2.,1.,2.))
+        plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),segments,0,'16:9',Path('unused.mp4'),fps=30.)
+        numeric=replace(plan,segments=(replace(segments[0],duration=1.2,editorial_transform=None),
+            replace(segments[1],master_start=1.2,source_start=1.2,duration=.8,editorial_transform=None),segments[2]))
+        preview=retimed_incumbent_camera_preview(plan,numeric,0)
+        self.assertEqual(preview.segments[2],plan.segments[2])
+        for index,shift in ((0,0.),(1,.2)):
+            original=plan.segments[index].editorial_transform
+            track=preview.segments[index].editorial_transform
+            for time in (0.,.25,.5,.7):
+                a,b=track.evaluate(time),original.evaluate(time+shift)
+                for field in ('zoom','center_x','center_y','roll_degrees'):
+                    self.assertAlmostEqual(getattr(a,field),getattr(b,field))
+            self.assertEqual(track.effective_sampling_canvas_zoom,original.effective_sampling_canvas_zoom)
+            self.assertIn('not_dense_authority',track.reason)
+        self.assertIsNotNone(preview.segments[1].editorial_transform.sampling_canvas_zoom)
+        self.assertIsNone(plan.segments[1].editorial_transform.sampling_canvas_zoom)
+        self.assertEqual(preview.output_frame_count,plan.output_frame_count)
+        for bad in (True,-1,2):
+            with self.assertRaises(ValueError):retimed_incumbent_camera_preview(plan,numeric,bad)
+
     def test_bounded_candidate_frontier_does_not_limit_sensing_to_the_first_twelve_scales(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
             shot_type=ShotType.MEDIUM,shot_scale=.8-i*.01,
@@ -143,6 +172,51 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertEqual(budget['measured_boundary_indices'],[12])
         self.assertEqual(result.proposals,())
         self.assertEqual(result.plan,plan)
+
+    def test_head_fallback_stays_in_its_basis_and_native_cuts_precede_all_sensing(self):
+        timeline=VisualTimelinePlan(tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),
+            entry_shot_scale=.5,exit_shot_scale=.5) for i in range(2)),1.)
+        plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),
+            (RenderSegment(0,0.,2.,0.),RenderSegment(1,2.,2.,2.)),0,'16:9',Path('unused.mp4'),
+            fps=30.,transitions=(RenderTransition(),))
+        for arm_available,native_cut in ((False,False),(True,False),(False,True)):
+            arm_calls=[];head_calls=[];descriptor_calls=[]
+            def arm(*args,**kwargs):
+                arm_calls.append(args)
+                return self.gesture() if arm_available else None
+            def head(*args,**kwargs):
+                head_calls.append(args)
+                frames=tuple(int(row[1]*30.+.5) for row in args)
+                return HeadMotionEvidence(ObservedHeadMotion(frames,(.1,1/30.,.1),.2,.1))
+            def descriptor(*args,**kwargs):
+                descriptor_calls.append(args)
+                return SimpleNamespace()
+            provider=SimpleNamespace(compare_motion=arm,compare_head_motion=head,close=lambda:None,
+                capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8)))
+            with self.subTest(arm_available=arm_available,native_cut=native_cut), \
+                    patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',return_value=
+                        VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
+                    patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
+                    patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
+                        SimpleNamespace(feature_descriptor_at=descriptor,close=lambda:None)), \
+                    patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)):
+                result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
+                    source_timewarps=(None,None),scene_cut_times=((1.95,) if native_cut else (),()),
+                    model_path='unused')
+            baseline=next(row for row in result.attempts if row['stage']=='baseline_motion')
+            self.assertEqual(result.proposals,())
+            if native_cut:
+                self.assertFalse(arm_calls or head_calls or descriptor_calls)
+                self.assertFalse(baseline['complete_measured_candidate'])
+            elif arm_available:
+                self.assertTrue(arm_calls)
+                self.assertFalse(head_calls)
+                self.assertNotEqual(baseline['motion_evidence_basis'],HEAD_MOTION_BASIS)
+            else:
+                self.assertEqual(len(arm_calls),1,'head candidate offsets may not switch to newly visible arms')
+                self.assertEqual(len(head_calls),7)
+                self.assertEqual(baseline['motion_evidence_basis'],HEAD_MOTION_BASIS)
+                self.assertTrue(baseline['complete_measured_candidate'])
 
     def test_action_recovery_is_one_explicit_retry_inside_existing_camera_slots(self):
         timeline=VisualTimelinePlan(tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),

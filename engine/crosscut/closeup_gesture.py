@@ -309,6 +309,7 @@ class CloseupGestureProvider:
         self.capture = _CaptureProvider(self.sources)
         self.pose = BodyPose2DAnalyzer(model_path)
         self.cache = OrderedDict()
+        self.head_cache = OrderedDict()
 
     @staticmethod
     def _identity(path):
@@ -388,6 +389,82 @@ class CloseupGestureProvider:
         motion=measure_arm_motion(tuple(frame[1] for frame in frames),native_frames=ids,
             output_intervals_seconds=(flank_frames/output_fps,1./output_fps,flank_frames/output_fps))
         return replace(evidence,motion=motion) if motion is not None else None
+
+    def compare_head_motion(self, outgoing_preceding, outgoing, incoming, incoming_following,
+                            *, output_fps, flank_frames=3):
+        """A separate pixel-linked head basis, only for arm-unmeasured callers.
+
+        Same-source paths must link the actual four native frames. Known
+        primary faces are preserved; missing five-point geometry gets one
+        bounded global reacquisition, never a central-face substitute.
+        """
+        from .observed_head_motion import head_motion_signature,measure_head_motion,HeadMotionEvidence
+        from .roll_aware_face_geometry import detect_roll_aware_faces
+        from .visual_score import _dominant_face,_normalized_face_metadata,_working_frame
+        from .group_focal_attention import focal_landmarks_track
+        from .boundary_subject_alignment import _optical_flow_box
+        from .cut_anchored_containment import _iou
+        import cv2
+        if (type(output_fps) not in (float,int) or not math.isfinite(output_fps) or output_fps<=0
+                or type(flank_frames) is not int or flank_frames<1):
+            raise ValueError('head motion requires a valid output clock')
+        requests=(outgoing_preceding,outgoing,incoming,incoming_following)
+        if (outgoing_preceding[0]!=outgoing[0] or incoming[0]!=incoming_following[0]
+                or outgoing[0]==incoming[0]):
+            raise ValueError('head paths must stay within two different source runs')
+        observations=[]
+        for source,seconds,clock,descriptor in requests:
+            if self._identity(self.sources[source])!=self.identities[source]:
+                raise OSError('head source changed during analysis')
+            if clock is None or type(seconds) not in (float,int) or not math.isfinite(seconds) or seconds<0:
+                return None
+            index=int(seconds*float(clock.frame_rate)+.5)
+            if not 0<=index<clock.frame_count:return None
+            frame=self.capture.frame_at_native_index(source,index,clock)
+            if frame is None:return None
+            frame=cv2.resize(_working_frame(frame,maximum_width=960),(854,480))
+            known=descriptor.primary_face_bbox
+            geometry=getattr(descriptor,'primary_face_geometry',None)
+            points=getattr(descriptor,'primary_face_landmarks_xy',None)
+            key=(source,index,known,geometry,points)
+            if key in self.head_cache:
+                signature,box,points=self.head_cache[key]
+                self.head_cache.move_to_end(key)
+            else:
+                signature=head_motion_signature(geometry,points)
+                box=known
+                if signature is None:
+                    faces=detect_roll_aware_faces(frame,angles=(0.,))
+                    primary=_dominant_face(faces)
+                    if primary is None:
+                        primary=_dominant_face(detect_roll_aware_faces(frame))
+                    measured_box,measured_points,_,_,measured_geometry=_normalized_face_metadata(primary,
+                        frame_width=854,frame_height=480)
+                    if measured_box is not None and (known is None or _iou(known,measured_box)>=.60):
+                        box,points=measured_box,measured_points
+                        signature=head_motion_signature(measured_geometry,points)
+                self.head_cache[key]=(signature,box,points)
+                if len(self.head_cache)>256:self.head_cache.popitem(last=False)
+            if signature is None or box is None or points is None:return None
+            observations.append((index,signature,box,points,frame))
+        ids=tuple(row[0] for row in observations)
+        if ids[0]>=ids[1] or ids[2]>=ids[3]:return None
+        for a,b in (observations[:2],observations[2:]):
+            if focal_landmarks_track(a[4],b[4],a[3],b[3]):continue
+            tracked=_optical_flow_box(a[4],b[4],a[2])
+            if tracked is None or _iou(tracked,b[2])<.60:return None
+        motion=measure_head_motion(tuple(row[1] for row in observations),native_frames=ids,
+            output_intervals_seconds=(flank_frames/output_fps,1/output_fps,flank_frames/output_fps),
+            same_source_face_paths_pixel_verified=True)
+        if motion is None:return None
+        guard=self.compare(outgoing,incoming)
+        # The head path follows the GLOBAL dominant face. A legacy local arm
+        # fallback may have selected a different central person, even on the
+        # same frame IDs; it cannot become this head's arm guard.
+        if guard is not None and (guard.outgoing_focal_basis!=GLOBAL_FOCAL_BASIS
+                or guard.incoming_focal_basis!=GLOBAL_FOCAL_BASIS):
+            guard=None
+        return HeadMotionEvidence(motion,guard)
 
     def close(self):
         self.capture.close()

@@ -11,11 +11,12 @@ from pathlib import Path
 from time import monotonic
 
 from .optional_native_worker import isolated_optional
-from .render import aligned_render_segment,segment_frame_counts
+from .render import aligned_render_segment,segment_frame_counts,EditorialTransformTrack
 from .render_boundary_clock import hard_cut_boundary_sample_clocks
 from .render_frame_schedule import probe_render_frame_clock
-from .closeup_gesture import CloseupGestureProvider
-from .group_cut_camera_proposal import build_group_cut_camera_proposal
+from .closeup_gesture import CloseupGestureProvider,CloseupGestureEvidence
+from .observed_head_motion import HeadMotionEvidence,HEAD_MOTION_BASIS,HEAD_DIMENSIONS
+from .group_cut_camera_proposal import build_group_cut_camera_proposal,retime_base_pan
 from .prescribed_render_geometry import PrescribedGeometrySampler
 from .post_render_perceptual_quality import _reference_view_for_span
 from .rendered_proxy_review import _default_geometry_provider,_box_discontinuity,ProxyReviewConfig
@@ -63,12 +64,65 @@ def measured_motion_improves(candidate, before):
     measurement. Static-only callers keep their separate, stricter comparator.
     New measured bones still contribute to the candidate's worst-bone cost.
     """
-    return bool(candidate is not None and before is not None
+    if isinstance(before,HeadMotionEvidence):
+        return isinstance(candidate,HeadMotionEvidence) and candidate.improves_over(before)
+    return bool(isinstance(candidate,CloseupGestureEvidence) and isinstance(before,CloseupGestureEvidence)
         and candidate.motion is not None and before.motion is not None
         and before.motion.observed_bones <= candidate.motion.observed_bones
         and candidate.motion.output_intervals_seconds == before.motion.output_intervals_seconds
         and candidate.preserves_pose_continuity_of(before)
         and candidate.ranking_cost < before.ranking_cost-1e-6)
+
+
+def motion_evidence_basis(evidence):
+    if isinstance(evidence,HeadMotionEvidence):return HEAD_MOTION_BASIS
+    return 'exact_four_frame_observed_arm_motion_cost_v1' if isinstance(evidence,CloseupGestureEvidence) else None
+
+
+def measured_motion_frontier(triage,maximum_boundaries):
+    """Do not compare uncalibrated head and arm costs on one numeric axis.
+
+    Alternate independently ranked bases inside the same four-camera budget;
+    a missing basis donates its slots to the other, never creates extra work.
+    """
+    groups=[sorted((row for row in triage if isinstance(row[2],kind)),
+        key=lambda row:row[:2],reverse=True) for kind in (CloseupGestureEvidence,HeadMotionEvidence)]
+    selected=[]
+    while len(selected)<maximum_boundaries and any(groups):
+        for group in groups:
+            if group and len(selected)<maximum_boundaries:selected.append(group.pop(0))
+    return tuple(selected)
+
+
+def retimed_incumbent_camera_preview(plan,numeric,boundary):
+    """Cheap candidate ordering only; this curve owns no dense camera receipt.
+
+    Preview each new native endpoint through the incumbent's absolute camera
+    rather than selecting the two lowest motion costs with no framing evidence.
+    The ordinary proposer still constructs and densely validates its own curve.
+    """
+    if (type(boundary) is not int or not 0<=boundary<len(plan.segments)-1
+            or len(plan.segments)!=len(numeric.segments)):
+        raise ValueError('incumbent camera preview requires one exact adjacent pair')
+    segments=list(numeric.segments)
+    for index in (boundary,boundary+1):
+        old,new=plan.segments[index],numeric.segments[index]
+        if old.source_index!=new.source_index:
+            raise ValueError('incumbent camera preview cannot change sources')
+        shift=new.master_start-old.master_start
+        track=old.editorial_transform
+        if track is not None:
+            times=sorted({0.,new.duration,*(key.time_seconds-shift for key in track.keyframes
+                if 0.<key.time_seconds-shift<new.duration)})
+            keys=tuple(replace(track.evaluate(max(0.,time+shift)),time_seconds=time) for time in times)
+            canvas=track.effective_sampling_canvas_zoom
+            track=EditorialTransformTrack(keys,reason='retimed_incumbent_camera_ranking_preview_not_dense_authority',
+                sampling_canvas_zoom=canvas if track.sampling_canvas_zoom is not None
+                    or max(key.zoom for key in keys)<canvas else None)
+        segments[index]=replace(new,editorial_transform=track,
+            pan_crop=retime_base_pan(old.pan_crop,relative_shift=shift,duration=new.duration),
+            crop=old.crop,look_adjustment=old.look_adjustment)
+    return replace(numeric,segments=tuple(segments))
 
 
 def measured_output_face_box(frame):
@@ -163,7 +217,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 feature_derived_cache_directory=feature_derived_cache_directory,
                 require_persistent_feature_cache=require_persistent_feature_cache)
         return samplers[source]
-    def measured(candidate,boundary):
+    def measured(candidate,boundary,required_basis=None):
         samples=hard_cut_boundary_sample_clocks(candidate,clocks,boundary_index=boundary)
         for first,last in ((samples[0],samples[1]),(samples[2],samples[3])):
             rate=float(clocks[first.source_index].frame_rate)
@@ -180,7 +234,10 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 return None,None,None
             descriptors.append(descriptor)
             values.append((sample.source_index,seconds,clocks[sample.source_index],descriptor))
-        gesture=provider.compare_motion(*values,output_fps=plan.fps)
+        gesture=(provider.compare_motion(*values,output_fps=plan.fps)
+            if required_basis!=HEAD_MOTION_BASIS else None)
+        if gesture is None and hasattr(provider,'compare_head_motion'):
+            gesture=provider.compare_head_motion(*values,output_fps=plan.fps)
         return gesture,tuple(descriptors),samples
     def faces(candidate,boundary,samples):
         counts=segment_frame_counts(candidate)
@@ -222,13 +279,14 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 triage.append((gesture.ranking_cost,boundary,gesture,samples,baseline_faces,baseline_rank))
             attempts.append(dict(stage='baseline_motion',boundary_index=boundary,admitted=False,
                 motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
+                motion_evidence_basis=motion_evidence_basis(gesture),
                 output_face_metrics=baseline_faces,complete_measured_candidate=baseline_rank is not None))
         attempts.append(dict(stage='bounded_measured_focal_frontier',admitted=False,
             cached_candidate_budget=maximum_candidate_boundaries,measured_candidate_budget=maximum_measured_boundaries,
             cached_eligible_boundaries=len(shortlist),measured_candidate_count=len(triage),
             measured_boundary_indices=[row[1] for row in triage],
             cached_geometry_used_only_for_sensing_order=True,quality_approved=False))
-        for _,boundary,before,samples,before_faces,before_rank in sorted(triage,key=lambda row:row[:2],reverse=True)[:maximum_boundaries]:
+        for _,boundary,before,samples,before_faces,before_rank in measured_motion_frontier(triage,maximum_boundaries):
             if any(abs(boundary-proposal.boundary_index)<=1 for proposal in selected):
                 continue
             offsets=[]
@@ -245,25 +303,40 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     for choice,start,end in ((left,left.canonical_master_start,cut),(right,cut,right.canonical_master_end)))
                 numeric=replace(plan,segments=(*plan.segments[:boundary],*pair,*plan.segments[boundary+2:]))
                 try:
-                    gesture,descriptors,native=measured(numeric,boundary)
+                    gesture,descriptors,native=measured(numeric,boundary,required_basis=motion_evidence_basis(before))
                 except ValueError:
                     continue
                 improves=measured_motion_improves(gesture,before)
+                preview_faces=preview_rank=None
+                if improves:
+                    preview=retimed_incumbent_camera_preview(plan,numeric,boundary)
+                    preview_faces=faces(preview,boundary,native)
+                    preview_rank=camera_motion_rank(gesture,preview_faces,enforce_face_limits=False)
                 attempts.append(dict(stage='directional_candidate',boundary_index=boundary,
                     offset_frames=offset,admitted=False,motion_rank_improved=improves,
-                    before_motion_bones=sorted(before.motion.observed_bones),
+                    motion_evidence_basis=motion_evidence_basis(before),
+                    before_motion_bones=(sorted(before.motion.observed_bones) if isinstance(before,CloseupGestureEvidence) else []),
                     proposed_motion_bones=(sorted(gesture.motion.observed_bones)
-                        if gesture is not None and gesture.motion is not None else []),
+                        if isinstance(gesture,CloseupGestureEvidence) and gesture.motion is not None else []),
+                    head_motion_dimensions=list(HEAD_DIMENSIONS) if isinstance(before,HeadMotionEvidence) else [],
                     endpoint_only_bones_no_longer_observed=(sorted(before.observed_bones-gesture.observed_bones)
                         if gesture is not None else []),
                     proposed_motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
+                    incumbent_camera_preview_face_metrics=preview_faces,
+                    incumbent_camera_preview_joint_rank=preview_rank,
+                    preview_grants_dense_camera_authority=False,
                     unknown_motion_bones_imputed=False))
                 if improves:
-                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native))
+                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native,preview_rank))
             eligible=[]
-            for _,offset,pair,gesture,descriptors,native in sorted(offsets,key=lambda row:row[:2])[:maximum_camera_candidates]:
+            for _,offset,pair,gesture,descriptors,native,preview_rank in sorted(offsets,
+                    key=lambda row:(row[6] is None,row[6] if row[6] is not None else row[0],row[0],abs(row[1]),row[1]))[:maximum_camera_candidates]:
                 row=dict(stage='complete_camera_candidate',boundary_index=boundary,offset_frames=offset,
                     before_motion_cost=before.ranking_cost,proposed_motion_cost=gesture.ranking_cost,
+                    motion_evidence_basis=motion_evidence_basis(before),
+                    before_motion_evidence=before.to_dict(),proposed_motion_evidence=gesture.to_dict(),
+                    incumbent_camera_preview_joint_rank=preview_rank,
+                    preview_grants_dense_camera_authority=False,
                     before_output_face_metrics=before_faces,admitted=False)
                 try:
                     camera_arguments=dict(plan=plan,timeline=timeline,boundary_index=boundary,
