@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.direct_member_editorial_motion import (
@@ -168,6 +169,21 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
         self.assertEqual(diagnostics["status"], "binding_ready")
         assert binding is not None
         return binding
+
+    def test_camera_search_modules_invalidate_decision_feedback_not_observations(self) -> None:
+        from crosscut.pipeline import source_content_sha256
+        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write_acquisition_manifest(directory)
+            original = self._binding(directory)
+            observations = SourceFirstFocalGeometryProvider.observation_fingerprint()
+            for filename in ('direct_member_transform.py', 'direct_member_bilateral_transform.py'):
+                def changed(path):
+                    return 'f' * 64 if path.name == filename else source_content_sha256(path)
+                with self.subTest(filename=filename), patch('crosscut.pipeline.source_content_sha256', side_effect=changed):
+                    self.assertNotEqual(self._binding(directory), original)
+                    self.assertEqual(SourceFirstFocalGeometryProvider.observation_fingerprint(), observations)
 
     def test_look_refinement_requires_rendered_continuity_success(self) -> None:
         self.assertFalse(

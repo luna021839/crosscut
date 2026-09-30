@@ -203,8 +203,19 @@ class EditorialMotionPlan:
     # Authored gestures and frame-visible trajectory targets have different
     # cardinalities (e.g. one pulse split across two render segments).
     authored_event_counts: tuple[tuple[str, int], ...] = ()
+    # A partial proposal must not discard the exact reasons a required camera
+    # was withheld. This is diagnostic evidence, never acceptance authority.
+    required_boundary_failures: tuple[tuple[int, tuple[str, ...], str | None], ...] = ()
 
     def __post_init__(self):
+        failures = tuple((index, tuple(reasons), context) for index, reasons, context in self.required_boundary_failures)
+        if (len({row[0] for row in failures}) != len(failures)
+                or any(type(index) is not int or not 0 <= index < len(self.segments) - 1
+                       or not reasons or any(not isinstance(reason, str) or not reason for reason in reasons)
+                       or context is not None and not isinstance(context, str)
+                       for index, reasons, context in failures)):
+            raise ValueError('required camera failures must name valid boundaries and diagnostic reasons')
+        object.__setattr__(self, 'required_boundary_failures', failures)
         if self.member_roll_audit:
             from .visual_boundary_repair import _freeze_audit_value
             object.__setattr__(self,'member_roll_audit',tuple(_freeze_audit_value(row) for row in self.member_roll_audit))
@@ -337,6 +348,10 @@ class EditorialMotionPlan:
                 else None
             ),
             "segments": [item.to_dict() for item in self.segments],
+            **({"required_boundary_failures": [
+                {"boundary_index": index, "reasons": list(reasons), "context": context}
+                for index, reasons, context in self.required_boundary_failures
+            ]} if self.required_boundary_failures else {}),
             **({'member_roll_audit':_thaw_audit_value(self.member_roll_audit)} if self.member_roll_audit else {}),
         }
 

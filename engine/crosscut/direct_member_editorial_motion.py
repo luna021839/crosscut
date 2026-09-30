@@ -26,6 +26,7 @@ from .direct_member_transform import (
     direct_member_source_frame_geometry,
     map_box_to_portrait_fill,
 )
+from .direct_member_bilateral_transform import DirectMemberBilateralTransformRepair
 from .direct_member_target_face import (
     FOCAL_FACE_BASIS,
     FocalFaceCandidate,
@@ -3043,7 +3044,7 @@ def build_direct_member_editorial_motion_plan(
         repair = getattr(mismatch, "transform_repair", None)
         if repair is not None and not isinstance(
             repair,
-            DirectMemberBoundaryTransformRepair,
+            (DirectMemberBoundaryTransformRepair, DirectMemberBilateralTransformRepair),
         ):
             raise ValueError("direct member boundary transform repair is invalid")
         required = bool(
@@ -3085,6 +3086,13 @@ def build_direct_member_editorial_motion_plan(
         )
         left_geometry = source_frame_geometries[left_source]
         right_geometry = source_frame_geometries[right_source]
+        if isinstance(repair, DirectMemberBilateralTransformRepair):
+            if (repair.outgoing.source_index != left_source
+                    or repair.incoming.source_index != right_source):
+                raise ValueError("paired member transform sources disagree with path")
+            if (repair.outgoing.source_geometry != left_geometry
+                    or repair.incoming.source_geometry != right_geometry):
+                raise ValueError("paired member transform source capacity disagrees with render")
         left_time = (
             common_master_start
             + renders[boundary_index].master_start
@@ -3247,16 +3255,19 @@ def build_direct_member_editorial_motion_plan(
                 raise ValueError(
                     "required transform geometry basis disagrees with dense audit"
                 )
-            preferred_side = (
-                "left" if repair.transformed_side == "outgoing" else "right"
-            )
-            expected_source = (
-                left_source if preferred_side == "left" else right_source
-            )
-            if repair.transformed_source_index != expected_source:
-                raise ValueError(
-                    "direct member required transform source disagrees with path"
+            if isinstance(repair, DirectMemberBilateralTransformRepair):
+                preferred_side = "left"
+            else:
+                preferred_side = (
+                    "left" if repair.transformed_side == "outgoing" else "right"
                 )
+                expected_source = (
+                    left_source if preferred_side == "left" else right_source
+                )
+                if repair.transformed_source_index != expected_source:
+                    raise ValueError(
+                        "direct member required transform source disagrees with path"
+                    )
         elif left_box[3] + 1e-9 < right_box[3]:
             preferred_side = "left"
         else:
@@ -3294,6 +3305,41 @@ def build_direct_member_editorial_motion_plan(
                 right_box,
             )
             skip("required_dense_natural_match")
+            continue
+
+        if required and isinstance(repair, DirectMemberBilateralTransformRepair):
+            # Reproduce the selector's TWO source-bound endpoint states, then
+            # subject both full ramps to the existing atomic dense publication.
+            # Never reinterpret the second camera as a one-sided certificate.
+            if any(boundary_side_overlaps_effect(boundary_index, side) for side in ("left", "right")):
+                reject_boundary("bilateral_dissolve_adjacent")
+                continue
+            if min(last_frame_times[boundary_index:boundary_index + 2]) < .55 - 1e-9:
+                reject_boundary("bilateral_window_shorter_than_reference_ramp")
+                continue
+            if any(camera.zoom > min(settings.maximum_boundary_zoom,
+                       camera.source_geometry.lossless_zoom_capacity * settings.maximum_boundary_upscale_ratio) + 1e-9
+                   or camera.center_shift > settings.maximum_center_shift + 1e-9 for camera in repair.cameras):
+                reject_boundary("bilateral_camera_exceeds_render_bounds")
+                continue
+            states = tuple(_State(zoom=c.zoom, center_x=c.center_x, center_y=c.center_y) for c in repair.cameras)
+            projected = tuple(_project(box, state) for box, state in zip((left_box, right_box), states))
+            position, scale = _rendered_attention_mismatch(*projected)
+            transformed = _mismatch(*projected)
+            minimum_visible = (settings.minimum_dense_face_visible_fraction if _is_face_alignment_basis(audited_basis)
+                               else settings.minimum_widened_subject_visible_fraction)
+            if (position > professional_position_limit + 1e-9 or scale > professional_scale_limit + 1e-9
+                    or math.dist(_center(projected[0]), _center(projected[1])) > settings.maximum_residual_center_distance + 1e-9
+                    or transformed > baseline * (1.0 - required_improvement_fraction) + 1e-9
+                    or min(_visible_fraction(box, state) for box, state in zip((left_box, right_box), states)) + 1e-9 < minimum_visible):
+                reject_boundary("bilateral_selector_camera_disagrees_with_dense_geometry")
+                continue
+            candidates.append(_BoundaryCandidate(
+                boundary_index=boundary_index, event_time=boundary_times[boundary_index],
+                score=baseline - transformed, side="both", state=states[0], paired_state=states[1],
+                upscale_ratio=repair.outgoing.upscale_ratio, paired_upscale_ratio=repair.incoming.upscale_ratio,
+                alignment_geometry_basis=audited_basis, left_box=left_box, right_box=right_box, required=True,
+            ))
             continue
 
         def qualifying_for_side(
@@ -4471,6 +4517,11 @@ def build_direct_member_editorial_motion_plan(
                 *final_boundary_residuals[boundary_index],
             )
             for boundary_index in sorted(final_boundary_residuals)
+        ),
+        required_boundary_failures=tuple(
+            (index, tuple(sorted(required_rejection_reasons.get(index,
+                {"required_candidate_missing_without_reason"}))), required_rejection_context.get(index))
+            for index in missing_required
         ),
     )
     from .direct_member_roll import apply_direct_member_roll

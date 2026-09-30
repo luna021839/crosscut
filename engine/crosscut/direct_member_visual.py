@@ -61,6 +61,10 @@ from .direct_member_transform import (
     map_box_to_portrait_fill,
     project_box,
 )
+from .direct_member_bilateral_transform import (
+    DirectMemberBilateralTransformRepair, DirectMemberBoundaryCamera,
+    find_bilateral_boundary_transform_repair,
+)
 from .pose import SILHOUETTE_BACKEND
 from .timeline import formation_assignment_mismatch
 from .timewarp import TimeWarpMap
@@ -1432,7 +1436,7 @@ class DirectBoundaryMismatch:
     attention_geometry_basis: str | None = None
     dense_attention_validation_required: bool = False
     motion_connection: DirectBoundaryMotionEvidence | None = None
-    transform_repair: DirectMemberBoundaryTransformRepair | None = None
+    transform_repair: DirectMemberBoundaryTransformRepair | DirectMemberBilateralTransformRepair | None = None
     member_context_softened_flags: tuple[str, ...] = ()
     cinematic_bridge: DirectMemberCinematicBridge | None = None
     boundary_search_offset_frames: int = 0
@@ -1534,7 +1538,7 @@ def _cinematic_bridge_from_verified_evidence(
     outgoing_source_geometry: DirectMemberSourceFrameGeometry | None,
     incoming_source_geometry: DirectMemberSourceFrameGeometry | None,
     timestamp_bound_adjacent: bool,
-    transform_repair: DirectMemberBoundaryTransformRepair | None,
+    transform_repair: DirectMemberBoundaryTransformRepair | DirectMemberBilateralTransformRepair | None,
     motion_connection: DirectBoundaryMotionEvidence | None = None,
     focal_pose_window_verified: bool = False,
 ) -> DirectMemberCinematicBridge | None:
@@ -4697,7 +4701,7 @@ def _sample_in_portrait_fill(
 
 def _sample_with_boundary_transform(
     sample: _BoundarySample,
-    repair: DirectMemberBoundaryTransformRepair | None,
+    repair: DirectMemberBoundaryTransformRepair | DirectMemberBoundaryCamera | None,
 ) -> _BoundarySample:
     """Project attention through a selector-authorized boundary camera state."""
 
@@ -5283,7 +5287,7 @@ def _verified_cross_source_structure_pose_proxy(
     attention_position_mismatch: float | None,
     attention_scale_mismatch: float | None,
     evidence_component_count: int,
-    transform_repair: DirectMemberBoundaryTransformRepair | None,
+    transform_repair: DirectMemberBoundaryTransformRepair | DirectMemberBilateralTransformRepair | None,
     config: DirectMemberVisualConfig,
 ) -> bool:
     """Admit detector misses only when independent render-space evidence agrees.
@@ -5583,7 +5587,7 @@ def _boundary_mismatch(
         and incoming_source_index is not None
         and outgoing_source_index != incoming_source_index
     )
-    transform_repair: DirectMemberBoundaryTransformRepair | None = None
+    transform_repair: DirectMemberBoundaryTransformRepair | DirectMemberBilateralTransformRepair | None = None
     repairable_attention_flags = tuple(
         name
         for name in raw_severe_flags
@@ -5654,7 +5658,7 @@ def _boundary_mismatch(
             incoming_subject_box = incoming_attention.bbox_xywh
             outgoing_subject_basis = alignment_geometry_basis
             incoming_subject_basis = alignment_geometry_basis
-        transform_repair = find_resolution_bound_boundary_transform_repair(
+        repair_arguments = dict(
             maximum_upscale_ratio=(config.transform_repair_maximum_upscale_ratio if focal_mode else 1.0),
             outgoing_face_box=outgoing_attention.bbox_xywh,
             incoming_face_box=incoming_attention.bbox_xywh,
@@ -5697,6 +5701,23 @@ def _boundary_mismatch(
             ),
             alignment_geometry_basis=str(alignment_geometry_basis),
         )
+        transform_repair = find_resolution_bound_boundary_transform_repair(**repair_arguments)
+        if transform_repair is None and focal_mode:
+            # The downstream camera already supports paired boundary ramps.
+            # Admit that same family here, with its professional residual
+            # limits, rather than excluding it after only a one-sided test.
+            paired_arguments = dict(repair_arguments)
+            paired_arguments.update(
+                maximum_residual_attention_position_mismatch=(
+                    config.transform_alignment_position_trigger if official_face_pair
+                    else config.transform_body_alignment_position_trigger
+                ) + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE,
+                maximum_residual_attention_scale_mismatch=(
+                    config.transform_alignment_scale_trigger if official_face_pair
+                    else config.transform_body_alignment_scale_trigger
+                ) + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE,
+            )
+            transform_repair = find_bilateral_boundary_transform_repair(**paired_arguments)
         if transform_repair is not None:
             transform_repair = transform_repair.with_repaired_severe_flags(
                 repairable_attention_flags
@@ -5738,7 +5759,16 @@ def _boundary_mismatch(
         motion_incoming = incoming_output
         motion_incoming_next = incoming_next_output
         if transform_repair is not None:
-            if transform_repair.transformed_side == "outgoing":
+            if isinstance(transform_repair, DirectMemberBilateralTransformRepair):
+                motion_outgoing_previous = _sample_with_boundary_transform(
+                    motion_outgoing_previous, transform_repair.outgoing)
+                motion_outgoing = _sample_with_boundary_transform(
+                    motion_outgoing, transform_repair.outgoing)
+                motion_incoming = _sample_with_boundary_transform(
+                    motion_incoming, transform_repair.incoming)
+                motion_incoming_next = _sample_with_boundary_transform(
+                    motion_incoming_next, transform_repair.incoming)
+            elif transform_repair.transformed_side == "outgoing":
                 motion_outgoing_previous = _sample_with_boundary_transform(
                     motion_outgoing_previous,
                     transform_repair,
@@ -5936,11 +5966,14 @@ def _boundary_mismatch(
     if motion_connection is not None:
         cost -= motion_connection.soft_preference_applied
     if transform_repair is not None:
-        cost += 0.35 * (
-            (transform_repair.zoom - 1.0)
+        cameras = (transform_repair.cameras if isinstance(transform_repair, DirectMemberBilateralTransformRepair)
+                   else (transform_repair,))
+        cost += 0.35 * sum(
+            (camera.zoom - 1.0)
             / max(1e-9, config.transform_repair_maximum_zoom - 1.0)
-            + transform_repair.center_shift
+            + camera.center_shift
             / max(1e-9, config.transform_repair_maximum_center_shift)
+            for camera in cameras
         )
     mismatch = DirectBoundaryMismatch(
         cost=cost,
