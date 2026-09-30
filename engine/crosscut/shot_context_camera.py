@@ -45,6 +45,13 @@ def _focal_pixel_path_step(reference,target,before,after):
     tracked=_optical_flow_box(reference,target,before.face_box_xywh)
     if tracked is not None and _iou(tracked,after.face_box_xywh)>=.60:
         return 'head_box_forward_backward_pixel_flow'
+    # A lighting flash/nonrigid face motion may defeat LK even though both
+    # neighboring faces are freshly observed. Reuse the existing bounded
+    # local geometry + appearance check; this cannot synthesize missing faces
+    # or search for a similar person elsewhere in the image.
+    from .observed_face_containment import recover_observed_face_step
+    if recover_observed_face_step(reference,target,before.face_box_xywh,(after.face_box_xywh,)) is not None:
+        return 'observed_local_face_geometry_and_appearance'
     return None
 
 

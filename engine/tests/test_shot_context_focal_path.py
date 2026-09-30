@@ -1,12 +1,13 @@
 from dataclasses import replace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 
 from crosscut.boundary_subject_alignment import BoundarySubjectObservation
 from crosscut.group_focal_attention import GroupFocalSubject,CENTRAL_FOCAL_BASIS,GLOBAL_FOCAL_BASIS
 from crosscut.pose import FormationPersonDescriptor
-from crosscut.shot_context_camera import fixed_neighbor_face_state,_source_local_focal_path
+from crosscut.shot_context_camera import fixed_neighbor_face_state,_source_local_focal_path,_focal_pixel_path_step
 from engine.tests import test_shot_context_camera as fixtures
 
 face=fixtures.face
@@ -23,6 +24,16 @@ def focal_face(height=.2,*,central=True,x=.44):
 
 
 class ShotContextFocalPathTests(unittest.TestCase):
+    def test_failed_flow_uses_bounded_fresh_face_recovery_not_box_proximity(self):
+        frame=np.zeros((16,16,3),np.uint8);observed=focal_face()
+        for recovered in (None,SimpleNamespace(appearance_similarity=.62)):
+            with patch('crosscut.shot_context_camera.focal_landmarks_track',return_value=False), \
+                    patch('crosscut.shot_context_camera._optical_flow_box',return_value=None), \
+                    patch('crosscut.observed_face_containment.recover_observed_face_step',return_value=recovered) as recover:
+                result=_focal_pixel_path_step(frame,frame,observed,observed)
+            recover.assert_called_once_with(frame,frame,observed.face_box_xywh,(observed.face_box_xywh,))
+            self.assertEqual(result,'observed_local_face_geometry_and_appearance' if recovered else None)
+
     def test_central_face_needs_explicit_mode_without_forging_global_dominance(self):
         source=focal_face();target=face(.26)
         self.assertFalse(source.face_is_unambiguous_dominant)
