@@ -122,6 +122,23 @@ def _actual_pose_available(descriptor: FrameVisualDescriptor | None) -> bool:
     )
 
 
+def _gesture_preserves_visual_comparison(after: Mapping, before: Mapping) -> bool:
+    """A last-pass arm refinement must not buy its win with worse raw editing.
+
+    Keep both the existing aggregate and its pre-temporal-preference cost.
+    Missing a formerly measured channel cannot masquerade as a lower cost
+    under a smaller denominator. Crop/renderer/QA authority is unchanged.
+    """
+    for field in ('total_cost', 'base_total_cost'):
+        new, old = after.get(field), before.get(field)
+        if (type(new) not in (int,float) or type(old) not in (int,float)
+                or not math.isfinite(new) or not math.isfinite(old) or new > old+1e-12):
+            return False
+    return all(before.get(field) is None or after.get(field) is not None for field in (
+        'formation_mismatch', 'pose_mismatch', 'silhouette_mismatch',
+        'layout_mismatch', 'focus_mismatch', 'structure_mismatch'))
+
+
 def _actual_temporal_pose_available(
     descriptor: FrameVisualDescriptor | None,
 ) -> bool:
@@ -515,6 +532,23 @@ class VisualBoundaryRepair:
                 and not math.isclose(self.result.selected.visual_cost,
                     self.selected_visual_evidence.selection_cost, rel_tol=0., abs_tol=1e-12)):
             raise ValueError("selected gesture ranking cost disagrees with exact arm evidence")
+        if self.selected_visual_evidence.closeup_gesture is not None and self.result.changed:
+            baseline_audit = next(item for item in frozen_candidate_audit if item['frame_offset'] == 0)
+            baseline_payload = baseline_audit.get('visual_evidence', {}).get('closeup_gesture')
+            if not isinstance(baseline_payload, Mapping):
+                raise ValueError('selected repair lost incumbent gesture observations')
+            try:
+                baseline_gesture = CloseupGestureEvidence(
+                    baseline_payload['outgoing_native_frame'], baseline_payload['incoming_native_frame'],
+                    tuple(baseline_payload['bone_mismatches']),
+                    baseline_payload['outgoing_focal_basis'], baseline_payload['incoming_focal_basis'])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError('selected repair has invalid incumbent gesture observations') from exc
+            if not self.selected_visual_evidence.closeup_gesture.improves_over(baseline_gesture):
+                raise ValueError('selected repair does not improve preserved incumbent gesture observations')
+            if not _gesture_preserves_visual_comparison(self.selected_visual_evidence.to_dict(),
+                                                        baseline_audit['visual_evidence']):
+                raise ValueError('selected gesture repair regresses incumbent visual evidence')
         selected_visual_payload = selected_audit[0].get("visual_evidence")
         if (
             not isinstance(selected_visual_payload, Mapping)
@@ -2363,6 +2397,8 @@ def repair_visual_timeline_boundaries(
                         )
                         continue
                     evidence = item[0]
+                    baseline_item = evidence_by_offset.get(0)
+                    baseline_gesture = baseline_item[0].closeup_gesture if baseline_item else None
                     audit.append(
                         {
                             "frame_offset": frame_offset,
@@ -2386,6 +2422,12 @@ def repair_visual_timeline_boundaries(
                             ),
                             "visual_evidence": evidence.to_dict(),
                             "sample_clock_basis": ("renderer_bound_output_ticks_v2" if renderer_bound else "unverified_legacy_midpoint_v1"),
+                            **({'gesture_preserves_incumbent_observations': bool(
+                                evidence.closeup_gesture is not None and baseline_gesture is not None
+                                and evidence.closeup_gesture.preserves_observations_of(baseline_gesture)),
+                                'gesture_preserves_incumbent_visual_cost': bool(baseline_item is not None
+                                    and _gesture_preserves_visual_comparison(evidence.to_dict(), baseline_item[0].to_dict()))}
+                                if closeup_gesture_model_path is not None else {}),
                         }
                     )
                 return tuple(audit)
@@ -2536,9 +2578,24 @@ def repair_visual_timeline_boundaries(
                     # a fake calibrated temporal-motion bonus or pass signal.
                     evidence = replace(evidence, closeup_gesture=gesture)
                     evidence_by_offset[context.frame_offset] = (evidence, outgoing_descriptor, incoming_descriptor)
+                    original = evidence_by_offset.get(0)
+                    if (context.frame_offset != 0 and original is not None
+                            and original[0].closeup_gesture is not None
+                            and not gesture.preserves_observations_of(original[0].closeup_gesture)):
+                        return None  # A hidden mismatched hand cannot improve the score.
+                    if (context.frame_offset != 0 and original is not None
+                            and not _gesture_preserves_visual_comparison(evidence.to_dict(), original[0].to_dict())):
+                        return None
                 return evidence.selection_cost
 
             try:
+                if closeup_gesture_model_path is not None:
+                    # Establish the comparison domain before ranking offsets.
+                    # Run-local exact-pose/descriptor caches reuse this frame
+                    # when the ordinary bounded optimizer reaches zero again.
+                    visual_cost(BoundaryCandidateContext(0, nominal,
+                        source_time(outgoing.source_index, nominal),
+                        source_time(incoming.source_index, nominal)))
                 result = repair_boundary(
                     BoundaryRepairRequest(
                         nominal_boundary_seconds=nominal,
@@ -2572,7 +2629,7 @@ def repair_visual_timeline_boundaries(
                     original = evidence_by_offset.get(0)
                     if (original is None or original[0].closeup_gesture is None
                             or evidence.closeup_gesture is None
-                            or evidence.closeup_gesture.mismatch >= original[0].closeup_gesture.mismatch-1e-6):
+                            or not evidence.closeup_gesture.improves_over(original[0].closeup_gesture)):
                         raise ValueError('optional_gesture_refinement_no_proven_articulation_improvement')
             except (ValueError, KeyError, cv2.error) as exc:
                 failure: dict[str, Any] = {
@@ -2752,7 +2809,7 @@ def repair_visual_timeline_boundaries(
             f"{visual_timeline.analysis_basis}+local_boundary_repair_v4+"
             "complete_success_offset_audit_v1+"
             "temporal_pose_motion_audit_v1+renderer_bound_output_tick_audition_v2"
-            + ("+exact_closeup_arm_articulation_refinement_v1" if closeup_gesture_model_path is not None else "")
+            + ("+exact_closeup_observed_arm_articulation_refinement_v2" if closeup_gesture_model_path is not None else "")
         ),
         selected_candidate_index=visual_timeline.selected_candidate_index,
         candidate_generation_basis=visual_timeline.candidate_generation_basis,

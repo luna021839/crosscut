@@ -20966,8 +20966,9 @@ def _review_first_closeup_gesture_repair(
 
     This is not a render retry or a missing-pose veto on source availability.
     At most twelve existing tight/medium boundaries are sampled once; all other
-    boundaries stay fixed. Complete exact arms rank only candidates admitted
-    by the unchanged production gates. No reanalysis of the whole sources.
+    boundaries stay fixed. At least two common exact bones rank only candidates
+    admitted by the unchanged production gates, retaining the incumbent's bone
+    coverage and existing visual costs. No reanalysis of the whole sources.
     """
     from .timeline import ShotType
     choices = earlier.timeline.choices
@@ -21016,7 +21017,7 @@ def _review_first_closeup_gesture_repair(
             or after.source_switch_count != before.source_switch_count):
         return None
     return _merge_visual_boundary_repair_plans(earlier, later,
-        analysis_suffix='single_exact_closeup_arm_articulation_with_central_medium_v2')
+        analysis_suffix='single_exact_closeup_observed_arm_articulation_no_regression_v3')
 
 
 def _output_geometry_deferred_boundary_indices(

@@ -3,7 +3,9 @@
 This is a separate RTMPose measurement, not the legacy MediaPipe 60D basis,
 an identity decision, a temporal phase proof, or a quality approval. Four
 directed arm bones remain usable when a tight shot crops the hips. Every arm
-joint must actually be visible and associated with the selected focal face.
+joint used in a cost must actually be visible and associated with the selected
+focal face. Occluded bones stay unknown. Timing refinement can compare at least
+two common measured bones, but cannot win by dropping a previously seen bone.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from .group_focal_attention import CENTRAL_FOCAL_BASIS, GLOBAL_FOCAL_BASIS
 
 
 CONTRACT = 'exact_face_owned_four_arm_bone_articulation_v1'
+MASKED_CONTRACT = 'exact_face_owned_observed_arm_bones_v2'
 _BONES = ((0, 2), (2, 4), (1, 3), (3, 5))
 
 
@@ -27,7 +30,7 @@ _BONES = ((0, 2), (2, 4), (1, 3), (3, 5))
 class CloseupGestureEvidence:
     outgoing_native_frame: int
     incoming_native_frame: int
-    bone_mismatches: tuple[float, ...]
+    bone_mismatches: tuple[float | None, ...]
     outgoing_focal_basis: str = GLOBAL_FOCAL_BASIS
     incoming_focal_basis: str = GLOBAL_FOCAL_BASIS
 
@@ -38,21 +41,38 @@ class CloseupGestureEvidence:
         if (any(type(index) is not int or index < 0 for index in
                 (self.outgoing_native_frame, self.incoming_native_frame))
                 or len(self.bone_mismatches) != 4
-                or any(isinstance(v, bool) or not isinstance(v, (float, int))
-                       or not math.isfinite(v) or not 0 <= v <= 1 for v in self.bone_mismatches)):
-            raise ValueError('gesture evidence requires exact frame IDs and four finite arm costs')
+                or sum(v is not None for v in self.bone_mismatches) < 2
+                or any(v is not None and (isinstance(v, bool) or not isinstance(v, (float, int))
+                       or not math.isfinite(v) or not 0 <= v <= 1) for v in self.bone_mismatches)):
+            raise ValueError('gesture evidence requires exact frame IDs and at least two measured arm costs')
+
+    @property
+    def observed_bones(self) -> frozenset[int]:
+        return frozenset(i for i, value in enumerate(self.bone_mismatches) if value is not None)
+
+    def preserves_observations_of(self, before: CloseupGestureEvidence) -> bool:
+        return before.observed_bones <= self.observed_bones
+
+    def improves_over(self, before: CloseupGestureEvidence) -> bool:
+        # Include newly observed bones in the candidate's maximum as well.
+        # Filling a gap with a badly mismatched hand is not an improvement.
+        return self.preserves_observations_of(before) and self.mismatch < before.mismatch-1e-6
 
     @property
     def mismatch(self) -> float:
         # The worst visible arm matters: averaging it with three unchanged
         # bones can disguise exactly the one hand that breaks across the cut.
-        return max(self.bone_mismatches)
+        return max(value for value in self.bone_mismatches if value is not None)
 
     def to_dict(self):
-        return dict(contract=CONTRACT, feature_basis='four_directed_screen_arm_bones',
+        return dict(contract=CONTRACT if len(self.observed_bones) == 4 else MASKED_CONTRACT,
+            feature_basis='four_directed_screen_arm_bones',
             outgoing_native_frame=self.outgoing_native_frame,
             incoming_native_frame=self.incoming_native_frame,
-            bone_count=4, bone_mismatches=list(self.bone_mismatches),
+            bone_count=len(self.observed_bones), bone_mismatches=list(self.bone_mismatches),
+            observed_bone_indices=sorted(self.observed_bones),
+            unobserved_bone_count=4-len(self.observed_bones),
+            observation_policy='at_least_two_exact_bones_no_loss_against_incumbent',
             mismatch=self.mismatch, aggregation='maximum_bone_angular_mismatch',
             outgoing_focal_basis=self.outgoing_focal_basis,
             incoming_focal_basis=self.incoming_focal_basis,
@@ -88,17 +108,52 @@ def arm_articulation(observation: BodyPose2DEvidence | None):
     return tuple(result)
 
 
+def observed_arm_articulation(observation: BodyPose2DEvidence | None):
+    """Keep per-bone visibility, not an all-or-nothing whole-arm declaration.
+
+    Detection/ownership/face-anchor requirements are unchanged. No low-score,
+    offscreen, nonfinite or collapsed joint is imputed or relabelled observed.
+    """
+    full = arm_articulation(observation)
+    if full is not None:
+        return full
+    if (observation is None or observation.reason != 'observed'
+            or observation.face_anchor_consistent is not True
+            or len(observation.upper_body_xyc) != 8):
+        return None
+    points = np.asarray(observation.upper_body_xyc[:6], dtype=np.float64)
+    dimensions = np.asarray(observation.frame_size_wh, dtype=np.float64)
+    if (points.shape != (6, 3) or dimensions.shape != (2,)
+            or not np.isfinite(dimensions).all() or np.any(dimensions <= 0)):
+        return None
+    valid = (np.isfinite(points).all(axis=1) & (points[:, 2] >= .3) & (points[:, 2] <= 1)
+             & (points[:, :2] >= 0).all(axis=1) & (points[:, :2] < 1).all(axis=1))
+    pixels = points[:, :2] * dimensions
+    result = []
+    for start, end in _BONES:
+        direction = pixels[end]-pixels[start]
+        length = float(np.linalg.norm(direction)) if valid[start] and valid[end] else 0.
+        result.append(tuple(float(v) for v in direction/length) if length >= 2. else None)
+    return tuple(result) if sum(value is not None for value in result) >= 2 else None
+
+
 def compare_arm_articulation(left, right, *, outgoing_native_frame, incoming_native_frame,
                             outgoing_focal_basis=GLOBAL_FOCAL_BASIS,
-                            incoming_focal_basis=GLOBAL_FOCAL_BASIS):
-    a, b = arm_articulation(left), arm_articulation(right)
+                            incoming_focal_basis=GLOBAL_FOCAL_BASIS, allow_partial=False):
+    if type(allow_partial) is not bool:
+        raise ValueError('partial arm observation policy must be boolean')
+    observe = observed_arm_articulation if allow_partial else arm_articulation
+    a, b = observe(left), observe(right)
     if a is None or b is None:
         return None
     if any(type(index) is not int or index < 0
            for index in (outgoing_native_frame, incoming_native_frame)):
         raise ValueError('gesture comparison requires exact native frame IDs')
     values = tuple(min(1., max(0., (1.-sum(x*y for x,y in zip(v,w)))/2.))
+                   if v is not None and w is not None else None
                    for v,w in zip(a,b))
+    if sum(value is not None for value in values) < 2:
+        return None
     return CloseupGestureEvidence(outgoing_native_frame, incoming_native_frame, values,
                                   outgoing_focal_basis, incoming_focal_basis)
 
@@ -168,7 +223,7 @@ class CloseupGestureProvider:
             return None
         return compare_arm_articulation(left[1], right[1],
             outgoing_native_frame=left[0], incoming_native_frame=right[0],
-            outgoing_focal_basis=left[2], incoming_focal_basis=right[2])
+            outgoing_focal_basis=left[2], incoming_focal_basis=right[2], allow_partial=True)
 
     def close(self):
         self.capture.close()

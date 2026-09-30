@@ -8,12 +8,20 @@ from crosscut.closeup_gesture import CloseupGestureEvidence
 from crosscut.pipeline import _review_first_closeup_gesture_repair
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.timeline import ShotType
-from crosscut.visual_boundary_repair import repair_visual_timeline_boundaries, VisualBoundaryRepairPlan
+from crosscut.visual_boundary_repair import (repair_visual_timeline_boundaries, VisualBoundaryRepairPlan,
+    _gesture_preserves_visual_comparison)
 from crosscut.visual_score import VisualTimelinePlan
 from tests.test_visual_boundary_repair import _choice, _descriptor
 
 
 class CloseupGestureRepairTests(unittest.TestCase):
+    def test_arm_preference_cannot_trade_away_existing_visual_cost_or_coverage(self):
+        before=dict(total_cost=.2,base_total_cost=.2,focus_mismatch=.1)
+        self.assertTrue(_gesture_preserves_visual_comparison(dict(before,total_cost=.1),before))
+        for after in (dict(before,total_cost=.3),dict(before,total_cost=.1,base_total_cost=.3),
+                      dict(before,total_cost=.1,focus_mismatch=None),dict(before,total_cost=float('nan'))):
+            self.assertFalse(_gesture_preserves_visual_comparison(after,before))
+
     def setUp(self):
         self.timeline=VisualTimelinePlan(tuple(replace(_choice(i,i%2),shot_type=ShotType.CLOSE_UP)
             for i in range(6)),1.)
@@ -64,6 +72,52 @@ class CloseupGestureRepairTests(unittest.TestCase):
         self.assertEqual(0,result.changed_count)
         self.assertEqual(self.timeline.choices,result.timeline.choices)
         self.assertIn('no_proven_articulation_improvement',result.failures[0]['reason'])
+
+    def test_partial_incumbent_can_improve_only_on_same_or_superset_of_bones(self):
+        def compare(left,right):
+            first=round(right[1]*30)
+            values={58:(None,.001,.001,None),59:(.15,.15,.15,None)}.get(first,(.5,.5,.5,None))
+            return CloseupGestureEvidence(round(left[1]*30),first,values)
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=compare
+            result=repair_visual_timeline_boundaries(**self.arguments)
+        self.assertEqual(1,result.changed_count)
+        repair=result.repairs[0]
+        # The superficially cheapest -2 drops a visible arm. The optimizer
+        # must actually try the next admissible candidate, not reject the
+        # whole optional pass after having selected the unsupported winner.
+        self.assertEqual(-1,repair.result.selected_frame_offset)
+        self.assertEqual(frozenset((0,1,2)),repair.selected_visual_evidence.closeup_gesture.observed_bones)
+        original=next(row for row in repair.candidate_evidence_audit if row['frame_offset']==0)
+        self.assertEqual(3,original['visual_evidence']['closeup_gesture']['bone_count'])
+        hidden=next(row for row in repair.candidate_evidence_audit if row['frame_offset']==-2)
+        self.assertTrue(hidden['production_transition_gate_passed'])
+        self.assertFalse(hidden['gesture_preserves_incumbent_observations'])
+        # Validate this again at publication, independently of the optimizer.
+        audit=repair.to_dict()['candidate_evidence_audit']
+        before=next(row for row in audit if row['frame_offset']==0)
+        before['visual_evidence']['closeup_gesture']=CloseupGestureEvidence(59,60,(.5,)*4).to_dict()
+        with self.assertRaisesRegex(ValueError,'incumbent gesture observations'):
+            replace(repair,candidate_evidence_audit=tuple(audit))
+        audit=repair.to_dict()['candidate_evidence_audit']
+        before=next(row for row in audit if row['frame_offset']==0)
+        before['visual_evidence']['total_cost']=-1.
+        with self.assertRaisesRegex(ValueError,'regresses incumbent visual evidence'):
+            replace(repair,candidate_evidence_audit=tuple(audit))
+
+    def test_newly_visible_bad_arm_cannot_hide_behind_old_partial_mask(self):
+        def compare(left,right):
+            first=round(right[1]*30)
+            values=(.01,.01,.01,.8) if first==58 else (.5,.5,.5,None)
+            return CloseupGestureEvidence(round(left[1]*30),first,values)
+        with patch('crosscut.visual_boundary_repair.CloseupGestureProvider') as provider:
+            provider.return_value.compare.side_effect=compare
+            result=repair_visual_timeline_boundaries(**self.arguments)
+        self.assertEqual(0,result.changed_count)
+        self.assertEqual(tuple((c.source_index,c.canonical_master_start,c.canonical_master_end,
+                                c.source_local_start,c.source_local_end) for c in self.timeline.choices),
+                         tuple((c.source_index,c.canonical_master_start,c.canonical_master_end,
+                                c.source_local_start,c.source_local_end) for c in result.timeline.choices))
 
     def test_unverified_clock_or_missing_gesture_keeps_complete_incumbent(self):
         for clock in (None,self.arguments['render_frame_clocks']):
