@@ -246,6 +246,28 @@ class MemberObservationSearch(Generic[Evidence]):
             and demand not in self._excluded),
             key=lambda demand: (demand.outgoing_source_index, demand.incoming_source_index)))
 
+    def seed_observations(self, observations):
+        """Reuse currently scored exact evidence before the first policy solve.
+
+        Missing cached alternatives cannot be a rejection; TransitionObservation
+        already requires complete offsets for rejected pairs. Selected partial
+        positives still pass the existing charged refinement path in run().
+        """
+        if self._solver_calls or self._observation_calls:
+            raise ValueError('cached observations must precede the first policy solve')
+        items = tuple(observations)
+        if len(items) > len(self._domain):
+            raise ValueError('cached observations exceed the exact source/boundary domain')
+        seen = set()
+        for item in items:
+            if (not isinstance(item, TransitionObservation) or item.demand not in self._domain
+                    or item.demand in self._observed or item.demand in self._excluded
+                    or item.demand in seen):
+                raise ValueError('cached observations must be new, unique and domain bound')
+            seen.add(item.demand)
+        self._observed.update((item.demand, item) for item in items)
+        self._reused_observations += len(items)
+
     def _emit(self, event, **payload):
         if self._progress_callback is not None:
             self._progress_callback(dict(phase='member_observation_search', event=event,

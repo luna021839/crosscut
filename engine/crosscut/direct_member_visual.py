@@ -14145,6 +14145,22 @@ def select_balanced_direct_member_sources(
                         # handles were never requested. That pair stays unknown.
                         pass
             return result
+        # Inspect only existing exact observations before proposing a path.
+        # Otherwise a warm app run may repeatedly infer unrelated failing
+        # candidates while already measured good cuts remain invisible.
+        from .member_cached_observations import seed_cached_boundary_samples
+        cached_sample_seed_count = sum(seed_cached_boundary_samples(store, provider)
+            for store in observation_stores)
+        cached_pair_seed_count = 0
+        if cached_sample_seed_count:
+            for boundary in range(len(observation_stores)):
+                available = observation_search.unobserved_at(boundary)
+                if available:
+                    related = reuse_observed_pairs(available[0])
+                    observation_search.seed_observations(related)
+                    cached_pair_seed_count += len(related)
+            observation_search._emit('cached_evidence_seeded',
+                cached_sample_count=cached_sample_seed_count, cached_pair_count=cached_pair_seed_count)
         observed_path = observation_search.run(propose=propose_observation_path,
             observe=observe_transition, reuse_observed=reuse_observed_pairs,
             refine=lambda previous: observe_transition(previous.demand, complete_offsets=True),
@@ -14170,6 +14186,8 @@ def select_balanced_direct_member_sources(
             'total_exact_pair_work_count': (observed_path.observation_count+observed_path.refinement_count
                 - observed_path.reused_pair_refinement_reservation_count),
             'reused_observation_count': observed_path.reused_observation_count,
+            'initial_cached_sample_count': cached_sample_seed_count,
+            'initial_cached_pair_count': cached_pair_seed_count,
             'endpoint_excluded_transition_count': observed_path.endpoint_excluded_transition_count,
             'endpoint_only_observation_count': observed_path.endpoint_only_observation_count,
             'observed_transition_count': len(observation_search.observations),

@@ -140,6 +140,27 @@ class MemberBoundaryObservationStore(Generic[Sample]):
     def observed_sample(self, offset_frames, source_index, slot):
         return self.requested_samples(offset_frames, source_index, (slot,), observed_only=True)[0]
 
+    def publish_cached_samples(self, offset_frames, source_index, values):
+        """Import already measured slots atomically, never a missing default."""
+        key = self._demand(offset_frames, source_index)
+        if not isinstance(values, Mapping):
+            raise ValueError('cached boundary samples must be an exact slot mapping')
+        for slot, value in values.items():
+            self._slot_demand(offset_frames, source_index, slot)
+            if value is None or not self._plans[offset_frames].eligibility_by_source[source_index][slot]:
+                raise ValueError('cached boundary sample must be present and content eligible')
+        existing = dict(enumerate(self._samples[key])) if key in self._samples else dict(self._partial.get(key, {}))
+        if set(existing).intersection(values):
+            raise ValueError('cached boundary samples cannot overwrite observed evidence')
+        if not values:
+            return
+        existing.update(values)
+        if len(existing) == 5:
+            self._samples[key] = tuple(existing[slot] for slot in range(5))
+            self._partial.pop(key, None)
+        else:
+            self._partial[key] = existing
+
     @property
     def observed_sample_demands(self) -> frozenset[tuple[int, int, int]]:
         return frozenset((*key, slot) for key, values in self._partial.items() for slot in values) | frozenset(

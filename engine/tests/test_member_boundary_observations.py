@@ -16,6 +16,21 @@ def plan(offset=0):
 
 
 class MemberBoundaryObservationTests(unittest.TestCase):
+    def test_cached_slot_publication_is_atomic_and_cannot_overwrite_or_invent(self):
+        store=MemberBoundaryObservationStore((plan(),),observe=Mock(),observe_samples=Mock())
+        for invalid in ({0:'observed',5:'bad'}, {0:'observed',1:None}, {True:'bad'}):
+            with self.assertRaises(ValueError):store.publish_cached_samples(0,0,invalid)
+            self.assertFalse(store.observed_sample_demands)
+        with self.assertRaises(ValueError):store.publish_cached_samples(0,1,{2:'content invalid'})
+        store.publish_cached_samples(0,0,{0:'first'})
+        with self.assertRaises(ValueError):store.publish_cached_samples(0,0,{0:'replacement',1:'next'})
+        self.assertEqual(store.observed_sample(0,0,0),'first')
+        with self.assertRaises(KeyError):store.observed_sample(0,0,1)
+        store.publish_cached_samples(0,0,{slot:str(slot) for slot in range(1,5)})
+        self.assertEqual(store.observed_samples(0,0),('first','1','2','3','4'))
+        store._observe.assert_not_called()
+        store._observe_samples.assert_not_called()
+
     def test_slot_demands_preserve_unknowns_then_complete_the_same_source(self):
         observer, prepare = Mock(), Mock()
         slots = Mock(side_effect=lambda p, source, indices:

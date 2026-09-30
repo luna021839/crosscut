@@ -69,6 +69,8 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
         visual.prepare_focal_observations = SourceFirstObservationBatch(focal,
             progress_callback=progress_callback)
         visual.member_observation_progress = progress_callback
+        from .member_cached_observations import attach_cached_member_observations
+        attach_cached_member_observations(focal, visual)
     except BaseException:
         focal.close()
         raise

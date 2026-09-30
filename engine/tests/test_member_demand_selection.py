@@ -65,6 +65,37 @@ class DemandMemberSelectionTests(unittest.TestCase):
                          coordinator.call_args.kwargs['maximum_observations']+1)
         self.assertTrue(all(not boundary.mismatch.severe_flags for boundary in result.boundaries))
 
+    def test_complete_cached_observations_enter_the_first_full_policy_solve(self):
+        from crosscut.member_cached_observations import CachedMemberObservation
+        class Warm(Provider):
+            def cached_focal_observation_at(self,source,seconds):
+                return CachedMemberObservation(self.content_at(source,Path('source'),seconds),
+                    replace(geometry(source),source_seconds=seconds))
+        provider=Warm()
+        result,_=self.select(descriptor_provider=provider)
+        self.assertEqual(provider.focal_queries,[])
+        self.assertEqual(provider.prepared,[])
+        self.assertEqual(result.source_counts,(2,2,2))
+        self.assertTrue(all(not boundary.mismatch.severe_flags for boundary in result.boundaries))
+        audit=result.optimizer_search_diagnostics['demand_driven_observations']
+        self.assertGreater(audit['initial_cached_sample_count'],0)
+        self.assertGreater(audit['initial_cached_pair_count'],0)
+        self.assertEqual(audit['exact_pair_request_count'],0)
+        self.assertEqual(audit['solver_call_count'],1)
+        self.assertTrue(audit['selected_transitions_and_all_offsets_observed'])
+
+    def test_cache_misses_preserve_the_original_demand_path_and_budget(self):
+        class Cold(Provider):
+            def cached_focal_observation_at(self,source,seconds):return None
+        baseline,_=self.select()
+        result,_=self.select(descriptor_provider=Cold())
+        self.assertEqual(result.source_indices,baseline.source_indices)
+        self.assertEqual(result.selected_boundary_master_seconds,baseline.selected_boundary_master_seconds)
+        self.assertEqual(result.optimizer_cost,baseline.optimizer_cost)
+        audit=result.optimizer_search_diagnostics['demand_driven_observations']
+        self.assertEqual(audit['initial_cached_sample_count'],0)
+        self.assertEqual(audit['initial_cached_pair_count'],0)
+
     def test_public_selector_returns_only_exact_observed_full_policy_samples(self):
         result, provider = self.select()
         full, exhaustive = self.select(demand=False)

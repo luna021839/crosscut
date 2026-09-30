@@ -179,7 +179,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             original = self._binding(directory)
             observations = SourceFirstFocalGeometryProvider.observation_fingerprint()
             for filename in ('direct_member_transform.py', 'direct_member_bilateral_transform.py',
-                             'member_dense_containment.py'):
+                             'member_dense_containment.py', 'member_cached_observations.py'):
                 def changed(path):
                     return 'f' * 64 if path.name == filename else source_content_sha256(path)
                 with self.subTest(filename=filename), patch('crosscut.pipeline.source_content_sha256', side_effect=changed):
