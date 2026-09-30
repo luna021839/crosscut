@@ -5,6 +5,7 @@ It is descriptor-stage evidence, not a substitute for decoded-render QA. Raw
 source feature caches are never overwritten with transformed observations.
 """
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 
 from .post_render_perceptual_quality import _Span, _reference_view_for_span
@@ -37,6 +38,7 @@ class PrescribedGeometrySampler:
         self.master_start = master_start
         self.source_clock = PrescribedRenderClock(segment, master_start)
         self.frame_rate = getattr(sampler, "frame_rate", 29.97)
+        self.path = getattr(sampler, 'path', None)
         def serialized(value):
             return json.loads(json.dumps(value.to_dict() if hasattr(value,'to_dict') else asdict(value))) if value is not None else None
         self.span = _Span(
@@ -48,6 +50,14 @@ class PrescribedGeometrySampler:
             crop=serialized(segment.crop), pan_crop=serialized(segment.pan_crop),
             editorial_transform=serialized(segment.editorial_transform),
         )
+        # Arm observations on equal native ticks can still differ after crop
+        # or roll. Do not reuse a source-space arm cache as output evidence.
+        self.observation_geometry_identity = hashlib.sha256(json.dumps(
+            asdict(self.span), sort_keys=True, separators=(',', ':'), allow_nan=False
+        ).encode()).hexdigest()
+
+    def frame_identity(self, seconds):
+        return self.sampler.frame_identity(seconds)
 
     def frame_at(self, seconds):
         frame = self.sampler.frame_at(seconds)

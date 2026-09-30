@@ -143,6 +143,26 @@ class SelectionArmMotionTests(unittest.TestCase):
                 options['source_times'],options['master_times'])))
         self.assertIn('sampled_directional_focal_arm_selection_v1',plan.candidate_generation_basis)
 
+    def test_same_native_tick_different_output_geometry_does_not_share_arm_observation(self):
+        class Sampler:
+            path=Path('/synthetic/source.mp4')
+            def __init__(self, geometry):self.observation_geometry_identity=geometry
+            def frame_identity(self, seconds):
+                return CanonicalFrameIdentity.from_seconds(seconds,frame_rate=30.)
+            def frame_at(self, seconds):return np.zeros((96,160,3),np.uint8)
+        body=FormationPersonDescriptor((.2,.1,.6,.8),(.5,.5),.9)
+        descriptor=SimpleNamespace(primary_face_bbox=(.4,.12,.15,.16),formation_people=(body,))
+        with patch('crosscut.body_pose_2d.BodyPose2DAnalyzer') as analyzer, patch(
+                'crosscut.closeup_gesture.observed_arm_articulation',return_value=((1.,0.),(1.,0.),None,None)):
+            model=SelectionArmSampler(Path('/not-loaded.onnx'))
+            options=dict(source_id='0',master_times=(1.,1.1),source_times=(5.,5.1),
+                descriptors=(descriptor,descriptor),scene_cut_times=())
+            model.window(Sampler('raw'),**options)
+            model.window(Sampler('projected'),**options)
+            model.window(Sampler('projected'),**options)
+            self.assertEqual(analyzer.return_value.describe.call_count,4)
+            self.assertEqual(model.cache_hits,2)
+
     def test_optional_selector_and_exact_gesture_share_central_face_body_resolution(self):
         from crosscut.group_focal_attention import CENTRAL_FOCAL_BASIS, GroupFocalSubject
         class Sampler:

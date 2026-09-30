@@ -314,6 +314,7 @@ def _quality_soft_floor_policy() -> dict[str, Any]:
         ),
         "above_floor_emission_unchanged": True,
         "hard_rejection": False,
+        "group_proximity_preference_budget": "above_soft_floor_quality_margin_only",
         "evidence_scope": "observed_development_songs_not_blind_system_holdout",
         "blind_holdout_claim_authorized": False,
     }
@@ -333,6 +334,11 @@ def _safe_cadence_profiles(
         sync_weight=0.55,
         composition_weight=0.30,
         boundary_weight=0.62,
+        # Independent product taste, not a rewritten human-reference quota.
+        # Formation anchors remain role-conditioned and all visual gates stay
+        # unchanged. Prefer a nearer wide over a tiny-stage audience picture.
+        group_wide_frequency_preference_weight=0.55,
+        group_wide_distance_preference_weight=0.65,
         continuity_bonus=0.30,
         cut_penalty=0.22,
         early_cut_penalty=0.48,
@@ -425,6 +431,17 @@ def _safe_cadence_profiles(
             ),
         ),
     )
+
+
+def _selection_cadence_profiles(diversity, professional_montage_policy):
+    profiles = _safe_cadence_profiles(diversity)
+    if professional_montage_policy is not None:
+        return profiles
+    # GROUP editorial taste is opt-in with the professional montage policy.
+    # Generic quality selection and MEMBER callers must retain their behavior.
+    return tuple(replace(profile, config=replace(profile.config,
+        group_wide_frequency_preference_weight=0.,
+        group_wide_distance_preference_weight=0.)) for profile in profiles)
 
 
 def _timeline_path_signature(result: TimelineResult) -> tuple[str, ...]:
@@ -1523,7 +1540,7 @@ def _select_safe_cadence_candidates(
 ) -> tuple[tuple[TimelineResult, ...], tuple[str, ...]]:
     """Generate profile-local alternatives, then interleave unique paths."""
 
-    profiles = _safe_cadence_profiles(diversity)
+    profiles = _selection_cadence_profiles(diversity, professional_montage_policy)
     if (section_plan is None) != (professional_montage_policy is None):
         raise ValueError(
             "section_plan and professional_montage_policy must be supplied together"
@@ -2100,6 +2117,7 @@ def _candidate_review_summary(
     """Return the stable compact summary already exposed by timeline plans."""
 
     from .selection_arm_motion import selection_arm_cost
+    from .shot_proximity import source_path_proximity_summary
     arm_edges = [(index, selection_arm_cost(left.candidate.exit_arm_window,
         right.candidate.entry_arm_window)) for index, (left, right) in enumerate(
             zip(candidate.choices, candidate.choices[1:]))
@@ -2124,6 +2142,7 @@ def _candidate_review_summary(
         "source_run_median_seconds": review.source_run_median_seconds,
         "visual_shot_median_seconds": review.visual_shot_median_seconds,
         "ping_pong_count": len(review.ping_pongs),
+        "shot_proximity": source_path_proximity_summary(candidate.candidates),
         "selection_arm_motion": {
             "basis": "sampled_focal_arm_direction_selection_v1",
             "measured_switch_count": sum(value is not None for _, value in arm_edges),
@@ -2264,6 +2283,8 @@ def _visual_optimizer_input_identity(
     professional_montage_policy: ProfessionalMontageSelectionPolicy | None = None,
     subject_metadata_by_candidate: Mapping[str, object] | None = None,
     prescribed_source_ids: Sequence[str] | None = None,
+    candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
+    group_incumbent_render_segments: Sequence[Any] | None = None,
     maximum_results: int = 32,
 ) -> str:
     segments = tuple(tuple(segment) for segment in candidates_by_segment)
@@ -2287,6 +2308,11 @@ def _visual_optimizer_input_identity(
             for segment in segments
         ],
         "selection_context": {
+            # Source-feature caches can be reused, but an optimizer checkpoint
+            # cannot retain a path scored under older framing/cadence weights.
+            "safe_cadence_profile_configs": _optimizer_identity_value(tuple(
+                (profile.name,profile.config) for profile in _selection_cadence_profiles(
+                    diversity or VisualDiversityConfig(), professional_montage_policy))),
             "highlight_switch_scheduling_basis": (
                 _HIGHLIGHT_SWITCH_OPPORTUNITY_BASIS if professional_montage_policy is not None else None
             ),
@@ -2315,6 +2341,10 @@ def _visual_optimizer_input_identity(
                 if prescribed_source_ids is None
                 else tuple(prescribed_source_ids)
             ),
+            "candidate_source_indices_by_segment": _optimizer_identity_value(
+                candidate_source_indices_by_segment
+            ),
+            "group_incumbent_render_segments": _optimizer_identity_value(group_incumbent_render_segments),
             "maximum_results": maximum_results,
         },
     }
@@ -2378,6 +2408,8 @@ class VisualTimelineOptimizerWorkspace:
         str, "_CandidateSubjectMetadata"
     ] = field(default_factory=dict, repr=False, compare=False)
     prescribed_source_ids: tuple[str, ...] | None = None
+    candidate_source_indices_by_segment: tuple[tuple[int, ...], ...] | None = None
+    group_incumbent_render_segments: tuple[Any, ...] | None = field(default=None, repr=False)
     maximum_results: int = 32
     singleton: bool = False
 
@@ -2437,6 +2469,16 @@ class VisualTimelineOptimizerWorkspace:
             raise ValueError(
                 "workspace cannot combine preferences with a prescribed path"
             )
+        source_options = self.candidate_source_indices_by_segment
+        if source_options is not None:
+            source_options = tuple(tuple(cell) for cell in source_options)
+            if prescribed is not None or len(source_options) != len(segments):
+                raise ValueError('workspace sparse options must bind each non-prescribed segment')
+            for cell, options in zip(segments, source_options, strict=True):
+                if (not options or any(type(index) is not int or index < 0 for index in options)
+                        or options != tuple(sorted(set(options)))
+                        or any(candidate.source_id not in {str(index) for index in options} for candidate in cell)):
+                    raise ValueError('workspace sparse options differ from its candidate lattice')
         if (self.section_plan is None) != (
             self.professional_montage_policy is None
         ):
@@ -2461,6 +2503,14 @@ class VisualTimelineOptimizerWorkspace:
         )
         object.__setattr__(self, "preferred_source_ids", preferred)
         object.__setattr__(self, "prescribed_source_ids", prescribed)
+        object.__setattr__(self, "candidate_source_indices_by_segment", source_options)
+        if self.group_incumbent_render_segments is not None:
+            from .render import RenderSegment
+            incumbent_segments = tuple(self.group_incumbent_render_segments)
+            if (prescribed is not None or len(incumbent_segments) != len(segments)
+                    or any(not isinstance(item, RenderSegment) for item in incumbent_segments)):
+                raise ValueError('workspace incumbent geometry must bind each non-prescribed segment')
+            object.__setattr__(self, 'group_incumbent_render_segments', incumbent_segments)
         object.__setattr__(self, "phrase_times", phrases)
         object.__setattr__(
             self,
@@ -2723,6 +2773,8 @@ class VisualTimelineCandidateSet:
                 prescribed_source_ids=(
                     self.optimizer_workspace.prescribed_source_ids
                 ),
+                candidate_source_indices_by_segment=self.optimizer_workspace.candidate_source_indices_by_segment,
+                group_incumbent_render_segments=self.optimizer_workspace.group_incumbent_render_segments,
                 maximum_results=self.optimizer_workspace.maximum_results,
             )
             if (
@@ -3063,6 +3115,8 @@ class VisualTimelineOptimizerSeed:
                 self.optimizer_workspace.subject_metadata_by_candidate
             ),
             prescribed_source_ids=self.optimizer_workspace.prescribed_source_ids,
+            candidate_source_indices_by_segment=self.optimizer_workspace.candidate_source_indices_by_segment,
+            group_incumbent_render_segments=self.optimizer_workspace.group_incumbent_render_segments,
             maximum_results=self.optimizer_workspace.maximum_results,
         )
         if (
@@ -3200,7 +3254,7 @@ def _select_optimizer_workspace_candidates(
         restricted_candidates.append(exact)
     timeline_candidates = select_timeline_candidates(
         restricted_candidates,
-        config=_safe_cadence_profiles(workspace.diversity)[0].config,
+        config=_selection_cadence_profiles(workspace.diversity, workspace.professional_montage_policy)[0].config,
         maximum_results=1,
         diversity_penalty=0.12,
         minimum_hamming_fraction=0.02,
@@ -3343,6 +3397,8 @@ def regenerate_visual_timeline_candidate_set(
         professional_montage_policy=workspace.professional_montage_policy,
         subject_metadata_by_candidate=workspace.subject_metadata_by_candidate,
         prescribed_source_ids=workspace.prescribed_source_ids,
+        candidate_source_indices_by_segment=workspace.candidate_source_indices_by_segment,
+        group_incumbent_render_segments=workspace.group_incumbent_render_segments,
         maximum_results=workspace.maximum_results,
     )
     if (
@@ -6373,7 +6429,9 @@ def materialize_visual_timeline_candidate(
     # prescribed rendered-coordinate observations. Final decoded QA owns this
     # path's transition evidence; no raw-source dissolve authority is invented.
     dissolve_entry_evidence, dissolve_exit_evidence = (
-        ({}, {}) if candidate_set.prescribed_render_segments is not None else
+        ({}, {}) if candidate_set.prescribed_render_segments is not None or (
+            candidate_set.optimizer_workspace is not None and
+            candidate_set.optimizer_workspace.group_incumbent_render_segments is not None) else
         _selected_dissolve_evidence(
             sources=candidate_set.sources,
             optimized=optimized,
@@ -6625,7 +6683,11 @@ def materialize_visual_timeline_candidate(
         candidate_review_summaries=candidate_review_summaries,
         source_clock_basis=candidate_set.source_clock_basis,
         geometry_basis=("prescribed_render_geometry_v1"
-                        if candidate_set.prescribed_render_segments is not None else "source_pixels"),
+                        if candidate_set.prescribed_render_segments is not None else
+                        "mixed_group_incumbent_output_and_alternative_source_geometry_v1"
+                        if candidate_set.optimizer_workspace is not None and
+                            candidate_set.optimizer_workspace.group_incumbent_render_segments is not None
+                        else "source_pixels"),
     )
 
 
@@ -6696,6 +6758,36 @@ def _professional_intentional_transition_anchor_basis(
     return INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
 
 
+def _validated_candidate_source_options(
+    values: Sequence[Sequence[int]] | None,
+    *,
+    source_count: int,
+    segment_count: int,
+) -> tuple[tuple[int, ...], ...] | None:
+    """Validate explicit sparse source options before opening or sensing media.
+
+    This is an input constraint, not a bypass of transition/identity/pose gates.
+    A missing frame in a restricted cell must still fail; never expand the cell
+    to an unrequested source or fabricate an incumbent candidate.
+    """
+    if values is None:
+        return None
+    if len(values) != segment_count:
+        raise ValueError("candidate source options must match canonical spans")
+    result = []
+    for cell in values:
+        indices = tuple(cell)
+        if not indices or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            or index < 0 or index >= source_count for index in indices
+        ):
+            raise ValueError("candidate source options contain an empty or invalid cell")
+        if len(set(indices)) != len(indices):
+            raise ValueError("candidate source options must not repeat an index")
+        result.append(tuple(sorted(indices)))
+    return tuple(result)
+
+
 def _build_visual_timeline(
     *,
     sources: Sequence[Path],
@@ -6717,6 +6809,8 @@ def _build_visual_timeline(
     require_persistent_feature_cache: bool = False,
     prescribed_source_indices: Sequence[int] | None = None,
     prescribed_render_segments: Sequence[Any] | None = None,
+    candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
+    group_incumbent_render_segments: Sequence[Any] | None = None,
     maximum_candidate_results: int,
     candidate_set_only: bool,
     optimizer_seed_only: bool = False,
@@ -6768,11 +6862,37 @@ def _build_visual_timeline(
         raise ValueError("per-source visual inputs must have matching lengths")
     if not canonical_spans:
         raise ValueError("canonical_spans cannot be empty")
+    source_options = _validated_candidate_source_options(
+        candidate_source_indices_by_segment,
+        source_count=source_count,
+        segment_count=len(canonical_spans),
+    )
+    if source_options is not None and prescribed_source_indices is not None:
+        raise ValueError("candidate source options cannot be combined with a prescribed path")
     clock_maps = _source_clock_maps(
         source_timewarps,
         audio_offsets=audio_offsets,
         source_count=source_count,
     )
+    incumbent_segments = None
+    if group_incumbent_render_segments is not None:
+        from .render import RenderSegment
+        incumbent_segments = tuple(group_incumbent_render_segments)
+        if (prescribed_source_indices is not None or len(incumbent_segments) != len(canonical_spans)):
+            raise ValueError('GROUP incumbent geometry must bind each non-prescribed canonical span')
+        common_start = canonical_spans[0][0]
+        for segment, (start, end) in zip(incumbent_segments, canonical_spans, strict=True):
+            if (not isinstance(segment, RenderSegment) or type(segment.source_index) is not int
+                    or not 0 <= segment.source_index < source_count
+                    or segment.outgoing_overlap_transform is not None
+                    or not math.isclose(segment.duration, end-start, abs_tol=1e-6)
+                    or not math.isclose(segment.master_start, start-common_start, abs_tol=1e-6)):
+                raise ValueError('GROUP incumbent geometry source/master span mismatch')
+            for master, local in ((start, segment.source_start), (end, segment.source_end)):
+                expected = _source_clock_time(master, source_index=segment.source_index,
+                    audio_offsets=audio_offsets, source_timewarps=clock_maps)
+                if not math.isclose(expected, local, rel_tol=0., abs_tol=1e-6):
+                    raise ValueError('GROUP incumbent geometry source clock mismatch')
     preferred_indices = (
         tuple(preferred_source_indices)
         if preferred_source_indices is not None
@@ -6847,6 +6967,13 @@ def _build_visual_timeline(
             )
             candidates: list[TimelineCandidate] = []
             for source_index, sampler in enumerate(samplers):
+                # Restrict BEFORE descriptor, identity, face-window and arm
+                # inference. Filtering a completed lattice still pays for all
+                # discarded sources, which made local repairs full reanalyses.
+                if source_options is not None and source_index not in source_options[segment_index]:
+                    continue
+                if prescribed_indices is not None and source_index != prescribed_indices[segment_index]:
+                    continue
                 observation_clocks = clock_maps
                 if prescribed_render_segments is not None:
                     if source_index != prescribed_indices[segment_index]:
@@ -6860,6 +6987,17 @@ def _build_visual_timeline(
                         sampler.source_clock if index == source_index else clock
                         for index, clock in enumerate(clock_maps)
                     )
+                elif incumbent_segments is not None and source_index == incumbent_segments[segment_index].source_index:
+                    from .prescribed_render_geometry import PrescribedGeometrySampler, PrescribedRenderClock
+                    incumbent = incumbent_segments[segment_index]
+                    # Neutral views retain their source feature cache. Only
+                    # actually transformed views are decoded and re-described;
+                    # transformed descriptors never overwrite the raw cache.
+                    observation_clock = PrescribedRenderClock(incumbent, master_start)
+                    if any(getattr(incumbent, name) is not None for name in ('crop', 'pan_crop', 'editorial_transform')):
+                        sampler = PrescribedGeometrySampler(sampler, incumbent, master_start=master_start)
+                    observation_clocks = tuple(observation_clock if index == source_index else clock
+                        for index, clock in enumerate(clock_maps))
                 source_start = _source_clock_time(
                     master_start,
                     source_index=source_index,
@@ -7339,9 +7477,15 @@ def _build_visual_timeline(
         )
     if arm_sampler is not None:
         candidate_generation_basis += '+sampled_directional_focal_arm_selection_v1'
+    if source_options is not None:
+        candidate_generation_basis += '+explicit_sparse_source_options_before_sensing_v1'
+    if incumbent_segments is not None:
+        candidate_generation_basis += '+group_incumbent_output_geometry_and_unmodified_source_alternatives_v1'
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"
         if prescribed_render_segments is not None else
+        "mixed_group_incumbent_render_clock_and_alternative_source_clock_v1"
+        if incumbent_segments is not None else
         "local_monotonic_timewarp_with_per_source_scalar_fallback"
         if any(
             timewarp is not None and not timewarp.scalar_fallback
@@ -7376,6 +7520,8 @@ def _build_visual_timeline(
         professional_montage_policy=professional_montage_selection_policy,
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         prescribed_source_ids=workspace_prescribed_source_ids,
+        candidate_source_indices_by_segment=source_options,
+        group_incumbent_render_segments=incumbent_segments,
         maximum_results=maximum_candidate_results,
     )
     optimizer_workspace = VisualTimelineOptimizerWorkspace(
@@ -7388,6 +7534,8 @@ def _build_visual_timeline(
         professional_montage_policy=professional_montage_selection_policy,
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         prescribed_source_ids=workspace_prescribed_source_ids,
+        candidate_source_indices_by_segment=source_options,
+        group_incumbent_render_segments=incumbent_segments,
         maximum_results=maximum_candidate_results,
         singleton=singleton,
     )
@@ -7476,6 +7624,8 @@ def build_visual_timeline(
     require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
     selection_arm_model_path: Path | None = None,
+    candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
+    group_incumbent_render_segments: Sequence[Any] | None = None,
 ) -> VisualTimelinePlan:
     """Build a selected plan, optionally requesting only one complete path.
 
@@ -7504,6 +7654,8 @@ def build_visual_timeline(
         maximum_candidate_results=maximum_results,
         candidate_set_only=False,
         selection_arm_model_path=selection_arm_model_path,
+        candidate_source_indices_by_segment=candidate_source_indices_by_segment,
+        group_incumbent_render_segments=group_incumbent_render_segments,
     )
     if not isinstance(result, VisualTimelinePlan):  # pragma: no cover - invariant
         raise TypeError("selected visual timeline builder returned a candidate set")
@@ -7530,6 +7682,8 @@ def build_visual_timeline_candidate_set(
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
+    candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
+    group_incumbent_render_segments: Sequence[Any] | None = None,
 ) -> VisualTimelineCandidateSet:
     """Retain reviewed top-N alternatives without selected-only postpasses.
 
@@ -7558,6 +7712,8 @@ def build_visual_timeline_candidate_set(
         require_persistent_feature_cache=require_persistent_feature_cache,
         maximum_candidate_results=maximum_results,
         candidate_set_only=True,
+        candidate_source_indices_by_segment=candidate_source_indices_by_segment,
+        group_incumbent_render_segments=group_incumbent_render_segments,
     )
     if not isinstance(
         result, VisualTimelineCandidateSet
@@ -7586,6 +7742,8 @@ def build_visual_timeline_optimizer_seed(
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
+    candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
+    group_incumbent_render_segments: Sequence[Any] | None = None,
 ) -> VisualTimelineOptimizerSeed:
     """Build the exact transient lattice without running the legacy DP.
 
@@ -7616,6 +7774,8 @@ def build_visual_timeline_optimizer_seed(
         maximum_candidate_results=maximum_results,
         candidate_set_only=True,
         optimizer_seed_only=True,
+        candidate_source_indices_by_segment=candidate_source_indices_by_segment,
+        group_incumbent_render_segments=group_incumbent_render_segments,
     )
     if not isinstance(
         result,

@@ -16,10 +16,12 @@ from .boundary_subject_alignment import (
 from .face_match import FaceMatchPlan, FaceMatchSegment
 from .render import (
     EditorialTransformKeyframe, EditorialTransformTrack, NormalizedCrop,
-    PanCropKeyframe, PanCropTrack, RenderPlan, RenderSegment, segment_frame_counts,
+    PanCropKeyframe, PanCropTrack, RenderPlan, RenderSegment, RenderTransition, segment_frame_counts,
 )
 from .render_boundary_clock import native_frame_clocks_for_output
 from .visual_score import VisualTimelinePlan
+
+UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON = 'unreviewed_group_source_span_replacement'
 
 
 def _neutral(keyframe):
@@ -240,36 +242,66 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
 
 
 def assert_preserved_output_boundaries(plan, proposal, source_clocks, neighbors, *,
-        preserved_boundary_frames=14, changed_segment_indices=None, allow_same_source_seams=False):
+        preserved_boundary_frames=14, changed_segment_indices=None, allow_same_source_seams=False,
+        complete_interval_bounds=None, reset_transition_boundaries=()):
     """Prove the unchanged outer windows of a local proposal, never its new cuts."""
     if (type(preserved_boundary_frames) is not int or not 4<=preserved_boundary_frames<=14
             or type(allow_same_source_seams) is not bool):
         raise ValueError('invalid exact neighbor preservation window')
     if any(getattr(plan,name)!=getattr(proposal,name) for name in (
-            'sources','fps','width','height','transitions','master_audio_start','reference_source')):
+            'sources','fps','width','height','master_audio_start','reference_source')):
+        raise ValueError('camera proposal changed the output or source domain')
+    if complete_interval_bounds is not None and not allow_same_source_seams:
+        raise ValueError('complete interval preservation requires its exact outside-clock proof')
+    if not isinstance(reset_transition_boundaries,tuple):
+        raise ValueError('source transition reset needs the exact complete interior interval')
+    if reset_transition_boundaries:
+        if (not allow_same_source_seams or not isinstance(complete_interval_bounds,tuple)
+                or len(complete_interval_bounds)!=2
+                or any(type(i) is not int or not 0<=i<len(plan.segments) for i in complete_interval_bounds)
+                or complete_interval_bounds[0]>=complete_interval_bounds[1]
+                or not isinstance(reset_transition_boundaries,tuple)
+                or any(type(i) is not int for i in reset_transition_boundaries)
+                or reset_transition_boundaries != tuple(range(*complete_interval_bounds))):
+            raise ValueError('source transition reset needs the exact complete interior interval')
+        neutral = RenderTransition(tier='C',reason=UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON)
+        if (len(plan.transitions)!=len(proposal.transitions) or any(
+                after != (neutral if i in reset_transition_boundaries else before)
+                for i,(before,after) in enumerate(zip(plan.transitions,proposal.transitions)))):
+            raise ValueError('source transition reset changed an outside transition or retained stale evidence')
+    elif plan.transitions != proposal.transitions:
         raise ValueError('camera proposal changed the output or source domain')
     before_counts,after_counts = segment_frame_counts(plan),segment_frame_counts(proposal)
     if plan.output_frame_count != proposal.output_frame_count:
         raise ValueError('camera proposal changed total output frames')
     if allow_same_source_seams:
-        if (not isinstance(changed_segment_indices,tuple) or len(changed_segment_indices)!=2
+        interval_name='pair' if complete_interval_bounds is None else 'interval'
+        if complete_interval_bounds is not None:
+            if (changed_segment_indices is not None or not isinstance(complete_interval_bounds,tuple)
+                    or len(complete_interval_bounds)!=2
+                    or any(type(i) is not int or not 0<=i<len(plan.segments) for i in complete_interval_bounds)
+                    or complete_interval_bounds[0]>=complete_interval_bounds[1]):
+                raise ValueError('source interval preservation needs explicit complete interval bounds')
+            first,last=complete_interval_bounds
+        elif (not isinstance(changed_segment_indices,tuple) or len(changed_segment_indices)!=2
                 or any(type(i) is not int or not 0<=i<len(plan.segments) for i in changed_segment_indices)
                 or changed_segment_indices[1]!=changed_segment_indices[0]+1):
             raise ValueError('same-source seam preservation needs one complete changed pair')
-        first,last=changed_segment_indices
+        else:
+            first,last=changed_segment_indices
         if (len(plan.segments)!=len(proposal.segments) or any(a!=b
                 for i,(a,b) in enumerate(zip(plan.segments,proposal.segments)) if not first<=i<=last)):
-            raise ValueError('camera proposal changed a segment outside its complete pair')
+            raise ValueError(f'camera proposal changed a segment outside its complete {interval_name}')
         begin,end=sum(before_counts[:first]),sum(before_counts[:last+1])
         if (begin,end)!=(sum(after_counts[:first]),sum(after_counts[:last+1])):
-            raise ValueError('camera proposal changed the outer pair clock')
+            raise ValueError(f'camera proposal changed the outer {interval_name} clock')
         wanted=(*range(begin),*range(end,plan.output_frame_count))
         before=native_frame_clocks_for_output(plan,source_clocks,wanted)
         after=native_frame_clocks_for_output(proposal,source_clocks,wanted)
         for n in wanted:
             a,b=before[n],after[n]
             if (a.source_index,a.native_frame_index,a.terminal_clone)!=(b.source_index,b.native_frame_index,b.terminal_clone):
-                raise ValueError('camera proposal changed native frames outside its complete pair')
+                raise ValueError(f'camera proposal changed native frames outside its complete {interval_name}')
     preserved = []
     for neighbor in neighbors:
         if not 0 <= neighbor < len(plan.segments)-1:

@@ -595,6 +595,8 @@ class TimelineConfig:
     sync_weight: float = 1.7
     composition_weight: float = 0.65
     boundary_weight: float = 0.35
+    group_wide_frequency_preference_weight: float = 0.0
+    group_wide_distance_preference_weight: float = 0.0
     target_weight: float = 2.4
     crop_stability_weight: float = 0.7
     continuity_bonus: float = 0.28
@@ -647,6 +649,10 @@ class TimelineConfig:
     maximum_switch_score_sacrifice: float = 0.0
 
     def __post_init__(self) -> None:
+        for name in ('group_wide_frequency_preference_weight','group_wide_distance_preference_weight'):
+            value=getattr(self,name)
+            if type(value) not in (int,float) or not isfinite(value) or value<0:
+                raise ValueError('GROUP framing preference weights must be finite and non-negative')
         weight_names = (
             "quality_weight",
             "sync_weight",
@@ -1337,6 +1343,24 @@ def _candidate_emission(
         - quality_floor_penalty
     )
     if mode is TimelineMode.GENERAL:
+        if config.group_wide_frequency_preference_weight or config.group_wide_distance_preference_weight:
+            from .shot_proximity import observed_shot_proximity
+            proximity=observed_shot_proximity(candidate)
+            penalty=(config.group_wide_frequency_preference_weight*proximity.wide_fraction
+                +config.group_wide_distance_preference_weight*(proximity.distant_wide_cost
+                    +proximity.wide_height_uncertainty_fraction))
+            if config.quality_soft_floor is not None:
+                # Editorial proximity must not spend away the quality margin
+                # above the existing soft floor. Otherwise a blurry close-up
+                # can win solely because an excellent wide pays both taste
+                # costs. Scale the whole preference, retaining nearer-vs-far
+                # ordering; do not clamp all wide shots to the same score or
+                # introduce a new hard exclusion around the quality floor.
+                maximum_penalty=(config.group_wide_frequency_preference_weight
+                    +config.group_wide_distance_preference_weight)
+                quality_margin=config.quality_weight*max(0.,candidate.quality_score-config.quality_soft_floor)
+                penalty*=min(1.,quality_margin/maximum_penalty)
+            base-=penalty
         return (base, False)
 
     assert target is not None

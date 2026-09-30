@@ -109,7 +109,8 @@ class SelectionArmSampler:
         if face is not None and person is None:
             return None
         identity = sampler.frame_identity(seconds)
-        key = (str(sampler.path), identity, face, tuple(descriptor.formation_people))
+        key = (str(sampler.path), identity, face, tuple(descriptor.formation_people),
+            getattr(sampler, 'observation_geometry_identity', None))
         if key in self.cache:
             self.cache_hits += 1
             self.cache.move_to_end(key)
