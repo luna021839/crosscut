@@ -13,6 +13,7 @@ from crosscut.boundary_subject_alignment import (
 )
 from crosscut.body_pose_2d import BodyPose2DEvidence
 from crosscut.group_action_observation import observe_global_head_arms
+from crosscut.native_global_face import NativeGlobalFace
 from crosscut.group_focal_attention import GroupFocalSubject, GLOBAL_FOCAL_BASIS
 from crosscut.pose import FormationPersonDescriptor
 from crosscut.render import (
@@ -46,6 +47,10 @@ def observation(source):
 
 
 class GlobalActionObservationTests(unittest.TestCase):
+    def native(self):
+        row=observation(0)
+        return NativeGlobalFace(1,row.face_box_xywh,row.face_landmarks_xy,0.,row.face_eye_scale,None)
+
     def descriptor(self, face=True, people=None):
         row=observation(0)
         return SimpleNamespace(face_count=1 if face else 0,
@@ -57,12 +62,12 @@ class GlobalActionObservationTests(unittest.TestCase):
             detected_person_count=len(people if people is not None else (person(),)),
             formation_people=people if people is not None else (person(),))
 
-    def test_known_global_face_keeps_its_geometry_and_exact_body_owner(self):
+    def test_global_face_and_body_owner_are_verified_from_native_pixels(self):
         analyzer=Mock();analyzer.describe.return_value=pose(person())
         with patch('crosscut.group_action_observation.describe_frame',return_value=self.descriptor()), \
-                patch('crosscut.group_action_observation.detect_roll_aware_faces') as faces:
+                patch('crosscut.group_action_observation.observe_native_global_face',return_value=self.native()) as faces:
             observed=observe_global_head_arms(_frame(0),analyzer)
-        faces.assert_not_called()
+        faces.assert_called_once()
         self.assertEqual(observed.face_box_xywh,observation(0).face_box_xywh)
         self.assertEqual(observed.selected_focal_subject.basis,GLOBAL_FOCAL_BASIS)
         self.assertEqual(analyzer.describe.call_args.kwargs['bbox_xywh'],person().bbox_xywh)
@@ -70,7 +75,8 @@ class GlobalActionObservationTests(unittest.TestCase):
     def test_ambiguous_or_missing_body_never_borrows_more_convenient_arms(self):
         for people in ((),(person(),person())):
             analyzer=Mock()
-            with patch('crosscut.group_action_observation.describe_frame',return_value=self.descriptor(people=people)):
+            with patch('crosscut.group_action_observation.describe_frame',return_value=self.descriptor(people=people)), \
+                    patch('crosscut.group_action_observation.observe_native_global_face',return_value=self.native()):
                 observed=observe_global_head_arms(_frame(0),analyzer)
             analyzer.describe.assert_not_called()
             self.assertIsNone(observed.selected_focal_subject)
@@ -79,12 +85,19 @@ class GlobalActionObservationTests(unittest.TestCase):
     def test_ambiguous_fresh_faces_do_not_turn_centrality_into_global_dominance(self):
         analyzer=Mock()
         with patch('crosscut.group_action_observation.describe_frame',return_value=self.descriptor(face=False)), \
-                patch('crosscut.group_action_observation.detect_roll_aware_faces',return_value=()), \
-                patch('crosscut.group_action_observation._dominant_face',return_value=None):
+                patch('crosscut.group_action_observation.observe_native_global_face',return_value=NativeGlobalFace(2,None,None,None,None,None)):
             observed=observe_global_head_arms(_frame(0),analyzer)
         analyzer.describe.assert_not_called()
         self.assertIsNone(observed.face_box_xywh)
         self.assertFalse(observed.face_is_unambiguous_dominant)
+
+    def test_native_foreground_miss_or_ambiguity_revokes_a_cached_background(self):
+        analyzer=Mock()
+        with patch('crosscut.group_action_observation.describe_frame',return_value=self.descriptor()), \
+                patch('crosscut.group_action_observation.observe_native_global_face',return_value=NativeGlobalFace(2,None,None,None,None,None)):
+            observed=observe_global_head_arms(_frame(0),analyzer)
+        self.assertIsNone(observed.face_box_xywh);self.assertFalse(observed.face_is_unambiguous_dominant)
+        analyzer.describe.assert_not_called()
 
 
 class GlobalActionRetainedCameraTests(unittest.TestCase):

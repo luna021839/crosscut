@@ -97,11 +97,11 @@ class HeadMotionEvidence:
         # Static endpoint bones are not relabelled four-frame arm motion.
         return self.endpoint_arm_guard.observed_bones if self.endpoint_arm_guard else frozenset()
 
-    def improves_over(self,before):
+    def preserves_motion_of(self,before):
         if (not isinstance(before,HeadMotionEvidence)
                 or self.motion.output_intervals_seconds!=before.motion.output_intervals_seconds
                 or self.motion.predicted_pose_cost>before.motion.predicted_pose_cost+1e-9
-                or self.ranking_cost>=before.ranking_cost-1e-6):
+                or self.ranking_cost>before.ranking_cost+1e-9):
             return False
         if before.endpoint_arm_guard is not None:
             guard=self.endpoint_arm_guard
@@ -113,6 +113,9 @@ class HeadMotionEvidence:
                     for i in before.observed_bones):
                 return False
         return True
+
+    def improves_over(self,before):
+        return self.preserves_motion_of(before) and self.ranking_cost<before.ranking_cost-1e-6
 
     def to_dict(self):
         return dict(contract=HEAD_MOTION_BASIS,motion=self.motion.to_dict(),

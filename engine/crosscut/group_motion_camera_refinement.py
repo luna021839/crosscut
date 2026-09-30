@@ -1,7 +1,9 @@
 """Bounded common-clock motion/camera refinement of an owned GROUP plan.
 
-Source arm motion proposes time offsets; actual projected output faces rank
-complete dense camera candidates. Raw timeline failures stay raw failures.
+Actual projected output motion and faces propose and rank time offsets and
+complete dense camera candidates. Source motion remains diagnostic evidence:
+source-only bones cannot become required observations on a different crop.
+Raw timeline failures stay raw failures.
 This grants only a better local candidate for final decoded QA, never a
 professional quality, temporal-phase or cross-camera identity certificate.
 """
@@ -14,7 +16,8 @@ from .optional_native_worker import isolated_optional
 from .render import aligned_render_segment,segment_frame_counts,EditorialTransformTrack
 from .render_boundary_clock import hard_cut_boundary_sample_clocks
 from .render_frame_schedule import probe_render_frame_clock
-from .closeup_gesture import CloseupGestureProvider,CloseupGestureEvidence
+from .closeup_gesture import (CloseupGestureProvider,CloseupGestureEvidence,
+    compare_arm_articulation,measure_arm_motion,MOTION_CONTRACT)
 from .observed_head_motion import HeadMotionEvidence,HEAD_MOTION_BASIS,HEAD_DIMENSIONS
 from .group_cut_camera_proposal import build_group_cut_camera_proposal,retime_base_pan
 from .prescribed_render_geometry import PrescribedGeometrySampler
@@ -24,6 +27,64 @@ from .timeline import ShotType
 from .timeline_review import review_timeline
 from .visual_boundary_repair import _visual_evidence,_updated_entry,_updated_exit,_new_hard_failures
 from .visual_score import _VideoSampler
+
+
+def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis=None):
+    """Four actual output-coordinate pixel views, BEFORE a full encode.
+
+    This reuses the loaded pose model; no output film/feature cache is needed.
+    Missing bodies/arms stay unknown. A camera cannot claim source-arm gains
+    while losing previously observable output bones. Head is a separate basis.
+    """
+    import cv2
+    from .native_global_face import observe_native_global_face
+    from .visual_score import describe_frame,_working_frame
+    from .focal_pose import face_associated_person
+    from .observed_head_motion import measure_head_motion,head_motion_signature
+    from .group_focal_attention import focal_landmarks_track
+    from .boundary_subject_alignment import _optical_flow_box
+    from .cut_anchored_containment import _iou
+    if len(frames)!=4 or len(samples)!=4:
+        raise ValueError('projected motion requires four exact output views')
+    if required_basis not in (None,HEAD_MOTION_BASIS,MOTION_CONTRACT):
+        raise ValueError('projected motion must retain an explicit known evidence basis')
+    if (type(output_fps) not in (int,float) or not math.isfinite(output_fps) or output_fps<=0
+            or any(frame is None for frame in frames)):
+        return None
+    ticks=tuple(sample.output_frame_index for sample in samples)
+    if (ticks[1]-ticks[0],ticks[2]-ticks[1],ticks[3]-ticks[2])!=(3,1,3):
+        raise ValueError('projected motion views must own the exact four output ticks')
+    if (samples[0].source_index!=samples[1].source_index
+            or samples[2].source_index!=samples[3].source_index
+            or samples[0].source_index==samples[2].source_index
+            or any(sample.terminal_clone for sample in samples)):
+        return None
+    ids=tuple(sample.native_frame_index for sample in samples)
+    intervals=(3/output_fps,1/output_fps,3/output_fps)
+    working=[];heads=[];arms=[]
+    for pixels in frames:
+        frame=cv2.resize(_working_frame(pixels,maximum_width=960),(854,480))
+        head=observe_native_global_face(frame)
+        descriptor=describe_frame(frame,include_subject_geometry=True,include_formation_pose=False)
+        owner=face_associated_person(head.bbox_xywh,descriptor.formation_people)
+        arm=(provider.pose.describe(frame,bbox_xywh=owner.bbox_xywh,face_bbox_xywh=head.bbox_xywh)
+            if head.bbox_xywh is not None and owner is not None else None)
+        working.append(frame);heads.append(head);arms.append(arm)
+    endpoint=compare_arm_articulation(arms[1],arms[2],outgoing_native_frame=ids[1],
+        incoming_native_frame=ids[2],allow_partial=True)
+    if required_basis!=HEAD_MOTION_BASIS:
+        motion=measure_arm_motion(tuple(arms),native_frames=ids,output_intervals_seconds=intervals)
+        if motion is not None and endpoint is not None:return replace(endpoint,motion=motion)
+        if required_basis==MOTION_CONTRACT:return None
+    for a,b in ((0,1),(2,3)):
+        ha,hb=heads[a],heads[b]
+        if ha.landmarks_xy and hb.landmarks_xy and focal_landmarks_track(
+                working[a],working[b],ha.landmarks_xy,hb.landmarks_xy):continue
+        box=_optical_flow_box(working[a],working[b],ha.bbox_xywh) if ha.bbox_xywh else None
+        if box is None or hb.bbox_xywh is None or _iou(box,hb.bbox_xywh)<.60:return None
+    motion=measure_head_motion(tuple(head_motion_signature(h.geometry,h.landmarks_xy) for h in heads),
+        native_frames=ids,output_intervals_seconds=intervals,same_source_face_paths_pixel_verified=True)
+    return HeadMotionEvidence(motion,endpoint) if motion is not None else None
 
 
 @dataclass(frozen=True)
@@ -76,7 +137,19 @@ def measured_motion_improves(candidate, before):
 
 def motion_evidence_basis(evidence):
     if isinstance(evidence,HeadMotionEvidence):return HEAD_MOTION_BASIS
-    return 'exact_four_frame_observed_arm_motion_cost_v1' if isinstance(evidence,CloseupGestureEvidence) else None
+    return MOTION_CONTRACT if isinstance(evidence,CloseupGestureEvidence) else None
+
+
+def projected_motion_preserved(candidate,before):
+    """A framing gain cannot buy lost bones or worse measured output motion."""
+    if isinstance(before,HeadMotionEvidence):
+        return isinstance(candidate,HeadMotionEvidence) and candidate.preserves_motion_of(before)
+    return bool(isinstance(before,CloseupGestureEvidence) and isinstance(candidate,CloseupGestureEvidence)
+        and before.motion is not None and candidate.motion is not None
+        and before.motion.observed_bones<=candidate.motion.observed_bones
+        and before.motion.output_intervals_seconds==candidate.motion.output_intervals_seconds
+        and candidate.preserves_pose_continuity_of(before)
+        and candidate.ranking_cost<=before.ranking_cost+1e-9)
 
 
 def measured_motion_frontier(triage,maximum_boundaries):
@@ -133,13 +206,8 @@ def measured_output_face_box(frame):
     do not relabel a local body owner or a missing face as globally dominant.
     These pixels rank a candidate; they do not grant a dense camera binding.
     """
-    box=_default_geometry_provider(frame).face_bbox_xywh
-    if box is not None:return box
-    import cv2
-    from .visual_score import _working_frame
-    from .shot_context_camera import observe_shot_head
-    observed=observe_shot_head(cv2.resize(_working_frame(frame,maximum_width=960),(854,480)))
-    return observed.face_box_xywh if observed.face_is_unambiguous_dominant else None
+    from .native_global_face import observe_native_global_face
+    return observe_native_global_face(frame).bbox_xywh
 
 
 def focal_boundary_shortlist(timeline, *, maximum_candidates=12):
@@ -208,7 +276,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     if not targets:
         return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
     clocks={i:probe_render_frame_clock(source) for i,source in enumerate(plan.sources)}
-    provider=CloseupGestureProvider(plan.sources,Path(model_path))
+    provider=CloseupGestureProvider(plan.sources,Path(model_path),verify_native_global_focal=True)
     samplers={}
     local_index={source:index for index,source in enumerate(mapping)}
     def sampler(source):
@@ -254,6 +322,18 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 size=(candidate.width,candidate.height))
             boxes.append(measured_output_face_box(output))
         return _box_discontinuity(*boxes) if all(box is not None for box in boxes) else None
+    def projected(candidate,boundary,samples,required_basis=None):
+        counts=segment_frame_counts(candidate);frames=[]
+        for index,sample in zip((boundary,boundary,boundary+1,boundary+1),samples):
+            frame=provider.capture.frame_at_native_index(sample.source_index,sample.native_frame_index,
+                clocks[sample.source_index])
+            if frame is None:return None
+            geometry=PrescribedGeometrySampler(sampler(sample.source_index),candidate.segments[index],
+                master_start=candidate.master_audio_start+candidate.segments[index].master_start)
+            frames.append(_reference_view_for_span(frame,geometry.span,
+                relative_time=(sample.output_frame_index-sum(counts[:index]))/candidate.fps,
+                size=(candidate.width,candidate.height)))
+        return measure_projected_motion(frames,samples,provider,output_fps=candidate.fps,required_basis=required_basis)
     # These cameras belong to an independent complete context transaction.
     # Editing one of its fixed neighbors is not a proposal this stage can
     # compose. Avoid decoding/ranking a candidate known to lose its receipt.
@@ -264,7 +344,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
             if len(triage)>=maximum_measured_boundaries:
                 break
             try:
-                gesture,_,samples=measured(plan,boundary)
+                source_gesture,source_descriptors,samples=measured(plan,boundary)
+                gesture=projected(plan,boundary,samples) if samples is not None else None
                 baseline_faces=(faces(plan,boundary,samples) if gesture is not None
                     and gesture.motion is not None and samples is not None else None)
             except ValueError as error:
@@ -276,17 +357,21 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 # Cached face scale only orders sensing; missing four-frame
                 # motion/output faces do not consume a measured repair slot.
                 # Keep these exact measurements rather than decode them again.
-                triage.append((gesture.ranking_cost,boundary,gesture,samples,baseline_faces,baseline_rank))
+                triage.append((baseline_rank,boundary,gesture,samples,baseline_faces,baseline_rank,
+                    source_gesture,source_descriptors))
             attempts.append(dict(stage='baseline_motion',boundary_index=boundary,admitted=False,
                 motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
                 motion_evidence_basis=motion_evidence_basis(gesture),
+                source_motion_cost=source_gesture.ranking_cost if source_gesture is not None else None,
+                source_motion_evidence_basis=motion_evidence_basis(source_gesture),
+                motion_ranking_coordinate_basis='actual_projected_output_pixels',
                 output_face_metrics=baseline_faces,complete_measured_candidate=baseline_rank is not None))
         attempts.append(dict(stage='bounded_measured_focal_frontier',admitted=False,
             cached_candidate_budget=maximum_candidate_boundaries,measured_candidate_budget=maximum_measured_boundaries,
             cached_eligible_boundaries=len(shortlist),measured_candidate_count=len(triage),
             measured_boundary_indices=[row[1] for row in triage],
             cached_geometry_used_only_for_sensing_order=True,quality_approved=False))
-        for _,boundary,before,samples,before_faces,before_rank in measured_motion_frontier(triage,maximum_boundaries):
+        for _,boundary,before,samples,before_faces,before_rank,source_before,before_descriptors in measured_motion_frontier(triage,maximum_boundaries):
             if any(abs(boundary-proposal.boundary_index)<=1 for proposal in selected):
                 continue
             offsets=[]
@@ -303,13 +388,15 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     for choice,start,end in ((left,left.canonical_master_start,cut),(right,cut,right.canonical_master_end)))
                 numeric=replace(plan,segments=(*plan.segments[:boundary],*pair,*plan.segments[boundary+2:]))
                 try:
-                    gesture,descriptors,native=measured(numeric,boundary,required_basis=motion_evidence_basis(before))
+                    source_gesture,descriptors,native=measured(numeric,boundary,required_basis=motion_evidence_basis(before))
                 except ValueError:
                     continue
+                if native is None:continue
+                preview=retimed_incumbent_camera_preview(plan,numeric,boundary)
+                gesture=projected(preview,boundary,native,required_basis=motion_evidence_basis(before))
                 improves=measured_motion_improves(gesture,before)
                 preview_faces=preview_rank=None
-                if improves:
-                    preview=retimed_incumbent_camera_preview(plan,numeric,boundary)
+                if projected_motion_preserved(gesture,before):
                     preview_faces=faces(preview,boundary,native)
                     preview_rank=camera_motion_rank(gesture,preview_faces,enforce_face_limits=False)
                 attempts.append(dict(stage='directional_candidate',boundary_index=boundary,
@@ -322,19 +409,39 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     endpoint_only_bones_no_longer_observed=(sorted(before.observed_bones-gesture.observed_bones)
                         if gesture is not None else []),
                     proposed_motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
+                    source_motion_cost=source_gesture.ranking_cost if source_gesture is not None else None,
+                    source_motion_evidence_basis=motion_evidence_basis(source_gesture),
+                    motion_ranking_coordinate_basis='actual_projected_output_pixels',
                     incumbent_camera_preview_face_metrics=preview_faces,
                     incumbent_camera_preview_joint_rank=preview_rank,
                     preview_grants_dense_camera_authority=False,
                     unknown_motion_bones_imputed=False))
-                if improves:
-                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native,preview_rank))
-            eligible=[]
-            for _,offset,pair,gesture,descriptors,native,preview_rank in sorted(offsets,
-                    key=lambda row:(row[6] is None,row[6] if row[6] is not None else row[0],row[0],abs(row[1]),row[1]))[:maximum_camera_candidates]:
+                # A crop can hide a bone genuinely seen in the raw source.
+                # Compare the incumbent output domain, not that unrelated raw
+                # domain. Equally good output motion can accompany better
+                # framing; no source-only motion cost authorizes this candidate.
+                # The incumbent-camera preview orders work; it cannot veto a
+                # timing whose worse FACE framing is exactly what the complete
+                # dense camera is supposed to repair. Motion must still survive.
+                if preview_rank is not None and projected_motion_preserved(gesture,before):
+                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native,preview_rank,source_gesture))
+            eligible=[];before_projected=before
+            ranked=sorted(offsets,key=lambda row:(row[6],row[0],abs(row[1]),row[1]))
+            # A bad cut can need camera alignment without any timing change.
+            # Reserve one of the SAME two slots for this unchanged-clock recipe,
+            # rather than requiring a source-motion gain before trying a camera.
+            unchanged=(before.ranking_cost,0,plan.segments[boundary:boundary+2],before,
+                before_descriptors,samples,before_rank,source_before)
+            frontier=((*ranked[:maximum_camera_candidates-1],unchanged)
+                if maximum_camera_candidates>1 else tuple(ranked[:1] or [unchanged]))
+            for _,offset,pair,gesture,descriptors,native,preview_rank,source_gesture in frontier:
                 row=dict(stage='complete_camera_candidate',boundary_index=boundary,offset_frames=offset,
                     before_motion_cost=before.ranking_cost,proposed_motion_cost=gesture.ranking_cost,
                     motion_evidence_basis=motion_evidence_basis(before),
                     before_motion_evidence=before.to_dict(),proposed_motion_evidence=gesture.to_dict(),
+                    before_source_motion_evidence=source_before.to_dict() if source_before else None,
+                    proposed_source_motion_evidence=source_gesture.to_dict() if source_gesture else None,
+                    motion_ranking_coordinate_basis='actual_projected_output_pixels',
                     incumbent_camera_preview_joint_rank=preview_rank,
                     preview_grants_dense_camera_authority=False,
                     before_output_face_metrics=before_faces,admitted=False)
@@ -346,11 +453,15 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                         proposal=build_group_cut_camera_proposal(**camera_arguments)
                     except ValueError as error:
                         reason=str(error).split(': ',1)[-1]
-                        if reason not in {'shot_policy_family_mismatch','exact_subject_would_be_clipped'}:
+                        if reason not in {'shot_policy_family_mismatch','exact_subject_would_be_clipped',
+                                'per_frame_layout_mismatch_gate'}:
                             raise
                         # One explicit, globally dominant action-camera retry
                         # inside this candidate's existing bounded slot. Do
                         # not relabel central attention or lower containment.
+                        # Aggregate background layout can fail an otherwise
+                        # valid dominant-performer action shot; this separate
+                        # recipe must freshly prove its own head AND arm owner.
                         row['ordinary_camera_rejection']=reason
                         proposal=build_group_cut_camera_proposal(**camera_arguments,
                             global_action_framing=True,action_framing_model_path=model_path)
@@ -360,9 +471,21 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                            for a,b in zip(native,final_native,strict=True)):
                         raise ValueError('camera construction changed the measured native motion clock')
                     projected_faces=faces(proposal.plan,boundary,native)
-                    rank=camera_motion_rank(gesture,projected_faces)
-                    row.update(proposed_output_face_metrics=projected_faces,before_joint_rank=before_rank,proposed_joint_rank=rank)
-                    if rank is None or rank>=before_rank-1e-9:
+                    after_projected=(projected(proposal.plan,boundary,native,
+                        required_basis=motion_evidence_basis(before_projected))
+                        if before_projected is not None else None)
+                    output_before_rank=camera_motion_rank(before_projected,before_faces,enforce_face_limits=False)
+                    rank=camera_motion_rank(after_projected,projected_faces)
+                    row.update(proposed_output_face_metrics=projected_faces,
+                        before_source_motion_face_rank=camera_motion_rank(source_before,before_faces,enforce_face_limits=False),
+                        before_joint_rank=output_before_rank,proposed_joint_rank=rank,
+                        before_projected_motion=before_projected.to_dict() if before_projected else None,
+                        proposed_projected_motion=after_projected.to_dict() if after_projected else None,
+                        projected_motion_required_for_promotion=True)
+                    if not projected_motion_preserved(after_projected,before_projected):
+                        row['reason']='projected_output_motion_unobserved_or_worsened'
+                        attempts.append(row);continue
+                    if rank is None or output_before_rank is None or rank>=output_before_rank-1e-9:
                         row['reason']='output_motion_face_rank_not_improved'
                         attempts.append(row)
                         continue

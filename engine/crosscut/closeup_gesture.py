@@ -301,7 +301,9 @@ def measure_arm_motion(observations, *, native_frames, output_intervals_seconds)
 
 class CloseupGestureProvider:
     """Lazy, source-checked native reads and a bounded run-local pose cache."""
-    def __init__(self, sources, model_path: Path):
+    def __init__(self, sources, model_path: Path, *, verify_native_global_focal=False):
+        if type(verify_native_global_focal) is not bool:
+            raise ValueError('native global focal verification must be explicit')
         # Keep this optional dependency outside the persistent descriptor path.
         from .boundary_subject_alignment import _CaptureProvider
         self.sources = tuple(Path(p) for p in sources)
@@ -310,6 +312,7 @@ class CloseupGestureProvider:
         self.pose = BodyPose2DAnalyzer(model_path)
         self.cache = OrderedDict()
         self.head_cache = OrderedDict()
+        self.verify_native_global_focal=verify_native_global_focal
 
     @staticmethod
     def _identity(path):
@@ -326,7 +329,8 @@ class CloseupGestureProvider:
             return None
         face = descriptor.primary_face_bbox
         body = face_associated_person(face, descriptor.formation_people)
-        if face is not None and body is None:
+        native_global=getattr(self,'verify_native_global_focal',False)
+        if not native_global and face is not None and body is None:
             return None
         # Cache by exact input evidence, including the unknown-primary case.
         # A central focal supplement is local to this optional arm measurement;
@@ -340,8 +344,16 @@ class CloseupGestureProvider:
             return None
         from .visual_score import _working_frame
         frame = _working_frame(frame, maximum_width=960)
-        from .group_focal_attention import resolve_group_focal_subject
-        focal = resolve_group_focal_subject(frame, descriptor)
+        from .group_focal_attention import resolve_group_focal_subject,GroupFocalSubject
+        if native_global:
+            from .native_global_face import observe_native_global_face
+            native=observe_native_global_face(frame)
+            owner=face_associated_person(native.bbox_xywh,descriptor.formation_people)
+            focal=(GroupFocalSubject(native.bbox_xywh,native.landmarks_xy,native.head_roll_radians,
+                native.eye_scale,owner,native.face_count,GLOBAL_FOCAL_BASIS)
+                if native.bbox_xywh is not None and owner is not None else None)
+        else:
+            focal = resolve_group_focal_subject(frame, descriptor)
         if focal is None:
             self.cache[key] = None
             if len(self.cache) > 256:
@@ -394,13 +406,13 @@ class CloseupGestureProvider:
                             *, output_fps, flank_frames=3):
         """A separate pixel-linked head basis, only for arm-unmeasured callers.
 
-        Same-source paths must link the actual four native frames. Known
-        primary faces are preserved; missing five-point geometry gets one
-        bounded global reacquisition, never a central-face substitute.
+        Same-source paths must link the actual four native frames. Cached
+        owners are verified against a fresh native GLOBAL face. Motion always
+        uses its fresh five points, not lower-resolution cached derivatives.
         """
         from .observed_head_motion import head_motion_signature,measure_head_motion,HeadMotionEvidence
-        from .roll_aware_face_geometry import detect_roll_aware_faces
-        from .visual_score import _dominant_face,_normalized_face_metadata,_working_frame
+        from .native_global_face import observe_native_global_face
+        from .visual_score import _working_frame
         from .group_focal_attention import focal_landmarks_track
         from .boundary_subject_alignment import _optical_flow_box
         from .cut_anchored_containment import _iou
@@ -428,25 +440,18 @@ class CloseupGestureProvider:
             points=getattr(descriptor,'primary_face_landmarks_xy',None)
             key=(source,index,known,geometry,points)
             if key in self.head_cache:
-                signature,box,points=self.head_cache[key]
+                signature,box,points,known_owner_verified=self.head_cache[key]
                 self.head_cache.move_to_end(key)
             else:
-                signature=head_motion_signature(geometry,points)
-                box=known
-                if signature is None:
-                    faces=detect_roll_aware_faces(frame,angles=(0.,))
-                    primary=_dominant_face(faces)
-                    if primary is None:
-                        primary=_dominant_face(detect_roll_aware_faces(frame))
-                    measured_box,measured_points,_,_,measured_geometry=_normalized_face_metadata(primary,
-                        frame_width=854,frame_height=480)
-                    if measured_box is not None and (known is None or _iou(known,measured_box)>=.60):
-                        box,points=measured_box,measured_points
-                        signature=head_motion_signature(measured_geometry,points)
-                self.head_cache[key]=(signature,box,points)
+                native=observe_native_global_face(frame)
+                known_owner_verified=(known is not None and native.bbox_xywh is not None
+                    and _iou(known,native.bbox_xywh)>=.60)
+                box,points=native.bbox_xywh,native.landmarks_xy
+                signature=head_motion_signature(native.geometry,points)
+                self.head_cache[key]=(signature,box,points,known_owner_verified)
                 if len(self.head_cache)>256:self.head_cache.popitem(last=False)
             if signature is None or box is None or points is None:return None
-            observations.append((index,signature,box,points,frame))
+            observations.append((index,signature,box,points,frame,known_owner_verified))
         ids=tuple(row[0] for row in observations)
         if ids[0]>=ids[1] or ids[2]>=ids[3]:return None
         for a,b in (observations[:2],observations[2:]):
@@ -462,7 +467,9 @@ class CloseupGestureProvider:
         # fallback may have selected a different central person, even on the
         # same frame IDs; it cannot become this head's arm guard.
         if guard is not None and (guard.outgoing_focal_basis!=GLOBAL_FOCAL_BASIS
-                or guard.incoming_focal_basis!=GLOBAL_FOCAL_BASIS):
+                or guard.incoming_focal_basis!=GLOBAL_FOCAL_BASIS
+                or (not getattr(self,'verify_native_global_focal',False)
+                    and not all(row[5] for row in observations[1:3]))):
             guard=None
         return HeadMotionEvidence(motion,guard)
 

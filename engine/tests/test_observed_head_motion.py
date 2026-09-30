@@ -17,6 +17,7 @@ from crosscut.observed_head_motion import (
 from crosscut.group_motion_camera_refinement import measured_motion_improves,measured_motion_frontier
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.group_focal_attention import CENTRAL_FOCAL_BASIS
+from crosscut.native_global_face import NativeGlobalFace
 
 
 class ObservedHeadMotionTests(unittest.TestCase):
@@ -112,6 +113,11 @@ class ObservedHeadMotionTests(unittest.TestCase):
 
 
 class HeadMotionProviderTests(unittest.TestCase):
+    def native(self):
+        descriptor=self.requests()[0][-1]
+        return NativeGlobalFace(1,descriptor.primary_face_bbox,descriptor.primary_face_landmarks_xy,
+            0.,.1,descriptor.primary_face_geometry)
+
     def provider(self):
         provider=CloseupGestureProvider.__new__(CloseupGestureProvider)
         provider.sources=(Path('0.mp4'),Path('1.mp4'));provider.identities=('same','same')
@@ -127,13 +133,13 @@ class HeadMotionProviderTests(unittest.TestCase):
             primary_face_landmarks_xy=((.4,.2),(.5,.2),(.45,.25),(.42,.3),(.48,.3)))
         return tuple((source,index/30.,clock,descriptor) for source,index in ((0,10),(0,13),(1,20),(1,23)))
 
-    def test_known_five_point_geometry_is_reused_without_detector_or_body_guess(self):
+    def test_known_five_point_geometry_is_reused_only_after_fresh_global_verification(self):
         provider=self.provider()
         with patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True), \
-                patch('crosscut.roll_aware_face_geometry.detect_roll_aware_faces') as detect:
+                patch('crosscut.native_global_face.observe_native_global_face',return_value=self.native()) as detect:
             result=provider.compare_head_motion(*self.requests(),output_fps=30.)
             again=provider.compare_head_motion(*self.requests(),output_fps=30.)
-        detect.assert_not_called()
+        self.assertEqual(detect.call_count,4,'run-local verified geometry is reused, not re-inferred')
         self.assertEqual(result,again)
         self.assertEqual(result.motion.native_frames,(10,13,20,23))
         self.assertEqual(len(provider.head_cache),4)
@@ -141,7 +147,8 @@ class HeadMotionProviderTests(unittest.TestCase):
 
     def test_failed_same_source_pixel_link_stays_unknown(self):
         with patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=False), \
-                patch('crosscut.boundary_subject_alignment._optical_flow_box',return_value=None):
+                patch('crosscut.boundary_subject_alignment._optical_flow_box',return_value=None), \
+                patch('crosscut.native_global_face.observe_native_global_face',return_value=self.native()):
             self.assertIsNone(self.provider().compare_head_motion(*self.requests(),output_fps=30.))
 
     def test_central_person_arms_are_not_attached_to_the_global_head(self):
@@ -149,7 +156,8 @@ class HeadMotionProviderTests(unittest.TestCase):
         for field in ('outgoing_focal_basis','incoming_focal_basis'):
             provider=self.provider()
             provider.compare=lambda *a:replace(guard,**{field:CENTRAL_FOCAL_BASIS})
-            with self.subTest(field=field),patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True):
+            with self.subTest(field=field),patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True), \
+                    patch('crosscut.native_global_face.observe_native_global_face',return_value=self.native()):
                 result=provider.compare_head_motion(*self.requests(),output_fps=30.)
             self.assertIsNotNone(result)
             self.assertIsNone(result.endpoint_arm_guard)
@@ -162,6 +170,33 @@ class HeadMotionProviderTests(unittest.TestCase):
                 patch('crosscut.group_focal_attention.observe_central_focal_face') as central:
             self.assertIsNone(self.provider().compare_head_motion(*requests,output_fps=30.))
         central.assert_not_called()
+
+    def test_cached_background_head_and_its_arms_are_not_preserved_as_foreground(self):
+        provider=self.provider();requests=self.requests()
+        provider.compare=lambda *a:CloseupGestureEvidence(13,20,(.1,.1,None,None))
+        foreground=replace(self.native(),bbox_xywh=(.1,.15,.3,.35),
+            geometry=(*self.native().geometry[:6],.25,.4,.8,0.))
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=foreground), \
+                patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True):
+            result=provider.compare_head_motion(*requests,output_fps=30.)
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.endpoint_arm_guard,'legacy arms belonged to a displaced cached background face')
+        self.assertTrue(all(not row[3] for row in provider.head_cache.values()))
+
+    def test_new_global_ambiguity_revokes_even_previously_known_head_geometry(self):
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=NativeGlobalFace(2,None,None,None,None,None)):
+            self.assertIsNone(self.provider().compare_head_motion(*self.requests(),output_fps=30.))
+
+    def test_cached_low_resolution_derivatives_do_not_override_fresh_five_points(self):
+        requests=[]
+        for i,row in enumerate(self.requests()):
+            old=row[-1];geometry=(*old.primary_face_geometry[:6],i*.3,.4,.8,0.)
+            requests.append((*row[:3],SimpleNamespace(primary_face_bbox=old.primary_face_bbox,
+                primary_face_landmarks_xy=old.primary_face_landmarks_xy,primary_face_geometry=geometry)))
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=self.native()), \
+                patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True):
+            result=self.provider().compare_head_motion(*requests,output_fps=30.)
+        self.assertAlmostEqual(result.ranking_cost,0.,msg='same fresh observed head must not inherit stale derivative jumps')
 
     def test_changed_source_or_wrong_source_runs_are_rejected(self):
         provider=self.provider();provider._identity=lambda p:'changed'

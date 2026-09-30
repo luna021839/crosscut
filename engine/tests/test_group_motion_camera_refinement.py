@@ -16,6 +16,7 @@ from crosscut.group_motion_camera_refinement import (
     measured_motion_improves,
     measured_output_face_box,
     retimed_incumbent_camera_preview,
+    projected_motion_preserved,measure_projected_motion,
 )
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (
@@ -44,20 +45,16 @@ class MotionCameraRankTests(unittest.TestCase):
                              (gesture, (.1, True)), (gesture, (-.1, .1))):
             self.assertIsNone(camera_motion_rank(value, faces))
 
-    def test_output_face_reacquisition_does_not_invent_dominance_or_replace_known_geometry(self):
+    def test_output_face_ranking_uses_fresh_native_global_geometry_not_a_legacy_background(self):
         frame=np.zeros((1080,1920,3),np.uint8);box=(.4,.2,.1,.15)
         with patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
-                    SimpleNamespace(face_bbox_xywh=box)), \
-                patch('crosscut.shot_context_camera.observe_shot_head') as observe:
-            self.assertEqual(measured_output_face_box(frame),box);observe.assert_not_called()
-        for dominant in (False,True):
-            observation=BoundarySubjectObservation(face_count=2,face_box_xywh=box,
-                face_is_unambiguous_dominant=dominant)
-            with patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
-                        SimpleNamespace(face_bbox_xywh=None)), \
-                    patch('crosscut.shot_context_camera.observe_shot_head',return_value=observation) as observe:
-                self.assertEqual(measured_output_face_box(frame),box if dominant else None)
-                self.assertEqual(observe.call_args.args[0].shape,(480,854,3))
+                    SimpleNamespace(face_bbox_xywh=(.8,.3,.02,.05))) as legacy, \
+                patch('crosscut.native_global_face.observe_native_global_face',return_value=
+                    SimpleNamespace(bbox_xywh=box)) as observe:
+            self.assertEqual(measured_output_face_box(frame),box)
+            legacy.assert_not_called();self.assertIs(observe.call_args.args[0],frame)
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=SimpleNamespace(bbox_xywh=None)):
+            self.assertIsNone(measured_output_face_box(frame))
 
     def test_joint_rank_accounts_for_framing_and_keeps_existing_face_limits(self):
         better_motion = self.gesture(pose=.1, velocity=.05)
@@ -81,6 +78,47 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertFalse(measured_motion_improves(replace(better,motion=None),before))
         self.assertFalse(measured_motion_improves(self.gesture(pose=.25,velocity=0.),self.gesture()),
             'lower velocity cost cannot buy a larger predicted pose jump')
+
+    def test_output_framing_may_not_buy_lost_motion_bones_or_a_larger_pose_jump(self):
+        before=self.gesture();equal=self.gesture()
+        self.assertTrue(projected_motion_preserved(equal,before),'unchanged motion can accompany better framing')
+        self.assertTrue(projected_motion_preserved(self.gesture(pose=.1,velocity=.05),before))
+        self.assertFalse(projected_motion_preserved(None,before))
+        self.assertFalse(projected_motion_preserved(replace(equal,motion=None),before))
+        self.assertFalse(projected_motion_preserved(self.gesture(pose=.25,velocity=0.),before))
+        extra=replace(before,bone_mismatches=(.1,.2,.3,None),
+            motion=replace(before.motion,predicted_jump_radians=(.2,.2,.2,None),
+            velocity_jump_per_output_tick_radians=(.1,.1,.1,None)))
+        self.assertFalse(projected_motion_preserved(self.gesture(pose=.01,velocity=.01),extra))
+        head=HeadMotionEvidence(ObservedHeadMotion((10,13,20,23),(.1,1/30.,.1),.2,.1))
+        self.assertTrue(projected_motion_preserved(head,head))
+        self.assertFalse(projected_motion_preserved(head,before),'head cannot replace previously observed output arms')
+
+    def test_projected_motion_measures_actual_output_views_without_borrowing_missing_bodies(self):
+        from crosscut.native_global_face import NativeGlobalFace
+        from engine.tests.test_global_action_cut_camera import person,pose,observation
+        row=observation(0);head=NativeGlobalFace(1,row.face_box_xywh,row.face_landmarks_xy,0.,.1,
+            (.4,.3,.5,.3,.1,0.,0.,.4,.8,0.))
+        frames=[np.zeros((480,854,3),np.uint8) for _ in range(4)]
+        samples=tuple(SimpleNamespace(source_index=s,native_frame_index=n,output_frame_index=o,terminal_clone=False)
+            for s,n,o in ((0,10,100),(0,13,103),(1,20,104),(1,23,107)))
+        provider=SimpleNamespace(pose=SimpleNamespace(describe=lambda *a,**k:pose(person())))
+        for missing_body in (False,True):
+            with self.subTest(missing_body=missing_body), \
+                    patch('crosscut.native_global_face.observe_native_global_face',return_value=head), \
+                    patch('crosscut.visual_score.describe_frame',return_value=
+                        SimpleNamespace(formation_people=() if missing_body else (person(),))):
+                result=measure_projected_motion(frames,samples,provider,output_fps=30.,
+                    required_basis='exact_four_frame_observed_arm_motion_cost_v1')
+            if missing_body:self.assertIsNone(result,'no head-only replacement for missing output arm evidence')
+            else:self.assertEqual(result.motion.observed_bones,frozenset(range(4)))
+        wrong=list(samples);wrong[0]=SimpleNamespace(**(vars(wrong[0])|{'output_frame_index':101}))
+        with self.assertRaises(ValueError):measure_projected_motion(frames,wrong,provider,output_fps=30.)
+        with self.assertRaises(ValueError):measure_projected_motion(frames,samples,provider,output_fps=30.,required_basis='unknown_basis')
+        same=tuple(SimpleNamespace(**(vars(sample)|{'source_index':0})) for sample in samples)
+        with patch('crosscut.native_global_face.observe_native_global_face') as observe:
+            self.assertIsNone(measure_projected_motion(frames,same,provider,output_fps=30.))
+            observe.assert_not_called()
 
     def test_bound_is_checked_before_any_media_decode(self):
         with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock') as probe:
@@ -145,11 +183,15 @@ class MotionCameraRankTests(unittest.TestCase):
         plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),
             tuple(RenderSegment(i%2,float(i),1.,float(i)) for i in range(16)),0,
             '16:9',Path('unused.mp4'),fps=30.,transitions=(RenderTransition(),)*15)
-        calls=0
+        calls=0;output_calls=0
         def compare(*_args,**_kwargs):
             nonlocal calls
             calls+=1
             return None if calls<=12 else self.gesture()
+        def projected(*_args,**_kwargs):
+            nonlocal output_calls
+            output_calls+=1
+            return None if output_calls<=12 else self.gesture()
         sampler=SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)
         capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8))
         provider=SimpleNamespace(compare_motion=compare,capture=capture,close=lambda:None)
@@ -157,8 +199,9 @@ class MotionCameraRankTests(unittest.TestCase):
                     VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
                 patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                 patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=sampler), \
-                patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
-                    SimpleNamespace(face_bbox_xywh=(.4,.25,.1,.15))) as observed, \
+                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=ValueError('native camera cannot be bound')) as camera, \
+                patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)) as observed, \
                 patch('crosscut.group_motion_camera_refinement.measured_motion_improves',return_value=False):
             result=refine_group_motion_camera(plan=plan,timeline=VisualTimelinePlan(choices,1.),
                 audio_offsets=(0.,0.),source_timewarps=(None,None),scene_cut_times=((),()),
@@ -167,11 +210,13 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertEqual([r['boundary_index'] for r in baseline],list(range(13)))
         self.assertFalse(any(r['complete_measured_candidate'] for r in baseline[:12]))
         self.assertTrue(baseline[12]['complete_measured_candidate'])
-        observed.assert_called();self.assertEqual(observed.call_count,2,'unknown motion did not trigger output face sensing')
+        observed.assert_called();self.assertEqual(observed.call_count,14,
+            'twelve unknown baselines did not trigger faces; one known baseline and six equal-motion previews did')
         budget=next(r for r in result.attempts if r['stage']=='bounded_measured_focal_frontier')
         self.assertEqual(budget['measured_boundary_indices'],[12])
         self.assertEqual(result.proposals,())
         self.assertEqual(result.plan,plan)
+        self.assertEqual(camera.call_count,2,'one equal-motion retime and one unchanged-clock camera share the same budget')
 
     def test_head_fallback_stays_in_its_basis_and_native_cuts_precede_all_sensing(self):
         timeline=VisualTimelinePlan(tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),
@@ -199,6 +244,9 @@ class MotionCameraRankTests(unittest.TestCase):
                     patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                     patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                         SimpleNamespace(feature_descriptor_at=descriptor,close=lambda:None)), \
+                    patch('crosscut.group_motion_camera_refinement.measure_projected_motion',return_value=
+                        self.gesture() if arm_available else HeadMotionEvidence(ObservedHeadMotion((10,13,20,23),(.1,1/30.,.1),.2,.1))) as output_motion, \
+                    patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=ValueError('native camera cannot be bound')), \
                     patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)):
                 result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
                     source_timewarps=(None,None),scene_cut_times=((1.95,) if native_cut else (),()),
@@ -207,6 +255,7 @@ class MotionCameraRankTests(unittest.TestCase):
             self.assertEqual(result.proposals,())
             if native_cut:
                 self.assertFalse(arm_calls or head_calls or descriptor_calls)
+                output_motion.assert_not_called()
                 self.assertFalse(baseline['complete_measured_candidate'])
             elif arm_available:
                 self.assertTrue(arm_calls)
@@ -225,12 +274,17 @@ class MotionCameraRankTests(unittest.TestCase):
             (RenderSegment(0,0.,2.,0.),RenderSegment(1,2.,2.,2.)),0,'16:9',Path('unused.mp4'),
             fps=30.,transitions=(RenderTransition(),))
         for reason,recoverable in (('shot_policy_family_mismatch',True),
-                ('exact_subject_would_be_clipped',True),('broadcaster_native_internal_cut',False)):
-            calls=[];measurements=0
+                ('exact_subject_would_be_clipped',True),('per_frame_layout_mismatch_gate',True),
+                ('broadcaster_native_internal_cut',False)):
+            calls=[];measurements=0;output_measurements=0
             def measure(*_args,**_kwargs):
                 nonlocal measurements
                 measurements+=1
                 return self.gesture(pose=.6 if measurements==1 else .1)
+            def output_measure(*_args,**_kwargs):
+                nonlocal output_measurements
+                output_measurements+=1
+                return self.gesture(pose=.6 if output_measurements==1 else .1)
             def camera(**kwargs):
                 calls.append(kwargs)
                 raise ValueError('camera proposal lacks dense local subject alignment: '+
@@ -243,8 +297,8 @@ class MotionCameraRankTests(unittest.TestCase):
                     patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                     patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                         SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
-                    patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
-                        SimpleNamespace(face_bbox_xywh=(.4,.25,.1,.15))), \
+                    patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=output_measure), \
+                    patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
                     patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=camera):
                 result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
                     source_timewarps=(None,None),scene_cut_times=((),()),model_path=Path('exact-model'))
@@ -255,6 +309,45 @@ class MotionCameraRankTests(unittest.TestCase):
                 if call.get('global_action_framing'):
                     self.assertEqual(call['action_framing_model_path'],Path('exact-model'))
                     self.assertNotIn('local_focal_attention',call)
+
+    def test_candidate_ranking_uses_the_output_bone_domain_not_more_visible_raw_source_bones(self):
+        timeline=VisualTimelinePlan(tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),
+            entry_shot_scale=.5,exit_shot_scale=.5) for i in range(2)),1.)
+        plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),
+            (RenderSegment(0,0.,2.,0.),RenderSegment(1,2.,2.,2.)),0,'16:9',Path('unused.mp4'),
+            fps=30.,transitions=(RenderTransition(),))
+        raw=replace(self.gesture(),bone_mismatches=(.1,.2,.3,None),
+            motion=replace(self.gesture().motion,predicted_jump_radians=(.2,.2,.2,None),
+                velocity_jump_per_output_tick_radians=(.1,.1,.1,None)))
+        calls=[]
+        def projected(_frames,samples,_provider,**kwargs):
+            cut=samples[2].output_frame_index
+            if cut==60:return self.gesture()
+            if cut==66:return self.gesture(pose=.01,velocity=.01)
+            return None
+        def camera(**kwargs):
+            calls.append(kwargs)
+            raise ValueError('camera proposal lacks dense local subject alignment: broadcaster_native_internal_cut')
+        provider=SimpleNamespace(compare_motion=lambda *a,**k:raw,close=lambda:None,
+            capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8)))
+        with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',return_value=
+                    VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
+                patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
+                patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
+                    SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
+                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
+                patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=camera):
+            result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
+                source_timewarps=(None,None),scene_cut_times=((),()),model_path='unused',maximum_camera_candidates=1)
+        self.assertEqual(len(calls),1)
+        self.assertAlmostEqual(calls[0]['shifted_segments'][0].duration,2.2)
+        proposal=next(row for row in result.attempts if row['stage']=='complete_camera_candidate')
+        self.assertEqual(proposal['offset_frames'],6)
+        self.assertEqual(proposal['motion_ranking_coordinate_basis'],'actual_projected_output_pixels')
+        self.assertEqual(proposal['before_motion_evidence']['motion']['observed_bone_indices'],[0,1])
+        self.assertEqual(proposal['before_source_motion_evidence']['motion']['observed_bone_indices'],[0,1,2])
+        self.assertFalse(proposal['admitted'],'a better preview cannot bypass the dense camera failure')
 
     def test_shortlist_uses_cut_endpoint_sizes_not_interior_labels(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
@@ -289,7 +382,7 @@ class MotionCameraRankTests(unittest.TestCase):
 
 
 class MotionCameraBundleTests(unittest.TestCase):
-    def fixture(self):
+    def fixture(self,offset_frames=2):
         plan, motion = produced_plan(Path('/synthetic'))
         timeline = VisualTimelinePlan(tuple(_choice(index, index,
             start=float(index), end=float(index+1)) for index in range(2)), 1.)
@@ -303,7 +396,7 @@ class MotionCameraBundleTests(unittest.TestCase):
             output=plan.output, reporter=SimpleNamespace(log=lambda *_args, **_kwargs: None), warnings=[])
         bundle = replace(bundle, render_plan=plan, editorial_motion_plan=motion,
             group_transition_plan=replace(bundle.group_transition_plan, transitions=plan.transitions))
-        delta = 2/30.
+        delta = offset_frames/30.
         left, right = plan.segments
         pair = (replace(left, duration=left.duration+delta, editorial_transform=None),
             replace(right, master_start=right.master_start+delta,
@@ -354,6 +447,21 @@ class MotionCameraBundleTests(unittest.TestCase):
             json.loads(json.dumps(changed.render_plan.to_json())),PostRenderQAConfig(),collector)
         self.assertTrue(all(metrics['count_reconciliation_checks'].values()),
                         metrics['count_reconciliation_checks'])
+
+    def test_clock_preserving_camera_is_an_owned_edit_not_a_required_fake_retime(self):
+        bundle,request,result=self.fixture(offset_frames=0)
+        changed=self.run_bundle(bundle,request,result)
+        _validate_review_first_group_bundle(changed,eligible_indices=(0,1),
+            offsets=(0.,0.),timewarps=(None,None),common_start=0.)
+        fields=('source_index','source_start','source_duration','master_start','duration')
+        for before,after in zip(bundle.render_plan.segments,changed.render_plan.segments,strict=True):
+            self.assertEqual(tuple(getattr(before,name) for name in fields),
+                tuple(getattr(after,name) for name in fields))
+        self.assertEqual(changed.stage_edit_exact_shot_clock,bundle.stage_edit_exact_shot_clock)
+        self.assertNotEqual(changed.render_plan.segments,bundle.render_plan.segments)
+        self.assertEqual(result.proposals[0].timing_offset_frames,0)
+        self.assertEqual(changed.candidate_lineage[-1]['changed_boundary_count'],1)
+        self.assertFalse(changed.candidate_lineage[-1]['quality_approved'])
 
     def test_empty_optional_pass_retains_failure_evidence_without_editing_the_plan(self):
         bundle,request,_=self.fixture()

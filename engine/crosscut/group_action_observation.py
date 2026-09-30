@@ -8,26 +8,18 @@ from dataclasses import replace
 from .boundary_subject_alignment import _observation_from_descriptor
 from .focal_pose import face_associated_person
 from .group_focal_attention import GroupFocalSubject, GLOBAL_FOCAL_BASIS
-from .roll_aware_face_geometry import detect_roll_aware_faces
-from .visual_score import describe_frame, _dominant_face, _normalized_face_metadata
+from .native_global_face import observe_native_global_face
+from .visual_score import describe_frame
 
 
 def observe_global_head_arms(frame, analyzer):
     descriptor = describe_frame(frame, include_subject_geometry=True,
         include_formation_pose=False)
     observed = _observation_from_descriptor(descriptor)
-    if observed.face_box_xywh is None:
-        faces = detect_roll_aware_faces(frame, angles=(0.,))
-        primary = _dominant_face(faces)
-        if primary is None:
-            faces = detect_roll_aware_faces(frame)
-            primary = _dominant_face(faces)
-        box, points, roll, eye, _ = _normalized_face_metadata(primary,
-            frame_width=frame.shape[1], frame_height=frame.shape[0])
-        if box is not None:
-            observed = replace(observed, face_count=len(faces), face_box_xywh=box,
-                face_landmarks_xy=points, face_head_roll_radians=roll,
-                face_eye_scale=eye, face_is_unambiguous_dominant=True)
+    native=observe_native_global_face(frame)
+    observed=replace(observed,face_count=native.face_count,face_box_xywh=native.bbox_xywh,
+        face_landmarks_xy=native.landmarks_xy,face_head_roll_radians=native.head_roll_radians,
+        face_eye_scale=native.eye_scale,face_is_unambiguous_dominant=native.bbox_xywh is not None)
     if not observed.face_is_unambiguous_dominant or observed.face_box_xywh is None:
         return observed
     person = face_associated_person(observed.face_box_xywh, descriptor.formation_people)
