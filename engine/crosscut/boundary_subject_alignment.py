@@ -393,6 +393,7 @@ class BoundarySubjectAlignmentDecision:
     incoming_output_frame_index: int | None = None
     outgoing_validated_output_frame_count: int = 0
     incoming_validated_output_frame_count: int = 0
+    replaced_one_sided_geometry_mismatch: float | None = None
 
     def __post_init__(self) -> None:
         if self.boundary_index < 0 or min(
@@ -431,6 +432,12 @@ class BoundarySubjectAlignmentDecision:
             raise ValueError("validated frame counts cannot be negative")
         if self.optical_flow_containment_frame_count > self.validated_output_frame_count:
             raise ValueError("tracked containment frames must be a validated subset")
+        previous = self.replaced_one_sided_geometry_mismatch
+        if previous is not None and (type(previous) not in (int, float) or not math.isfinite(previous)
+                or not self.eligible or self.transformed_side != 'both'
+                or self.transformed_geometry_mismatch is None
+                or not 0 <= self.transformed_geometry_mismatch < previous <= 1):
+            raise ValueError('paired replacement requires a strictly improved measured incumbent')
 
     @property
     def uses_pan(self) -> bool:
@@ -472,6 +479,7 @@ class BoundarySubjectAlignmentDecision:
             "incoming_output_frame_index": self.incoming_output_frame_index,
             "outgoing_validated_output_frame_count": self.outgoing_validated_output_frame_count,
             "incoming_validated_output_frame_count": self.incoming_validated_output_frame_count,
+            "replaced_one_sided_geometry_mismatch": self.replaced_one_sided_geometry_mismatch,
         }
 
 
@@ -600,6 +608,7 @@ class BoundarySubjectAlignmentPlan:
                 "maximum_track_candidates_per_segment": 120,
                 "dense_observations_reused_across_strengths": True,
                 "paired_framing_fallback": "common_face_scale_center_on_two_unused_segments_v1",
+                "paired_framing_competition": "replace_only_own_isolated_one_sided_ramp_after_strict_gain_and_two_dense_windows_v1",
                 "maximum_paired_framing_candidates_per_boundary": 5,
                 "paired_framing_publication": "both_complete_dense_windows_or_neither",
                 "paired_face_center_shift_cap": 0.10,
@@ -2571,18 +2580,29 @@ def build_boundary_subject_alignment_plan(
                     validated_output_frame_count=0, optical_flow_containment_frame_count=0,
                 )
 
-        # Preserve every already validated independent ramp. A paired fallback
-        # may claim only two unused segments; this avoids silently changing a
-        # neighboring cut or combining independently approved curves. Publish
-        # BOTH tracks only after BOTH complete visible windows pass.
+        # A passing one-sided crop is an incumbent, not necessarily the best
+        # camera match. Compare the bounded bilateral family when both segments
+        # are unused OR occupied solely by this cut. Neighbors are immutable;
+        # failed candidates retain the complete incumbent, and publication is
+        # atomic only after BOTH visible windows pass the same dense gates.
         initial_decisions = {item.boundary_index: item for item in decisions}
         for boundary_index, options in sorted(joint_options.items()):
             current = candidate_by_boundary.get(boundary_index, initial_decisions[boundary_index])
             sides = (boundary_index, boundary_index+1)
-            if (current.eligible or not options
-                    or any(choices[index].segment_index in segment_tracks for index in sides)):
+            if (not options or any(choices[index].segment_index in segment_tracks
+                    and set(segment_boundaries[choices[index].segment_index]) != {boundary_index}
+                    for index in sides)):
                 continue
             for candidate in options:
+                previous = current.transformed_geometry_mismatch if current.eligible else None
+                if current.eligible:
+                    if previous is None or current.transformed_layout_mismatch is None:
+                        continue
+                    gain = previous-candidate.transformed_geometry_mismatch
+                    if (gain < settings.minimum_geometry_improvement
+                            or gain/max(previous, 1e-9) < settings.minimum_geometry_improvement_fraction
+                            or candidate.transformed_layout_mismatch > current.transformed_layout_mismatch+1e-9):
+                        continue
                 tracks = []
                 counts_by_side = []
                 flow_count = 0
@@ -2610,7 +2630,8 @@ def build_boundary_subject_alignment_plan(
                     validated_output_frame_count=sum(counts_by_side),
                     optical_flow_containment_frame_count=flow_count,
                     outgoing_validated_output_frame_count=counts_by_side[0],
-                    incoming_validated_output_frame_count=counts_by_side[1])
+                    incoming_validated_output_frame_count=counts_by_side[1],
+                    replaced_one_sided_geometry_mismatch=previous)
                 break
 
         final_decisions = tuple(

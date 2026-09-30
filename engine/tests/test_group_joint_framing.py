@@ -75,6 +75,65 @@ class GroupJointFramingTests(unittest.TestCase):
         self.assertEqual(after.decisions[0],before.decisions[0])
         self.assertEqual(after.segments,before.segments)
 
+    @staticmethod
+    def _one_sided_fixture(frame):
+        source=int(frame.mean()>75)
+        x,y,w,h=((.42,.28,.15,.27),(.44,.40,.135,.24))[source]
+        return replace(observed(source),face_box_xywh=(x,y,w,h),face_eye_scale=h*.35,
+            face_landmarks_xy=tuple((x+a*w,y+b*h) for a,b in
+                ((.3,.3),(.7,.3),(.5,.5),(.3,.8),(.7,.8))))
+
+    def test_bilateral_candidate_can_improve_a_passing_isolated_one_sided_ramp(self):
+        with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
+            before,_,_=produce(observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,motion,plan=produce(observe=self._one_sided_fixture,resolution=(3840,2160))
+        old,new=before.decisions[0],after.decisions[0]
+        self.assertTrue(old.eligible)
+        self.assertIn(old.transformed_side,('outgoing','incoming'))
+        self.assertEqual(new.transformed_side,'both')
+        self.assertEqual(old.transformed_geometry_mismatch,new.replaced_one_sided_geometry_mismatch)
+        self.assertLess(new.transformed_geometry_mismatch,old.transformed_geometry_mismatch-.015)
+        self.assertLessEqual(new.transformed_layout_mismatch,old.transformed_layout_mismatch)
+        self.assertEqual(new.validated_output_frame_count,26)
+        self.assertEqual(_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(plan.to_json()))),
+                         ({0,1},{0}))
+
+    def test_failed_bilateral_window_keeps_complete_valid_one_sided_incumbent(self):
+        # The larger face is the untouched side of the initial one-sided crop.
+        # Its missing interior frame must reject the two-sided replacement,
+        # without erasing the already valid curve on the other side.
+        frames=lambda index,time: None if index==0 and abs(time-25/30.)<1e-8 else _frame(index)
+        with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
+            before,_,_=produce(frames=frames,observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,_,_=produce(frames=frames,observe=self._one_sided_fixture,resolution=(3840,2160))
+        self.assertTrue(before.decisions[0].eligible)
+        self.assertEqual(before.decisions,after.decisions)
+        self.assertEqual(before.segments,after.segments)
+
+    def test_bilateral_replacement_receipt_requires_a_measured_strict_improvement(self):
+        alignment,_,_=produce(observe=self._one_sided_fixture,resolution=(3840,2160))
+        decision=alignment.decisions[0]
+        self.assertIsNotNone(decision.replaced_one_sided_geometry_mismatch)
+        for previous in (True, float('nan'), float('inf'), -1., 1.1,
+                         decision.transformed_geometry_mismatch):
+            with self.subTest(previous=previous), self.assertRaises(ValueError):
+                replace(decision,replaced_one_sided_geometry_mismatch=previous)
+        with self.assertRaises(ValueError):
+            replace(decision,transformed_side='incoming')
+        self.assertEqual(decision.to_dict()['replaced_one_sided_geometry_mismatch'],
+                         decision.replaced_one_sided_geometry_mismatch)
+
+    def test_bilateral_competition_cannot_overwrite_a_neighboring_ramp(self):
+        choices=(_choice(0,0,start=0.,end=1.), _choice(1,1,start=1.,end=2.),
+                 _choice(2,0,start=2.,end=3.))
+        with patch('crosscut.boundary_subject_alignment._joint_face_alignment_states',return_value=()):
+            before,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
+        after,_,_=produce(choices=choices,observe=self._one_sided_fixture,resolution=(3840,2160))
+        self.assertEqual(before.eligible_count,2)
+        self.assertEqual(before.segments[1].boundary_indices,(0,1))
+        self.assertEqual(before.decisions,after.decisions)
+        self.assertEqual(before.segments,after.segments)
+
     def test_missing_frame_on_either_side_publishes_neither_transform(self):
         for source,seconds in ((0,25/30.),(1,1.+4/30.)):
             with self.subTest(source=source):
