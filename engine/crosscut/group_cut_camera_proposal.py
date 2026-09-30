@@ -113,7 +113,7 @@ class GroupCutCameraProposal:
 def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_segments,
                                    source_clocks, scene_cut_times, source_index_map=None,
                                    local_focal_attention=False, action_framing_model_path=None,
-                                   preserved_boundary_frames=14):
+                                   preserved_boundary_frames=14, global_action_framing=False):
     """Bind one proposed aligned pair to dense local geometry and its neighbors.
 
     ``clock_timeline`` deliberately is NOT a refreshed visual selection or
@@ -211,6 +211,7 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         preserved_boundary_frames=preserved_boundary_frames,
         local_focal_attention=local_focal_attention,
         action_framing_model_path=action_framing_model_path,
+        global_action_framing=global_action_framing,
         config=BoundarySubjectAlignmentConfig(window_frames=window_frames))
     decision = alignment.decision_for(boundary_index)
     if decision is None or not decision.eligible:

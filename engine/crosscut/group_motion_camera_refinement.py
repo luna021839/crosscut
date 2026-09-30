@@ -266,9 +266,22 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     before_motion_cost=before.ranking_cost,proposed_motion_cost=gesture.ranking_cost,
                     before_output_face_metrics=before_faces,admitted=False)
                 try:
-                    proposal=build_group_cut_camera_proposal(plan=plan,timeline=timeline,boundary_index=boundary,
+                    camera_arguments=dict(plan=plan,timeline=timeline,boundary_index=boundary,
                         shifted_segments=pair,source_clocks=clocks,scene_cut_times=scene_cut_times,
                         source_index_map=mapping,preserved_boundary_frames=4)
+                    try:
+                        proposal=build_group_cut_camera_proposal(**camera_arguments)
+                    except ValueError as error:
+                        reason=str(error).split(': ',1)[-1]
+                        if reason not in {'shot_policy_family_mismatch','exact_subject_would_be_clipped'}:
+                            raise
+                        # One explicit, globally dominant action-camera retry
+                        # inside this candidate's existing bounded slot. Do
+                        # not relabel central attention or lower containment.
+                        row['ordinary_camera_rejection']=reason
+                        proposal=build_group_cut_camera_proposal(**camera_arguments,
+                            global_action_framing=True,action_framing_model_path=model_path)
+                        row['camera_geometry_contract']='global_head_arms_and_retained_opposite_camera'
                     final_native=hard_cut_boundary_sample_clocks(proposal.plan,clocks,boundary_index=boundary)
                     if any((a.source_index,a.native_frame_index,a.output_frame_index)!=(b.source_index,b.native_frame_index,b.output_frame_index)
                            for a,b in zip(native,final_native,strict=True)):

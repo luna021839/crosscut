@@ -4615,11 +4615,12 @@ def _bound_boundary_local_alignment_tracks(
 ) -> tuple[set[int], set[int]]:
     """Identify dense local reports whose tracks are exactly in final pixels.
 
-    This only selects the already-tested local planner's 4% center bound; it
-    cannot grant that bound to decorative or unbound serialized tracks.
+    This selects the tested local/paired/action geometry bounds, never wider
+    authority for decorative, experimental or unbound serialized tracks.
     """
     from .render_plan_serialization import render_plan_from_json
     from .render import quantized_segment_frame_counts
+    from .boundary_subject_alignment import GLOBAL_ACTION_BASIS
 
     alignment = _mapping(motion.get("boundary_subject_alignment")) or {}
     if alignment.get("analysis_basis") not in {
@@ -4627,8 +4628,20 @@ def _bound_boundary_local_alignment_tracks(
         "exact_cut_frame_shot_adaptive_subject_alignment_v3",
         "exact_cut_frame_shot_adaptive_subject_alignment_v4",
         "exact_cut_frame_shot_adaptive_subject_alignment_v5",
+        GLOBAL_ACTION_BASIS,
     }:
         return set(), set()
+    if alignment.get('analysis_basis') == GLOBAL_ACTION_BASIS:
+        action = _mapping(alignment.get('global_action_framing')) or {}
+        if (action.get('contract') != 'global_dominant_face_unique_body_observed_or_pixel_tracked_head_arms_v1'
+                or action.get('central_face_authority') is not False
+                or action.get('minimum_joint_confidence') != .30
+                or action.get('required_arm_joint_count') != 6
+                or action.get('hand_margin_face_heights') != .40
+                or action.get('minimum_head_arm_visible_fraction') != .995
+                or action.get('maximum_action_center_shift') != .10
+                or action.get('validation') != 'every_active_output_frame_including_retained_opposite_camera'):
+            return set(), set()
     try:
         typed = render_plan_from_json(dict(plan))
         counts = quantized_segment_frame_counts(typed.segments, typed.fps)
@@ -4720,7 +4733,8 @@ def _bound_boundary_local_alignment_tracks(
         for boundary_index in indices:
             boundary = decisions.get(boundary_index, {}) if _integer(boundary_index) is not None else {}
             side = boundary.get("transformed_side")
-            paired = side == 'both' and alignment.get('analysis_basis') == 'exact_cut_frame_shot_adaptive_subject_alignment_v5'
+            paired = side == 'both' and alignment.get('analysis_basis') in {
+                'exact_cut_frame_shot_adaptive_subject_alignment_v5',GLOBAL_ACTION_BASIS}
             if paired:
                 side = 'outgoing' if boundary.get('outgoing_segment_index') == index else 'incoming'
             target = boundary.get(f"{side}_segment_index")
@@ -4808,12 +4822,13 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
     face-only. Old, decorative, other-body and unbound tracks keep the legacy cap.
     """
     from .render_plan_serialization import render_plan_from_json
+    from .boundary_subject_alignment import GLOBAL_ACTION_BASIS
     alignment = _mapping(motion.get('boundary_subject_alignment')) or {}
     basis = alignment.get('analysis_basis')
     contexts = _bound_context_cameras(motion, plan)
     subject_caps = {'face': 2.0}
     if basis in {'exact_cut_frame_shot_adaptive_subject_alignment_v4',
-                 'exact_cut_frame_shot_adaptive_subject_alignment_v5'}:
+                 'exact_cut_frame_shot_adaptive_subject_alignment_v5',GLOBAL_ACTION_BASIS}:
         subject_caps['formation'] = 1.33
     elif basis != 'exact_cut_frame_shot_adaptive_subject_alignment_v3' and not contexts:
         return {}
@@ -4831,7 +4846,7 @@ def _native_local_alignment_zoom_budgets(motion, plan, bound_segments, config, *
         if index not in contexts and basis not in {
                 'exact_cut_frame_shot_adaptive_subject_alignment_v3',
                 'exact_cut_frame_shot_adaptive_subject_alignment_v4',
-                'exact_cut_frame_shot_adaptive_subject_alignment_v5'}:
+                'exact_cut_frame_shot_adaptive_subject_alignment_v5',GLOBAL_ACTION_BASIS}:
             # One new context receipt cannot upgrade unrelated legacy v2
             # cameras to native-funded v3+ zoom authority.
             continue
@@ -4925,6 +4940,13 @@ def _transform_metrics(
         for segment in (item.get('outgoing_segment_index'), item.get('incoming_segment_index'))
         if segment in local_alignment_segments
     }
+    from .boundary_subject_alignment import GLOBAL_ACTION_BASIS
+    action_alignment_segments = ({segment for raw in (_sequence(alignment_report.get('decisions')) or [])
+        if (item := _mapping(raw)) is not None and item.get('boundary_index') in local_alignment_boundaries
+        for side in ('outgoing','incoming')
+        if item.get(side+'_shot_policy') == 'action_medium_face'
+        and (segment := item.get(side+'_segment_index')) in local_alignment_segments}
+        if alignment_report.get('analysis_basis') == GLOBAL_ACTION_BASIS else set())
     native_zoom_budgets = _native_local_alignment_zoom_budgets(
         motion, plan, local_alignment_segments, config, runner=runner)
     frame_visible_contract = motion.get("event_count_contract") == "frame_visible_active_targets_v1"
@@ -5119,7 +5141,7 @@ def _transform_metrics(
                 'maximum_zoom', config.maximum_editorial_zoom) + 1e-9
             or max_shift > (
                 max(config.maximum_editorial_center_shift,
-                    0.10 if segment_index in paired_alignment_segments else 0.04)
+                    0.10 if segment_index in paired_alignment_segments|action_alignment_segments else 0.04)
                 if segment_index in local_alignment_segments
                 else config.maximum_editorial_center_shift
             ) + 1e-9

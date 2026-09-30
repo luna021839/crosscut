@@ -55,6 +55,7 @@ from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
 ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v5"
+GLOBAL_ACTION_BASIS = "exact_cut_frame_global_head_arms_subject_alignment_v1"
 # Deliberately not accepted by final-QA's production binding allowlist. Local
 # attention must not inherit v5's global-primary authority merely by looking
 # like a face. This opt-in remains a measured experiment until independently
@@ -589,6 +590,7 @@ class BoundarySubjectAlignmentPlan:
     settle_policy: str = "boundary_local"
     reframe_closeups: bool = False
     follow_face_path: bool = False
+    global_action_framing: bool = False
 
     def __post_init__(self) -> None:
         if (self.settle_policy not in {'boundary_local','shot_continuous'}
@@ -597,6 +599,10 @@ class BoundarySubjectAlignmentPlan:
         if (self.settle_policy == 'shot_continuous' and self.analysis_basis != SHOT_CAMERA_EXPERIMENT_BASIS
                 or self.settle_policy != 'shot_continuous' and (self.reframe_closeups or self.follow_face_path)):
             raise ValueError('shot-continuous camera cannot inherit ordinary production authority')
+        if (type(self.global_action_framing) is not bool
+                or self.global_action_framing != (self.analysis_basis == GLOBAL_ACTION_BASIS)
+                or self.global_action_framing and self.settle_policy != 'boundary_local'):
+            raise ValueError('global head/arms camera requires its own explicit boundary-local contract')
 
     @property
     def eligible_count(self) -> int:
@@ -660,6 +666,19 @@ class BoundarySubjectAlignmentPlan:
         return {
             "analysis_basis": self.analysis_basis,
             "settle_policy": self.settle_policy,
+            **({"global_action_framing": {
+                "contract": "global_dominant_face_unique_body_observed_or_pixel_tracked_head_arms_v1",
+                "central_face_authority": False,
+                "minimum_joint_confidence": .30,
+                "required_arm_joint_count": 6,
+                "hand_margin_face_heights": .40,
+                "minimum_head_arm_visible_fraction": .995,
+                "maximum_action_center_shift": .10,
+                "validation": "every_active_output_frame_including_retained_opposite_camera",
+                "cross_camera_identity_proven": False,
+                "gesture_continuity_certified": False,
+                "quality_approved": False,
+            }} if self.global_action_framing else {}),
             **({"shot_continuous_experiment": {
                 "camera_curve": "entry_to_exit_over_complete_visible_segment_without_forced_neutral_middle",
                 "validation": "all_transformed_output_frames_and_all_native_cuts_in_segment",
@@ -1987,6 +2006,7 @@ def build_boundary_subject_alignment_plan(
     preserved_boundary_frames: int = 14,
     local_focal_attention: bool = False,
     action_framing_model_path: Path | None = None,
+    global_action_framing: bool = False,
     config: BoundarySubjectAlignmentConfig | None = None,
 ) -> BoundarySubjectAlignmentPlan:
     """Build exact-cut local tracks and validate every transformed frame.
@@ -1997,9 +2017,14 @@ def build_boundary_subject_alignment_plan(
 
     if type(local_focal_attention) is not bool:
         raise ValueError('local focal attention must be explicitly boolean')
-    if action_framing_model_path is not None and not local_focal_attention:
+    if (type(global_action_framing) is not bool or global_action_framing and
+            (local_focal_attention or action_framing_model_path is None or observation_provider is not None)):
+        raise ValueError('global action framing requires its own model and unmodified global observation provider')
+    if action_framing_model_path is not None and not (local_focal_attention or global_action_framing):
         raise ValueError('action framing requires the separate local-focal experiment')
     settings = config or BoundarySubjectAlignmentConfig()
+    if global_action_framing and settings.minimum_face_visible_fraction < .995:
+        raise ValueError('global action framing cannot weaken head/arms containment')
     if settings.settle_policy == 'shot_continuous' and (
             preserved_editorial_tracks is not None or action_framing_model_path is not None or local_focal_attention):
         raise ValueError('shot-continuous experiment cannot inherit local preservation or focal-action authority')
@@ -2070,8 +2095,11 @@ def build_boundary_subject_alignment_plan(
         frames = frame_provider
     action_analyzer = (BodyPose2DAnalyzer(action_framing_model_path)
         if action_framing_model_path is not None and observation_provider is None else None)
+    if global_action_framing:
+        from .group_action_observation import observe_global_head_arms
     observations = observation_provider or (
-        (lambda frame: _action_observation_provider(frame,action_analyzer)) if action_analyzer is not None
+        (lambda frame: observe_global_head_arms(frame,action_analyzer)) if global_action_framing
+        else (lambda frame: _action_observation_provider(frame,action_analyzer)) if action_analyzer is not None
         else _local_focal_observation_provider if local_focal_attention else _default_observation_provider)
     if source_resolutions is None:
         resolutions = tuple(
@@ -2185,7 +2213,9 @@ def build_boundary_subject_alignment_plan(
             return None
         try:
             result = observations(canonical)
-            if result is not None and result.selected_focal_subject is not None and not local_focal_attention:
+            if (result is not None and result.selected_focal_subject is not None and not local_focal_attention
+                    and not (global_action_framing and result.face_is_unambiguous_dominant
+                        and result.selected_focal_subject.basis == GLOBAL_FOCAL_BASIS)):
                 raise ValueError('local focal evidence requires the separate experimental contract')
             if result is not None and result.action_pose is not None and action_framing_model_path is None:
                 raise ValueError('action pose cannot bypass its explicit experimental opt-in')
@@ -2628,9 +2658,10 @@ def build_boundary_subject_alignment_plan(
                 target_box=target_box,
                 zoom=zoom,
                 roll_degrees=roll,
-                maximum_center_shift=_subject_center_shift_cap(
-                    subject_kind, settings
-                ),
+                maximum_center_shift=(settings.maximum_paired_face_center_shift
+                    if global_action_framing and subject_kind == 'face' and
+                        (outgoing_policy if transformed_side == 'outgoing' else incoming_policy) == 'action_medium_face'
+                    else _subject_center_shift_cap(subject_kind, settings)),
                 settings=settings,
             )
             target_states = [state] if state is not None else []
@@ -3061,6 +3092,45 @@ def build_boundary_subject_alignment_plan(
         # neighbor. The neighbor's complete active window remains immutable;
         # failed candidates retain the complete incumbent, and publication is
         # atomic only after BOTH visible windows pass the same dense gates.
+        # A retimed short shot can retain a nonneutral opposite tail even when
+        # this cut changes only its neighbor. Validate that ENTIRE retained
+        # camera against the new frame domain, then attach BOTH sides to the
+        # new explicit action receipt. An unchanged cut endpoint must remain
+        # the originally solved neutral state; no old tail is approved merely
+        # because its numeric keyframes were copied.
+        if global_action_framing and preserved_editorial_tracks is not None:
+            for boundary_index, decision in tuple(candidate_by_boundary.items()):
+                if not decision.eligible or decision.transformed_side not in {'outgoing','incoming'}:
+                    continue
+                own = boundary_index if decision.transformed_side == 'outgoing' else boundary_index+1
+                other = boundary_index+1 if own == boundary_index else boundary_index
+                paired = replace(decision, transformed_side='both')
+                try:
+                    retained = compose_preserved_track(other, None, {boundary_index: paired})
+                except ValueError:
+                    failure = 'retained_opposite_camera_endpoint_or_renderer_rejection'
+                else:
+                    if retained is None or all(_TransformState(k.zoom,k.center_x,k.center_y,k.roll_degrees).neutral
+                            for k in retained.keyframes):
+                        continue
+                    failure, validated, tracked = validate_track(other, retained, {boundary_index: paired})
+                if failure is not None:
+                    candidate_by_boundary[boundary_index] = replace(decision, eligible=False,
+                        rejection_reason=failure, validated_output_frame_count=0,
+                        optical_flow_containment_frame_count=0)
+                    segment_tracks.pop(choices[own].segment_index, None)
+                    segment_boundaries.pop(choices[own].segment_index, None)
+                    continue
+                own_count = decision.validated_output_frame_count
+                own_flow = decision.optical_flow_containment_frame_count
+                segment_tracks[choices[other].segment_index] = retained
+                segment_boundaries[choices[other].segment_index] = (boundary_index,)
+                candidate_by_boundary[boundary_index] = replace(paired,
+                    validated_output_frame_count=own_count+validated,
+                    optical_flow_containment_frame_count=own_flow+tracked,
+                    outgoing_validated_output_frame_count=own_count if own == boundary_index else validated,
+                    incoming_validated_output_frame_count=validated if own == boundary_index else own_count)
+
         initial_decisions = {item.boundary_index: item for item in decisions}
         for boundary_index, options in sorted(joint_options.items()):
             current = candidate_by_boundary.get(boundary_index, initial_decisions[boundary_index])
@@ -3177,7 +3247,8 @@ def build_boundary_subject_alignment_plan(
             final_segments,
             tuple(headroom_items),
             settings.window_frames,
-            analysis_basis=(SHOT_CAMERA_EXPERIMENT_BASIS if settings.settle_policy == 'shot_continuous'
+            analysis_basis=(GLOBAL_ACTION_BASIS if global_action_framing
+                else SHOT_CAMERA_EXPERIMENT_BASIS if settings.settle_policy == 'shot_continuous'
                 else ACTION_EXPERIMENT_BASIS if action_framing_model_path is not None
                 else FOCAL_EXPERIMENT_BASIS if local_focal_attention else ANALYSIS_BASIS),
             sample_clock_basis=clock_basis,
@@ -3185,6 +3256,7 @@ def build_boundary_subject_alignment_plan(
             settle_policy=settings.settle_policy,
             reframe_closeups=settings.reframe_closeups,
             follow_face_path=settings.follow_face_path,
+            global_action_framing=global_action_framing,
         )
     finally:
         if capture is not None:
@@ -3193,6 +3265,7 @@ def build_boundary_subject_alignment_plan(
 
 __all__ = [
     "ANALYSIS_BASIS",
+    "GLOBAL_ACTION_BASIS",
     "FOCAL_EXPERIMENT_BASIS",
     "ACTION_EXPERIMENT_BASIS",
     "SHOT_CAMERA_EXPERIMENT_BASIS",

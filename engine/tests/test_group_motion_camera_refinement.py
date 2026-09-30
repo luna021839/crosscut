@@ -144,6 +144,44 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertEqual(result.proposals,())
         self.assertEqual(result.plan,plan)
 
+    def test_action_recovery_is_one_explicit_retry_inside_existing_camera_slots(self):
+        timeline=VisualTimelinePlan(tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),
+            entry_shot_scale=.5,exit_shot_scale=.5) for i in range(2)),1.)
+        plan=RenderPlan((Path('0.mp4'),Path('1.mp4')),
+            (RenderSegment(0,0.,2.,0.),RenderSegment(1,2.,2.,2.)),0,'16:9',Path('unused.mp4'),
+            fps=30.,transitions=(RenderTransition(),))
+        for reason,recoverable in (('shot_policy_family_mismatch',True),
+                ('exact_subject_would_be_clipped',True),('broadcaster_native_internal_cut',False)):
+            calls=[];measurements=0
+            def measure(*_args,**_kwargs):
+                nonlocal measurements
+                measurements+=1
+                return self.gesture(pose=.6 if measurements==1 else .1)
+            def camera(**kwargs):
+                calls.append(kwargs)
+                raise ValueError('camera proposal lacks dense local subject alignment: '+
+                    ('per_frame_subject_containment_failed' if kwargs.get('global_action_framing') else reason))
+            provider=SimpleNamespace(compare_motion=measure,close=lambda:None,
+                capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8)))
+            with self.subTest(reason=reason), \
+                    patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',return_value=
+                        VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
+                    patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
+                    patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
+                        SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
+                    patch('crosscut.group_motion_camera_refinement._default_geometry_provider',return_value=
+                        SimpleNamespace(face_bbox_xywh=(.4,.25,.1,.15))), \
+                    patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=camera):
+                result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
+                    source_timewarps=(None,None),scene_cut_times=((),()),model_path=Path('exact-model'))
+            self.assertEqual(len(calls),4 if recoverable else 2)
+            self.assertEqual(sum(bool(call.get('global_action_framing')) for call in calls),2 if recoverable else 0)
+            self.assertEqual(result.proposals,())
+            for call in calls:
+                if call.get('global_action_framing'):
+                    self.assertEqual(call['action_framing_model_path'],Path('exact-model'))
+                    self.assertNotIn('local_focal_attention',call)
+
     def test_shortlist_uses_cut_endpoint_sizes_not_interior_labels(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
             shot_type=ShotType.CLOSE_UP,shot_scale=.9,
@@ -294,6 +332,17 @@ class MotionCameraBundleTests(unittest.TestCase):
                 analysis_basis='exact_cut_frame_shot_adaptive_subject_alignment_v4')))
         with self.assertRaisesRegex(ValueError,'authority'):
             self.run_bundle(old_basis,request,result)
+
+    def test_explicit_global_action_receipt_keeps_its_own_mixed_plan_header(self):
+        from crosscut.boundary_subject_alignment import GLOBAL_ACTION_BASIS
+        bundle,request,result=self.fixture();proposal=result.proposals[0]
+        action=replace(proposal.alignment,analysis_basis=GLOBAL_ACTION_BASIS,global_action_framing=True)
+        changed=self.run_bundle(bundle,request,replace(result,proposals=(replace(proposal,alignment=action),)))
+        alignment=changed.editorial_motion_plan.boundary_subject_alignment_plan
+        self.assertEqual(alignment.analysis_basis,GLOBAL_ACTION_BASIS)
+        self.assertTrue(alignment.global_action_framing)
+        self.assertFalse(alignment.to_dict()['global_action_framing']['central_face_authority'])
+        self.assertFalse(changed.candidate_lineage[-1]['quality_approved'])
 
     def test_unrelated_retime_keeps_independently_bound_context_in_real_bundle(self):
         import engine.tests.test_shot_context_camera as cameras
