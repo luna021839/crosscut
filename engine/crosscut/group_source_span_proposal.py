@@ -16,6 +16,7 @@ from .render import RenderPlan, RenderTransition, aligned_render_segment, segmen
 from .render_boundary_clock import native_frame_clocks_for_output
 from .render_frame_schedule import VerifiedRenderFrameClock
 from .visual_score import VisualTimelinePlan
+from .group_source_domain import GroupSourceDomain, bind_group_source_domain
 
 
 @dataclass(frozen=True)
@@ -29,15 +30,24 @@ class GroupSourceSpanProposal:
     preserved_neighbor_boundaries: tuple[int, ...]
     maximum_shift_frames: int = 8
     last_segment_index: int | None = None
+    source_domain: GroupSourceDomain | None = None
 
     @property
     def end_segment_index(self):
         return self.segment_index if self.last_segment_index is None else self.last_segment_index
 
     def to_dict(self):
-        return dict(contract=('coupled_group_source_run_clock_proposal_v2'
-            if self.last_segment_index is not None else 'coupled_group_source_span_clock_proposal_v1'),
+        eligible=bool(self.source_domain is not None and not self.source_domain.is_identity)
+        contract=('coupled_group_eligible_source_run_clock_proposal_v3' if self.last_segment_index is not None
+            else 'coupled_group_eligible_source_span_clock_proposal_v3') if eligible else (
+            'coupled_group_source_run_clock_proposal_v2' if self.last_segment_index is not None
+            else 'coupled_group_source_span_clock_proposal_v1')
+        return dict(contract=contract,
             segment_index=self.segment_index,source_index=self.source_index,
+            source_index_domain='eligible_local' if eligible else 'request_identity',
+            request_source_index=self.source_domain.request_index(self.source_index)
+                if self.source_domain is not None else self.source_index,
+            eligible_request_indices=list(self.source_domain.eligible_indices) if self.source_domain is not None else None,
             last_segment_index=self.end_segment_index,
             entry_offset_frames=self.entry_offset_frames,exit_offset_frames=self.exit_offset_frames,
             maximum_shift_frames=self.maximum_shift_frames,
@@ -48,13 +58,15 @@ class GroupSourceSpanProposal:
             transition_evidence_refreshed=False,
             source_reference_alignment_authority='caller_supplied',
             duration_floor_basis='visible_source_run_not_internal_beat_cells',
+            incumbent_native_cut_policy='replacement_run_cut_free_and_actual_native_cut_identities_and_output_ticks_unchanged',
             production_selected=False,quality_approved=False)
 
 
 def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
-        entry_offset_frames,exit_offset_frames,audio_offsets,source_timewarps,
-        scene_cut_times,source_clocks,maximum_shift_frames=8,last_segment_index=None):
-    """Identity source domain; conserve outer clocks and every untouched pixel input.
+        entry_offset_frames,exit_offset_frames,audio_offsets=None,source_timewarps=None,
+        scene_cut_times=None,source_clocks=None,source_domain=None,
+        maximum_shift_frames=8,last_segment_index=None):
+    """Conserve outer clocks and every untouched pixel input in a bound source domain.
 
     Do not copy the previous source's crop, zoom, grade or face observations as
     evidence for the replacement. Both new boundaries require fresh complete
@@ -65,17 +77,21 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
     """
     if not isinstance(plan,RenderPlan) or not isinstance(timeline,VisualTimelinePlan):
         raise TypeError('source span proposal needs a complete plan and timeline')
+    domain=bind_group_source_domain(plan=plan,source_domain=source_domain,audio_offsets=audio_offsets,
+        source_timewarps=source_timewarps,scene_cut_times=scene_cut_times,source_clocks=source_clocks)
+    audio_offsets,source_timewarps,scene_cut_times=(domain.audio_offsets,domain.source_timewarps,domain.scene_cut_times)
+    source_clocks=domain.clocks_by_request
     if (type(maximum_shift_frames) is not int or not 1 <= maximum_shift_frames <= math.floor(plan.fps)):
         raise ValueError('source span search radius must be an explicit positive budget of at most one second')
     if (type(segment_index) is not int or not 1 <= segment_index < len(plan.segments)-1
-            or type(source_index) is not int or not 0 <= source_index < len(plan.sources)
+            or type(source_index) is not int or not 0 <= source_index < len(domain.eligible_indices)
             or any(type(value) is not int or abs(value)>maximum_shift_frames
                    for value in (entry_offset_frames,exit_offset_frames))):
         raise ValueError('source span proposal needs one interior shot and bounded whole-frame shifts')
     last=segment_index if last_segment_index is None else last_segment_index
     if type(last) is not int or not segment_index <= last < len(plan.segments)-1:
         raise ValueError('source run proposal needs an explicit interior final cell')
-    if (not len(audio_offsets)==len(source_timewarps)==len(scene_cut_times)==len(plan.sources)
+    if (not len(audio_offsets)==len(source_timewarps)==len(scene_cut_times)==len(domain.eligible_indices)
             or len(timeline.choices)!=len(plan.segments)
             or plan.aspect_ratio.value!='16:9'
             or any(transition.kind.uses_overlap for transition in plan.transitions)
@@ -84,7 +100,7 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
                    for cuts in scene_cut_times for value in cuts)):
         raise ValueError('source span proposal source/clock/transition domain differs')
     for index,(choice,segment) in enumerate(zip(timeline.choices,plan.segments,strict=True)):
-        if (choice.segment_index!=index or choice.source_index!=segment.source_index or any(abs(a-b)>1e-6 for a,b in (
+        if (choice.segment_index!=index or domain.request_index(choice.source_index)!=segment.source_index or any(abs(a-b)>1e-6 for a,b in (
                 (choice.canonical_master_start,plan.master_audio_start+segment.master_start),
                 (choice.duration_seconds,segment.duration),(choice.source_local_start,segment.source_start),
                 (choice.source_local_end,segment.source_end)))):
@@ -96,12 +112,20 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
                 or run[0].source_index in (plan.segments[i-1].source_index,plan.segments[last+1].source_index)
                 or sum(segment_frame_counts(plan)[i:last+1])>300):
             raise ValueError('source run proposal requires one complete bounded render-source run')
-    if source_index in {plan.segments[j].source_index for j in range(i-1,last+2)}:
+    request_source=domain.request_index(source_index)
+    if request_source in {plan.segments[j].source_index for j in range(i-1,last+2)}:
         raise ValueError('source span proposal needs a distinct replacement and cross-source outer seams')
     if any(segment.crop is not None or segment.outgoing_overlap_transform is not None
             or segment.boundary_look_track is not None for segment in plan.segments[i-1:last+2]):
         raise ValueError('source span proposal must precede fixed crops, overlap and look finalization')
     old_left,old_middle,old_right=plan.segments[i-1],plan.segments[i],plan.segments[last+1]
+    # A continuous render-source clock can contain real broadcaster cuts.
+    # Do not erase those cuts by replacing the whole run with a cut-free one.
+    # A future joint selector must split at the observed actual cut and bind an
+    # explicit replacement event, rather than treating beat-cell seams as cuts.
+    if any(old_middle.source_start < cut < plan.segments[last].source_end
+            for cut in domain.cuts_for_request(old_middle.source_index)):
+        raise ValueError('source span proposal cannot erase an incumbent native cut')
     entry=old_middle.master_start+entry_offset_frames/plan.fps
     exit=old_right.master_start+exit_offset_frames/plan.fps
     times=(old_left.master_start,entry,exit,old_right.master_start+old_right.duration)
@@ -110,7 +134,7 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
     segments=list(plan.segments)
     choices=list(timeline.choices)
     intervals=[(i-1,old_left.source_index,times[0],entry)]
-    intervals.extend((j,source_index,entry if j==i else plan.segments[j].master_start,
+    intervals.extend((j,request_source,entry if j==i else plan.segments[j].master_start,
         exit if j==last else plan.segments[j].master_start+plan.segments[j].duration)
         for j in range(i,last+1))
     intervals.append((last+1,old_right.source_index,exit,times[-1]))
@@ -123,10 +147,18 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
         raise ValueError('source span proposal collapsed an internal beat cell')
     for j,source,start,end in intervals:
         old=segments[j]
+        eligible_source=domain.eligible_index(source)
+        cuts=domain.cuts_for_request(source)
         new=aligned_render_segment(source_index=source,
             reference_start=plan.master_audio_start+start,common_master_start=plan.master_audio_start,
-            source_offset=audio_offsets[source],duration=end-start,timewarp=source_timewarps[source])
+            source_offset=audio_offsets[eligible_source],duration=end-start,timewarp=source_timewarps[eligible_source])
         if j not in range(i,last+1):
+            old_cuts=tuple(cut for cut in cuts
+                if old.source_start < cut < old.source_end)
+            new_cuts=tuple(cut for cut in cuts
+                if new.source_start < cut < new.source_end)
+            if old_cuts != new_cuts:
+                raise ValueError('source span proposal changes a retained neighbor native cut inventory')
             new=replace(new,pan_crop=retime_base_pan(old.pan_crop,
                 relative_shift=start-old.master_start,duration=new.duration),look_adjustment=old.look_adjustment)
         segments[j]=new
@@ -135,22 +167,20 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
             raise ValueError('replacement source has no verified frame clock')
         native_tick=1./float(clock.frame_rate)
         handle=3/plan.fps*new.source_playback_rate
-        choices[j]=replace(choices[j],source_index=source,
+        choices[j]=replace(choices[j],source_index=eligible_source,
             canonical_master_start=plan.master_audio_start+start,
             canonical_master_end=plan.master_audio_start+end,
             source_local_start=new.source_start,source_local_end=new.source_end,
             internal_scene_cut_master_seconds=tuple(plan.master_audio_start+start+
-                (cut-new.source_start)/new.source_playback_rate for cut in scene_cut_times[source]
+                (cut-new.source_start)/new.source_playback_rate for cut in cuts
                 if new.source_start<cut<new.source_end),
-            entry_scene_cut_near=any(new.source_start+native_tick < cut <= new.source_start+handle
-                for cut in scene_cut_times[source]),
-            exit_scene_cut_near=any(new.source_end-handle <= cut < new.source_end-native_tick
-                for cut in scene_cut_times[source]))
+            entry_scene_cut_near=any(new.source_start+native_tick < cut <= new.source_start+handle for cut in cuts),
+            exit_scene_cut_near=any(new.source_end-handle <= cut < new.source_end-native_tick for cut in cuts))
     # The desired replacement must really be one continuous native shot.
     replacement_start,replacement_end=segments[i].source_start,segments[last].source_end
     # Inspect the UNION too: a native cut exactly at an artificial cell seam
     # must not disappear from every open per-cell internal-cut interval.
-    if any(replacement_start < cut < replacement_end for cut in scene_cut_times[source_index]):
+    if any(replacement_start < cut < replacement_end for cut in domain.scene_cut_times[source_index]):
         raise ValueError('replacement interval still crosses a broadcaster camera cut')
     # A same-source tier-D hold cannot authorize a new cross-source cut. Even
     # an old tier-C/A/B score refers to different pixels and source identities.
@@ -172,16 +202,18 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
             relative_shift=new.master_start-old.master_start,frame_count=counts[j],fps=plan.fps,outgoing=outgoing)
             if old.editorial_transform is not None else None))
     proposed=replace(proposed,segments=tuple(segments))
+    from .group_actual_shots import assert_native_cut_events_preserved
+    assert_native_cut_events_preserved(plan,proposed,domain)
     preserved=assert_preserved_output_boundaries(plan,proposed,source_clocks,(i-2,last+1),
         allow_same_source_seams=True,complete_interval_bounds=(i-1,last+1),
         reset_transition_boundaries=reset_boundaries)
     return GroupSourceSpanProposal(proposed,replace(timeline,choices=tuple(choices),
         analysis_basis='UNREFRESHED_source_span_clock_proposal_not_a_selected_timeline'),i,source_index,
-        entry_offset_frames,exit_offset_frames,preserved,maximum_shift_frames,last_segment_index)
+        entry_offset_frames,exit_offset_frames,preserved,maximum_shift_frames,last_segment_index,domain)
 
 
-def refresh_group_source_span_observations(*,proposal,audio_offsets,source_timewarps,sync_scores,
-        scene_cut_times,feature_cache_directory=None,feature_derived_cache_directory=None,
+def refresh_group_source_span_observations(*,proposal,audio_offsets=None,source_timewarps=None,sync_scores,
+        scene_cut_times=None,feature_cache_directory=None,feature_derived_cache_directory=None,
         require_persistent_feature_cache=False):
     """Fresh local observations for camera audition, NOT source selection proof.
 
@@ -198,13 +230,18 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets,source_timew
     from .timeline import TimelineChoice,TimelineResult,TimelineMode
     from .timeline_review import review_timeline
     plan=proposal.plan;first=proposal.segment_index-1;last=proposal.end_segment_index+1
+    domain=bind_group_source_domain(plan=plan,source_domain=proposal.source_domain,
+        audio_offsets=audio_offsets,source_timewarps=source_timewarps,scene_cut_times=scene_cut_times,
+        source_clocks=None)
+    audio_offsets,source_timewarps,scene_cut_times=(domain.audio_offsets,domain.source_timewarps,domain.scene_cut_times)
     chosen=proposal.clock_timeline.choices[first:last+1]
     origin=plan.segments[first].master_start
-    seed=build_visual_timeline_optimizer_seed(sources=plan.sources,
+    seed=build_visual_timeline_optimizer_seed(sources=domain.eligible_sources,
         canonical_spans=tuple((c.canonical_master_start,c.canonical_master_end) for c in chosen),
         audio_offsets=audio_offsets,source_timewarps=source_timewarps,sync_scores=sync_scores,
         scene_cut_times=scene_cut_times,candidate_source_indices_by_segment=tuple((c.source_index,) for c in chosen),
-        group_incumbent_render_segments=tuple(replace(s,master_start=s.master_start-origin)
+        group_incumbent_render_segments=tuple(replace(s,source_index=domain.eligible_index(s.source_index),
+            master_start=s.master_start-origin)
             for s in plan.segments[first:last+1]),feature_cache_directory=feature_cache_directory,
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache)
@@ -213,7 +250,7 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets,source_timew
         raise ValueError('local source observation refresh expanded its fixed source domain')
     fixed=TimelineResult(TimelineMode.GENERAL,None,tuple(TimelineChoice(cell[0],0.,0.,0.,False)
         for cell in cells),0.)
-    review=review_timeline(fixed,available_source_count=len(plan.sources))
+    review=review_timeline(fixed,available_source_count=len(domain.eligible_indices))
     record=VisualTimelineCandidateRecord(0,'unapproved_fixed_source_clock_observations',fixed,review,0,True)
     local=VisualTimelineCandidateSet(candidates=(record,),selected_candidate_index=0,
         sources=seed.sources,audio_offsets=seed.audio_offsets,source_timewarps=seed.source_timewarps,
@@ -226,7 +263,7 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets,source_timew
     choices=list(proposal.clock_timeline.choices)
     for offset,choice in enumerate(local.choices):
         index=first+offset
-        if (choice.source_index!=plan.segments[index].source_index or any(abs(a-b)>1e-6 for a,b in (
+        if (domain.request_index(choice.source_index)!=plan.segments[index].source_index or any(abs(a-b)>1e-6 for a,b in (
                 (choice.source_local_start,plan.segments[index].source_start),
                 (choice.source_local_end,plan.segments[index].source_end)))):
             raise ValueError('fresh source observations changed the proposed source clock')

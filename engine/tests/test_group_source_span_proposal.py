@@ -200,11 +200,49 @@ class SourceSpanProposalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'two output frames'):
             build_group_source_span_proposal(**self.short_cell_run_fixture((.02,.4,1.58)))
 
+    def test_same_point_eight_second_shot_has_split_cell_invariant_verdict(self):
+        proposals=[]
+        for durations in ((.8,),(.4,.4)):
+            args=self.short_cell_run_fixture(durations)
+            proposal=build_group_source_span_proposal(**args);proposals.append(proposal)
+            self.assertAlmostEqual(sum(s.duration for s in proposal.plan.segments[
+                proposal.segment_index:proposal.end_segment_index+1]),.8)
+            self.assertFalse(proposal.to_dict()['production_selected'])
+            args['scene_cut_times']=((),(),(4.4,),(),(),())
+            with self.assertRaisesRegex(ValueError,'incumbent.*native cut'):
+                build_group_source_span_proposal(**args)
+        self.assertEqual(proposals[0].plan.output_frame_count,proposals[1].plan.output_frame_count)
+
     def test_broadcaster_cut_at_artificial_cell_seam_cannot_disappear(self):
         args=self.run_fixture()
         args['scene_cut_times']=((),(),(),(),(),(4.9,))
         with self.assertRaisesRegex(ValueError,'broadcaster'):
             build_group_source_span_proposal(**args)
+
+    def test_existing_native_cut_cannot_be_erased_by_a_cut_free_replacement(self):
+        for cut in (4.9,5.2):
+            args=self.run_fixture()
+            args['scene_cut_times']=((),(),(cut,),(),(),())
+            with self.subTest(cut=cut),self.assertRaisesRegex(ValueError,'incumbent.*native cut'):
+                build_group_source_span_proposal(**args)
+
+    def test_single_cell_existing_native_cut_is_also_a_real_cut(self):
+        args=self.fixture();args['scene_cut_times']=((),(),(5.,),(),(),())
+        with self.assertRaisesRegex(ValueError,'incumbent.*native cut'):
+            build_group_source_span_proposal(**args)
+
+    def test_retimed_neighbors_cannot_lose_or_gain_native_cuts(self):
+        for source,cut in ((1,3.96),(3,5.95)):
+            args=self.fixture();cuts=list(args['scene_cut_times']);cuts[source]=(cut,)
+            args['scene_cut_times']=tuple(cuts)
+            with self.subTest(source=source),self.assertRaisesRegex(ValueError,'neighbor.*native cut'):
+                build_group_source_span_proposal(**args)
+
+    def test_native_cuts_outside_the_replaced_run_remain_allowed(self):
+        args=self.run_fixture();args['scene_cut_times']=((.5,),(2.5,),(4.,6.),(7.,),(9.,),())
+        result=build_group_source_span_proposal(**args)
+        self.assertEqual(result.plan.output_frame_count,args['plan'].output_frame_count)
+        self.assertEqual(result.preserved_neighbor_boundaries,(0,4))
 
     def test_fragment_discontinuous_clock_and_unbounded_run_rejected(self):
         args=self.run_fixture()
