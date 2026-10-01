@@ -13,6 +13,23 @@ from crosscut.timewarp import TimeWarpMap,TimeWarpConfig,TimeWarpControlPoint,Ti
 
 
 class JointStateFactoryTests(unittest.TestCase):
+    def test_joint_continuous_run_does_not_require_invalid_solo_tier_d_transition(self):
+        plan,domain,_ = self.fixture()
+        plan = replace(plan,segments=(plan.segments[0], plan.segments[1],
+            replace(plan.segments[2],source_index=plan.segments[1].source_index), plan.segments[3]),
+            transitions=(RenderTransition(),RenderTransition(tier='D',reason='same_native_run'),RenderTransition()))
+        states = tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=slot,
+            first_output_frame=slot*30,end_output_frame=(slot+1)*30,role=GroupOutputRole.FOCAL_HEAD_ARMS)
+            for slot in range(4))
+        # Neither first solo edit is a valid full old plan: its old tier-D
+        # seam refers to a source that is also being changed in this transaction.
+        b = candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],eligible_source_index=2)
+        c = candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[2],eligible_source_index=2)
+        proposed,changed = assemble_joint_group_states(plan=plan,domain=domain,path=(states[0],b,c,states[3]))
+        self.assertEqual(changed,(1,2))
+        self.assertEqual(tuple(s.source_index for s in proposed.segments),(0,3,3,5))
+        self.assertEqual(proposed.output_frame_count,plan.output_frame_count)
+
     def fixture(self,fps=30.,native_fps=Fraction(30)):
         sources=tuple(Path(f'unopened-{i}.mp4') for i in range(6))
         clock=VerifiedRenderFrameClock(native_fps,10000,'a'*64)

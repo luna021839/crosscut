@@ -2223,15 +2223,40 @@ def _can_share_source_clock(
 
     if candidate_last_index <= first_index:
         return True
-    segments = plan.segments[first_index : candidate_last_index + 1]
+    return _segments_share_source_clock(
+        plan.segments[first_index : candidate_last_index + 1],
+        plan.transitions[first_index:candidate_last_index],
+        fps=plan.fps,
+    )
+
+
+def _segments_share_source_clock(
+    segments: tuple[RenderSegment, ...],
+    transitions: tuple[RenderTransition, ...],
+    *,
+    fps: float,
+) -> bool:
+    """Check a numeric run without constructing a partially replaced plan.
+
+    Joint source proposals must check their own clock before BOTH neighboring
+    replacements are assembled. Old transition receipts outside this run
+    cannot authorize or reject that intermediate numeric hypothesis. Full
+    renderer-plan validation still belongs to the assembled transaction.
+    """
+    if (
+        not segments
+        or len(transitions) != len(segments) - 1
+        or not math.isfinite(fps)
+        or fps <= 0
+    ):
+        return False
     first = segments[0]
     for offset, segment in enumerate(segments):
         if segment.source_index != first.source_index:
             return False
         if offset == 0:
             continue
-        boundary_index = first_index + offset - 1
-        transition = plan.transitions[boundary_index]
+        transition = transitions[offset - 1]
         previous = segments[offset - 1]
         if (
             transition.kind is not TransitionKind.HARD_CUT
@@ -2244,7 +2269,7 @@ def _can_share_source_clock(
     source_duration = segments[-1].source_end - first.source_start
     cumulative_timeline = 0.0
     maximum_clock_error = (
-        MAXIMUM_COALESCED_INTERNAL_CLOCK_ERROR_FRAMES / plan.fps
+        MAXIMUM_COALESCED_INTERNAL_CLOCK_ERROR_FRAMES / fps
     )
     for segment in segments[:-1]:
         cumulative_timeline += segment.duration
