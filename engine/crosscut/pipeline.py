@@ -27349,6 +27349,13 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
         if any(type(shot.get(key)) not in (int, float) or not math.isfinite(shot[key])
                or not 0 <= shot[key] <= 1 for key in ('section_progress', 'phrase_progress')):
             raise ValueError('GROUP bundle shot progress is invalid')
+        bounded_start=min(bundle.section_plan.end_seconds,
+            max(bundle.section_plan.start_seconds,choice.canonical_master_start))
+        directive=bundle.section_plan.directive_at(bounded_start)
+        expected_progress=min(1.,max(0.,(bounded_start-directive.start_seconds)/directive.duration_seconds))
+        if (shot.get('section_role')!=directive.role.value
+                or abs(shot['section_progress']-expected_progress)>1e-9):
+            raise ValueError('GROUP exact shot section role/progress differs from owned timeline and section')
 
 
 def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices,offsets,

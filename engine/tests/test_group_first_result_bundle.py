@@ -80,3 +80,11 @@ class GroupFirstResultBundleTests(unittest.TestCase):
         for candidate in candidates:
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 self.validate(candidate)
+
+    def test_in_range_but_stale_role_and_section_progress_cannot_promote(self):
+        bundle=self.make_bundle()
+        for field,value in (('section_role','chorus_like'),('section_progress',.9)):
+            clock=_thaw_audit_value(bundle.stage_edit_exact_shot_clock)
+            clock['shots'][0][field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                self.validate(replace(bundle,stage_edit_exact_shot_clock=clock))
