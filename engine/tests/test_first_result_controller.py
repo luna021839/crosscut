@@ -3,6 +3,10 @@ from dataclasses import replace
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+import json
+import os
+import signal
+import tempfile
 
 from crosscut.first_result_controller import FirstResultController, finalize_first_result_manifest
 from crosscut.ive import AspectRatio
@@ -12,6 +16,160 @@ from crosscut.review_first_runtime import classify_review_first_qa, ReviewFirstS
 
 
 class FirstResultControllerTests(unittest.TestCase):
+    def journaled(self, directory):
+        clock, controller, plan = self.make()
+        controller.journal_path = Path(directory) / 'owner.json'
+        controller._persist()
+        return clock, controller, plan
+
+    def test_precommit_journal_failures_keep_old_owner_and_journal(self):
+        for failing in ('json.dump', 'os.fsync', 'Path.replace'):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as directory:
+                _, controller, plan = self.journaled(directory)
+                before = controller.journal_path.read_bytes()
+                token = controller.transaction_token()
+                candidate = replace(plan, segments=(replace(plan.segments[0], source_start=.1), plan.segments[1]))
+                with patch('crosscut.first_result_controller.'+failing, side_effect=OSError('precommit injected')):
+                    with self.assertRaisesRegex(OSError, 'precommit injected'):
+                        controller.compare_and_promote(candidate, plan=candidate, authority='candidate',
+                            token=token, validate=lambda value: None)
+                self.assertIs(controller.incumbent, plan)
+                self.assertEqual(controller.transaction_token(), token)
+                self.assertEqual(controller.journal_path.read_bytes(), before)
+                self.assertEqual(list(Path(directory).glob('*.tmp')), [])
+
+    def test_postcommit_cleanup_failure_does_not_reject_new_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, controller, plan = self.journaled(directory)
+            token = controller.transaction_token()
+            candidate = replace(plan, segments=(replace(plan.segments[0], source_start=.1), plan.segments[1]))
+            with patch('crosscut.first_result_controller.Path.unlink', side_effect=OSError('cleanup injected')):
+                adopted = controller.compare_and_promote(candidate, plan=candidate, authority='candidate',
+                    token=token, validate=lambda value: None)
+            self.assertIs(adopted, candidate)
+            self.assertIs(controller.incumbent, candidate)
+            journal = json.loads(controller.journal_path.read_text())
+            self.assertEqual(journal['incumbent_revision'], token.revision+1)
+            self.assertEqual(journal['selected_authority'], 'candidate')
+            self.assertEqual(controller.to_dict()['journal_warnings'][-1]['phase'], 'postcommit_cleanup')
+
+    def test_failed_baseline_publication_is_retryable_without_partial_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, old, plan = self.make()
+            controller = FirstResultController(old.runtime, sources=plan.sources, source_durations=(10., 10.),
+                master_start=0., duration=2., journal_path=Path(directory)/'owner.json')
+            with patch('crosscut.first_result_controller.os.fsync', side_effect=OSError('baseline injected')):
+                with self.assertRaisesRegex(OSError, 'baseline injected'):
+                    controller.install_baseline(plan, plan=plan, authority='baseline')
+            self.assertIsNone(controller.incumbent)
+            self.assertIsNone(controller.baseline)
+            self.assertFalse(controller.journal_path.exists())
+            self.assertEqual(controller.to_dict()['incumbent_revision'], 0)
+            controller.install_baseline(plan, plan=plan, authority='baseline')
+            self.assertIs(controller.incumbent, plan)
+
+    def test_publication_rechecks_token_after_journal_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, controller, plan = self.journaled(directory)
+            owner = {'music': [0., 1.]}
+            controller.promote(owner, plan=plan, authority='mutable-test')
+            token = controller.transaction_token()
+            before = controller.journal_path.read_bytes()
+            def mutate(_): owner['music'][0] = 99.
+            with patch('crosscut.first_result_controller.os.fsync', side_effect=mutate):
+                with self.assertRaisesRegex(ValueError, 'before publication'):
+                    controller.compare_and_promote(plan, plan=plan, authority='candidate',
+                        token=token, validate=lambda value: None)
+            self.assertIs(controller.incumbent, owner)
+            self.assertEqual(controller.journal_path.read_bytes(), before)
+            self.assertEqual(controller.to_dict()['incumbent_revision'], token.revision)
+
+    def test_expired_publication_does_not_write_or_change_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock, controller, plan = self.journaled(directory)
+            token = controller.transaction_token()
+            before = controller.journal_path.read_bytes()
+            clock[0] = 600.
+            with self.assertRaises(ReviewFirstDeadlineExceeded):
+                controller.compare_and_promote(plan, plan=plan, authority='late',
+                    token=token, validate=lambda value: None)
+            self.assertIs(controller.incumbent, plan)
+            self.assertEqual(controller.journal_path.read_bytes(), before)
+
+    def test_replace_then_control_exception_keeps_committed_owner_and_attempt_status(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+                'crosscut.first_result_controller.enforce_review_first_deadline', return_value=nullcontext()):
+            _, controller, plan = self.journaled(directory)
+            token = controller.transaction_token()
+            candidate = replace(plan, segments=(replace(plan.segments[0], source_start=.1), plan.segments[1]))
+            actual_replace = Path.replace
+            def committed_then_interrupt(path, target):
+                actual_replace(path, target)
+                raise ReviewFirstDeadlineExceeded('committed injected deadline')
+            def operation():
+                # Only owner publication is faulted, not attempt journaling.
+                with patch('crosscut.first_result_controller.Path.replace', side_effect=committed_then_interrupt,
+                        autospec=True):
+                    return controller.compare_and_promote(candidate, plan=candidate, authority='candidate',
+                        token=token, validate=lambda value: None)
+            self.assertIsNone(controller.run_optional('publication', operation))
+            self.assertIs(controller.incumbent, candidate)
+            journal = json.loads(controller.journal_path.read_text())
+            self.assertEqual(journal['incumbent_revision'], token.revision+1)
+            self.assertEqual(journal['selected_authority'], 'candidate')
+            self.assertEqual(journal['attempts'][-1]['status'], 'committed_deadline_pending')
+
+    def test_expiry_during_journal_preparation_keeps_old_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock, controller, plan = self.journaled(directory)
+            token = controller.transaction_token()
+            before = controller.journal_path.read_bytes()
+            with patch('crosscut.first_result_controller.os.fsync', side_effect=lambda _: clock.__setitem__(0, 600.)):
+                with self.assertRaises(ReviewFirstDeadlineExceeded):
+                    controller.compare_and_promote(plan, plan=plan, authority='late-preparation',
+                        token=token, validate=lambda _: None)
+            self.assertEqual(controller.transaction_token(), token)
+            self.assertIs(controller.incumbent, plan)
+            self.assertEqual(controller.journal_path.read_bytes(), before)
+            self.assertEqual(list(Path(directory).glob('*.tmp')), [])
+
+    @unittest.skipUnless(os.name == 'posix' and hasattr(signal, 'pthread_sigmask'), 'POSIX signal publication')
+    def test_pending_posix_deadline_and_cancel_are_delivered_after_matching_owner(self):
+        for sig, error, status in ((signal.SIGALRM, ReviewFirstDeadlineExceeded, 'committed_deadline_pending'),
+                (signal.SIGINT, KeyboardInterrupt, 'committed_cancelled')):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory, patch(
+                    'crosscut.first_result_controller.enforce_review_first_deadline', return_value=nullcontext()):
+                _, controller, plan = self.journaled(directory)
+                token = controller.transaction_token()
+                candidate = replace(plan, segments=(replace(plan.segments[0], source_start=.1), plan.segments[1]))
+                actual_replace = Path.replace
+                previous = signal.getsignal(sig)
+                def pending_signal(path, target):
+                    actual_replace(path, target)
+                    os.kill(os.getpid(), sig)
+                    # The actual signal is blocked at this point, before the
+                    # new Python owner has been installed.
+                    self.assertIs(controller.incumbent, plan)
+                def handler(number, frame):
+                    self.assertIs(controller.incumbent, candidate)
+                    self.assertEqual(json.loads(controller.journal_path.read_text())['incumbent_revision'], token.revision+1)
+                    raise error('pending publication control')
+                def operation():
+                    with patch('crosscut.first_result_controller.Path.replace', side_effect=pending_signal, autospec=True):
+                        return controller.compare_and_promote(candidate, plan=candidate, authority='candidate',
+                            token=token, validate=lambda _: None)
+                try:
+                    signal.signal(sig, handler)
+                    if error is KeyboardInterrupt:
+                        with self.assertRaises(KeyboardInterrupt):
+                            controller.run_optional('actual-signal', operation)
+                    else:
+                        self.assertIsNone(controller.run_optional('actual-signal', operation))
+                finally:
+                    signal.signal(sig, previous)
+                self.assertIs(controller.incumbent, candidate)
+                self.assertEqual(json.loads(controller.journal_path.read_text())['attempts'][-1]['status'], status)
+
     def test_journal_survives_failures_cancellation_and_bounded_attempts(self):
         import json
         import tempfile

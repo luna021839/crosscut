@@ -147,9 +147,11 @@ def track_native_group(session, *, request_source_index, native_frame_indices,
         if (not isinstance(current, NativeGroupObservation)
                 or current.native_frame_index != native
                 or (current.request_source_index, current.source_clock_identity, current.source_file_identity,
-                    current.model_content_sha256,getattr(current,'model_adapter_fingerprints',()))
+                    current.model_content_sha256,getattr(current,'model_adapter_fingerprints',()),
+                    current.person_ownership_policy_sha256)
                     != (source, first.source_clock_identity, first.source_file_identity,
-                        first.model_content_sha256,getattr(first,'model_adapter_fingerprints',()))
+                        first.model_content_sha256,getattr(first,'model_adapter_fingerprints',()),
+                        first.person_ownership_policy_sha256)
                 or current.native_pixel_sha256 is not None and first.native_pixel_sha256 is not None
                     and current.frame_size_wh != first.frame_size_wh):
             raise ValueError('native track observations changed source/file/clock/raster/model/requested-frame domain')

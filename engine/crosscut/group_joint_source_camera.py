@@ -251,17 +251,20 @@ class JointGroupSelection:
     attempts: tuple
     status: str
     budget: dict
+    baseline_edge_costs: tuple = ()
 
     def to_dict(self):
         return dict(contract='bounded_two_actual_shot_source_clock_camera_role_graph_v1',status=self.status,
             selected_state_keys=[s.key for s in self.path] if self.path else None,
             attempts=list(self.attempts),budget=self.budget,raw_family_reachability_gate=False,
             prior_solo_success_required=False,complete_middle_camera_shared_by_both_edges=True,
+            baseline_edge_costs=list(self.baseline_edge_costs),
+            per_edge_nonregression_checked=bool(self.baseline_edge_costs),
             production_selected=False,quality_approved=False)
 
 
 def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,declared_roles,
-        observe_edge,verify_dense,budget,editorial_contract=None):
+        observe_edge,verify_dense,budget,editorial_contract=None,baseline_path=None):
     """Search A -> B -> C -> D without first solving B or C on its own.
 
     Every edge owns the SAME complete state and shared exact boundary tick.
@@ -275,12 +278,21 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
             or not isinstance(left,GroupSourceCameraState) or left.slot!=0
             or not isinstance(right,GroupSourceCameraState) or right.slot!=3):
         raise ValueError('joint GROUP requires two mutable actual-shot slots and fixed declared roles/neighbors')
-    attempts=[];edges={};seen=set();states=[]
+    attempts=[];edges={};seen=set();states=[];baseline_costs=()
+    if baseline_path is not None:
+        if (not isinstance(baseline_path,tuple) or len(baseline_path)!=4
+                or any(not isinstance(s,GroupSourceCameraState) or s.slot!=i
+                    or s.role!=declared_roles[i] for i,s in enumerate(baseline_path))
+                or baseline_path[0].key!=left.key or baseline_path[3].key!=right.key
+                or any(a.end_output_frame!=b.first_output_frame for a,b in zip(baseline_path,baseline_path[1:]))):
+            raise ValueError('joint comparison requires the same four-shot incumbent and fixed outer states')
+        for state in baseline_path:state.bind_source(domain)
     if editorial_contract is not None:
         from .group_joint_editorial_contract import GroupJointEditorialContract
         if not isinstance(editorial_contract,GroupJointEditorialContract):
             raise ValueError('joint search needs its pre-search typed editorial declaration')
         editorial_contract.validate_states((left,*states_by_slot[0],*states_by_slot[1],right))
+        if baseline_path is not None:editorial_contract.validate_states(baseline_path)
     try:
         for slot,values in enumerate(((left,),*states_by_slot,(right,))):
             if not isinstance(values,tuple):raise ValueError('joint states must be immutable bounded tuples')
@@ -308,6 +320,12 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
                 edges[key]=value
             value=edges[key]
             return value if value is not None and value.feasible else None
+        if baseline_path is not None:
+            baseline_edges=tuple(edge(a,b) for a,b in zip(baseline_path,baseline_path[1:]))
+            if any(value is None for value in baseline_edges):
+                return JointGroupSelection(None,(),({'complete':False,'reason':'baseline_edge_unknown'},),
+                    'baseline_edge_unknown_retained',budget.to_dict())
+            baseline_costs=tuple(value.framing_cost for value in baseline_edges)
         paths=[]
         for b in states[1]:
             first=edge(left,b)
@@ -316,6 +334,15 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
                 budget.check();middle=edge(b,c);last=edge(c,right)
                 if middle is None or last is None:continue
                 path=(left,b,c,right);observed=(first,middle,last)
+                if baseline_costs:
+                    costs=tuple(e.framing_cost for e in observed)
+                    regressed=tuple(i for i,(old,new) in enumerate(zip(baseline_costs,costs)) if new>old+1e-9)
+                    if regressed or not any(new<old-1e-6 for old,new in zip(baseline_costs,costs)):
+                        attempts.append(dict(state_keys=[s.key for s in path],complete=False,
+                            reason='protected_edge_framing_regression' if regressed else 'no_observed_edge_gain',
+                            regressed_edge_slots=list(regressed),baseline_edge_costs=list(baseline_costs),
+                            proposed_edge_costs=list(costs)))
+                        continue
                 paths.append((sum(e.framing_cost for e in observed),tuple(s.key for s in path),path,observed))
         for _,_,path,observed in sorted(paths,key=lambda p:p[:2]):
             budget.spend('dense_paths');verification=verify_dense(path,observed,budget);budget.check()
@@ -323,8 +350,8 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
                 raise ValueError('joint GROUP dense verification must return complete typed evidence')
             complete=verification.validates(path)
             attempts.append(dict(state_keys=[s.key for s in path],complete=complete,reason=verification.reason))
-            if complete:return JointGroupSelection(path,observed,tuple(attempts),'complete_geometric_candidate',budget.to_dict())
+            if complete:return JointGroupSelection(path,observed,tuple(attempts),'complete_geometric_candidate',budget.to_dict(),baseline_costs)
     except JointGroupBudgetExhausted as exc:
         attempts.append(dict(complete=False,reason=str(exc)))
-        return JointGroupSelection(None,(),tuple(attempts),'budget_retained_baseline',budget.to_dict())
-    return JointGroupSelection(None,(),tuple(attempts),'no_complete_geometric_candidate',budget.to_dict())
+        return JointGroupSelection(None,(),tuple(attempts),'budget_retained_baseline',budget.to_dict(),baseline_costs)
+    return JointGroupSelection(None,(),tuple(attempts),'no_complete_geometric_candidate',budget.to_dict(),baseline_costs)

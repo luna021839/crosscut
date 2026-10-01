@@ -4,11 +4,14 @@ This controller is not a quality approver. It protects a validated render plan
 from failed proposals; decoded technical and editorial QA still run afterward.
 """
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass,replace
 from enum import Enum
 import json
 import hashlib
 import os
+import signal
+import threading
 from pathlib import Path
 import tempfile
 from typing import Callable
@@ -33,6 +36,23 @@ class FirstResultStage(str, Enum):
 class IncumbentTransactionToken:
     revision: int
     content_sha256: str
+
+
+@contextmanager
+def _defer_owner_publication_signals():
+    """Defer POSIX deadline/cancel delivery only across the short commit.
+
+    No model work or arbitrary validator runs here. This is not hardware-level
+    atomicity or full crash recovery; the journal is a controller audit record.
+    """
+    supported = (os.name == 'posix' and threading.current_thread() is threading.main_thread()
+        and hasattr(signal, 'pthread_sigmask') and hasattr(signal, 'SIGALRM'))
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM, signal.SIGINT}) if supported else None
+    try:
+        yield
+    finally:
+        if supported:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 class FirstResultController:
@@ -61,22 +81,88 @@ class FirstResultController:
         self._history = [self.stage.value]
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self.omitted_attempt_count = 0
+        self._journal_warnings = []
 
-    def _persist(self):
-        if self.journal_path is None:
+    def _cleanup_journal(self, temporary, *, phase):
+        if temporary is None:
             return
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            # A successful publication must not become a rejected proposal
+            # because removing an already-renamed temporary path failed.
+            self._journal_warnings.append(dict(phase=phase, error_type=type(exc).__name__, error=str(exc)[:2000]))
+            self._journal_warnings = self._journal_warnings[-16:]
+
+    def _prepare_journal(self, snapshot):
+        if self.journal_path is None:
+            return None
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix='.' + self.journal_path.name, suffix='.tmp',
                                     dir=self.journal_path.parent)
         temporary = Path(name)
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                json.dump(self.to_dict(), stream, ensure_ascii=False, allow_nan=False, indent=2)
+                json.dump(snapshot, stream, ensure_ascii=False, allow_nan=False, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
-            temporary.replace(self.journal_path)
+            return temporary
+        except BaseException:
+            self._cleanup_journal(temporary, phase='precommit_cleanup')
+            raise
+
+    def _persist(self):
+        temporary = self._prepare_journal(self.to_dict())
+        published = False
+        try:
+            if temporary is not None:
+                temporary.replace(self.journal_path)
+            published = True
         finally:
-            temporary.unlink(missing_ok=True)
+            self._cleanup_journal(temporary, phase='postcommit_cleanup' if published else 'precommit_cleanup')
+
+    def _publish_owner(self, changes, snapshot, *, token=None):
+        """Prepare first; journal replace is the declared publication point.
+
+        Before that point, any failure preserves the old whole owner/journal.
+        Afterwards memory must match the published revision even if a pending
+        control exception or cleanup error is delivered. No rollback launders a
+        committed disk state back into an old memory owner.
+        """
+        def recheck():
+            if token is not None:
+                self.runtime.require_first_render_budget('candidate_publication')
+                if self.transaction_token() != token:
+                    raise ValueError('atomic candidate baseline changed before publication')
+        recheck()
+        temporary = self._prepare_journal(snapshot)
+        published = False
+        delayed_error = None
+        expected_bytes = json.dumps(snapshot, ensure_ascii=False, allow_nan=False, indent=2).encode('utf-8')
+        try:
+            recheck()
+            with _defer_owner_publication_signals():
+                recheck()
+                if temporary is not None:
+                    try:
+                        temporary.replace(self.journal_path)
+                    except BaseException as exc:
+                        # A wrapper/control exception can occur after rename
+                        # took effect. Resolve actual publication, not just the
+                        # return value, before deciding which owner to retain.
+                        try:
+                            committed = self.journal_path.read_bytes() == expected_bytes
+                        except OSError:
+                            committed = False
+                        if not committed:
+                            raise
+                        delayed_error = exc
+                published = True
+                self.__dict__.update(changes)
+            if delayed_error is not None:
+                raise delayed_error
+        finally:
+            self._cleanup_journal(temporary, phase='postcommit_cleanup' if published else 'precommit_cleanup')
 
     def validate_plan(self, plan: RenderPlan) -> None:
         if not isinstance(plan, RenderPlan):
@@ -101,15 +187,14 @@ class FirstResultController:
         if self.baseline is not None:
             raise RuntimeError("baseline may only be installed once")
         self.validate_plan(plan)
-        self._render_configuration = (plan.reference_source, plan.aspect_ratio, plan.width, plan.height, plan.fps)
-        self.baseline = value
-        self.incumbent = value
-        self._incumbent_plan = plan
-        self._incumbent_revision += 1
-        self._selected_authority = authority
-        self.stage = FirstResultStage.BASELINE_PLAN_READY
-        self._history.append(self.stage.value)
-        self._persist()
+        stage = FirstResultStage.BASELINE_PLAN_READY
+        history = [*self._history, stage.value]
+        revision = self._incumbent_revision+1
+        snapshot = dict(self.to_dict(), baseline_retained=True, stage=stage.value,
+            stage_history=history, incumbent_revision=revision, selected_authority=authority)
+        self._publish_owner(dict(_render_configuration=(plan.reference_source, plan.aspect_ratio, plan.width, plan.height, plan.fps),
+            baseline=value, incumbent=value, _incumbent_plan=plan, _incumbent_revision=revision,
+            _selected_authority=authority, stage=stage, _history=history), snapshot)
         return value
 
     def run_optional(self, stage: str, operation: Callable, *, validate: Callable | None = None):
@@ -125,6 +210,7 @@ class FirstResultController:
             self._persist()
             return None
         started = self.runtime.elapsed_seconds
+        started_revision = self._incumbent_revision
         row = dict(stage=stage, status="running")
         self.attempts.append(row)
         self._persist()
@@ -141,28 +227,30 @@ class FirstResultController:
             row["status"] = "validated_proposal" if value is not None else "unavailable"
             return value
         except ReviewFirstDeadlineExceeded:
-            row["status"] = "deadline_exceeded"
+            committed = self._incumbent_revision != started_revision
+            row["status"] = "committed_deadline_pending" if committed else "deadline_exceeded"
             self.runtime.require_total_budget(stage)
-            row["status"] = "search_cutoff"
+            if not committed:
+                row["status"] = "search_cutoff"
         except ReviewFirstSearchCutoff:
-            row["status"] = "search_cutoff"
+            row["status"] = "committed_search_cutoff" if self._incumbent_revision != started_revision else "search_cutoff"
         except Exception as exc:
-            row.update(status="rejected", error_type=type(exc).__name__, error=str(exc)[:2000])
+            row.update(status="committed_optional_error" if self._incumbent_revision != started_revision else "rejected",
+                error_type=type(exc).__name__, error=str(exc)[:2000])
         except BaseException:
-            row["status"] = "cancelled"
+            row["status"] = "committed_cancelled" if self._incumbent_revision != started_revision else "cancelled"
             raise
         finally:
             row["elapsed_seconds"] = max(0., self.runtime.elapsed_seconds-started)
             self._persist()
         return None
 
-    def promote(self, value, *, plan: RenderPlan, authority: str):
+    def promote(self, value, *, plan: RenderPlan, authority: str, _token=None):
         self.validate_plan(plan)
-        self.incumbent = value
-        self._incumbent_plan = plan
-        self._incumbent_revision += 1
-        self._selected_authority = authority
-        self._persist()
+        revision = self._incumbent_revision+1
+        snapshot = dict(self.to_dict(), incumbent_revision=revision, selected_authority=authority)
+        self._publish_owner(dict(incumbent=value, _incumbent_plan=plan, _incumbent_revision=revision,
+            _selected_authority=authority), snapshot, token=_token)
         return value
 
     def transaction_token(self):
@@ -197,7 +285,7 @@ class FirstResultController:
         validate(value)
         if self.transaction_token()!=token:
             raise ValueError('atomic candidate baseline changed during parent validation')
-        return self.promote(value,plan=plan,authority=authority)
+        return self.promote(value,plan=plan,authority=authority,_token=token)
 
     def render_complete(self):
         if self.stage is not FirstResultStage.BASELINE_PLAN_READY:
@@ -216,6 +304,7 @@ class FirstResultController:
             skipped_count=self.skipped_count, attempts=deepcopy(self.attempts),
             omitted_attempt_count=self.omitted_attempt_count,
             journal_path=str(self.journal_path) if self.journal_path is not None else None,
+            journal_warnings=deepcopy(self._journal_warnings),
             quality_approved=False, decoded_qa_required=True)
 
 

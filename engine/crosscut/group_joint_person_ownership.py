@@ -6,6 +6,8 @@ support. Optical texture agreement is not a replacement for these checks.
 """
 from dataclasses import dataclass, replace
 import math
+import hashlib
+from pathlib import Path
 
 import numpy as np
 
@@ -25,10 +27,12 @@ class OwnedPersonObservation(ObservedFormationPerson):
     body_ownership_state: str = 'unknown'
     part_states: tuple[tuple[str,str],...] = ()
     face_anchor_consistent: bool | None = None
+    upper_body_ownership_state: str = 'unknown'
 
     def __post_init__(self):
         ObservedFormationPerson.__post_init__(self)
-        if self.body_ownership_state not in ('observed','ambiguous','unknown'):
+        if any(state not in ('observed','ambiguous','unknown') for state in
+                (self.body_ownership_state, self.upper_body_ownership_state)):
             raise ValueError('person ownership must retain an explicit observed/ambiguous/unknown state')
         for box in (() if self.pose_crop_xywh is None else (self.pose_crop_xywh,)):
             if (not isinstance(box,tuple) or len(box)!=4
@@ -69,9 +73,34 @@ def torso_owned_by_detector(person):
     return all(_inside(center,person.box_xywh,padding=.005) for center in centers)
 
 
+def _shoulder_anchor_owned(person):
+    """A close-up anchor, NOT full torso/person/head-extent ownership.
+
+    Hips outside native pixels remain outside/unknown. Visible shoulders plus
+    a separately detected unique face can still own actual upper-body parts.
+    """
+    if (person.pose_reason != 'observed' or person.pose_crop_xywh is None
+            or not person.source_pixel_to_pose_input_affine or len(person.upper_body_xyc) != 8
+            or len(person.raw_pose_xyc) != 17 or person.face_anchor_consistent is False):
+        return False
+    nose = person.raw_pose_xyc[0]
+    shoulders = person.upper_body_xyc[:2]
+    if any(p[2] < .3 or not _inside(p[:2], (0., 0., 1., 1.))
+            or not _inside(p[:2], person.pose_crop_xywh) for p in (*shoulders, nose)):
+        return False
+    center = np.mean(np.asarray(shoulders)[:, :2], axis=0)
+    return _inside(center, person.box_xywh, padding=.005) and _inside(nose[:2], person.box_xywh, padding=.005)
+
+
+def ownership_policy_fingerprint():
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def trackable_person_ownership(person):
     if isinstance(person,OwnedPersonObservation):
-        return person.body_ownership_state=='observed'
+        return (not person.competing_person_observation_ids
+            and person.body_ownership_state != 'ambiguous' and person.upper_body_ownership_state != 'ambiguous'
+            and 'observed' in (person.body_ownership_state, person.upper_body_ownership_state))
     # Legacy synthetic/diagnostic callers have no owned-head authority. Still
     # reject a skeleton outside its claimed detector before LK assignment.
     return torso_owned_by_detector(person)
@@ -88,12 +117,21 @@ def bind_person_ownership(people,heads,frame_size_wh):
                 continue
             a,b=np.asarray(left.upper_body_xyc),np.asarray(right.upper_body_xyc)
             common=tuple(n for n in (0,1,6,7) if min(a[n,2],b[n,2])>=.3)
-            if len(common)<3:
-                continue
-            distances=np.linalg.norm((a[list(common),:2]-b[list(common),:2])*size,axis=1)
-            scale=min(float(np.linalg.norm((a[:2,:2].mean(0)-a[6:,:2].mean(0))*size)),
-                float(np.linalg.norm((b[:2,:2].mean(0)-b[6:,:2].mean(0))*size)))
-            if float(np.median(distances))<=max(3.,.06*scale):
+            same_torso = False
+            if len(common) >= 3:
+                distances=np.linalg.norm((a[list(common),:2]-b[list(common),:2])*size,axis=1)
+                scale=min(float(np.linalg.norm((a[:2,:2].mean(0)-a[6:,:2].mean(0))*size)),
+                    float(np.linalg.norm((b[:2,:2].mean(0)-b[6:,:2].mean(0))*size)))
+                same_torso = float(np.median(distances)) <= max(3., .06*scale)
+            same_upper = False
+            if _shoulder_anchor_owned(left) and _shoulder_anchor_owned(right):
+                anchors_a = np.asarray((*left.upper_body_xyc[:2], left.raw_pose_xyc[0]))
+                anchors_b = np.asarray((*right.upper_body_xyc[:2], right.raw_pose_xyc[0]))
+                shoulder_scale = min(float(np.linalg.norm((a[1, :2]-a[0, :2])*size)),
+                    float(np.linalg.norm((b[1, :2]-b[0, :2])*size)))
+                distances = np.linalg.norm((anchors_a[:, :2]-anchors_b[:, :2])*size, axis=1)
+                same_upper = float(distances.max()) <= max(3., .06*shoulder_scale)
+            if same_torso or same_upper:
                 duplicates[left.observation_id].add(right.observation_id)
                 duplicates[right.observation_id].add(left.observation_id)
     head_candidates={person.observation_id:[] for person in people}
@@ -118,15 +156,23 @@ def bind_person_ownership(people,heads,frame_size_wh):
             and all(_inside(person.upper_body_xyc[n][:2],person.pose_crop_xywh) for n in (0,1,6,7)))
         body_state='ambiguous' if competing and body_valid else 'observed' if body_valid else 'unknown'
         candidates=tuple(head_candidates[person.observation_id])
-        head_id=(candidates[0] if len(candidates)==1 and len(owners[candidates[0]])==1
-            and body_state=='observed' and person.face_anchor_consistent is not False else None)
-        states=[('torso',body_state),('face_roi','observed' if head_id is not None else
+        unique_face = len(candidates) == 1 and len(owners[candidates[0]]) == 1
+        upper_valid = _shoulder_anchor_owned(person)
+        upper_state = ('ambiguous' if upper_valid and (competing or candidates and not unique_face) else
+            'observed' if upper_valid and unique_face else 'unknown')
+        head_id=(candidates[0] if unique_face and not competing
+            and (body_state=='observed' or upper_state=='observed')
+            and person.face_anchor_consistent is not False else None)
+        states=[('torso',body_state),('shoulder_anchor',upper_state),('face_roi','observed' if head_id is not None else
             'ambiguous' if candidates else 'unknown'),('head_extent','unknown'),('head_motion','unknown')]
         for name,joints in (('left_arm',(0,2,4)),('right_arm',(1,3,5))):
-            observed=(body_state=='observed' and all(person.upper_body_xyc[n][2]>=.3
+            observed=(not competing and (body_state=='observed' or upper_state=='observed')
+                and all(person.upper_body_xyc[n][2]>=.3
                 and _inside(person.upper_body_xyc[n][:2],person.pose_crop_xywh)
                 and _inside(person.upper_body_xyc[n][:2],(0.,0.,1.,1.)) for n in joints))
-            states.append((name,'observed' if observed else 'ambiguous' if body_state=='ambiguous' else 'unknown'))
+            states.append((name,'observed' if observed else 'ambiguous' if
+                'ambiguous' in (body_state, upper_state) else 'unknown'))
         result.append(replace(person,candidate_head_observation_ids=candidates,unique_head_observation_id=head_id,
-            competing_person_observation_ids=competing,body_ownership_state=body_state,part_states=tuple(states)))
+            competing_person_observation_ids=competing,body_ownership_state=body_state,
+            upper_body_ownership_state=upper_state,part_states=tuple(states)))
     return tuple(result),owners

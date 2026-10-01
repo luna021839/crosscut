@@ -144,6 +144,53 @@ class JointGroupSourceCameraTests(unittest.TestCase):
         self.assertEqual(result.budget['counts']['edges'],3)
         self.assertEqual(result.budget['counts']['dense_paths'],1)
 
+    def comparison(self, candidate_costs, baseline_costs=(.1,.6,.1)):
+        args,raw,b,c=self.fixture();dense_calls=[]
+        before={(raw[i].key,raw[i+1].key):cost for i,cost in enumerate(baseline_costs)}
+        after={(a.key,z.key):cost for a,z,cost in zip((raw[0],b,c),(b,c,raw[3]),candidate_costs)}
+        def observe(a,z,budget):
+            cost={**before,**after}.get((a.key,z.key))
+            return None if cost is None else JointGroupEdgeObservation(a.key,z.key,
+                z.first_output_frame,cost,True,True)
+        verify=args['verify_dense']
+        def dense(path,edges,budget):
+            dense_calls.append(path)
+            return verify(path,edges,budget)
+        args.update(observe_edge=observe,verify_dense=dense,baseline_path=raw,
+            states_by_slot=((b,),(c,)))
+        return args,raw,dense_calls
+
+    def test_lower_total_cannot_buy_a_worse_fixed_neighbor_edge(self):
+        args,raw,calls=self.comparison((.3,.2,.1))
+        result=select_joint_group_source_camera_path(**args)
+        self.assertIsNone(result.path)
+        self.assertEqual(calls,[])
+        self.assertEqual(result.attempts[-1]['reason'],'protected_edge_framing_regression')
+        self.assertEqual(result.attempts[-1]['regressed_edge_slots'],[0])
+
+    def test_all_three_edges_are_observed_before_individual_nonregression_and_gain(self):
+        args,raw,calls=self.comparison((.1,.2,.1))
+        result=select_joint_group_source_camera_path(**args)
+        self.assertIsNotNone(result.path)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(result.baseline_edge_costs,(.1,.6,.1))
+        self.assertTrue(result.to_dict()['per_edge_nonregression_checked'])
+        args,raw,calls=self.comparison((.1,.6,.1))
+        result=select_joint_group_source_camera_path(**args)
+        self.assertIsNone(result.path)
+        self.assertEqual(result.attempts[-1]['reason'],'no_observed_edge_gain')
+        self.assertEqual(calls,[])
+
+    def test_unknown_baseline_edge_is_not_zero_or_a_worst_numeric_cost(self):
+        args,raw,calls=self.comparison((.1,.2,.1))
+        observe=args['observe_edge']
+        args['observe_edge']=lambda a,b,budget:None if (a.key,b.key)==(raw[1].key,raw[2].key) \
+            else observe(a,b,budget)
+        result=select_joint_group_source_camera_path(**args)
+        self.assertIsNone(result.path)
+        self.assertEqual(result.status,'baseline_edge_unknown_retained')
+        self.assertEqual(calls,[])
+
     def test_byte_lru_reuses_same_geometry_but_not_another_camera_on_the_same_raw_frame(self):
         args,raw,b,c=self.fixture();budget=JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.,
             maximum_projected_cache_bytes=100)

@@ -12,7 +12,7 @@ import math
 import cv2
 import numpy as np
 
-from .group_joint_person_ownership import trackable_person_ownership
+from .group_joint_person_ownership import trackable_person_ownership, OwnedPersonObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +121,16 @@ def native_joint_assignment_cost(flow, person, frame_size_wh):
     points = np.asarray(person.upper_body_xyc, dtype=float)
     shoulder = np.mean(points[:2, :2], axis=0)*size
     hip = np.mean(points[6:8, :2], axis=0)*size
-    if min(points[[0, 1, 6, 7], 2]) < .3:
-        return None
-    scale = float(np.linalg.norm(hip-shoulder))
+    if isinstance(person, OwnedPersonObservation) and person.body_ownership_state != 'observed':
+        if person.upper_body_ownership_state != 'observed' or min(points[:2, 2]) < .3:
+            return None
+        # Actual source-local shoulder span for a measured cropped upper body,
+        # never a fabricated hip or a cross-camera identity threshold.
+        scale = float(np.linalg.norm((points[1, :2]-points[0, :2])*size))
+    else:
+        if min(points[[0, 1, 6, 7], 2]) < .3:
+            return None
+        scale = float(np.linalg.norm(hip-shoulder))
     if scale < 8.:
         return None
     errors = tuple(float(np.linalg.norm((np.asarray(row[3:5])-points[row[0], :2])*size))/scale

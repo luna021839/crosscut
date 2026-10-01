@@ -14,7 +14,7 @@ import cv2
 
 from .group_joint_formation import ObservedFormationPerson
 from .group_joint_formation_observer import register_formation_models
-from .group_joint_person_ownership import OwnedPersonObservation,bind_person_ownership
+from .group_joint_person_ownership import OwnedPersonObservation,bind_person_ownership,ownership_policy_fingerprint
 from .group_joint_observations import _file_identity
 from .visual_score import YUNET_EXPECTED_SHA256, _working_frame
 
@@ -54,6 +54,7 @@ class NativeGroupObservation:
     heads: tuple[NativeGroupHead, ...]
     reason: str
     model_adapter_fingerprints: tuple[tuple[str,str],...] = ()
+    person_ownership_policy_sha256: str | None = None
 
     def __post_init__(self):
         sha=lambda value:isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
@@ -73,6 +74,11 @@ class NativeGroupObservation:
                 or any(not isinstance(head,NativeGroupHead) for head in self.heads)
                 or len({head.observation_id for head in self.heads})!=len(self.heads)):
             raise ValueError('native observation requires bounded source/native/pixel/raw-model identities')
+        if self.person_ownership_policy_sha256 is not None and not sha(self.person_ownership_policy_sha256):
+            raise ValueError('native part ownership must bind its actual postprocessing policy')
+        if self.person_ownership_policy_sha256 is None and any(
+                isinstance(p, OwnedPersonObservation) and p.upper_body_ownership_state != 'unknown' for p in self.people):
+            raise ValueError('new upper-body ownership cannot borrow a legacy observation policy')
         for values in (self.model_content_sha256,self.model_adapter_fingerprints):
             if (not isinstance(values,tuple) or any(not isinstance(row,tuple) or len(row)!=2
                         or not isinstance(row[0],str) or not row[0] or not sha(row[1]) for row in values)
@@ -82,7 +88,16 @@ class NativeGroupObservation:
             raise ValueError('every native model must bind the same named adapter set')
 
     def to_dict(self):
-        return dict(contract='actual_source_native_owned_person_body_face_observation_rows_v2', **asdict(self),
+        payload = asdict(self)
+        contract = 'actual_source_native_owned_person_body_face_observation_rows_v3'
+        if self.person_ownership_policy_sha256 is None:
+            # Legacy raw preimages stay byte-semantically reproducible, without
+            # upgrading them to new partial-body ownership evidence.
+            contract = 'actual_source_native_owned_person_body_face_observation_rows_v2'
+            payload.pop('person_ownership_policy_sha256')
+            for person in payload['people']:
+                person.pop('upper_body_ownership_state', None)
+        return dict(contract=contract, **payload,
             detection_ids_are_frame_local=True, persistent_subject_correspondence_verified=False,
             named_member_identity_certified=False, motion_certified=False,
             visibility_certified=False, quality_approved=False)
@@ -146,7 +161,7 @@ def observe_native_group(session, *, request_source_index, native_frame_index):
         return NativeGroupObservation(source, native,
             (pixels.shape[1], pixels.shape[0]) if pixels is not None else (0, 0), clock_identity, identity,
             hashlib.sha256(memoryview(pixels)).hexdigest() if pixels is not None else None,
-            models, tuple(people), tuple(heads), reason,adapters)
+            models, tuple(people), tuple(heads), reason,adapters,ownership_policy_fingerprint())
     if pixels is None:
         return snapshot('exact_native_decode_unavailable')
     heads=session.observe_native(source,native,model='yunet_head_faces')
