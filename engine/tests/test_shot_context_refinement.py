@@ -57,6 +57,29 @@ class ShotContextRefinementTests(unittest.TestCase):
             timeline_review=updated.timeline_review,section_plan=updated.section_plan,
             editorial_motion=updated.editorial_motion_plan)
 
+    def test_overlapping_affine_rolls_back_complete_context_edit_without_deletion(self):
+        from crosscut.boundary_affine_plan import BoundaryAffinePlan,BoundaryAffineDecision
+        from crosscut.shot_context_refinement import ShotContextRefinement
+        plan,timeline,proposal=self.fixture();motion=motion_for(plan)
+        affine=BoundaryAffinePlan((BoundaryAffineDecision(0,0,1,29/30.,1.,None,None,'fixture_unavailable'),))
+        # Use an actual bundle, since production rollback is a dataclass
+        # transaction, not replacing just a render plan dictionary.
+        section=SectionPlan((SectionDirective(0,SectionRole.BUILD,0.,3.,.5,.5,1,4,15.,.4,.1,False,False),))
+        request=SimpleNamespace(sources=plan.sources,reference_source=0,aspect_ratio=plan.aspect_ratio)
+        bundle=_review_first_group_bundle(timeline=timeline,request=request,
+            eligible_indices=(0,1,2),offsets=(0.,)*3,timewarps=(None,)*3,common_start=0.,
+            section_plan=section,phrase_times=(0.,1.,2.,3.),output=plan.output,
+            reporter=SimpleNamespace(log=lambda *a,**k:None),warnings=[])
+        bundle=replace(bundle,render_plan=plan,editorial_motion_plan=motion,boundary_affine_plan=affine,
+            group_transition_plan=replace(bundle.group_transition_plan,transitions=plan.transitions))
+        result=ShotContextRefinement(proposal.plan,motion,(1,),(),.1)
+        with patch('crosscut.shot_context_refinement.refine_shot_context_cameras',return_value=result):
+            changed=_review_first_group_shot_context_bundle(bundle,scene_cut_times=((),)*3)
+        for field in bundle.__dataclass_fields__:
+            if field!='candidate_lineage':self.assertEqual(getattr(changed,field),getattr(bundle,field),field)
+        self.assertIs(changed.boundary_affine_plan,affine)
+        self.assertFalse(changed.candidate_lineage[-1]['applied'])
+
     def test_separated_shots_can_share_an_unchanged_neighbor_without_losing_binding(self):
         from crosscut.render import RenderSegment,RenderTransition
         from crosscut.shot_context_refinement import attach_shot_context_proposal

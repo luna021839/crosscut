@@ -625,6 +625,7 @@ class MotionCameraBundleTests(unittest.TestCase):
         from crosscut.shot_context_refinement import attach_shot_context_proposal
         from crosscut.shot_context_binding import bound_shot_context_cameras
         from crosscut.post_render_qa import _bound_local_alignment_tracks
+        from crosscut.boundary_affine_plan import BoundaryAffinePlan, BoundaryAffineDecision
         import json
         fixture=cameras.ShotContextProposalTests();args=fixture.fixture();sources=args['plan'].sources
         source_order=(0,2,0,1,2)
@@ -654,6 +655,9 @@ class MotionCameraBundleTests(unittest.TestCase):
             reporter=SimpleNamespace(log=lambda *_a,**_k:None),warnings=[])
         bundle=replace(bundle,render_plan=plan,editorial_motion_plan=motion,
             group_transition_plan=replace(bundle.group_transition_plan,transitions=transitions))
+        distant_affine=BoundaryAffinePlan((BoundaryAffineDecision(3,1,2,
+            3.+29./30.,4.,None,None,'fixture_geometry_unavailable'),))
+        bundle=replace(bundle,boundary_affine_plan=distant_affine)
         delta=2/30.;left,right=plan.segments[:2]
         pair=(replace(left,duration=1.+delta,editorial_transform=None),
             replace(right,master_start=1.+delta,source_start=1.+delta,duration=1.-delta,
@@ -676,6 +680,7 @@ class MotionCameraBundleTests(unittest.TestCase):
         self.assertTrue(old_bound[0]<=new_bound[0]);self.assertTrue(old_bound[1]<=new_bound[1])
         self.assertEqual(changed.candidate_lineage[-1]['unchanged_shot_context_receipts_rebound'],1)
         self.assertFalse(changed.candidate_lineage[-1]['quality_approved'])
+        self.assertIs(changed.boundary_affine_plan,distant_affine)
 
     def test_invalid_existing_context_is_rejected_before_expensive_refinement(self):
         bundle,request,result=self.fixture()
@@ -687,6 +692,21 @@ class MotionCameraBundleTests(unittest.TestCase):
                     eligible_indices=(0,1),offsets=(0.,0.),timewarps=(None,None),
                     scene_cut_times=((),()),phrase_times=(0.,2.),model_path=Path('unused'))
             refine.assert_not_called()
+
+    def test_overlapping_affine_keeps_complete_incumbent_not_a_plan_with_erased_metadata(self):
+        from crosscut.boundary_affine_plan import BoundaryAffinePlan,BoundaryAffineDecision
+        bundle,request,result=self.fixture()
+        affine=BoundaryAffinePlan((BoundaryAffineDecision(0,0,1,29/30.,1.,None,None,'fixture_unavailable'),))
+        bundle=replace(bundle,boundary_affine_plan=affine)
+        changed=self.run_bundle(bundle,request,result)
+        for field in bundle.__dataclass_fields__:
+            if field!='candidate_lineage':
+                self.assertEqual(getattr(changed,field),getattr(bundle,field),field)
+        self.assertIs(changed.boundary_affine_plan,affine)
+        self.assertFalse(changed.candidate_lineage[-1]['applied'])
+        self.assertEqual(changed.candidate_lineage[-1]['changed_boundary_count'],0)
+        self.assertEqual(changed.candidate_lineage[-1]['evidence_preservation']['disposition'],
+            'complete_optional_edit_rollback_keep_incumbent_payloads')
 
 
 if __name__ == '__main__':

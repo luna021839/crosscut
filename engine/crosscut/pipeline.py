@@ -27493,6 +27493,18 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         return replace(bundle,candidate_lineage=(*bundle.candidate_lineage,
             {'stage':'bounded_joint_motion_camera_refinement','applied':False,
              'status':'no_complete_camera_candidate',**result.to_dict()}))
+    from .group_boundary_evidence_preservation import preserve_boundary_evidence,BoundaryEvidencePreservationUnavailable
+    try:
+        repairs,affine,evidence_preservation=preserve_boundary_evidence(
+            old_plan=bundle.render_plan,new_plan=result.plan,old_timeline=bundle.visual_timeline,
+            new_timeline=result.timeline,boundary_repairs=bundle.boundary_repairs,
+            boundary_affine_plan=bundle.boundary_affine_plan)
+    except BoundaryEvidencePreservationUnavailable as exc:
+        return replace(bundle,candidate_lineage=(*bundle.candidate_lineage,
+            {**result.to_dict(),'stage':'bounded_joint_motion_camera_refinement','applied':False,
+             'status':'incumbent_boundary_evidence_preserved_optional_edit_rolled_back',
+             'proposed_changed_boundary_count':len(result.proposals),'changed_boundary_count':0,
+             'evidence_preservation':exc.to_dict()}))
     prior_alignment=alignment=motion.boundary_subject_alignment_plan
     if any(proposal.alignment.analysis_basis not in {ANALYSIS_BASIS,GLOBAL_ACTION_BASIS} for proposal in result.proposals):
         # Replacing just the decisions below retains the incumbent plan's
@@ -27565,12 +27577,13 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     review=review_timeline(result.timeline,available_source_count=len(eligible_indices))
     updated=replace(bundle,render_plan=result.plan,visual_timeline=result.timeline,
         timeline_review=review,pre_render_score=float(review.weighted_score),face_match_plan=face_match,
-        editorial_motion_plan=motion,boundary_repairs=None,boundary_affine_plan=None,
+        editorial_motion_plan=motion,boundary_repairs=repairs,boundary_affine_plan=affine,
         stage_edit_exact_shot_clock=_deterministic_exact_shot_clock_from_timeline(result.timeline,
             section_plan=bundle.section_plan,phrase_times=phrase_times),
         phrase_times=tuple(phrase_times),
         candidate_lineage=(*bundle.candidate_lineage,{'stage':'bounded_joint_motion_camera_refinement',
-            'supersedes_legacy_repair_endpoint_metadata':True,
+            'supersedes_legacy_repair_endpoint_metadata':False,
+            'boundary_evidence_preservation':evidence_preservation,
             'unchanged_shot_context_receipts_rebound':len(contexts),
             'unchanged_coupled_shot_receipts_rebound':len(coupled),**result.to_dict()}))
     _validate_review_first_group_bundle(updated,eligible_indices=eligible_indices,offsets=offsets,
@@ -27587,6 +27600,18 @@ def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
     result=refine_shot_context_cameras(plan=bundle.render_plan,timeline=bundle.visual_timeline,
         motion=bundle.editorial_motion_plan,scene_cut_times=scene_cut_times)
     changed=set(result.changed_segments)
+    from .group_boundary_evidence_preservation import preserve_boundary_evidence,BoundaryEvidencePreservationUnavailable
+    try:
+        repairs,affine,evidence_preservation=preserve_boundary_evidence(
+            old_plan=bundle.render_plan,new_plan=result.plan,old_timeline=bundle.visual_timeline,
+            new_timeline=bundle.visual_timeline,boundary_repairs=bundle.boundary_repairs,
+            boundary_affine_plan=bundle.boundary_affine_plan)
+    except BoundaryEvidencePreservationUnavailable as exc:
+        return replace(bundle,candidate_lineage=(*bundle.candidate_lineage,
+            {**result.to_dict(),'stage':'two_sided_shot_context_framing','applied':False,
+             'status':'incumbent_boundary_evidence_preserved_optional_edit_rolled_back',
+             'proposed_changed_segments':tuple(sorted(changed)),'changed_segments':(),
+             'evidence_preservation':exc.to_dict()}))
     face_match=bundle.face_match_plan
     if face_match is not None and changed:
         face_match=replace(face_match,segments=tuple(replace(item,pan_crop=None,
@@ -27595,10 +27620,9 @@ def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
             for index,item in enumerate(face_match.segments)))
     return replace(bundle,render_plan=result.plan,editorial_motion_plan=result.motion,
         face_match_plan=face_match,
-        boundary_repairs=None if changed else bundle.boundary_repairs,
-        boundary_affine_plan=None if changed else bundle.boundary_affine_plan,
+        boundary_repairs=repairs,boundary_affine_plan=affine,
         candidate_lineage=(*bundle.candidate_lineage,{'stage':'two_sided_shot_context_framing',
-            **result.to_dict()}))
+            **result.to_dict(),'boundary_evidence_preservation':evidence_preservation}))
 
 
 def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):

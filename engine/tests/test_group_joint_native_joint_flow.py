@@ -56,3 +56,24 @@ class NativeJointFlowTests(unittest.TestCase):
         occluded = replace(moved, upper_body_xyc=tuple((x, y, .1 if i in (0, 1, 6, 7) else c)
             for i, (x, y, c) in enumerate(moved.upper_body_xyc)))
         self.assertIsNone(native_joint_assignment_cost(flow, occluded, (1000, 800)))
+
+    def test_actual_intermediate_rasters_keep_the_same_error_and_ownership_checks(self):
+        previous, current, subject, moved = self.fixture()
+        # These are supplied real rasters, not an interpolated/fabricated pose.
+        flow = native_joint_pixel_flows(previous, current, (subject,),
+            intermediate_pixels=(previous.copy(), current.copy()))[0]
+        self.assertIsNotNone(flow)
+        self.assertLess(native_joint_assignment_cost(flow, moved, (1000, 800)), .02)
+        self.assertTrue(all(row[5] <= 1.25 for row in flow.joints))
+        self.assertFalse(flow.to_dict()['quality_approved'])
+        self.assertEqual(native_joint_pixel_flows(previous, current, (subject,),
+            intermediate_pixels=(np.zeros_like(previous),)), (None,))
+
+    def test_bad_intervening_raster_does_not_get_skipped_or_resized(self):
+        previous, current, subject, _ = self.fixture()
+        self.assertEqual(native_joint_pixel_flows(previous, current, (subject,),
+            intermediate_pixels=(previous[:400],)), (None,))
+        with self.assertRaises(ValueError):
+            native_joint_pixel_flows(previous, current, (subject,), intermediate_pixels=(None,))
+        with self.assertRaises(ValueError):
+            native_joint_pixel_flows(previous, current, (subject,), intermediate_pixels=(previous,)*13)

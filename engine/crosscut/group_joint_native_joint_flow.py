@@ -27,17 +27,27 @@ class NativeJointPixelFlow:
             cross_camera_correspondence_verified=False, quality_approved=False)
 
 
-def native_joint_pixel_flows(previous_pixels, current_pixels, people):
-    """One pair of LK calls for all bodies, with separate joint-owned patches.
+def native_joint_pixel_flows(previous_pixels, current_pixels, people, *, intermediate_pixels=()):
+    """One pair of LK calls per supplied raster step, jointly for all bodies.
 
     Non-textured, off-screen, missing and inconsistent features stay absent.
     No observed joint is clipped into visibility or replaced by zero motion.
     The consumer must still resolve competing current-body assignments.
+    Fast gestures may supply actual intervening rasters; every step must pass
+    the SAME bidirectional checks. Interpolation and skipped failures cannot
+    create a path. The caller owns exact source/native timing and read budget.
     """
-    if previous_pixels.shape != current_pixels.shape:
+    middle = tuple(intermediate_pixels)
+    if len(middle) > 12:
+        raise ValueError('joint pixel flow accepts at most twelve actual intervening rasters')
+    frames = (previous_pixels, *middle, current_pixels)
+    if any(not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
+            or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 3
+            for frame in frames):
+        raise ValueError('joint pixel flow needs actual BGR8 rasters')
+    if any(frame.shape != previous_pixels.shape for frame in frames[1:]):
         return tuple(None for _ in people)
     previous = cv2.cvtColor(previous_pixels, cv2.COLOR_BGR2GRAY)
-    current = cv2.cvtColor(current_pixels, cv2.COLOR_BGR2GRAY)
     height, width = previous.shape
     feature_rows, groups = [], []
     for owner, person in enumerate(people):
@@ -66,19 +76,29 @@ def native_joint_pixel_flows(previous_pixels, current_pixels, people):
     original = np.asarray(feature_rows, dtype=np.float32).reshape(-1, 1, 2)
     options = dict(winSize=(21, 21), maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
-    forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(previous, current, original, None, **options)
-    if forward is None or forward_status is None:
-        return tuple(None for _ in people)
-    backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, forward, None, **options)
-    if backward is None or backward_status is None:
-        return tuple(None for _ in people)
-    positions, moved, returned = original.reshape(-1, 2), forward.reshape(-1, 2), backward.reshape(-1, 2)
-    errors = np.linalg.norm(returned-positions, axis=1)
-    valid = (forward_status.reshape(-1).astype(bool) & backward_status.reshape(-1).astype(bool)
-        & np.isfinite(errors) & (errors <= 1.25)
-        & np.all(np.isfinite(moved), axis=1)
-        & (moved[:, 0] >= 0) & (moved[:, 0] < width)
-        & (moved[:, 1] >= 0) & (moved[:, 1] < height))
+    positions = original.reshape(-1, 2)
+    moving = original
+    valid = np.ones(len(original), dtype=bool)
+    errors = np.zeros(len(original), dtype=np.float32)
+    for frame in frames[1:]:
+        current = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(previous, current, moving, None, **options)
+        if forward is None or forward_status is None:
+            return tuple(None for _ in people)
+        backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, forward, None, **options)
+        if backward is None or backward_status is None:
+            return tuple(None for _ in people)
+        moved = forward.reshape(-1, 2)
+        step_errors = np.linalg.norm(backward.reshape(-1, 2)-moving.reshape(-1, 2), axis=1)
+        valid &= (forward_status.reshape(-1).astype(bool) & backward_status.reshape(-1).astype(bool)
+            & np.isfinite(step_errors) & (step_errors <= 1.25)
+            & np.all(np.isfinite(moved), axis=1)
+            & (moved[:, 0] >= 0) & (moved[:, 0] < width)
+            & (moved[:, 1] >= 0) & (moved[:, 1] < height))
+        errors = np.maximum(errors, step_errors)
+        # Failed features remain failed across every subsequent step.
+        moving = forward
+        previous = current
     rows = [[] for _ in people]
     for owner, joint, x, y, start, end in groups:
         indices = np.flatnonzero(valid[start:end])+start

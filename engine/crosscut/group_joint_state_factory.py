@@ -87,18 +87,32 @@ def assemble_joint_group_states(*,plan,domain,path):
     source aliasing cannot erase a cut or change an outer sample. Descriptor,
     dense-subject, motion, review and binding refresh still belong to the owner.
     """
+    return _assemble_group_state_path(plan=plan,domain=domain,path=path,state_count=4)
+
+
+def assemble_single_group_source_camera_state(*,plan,domain,path):
+    """Fixed L -> one complete mutable X -> fixed R, not a fake B/C seam.
+
+    X may span multiple canonical cells but owns one entire native/camera
+    trajectory. This sibling numeric factory grants no semantic admission,
+    and does not silently change the existing four-state editorial contract.
+    """
+    return _assemble_group_state_path(plan=plan,domain=domain,path=path,state_count=3)
+
+
+def _assemble_group_state_path(*,plan,domain,path,state_count):
     if (not isinstance(plan,RenderPlan) or not isinstance(domain,GroupSourceDomain)
-            or not isinstance(path,tuple) or len(path)!=4 or any(not isinstance(s,GroupSourceCameraState)
+            or not isinstance(path,tuple) or len(path)!=state_count or any(not isinstance(s,GroupSourceCameraState)
                 or s.slot!=i for i,s in enumerate(path))
             or any(a.end_output_frame!=b.first_output_frame for a,b in zip(path,path[1:]))):
-        raise ValueError('joint assembly needs one complete consistent four-state path')
+        raise ValueError('joint assembly needs one complete consistent declared state path')
     segments=list(plan.segments);changed=set()
     for state in path:
         state.bind_source(domain)
         first,end,counts=_cell_interval(plan,state.first_output_frame,state.end_output_frame)
         if state.segment_output_frame_counts!=tuple(counts[first:end]) or len(state.segments)!=end-first:
             raise ValueError('joint state changed canonical cell/frame authority')
-        if state.slot in (0,3):
+        if state.slot in (0,state_count-1):
             original=joint_state_from_render_plan(plan=plan,domain=domain,slot=state.slot,
                 first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role,
                 editorial_contract_sha256=state.editorial_contract_sha256)

@@ -5,11 +5,13 @@ named identity, whole-head visibility, required-part coverage or cut quality.
 All target references are chosen before comparing source appearance/cameras;
 ambiguous/missing rows remain unavailable rather than becoming a zero score.
 """
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
+import json
 import math
 from itertools import product
 from pathlib import Path
+from time import monotonic
 
 import cv2
 import numpy as np
@@ -25,6 +27,34 @@ from .group_joint_person_ownership import (OwnedPersonObservation, ownership_pol
 from .render import aligned_render_segment
 from .render_frame_schedule import sampler_frame_schedule
 from .visual_score import _working_frame
+
+
+def locally_associated_face_roi_target(before_heads, after_heads, reference):
+    """Existing local recovery geometry, BEFORE counted appearance sensing.
+
+    The .7/.55 IoU, .08 displacement and .85..1.18 scale limits are the normal
+    nearby-face recovery policy, not a new cross-camera identity threshold.
+    All competing freshly detected faces take part in uniqueness checks.
+    """
+    def unique_near(heads, minimum):
+        ranked = sorted(((_iou(head.box_xywh, reference.box_xywh), head) for head in heads),
+            key=lambda item: item[0], reverse=True)
+        if (not ranked or ranked[0][0] < minimum or len(ranked) > 1
+                and ranked[1][0] >= .35 and ranked[0][0]-ranked[1][0] < .1):
+            return None
+        return ranked[0][1]
+    for head in (*before_heads, *after_heads, reference):
+        box = head.box_xywh
+        if (min(box[:2]) < 0 or box[0]+box[2] > 1.000001 or box[1]+box[3] > 1.000001):
+            return None
+    left, right = unique_near(before_heads, .7), unique_near(after_heads, .55)
+    if left is None or left.observation_id != reference.observation_id or right is None:
+        return None
+    a, b = reference.box_xywh, right.box_xywh
+    shift = math.hypot(b[0]+b[2]/2-a[0]-a[2]/2, b[1]+b[3]/2-a[1]-a[3]/2)
+    if shift > .08 or any(not .85 <= b[n]/a[n] <= 1.18 for n in (2, 3)):
+        return None
+    return right
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +88,34 @@ class NativeFaceAppearance:
     @property
     def person_observation_id(self):
         return None  # a native face track does not resolve body/arm ownership
+
+
+@dataclass(frozen=True, slots=True)
+class InheritedFocalReference:
+    """Parent-frozen semantic seed; not an appearance-derived identity claim.
+
+    The normal parent still owns live authority validation. This discovery
+    helper only checks that its first raw native observation is the one the
+    parent named; it cannot infer or certify the semantic reference itself.
+    """
+    semantic_reference: str
+    parent_authority_id: str
+    request_source_index: int
+    native_frame_index: int
+    observation_sha256: str
+    face_observation_id: int
+
+    def __post_init__(self):
+        if (any(not isinstance(value, str) or not value.strip() or len(value) > 512
+                for value in (self.semantic_reference, self.parent_authority_id))
+                or any(type(value) is not int or value < 0 for value in (
+                    self.request_source_index, self.native_frame_index, self.face_observation_id))
+                or not isinstance(self.observation_sha256, str) or len(self.observation_sha256) != 64
+                or any(c not in '0123456789abcdef' for c in self.observation_sha256)):
+            raise ValueError('inherited focal reference needs parent authority and an exact raw native seed')
+
+    def to_dict(self):
+        return asdict(self)
 
 
 def register_owned_focal_appearance_model(session, model_path):
@@ -151,13 +209,150 @@ def _dominant_owned_face(row, appearances):
     return values[0] if len(values) == 1 else None
 
 
+def _native_pair_is_continuous(session, left, right):
+    if (left.request_source_index != right.request_source_index
+            or left.native_frame_index >= right.native_frame_index):
+        return False
+    clock = session.domain.render_frame_clocks[session.domain.eligible_index(left.request_source_index)]
+    return not any(left.native_frame_index < math.ceil(t*float(clock.frame_rate)-1e-9) <= right.native_frame_index
+        for t in session.domain.cuts_for_request(left.request_source_index))
+
+
+class NativeFocalLinkGraph:
+    """Window-local pair sensing, never a semantic/part/identity receipt.
+
+    Build adjacent pairs as each row arrives, while at most two native
+    rasters are needed. All face/body alternatives are measured once, then
+    triplet ranking reads this graph without any decode/resize/flow calls.
+    Cached edges include raw-row identities; false/unknown edges are cached
+    too. Raw LK feature ownership still requires the separate part producer.
+    """
+    def __init__(self, session, *, maximum_pair_observations=128,
+            maximum_analysis_pair_bytes=16*1024*1024):
+        if any(type(value) is not int or value < 1 for value in (
+                maximum_pair_observations, maximum_analysis_pair_bytes)):
+            raise ValueError('native focal graph needs explicit finite pair and analysis budgets')
+        self.session = session
+        self.maximum_pairs = maximum_pair_observations
+        self.maximum_analysis_bytes = maximum_analysis_pair_bytes
+        self.pairs = {}
+        self.unique_pairs = self.lookups = self.peak_analysis_bytes = self.peak_raw_pair_bytes = 0
+        self.pair_sensing_seconds = 0.
+
+    @staticmethod
+    def _appearance_key(item):
+        if not isinstance(item, (NativeFaceAppearance, OwnedFocalAppearance)):
+            raise ValueError('native focal graph requires explicit face/body appearance alternatives')
+        return (type(item).__name__, item.face_observation_id, item.person_observation_id)
+
+    def _assert_row_binding(self, row):
+        identity = self.session._assert_source_identity(row.request_source_index)
+        clock = self.session.domain.render_frame_clocks[self.session.domain.eligible_index(row.request_source_index)]
+        clock_sha = hashlib.sha256(json.dumps(clock.to_dict(), sort_keys=True,
+            separators=(',', ':')).encode()).hexdigest()
+        if identity != row.source_file_identity or clock_sha != row.source_clock_identity:
+            raise ValueError('native focal graph raw row source/file/clock binding changed')
+        for name, digest in row.model_content_sha256:
+            self.session._assert_model_assets(name)
+            if self.session.models[name][2] != digest:
+                raise ValueError('native focal graph raw model binding changed')
+        for name, digest in row.model_adapter_fingerprints:
+            if self.session.model_adapters[name] != digest:
+                raise ValueError('native focal graph raw adapter binding changed')
+
+    def add_pair(self, left, right, before_values, after_values):
+        self.session.budget.check()
+        self._assert_row_binding(left); self._assert_row_binding(right)
+        key = (left.sha256, right.sha256)
+        if key in self.pairs:
+            raise ValueError('native focal graph pair may be measured only once per window')
+        alternatives = tuple(product(before_values, after_values))
+        if self.unique_pairs+len(alternatives) > self.maximum_pairs:
+            raise ValueError('native focal graph pair overflow, not success-biased truncation')
+        started = monotonic()
+        observed = {}
+        continuous = _native_pair_is_continuous(self.session, left, right)
+        if not alternatives or not continuous:
+            self.pairs[key] = observed
+            return
+        pixels_before = self.session.native_pixels(left.request_source_index, left.native_frame_index)
+        pixels_after = self.session.native_pixels(right.request_source_index, right.native_frame_index)
+        if pixels_before is None or pixels_after is None:
+            self.pairs[key] = observed
+            return
+        if (hashlib.sha256(memoryview(pixels_before)).hexdigest() != left.native_pixel_sha256
+                or hashlib.sha256(memoryview(pixels_after)).hexdigest() != right.native_pixel_sha256
+                or pixels_before.shape != pixels_after.shape
+                or pixels_before.shape[1::-1] != left.frame_size_wh
+                or pixels_after.shape[1::-1] != right.frame_size_wh):
+            raise ValueError('native focal graph pixels differ from the measured raw rows')
+        self.peak_raw_pair_bytes = max(self.peak_raw_pair_bytes, pixels_before.nbytes+pixels_after.nbytes)
+        tracking_before = _working_frame(pixels_before, maximum_width=960)
+        tracking_after = _working_frame(pixels_after, maximum_width=960)
+        analysis_bytes = tracking_before.nbytes+tracking_after.nbytes
+        if analysis_bytes > self.maximum_analysis_bytes:
+            raise ValueError('native focal graph analysis pair exceeds its byte budget')
+        self.peak_analysis_bytes = max(self.peak_analysis_bytes, analysis_bytes)
+        before_heads = {head.observation_id: head for head in left.heads}
+        after_heads = {head.observation_id: head for head in right.heads}
+        flows = None
+        for before, after in alternatives:
+            self.session.budget.check()
+            self.unique_pairs += 1
+            pair = (self._appearance_key(before), self._appearance_key(after))
+            if pair in observed:
+                raise ValueError('duplicate native appearance IDs cannot add competing pair evidence')
+            basis = None
+            if isinstance(before, NativeFaceAppearance) and isinstance(after, NativeFaceAppearance):
+                a, b = before_heads[before.face_observation_id], after_heads[after.face_observation_id]
+                if focal_landmarks_track(tracking_before, tracking_after, a.landmarks_xy, b.landmarks_xy):
+                    basis = 'native_face_landmark_path_not_whole_head_or_part_ownership'
+                else:
+                    box = _optical_flow_box(tracking_before, tracking_after, a.box_xywh)
+                    if box is not None and _iou(box, b.box_xywh) >= .60:
+                        basis = 'native_face_box_path_not_whole_head_or_part_ownership'
+            elif isinstance(before, OwnedFocalAppearance) and isinstance(after, OwnedFocalAppearance):
+                if flows is None:
+                    flows = dict(zip((p.observation_id for p in left.people),
+                        native_joint_pixel_flows(pixels_before, pixels_after, left.people), strict=True))
+                target = next(p for p in right.people if p.observation_id == after.person_observation_id)
+                flow = flows[before.person_observation_id]
+                cost = native_joint_assignment_cost(flow, target, right.frame_size_wh)
+                alternatives_cost = [native_joint_assignment_cost(flow, p, right.frame_size_wh)
+                    for p in right.people if p.observation_id != target.observation_id]
+                if cost is not None and cost <= .2 and not any(
+                        value is not None and value <= cost+.02 for value in alternatives_cost):
+                    basis = 'native_joint_patch_path_not_owned_visible_surface'
+            observed[pair] = basis
+        self.pairs[key] = observed
+        self.pair_sensing_seconds += monotonic()-started
+
+    def path_available(self, rows, chosen):
+        self.session.budget.check()
+        if len(rows) != len(chosen) or len(rows) < 2:
+            raise ValueError('native focal graph path must name every measured anchor')
+        for row in rows:
+            self._assert_row_binding(row)
+        for left, right, before, after in zip(rows, rows[1:], chosen, chosen[1:]):
+            self.lookups += 1
+            values = self.pairs.get((left.sha256, right.sha256))
+            if values is None or values.get((self._appearance_key(before), self._appearance_key(after))) is None:
+                return False
+        return True
+
+    def to_dict(self):
+        return dict(contract='window_local_native_focal_pair_discovery_graph_v1',
+            unique_pair_observations=self.unique_pairs, cached_pair_lookups=self.lookups,
+            peak_raw_pair_raster_bytes=self.peak_raw_pair_bytes,
+            peak_analysis_pair_raster_bytes=self.peak_analysis_bytes,
+            pair_sensing_seconds=self.pair_sensing_seconds,
+            pixel_reads_during_path_ranking=0, model_calls_during_path_ranking=0,
+            part_feature_ownership_verified=False, quality_approved=False)
+
+
 def _same_source_links(session, rows, chosen):
     for left, right, before, after in zip(rows, rows[1:], chosen, chosen[1:]):
-        if left.native_frame_index >= right.native_frame_index:
-            return False
-        clock = session.domain.render_frame_clocks[session.domain.eligible_index(left.request_source_index)]
-        if any(left.native_frame_index < math.ceil(t*float(clock.frame_rate)-1e-9) <= right.native_frame_index
-                for t in session.domain.cuts_for_request(left.request_source_index)):
+        if not _native_pair_is_continuous(session, left, right):
             return False
         pixels_before = session.native_pixels(left.request_source_index, left.native_frame_index)
         pixels_after = session.native_pixels(right.request_source_index, right.native_frame_index)
@@ -214,20 +409,54 @@ def match_focal_appearance_anchors(reference, alternatives, *, minimum_similarit
     return tuple(chosen), 'appearance_shortlist_only', tuple(similarities), tuple(margins)
 
 
-def resolve_inherited_focal_reference(session, rows, appearances):
-    """Seed before donor search, then keep that actual native face track.
+def _resolve_seeded_focal_reference(session, rows, appearances, seed, *, pixel_path_available=None):
+    if seed is None:
+        return None
+    chosen, info = match_focal_trajectory((seed,) * 3, appearances,
+        path_available=lambda path: path[0].face_observation_id == seed.face_observation_id
+            and (pixel_path_available(path) if pixel_path_available is not None else _same_source_links(session, rows, path)))
+    return chosen if chosen is not None and min(info['similarities']) >= .5 else None
+
+
+def resolve_diagnostic_focal_reference(session, rows, appearances, *, pixel_path_available=None):
+    """Diagnostic area seed before donor search, not an inherited subject.
 
     The target cannot switch to a different/larger face mid-gesture. A global
     area margin at EVERY frame would erase an already measured focal subject
     when a background face briefly grows; native appearance+pixel links, not
     subsequent screen centrality/dominance, resolve the retained reference.
     """
-    seed = _dominant_owned_face(rows[0], appearances[0])
-    if seed is None:
+    return _resolve_seeded_focal_reference(session, rows, appearances,
+        _dominant_owned_face(rows[0], appearances[0]), pixel_path_available=pixel_path_available)
+
+
+def resolve_inherited_focal_reference(session, rows, appearances, *, inherited_reference,
+        pixel_path_available=None):
+    """Bind the caller's frozen subject, never reselect by face size/score.
+
+    A missing/stale native seed is unavailable even if a convenient larger
+    face is detected. The return value remains discovery, not identity or a
+    whole-shot required-part receipt.
+    """
+    if not isinstance(inherited_reference, InheritedFocalReference):
+        raise ValueError('inherited focal discovery requires an explicit parent-frozen reference')
+    if len(rows) != 3 or len(appearances) != 3:
+        raise ValueError('inherited focal discovery requires three native anchors')
+    first = rows[0]
+    if (first.request_source_index != inherited_reference.request_source_index
+            or first.native_frame_index != inherited_reference.native_frame_index
+            or first.sha256 != inherited_reference.observation_sha256):
         return None
-    chosen, info = match_focal_trajectory((seed,) * 3, appearances,
-        path_available=lambda path: _same_source_links(session, rows, path))
-    return chosen if chosen is not None and min(info['similarities']) >= .5 else None
+    if session is not None:
+        session.domain.eligible_index(inherited_reference.request_source_index)
+    seeds = tuple(item for item in appearances[0]
+        if item.face_observation_id == inherited_reference.face_observation_id)
+    heads = tuple(head for head in first.heads
+        if head.observation_id == inherited_reference.face_observation_id)
+    if len(seeds) != 1 or len(heads) != 1:
+        return None
+    return _resolve_seeded_focal_reference(session, rows, appearances, seeds[0],
+        pixel_path_available=pixel_path_available)
 
 
 def match_focal_trajectory(reference, alternatives, *, path_available, maximum_hypotheses=64):
@@ -264,12 +493,13 @@ def match_focal_trajectory(reference, alternatives, *, path_available, maximum_h
         hypotheses=hypotheses, identity_certified=False, required_part_coverage_certified=False)
 
 
-def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False):
+def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False,
+        inherited_reference=None):
     """At most three rasters per eligible source; no full-song reanalysis.
 
-    Reference motive must be inherited by the caller BEFORE this procedure.
-    A global dominant face plus local paths can order candidates, not replace
-    semantic duties or prove the complete B/C/neighbor camera receipt.
+    The normal caller supplies its parent-frozen reference BEFORE discovery.
+    Without it, area-based seeding is explicitly diagnostic, never labelled
+    an inherited subject. Neither path proves a dense final render schedule.
     """
     times = tuple(canonical_times)
     if (len(times) != 3 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
@@ -278,27 +508,48 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
     session.domain.eligible_index(reference_source)
     if type(face_roi_only) is not bool:
         raise ValueError('face-ROI-only sensing must be an explicit non-admission policy')
-    observed = {}; appearances = {}; candidates = []
+    if inherited_reference is not None and (not isinstance(inherited_reference, InheritedFocalReference)
+            or inherited_reference.request_source_index != reference_source):
+        raise ValueError('focal discovery reference differs from the predeclared source')
+    reference_basis = ('parent_frozen_raw_native_seed_not_identity_certification'
+        if inherited_reference is not None else 'diagnostic_area_seed_not_inherited_subject')
+    observed = {}; appearances = {}; candidates = []; graphs = []
     # Declare reference first, not after seeing favorable donor/camera scores.
     sources = (reference_source, *(s for s in session.domain.eligible_indices if s != reference_source))
     for source in sources:
-        rows = tuple(observe_native_group(session, request_source_index=source,
-            native_frame_index=_native_for_canonical(session.domain, source, time)) for time in times)
-        observed[source] = rows
+        rows, values = [], []
+        graph = NativeFocalLinkGraph(session)
         appearance_observer = observe_native_face_appearances if face_roi_only else observe_owned_focal_appearances
-        appearances[source] = tuple(appearance_observer(session, row) for row in rows)
+        for time in times:
+            session.retain_native_pixels(((source,rows[-1].native_frame_index),) if rows else ())
+            row = observe_native_group(session, request_source_index=source,
+                native_frame_index=_native_for_canonical(session.domain, source, time))
+            rows.append(row); values.append(appearance_observer(session, row))
+            # Stream a pair BEFORE decoding the third raster. An overflow
+            # remains the trajectory selector's explicit unavailable result.
+            if len(rows) > 1 and math.prod(len(items) for items in values) <= 64:
+                graph.add_pair(rows[-2], rows[-1], values[-2], values[-1])
+        rows, values = tuple(rows), tuple(values)
+        observed[source] = rows; appearances[source] = values
+        pixel_path_available = lambda path: graph.path_available(rows, path)
         if source == reference_source:
-            reference = resolve_inherited_focal_reference(session, rows, appearances[source])
+            reference = (resolve_diagnostic_focal_reference(session, rows, appearances[source],
+                    pixel_path_available=pixel_path_available)
+                if inherited_reference is None else resolve_inherited_focal_reference(session, rows,
+                    appearances[source], inherited_reference=inherited_reference,
+                    pixel_path_available=pixel_path_available))
             if reference is None:
                 return dict(contract='bounded_synchronized_owned_focal_source_frontier_v1',
                     status='inherited_focal_reference_unavailable', canonical_times=times,
+                    reference_basis=reference_basis,
                     candidates=[], raw_observations=[row.to_dict() for row in rows],
                     production_admitted=False, cross_source_identity_certified=False, quality_approved=False)
-        # Resolve this donor while its three native rasters are in the byte
-        # LRU. A second all-source pass would evict/redecode 4K sources just
-        # to compare their already measured temporal paths.
+        # Only the already sensed pair graph is needed now. Three 4K native
+        # rasters need not fit together in the default 64MiB raw LRU.
         provisional, path_info = match_focal_trajectory(reference, appearances[source],
-            path_available=lambda path: _same_source_links(session, observed[source], path))
+            path_available=lambda path: (source != reference_source
+                or path[0].face_observation_id == reference[0].face_observation_id)
+                and pixel_path_available(path))
         ranking_similarities = path_info['similarities']
         trajectory_margin = path_info.get('competing_trajectory_margin')
         linked = (provisional is not None and min(ranking_similarities) >= .5
@@ -322,8 +573,12 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
                 face_observation_id=item.face_observation_id,
                 face_box_xywh=next(head.box_xywh for head in row.heads if head.observation_id == item.face_observation_id))
                 for row, item in zip(observed[source], anchors)]))
+        graphs.append(dict(source_index=source, **graph.to_dict()))
     return dict(contract='bounded_synchronized_owned_focal_source_frontier_v1', status='measured_shortlist',
         canonical_times=times, reference_source_index=reference_source, candidates=candidates,
+        reference_basis=reference_basis,
+        inherited_reference=None if inherited_reference is None else inherited_reference.to_dict(),
+        source_local_pair_graphs=graphs,
         raw_observations=[row.to_dict() for rows in observed.values() for row in rows],
         target_declared_before_donor_comparison=True, evidence_basis=(
             'native_face_roi_appearance_and_local_landmark_paths_not_body_ownership' if face_roi_only else
@@ -335,4 +590,5 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         appearance_policy=dict(minimum_similarity=.5, minimum_margin=.06, calibrated_identity_confidence=False),
         source_clock_authority=session.domain.to_dict(), production_admitted=False,
         whole_head_extent_verified=False, full_required_part_coverage_verified=False,
+        final_render_schedule_join_verified=False,
         cross_source_identity_certified=False, quality_approved=False)

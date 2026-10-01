@@ -16,6 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+semantic-parts-onnx = [
+  "onnxruntime==1.30.0",
+  "Pillow==12.2.0",
+]
 stage-edit-mlx = [
   "mlx==0.32.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
@@ -24,4 +28,4 @@ stage-edit-mlx = [
 packages = ["crosscut"]
 
 [tool.setuptools.package-data]
-crosscut = ["models/*"]
+crosscut = ["models/*", "licenses/*"]

@@ -4,7 +4,8 @@ from pathlib import Path
 import unittest
 
 from crosscut.group_joint_source_camera import GroupOutputRole,joint_state_from_render_plan
-from crosscut.group_joint_state_factory import candidate_joint_group_state,assemble_joint_group_states
+from crosscut.group_joint_state_factory import (candidate_joint_group_state,assemble_joint_group_states,
+    assemble_single_group_source_camera_state)
 from crosscut.group_source_domain import GroupSourceDomain
 from crosscut.render import RenderPlan,RenderSegment,RenderTransition,EditorialTransformTrack,EditorialTransformKeyframe
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
@@ -141,3 +142,53 @@ class JointStateFactoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'not one complete linear renderer clock'):
             candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=old,
                 eligible_source_index=2)
+
+    def single_shot_fixture(self):
+        plan,domain,_=self.fixture(29.97,Fraction(60000,1001))
+        plan=replace(plan,segments=(plan.segments[0],
+            replace(plan.segments[1],duration=.4),
+            replace(plan.segments[1],source_start=1.4,master_start=1.4,duration=.6),
+            replace(plan.segments[3],source_start=2.,master_start=2.)),
+            transitions=(RenderTransition(),)*3)
+        states=tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=slot,
+            first_output_frame=slot*30,end_output_frame=(slot+1)*30,role=GroupOutputRole.FOCAL_HEAD_ARMS)
+            for slot in range(3))
+        return plan,domain,states
+
+    def test_single_actual_shot_spanning_two_cells_keeps_only_two_visible_cuts(self):
+        from crosscut.group_actual_shots import visible_group_cut_inventory
+        plan,domain,states=self.single_shot_fixture()
+        camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),
+            EditorialTransformKeyframe(.97,1.25,.52,.48)),sampling_canvas_zoom=1.25)
+        whole=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],
+            eligible_source_index=2,camera_track=camera)
+        proposed,changed=assemble_single_group_source_camera_state(plan=plan,domain=domain,
+            path=(states[0],whole,states[2]))
+        self.assertEqual(changed,(1,2))
+        self.assertEqual(tuple(e.first_incoming_output_frame for e in visible_group_cut_inventory(proposed,domain)),(30,60))
+        self.assertEqual(whole.segment_output_frame_counts,(12,18))
+        self.assertEqual(tuple(s.editorial_transform.sampling_canvas_zoom for s in proposed.segments[1:3]),(1.25,1.25))
+        self.assertGreater(proposed.segments[2].editorial_transform.evaluate(0.).zoom,1.1)
+        rebound=joint_state_from_render_plan(plan=proposed,domain=domain,slot=1,
+            first_output_frame=30,end_output_frame=60,role=whole.role)
+        self.assertEqual(rebound.key,whole.key)
+        self.assertEqual(proposed.segments[0],plan.segments[0])
+        self.assertEqual(proposed.segments[3],plan.segments[3])
+
+    def test_single_shot_factory_rejects_changed_right_neighbor_or_erased_outer_cut(self):
+        plan,domain,states=self.single_shot_fixture()
+        with self.assertRaisesRegex(ValueError,'fixed outer neighbor'):
+            assemble_single_group_source_camera_state(plan=plan,domain=domain,path=(states[0],states[1],
+                replace(states[2],segments=(replace(states[2].segments[0],editorial_transform=
+                    EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),))),))))
+        aliased=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],eligible_source_index=3)
+        with self.assertRaisesRegex(ValueError,'visible cut cadence'):
+            assemble_single_group_source_camera_state(plan=plan,domain=domain,path=(states[0],aliased,states[2]))
+
+    def test_three_and_four_state_factory_contracts_are_not_interchangeable(self):
+        plan,domain,states=self.single_shot_fixture()
+        with self.assertRaisesRegex(ValueError,'declared state path'):
+            assemble_joint_group_states(plan=plan,domain=domain,path=states)
+        four_plan,four_domain,four_states=self.fixture()
+        with self.assertRaisesRegex(ValueError,'declared state path'):
+            assemble_single_group_source_camera_state(plan=four_plan,domain=four_domain,path=four_states)

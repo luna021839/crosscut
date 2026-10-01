@@ -485,6 +485,7 @@ class VisualBoundaryRepair:
     result_edge_context: Mapping[str, Any]
     result_edge_context_identity: str
     optimizer_edge_context_match: bool
+    measurement_support: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         frozen_candidate_audit = tuple(
@@ -601,6 +602,25 @@ class VisualBoundaryRepair:
             optimizer_context == observed_context
         ):
             raise ValueError("boundary repair edge context match contradicts inputs")
+        if self.measurement_support is not None:
+            support = _freeze_audit_value(self.measurement_support)
+            if (not isinstance(support, Mapping)
+                    or support.get('contract') != 'boundary_repair_declared_output_sample_support_v1'
+                    or type(support.get('renderer_bound')) is not bool
+                    or type(support.get('output_fps')) not in (int, float)
+                    or not math.isfinite(support['output_fps']) or support['output_fps'] <= 0
+                    or type(support.get('output_timeline_origin_seconds')) not in (int, float)
+                    or not math.isfinite(support['output_timeline_origin_seconds'])):
+                raise ValueError('boundary repair measurement support contract is invalid')
+            intervals = support.get('output_frame_intervals')
+            if (not isinstance(intervals, tuple) or len(intervals) > 512
+                    or any(not isinstance(v, tuple) or len(v) != 2
+                        or any(type(n) is not int or n < 0 for n in v) or v[0] >= v[1]
+                        for v in intervals)
+                    or any(a[1] > b[0] for a,b in zip(intervals,intervals[1:]))
+                    or support['renderer_bound'] and not intervals):
+                raise ValueError('boundary repair measurement support intervals are invalid')
+            object.__setattr__(self, 'measurement_support', support)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -634,6 +654,8 @@ class VisualBoundaryRepair:
             "optimizer_edge_context_match": (
                 self.optimizer_edge_context_match
             ),
+            **({'measurement_support': _thaw_audit_value(self.measurement_support)}
+                if self.measurement_support is not None else {}),
         }
 
 
@@ -2200,6 +2222,7 @@ def repair_visual_timeline_boundaries(
 
     geometry_provider_attempts: set[tuple[int, float]] = set()
     geometry_provider_failures: set[tuple[int, float]] = set()
+    active_descriptor_queries: set[tuple[int, float]] = set()
 
     def sample_descriptor(
         source_index: int,
@@ -2207,6 +2230,7 @@ def repair_visual_timeline_boundaries(
     ) -> FrameVisualDescriptor | None:
         key = (source_index, round(float(seconds), 7))
         geometry_provider_attempts.add(key)
+        active_descriptor_queries.add((source_index, float(seconds)))
         descriptor = provider(source_index, seconds)
         if descriptor is None:
             geometry_provider_failures.add(key)
@@ -2315,6 +2339,7 @@ def repair_visual_timeline_boundaries(
     same_source = 0
     try:
         for boundary_index in boundary_indices_to_review:
+            active_descriptor_queries = set()
             outgoing = choices[boundary_index]
             incoming = choices[boundary_index + 1]
             if outgoing.source_index == incoming.source_index:
@@ -2336,6 +2361,7 @@ def repair_visual_timeline_boundaries(
             renderer_bound = outgoing_clock is not None and incoming_clock is not None
             output_origin = choices[0].canonical_master_start
             rendered_clocks_by_boundary = {}
+            measured_output_ticks = set()
 
             def rendered_sample_times(boundary, flank_frames=3):
                 key = (boundary, flank_frames)
@@ -2356,6 +2382,7 @@ def repair_visual_timeline_boundaries(
                     samples = hard_cut_boundary_sample_clocks(clock_plan,
                         {outgoing.source_index: outgoing_clock, incoming.source_index: incoming_clock},
                         boundary_index=boundary_index, flank_frames=flank_frames)
+                    measured_output_ticks.update(sample.output_frame_index for sample in samples)
                     rendered_clocks_by_boundary[key] = tuple(sample.source_request_seconds for sample in samples)
                 return rendered_clocks_by_boundary[key]
 
@@ -2817,6 +2844,19 @@ def repair_visual_timeline_boundaries(
                     optimizer_edge_context_match=(
                         optimizer_edge_context == observed_edge_context
                     ),
+                    measurement_support={
+                        'contract': 'boundary_repair_declared_output_sample_support_v1',
+                        'renderer_bound': renderer_bound,
+                        'output_fps': output_fps,
+                        'output_timeline_origin_seconds': output_origin,
+                        # Includes every requested candidate/scene-guard flank,
+                        # not just the selected endpoint or adjacent cell IDs.
+                        'output_frame_intervals': ([(min(measured_output_ticks), max(measured_output_ticks)+1)]
+                            if measured_output_ticks else []),
+                        'descriptor_queries': [dict(source_index=source, source_seconds=seconds)
+                            for source,seconds in sorted(active_descriptor_queries)],
+                        'projected_part_or_quality_certificate': False,
+                    },
                 )
             )
     finally:

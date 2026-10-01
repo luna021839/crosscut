@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from time import monotonic
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -164,6 +165,76 @@ class JointObservationSessionTests(unittest.TestCase):
         self.assertFalse(capture.isOpened());self.assertTrue(session.closed)
         self.assertEqual((session.raw_bytes,session.projected.bytes),(0,0))
         with self.assertRaisesRegex(ValueError,'closed'):session.native_pixels(2,15)
+
+    def test_external_weight_change_invalidates_native_and_projected_cache_hits(self):
+        dependency=Path(self.directory.name)/'fixture.onnx.data'
+        dependency.write_bytes(b'disposable external weights')
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            calls=[]
+            session.register_model('external-fixture',self.model,
+                lambda p:calls.append(p.shape) or p.shape,asset_dependencies=(dependency,))
+            session.observe_native(2,15,model='external-fixture')
+            session.observe(self.state,15,model='external-fixture')
+            self.assertEqual(len(calls),2)
+            self.assertIn('fixture.onnx.data',session.diagnostics()['model_external_asset_sha256']['external-fixture'])
+            dependency.write_bytes(b'changed disposable external weights')
+            for operation in (lambda:session.observe_native(2,15,model='external-fixture'),
+                    lambda:session.observe(self.state,15,model='external-fixture')):
+                with self.assertRaisesRegex(ValueError,'external asset identity changed'):operation()
+            self.assertEqual(len(calls),2,'cached result cannot hide changed external weights')
+
+    def test_external_asset_changed_inside_observer_is_not_cached(self):
+        dependency=Path(self.directory.name)/'changing-fixture.onnx.data'
+        dependency.write_bytes(b'disposable weights')
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            def observer(pixels):
+                dependency.write_bytes(b'changed fixture inside model call')
+                return pixels.shape
+            session.register_model('changing-external-fixture',self.model,observer,asset_dependencies=(dependency,))
+            with self.assertRaisesRegex(ValueError,'external asset identity changed'):
+                session.observe_native(2,15,model='changing-external-fixture')
+            self.assertEqual(session.model_observations,{})
+
+    def test_raw_lru_evicts_before_third_decode_and_does_not_copy_owned_rasters(self):
+        size=96*54*3
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget(),maximum_raw_cache_bytes=2*size) as session:
+            session.native_pixels(2,15);session.native_pixels(2,16);session.native_pixels(2,17)
+            report=session.diagnostics()
+            self.assertEqual(report['peak_raw_pixel_cache_bytes'],2*size)
+            self.assertEqual(report['peak_owned_raw_raster_bytes_during_decode'],2*size)
+            self.assertEqual(report['raw_pixel_cache_eviction_count'],1)
+            self.assertEqual(report['native_pixel_copy_count'],0)
+            self.assertEqual(report['budget']['counts']['new_decodes'],3)
+            self.assertFalse(report['process_peak_rss_measured'])
+
+    def test_explicit_pair_retention_keeps_model_evidence_but_later_pixel_miss_is_counted(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            calls=[]
+            session.register_model('retention-fixture',self.model,lambda p:calls.append(p.shape) or p.shape)
+            session.observe_native(2,15,model='retention-fixture')
+            kept=session.native_pixels(2,16)
+            session.retain_native_pixels(((2,16),))
+            self.assertIs(session.native_pixels(2,16),kept)
+            self.assertEqual(len(session.raw),1)
+            self.assertEqual(session.observe_native(2,15,model='retention-fixture'),(54,96,3))
+            self.assertEqual(len(calls),1,'raster release must not discard immutable model evidence')
+            self.assertEqual(session.budget.counts['new_decodes'],2)
+            session.native_pixels(2,15)
+            self.assertEqual(session.budget.counts['new_decodes'],3,'re-materialization is not hidden')
+            for invalid in (((1,15),),((2,True),),((2,9000),),[(2,15)]):
+                with self.assertRaises(ValueError):session.retain_native_pixels(invalid)
+
+    def test_decoder_view_is_copied_without_mutating_its_parent_buffer(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            session.native_pixels(2,15)
+            parent=np.zeros((54,192,3),np.uint8);view=parent[:,:96,:]
+            with patch.object(session.readers[2],'frame_at',return_value=view):
+                actual=session.native_pixels(2,16)
+            self.assertFalse(actual.flags.writeable)
+            self.assertTrue(actual.flags.owndata)
+            parent[:]=25
+            self.assertEqual(int(actual.max()),0)
+            self.assertEqual(session.diagnostics()['native_pixel_copy_count'],1)
 
 
 if __name__=='__main__':unittest.main()
