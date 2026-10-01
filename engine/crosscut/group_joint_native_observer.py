@@ -4,15 +4,17 @@ Rows contain real model/ROI/native/file/pixel identities and remain replayable.
 Detection IDs are frame-local, never persistent subject or member identities.
 There is no acquisition, Haar fallback, hidden descriptor model or approval.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass,replace
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import cv2
 
 from .group_joint_formation import ObservedFormationPerson
 from .group_joint_formation_observer import register_formation_models
+from .group_joint_person_ownership import OwnedPersonObservation,bind_person_ownership
 from .group_joint_observations import _file_identity
 from .visual_score import YUNET_EXPECTED_SHA256, _working_frame
 
@@ -23,6 +25,20 @@ class NativeGroupHead:
     box_xywh: tuple
     landmarks_xy: tuple
     confidence: float
+    candidate_body_observation_ids: tuple[int,...] = ()
+    extent_basis: str = 'face_roi_not_whole_head'
+
+    def __post_init__(self):
+        if (type(self.observation_id) is not int or self.observation_id<0
+                or not isinstance(self.box_xywh,tuple) or len(self.box_xywh)!=4
+                or any(type(v) not in (int,float) or not math.isfinite(v) for v in self.box_xywh)
+                or min(self.box_xywh[2:])<=0
+                or type(self.confidence) not in (int,float) or not 0<=self.confidence<=1
+                or not isinstance(self.landmarks_xy,tuple) or len(self.landmarks_xy)!=5
+                or any(not isinstance(p,tuple) or len(p)!=2
+                    or any(type(v) not in (int,float) or not math.isfinite(v) for v in p) for p in self.landmarks_xy)
+                or self.extent_basis!='face_roi_not_whole_head'):
+            raise ValueError('native face observation must retain its actual ROI/landmarks, not whole-head authority')
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,9 +53,36 @@ class NativeGroupObservation:
     people: tuple[ObservedFormationPerson, ...]
     heads: tuple[NativeGroupHead, ...]
     reason: str
+    model_adapter_fingerprints: tuple[tuple[str,str],...] = ()
+
+    def __post_init__(self):
+        sha=lambda value:isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+        if (type(self.request_source_index) is not int or self.request_source_index<0
+                or type(self.native_frame_index) is not int or self.native_frame_index<0
+                or not isinstance(self.frame_size_wh,tuple) or len(self.frame_size_wh)!=2
+                or any(type(v) is not int or v<0 for v in self.frame_size_wh)
+                or self.native_pixel_sha256 is not None
+                    and (not sha(self.native_pixel_sha256) or min(self.frame_size_wh)<1)
+                or not sha(self.source_clock_identity)
+                or not isinstance(self.source_file_identity,tuple) or len(self.source_file_identity)!=5
+                or any(type(v) is not int for v in self.source_file_identity)
+                or not isinstance(self.people,tuple) or len(self.people)>12
+                or any(not isinstance(p,ObservedFormationPerson) for p in self.people)
+                or len({p.observation_id for p in self.people})!=len(self.people)
+                or not isinstance(self.heads,tuple) or len(self.heads)>24
+                or any(not isinstance(head,NativeGroupHead) for head in self.heads)
+                or len({head.observation_id for head in self.heads})!=len(self.heads)):
+            raise ValueError('native observation requires bounded source/native/pixel/raw-model identities')
+        for values in (self.model_content_sha256,self.model_adapter_fingerprints):
+            if (not isinstance(values,tuple) or any(not isinstance(row,tuple) or len(row)!=2
+                        or not isinstance(row[0],str) or not row[0] or not sha(row[1]) for row in values)
+                    or len({row[0] for row in values})!=len(values)):
+                raise ValueError('native model and adapter identities must be immutable named SHA-256 values')
+        if self.model_adapter_fingerprints and tuple(n for n,_ in self.model_adapter_fingerprints)!=tuple(n for n,_ in self.model_content_sha256):
+            raise ValueError('every native model must bind the same named adapter set')
 
     def to_dict(self):
-        return dict(contract='actual_source_native_person_body_head_observation_rows_v1', **asdict(self),
+        return dict(contract='actual_source_native_owned_person_body_face_observation_rows_v2', **asdict(self),
             detection_ids_are_frame_local=True, persistent_subject_correspondence_verified=False,
             named_member_identity_certified=False, motion_certified=False,
             visibility_certified=False, quality_approved=False)
@@ -76,7 +119,11 @@ def register_joint_native_models(session, *, person_model_path, pose_model_path,
             result.append(NativeGroupHead(index, (x/width, y/height, w/width, h/height),
                 points, float(row[14])))
         return tuple(result)
-    session.register_model('yunet_head_faces', head_model_path, heads)
+    session.register_model('yunet_head_faces', head_model_path, heads,
+        adapter_fingerprint={'contract':'yunet_native_face_not_whole_head_v1',
+            'implementation_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'opencv_version':cv2.__version__,'working_maximum_width':960,
+            'confidence':.76,'nms':.3,'top_k':5000})
 
 
 def observe_native_group(session, *, request_source_index, native_frame_index):
@@ -94,18 +141,23 @@ def observe_native_group(session, *, request_source_index, native_frame_index):
     identity = _file_identity(session.domain.request_sources[source])
     models = tuple((name, session.models[name][2]) for name in
         ('nanodet_people', 'rtmpose_body7', 'yunet_head_faces'))
+    adapters=tuple((name,session.model_adapters[name]) for name,_ in models)
     def snapshot(reason, people=(), heads=()):
         return NativeGroupObservation(source, native,
             (pixels.shape[1], pixels.shape[0]) if pixels is not None else (0, 0), clock_identity, identity,
             hashlib.sha256(memoryview(pixels)).hexdigest() if pixels is not None else None,
-            models, tuple(people), tuple(heads), reason)
+            models, tuple(people), tuple(heads), reason,adapters)
     if pixels is None:
         return snapshot('exact_native_decode_unavailable')
+    heads=session.observe_native(source,native,model='yunet_head_faces')
+    head_missing=heads is None
+    if head_missing:
+        heads=()
     rows = session.observe_native(source, native, model='nanodet_people')
     if rows is None:
-        return snapshot('person_model_unavailable')
+        return snapshot('person_model_unavailable',heads=heads)
     if len(rows) > 12:
-        return snapshot('person_detection_overflow_not_truncated')
+        return snapshot('person_detection_overflow_not_truncated',heads=heads)
     height, width = pixels.shape[:2]
     people = []
     for index, row in enumerate(rows):
@@ -114,10 +166,22 @@ def observe_native_group(session, *, request_source_index, native_frame_index):
         if (box[2] <= 0 or box[3] <= 0 or box[0] < 0 or box[1] < 0
                 or box[0]+box[2] > 1.000001 or box[1]+box[3] > 1.000001):
             return snapshot('invalid_source_native_body_roi')
-        body = session.observe_native(source, native, model='rtmpose_body7', arguments={'bbox_xywh': list(box)})
+        candidates=tuple(head for head in heads if box[0]<=head.box_xywh[0]+head.box_xywh[2]/2<=box[0]+box[2]
+            and box[1]<=head.box_xywh[1]+head.box_xywh[3]/2<=box[1]+box[3])
+        arguments={'bbox_xywh':list(box)}
+        if len(candidates)==1 and all(v>=0 for v in candidates[0].box_xywh[:2]) \
+                and candidates[0].box_xywh[0]+candidates[0].box_xywh[2]<=1 \
+                and candidates[0].box_xywh[1]+candidates[0].box_xywh[3]<=1:
+            arguments['face_bbox_xywh']=list(candidates[0].box_xywh)
+        body = session.observe_native(source, native, model='rtmpose_body7', arguments=arguments)
         points = body.upper_body_xyc if body is not None and body.reason == 'observed' else ()
-        people.append(ObservedFormationPerson(index, box, points, confidence))
-    heads = session.observe_native(source, native, model='yunet_head_faces')
-    if heads is None:
-        return snapshot('head_model_unavailable_or_detection_overflow', people)
-    return snapshot('observed_native_model_rows' if people else 'no_people_detected', people, heads)
+        people.append(OwnedPersonObservation(index,box,points,confidence,
+            pose_crop_xywh=None if body is None else body.pose_crop_xywh,
+            source_pixel_to_pose_input_affine=() if body is None else body.source_pixel_to_pose_input_affine,
+            raw_pose_xyc=() if body is None else body.raw_keypoints_xyc,
+            pose_reason='pose_model_unavailable' if body is None else body.reason,
+            face_anchor_consistent=None if body is None else body.face_anchor_consistent))
+    people,owners=bind_person_ownership(tuple(people),heads,(width,height))
+    heads=tuple(replace(head,candidate_body_observation_ids=tuple(owners[head.observation_id])) for head in heads)
+    return snapshot('head_model_unavailable_or_detection_overflow' if head_missing else
+        'observed_native_model_rows' if people else 'no_people_detected',people,heads)

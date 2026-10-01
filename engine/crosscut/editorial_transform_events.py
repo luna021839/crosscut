@@ -99,3 +99,27 @@ def rendered_transform_event_records(
                 ordered.append(record)
         result[component] = tuple(ordered)
     return result
+
+
+def validate_rendered_motion_event_inventory(segments, fps, motion):
+    """Reject stale/forged inventory before encoding, without media inference.
+
+    Frame-visible counters have exact rendered semantics. Legacy authored
+    gesture counters retain their different semantics, but cannot exceed the
+    number of nonneutral component targets actually present in the curves.
+    This is not a transform-density or editorial-quality acceptance gate.
+    """
+    records=rendered_transform_event_records(segments,fps)
+    counts={name:getattr(motion,name+'_event_count') for name in _NEUTRAL}
+    if any(type(value) is not int or value<0 for value in counts.values()):
+        raise ValueError('rendered motion event inventory needs nonnegative integer counters')
+    if motion.authored_event_counts:
+        if any(counts[name]!=len(records[name]) for name in _NEUTRAL):
+            raise ValueError('rendered motion event inventory differs from actual frame-visible transform targets')
+    else:
+        capacities={name:sum(_active(_value(keyframe,name),name) for segment in segments
+            if segment.editorial_transform is not None for keyframe in segment.editorial_transform.keyframes)
+            for name in _NEUTRAL}
+        if any(counts[name]>capacities[name] for name in _NEUTRAL):
+            raise ValueError('legacy motion event inventory exceeds actual authored transform targets')
+    return records

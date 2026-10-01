@@ -38,7 +38,8 @@ class GroupJointObservationSession:
             raise ValueError('joint observation session needs bound sources and finite cache/work budgets')
         self.domain=domain;self.budget=budget;self.raw_limit=maximum_raw_cache_bytes
         self.captures={};self.readers={};self.identities={};self.raw=OrderedDict();self.raw_bytes=0
-        self.projected=JointProjectedPixelCache(budget);self.models={};self.geometry={}
+        self.projected=JointProjectedPixelCache(budget);self.models={};self.model_adapters={};self.geometry={}
+        self.model_adapter_preimages={}
         self.model_observations=OrderedDict();self.observation_bytes=0
         self.observation_limit=maximum_model_observation_bytes;self.model_reuse=0
         self.cache_reuse=0;self.closed=False
@@ -121,7 +122,7 @@ class GroupJointObservationSession:
         self._assert_source_identity(source)
         return pixels
 
-    def register_model(self,name,asset_path,observer):
+    def register_model(self,name,asset_path,observer,*,adapter_fingerprint=None):
         """The worker loads each actual model once and supplies its observer."""
         self.budget.check()
         if not isinstance(name,str) or not name or name in self.models or not callable(observer):
@@ -130,7 +131,10 @@ class GroupJointObservationSession:
         with asset_path.open('rb') as stream:
             digest=hashlib.file_digest(stream,'sha256').hexdigest()
         if _file_identity(asset_path)!=identity:raise ValueError('joint model changed while binding its content identity')
+        encoded=json.dumps(adapter_fingerprint,sort_keys=True,separators=(',',':'),allow_nan=False)
         self.models[name]=(asset_path,identity,digest,observer)
+        self.model_adapters[name]=hashlib.sha256(encoded.encode()).hexdigest()
+        self.model_adapter_preimages[name]=json.loads(encoded)
 
     def observe(self,state,output_tick,*,model,arguments=None):
         if model not in self.models:raise ValueError('joint observation model is not owned by this worker')
@@ -148,7 +152,8 @@ class GroupJointObservationSession:
         # must not collide and lend one dancer's cached pose to another.
         encoded_arguments=json.dumps(arguments,sort_keys=True,separators=(',',':'),allow_nan=False)
         bound_arguments=json.loads(encoded_arguments)
-        key=(state.key,output_tick,source_identity,model,self.models[model][2],encoded_arguments)
+        key=(state.key,output_tick,source_identity,model,self.models[model][2],
+            self.model_adapters[model],encoded_arguments)
         if key in self.model_observations:
             payload=self.model_observations.pop(key);self.model_observations[key]=payload;self.model_reuse+=1
             # Private in-process data from this registered worker observer only.
@@ -190,7 +195,8 @@ class GroupJointObservationSession:
             raise ValueError('native model arguments must be explicit named JSON-native values')
         encoded=json.dumps(arguments,sort_keys=True,separators=(',',':'),allow_nan=False)
         bound_arguments=json.loads(encoded)
-        key=('source_native',source,source_identity,clock.packet_grid_sha256,native_frame,model,digest,encoded)
+        key=('source_native',source,source_identity,clock.packet_grid_sha256,native_frame,model,digest,
+            self.model_adapters[model],encoded)
         if key in self.model_observations:
             payload=self.model_observations.pop(key);self.model_observations[key]=payload;self.model_reuse+=1
             return pickle.loads(payload)
@@ -215,6 +221,8 @@ class GroupJointObservationSession:
             projected_pixel_cache_bytes=self.projected.bytes,native_pixel_cache_reuse=self.cache_reuse,
             source_readers={str(s):r.diagnostics() for s,r in self.readers.items()},
             model_content_sha256={name:row[2] for name,row in self.models.items()},
+            model_adapter_fingerprints=dict(self.model_adapters),
+            model_adapter_preimages=json.loads(json.dumps(self.model_adapter_preimages)),
             reused_model_observations=self.model_reuse,model_observation_serialized_cache_bytes=self.observation_bytes,
             counted_decodes='materialized_exact_native_requests_not_hidden_codec_keyframe_work',
             persistent_raw_feature_caches_modified=False,budget=self.budget.to_dict())
@@ -222,7 +230,8 @@ class GroupJointObservationSession:
     def close(self):
         for capture in self.captures.values():capture.release()
         self.captures.clear();self.readers.clear();self.raw.clear();self.raw_bytes=0
-        self.projected.rows.clear();self.projected.bytes=0;self.geometry.clear();self.models.clear()
+        self.projected.rows.clear();self.projected.bytes=0;self.geometry.clear();self.models.clear();self.model_adapters.clear()
+        self.model_adapter_preimages.clear()
         self.model_observations.clear();self.observation_bytes=0
         self.closed=True
 

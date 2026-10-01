@@ -5610,7 +5610,7 @@ def _rendered_candidate_selection_index_domains() -> dict[str, str]:
             ELIGIBLE_SOURCE_INDEX_DOMAIN
         ),
         "complete_candidates[].editorial_motion.segments[].source_index": (
-            ELIGIBLE_SOURCE_INDEX_DOMAIN
+            REQUEST_SOURCE_INDEX_DOMAIN
         ),
         (
             "complete_candidates[].splice_graph_authorization"
@@ -5635,19 +5635,19 @@ def _rendered_candidate_selection_index_domains() -> dict[str, str]:
         (
             "complete_candidates[].editorial_motion.boundary_subject_alignment"
             ".decisions[].outgoing_source_index"
-        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ): REQUEST_SOURCE_INDEX_DOMAIN,
         (
             "complete_candidates[].editorial_motion.boundary_subject_alignment"
             ".decisions[].incoming_source_index"
-        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ): REQUEST_SOURCE_INDEX_DOMAIN,
         (
             "complete_candidates[].editorial_motion.boundary_subject_alignment"
             ".segments[].source_index"
-        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ): REQUEST_SOURCE_INDEX_DOMAIN,
         (
             "complete_candidates[].editorial_motion.boundary_subject_alignment"
             ".source_resolution_headroom[].source_index"
-        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ): REQUEST_SOURCE_INDEX_DOMAIN,
         (
             "complete_candidates[].boundary_look_match.decisions[]"
             ".outgoing_source_index"
@@ -5715,6 +5715,7 @@ def _rendered_candidate_selection_index_domains() -> dict[str, str]:
 def _source_index_mapping(
     sources: Sequence[Path],
     eligible_indices: Sequence[int],
+    *, editorial_motion_domain: str = ELIGIBLE_SOURCE_INDEX_DOMAIN,
 ) -> dict[str, Any]:
     """Describe both source-index domains used by the analysis artifacts.
 
@@ -5727,6 +5728,8 @@ def _source_index_mapping(
     request index after an excluded source creates a gap.
     """
 
+    if editorial_motion_domain not in (REQUEST_SOURCE_INDEX_DOMAIN,ELIGIBLE_SOURCE_INDEX_DOMAIN):
+        raise ValueError('unknown serialized editorial motion source domain')
     request_count = len(sources)
     eligible = tuple(eligible_indices)
     if any(
@@ -5752,7 +5755,7 @@ def _source_index_mapping(
             }
         )
 
-    return {
+    payload = {
         "request_index_domain": REQUEST_SOURCE_INDEX_DOMAIN,
         "eligible_index_domain": ELIGIBLE_SOURCE_INDEX_DOMAIN,
         "render_plan_index_domain": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
@@ -5902,6 +5905,19 @@ def _source_index_mapping(
             "render_plan.segments[].source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
         },
     }
+    for path in tuple(payload['payload_index_domains']):
+        if path.startswith(('editorial_motion.','render.editorial_motion.')):
+            payload['payload_index_domains'][path]=editorial_motion_domain
+    return payload
+
+
+def _serialized_editorial_motion_domain(motion):
+    return (REQUEST_SOURCE_INDEX_DOMAIN if getattr(motion,'eligible_request_indices',None) is not None
+        else ELIGIBLE_SOURCE_INDEX_DOMAIN)
+
+
+def _serialized_editorial_motion_payload(motion):
+    return _with_index_domain(motion.to_dict(),_serialized_editorial_motion_domain(motion))
 
 
 def _with_index_domain(payload: dict[str, Any], domain: str) -> dict[str, Any]:
@@ -22050,8 +22066,11 @@ def _derive_complete_joint_group_candidate(
         face_match_plan=None,
         group_transition_plan=group_transition_plan,
         boundary_affine_plan=None,
-        editorial_motion_plan=editorial_motion_plan,
+        editorial_motion_plan=replace(editorial_motion_plan,
+            eligible_request_indices=tuple(eligible_indices)),
         render_plan=plan,
+        section_plan=section_plan,
+        phrase_times=tuple(phrase_times),
         boundary_look_match=boundary_look_match,
         output_geometry_deferral=None,
         splice_graph_authorization={
@@ -22646,6 +22665,8 @@ def _derive_complete_group_candidate(
             boundary_affine_plan=None,
             editorial_motion_plan=None,
             render_plan=rejected_plan,
+            section_plan=section_plan,
+            phrase_times=tuple(phrase_times),
             splice_graph_authorization=splice_graph_authorization,
             diagnostics=tuple(diagnostics),
             stage_edit_exact_shot_clock=(
@@ -22862,8 +22883,12 @@ def _derive_complete_group_candidate(
         face_match_plan=face_match_plan,
         group_transition_plan=group_transition_plan,
         boundary_affine_plan=boundary_affine_plan,
-        editorial_motion_plan=editorial_motion_plan,
+        editorial_motion_plan=(replace(editorial_motion_plan,
+            eligible_request_indices=tuple(eligible_indices))
+            if editorial_motion_plan is not None else None),
         render_plan=plan,
+        section_plan=section_plan,
+        phrase_times=tuple(phrase_times),
         boundary_look_match=boundary_look_match,
         output_geometry_deferral=output_geometry_deferral,
         splice_graph_authorization=splice_graph_authorization,
@@ -27352,6 +27377,8 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     motion=bundle.editorial_motion_plan
     if not isinstance(motion,EditorialMotionPlan) or len(motion.segments)!=len(plan.segments):
         raise ValueError('GROUP bundle lacks complete motion source/camera authority')
+    from .editorial_transform_events import validate_rendered_motion_event_inventory
+    validate_rendered_motion_event_inventory(plan.segments,plan.fps,motion)
     if (motion.eligible_request_indices!=tuple(eligible_indices)
             and not (motion.eligible_request_indices is None
                 and tuple(eligible_indices)==tuple(range(len(plan.sources))))):
@@ -39740,6 +39767,8 @@ def analyze(
         "source_index_mapping": _source_index_mapping(
             request.sources,
             eligible_indices,
+            editorial_motion_domain=_serialized_editorial_motion_domain(
+                editorial_motion_plan if editorial_motion_plan is not None else member_editorial_motion_plan),
         ),
         "media": [info.to_dict() for info in media],
         "alignment": alignment.to_dict(),
@@ -39958,13 +39987,12 @@ def analyze(
             else None
         ),
         "editorial_motion": (
-            _with_index_domain(
+            _serialized_editorial_motion_payload(
                 (
                     editorial_motion_plan
                     if editorial_motion_plan is not None
                     else member_editorial_motion_plan
-                ).to_dict(),
-                ELIGIBLE_SOURCE_INDEX_DOMAIN,
+                ),
             )
             if (
                 editorial_motion_plan is not None

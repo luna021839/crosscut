@@ -8,6 +8,10 @@ import unittest
 from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from crosscut.post_render_qa import (_bound_local_alignment_tracks, _transform_metrics,
     _IssueCollector, PostRenderQAConfig)
+from crosscut.pipeline import (_serialized_editorial_motion_payload,
+    _serialized_editorial_motion_domain, _source_index_mapping,
+    _rendered_candidate_selection_index_domains, REQUEST_SOURCE_INDEX_DOMAIN,
+    ELIGIBLE_SOURCE_INDEX_DOMAIN)
 from crosscut.shot_context_refinement import attach_shot_context_proposal, attach_coupled_shot_proposal
 from engine.tests.test_shot_context_binding import ShotContextBindingTests, motion_for
 from engine.tests.test_coupled_shot_camera import CoupledShotCameraTests
@@ -108,3 +112,31 @@ class EditorialMotionSourceDomainTests(unittest.TestCase):
         for mapping in ([0, 2, 3], (0, 2, 2), (0, True, 3), (0, 2), (0, -1, 3)):
             with self.subTest(mapping=mapping), self.assertRaises(ValueError):
                 replace(motion, eligible_request_indices=mapping)
+
+    def test_final_manifest_labels_follow_actual_motion_serialization_not_typed_indices(self):
+        motion=eligible_motion(motion_for(ShotContextBindingTests().fixture()[0]))
+        raw=_serialized_editorial_motion_payload(motion)
+        self.assertEqual(raw['index_domain'],REQUEST_SOURCE_INDEX_DOMAIN)
+        self.assertEqual([item['source_index'] for item in raw['segments']],[0,2,3])
+        mapping=_source_index_mapping(tuple(Path(f'{n}.mp4') for n in range(6)),DOMAIN,
+            editorial_motion_domain=_serialized_editorial_motion_domain(motion))
+        for path,domain in mapping['payload_index_domains'].items():
+            if path.startswith(('editorial_motion.','render.editorial_motion.')):
+                self.assertEqual(domain,REQUEST_SOURCE_INDEX_DOMAIN,path)
+        self.assertEqual(mapping['payload_index_domains'][
+            'member_direct_full_frame.editorial_motion.segments[].source_index'],ELIGIBLE_SOURCE_INDEX_DOMAIN)
+
+    def test_unmapped_member_serialization_remains_eligible_and_joint_history_stays_local(self):
+        motion=motion_for(ShotContextBindingTests().fixture()[0])
+        raw=_serialized_editorial_motion_payload(motion)
+        self.assertEqual(raw['index_domain'],ELIGIBLE_SOURCE_INDEX_DOMAIN)
+        self.assertEqual([row['source_index'] for row in raw['segments']],[0,1,2])
+        domains=_rendered_candidate_selection_index_domains()
+        self.assertEqual(domains['complete_candidates[].editorial_motion.segments[].source_index'],
+            REQUEST_SOURCE_INDEX_DOMAIN)
+        self.assertEqual(domains['complete_candidates[].candidate_lineage[].candidate_history'
+            '.editorial_motion_plan.segments[].source_index'],ELIGIBLE_SOURCE_INDEX_DOMAIN)
+
+    def test_unknown_manifest_motion_domain_cannot_be_silently_labeled(self):
+        with self.assertRaisesRegex(ValueError,'serialized editorial motion'):
+            _source_index_mapping((Path('0.mp4'),),(0,),editorial_motion_domain='invented')

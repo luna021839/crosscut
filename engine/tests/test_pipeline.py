@@ -1557,9 +1557,9 @@ class PipelineTests(unittest.TestCase):
             )
             affine = SimpleNamespace()
             boundary_subject = SimpleNamespace()
-            editorial = SimpleNamespace(
-                track_for=lambda _segment_index: None,
-            )
+            editorial = EditorialMotionPlan(
+                tuple(EditorialMotionSegment(i,i,None) for i in range(2)),0,0,0,0,0,
+                analysis_basis='synthetic_complete_candidate')
             request = SimpleNamespace(
                 sources=sources,
                 reference_source=0,
@@ -1642,7 +1642,11 @@ class PipelineTests(unittest.TestCase):
             self.assertIs(bundle.face_match_plan, face_match)
             self.assertIs(bundle.group_transition_plan, transitions)
             self.assertIs(bundle.boundary_affine_plan, affine)
-            self.assertIs(bundle.editorial_motion_plan, editorial)
+            self.assertEqual(bundle.editorial_motion_plan.segments,editorial.segments)
+            self.assertEqual(bundle.editorial_motion_plan.eligible_request_indices,(2,5))
+            self.assertEqual([row['source_index'] for row in
+                bundle.editorial_motion_plan.to_dict()['segments']],[2,5])
+            self.assertEqual(bundle.phrase_times,(10.,12.))
             self.assertIs(bundle.boundary_look_match, boundary_look)
             self.assertEqual(
                 tuple(item.source_index for item in bundle.render_plan.segments),

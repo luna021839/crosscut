@@ -12,6 +12,8 @@ import math
 import cv2
 import numpy as np
 
+from .group_joint_person_ownership import trackable_person_ownership
+
 
 @dataclass(frozen=True, slots=True)
 class NativeJointPixelFlow:
@@ -39,6 +41,8 @@ def native_joint_pixel_flows(previous_pixels, current_pixels, people):
     height, width = previous.shape
     feature_rows, groups = [], []
     for owner, person in enumerate(people):
+        if not trackable_person_ownership(person):
+            continue
         for joint, (x, y, confidence) in enumerate(person.upper_body_xyc):
             if confidence < .3 or not 0 <= x < 1 or not 0 <= y < 1:
                 continue
@@ -108,7 +112,7 @@ def native_joint_assignment_cost(flow, person, frame_size_wh):
     This is a local tracking policy, not calibrated cross-camera confidence.
     It never borrows the .015 margin of the single-time formation diagnostic.
     """
-    if flow is None or len(person.upper_body_xyc) != 8:
+    if flow is None or len(person.upper_body_xyc) != 8 or not trackable_person_ownership(person):
         return None
     common = tuple(row for row in flow.joints if person.upper_body_xyc[row[0]][2] >= .3)
     if len(common) < 3 or len({row[0] for row in common} & {0, 1, 6, 7}) < 2:

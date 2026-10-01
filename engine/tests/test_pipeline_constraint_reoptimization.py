@@ -2352,7 +2352,10 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 boundary_look_measurement_cache=None,
             )
 
-        self.assertIs(bundle.editorial_motion_plan, motion)
+        self.assertEqual(bundle.editorial_motion_plan.eligible_request_indices,(1,3))
+        self.assertEqual(bundle.editorial_motion_plan.segments,motion.segments)
+        self.assertEqual(tuple(row['source_index'] for row in
+            bundle.editorial_motion_plan.to_dict()['segments']),(1,3))
         self.assertEqual(
             tuple(item.source_index for item in bundle.editorial_motion_plan.segments),
             (0, 1),

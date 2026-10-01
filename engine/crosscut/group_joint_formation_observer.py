@@ -28,10 +28,15 @@ def register_formation_models(session,*,person_model_path,pose_model_path):
     detector=_NanoDetFormationDetector(person_model_path)
     pose=BodyPose2DAnalyzer(pose_model_path)
     session.budget.check()
-    session.register_model('nanodet_people',person_model_path,detector.infer)
-    def body(pixels,*,bbox_xywh):
-        return pose.describe(pixels,bbox_xywh=tuple(bbox_xywh))
-    session.register_model('rtmpose_body7',pose_model_path,body)
+    session.register_model('nanodet_people',person_model_path,detector.infer,
+        adapter_fingerprint={'contract':'nanodet_native_people_roi_v1',
+            'implementation_sha256':hashlib.sha256(Path(__file__).with_name('pose.py').read_bytes()).hexdigest(),
+            'observer_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+    def body(pixels,*,bbox_xywh,face_bbox_xywh=None):
+        return pose.describe(pixels,bbox_xywh=tuple(bbox_xywh),
+            face_bbox_xywh=None if face_bbox_xywh is None else tuple(face_bbox_xywh))
+    session.register_model('rtmpose_body7',pose_model_path,body,
+        adapter_fingerprint=BodyPose2DAnalyzer.fingerprint())
 
 
 def observe_formation_people(session,state,output_tick):

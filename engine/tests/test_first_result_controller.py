@@ -62,6 +62,46 @@ class FirstResultControllerTests(unittest.TestCase):
                 self.assertEqual(controller.to_dict()['optional_attempt_count'], 1)
                 self.assertNotEqual(controller.to_dict()['attempts'][0]['status'], 'running')
 
+    def test_atomic_adoption_rejects_stale_worker_and_keeps_new_incumbent(self):
+        _,controller,plan=self.make();token=controller.transaction_token()
+        newer=replace(plan,segments=(replace(plan.segments[0],source_start=.1),plan.segments[1]))
+        controller.promote(newer,plan=newer,authority='newer')
+        calls=[]
+        with self.assertRaisesRegex(ValueError,'baseline changed'):
+            controller.compare_and_promote(plan,plan=plan,authority='stale-worker',token=token,
+                validate=lambda value:calls.append(value))
+        self.assertEqual(calls,[])
+        self.assertIs(controller.incumbent,newer)
+
+    def test_atomic_adoption_installs_full_owner_only_after_validation(self):
+        _,controller,plan=self.make();token=controller.transaction_token()
+        candidate=replace(plan,segments=(replace(plan.segments[0],source_start=.1),plan.segments[1]))
+        def reject(value):
+            self.assertIs(controller.incumbent,plan)
+            raise ValueError('stale native observation')
+        with self.assertRaisesRegex(ValueError,'stale native'):
+            controller.compare_and_promote(candidate,plan=candidate,authority='candidate',token=token,validate=reject)
+        self.assertIs(controller.incumbent,plan)
+        self.assertEqual(controller.transaction_token(),token)
+        controller.compare_and_promote(candidate,plan=candidate,authority='candidate',token=token,
+            validate=lambda value:self.assertIs(controller.incumbent,plan))
+        self.assertIs(controller.incumbent,candidate)
+        self.assertEqual(controller.to_dict()['incumbent_revision'],token.revision+1)
+
+    def test_atomic_adoption_detects_mutated_metadata_and_reentrant_change(self):
+        _,controller,plan=self.make()
+        owner={'music':[0.,1.]}
+        controller.promote(owner,plan=plan,authority='mutable-test-only')
+        token=controller.transaction_token();owner['music'][0]=99.
+        with self.assertRaisesRegex(ValueError,'baseline changed'):
+            controller.compare_and_promote(plan,plan=plan,authority='candidate',token=token,validate=lambda value:None)
+        self.assertIs(controller.incumbent,owner)
+        token=controller.transaction_token()
+        def reentrant(value):controller.promote(plan,plan=plan,authority='new-owner')
+        with self.assertRaisesRegex(ValueError,'during parent'):
+            controller.compare_and_promote(owner,plan=plan,authority='stale-owner',token=token,validate=reentrant)
+        self.assertIs(controller.incumbent,plan)
+
     def test_admission_stops_at_search_cutoff_without_extending_total_budget(self):
         for elapsed in (359., 360., 361., 599., 600.):
             with self.subTest(elapsed=elapsed):

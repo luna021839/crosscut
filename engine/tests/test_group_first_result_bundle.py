@@ -105,6 +105,24 @@ class GroupFirstResultBundleTests(unittest.TestCase):
             changed=replace(bundle,editorial_motion_plan=replace(motion,segments=(item,motion.segments[1])))
             with self.subTest(item=item),self.assertRaises(ValueError):self.validate(changed)
 
+    def test_forged_event_inventory_is_rejected_before_any_encode(self):
+        bundle=self.make_bundle();motion=bundle.editorial_motion_plan
+        for counters in ({'zoom_event_count':999},{'pan_event_count':1},{'roll_event_count':1}):
+            with self.subTest(counters=counters),self.assertRaisesRegex(ValueError,'event inventory'):
+                self.validate(replace(bundle,editorial_motion_plan=replace(motion,**counters)))
+
+    def test_frame_visible_inventory_matches_actual_curves_not_claimed_counts(self):
+        from crosscut.editorial_transform_events import validate_rendered_motion_event_inventory
+        from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
+        bundle=self.make_bundle();motion=bundle.editorial_motion_plan
+        track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),EditorialTransformKeyframe(.5,1.1)))
+        segments=(replace(bundle.render_plan.segments[0],editorial_transform=track),bundle.render_plan.segments[1])
+        typed=replace(motion,zoom_event_count=1,authored_event_counts=(('zoom',1),))
+        records=validate_rendered_motion_event_inventory(segments,bundle.render_plan.fps,typed)
+        self.assertEqual(len(records['zoom']),1)
+        with self.assertRaisesRegex(ValueError,'frame-visible'):
+            validate_rendered_motion_event_inventory(segments,bundle.render_plan.fps,replace(typed,zoom_event_count=0))
+
     def test_phrase_inputs_and_section_are_serialized_without_mutable_aliases(self):
         bundle=self.make_bundle();payload=bundle.to_dict()
         self.assertEqual(payload['phrase_times'],[0.,1.,2.])
@@ -156,3 +174,32 @@ class GroupFirstResultBundleTests(unittest.TestCase):
             self.assertIsNone(controller.run_optional('joint_source_camera',lambda:candidate,validate=validate))
             self.assertIs(controller.incumbent,baseline)
         self.assertFalse(controller.to_dict()['quality_approved'])
+
+    def test_existing_joint_candidate_producer_retains_music_and_source_authority_for_owned_consumer(self):
+        from crosscut.pipeline import _derive_complete_joint_group_candidate
+        from crosscut.ive import SourceMode
+        baseline=self.make_bundle()
+        sources=(baseline.render_plan.sources[0],Path('/synthetic/excluded'),baseline.render_plan.sources[1])
+        request=SimpleNamespace(sources=sources,reference_source=0,aspect_ratio=AspectRatio.PORTRAIT,
+            source_mode=SourceMode.LOCAL)
+        # Provider objects are synthetic. This checks the actual bundle
+        # constructor/consumer, not decoded evidence or editorial quality.
+        materialized=SimpleNamespace(common_master_start=0.,visual_plan=baseline.visual_timeline,
+            editorial_motion_plan=baseline.editorial_motion_plan,
+            segments=baseline.render_plan.segments,output_fps=baseline.render_plan.fps,
+            candidate_index=0,review_rank=0,cadence_profile='synthetic_joint_producer',
+            privacy_safe_signature='synthetic_only',candidate_history_entry={},
+            boundary_proof_bundle=SimpleNamespace(selection_identity='synthetic_only',
+                to_dict=lambda:dict(selection_identity='synthetic_only')))
+        owned=_derive_complete_joint_group_candidate(materialized,request=request,eligible_indices=(0,2),
+            source_aspect_ratios=(16/9,)*2,phrase_times=baseline.phrase_times,
+            section_plan=baseline.section_plan,common_master_start=0.,width=1080,height=1920,
+            output=Path('/synthetic/joint-not-rendered'),source_look_match=None,
+            boundary_look_measurement_cache=None)
+        _validate_review_first_group_bundle(owned,eligible_indices=(0,2),offsets=(0.,0.),
+            timewarps=(None,None),common_start=0.,phrase_times=baseline.phrase_times)
+        self.assertIs(owned.section_plan,baseline.section_plan)
+        self.assertEqual(owned.phrase_times,baseline.phrase_times)
+        self.assertEqual(owned.editorial_motion_plan.eligible_request_indices,(0,2))
+        self.assertEqual([row['source_index'] for row in owned.to_dict()['editorial_motion']['segments']],[0,2])
+        self.assertEqual([item.source_index for item in owned.editorial_motion_plan.segments],[0,1])

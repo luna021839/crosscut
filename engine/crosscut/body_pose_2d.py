@@ -41,9 +41,16 @@ def _valid_box(box: tuple[float, float, float, float]) -> bool:
     )
 
 
-def _prepare_input(image: np.ndarray, box: tuple[float, float, float, float]):
-    """Return RGB NCHW float32 plus the exact inverse-coordinate parameters."""
-    height, width = image.shape[:2]
+def pose_input_geometry(frame_size_wh, box):
+    """The exact padded crop and source-pixel affine used by this adapter.
+
+    The padded support can cross a frame edge. Do not clamp it or use the
+    tight detector rectangle as the claimed pose input/arm visibility extent.
+    """
+    if (not isinstance(frame_size_wh,tuple) or len(frame_size_wh)!=2
+            or any(type(v) is not int or v<1 for v in frame_size_wh) or not _valid_box(box)):
+        raise ValueError('pose input geometry requires a valid detector ROI and actual pixel raster')
+    width, height = frame_size_wh
     x, y, bw, bh = np.asarray(box) * np.asarray((width, height, width, height))
     center = np.asarray((x + bw / 2, y + bh / 2))
     scale = np.asarray((bw, bh)) * 1.25
@@ -52,6 +59,15 @@ def _prepare_input(image: np.ndarray, box: tuple[float, float, float, float]):
     factor = 192 / scale[0]
     affine = np.asarray(((factor, 0, 96 - factor * center[0]),
                          (0, factor, 128 - factor * center[1])), np.float32)
+    crop_xywh = tuple(map(float, ((center[0]-scale[0]/2)/width,
+        (center[1]-scale[1]/2)/height,scale[0]/width,scale[1]/height)))
+    return center, scale, affine, crop_xywh
+
+
+def _prepare_input(image: np.ndarray, box: tuple[float, float, float, float]):
+    """Return RGB NCHW float32 plus the exact inverse-coordinate parameters."""
+    height, width = image.shape[:2]
+    center,scale,affine,_ = pose_input_geometry((width,height),box)
     crop = cv2.warpAffine(image, affine, (192, 256), flags=cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32)
     normalized = (rgb - np.asarray((123.675, 116.28, 103.53), np.float32)) / np.asarray(
@@ -83,6 +99,11 @@ class BodyPose2DEvidence:
     # off-screen estimate must remain distinguishable from a visible joint.
     upper_body_xyc: tuple[tuple[float, float, float], ...] = ()
     face_anchor_consistent: bool | None = None
+    pose_crop_xywh: tuple[float,float,float,float] | None = None
+    source_pixel_to_pose_input_affine: tuple = ()
+    # Preserve the actual un-clipped 17-joint output/confidence for ownership.
+    # This is not a head-extent/visibility or named-identity measurement.
+    raw_keypoints_xyc: tuple = ()
 
     def as_formation_person(self, detection_confidence: float) -> FormationPersonDescriptor | None:
         """Expose the eight-joint basis only when its normalization torso is visible."""
@@ -167,6 +188,9 @@ class BodyPose2DAnalyzer:
                 return BodyPose2DEvidence(missing, **base)
             try:
                 tensor, center, scale = _prepare_input(image, bbox_xywh)
+                _,_,affine,crop = pose_input_geometry((width,height),bbox_xywh)
+                base.update(pose_crop_xywh=crop,
+                    source_pixel_to_pose_input_affine=tuple(tuple(map(float,row)) for row in affine))
                 self._net.setInput(tensor)
                 outputs = self._net.forward(self._net.getUnconnectedOutLayersNames())
                 points, scores = _decode_outputs(outputs, center, scale)
@@ -181,4 +205,6 @@ class BodyPose2DAnalyzer:
         values = tuple((float(points[i, 0] / width), float(points[i, 1] / height),
                         float(np.clip(scores[i], 0, 1))) for i in _BODY_JOINTS)
         return BodyPose2DEvidence("observed", upper_body_xyc=values,
-                                  face_anchor_consistent=face_consistent, **base)
+            face_anchor_consistent=face_consistent,
+            raw_keypoints_xyc=tuple((float(x/width),float(y/height),float(confidence))
+                for (x,y),confidence in zip(points,scores,strict=True)),**base)

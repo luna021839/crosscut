@@ -225,16 +225,52 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets=None,source_
     """
     if not isinstance(proposal,GroupSourceSpanProposal):
         raise TypeError('local source observation refresh needs a typed clock proposal')
+    return refresh_fixed_group_render_observations(plan=proposal.plan,
+        clock_timeline=proposal.clock_timeline,first_segment_index=proposal.segment_index-1,
+        last_segment_index=proposal.end_segment_index+1,source_domain=proposal.source_domain,
+        audio_offsets=audio_offsets,source_timewarps=source_timewarps,sync_scores=sync_scores,
+        scene_cut_times=scene_cut_times,feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache)
+
+
+def refresh_fixed_group_render_observations(*,plan,clock_timeline,first_segment_index,
+        last_segment_index,source_domain,audio_offsets=None,source_timewarps=None,sync_scores,
+        scene_cut_times=None,feature_cache_directory=None,feature_derived_cache_directory=None,
+        require_persistent_feature_cache=False):
+    """Describe one fixed local rendered path, including its actual cameras.
+
+    This shared materializer also serves a simultaneous B/C replacement. It
+    does not require either shot to pass the solo source-span constructor.
+    Source/clock/camera descriptors are observations, not selection or dense
+    motion/visibility approval. The caller owns that separate admission.
+    """
+    if (not isinstance(plan,RenderPlan) or not isinstance(clock_timeline,VisualTimelinePlan)
+            or type(first_segment_index) is not int or type(last_segment_index) is not int
+            or not 0<=first_segment_index<=last_segment_index<len(plan.segments)
+            or len(clock_timeline.choices)!=len(plan.segments)
+            or any(transition.kind.uses_overlap for transition in plan.transitions)):
+        raise ValueError('fixed GROUP refresh needs a complete hard-cut path and explicit local cell interval')
     from .visual_score import (build_visual_timeline_optimizer_seed,VisualTimelineCandidateSet,
         VisualTimelineCandidateRecord)
     from .timeline import TimelineChoice,TimelineResult,TimelineMode
     from .timeline_review import review_timeline
-    plan=proposal.plan;first=proposal.segment_index-1;last=proposal.end_segment_index+1
-    domain=bind_group_source_domain(plan=plan,source_domain=proposal.source_domain,
+    first,last=first_segment_index,last_segment_index
+    domain=bind_group_source_domain(plan=plan,source_domain=source_domain,
         audio_offsets=audio_offsets,source_timewarps=source_timewarps,scene_cut_times=scene_cut_times,
         source_clocks=None)
     audio_offsets,source_timewarps,scene_cut_times=(domain.audio_offsets,domain.source_timewarps,domain.scene_cut_times)
-    chosen=proposal.clock_timeline.choices[first:last+1]
+    if (len(sync_scores)!=len(domain.eligible_indices)
+            or any(type(value) not in (int,float) or not math.isfinite(value) for value in sync_scores)):
+        raise ValueError('fixed GROUP refresh sync scores differ from the eligible source domain')
+    for index,(choice,segment) in enumerate(zip(clock_timeline.choices,plan.segments,strict=True)):
+        if (choice.segment_index!=index or domain.request_index(choice.source_index)!=segment.source_index
+                or any(abs(a-b)>1e-6 for a,b in (
+                    (choice.canonical_master_start,plan.master_audio_start+segment.master_start),
+                    (choice.canonical_master_end,plan.master_audio_start+segment.master_start+segment.duration),
+                    (choice.source_local_start,segment.source_start),(choice.source_local_end,segment.source_end)))):
+            raise ValueError('fixed GROUP refresh timeline differs from its final source/render clock')
+    chosen=clock_timeline.choices[first:last+1]
     origin=plan.segments[first].master_start
     seed=build_visual_timeline_optimizer_seed(sources=domain.eligible_sources,
         canonical_spans=tuple((c.canonical_master_start,c.canonical_master_end) for c in chosen),
@@ -260,12 +296,15 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets=None,source_
         optimizer_workspace=seed.optimizer_workspace,optimizer_input_identity=seed.optimizer_input_identity,
         feature_cache_directory=seed.feature_cache_directory,feature_derived_cache_directory=seed.feature_derived_cache_directory,
         require_persistent_feature_cache=seed.require_persistent_feature_cache).materialize()
-    choices=list(proposal.clock_timeline.choices)
+    choices=list(clock_timeline.choices)
     for offset,choice in enumerate(local.choices):
         index=first+offset
         if (domain.request_index(choice.source_index)!=plan.segments[index].source_index or any(abs(a-b)>1e-6 for a,b in (
                 (choice.source_local_start,plan.segments[index].source_start),
-                (choice.source_local_end,plan.segments[index].source_end)))):
+                (choice.source_local_end,plan.segments[index].source_end),
+                (choice.canonical_master_start,plan.master_audio_start+plan.segments[index].master_start),
+                (choice.canonical_master_end,plan.master_audio_start+plan.segments[index].master_start+
+                    plan.segments[index].duration)))):
             raise ValueError('fresh source observations changed the proposed source clock')
         unchanged_outer_edge=({field.name:getattr(choices[index],field.name)
             for field in fields(choice) if field.name.endswith('_from_previous')} if offset==0 else {})

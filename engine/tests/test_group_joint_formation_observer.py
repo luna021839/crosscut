@@ -59,7 +59,7 @@ class FormationObserverTests(unittest.TestCase):
             path=Path(folder)/'invalid-fixture.onnx';path.write_bytes(b'not pinned model weights')
             calls=[]
             session=SimpleNamespace(budget=JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.),
-                register_model=lambda *a:calls.append(a))
+                register_model=lambda *a,**kw:calls.append(a))
             with self.assertRaisesRegex(ValueError,'pinned asset'):
                 register_formation_models(session,person_model_path=path,pose_model_path=path)
             self.assertEqual(calls,[])

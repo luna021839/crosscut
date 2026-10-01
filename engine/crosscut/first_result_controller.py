@@ -4,9 +4,10 @@ This controller is not a quality approver. It protects a validated render plan
 from failed proposals; decoded technical and editorial QA still run afterward.
 """
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass,replace
 from enum import Enum
 import json
+import hashlib
 import os
 from pathlib import Path
 import tempfile
@@ -26,6 +27,12 @@ class FirstResultStage(str, Enum):
     TECHNICALLY_VERIFIED = "TECHNICALLY_VERIFIED"
     REVIEW_READY = "REVIEW_READY"
     APPROVED = "APPROVED"
+
+
+@dataclass(frozen=True,slots=True)
+class IncumbentTransactionToken:
+    revision: int
+    content_sha256: str
 
 
 class FirstResultController:
@@ -49,6 +56,8 @@ class FirstResultController:
         self.attempts = []
         self.skipped_count = 0
         self._selected_authority = None
+        self._incumbent_revision = 0
+        self._incumbent_plan = None
         self._history = [self.stage.value]
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self.omitted_attempt_count = 0
@@ -95,6 +104,8 @@ class FirstResultController:
         self._render_configuration = (plan.reference_source, plan.aspect_ratio, plan.width, plan.height, plan.fps)
         self.baseline = value
         self.incumbent = value
+        self._incumbent_plan = plan
+        self._incumbent_revision += 1
         self._selected_authority = authority
         self.stage = FirstResultStage.BASELINE_PLAN_READY
         self._history.append(self.stage.value)
@@ -148,9 +159,45 @@ class FirstResultController:
     def promote(self, value, *, plan: RenderPlan, authority: str):
         self.validate_plan(plan)
         self.incumbent = value
+        self._incumbent_plan = plan
+        self._incumbent_revision += 1
         self._selected_authority = authority
         self._persist()
         return value
+
+    def transaction_token(self):
+        """Freeze full owner content, not just a plan/PID or object identity."""
+        if self.incumbent is None or self._incumbent_plan is None:
+            raise RuntimeError('candidate transaction cannot precede a complete incumbent')
+        if isinstance(self.incumbent,RenderPlan):
+            payload=self.incumbent.to_json()
+        elif hasattr(self.incumbent,'to_dict'):
+            payload=self.incumbent.to_dict()
+        elif isinstance(self.incumbent,dict):
+            payload=self.incumbent
+        else:
+            raise TypeError('candidate transaction needs a serializable complete typed owner')
+        preimage=dict(owner=payload,render_plan=self._incumbent_plan.to_json())
+        identity=hashlib.sha256(json.dumps(preimage,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+        return IncumbentTransactionToken(self._incumbent_revision,identity)
+
+    def compare_and_promote(self,value,*,plan,authority,token,validate):
+        """Validate and replace the whole candidate under controller ownership.
+
+        A worker's result cannot overwrite a newer or mutated incumbent. The
+        mandatory validator independently rechecks all external evidence; the
+        second token comparison also rejects reentrant validator mutations.
+        No partial plan or source-dependent metadata is installed on failure.
+        """
+        if not isinstance(token,IncumbentTransactionToken) or not callable(validate):
+            raise ValueError('atomic candidate adoption requires its frozen token and complete validator')
+        if self.transaction_token()!=token:
+            raise ValueError('atomic candidate baseline changed before parent validation')
+        self.validate_plan(plan)
+        validate(value)
+        if self.transaction_token()!=token:
+            raise ValueError('atomic candidate baseline changed during parent validation')
+        return self.promote(value,plan=plan,authority=authority)
 
     def render_complete(self):
         if self.stage is not FirstResultStage.BASELINE_PLAN_READY:
@@ -163,6 +210,7 @@ class FirstResultController:
         return dict(contract="retained_complete_first_result_plan_v1", stage=self.stage.value,
             stage_history=list(self._history),
             baseline_retained=self.baseline is not None, selected_authority=self._selected_authority,
+            incumbent_revision=self._incumbent_revision,
             optional_attempt_count=sum(r["status"] != "skipped_search_cutoff" for r in self.attempts),
             rejected_attempt_count=sum(r["status"] == "rejected" for r in self.attempts),
             skipped_count=self.skipped_count, attempts=deepcopy(self.attempts),
