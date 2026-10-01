@@ -4,11 +4,11 @@ import json
 import unittest
 
 from crosscut.group_joint_editorial_contract import (GroupSubjectObligation, GroupShotRoleDeclaration,
-    GroupBoundaryDeclaration, GroupBoundaryIntent, GroupJointEditorialContract)
+    GroupBoundaryDeclaration, GroupBoundaryIntent, GroupJointEditorialContract,GroupSingleShotEditorialContract)
 from crosscut.group_joint_source_camera import GroupOutputRole, select_joint_group_source_camera_path
 from engine.tests.test_group_joint_source_camera import JointGroupSourceCameraTests
 from engine.tests.test_group_joint_state_factory import JointStateFactoryTests
-from crosscut.group_joint_state_factory import candidate_joint_group_state, assemble_joint_group_states
+from crosscut.group_joint_state_factory import candidate_joint_group_state, assemble_joint_group_states,assemble_single_group_source_camera_state
 
 
 def focal(slot, state_key, *, arms=False):
@@ -112,3 +112,51 @@ class GroupJointEditorialContractTests(unittest.TestCase):
             self.assertEqual(len(payload['key_preimage']['native']), state.end_output_frame-state.first_output_frame)
             self.assertEqual(payload['key_preimage']['segments'][0]['source_index'],
                 proposed.segments[state.slot].source_index)
+
+    def single_contract(self):
+        plan,domain,states=JointStateFactoryTests().single_shot_fixture()
+        shots=tuple(focal(i,state.key,arms=True) for i,state in enumerate(states))
+        boundaries=tuple(GroupBoundaryDeclaration(i,GroupBoundaryIntent.CONTINUITY,
+            'retain_measured_subject_and_choreography') for i in range(2))
+        contract=GroupSingleShotEditorialContract(shots,boundaries)
+        bound=tuple(replace(s,editorial_contract_sha256=contract.sha256) for s in states)
+        return plan,domain,bound,contract
+
+    def test_single_whole_unit_has_three_roles_two_intents_and_no_fake_internal_handoff(self):
+        plan,domain,states,contract=self.single_contract()
+        self.assertEqual(len(states[1].segments),2)
+        self.assertEqual((len(contract.shots),len(contract.boundaries)),(3,2))
+        candidate=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],
+            eligible_source_index=2)
+        proposed,changed=assemble_single_group_source_camera_state(plan=plan,domain=domain,
+            path=(states[0],candidate,states[2]))
+        self.assertEqual(changed,(1,2))
+        self.assertEqual(proposed.segments[1].source_index,proposed.segments[2].source_index)
+        contract.validate_states((states[0],candidate,states[2]))
+        payload=contract.to_dict()
+        self.assertFalse(payload['named_identity_or_motion_certified'])
+        self.assertFalse(payload['quality_approved'])
+        self.assertEqual(hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':'),
+            allow_nan=False).encode()).hexdigest(),contract.sha256)
+
+    def test_single_and_double_mutable_contracts_are_not_interchangeable(self):
+        _,_,states,contract=self.single_contract()
+        with self.assertRaises(ValueError):GroupJointEditorialContract(contract.shots,contract.boundaries)
+        _,four,_,_=JointGroupSourceCameraTests().fixture();double=declaration(four)
+        with self.assertRaises(ValueError):GroupSingleShotEditorialContract(double.shots,double.boundaries)
+        with self.assertRaisesRegex(ValueError,'pre-search'):
+            contract.validate_states((replace(states[2],slot=3),))
+        with self.assertRaisesRegex(ValueError,'pre-search'):
+            contract.validate_states((replace(states[1],editorial_contract_sha256=double.sha256),))
+
+    def test_single_unit_cannot_drop_arms_or_relabel_failed_focal_role_as_formation(self):
+        _,_,_,contract=self.single_contract()
+        x=contract.shots[1]
+        with self.assertRaisesRegex(ValueError,'arms'):
+            replace(x,obligations=(replace(x.obligations[0],required_parts=('head',)),))
+        formation=GroupShotRoleDeclaration(1,GroupOutputRole.FORMATION,
+            'measured_multi_person_layout_and_collective_choreography',
+            tuple(GroupSubjectObligation(f'cohort-{i}','semantic_subject',('person_extent','formation_motion')) for i in range(2)),
+            x.incumbent_state_key,x.native_evidence_sha256,('source_native_tracks','body_joints','formation_layout'))
+        with self.assertRaisesRegex(ValueError,'composition change'):
+            replace(contract,shots=(contract.shots[0],formation,contract.shots[2]))

@@ -123,23 +123,7 @@ class GroupJointEditorialContract:
     boundaries: tuple[GroupBoundaryDeclaration, ...]
 
     def __post_init__(self):
-        if (not isinstance(self.shots, tuple) or len(self.shots) != 4
-                or any(not isinstance(item, GroupShotRoleDeclaration) or item.slot != index
-                    for index, item in enumerate(self.shots))
-                or not isinstance(self.boundaries, tuple) or len(self.boundaries) != 3
-                or any(not isinstance(item, GroupBoundaryDeclaration) or item.boundary_slot != index
-                    for index, item in enumerate(self.boundaries))):
-            raise ValueError('GROUP editorial declaration requires four immutable roles and three intents')
-        for index, edge in enumerate(self.boundaries):
-            left, right = self.shots[index:index+2]
-            focal = {GroupOutputRole.FOCAL_HEAD, GroupOutputRole.FOCAL_HEAD_ARMS}
-            if (edge.intent == GroupBoundaryIntent.CONTINUITY and left.role != right.role
-                    and not {left.role, right.role} <= focal):
-                raise ValueError('different shot purposes need a predeclared composition change')
-            if edge.subject_handoff is not None:
-                if (edge.subject_handoff[0] not in {item.reference for item in left.obligations}
-                        or edge.subject_handoff[1] not in {item.reference for item in right.obligations}):
-                    raise ValueError('composition handoff references an undeclared required subject')
+        _validate_editorial_window(self.shots,self.boundaries,4)
 
     def to_dict(self):
         return dict(contract='presearch_group_shot_obligations_and_boundary_intent_v1',
@@ -152,9 +136,61 @@ class GroupJointEditorialContract:
             allow_nan=False).encode()).hexdigest()
 
     def validate_states(self, states):
-        from .group_joint_source_camera import GroupSourceCameraState
-        for state in states:
-            if (not isinstance(state, GroupSourceCameraState)
-                    or state.role != self.shots[state.slot].role
-                    or state.editorial_contract_sha256 != self.sha256):
-                raise ValueError('joint state changed its pre-search role/subject/boundary declaration')
+        _validate_contract_states(self,states)
+
+
+def _validate_editorial_window(shots,boundaries,count):
+    if (not isinstance(shots,tuple) or len(shots)!=count
+            or any(not isinstance(item,GroupShotRoleDeclaration) or item.slot!=index
+                for index,item in enumerate(shots))
+            or not isinstance(boundaries,tuple) or len(boundaries)!=count-1
+            or any(not isinstance(item,GroupBoundaryDeclaration) or item.boundary_slot!=index
+                for index,item in enumerate(boundaries))):
+        raise ValueError(f'GROUP editorial declaration requires {count} immutable actual-shot roles and {count-1} intents')
+    for index,edge in enumerate(boundaries):
+        left,right=shots[index:index+2]
+        focal={GroupOutputRole.FOCAL_HEAD,GroupOutputRole.FOCAL_HEAD_ARMS}
+        if (edge.intent==GroupBoundaryIntent.CONTINUITY and left.role!=right.role
+                and not {left.role,right.role}<=focal):
+            raise ValueError('different shot purposes need a predeclared composition change')
+        if edge.subject_handoff is not None and (
+                edge.subject_handoff[0] not in {item.reference for item in left.obligations}
+                or edge.subject_handoff[1] not in {item.reference for item in right.obligations}):
+            raise ValueError('composition handoff references an undeclared required subject')
+
+
+def _validate_contract_states(contract,states):
+    from .group_joint_source_camera import GroupSourceCameraState
+    for state in states:
+        if (not isinstance(state,GroupSourceCameraState) or not 0<=state.slot<len(contract.shots)
+                or state.role!=contract.shots[state.slot].role
+                or state.editorial_contract_sha256!=contract.sha256):
+            raise ValueError('joint state changed its pre-search role/subject/boundary declaration')
+
+
+@dataclass(frozen=True,slots=True)
+class GroupSingleShotEditorialContract:
+    """Fixed L / one whole mutable X / fixed R with two actual cut intents.
+
+    X may span several canonical cells. Their internal bookkeeping seam is
+    not another shot, subject handoff or geometric matching obligation. This
+    sibling is deliberately not a four-state contract and grants no admission.
+    """
+    shots: tuple[GroupShotRoleDeclaration,...]
+    boundaries: tuple[GroupBoundaryDeclaration,...]
+
+    def __post_init__(self):
+        _validate_editorial_window(self.shots,self.boundaries,3)
+
+    def to_dict(self):
+        return dict(contract='presearch_group_single_actual_shot_obligations_and_two_boundary_intents_v1',
+            **asdict(self),candidates_or_failed_edges_used_for_declaration=False,
+            named_identity_or_motion_certified=False,quality_approved=False)
+
+    @property
+    def sha256(self):
+        return hashlib.sha256(json.dumps(self.to_dict(),sort_keys=True,separators=(',',':'),
+            allow_nan=False).encode()).hexdigest()
+
+    def validate_states(self,states):
+        _validate_contract_states(self,states)
