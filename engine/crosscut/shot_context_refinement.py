@@ -129,6 +129,7 @@ def attach_shot_context_proposal(plan,motion,proposal):
     """Commit camera, receipt and event inventory together or not at all."""
     import json
     from .post_render_qa import _bound_local_alignment_tracks
+    from .camera_replacement_preservation import validate_camera_replacement_preservation
     index=proposal.segment_index;last=proposal.end_segment_index
     changed_indices=set(range(index,last+1))
     if not both_boundary_framings_improve(proposal):
@@ -142,6 +143,7 @@ def attach_shot_context_proposal(plan,motion,proposal):
             or any(replace(proposal.plan.segments[i],pan_crop=plan.segments[i].pan_crop,
                 editorial_transform=plan.segments[i].editorial_transform)!=plan.segments[i] for i in changed_indices)):
         raise ValueError('shot-context proposal changed source/audio clock or a fixed neighbor')
+    validate_camera_replacement_preservation(plan,proposal.plan,motion)
     receipt=build_shot_context_binding(proposal)
     old=_bound_local_alignment_tracks(motion.to_dict(),json.loads(json.dumps(plan.to_json())))
     events=rendered_transform_event_records(proposal.plan.segments,proposal.plan.fps)
@@ -170,6 +172,7 @@ def attach_coupled_shot_proposal(plan,motion,proposal):
     import json
     from .post_render_qa import _bound_local_alignment_tracks,_bound_context_cameras
     from .coupled_shot_binding import build_coupled_shot_binding
+    from .camera_replacement_preservation import validate_camera_replacement_preservation
     index=proposal.segment_index;candidate=proposal.plan;changed_indices={index,index+1}
     singles=bound_shot_context_cameras(motion.to_dict(),plan)
     if (index not in singles or proposal.outgoing.end_segment_index!=index
@@ -184,6 +187,7 @@ def attach_coupled_shot_proposal(plan,motion,proposal):
             or plan.segments[index+1].editorial_transform is not None
             or candidate.segments[index].editorial_transform.evaluate(0.)!=plan.segments[index].editorial_transform.evaluate(0.)):
         raise ValueError('coupled camera changed source/audio timing or an unrelated camera')
+    validate_camera_replacement_preservation(plan,candidate,motion)
     receipt=build_coupled_shot_binding(proposal)
     events=rendered_transform_event_records(candidate.segments,candidate.fps)
     changed=replace(motion,segments=tuple(replace(item,track=candidate.segments[i].editorial_transform,
