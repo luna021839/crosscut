@@ -120,6 +120,41 @@ class JointObservationSessionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):session.observe(self.state,15,model='fixture',arguments=value)
             self.assertEqual(session.budget.counts['model_calls'],0)
 
+    def test_native_model_measurement_is_shared_before_camera_search_but_not_with_projected_models(self):
+        changed=replace(self.plan,segments=(replace(self.plan.segments[0],editorial_transform=
+            EditorialTransformTrack((EditorialTransformKeyframe(0.,1.25),))),))
+        other=joint_state_from_render_plan(plan=changed,domain=self.domain,slot=1,
+            first_output_frame=0,end_output_frame=30,role=GroupOutputRole.FOCAL_HEAD)
+        calls=[]
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            session.register_model('native-fixture',self.model,
+                lambda p,*,bbox_xywh:calls.append((p.copy(),bbox_xywh)) or dict(mean=float(p.mean()),roi=bbox_xywh))
+            roi={'bbox_xywh':[.1,.2,.2,.6]}
+            a=session.observe_native(2,15,model='native-fixture',arguments=roi)
+            session.projected_pixels(self.state,15);session.projected_pixels(other,15)
+            b=session.observe_native(2,15,model='native-fixture',arguments=roi)
+            self.assertEqual(a,b)
+            self.assertEqual(len(calls),1)
+            projected=session.observe(other,15,model='native-fixture',arguments=roi)
+            self.assertEqual(len(calls),2)
+            self.assertNotEqual(a['mean'],projected['mean'])
+            self.assertEqual(session.budget.counts['new_decodes'],1)
+            self.assertGreaterEqual(session.diagnostics()['native_pixel_cache_reuse'],2)
+            self.assertEqual(session.diagnostics()['reused_model_observations'],1)
+            self.assertEqual(session.diagnostics()['budget']['model_calls'],{'native-fixture':2})
+
+    def test_raw_source_clock_model_roi_and_missing_values_cannot_be_borrowed(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            session.register_model('missing-fixture',self.model,lambda pixels,**arguments:None)
+            self.assertIsNone(session.observe_native(2,15,model='missing-fixture',arguments={'roi':[.1,.2]}))
+            self.assertIsNone(session.observe_native(2,15,model='missing-fixture',arguments={'roi':[.6,.2]}))
+            self.assertEqual(session.budget.model_calls,{'missing-fixture':2})
+            with self.assertRaisesRegex(ValueError,'excluded'):
+                session.observe_native(1,15,model='missing-fixture')
+            with self.video.open('ab') as stream:stream.write(b'changed disposable fixture')
+            with self.assertRaisesRegex(ValueError,'source identity changed'):
+                session.observe_native(2,15,model='missing-fixture',arguments={'roi':[.1,.2]})
+
     def test_context_exit_releases_actual_decoder_and_pixel_caches_on_error(self):
         session=GroupJointObservationSession(domain=self.domain,budget=self.budget())
         with self.assertRaisesRegex(RuntimeError,'fixture failure'):

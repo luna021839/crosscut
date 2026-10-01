@@ -27317,7 +27317,8 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
             for index, choice in enumerate(timeline.choices)),
         boundary_match_count=0, zoom_event_count=0, pan_event_count=0,
         roll_event_count=0, blocked_dissolve_segment_count=0,
-        analysis_basis="review_first_primitive_explicit_neutral_tracks_v1")
+        analysis_basis="review_first_primitive_explicit_neutral_tracks_v1",
+        eligible_request_indices=tuple(eligible_indices))
     return _GroupRenderCandidateBundle(candidate_index=0, review_rank=0,
         cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
@@ -27351,6 +27352,10 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     motion=bundle.editorial_motion_plan
     if not isinstance(motion,EditorialMotionPlan) or len(motion.segments)!=len(plan.segments):
         raise ValueError('GROUP bundle lacks complete motion source/camera authority')
+    if (motion.eligible_request_indices!=tuple(eligible_indices)
+            and not (motion.eligible_request_indices is None
+                and tuple(eligible_indices)==tuple(range(len(plan.sources))))):
+        raise ValueError('GROUP motion source domain differs from the external eligible-request authority')
     for index,(item,choice,segment) in enumerate(zip(motion.segments,timeline.choices,plan.segments,strict=True)):
         if (item.segment_index!=index or type(item.source_index) is not int
                 or item.source_index!=choice.source_index or item.track!=segment.editorial_transform):
@@ -27360,6 +27365,19 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
             or any(item.segment_index!=index or item.source_index!=timeline.choices[index].source_index
                 for index,item in enumerate(alignment.segments))):
         raise ValueError('GROUP boundary alignment source authority differs from the current timeline')
+    if alignment is not None:
+        seen_boundaries=set()
+        for item in alignment.decisions:
+            index=item.boundary_index
+            if (type(index) is not int or not 0<=index<len(plan.transitions)
+                    or index in seen_boundaries or item.outgoing_segment_index!=index
+                    or item.incoming_segment_index!=index+1
+                    or type(item.outgoing_source_index) is not int
+                    or type(item.incoming_source_index) is not int
+                    or item.outgoing_source_index!=timeline.choices[index].source_index
+                    or item.incoming_source_index!=timeline.choices[index+1].source_index):
+                raise ValueError('GROUP boundary decision references a stale eligible source or segment')
+            seen_boundaries.add(index)
     face=bundle.face_match_plan
     if face is not None and (not isinstance(face,FaceMatchPlan) or len(face.segments)!=len(plan.segments)
             or any(item.segment_index!=index or item.source_index!=timeline.choices[index].source_index
@@ -27415,7 +27433,8 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     if (motion is None or motion.boundary_subject_alignment_plan is None
             or bundle.boundary_look_match is not None or bundle.cut_local_sync is not None
             or bundle.dynamic_crop_application is not None
-            or tuple(eligible_indices)!=tuple(range(len(bundle.render_plan.sources)))):
+            or motion.eligible_request_indices is None
+                and tuple(eligible_indices)!=tuple(range(len(bundle.render_plan.sources)))):
         return None
     if motion.boundary_subject_alignment_plan.analysis_basis not in {ANALYSIS_BASIS,GLOBAL_ACTION_BASIS}:
         raise ValueError('motion/camera incumbent has an unsupported subject-alignment authority')
@@ -35339,7 +35358,9 @@ def analyze(
                     face_match_plan=face_match_plan,
                     group_transition_plan=group_transition_plan,
                     boundary_affine_plan=boundary_affine_plan,
-                    editorial_motion_plan=editorial_motion_plan,
+                    editorial_motion_plan=(replace(editorial_motion_plan,
+                        eligible_request_indices=tuple(eligible_indices))
+                        if editorial_motion_plan is not None else None),
                     render_plan=plan,
                     section_plan=final_montage_section_plan,
                     boundary_look_match=boundary_look_match_result,

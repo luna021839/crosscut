@@ -95,8 +95,19 @@ class GroupJointFormationTests(unittest.TestCase):
 
     def test_invalid_cohort_or_duplicate_ids_cannot_be_admitted(self):
         with self.assertRaises(ValueError): view(person(0, .2), person(0, .8))
-        with self.assertRaises(ValueError): view(person(0, .2), required=(1,))
         with self.assertRaises(ValueError): view(person(0, .2), required=(True,))
+        with self.assertRaises(ValueError): view(person(0, .2), required=(-1,))
+
+    def test_detector_dropout_retains_a_missing_required_person_not_a_smaller_passing_cohort(self):
+        left = view(person(0, .2), person(1, .5), person(2, .8))
+        missing = view(person(10, .2), person(11, .5), required=(10, 11, 12))
+        self.assertEqual(missing.missing_required_observation_ids, (12,))
+        result = compare_projected_formation(left, missing)
+        self.assertEqual(result.status, 'missing_required_subject_observation')
+        self.assertIn(12, result.unmatched_incoming)
+        self.assertFalse(result.observed)
+        self.assertIsNone(result.framing_cost)
+        self.assertEqual(missing.required_observation_ids, (10, 11, 12))
 
     def test_no_family_threshold_parameter_and_no_quality_or_motion_claim(self):
         result = compare_projected_formation(view(person(0, .2), person(1, .8)),

@@ -39,6 +39,7 @@ class GroupSourceCameraState:
     output_size: tuple[int,int] = (1920,1080)
     segment_output_frame_counts: tuple[int,...] | None = None
     raw_shot_family: str | None = None
+    editorial_contract_sha256: str | None = None
 
     def __post_init__(self):
         if (type(self.slot) is not int or not 0<=self.slot<=3
@@ -57,7 +58,10 @@ class GroupSourceCameraState:
                 or not isinstance(self.output_size,tuple) or len(self.output_size)!=2
                 or any(type(n) is not int or n<1 for n in self.output_size)
                 or abs(sum(s.duration for s in self.segments)-
-                    (self.end_output_frame-self.first_output_frame)/self.output_fps)>1/self.output_fps):
+                    (self.end_output_frame-self.first_output_frame)/self.output_fps)>1/self.output_fps
+                or self.editorial_contract_sha256 is not None and (not isinstance(self.editorial_contract_sha256,str)
+                    or len(self.editorial_contract_sha256)!=64
+                    or any(c not in '0123456789abcdef' for c in self.editorial_contract_sha256))):
             raise ValueError('joint GROUP state needs one complete shot, role and exact native/output clock')
         counts=self.segment_output_frame_counts
         if counts is None and len(self.segments)==1:
@@ -68,16 +72,26 @@ class GroupSourceCameraState:
                 or sum(counts)!=self.end_output_frame-self.first_output_frame):
             raise ValueError('joint whole camera needs exact per-cell output frame counts')
 
-    @property
-    def key(self):
+    def key_preimage(self):
         # Whole trajectories and native clocks participate, not merely source
         # index/endpoints. Raw camera labels are diagnostics, NOT authority.
         payload=dict(slot=self.slot,first=self.first_output_frame,end=self.end_output_frame,
             source=self.eligible_source_index,segments=[asdict(s) for s in self.segments],
             native=list(self.native_frame_indices),role=self.role.value,clock=self.source_clock_identity,
             fps=self.output_fps,output_size=self.output_size,cell_frame_counts=self.segment_output_frame_counts)
-        return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':'),
+        if self.editorial_contract_sha256 is not None:
+            payload['editorial_contract_sha256']=self.editorial_contract_sha256
+        return payload
+
+    @property
+    def key(self):
+        return hashlib.sha256(json.dumps(self.key_preimage(),sort_keys=True,separators=(',',':'),
             allow_nan=False).encode()).hexdigest()
+
+    def to_dict(self):
+        return dict(contract='complete_joint_source_camera_state_hash_preimage_v1',
+            key_preimage=self.key_preimage(),state_key=self.key,raw_shot_family=self.raw_shot_family,
+            named_identity_or_motion_certified=False,quality_approved=False)
 
     def bind_source(self,domain):
         if not isinstance(domain,GroupSourceDomain):raise TypeError('joint state requires a GROUP source domain')
@@ -94,7 +108,7 @@ class GroupSourceCameraState:
 
 
 def joint_state_from_render_plan(*,plan,domain,slot,first_output_frame,end_output_frame,
-        role,raw_shot_family=None):
+        role,raw_shot_family=None,editorial_contract_sha256=None):
     """Bind a complete cell-aligned actual shot using the FULL renderer clock.
 
     An arbitrary shorter subshot inside a cell cannot expand to the whole cell
@@ -124,7 +138,8 @@ def joint_state_from_render_plan(*,plan,domain,slot,first_output_frame,end_outpu
     identity=hashlib.sha256(json.dumps(clock.to_dict(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
     return GroupSourceCameraState(slot,first_output_frame,end_output_frame,local,segments,
         tuple(s.native_frame_index for s in samples.values()),role,identity,plan.fps,
-        (plan.width,plan.height),counts[first:last+1],raw_shot_family).bind_source(domain)
+        (plan.width,plan.height),counts[first:last+1],raw_shot_family,
+        editorial_contract_sha256).bind_source(domain)
 
 
 @dataclass(frozen=True,slots=True)
@@ -246,7 +261,7 @@ class JointGroupSelection:
 
 
 def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,declared_roles,
-        observe_edge,verify_dense,budget):
+        observe_edge,verify_dense,budget,editorial_contract=None):
     """Search A -> B -> C -> D without first solving B or C on its own.
 
     Every edge owns the SAME complete state and shared exact boundary tick.
@@ -261,6 +276,11 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
             or not isinstance(right,GroupSourceCameraState) or right.slot!=3):
         raise ValueError('joint GROUP requires two mutable actual-shot slots and fixed declared roles/neighbors')
     attempts=[];edges={};seen=set();states=[]
+    if editorial_contract is not None:
+        from .group_joint_editorial_contract import GroupJointEditorialContract
+        if not isinstance(editorial_contract,GroupJointEditorialContract):
+            raise ValueError('joint search needs its pre-search typed editorial declaration')
+        editorial_contract.validate_states((left,*states_by_slot[0],*states_by_slot[1],right))
     try:
         for slot,values in enumerate(((left,),*states_by_slot,(right,))):
             if not isinstance(values,tuple):raise ValueError('joint states must be immutable bounded tuples')

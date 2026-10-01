@@ -213,8 +213,26 @@ class EditorialMotionPlan:
     # never inherit the older boundary-local planner's analysis header.
     shot_context_cameras: tuple = ()
     coupled_shot_cameras: tuple = ()
+    # Planners use eligible-local indices, receipts and RenderPlan request
+    # indices. Freeze the mapping and convert only at the serialization seam.
+    eligible_request_indices: tuple[int, ...] | None = None
 
     def __post_init__(self):
+        mapping = self.eligible_request_indices
+        if mapping is not None:
+            if (not isinstance(mapping, tuple) or not mapping
+                    or any(type(index) is not int or index < 0 for index in mapping)
+                    or len(set(mapping)) != len(mapping)):
+                raise ValueError('motion source domain requires an immutable unique eligible-request map')
+            references = [item.source_index for item in self.segments]
+            if self.boundary_subject_alignment_plan is not None:
+                alignment = self.boundary_subject_alignment_plan
+                references.extend(item.source_index for item in alignment.segments)
+                references.extend(item.source_index for item in alignment.source_headroom)
+                references.extend(index for item in alignment.decisions
+                    for index in (item.outgoing_source_index, item.incoming_source_index))
+            if any(type(index) is not int or not 0 <= index < len(mapping) for index in references):
+                raise ValueError('motion source reference is outside its eligible-local domain')
         failures = tuple((index, tuple(reasons), context) for index, reasons, context in self.required_boundary_failures)
         if (len({row[0] for row in failures}) != len(failures)
                 or any(type(index) is not int or not 0 <= index < len(self.segments) - 1
@@ -260,7 +278,7 @@ class EditorialMotionPlan:
             "official_target_fancam_"
         )
         member_policy = confirmed_member_policy or direct_member_policy
-        return {
+        result = {
             "analysis_basis": self.analysis_basis,
             "policy": {
                 "calibration": (
@@ -379,6 +397,23 @@ class EditorialMotionPlan:
             **({'coupled_shot_cameras': _thaw_audit_value(self.coupled_shot_cameras)}
                if self.coupled_shot_cameras else {}),
         }
+        if self.eligible_request_indices is not None:
+            mapping = self.eligible_request_indices
+            for item in result['segments']:
+                item['source_index'] = mapping[item['source_index']]
+            alignment = result['boundary_subject_alignment']
+            if alignment is not None:
+                for name in ('segments', 'source_resolution_headroom'):
+                    for item in alignment[name]:
+                        item['source_index'] = mapping[item['source_index']]
+                for item in alignment['decisions']:
+                    for name in ('outgoing_source_index', 'incoming_source_index'):
+                        item[name] = mapping[item[name]]
+                alignment['source_index_domain'] = 'request'
+            result['source_index_domain'] = 'request'
+            result['typed_source_index_domain'] = 'eligible_local'
+            result['eligible_request_indices'] = list(mapping)
+        return result
 
 
 @dataclass(frozen=True, slots=True)

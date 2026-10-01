@@ -43,7 +43,7 @@ def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_in
     first,end,counts=_cell_interval(plan,incumbent_state.first_output_frame,incumbent_state.end_output_frame)
     old=joint_state_from_render_plan(plan=plan,domain=domain,slot=incumbent_state.slot,
         first_output_frame=incumbent_state.first_output_frame,end_output_frame=incumbent_state.end_output_frame,
-        role=incumbent_state.role)
+        role=incumbent_state.role,editorial_contract_sha256=incumbent_state.editorial_contract_sha256)
     if old.key!=incumbent_state.key:raise ValueError('joint factory incumbent is not bound to its complete renderer state')
     request_source=domain.request_index(eligible_source_index)
     if sum(counts[first:end])>300:
@@ -74,7 +74,8 @@ def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_in
     identity=hashlib.sha256(json.dumps(clock.to_dict(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
     return GroupSourceCameraState(incumbent_state.slot,incumbent_state.first_output_frame,
         incumbent_state.end_output_frame,eligible_source_index,tuple(selected),tuple(schedule.source_frame_indices),
-        incumbent_state.role,identity,plan.fps,(plan.width,plan.height),tuple(counts[first:end])).bind_source(domain)
+        incumbent_state.role,identity,plan.fps,(plan.width,plan.height),tuple(counts[first:end]),
+        editorial_contract_sha256=incumbent_state.editorial_contract_sha256).bind_source(domain)
 
 
 def assemble_joint_group_states(*,plan,domain,path):
@@ -98,7 +99,8 @@ def assemble_joint_group_states(*,plan,domain,path):
             raise ValueError('joint state changed canonical cell/frame authority')
         if state.slot in (0,3):
             original=joint_state_from_render_plan(plan=plan,domain=domain,slot=state.slot,
-                first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role)
+                first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role,
+                editorial_contract_sha256=state.editorial_contract_sha256)
             if original.key!=state.key:raise ValueError('joint replacement changed a fixed outer neighbor')
         else:
             for index,segment in zip(range(first,end),state.segments,strict=True):
@@ -118,7 +120,8 @@ def assemble_joint_group_states(*,plan,domain,path):
         raise ValueError('joint source/camera replacement changed actual visible cut cadence')
     for state in path:
         rebound=joint_state_from_render_plan(plan=proposed,domain=domain,slot=state.slot,
-            first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role)
+            first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role,
+            editorial_contract_sha256=state.editorial_contract_sha256)
         if rebound.key!=state.key:
             raise ValueError('assembled joint renderer clock/camera differs from the observed whole state')
     return proposed,tuple(sorted(changed))

@@ -46,6 +46,14 @@ class FormationObserverTests(unittest.TestCase):
         self.assertIsNone(observe_formation_people(session,SimpleNamespace(output_size=(100,50)),15))
         self.assertEqual([n for n,_ in calls],['nanodet_people'])
 
+    def test_missing_required_detection_is_explicit_in_the_observer_result(self):
+        session, _ = self.session(np.asarray(((10, 5, 30, 45, .9),)))
+        result = declared_formation_observation(session, SimpleNamespace(output_size=(100, 50)), 15,
+            required_observation_ids=(0, 1))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.missing_required_observation_ids, (1,))
+        self.assertEqual(result.required_observation_ids, (0, 1))
+
     def test_incorrect_model_asset_cannot_register_or_download_an_observer(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'invalid-fixture.onnx';path.write_bytes(b'not pinned model weights')

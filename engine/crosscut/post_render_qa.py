@@ -4718,6 +4718,8 @@ def _bound_boundary_local_alignment_tracks(
         frames = (_mapping(plan["segments"][index].get("editorial_transform")) or {}).get("keyframes")
         canvas=(_mapping(plan['segments'][index].get('editorial_transform')) or {}).get('sampling_canvas_zoom')
         if (item.get("keyframes") != frames
+                or item.get('source_index') != segment.source_index
+                or (_mapping(motion_segments[index]) or {}).get('source_index') != segment.source_index
                 or item.get('sampling_canvas_zoom')!=canvas
                 or (_mapping(motion_segments[index]) or {}).get('sampling_canvas_zoom')!=canvas
                 or (_mapping(motion_segments[index]) or {}).get("keyframes") != frames):
@@ -4744,9 +4746,11 @@ def _bound_boundary_local_alignment_tracks(
                 and boundary.get("rejection_reason") is None and target == index
                 and boundary.get("outgoing_segment_index") == boundary_index
                 and boundary.get("incoming_segment_index") == boundary_index + 1
+                and 0 <= boundary_index < len(typed.transitions)
+                and boundary.get('outgoing_source_index') == typed.segments[boundary_index].source_index
+                and boundary.get('incoming_source_index') == typed.segments[boundary_index+1].source_index
                 and side in {"outgoing", "incoming"}
                 and count is not None and count >= active_count
-                and 0 <= boundary_index < len(typed.transitions)
                 and typed.transitions[boundary_index].kind.value == "hard_cut"
                 and typed.segments[boundary_index].source_index != typed.segments[boundary_index+1].source_index)
             if paired:

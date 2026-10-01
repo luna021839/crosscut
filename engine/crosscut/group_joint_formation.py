@@ -81,8 +81,7 @@ class DeclaredFormationView:
                 or len(set(ids)) != len(ids)
                 or not isinstance(self.required_observation_ids, tuple)
                 or len(set(self.required_observation_ids)) != len(self.required_observation_ids)
-                or not set(self.required_observation_ids) <= set(ids)
-                or any(type(n) is not int for n in self.required_observation_ids)
+                or any(type(n) is not int or n<0 for n in self.required_observation_ids)
                 or not isinstance(self.output_size, tuple) or len(self.output_size) != 2
                 or any(type(n) is not int or n < 1 for n in self.output_size)):
             raise ValueError('formation role needs an explicit predeclared bounded foreground cohort')
@@ -90,7 +89,12 @@ class DeclaredFormationView:
     @property
     def required(self):
         by_id = {p.observation_id: p for p in self.people}
-        return tuple(by_id[n] for n in self.required_observation_ids)
+        return tuple(by_id[n] for n in self.required_observation_ids if n in by_id)
+
+    @property
+    def missing_required_observation_ids(self):
+        present={p.observation_id for p in self.people}
+        return tuple(n for n in self.required_observation_ids if n not in present)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +184,12 @@ def compare_projected_formation(outgoing, incoming, *, minimum_pairs=2,
                     minimum_assignment_margin))):
         raise ValueError('projected formation comparison needs common output coordinates and bounded policy')
     left, right = outgoing.required, incoming.required
+    if outgoing.missing_required_observation_ids or incoming.missing_required_observation_ids:
+        # Keep the obligation after detector dropout. Comparing the remaining
+        # two people must not silently erase a third required subject.
+        return ProjectedFormationMatch('missing_required_subject_observation',(),
+            outgoing.required_observation_ids,incoming.required_observation_ids,
+            0.,0.,None,None,None,None,None,None,None)
     if min(len(left), len(right)) < minimum_pairs:
         return _unknown('required_cohort_unobserved', left, right)
     positions_a, positions_b = _locations(left), _locations(right)

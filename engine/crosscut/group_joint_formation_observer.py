@@ -57,7 +57,7 @@ def observe_formation_people(session,state,output_tick):
 
 def declared_formation_observation(session,state,output_tick,*,required_observation_ids):
     people=observe_formation_people(session,state,output_tick)
-    if people is None or not set(required_observation_ids)<={p.observation_id for p in people}:return None
+    if people is None:return None
     return DeclaredFormationView(people,tuple(required_observation_ids),state.output_size)
 
 

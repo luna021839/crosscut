@@ -168,6 +168,47 @@ class GroupJointObservationSession:
                 _,old=self.model_observations.popitem(last=False);self.observation_bytes-=len(old)
         return value
 
+    def observe_native(self,source,native_frame,*,model,arguments=None):
+        """Camera-independent raw source measurement, shared by all cameras.
+
+        A projected detection's enumeration is not a native subject track.
+        This separate cache binds file/native clock/model/ROI BEFORE camera
+        search and cannot borrow projected pixels or another body's pose.
+        """
+        if model not in self.models:
+            raise ValueError('native observation model is not owned by this worker')
+        path,identity,digest,observer=self.models[model]
+        if _file_identity(path)!=identity:
+            raise ValueError('joint observation model identity changed')
+        source_identity=self._assert_source_identity(source)
+        local=self.domain.eligible_index(source)
+        clock=self.domain.render_frame_clocks[local]
+        if type(native_frame) is not int or not 0<=native_frame<clock.frame_count:
+            raise ValueError('native observation is outside its verified source clock')
+        if arguments is not None and (not isinstance(arguments,dict)
+                or any(not isinstance(name,str) for name in arguments)):
+            raise ValueError('native model arguments must be explicit named JSON-native values')
+        encoded=json.dumps(arguments,sort_keys=True,separators=(',',':'),allow_nan=False)
+        bound_arguments=json.loads(encoded)
+        key=('source_native',source,source_identity,clock.packet_grid_sha256,native_frame,model,digest,encoded)
+        if key in self.model_observations:
+            payload=self.model_observations.pop(key);self.model_observations[key]=payload;self.model_reuse+=1
+            return pickle.loads(payload)
+        pixels=self.native_pixels(source,native_frame)
+        if pixels is None:return None
+        self.budget.spend('model_calls',model=model)
+        value=observer(pixels) if bound_arguments is None else observer(pixels,**bound_arguments)
+        self.budget.check()
+        if _file_identity(path)!=identity:
+            raise ValueError('joint model changed while observing source-native pixels')
+        self._assert_source_identity(source)
+        payload=_encode_message(value)
+        if len(payload)<=self.observation_limit:
+            self.model_observations[key]=payload;self.observation_bytes+=len(payload)
+            while self.observation_bytes>self.observation_limit or len(self.model_observations)>2400:
+                _,old=self.model_observations.popitem(last=False);self.observation_bytes-=len(old)
+        return value
+
     def diagnostics(self):
         return dict(contract='worker_owned_eligible_native_and_projected_observations_v1',
             opened_request_sources=sorted(self.captures),raw_pixel_cache_bytes=self.raw_bytes,
