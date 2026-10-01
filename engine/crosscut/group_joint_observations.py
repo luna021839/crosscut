@@ -8,6 +8,7 @@ native misses remain unavailable, without neighboring-frame fallback.
 """
 from collections import OrderedDict
 import hashlib
+import json
 import pickle
 import stat
 from types import SimpleNamespace
@@ -131,7 +132,7 @@ class GroupJointObservationSession:
         if _file_identity(asset_path)!=identity:raise ValueError('joint model changed while binding its content identity')
         self.models[name]=(asset_path,identity,digest,observer)
 
-    def observe(self,state,output_tick,*,model):
+    def observe(self,state,output_tick,*,model,arguments=None):
         if model not in self.models:raise ValueError('joint observation model is not owned by this worker')
         path,identity,_,observer=self.models[model]
         if _file_identity(path)!=identity:raise ValueError('joint observation model identity changed')
@@ -140,7 +141,14 @@ class GroupJointObservationSession:
             raise ValueError('model observation is outside its complete camera state')
         source=self.domain.request_index(state.eligible_source_index)
         source_identity=self._assert_source_identity(source)
-        key=(state.key,output_tick,source_identity,model,self.models[model][2])
+        if arguments is not None and (not isinstance(arguments,dict)
+                or any(not isinstance(name,str) for name in arguments)):
+            raise ValueError('joint model arguments must be explicit JSON-native named values')
+        # One frame may have multiple top-down bodies. Their ROI arguments
+        # must not collide and lend one dancer's cached pose to another.
+        encoded_arguments=json.dumps(arguments,sort_keys=True,separators=(',',':'),allow_nan=False)
+        bound_arguments=json.loads(encoded_arguments)
+        key=(state.key,output_tick,source_identity,model,self.models[model][2],encoded_arguments)
         if key in self.model_observations:
             payload=self.model_observations.pop(key);self.model_observations[key]=payload;self.model_reuse+=1
             # Private in-process data from this registered worker observer only.
@@ -149,7 +157,7 @@ class GroupJointObservationSession:
         pixels=self.projected_pixels(state,output_tick)
         if pixels is None:return None
         self.budget.spend('model_calls',model=model)
-        value=observer(pixels)
+        value=observer(pixels) if bound_arguments is None else observer(pixels,**bound_arguments)
         self.budget.check()
         if _file_identity(path)!=identity:raise ValueError('joint model changed while observing projected pixels')
         self._assert_source_identity(source)

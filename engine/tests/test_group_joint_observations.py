@@ -96,6 +96,30 @@ class JointObservationSessionTests(unittest.TestCase):
             self.assertEqual(session.budget.counts['model_calls'],0)
             self.assertEqual(session.captures,{})
 
+    def test_same_frame_different_body_rois_do_not_borrow_cached_pose(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            calls=[]
+            def observer(pixels,*,bbox_xywh):
+                calls.append(tuple(bbox_xywh));return {'box':bbox_xywh}
+            session.register_model('roi-fixture',self.model,observer)
+            a={'bbox_xywh':[.1,.2,.2,.6]};b={'bbox_xywh':[.6,.2,.2,.6]}
+            first=session.observe(self.state,15,model='roi-fixture',arguments=a)
+            second=session.observe(self.state,15,model='roi-fixture',arguments=b)
+            first['box'][0]=99
+            self.assertEqual(second['box'],b['bbox_xywh'])
+            self.assertEqual(session.observe(self.state,15,model='roi-fixture',arguments=a)['box'],a['bbox_xywh'])
+            self.assertEqual(len(calls),2)
+            self.assertEqual(session.budget.counts['new_decodes'],1)
+            self.assertEqual(session.budget.model_calls,{'roi-fixture':2})
+            self.assertEqual(session.diagnostics()['reused_model_observations'],1)
+
+    def test_invalid_model_arguments_fail_before_any_model_call(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            session.register_model('fixture',self.model,lambda pixels:None)
+            for value in ([],{1:'invalid'},{'bbox':float('nan')}):
+                with self.assertRaises(ValueError):session.observe(self.state,15,model='fixture',arguments=value)
+            self.assertEqual(session.budget.counts['model_calls'],0)
+
     def test_context_exit_releases_actual_decoder_and_pixel_caches_on_error(self):
         session=GroupJointObservationSession(domain=self.domain,budget=self.budget())
         with self.assertRaisesRegex(RuntimeError,'fixture failure'):
