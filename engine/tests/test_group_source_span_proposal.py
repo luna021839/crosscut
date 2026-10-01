@@ -156,6 +156,50 @@ class SourceSpanProposalTests(unittest.TestCase):
         self.assertFalse(result.to_dict()['timeline_descriptors_refreshed'])
         self.assertFalse(result.to_dict()['production_selected'])
 
+    def short_cell_run_fixture(self, durations=(.3, .4, 1.3)):
+        args=self.fixture();plan=args['plan'];start=4.;run=[]
+        for duration in durations:
+            run.append(RenderSegment(2,start,duration,start));start+=duration
+        tail=(RenderSegment(3,start,2.,start),RenderSegment(4,start+2.,2.,start+2.))
+        segments=(*plan.segments[:2],*run,*tail)
+        plan=replace(plan,segments=segments,
+            transitions=(RenderTransition(tier='C'),)*(len(segments)-1))
+        args.update(plan=plan,last_segment_index=1+len(run),
+            entry_offset_frames=0,exit_offset_frames=0,
+            timeline=VisualTimelinePlan(tuple(_choice(i,s.source_index,
+                start=s.master_start,end=s.master_start+s.duration)
+                for i,s in enumerate(segments)),1.))
+        return args
+
+    def test_internal_beat_cells_are_not_independent_short_visible_shots(self):
+        args=self.short_cell_run_fixture()
+        result=build_group_source_span_proposal(**args)
+        self.assertEqual([s.source_index for s in result.plan.segments],[0,1,5,5,5,3,4])
+        self.assertEqual(result.plan.output_frame_count,args['plan'].output_frame_count)
+        self.assertEqual(result.preserved_neighbor_boundaries,(0,5))
+        self.assertAlmostEqual(sum(s.duration for s in result.plan.segments[2:5]),2.)
+        self.assertFalse(result.to_dict()['production_selected'])
+        clocks=native_frame_clocks_for_output(result.plan,args['source_clocks'],range(120,180))
+        self.assertEqual([row.native_frame_index for row in clocks.values()],list(range(120,180)))
+        self.assertTrue(all(row.source_index==5 and not row.terminal_clone for row in clocks.values()))
+
+    def test_retiming_may_shorten_a_beat_cell_without_shortening_the_visible_run(self):
+        args=self.short_cell_run_fixture()
+        result=build_group_source_span_proposal(**dict(args,entry_offset_frames=6))
+        self.assertAlmostEqual(result.plan.segments[2].duration,.1)
+        self.assertAlmostEqual(sum(s.duration for s in result.plan.segments[2:5]),1.8)
+        self.assertEqual(result.plan.output_frame_count,args['plan'].output_frame_count)
+        self.assertEqual(result.preserved_neighbor_boundaries,(0,5))
+
+    def test_short_run_and_collapsed_internal_cells_still_fail(self):
+        with self.assertRaisesRegex(ValueError,'shot below'):
+            build_group_source_span_proposal(**self.short_cell_run_fixture((.2,.2)))
+        with self.assertRaises(ValueError):
+            build_group_source_span_proposal(**dict(self.short_cell_run_fixture(),
+                entry_offset_frames=10,maximum_shift_frames=12))
+        with self.assertRaisesRegex(ValueError,'two output frames'):
+            build_group_source_span_proposal(**self.short_cell_run_fixture((.02,.4,1.58)))
+
     def test_broadcaster_cut_at_artificial_cell_seam_cannot_disappear(self):
         args=self.run_fixture()
         args['scene_cut_times']=((),(),(),(),(),(4.9,))

@@ -47,6 +47,7 @@ class GroupSourceSpanProposal:
             reset_transition_boundaries=list(range(self.segment_index-1,self.end_segment_index+1)),
             transition_evidence_refreshed=False,
             source_reference_alignment_authority='caller_supplied',
+            duration_floor_basis='visible_source_run_not_internal_beat_cells',
             production_selected=False,quality_approved=False)
 
 
@@ -113,8 +114,13 @@ def build_group_source_span_proposal(*,plan,timeline,segment_index,source_index,
         exit if j==last else plan.segments[j].master_start+plan.segments[j].duration)
         for j in range(i,last+1))
     intervals.append((last+1,old_right.source_index,exit,times[-1]))
-    if any(end-start < .55 for _,_,start,end in intervals):
-        raise ValueError('source span proposal shortened a cell below its constructor floor')
+    # The three visible shot intervals already meet the .55s floor above.
+    # Internal beat cells inside one continuous replacement are NOT new cuts;
+    # imposing that floor again on each cell incorrectly rejects usable runs.
+    # Retiming must still leave each cell positive and the renderer's globally
+    # quantized two-frame minimum below remains mandatory.
+    if any(end <= start for _,_,start,end in intervals):
+        raise ValueError('source span proposal collapsed an internal beat cell')
     for j,source,start,end in intervals:
         old=segments[j]
         new=aligned_render_segment(source_index=source,
