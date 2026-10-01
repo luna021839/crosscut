@@ -20418,6 +20418,7 @@ class _GroupRenderCandidateBundle:
         DynamicCropMotionTimelineEvidenceV3 | None
     ) = None
     cut_local_sync: Mapping[str, Any] | None = None
+    phrase_times: tuple[float,...] | None = None
 
     def __post_init__(self):
         from .visual_boundary_repair import _freeze_audit_value
@@ -20427,6 +20428,12 @@ class _GroupRenderCandidateBundle:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _freeze_audit_value(value))
+        if self.phrase_times is not None:
+            values=tuple(self.phrase_times)
+            if any(isinstance(value,bool) or not isinstance(value,(int,float))
+                    or not math.isfinite(value) for value in values):
+                raise ValueError('GROUP phrase authority must contain finite numeric times')
+            object.__setattr__(self,'phrase_times',tuple(float(value) for value in values))
 
     def to_dict(self) -> dict[str, Any]:
         from .visual_boundary_repair import _thaw_audit_value
@@ -20435,6 +20442,8 @@ class _GroupRenderCandidateBundle:
             "review_rank": self.review_rank,
             "cadence_profile": self.cadence_profile,
             "pre_render_score": self.pre_render_score,
+            "section_plan": self.section_plan.to_dict() if self.section_plan is not None else None,
+            "phrase_times": list(self.phrase_times) if self.phrase_times is not None else None,
             "visual_timeline": self.visual_timeline.to_dict(),
             "boundary_repairs": (
                 self.boundary_repairs.to_dict()
@@ -27299,8 +27308,9 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         width=width, height=height, transitions=transitions.transitions)
     review = _review_visual_timeline_for_render(timeline, available_source_count=len(eligible_indices),
         reporter=reporter, warnings=warnings, comparison_render_allowed=True)
+    phrase_inputs=tuple(phrase_times)
     clock = _deterministic_exact_shot_clock_from_timeline(timeline,
-        section_plan=section_plan, phrase_times=phrase_times)
+        section_plan=section_plan, phrase_times=phrase_inputs)
     neutral_motion = EditorialMotionPlan(
         segments=tuple(EditorialMotionSegment(index, choice.source_index, None,
             ("review_first_primitive_no_authored_motion",))
@@ -27312,10 +27322,12 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
         group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=neutral_motion,
-        render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan)
+        render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan,
+        phrase_times=phrase_inputs)
 
 
-def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, timewarps, common_start):
+def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, timewarps, common_start,
+        phrase_times=None):
     if not isinstance(bundle, _GroupRenderCandidateBundle) or bundle.timeline_review is None:
         raise ValueError('complete GROUP bundle requires its timeline review')
     if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
@@ -27323,6 +27335,36 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     plan, timeline = bundle.render_plan, bundle.visual_timeline
     if len(plan.segments) != len(timeline.choices):
         raise ValueError('GROUP timeline/render cardinality changed')
+    if (bundle.phrase_times is None or phrase_times is not None
+            and tuple(float(value) for value in phrase_times)!=bundle.phrase_times):
+        raise ValueError('GROUP bundle lacks the retained external phrase authority')
+    try:
+        expected_music_clock=_deterministic_exact_shot_clock_from_timeline(timeline,
+            section_plan=bundle.section_plan,phrase_times=bundle.phrase_times)
+    except (TypeError,RuntimeError) as exc:
+        raise ValueError('GROUP bundle has malformed exact music structure inputs') from exc
+    fresh_review=review_timeline(timeline,available_source_count=len(eligible_indices))
+    if (not isinstance(bundle.timeline_review,TimelineReview)
+            or bundle.timeline_review.to_dict()!=fresh_review.to_dict()
+            or abs(bundle.pre_render_score-fresh_review.weighted_score)>1e-9):
+        raise ValueError('GROUP bundle review/score differs from its current timeline and review policy')
+    motion=bundle.editorial_motion_plan
+    if not isinstance(motion,EditorialMotionPlan) or len(motion.segments)!=len(plan.segments):
+        raise ValueError('GROUP bundle lacks complete motion source/camera authority')
+    for index,(item,choice,segment) in enumerate(zip(motion.segments,timeline.choices,plan.segments,strict=True)):
+        if (item.segment_index!=index or type(item.source_index) is not int
+                or item.source_index!=choice.source_index or item.track!=segment.editorial_transform):
+            raise ValueError('GROUP motion source/camera differs from the current eligible timeline and renderer')
+    alignment=motion.boundary_subject_alignment_plan
+    if alignment is not None and (len(alignment.segments)!=len(plan.segments)
+            or any(item.segment_index!=index or item.source_index!=timeline.choices[index].source_index
+                for index,item in enumerate(alignment.segments))):
+        raise ValueError('GROUP boundary alignment source authority differs from the current timeline')
+    face=bundle.face_match_plan
+    if face is not None and (not isinstance(face,FaceMatchPlan) or len(face.segments)!=len(plan.segments)
+            or any(item.segment_index!=index or item.source_index!=timeline.choices[index].source_index
+                or item.pan_crop!=plan.segments[index].pan_crop for index,item in enumerate(face.segments))):
+        raise ValueError('GROUP face source/pan authority differs from its current timeline and renderer')
     clock = bundle.stage_edit_exact_shot_clock
     if (not isinstance(clock, Mapping) or len(clock.get('shots', ())) != len(timeline.choices)
             or clock.get('contract') != EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT
@@ -27356,6 +27398,8 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
         if (shot.get('section_role')!=directive.role.value
                 or abs(shot['section_progress']-expected_progress)>1e-9):
             raise ValueError('GROUP exact shot section role/progress differs from owned timeline and section')
+        if abs(shot['phrase_progress']-expected_music_clock['shots'][index]['phrase_progress'])>1e-9:
+            raise ValueError('GROUP exact shot phrase progress differs from its retained phrase authority')
 
 
 def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices,offsets,
@@ -27478,12 +27522,13 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
         editorial_motion_plan=motion,boundary_repairs=None,boundary_affine_plan=None,
         stage_edit_exact_shot_clock=_deterministic_exact_shot_clock_from_timeline(result.timeline,
             section_plan=bundle.section_plan,phrase_times=phrase_times),
+        phrase_times=tuple(phrase_times),
         candidate_lineage=(*bundle.candidate_lineage,{'stage':'bounded_joint_motion_camera_refinement',
             'supersedes_legacy_repair_endpoint_metadata':True,
             'unchanged_shot_context_receipts_rebound':len(contexts),
             'unchanged_coupled_shot_receipts_rebound':len(coupled),**result.to_dict()}))
     _validate_review_first_group_bundle(updated,eligible_indices=eligible_indices,offsets=offsets,
-        timewarps=timewarps,common_start=bundle.render_plan.master_audio_start)
+        timewarps=timewarps,common_start=bundle.render_plan.master_audio_start,phrase_times=phrase_times)
     return updated
 
 
@@ -33948,7 +33993,8 @@ def analyze(
                                 materialized_review_candidate, motion_authority_v3=registered_stage_edit_motion_authority_v3)
                             group_first.validate_plan(promoted_bundle.render_plan)
                             _validate_review_first_group_bundle(promoted_bundle, eligible_indices=eligible_indices,
-                                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+                                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
+                                phrase_times=phrase_times)
                             promoted_bundle = replace(promoted_bundle, dynamic_crop_application=
                                 _dynamic_crop_render_application_audit(promoted_bundle, materialized_review_candidate))
                             if registered_stage_edit_bundle is not None:
@@ -34152,7 +34198,8 @@ def analyze(
                 common_start=common_start, section_plan=section_plan, phrase_times=phrase_times,
                 output=group_first.baseline.render_plan.output, reporter=reporter, warnings=warnings)
             _validate_review_first_group_bundle(bundle, eligible_indices=eligible_indices,
-                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+                offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
+                phrase_times=phrase_times)
             group_first.validate_plan(bundle.render_plan)
         if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
                 and (not review_first_runtime.enabled or review_first_runtime.optional_refinement_allowed)):
@@ -35296,6 +35343,7 @@ def analyze(
                     render_plan=plan,
                     section_plan=final_montage_section_plan,
                     boundary_look_match=boundary_look_match_result,
+                    phrase_times=tuple(phrase_times),
                     diagnostics=("bounded_review_first_singleton_finalization",),
                     candidate_origin="ordinary_visual_baseline",
                     candidate_lineage=(
@@ -35315,7 +35363,8 @@ def analyze(
                     ),
                 )
                 _validate_review_first_group_bundle(bundle, eligible_indices=eligible_indices,
-                    offsets=offsets, timewarps=eligible_timewarps, common_start=common_start)
+                    offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
+                    phrase_times=phrase_times)
                 group_first.validate_plan(plan)
                 from .review_first_repair_lineage import review_first_repair_lineage
                 repair_lineage = review_first_repair_lineage(
@@ -35341,7 +35390,7 @@ def analyze(
                         timewarps=eligible_timewarps,scene_cut_times=scene_cut_times,phrase_times=phrase_times),
                     validate=lambda value: _validate_review_first_group_bundle(value,
                         eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
-                        common_start=common_start) if value is not None else None)
+                        common_start=common_start,phrase_times=phrase_times) if value is not None else None)
                 if camera_bundle is not None:
                     group_first.promote(camera_bundle,plan=camera_bundle.render_plan,
                         authority=camera_bundle.cadence_profile)
@@ -35354,7 +35403,7 @@ def analyze(
                             for change in payload['changes']) for payload in scene_payloads)),
                     validate=lambda value: _validate_review_first_group_bundle(value,
                         eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
-                        common_start=common_start) if value is not None else None)
+                        common_start=common_start,phrase_times=phrase_times) if value is not None else None)
                 if context_bundle is not None:
                     group_first.promote(context_bundle,plan=context_bundle.render_plan,
                         authority=context_bundle.cadence_profile)
@@ -35369,7 +35418,7 @@ def analyze(
                             group_16x9_safe=source_aspects_are_editorial_safe),
                         validate=lambda value: _validate_review_first_group_bundle(
                             value, eligible_indices=eligible_indices, offsets=offsets,
-                            timewarps=eligible_timewarps, common_start=common_start))
+                            timewarps=eligible_timewarps, common_start=common_start,phrase_times=phrase_times))
                     if look_bundle is not None:
                         group_first.promote(look_bundle, plan=look_bundle.render_plan,
                                             authority=look_bundle.cadence_profile)

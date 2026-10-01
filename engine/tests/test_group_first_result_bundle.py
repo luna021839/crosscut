@@ -21,15 +21,14 @@ class GroupFirstResultBundleTests(unittest.TestCase):
             4, 15., .4, .1, False, False),))
         request = SimpleNamespace(sources=(Path('/synthetic/a'), Path('/synthetic/b')),
             reference_source=0, aspect_ratio=AspectRatio.LANDSCAPE)
-        with patch('crosscut.pipeline._review_visual_timeline_for_render', return_value=SimpleNamespace(weighted_score=.5)):
-            return _review_first_group_bundle(timeline=VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 1.),
-                request=request, eligible_indices=(0, 1), offsets=(0., 0.), timewarps=(None, None),
-                common_start=0., section_plan=section, phrase_times=(0., 1., 2.),
-                output=Path('/synthetic/out'), reporter=None, warnings=[])
+        return _review_first_group_bundle(timeline=VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 1.),
+            request=request, eligible_indices=(0, 1), offsets=(0., 0.), timewarps=(None, None),
+            common_start=0., section_plan=section, phrase_times=(0., 1., 2.),
+            output=Path('/synthetic/out'), reporter=SimpleNamespace(log=lambda *a,**k:None), warnings=[])
 
     def validate(self, bundle):
         _validate_review_first_group_bundle(bundle, eligible_indices=(0, 1), offsets=(0., 0.),
-            timewarps=(None, None), common_start=0.)
+            timewarps=(None, None), common_start=0.,phrase_times=(0.,1.,2.))
 
     def test_owned_clock_is_deeply_immutable_and_serializable(self):
         bundle = self.make_bundle()
@@ -88,3 +87,72 @@ class GroupFirstResultBundleTests(unittest.TestCase):
             clock['shots'][0][field]=value
             with self.subTest(field=field),self.assertRaises(ValueError):
                 self.validate(replace(bundle,stage_edit_exact_shot_clock=clock))
+
+    def test_in_range_stale_phrase_progress_and_forged_review_score_cannot_promote(self):
+        bundle=self.make_bundle()
+        clock=_thaw_audit_value(bundle.stage_edit_exact_shot_clock)
+        clock['shots'][0]['phrase_progress']=.419
+        for candidate in (replace(bundle,stage_edit_exact_shot_clock=clock),
+                replace(bundle,pre_render_score=bundle.pre_render_score+999.),
+                replace(bundle,timeline_review=replace(bundle.timeline_review,weighted_score=99.))):
+            with self.subTest(candidate=candidate),self.assertRaises(ValueError):self.validate(candidate)
+
+    def test_stale_motion_source_or_camera_cannot_promote(self):
+        from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
+        bundle=self.make_bundle();motion=bundle.editorial_motion_plan
+        for item in (replace(motion.segments[0],source_index=1),
+                replace(motion.segments[0],track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),)))):
+            changed=replace(bundle,editorial_motion_plan=replace(motion,segments=(item,motion.segments[1])))
+            with self.subTest(item=item),self.assertRaises(ValueError):self.validate(changed)
+
+    def test_phrase_inputs_and_section_are_serialized_without_mutable_aliases(self):
+        bundle=self.make_bundle();payload=bundle.to_dict()
+        self.assertEqual(payload['phrase_times'],[0.,1.,2.])
+        self.assertEqual(payload['section_plan'],bundle.section_plan.to_dict())
+        payload['phrase_times'][0]=999.
+        self.assertEqual(bundle.phrase_times,(0.,1.,2.))
+        from crosscut.pipeline import _deterministic_exact_shot_clock_from_timeline
+        changed=replace(bundle,phrase_times=(0.,2.),stage_edit_exact_shot_clock=
+            _deterministic_exact_shot_clock_from_timeline(bundle.visual_timeline,
+                section_plan=bundle.section_plan,phrase_times=(0.,2.)))
+        with self.assertRaisesRegex(ValueError,'external phrase authority'):self.validate(changed)
+
+    def test_nonidentity_joint_source_change_cannot_promote_with_old_motion_or_review(self):
+        from engine.tests.test_group_joint_state_factory import JointStateFactoryTests
+        from crosscut.group_joint_state_factory import candidate_joint_group_state,assemble_joint_group_states
+        from crosscut.group_transition import GroupTransitionPlan
+        from crosscut.first_result_controller import FirstResultController
+        from crosscut.review_first_runtime import ReviewFirstRuntime
+        plan,domain,states=JointStateFactoryTests().fixture()
+        timeline=VisualTimelinePlan(tuple(_choice(i,i) for i in range(4)),1.)
+        section=SectionPlan((SectionDirective(0,SectionRole.BUILD,0.,4.,.5,.5,1,4,15.,.4,.1,False,False),))
+        request=SimpleNamespace(sources=plan.sources,reference_source=0,aspect_ratio=plan.aspect_ratio)
+        def produce(current_timeline):
+            return _review_first_group_bundle(timeline=current_timeline,request=request,
+                eligible_indices=domain.eligible_indices,offsets=domain.audio_offsets,
+                timewarps=domain.source_timewarps,common_start=0.,section_plan=section,
+                phrase_times=(0.,1.,2.,3.,4.),output=plan.output,
+                reporter=SimpleNamespace(log=lambda *a,**k:None),warnings=[])
+        baseline=produce(timeline)
+        b=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],eligible_source_index=2)
+        c=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[2],eligible_source_index=1)
+        proposed,_=assemble_joint_group_states(plan=plan,domain=domain,path=(states[0],b,c,states[3]))
+        # New synthetic source descriptors enter the real owned producer;
+        # no old source's feature row or motion is copied into this bundle.
+        fresh=produce(VisualTimelinePlan(tuple(_choice(i,s) for i,s in enumerate((0,2,1,3))),1.))
+        fresh=replace(fresh,render_plan=proposed,group_transition_plan=GroupTransitionPlan(proposed.transitions))
+        def validate(value):
+            return _validate_review_first_group_bundle(value,eligible_indices=domain.eligible_indices,
+                offsets=domain.audio_offsets,timewarps=domain.source_timewarps,common_start=0.,
+                phrase_times=(0.,1.,2.,3.,4.))
+        validate(fresh)
+        self.assertEqual(tuple(s.source_index for s in fresh.render_plan.segments),(0,3,2,5))
+        self.assertEqual(tuple(s.source_index for s in fresh.editorial_motion_plan.segments),(0,2,1,3))
+        controller=FirstResultController(ReviewFirstRuntime(enabled=True),sources=plan.sources,
+            source_durations=(60.,)*6,master_start=0.,duration=4.,allowed_source_indices=domain.eligible_indices)
+        controller.install_baseline(baseline,plan=baseline.render_plan,authority='synthetic_complete_baseline')
+        for candidate in (replace(fresh,editorial_motion_plan=baseline.editorial_motion_plan),
+                replace(fresh,timeline_review=baseline.timeline_review,pre_render_score=baseline.pre_render_score)):
+            self.assertIsNone(controller.run_optional('joint_source_camera',lambda:candidate,validate=validate))
+            self.assertIs(controller.incumbent,baseline)
+        self.assertFalse(controller.to_dict()['quality_approved'])
