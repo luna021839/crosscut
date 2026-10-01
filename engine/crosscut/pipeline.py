@@ -27418,20 +27418,27 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     if tuple(bundle.group_transition_plan.transitions) != tuple(plan.transitions):
         raise ValueError('GROUP transition authority differs from renderer')
     for index, (choice, segment, shot) in enumerate(zip(timeline.choices, plan.segments, clock['shots'])):
-        if (choice.segment_index != index or type(choice.source_index) is not int
+        if (type(choice.segment_index) is not int or choice.segment_index != index
+                or type(choice.source_index) is not int
                 or not 0 <= choice.source_index < len(eligible_indices)
-                or not math.isfinite(choice.canonical_master_start)
-                or not math.isfinite(choice.duration_seconds) or choice.duration_seconds <= 0
+                or any(type(getattr(choice, name)) not in (int, float)
+                    or not math.isfinite(getattr(choice, name)) for name in
+                    ('canonical_master_start', 'duration_seconds', 'source_local_start', 'source_local_end'))
+                or choice.duration_seconds <= 0
                 or choice.canonical_master_start < bundle.section_plan.start_seconds-1e-6
                 or choice.canonical_master_end > bundle.section_plan.end_seconds+1e-6
-                or shot.get('shot_index') != index or shot.get('source_index') != choice.source_index):
+                or type(shot.get('shot_index')) is not int or shot.get('shot_index') != index
+                or type(shot.get('source_index')) is not int or shot.get('source_index') != choice.source_index):
             raise ValueError('GROUP bundle timeline/section/source/shot authority differs')
         expected = aligned_render_segment(source_index=eligible_indices[choice.source_index],
             reference_start=choice.canonical_master_start, common_master_start=common_start,
             source_offset=offsets[choice.source_index], duration=choice.duration_seconds,
             timewarp=timewarps[choice.source_index])
-        if (segment.source_index != expected.source_index or any(abs(getattr(segment, name)-getattr(expected, name)) > 1e-6
-                for name in ('master_start', 'source_start', 'duration', 'source_end'))):
+        if (type(segment.source_index) is not int or segment.source_index != expected.source_index
+                or any(abs(getattr(segment, name)-getattr(expected, name)) > 1e-6
+                for name in ('master_start', 'source_start', 'duration', 'source_end'))
+                or abs(choice.source_local_start-segment.source_start)>1e-6
+                or abs(choice.source_local_end-segment.source_end)>1e-6):
             raise ValueError('GROUP bundle source/reference clocks differ from timeline')
         if any(type(shot.get(key)) not in (int, float) or not math.isfinite(shot[key])
                or not 0 <= shot[key] <= 1 for key in ('section_progress', 'phrase_progress')):

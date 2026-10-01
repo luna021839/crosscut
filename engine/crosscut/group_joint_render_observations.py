@@ -8,7 +8,8 @@ from dataclasses import dataclass, replace
 
 from .group_joint_native_preparation import _plan_identity
 from .group_joint_source_camera import GroupSourceCameraState
-from .group_joint_state_factory import assemble_joint_group_states
+from .group_joint_state_factory import (assemble_joint_group_states,
+    assemble_single_group_source_camera_state)
 from .group_source_domain import GroupSourceDomain
 from .group_source_span_proposal import refresh_fixed_group_render_observations
 from .optional_native_worker import isolated_optional
@@ -62,7 +63,11 @@ def refresh_joint_group_render_observations(*, plan, timeline, domain, path,
                     (choice.canonical_master_end,plan.master_audio_start+segment.master_start+segment.duration),
                     (choice.source_local_start,segment.source_start),(choice.source_local_end,segment.source_end)))):
             raise ValueError('joint rendered observations have a stale incumbent source/clock timeline')
-    proposed,changed=assemble_joint_group_states(plan=plan,domain=domain,path=path)
+    if not isinstance(path, tuple) or len(path) not in (3, 4):
+        raise ValueError('joint rendered observations require three or four actual whole-shot states')
+    assembler = (assemble_single_group_source_camera_state if len(path) == 3
+        else assemble_joint_group_states)
+    proposed,changed=assembler(plan=plan,domain=domain,path=path)
     if not changed:
         return GroupJointRenderedObservations(_plan_identity(plan),plan,timeline,path,(),())
     first=max(0,min(changed)-1);last=min(len(plan.segments)-1,max(changed)+1)

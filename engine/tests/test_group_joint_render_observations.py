@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from crosscut.group_joint_render_observations import refresh_joint_group_render_observations
 from crosscut.group_joint_state_factory import candidate_joint_group_state
+from crosscut.group_joint_source_camera import joint_state_from_render_plan
 from crosscut.render import EditorialTransformTrack, EditorialTransformKeyframe
 from crosscut.visual_score import VisualTimelinePlan
 from tests import test_group_joint_state_factory as factory_fixture
@@ -18,6 +19,32 @@ class JointSampler(Sampler):
 
 
 class JointRenderedObservationsTests(unittest.TestCase):
+    def test_one_real_mutable_shot_refreshes_its_entire_multi_cell_path(self):
+        from crosscut.render import RenderTransition
+        plan,timeline,domain,_=self.fixture()
+        plan=replace(plan,segments=(plan.segments[0],plan.segments[1],
+            replace(plan.segments[2],source_index=plan.segments[1].source_index),plan.segments[3]),
+            transitions=(RenderTransition(),RenderTransition(tier='D',reason='one_actual_shot'),RenderTransition()))
+        timeline=replace(timeline,choices=(timeline.choices[0],timeline.choices[1],
+            replace(timeline.choices[2],source_index=1),timeline.choices[3]))
+        bounds=((0,30),(30,90),(90,120))
+        role=factory_fixture.JointStateFactoryTests().fixture()[2][1].role
+        states=tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=i,
+            first_output_frame=a,end_output_frame=b,role=role) for i,(a,b) in enumerate(bounds))
+        candidate=candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=states[1],
+            eligible_source_index=2)
+        Sampler.instances=[];Sampler.unreadable_source=None
+        with patch('crosscut.visual_score._VideoSampler',JointSampler):
+            result=refresh_joint_group_render_observations(plan=plan,timeline=timeline,domain=domain,
+                path=(states[0],candidate,states[2]),sync_scores=(1.,)*4)
+        self.assertEqual(result.changed_segment_indices,(1,2))
+        self.assertEqual(result.refreshed_segment_indices,(0,1,2,3))
+        self.assertEqual(tuple(c.source_index for c in result.timeline.choices),(0,2,2,3))
+        self.assertEqual(tuple(s.source_index for s in result.plan.segments),(0,3,3,5))
+        self.assertEqual(len(result.path),3)
+        self.assertTrue(all(s.closed for s in Sampler.instances))
+        self.assertFalse(result.to_dict()['dense_role_evidence_verified'])
+
     def fixture(self):
         plan,domain,states=factory_fixture.JointStateFactoryTests().fixture()
         timeline=VisualTimelinePlan(tuple(replace(_choice(i,i),quality_score=.99,

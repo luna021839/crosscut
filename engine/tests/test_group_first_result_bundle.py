@@ -16,6 +16,28 @@ from tests.test_visual_boundary_repair import _choice
 
 
 class GroupFirstResultBundleTests(unittest.TestCase):
+    def test_stale_or_nonfinite_source_local_descriptor_clock_cannot_promote(self):
+        bundle = self.make_bundle()
+        for field, value in (('source_local_start', .01), ('source_local_end', 1.01),
+                ('source_local_start', float('nan')), ('source_local_end', float('inf')),
+                ('source_local_start', False), ('canonical_master_start', False), ('segment_index', False)):
+            timeline = replace(bundle.visual_timeline, choices=(replace(
+                bundle.visual_timeline.choices[0], **{field: value}), *bundle.visual_timeline.choices[1:]))
+            from crosscut.timeline_review import review_timeline
+            review = review_timeline(timeline, available_source_count=2)
+            candidate = replace(bundle, visual_timeline=timeline, timeline_review=review,
+                pre_render_score=review.weighted_score)
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.validate(candidate)
+
+    def test_boolean_shot_ids_are_not_integer_music_authority(self):
+        bundle = self.make_bundle()
+        for field in ('shot_index', 'source_index'):
+            clock = _thaw_audit_value(bundle.stage_edit_exact_shot_clock)
+            clock['shots'][0][field] = False
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(replace(bundle, stage_edit_exact_shot_clock=clock))
+
     def make_bundle(self):
         section = SectionPlan((SectionDirective(0, SectionRole.BUILD, 0., 2., .5, .5, 1,
             4, 15., .4, .1, False, False),))
