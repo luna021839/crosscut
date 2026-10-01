@@ -38,7 +38,7 @@ class GroupJointMetadataProposal:
 
 
 def complete_joint_group_bundle_metadata(*, incumbent, observations, domain,
-        fresh_motion, fresh_face_match, phrase_times):
+        fresh_motion, fresh_face_match, phrase_times, shot_clock_context=None):
     """Build one full bundle; never install a new plan alongside old metadata.
 
     Only construction and numeric freshness are checked here. These checks do
@@ -65,6 +65,13 @@ def complete_joint_group_bundle_metadata(*, incumbent, observations, domain,
     assembler = (assemble_single_group_source_camera_state if len(path) == 3
         else assemble_joint_group_states)
     expected, changed = assembler(plan=before, domain=domain, path=path)
+    if observations.plan.authorized_shot_video_clocks:
+        from .shot_video_clock import FrozenShotVideoClockContext, attach_authorized_shot_video_clocks
+        if (not isinstance(shot_clock_context, FrozenShotVideoClockContext) or shot_clock_context.incumbent_plan != before
+                or shot_clock_context.source_domain != domain):
+            raise ValueError('joint numeric metadata lacks its external frozen shot-clock context')
+        expected = attach_authorized_shot_video_clocks(plan=expected,
+            context=shot_clock_context, clocks=observations.plan.authorized_shot_video_clocks)
     if expected != observations.plan or changed != observations.changed_segment_indices:
         raise ValueError('joint descriptor plan/changed inventory differs from the assembled whole states')
     if not changed:
@@ -162,5 +169,5 @@ def complete_joint_group_bundle_metadata(*, incumbent, observations, domain,
             candidate_admitted=False, raw_v2_parent_replay_required=True, quality_approved=False)))
     _validate_review_first_group_bundle(candidate, eligible_indices=domain.eligible_indices,
         offsets=domain.audio_offsets, timewarps=domain.source_timewarps,
-        common_start=before.master_audio_start, phrase_times=phrases)
+        common_start=before.master_audio_start, phrase_times=phrases, shot_clock_context=shot_clock_context)
     return GroupJointMetadataProposal(_plan_identity(before), candidate, changed)

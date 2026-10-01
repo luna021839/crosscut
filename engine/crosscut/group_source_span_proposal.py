@@ -237,7 +237,7 @@ def refresh_group_source_span_observations(*,proposal,audio_offsets=None,source_
 def refresh_fixed_group_render_observations(*,plan,clock_timeline,first_segment_index,
         last_segment_index,source_domain,audio_offsets=None,source_timewarps=None,sync_scores,
         scene_cut_times=None,feature_cache_directory=None,feature_derived_cache_directory=None,
-        require_persistent_feature_cache=False):
+        require_persistent_feature_cache=False, shot_clock_context=None):
     """Describe one fixed local rendered path, including its actual cameras.
 
     This shared materializer also serves a simultaneous B/C replacement. It
@@ -271,6 +271,12 @@ def refresh_fixed_group_render_observations(*,plan,clock_timeline,first_segment_
                     (choice.source_local_start,segment.source_start),(choice.source_local_end,segment.source_end)))):
             raise ValueError('fixed GROUP refresh timeline differs from its final source/render clock')
     chosen=clock_timeline.choices[first:last+1]
+    clock_slices = None
+    if plan.authorized_shot_video_clocks:
+        from .shot_video_clock import FrozenShotVideoClockContext, resolved_shot_video_clock_slices
+        if not isinstance(shot_clock_context, FrozenShotVideoClockContext) or shot_clock_context.source_domain != domain:
+            raise ValueError('fixed GROUP shot-clock context differs from external source domain')
+        clock_slices = resolved_shot_video_clock_slices(plan=plan, context=shot_clock_context)[first:last+1]
     origin=plan.segments[first].master_start
     seed=build_visual_timeline_optimizer_seed(sources=domain.eligible_sources,
         canonical_spans=tuple((c.canonical_master_start,c.canonical_master_end) for c in chosen),
@@ -278,7 +284,8 @@ def refresh_fixed_group_render_observations(*,plan,clock_timeline,first_segment_
         scene_cut_times=scene_cut_times,candidate_source_indices_by_segment=tuple((c.source_index,) for c in chosen),
         group_incumbent_render_segments=tuple(replace(s,source_index=domain.eligible_index(s.source_index),
             master_start=s.master_start-origin)
-            for s in plan.segments[first:last+1]),feature_cache_directory=feature_cache_directory,
+            for s in plan.segments[first:last+1]),group_incumbent_clock_slices=clock_slices,
+        feature_cache_directory=feature_cache_directory,
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache)
     cells=seed.optimizer_workspace.candidates_by_segment

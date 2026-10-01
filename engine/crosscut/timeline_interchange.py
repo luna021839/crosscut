@@ -96,6 +96,8 @@ def _safe_name(value: str, fallback: str) -> str:
 
 
 def _segment_metadata(plan: RenderPlan, index: int) -> dict[str, Any]:
+    from .shot_video_clock import validate_shot_video_clock_bindings
+    clocks = validate_shot_video_clock_bindings(plan)
     segment = plan.segments[index]
     transition = plan.transitions[index - 1] if index > 0 else None
     return {
@@ -104,6 +106,8 @@ def _segment_metadata(plan: RenderPlan, index: int) -> dict[str, Any]:
         "source_start_seconds": segment.source_start,
         "source_duration_seconds": segment.effective_source_duration,
         "source_playback_rate": segment.source_playback_rate,
+        **({'authorized_shot_video_clock': clocks[index].to_dict()}
+            if index in clocks else {}),
         "master_start_seconds": segment.master_start,
         "master_duration_seconds": segment.duration,
         "incoming_transition": (

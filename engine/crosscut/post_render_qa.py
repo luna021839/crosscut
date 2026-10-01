@@ -8085,6 +8085,43 @@ def _ive_product_quality_floor_metrics(
     return payload
 
 
+def _shot_video_clock_numeric_bindings(plan, frame_clock_payload):
+    """Replay numeric local clocks; NEVER infer semantic/lip-sync approval.
+
+    The frame-clock sidecar is a separately loaded render artifact. Its video
+    content binding is checked by the ordinary artifact pipeline, not invented
+    from the local clock receipt. A new joint semantic family remains required.
+    """
+    from fractions import Fraction
+    from .render_frame_schedule import VerifiedRenderFrameClock
+    from .render_plan_serialization import render_plan_from_json
+    from .shot_video_clock import validate_shot_video_clock_bindings
+    typed = render_plan_from_json(dict(plan))
+    if frame_clock_payload.get('plan') != plan or not frame_clock_payload.get('enabled') is True:
+        raise ValueError('local shot clocks differ from the enabled actual render clock artifact')
+    raw_clocks = frame_clock_payload.get('source_clocks')
+    if not isinstance(raw_clocks, dict):
+        raise ValueError('local shot clocks have no independently bound native/PTS inventory')
+    clocks = {}
+    for key, raw in raw_clocks.items():
+        if not isinstance(key, str) or not key.isdecimal() or not isinstance(raw, dict):
+            raise ValueError('local shot native clocks are malformed')
+        try:
+            clock = VerifiedRenderFrameClock(Fraction(raw['frame_rate']), raw['frame_count'],
+                raw['packet_grid_sha256'], raw['grid_basis'])
+        except (KeyError, TypeError, ZeroDivisionError) as exc:
+            raise ValueError('local shot native clock is incomplete') from exc
+        if clock.to_dict() != raw:
+            raise ValueError('local shot native clock changed contract on replay')
+        clocks[int(key)] = clock
+    claimed = validate_shot_video_clock_bindings(typed, frame_clocks=clocks)
+    return dict(contract='shot_local_video_clock_numeric_qa_v1',
+        declared_count=len(typed.authorized_shot_video_clocks), bound_count=len(typed.authorized_shot_video_clocks),
+        bound_segment_indices=sorted(claimed), numeric_clock_replayed=True,
+        semantic_audio_evidence_required=bool(claimed), choreography_certified=False,
+        lip_sync_certified=False, quality_approved=False)
+
+
 def evaluate_post_render_qa(
     artifact_set: PostRenderArtifactSet,
     *,
@@ -8135,6 +8172,19 @@ def evaluate_post_render_qa(
             created_at=created_at or datetime.now(UTC),
         )
 
+    if 'authorized_shot_video_clocks' in plan:
+        from .render_clock_artifact import render_clock_path
+        try:
+            sidecar = _load_json_object(render_clock_path(artifact_set.video_path))
+            metrics['shot_video_clocks'] = _shot_video_clock_numeric_bindings(plan, sidecar)
+            if metrics['shot_video_clocks']['semantic_audio_evidence_required']:
+                collector.add('shot_local_phase_semantic_audio_evidence_missing', QAIssueSeverity.FAIL,
+                    'Numeric video phase is valid but has no supported independent choreography/lip-sync QA family.',
+                    path='render_plan.authorized_shot_video_clocks')
+        except (ValueError, TypeError, OverflowError) as exc:
+            collector.add('shot_local_video_clock_binding_invalid', QAIssueSeverity.FAIL,
+                'Declared shot-local clocks do not match the actual render/native clock inventory.',
+                path='render_plan.authorized_shot_video_clocks', value=str(exc))
     # The policy must agree in BOTH independently loaded artifacts. Never use
     # an arbitrary serialized candidate count to weaken the decoded QA gates.
     render_payload = _mapping(analysis.get("render")) or {}

@@ -27353,12 +27353,22 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
 
 
 def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, timewarps, common_start,
-        phrase_times=None):
+        phrase_times=None, shot_clock_context=None):
     if not isinstance(bundle, _GroupRenderCandidateBundle) or bundle.timeline_review is None:
         raise ValueError('complete GROUP bundle requires its timeline review')
     if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
         raise ValueError('complete GROUP bundle requires finite review and section authority')
     plan, timeline = bundle.render_plan, bundle.visual_timeline
+    authorized_clocks = {}
+    if plan.authorized_shot_video_clocks:
+        from .shot_video_clock import FrozenShotVideoClockContext, validate_authorized_shot_video_clocks
+        if (not isinstance(shot_clock_context, FrozenShotVideoClockContext)
+                or shot_clock_context.source_domain.eligible_indices != tuple(eligible_indices)
+                or shot_clock_context.source_domain.audio_offsets != tuple(offsets)
+                or shot_clock_context.source_domain.source_timewarps != tuple(timewarps)
+                or shot_clock_context.incumbent_plan.master_audio_start != common_start):
+            raise ValueError('GROUP local video clock lacks matching external parent alignment context')
+        authorized_clocks = validate_authorized_shot_video_clocks(plan=plan, context=shot_clock_context)
     if len(plan.segments) != len(timeline.choices):
         raise ValueError('GROUP timeline/render cardinality changed')
     if (bundle.phrase_times is None or phrase_times is not None
@@ -27434,6 +27444,15 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
             reference_start=choice.canonical_master_start, common_master_start=common_start,
             source_offset=offsets[choice.source_index], duration=choice.duration_seconds,
             timewarp=timewarps[choice.source_index])
+        if index in authorized_clocks:
+            authority = authorized_clocks[index]
+            # Global audio offsets/warps stay unchanged, including other shots
+            # using this source. Only this bound complete unit has a local
+            # video clock; the numeric parent has replayed its exact grid.
+            expected = replace(expected,
+                source_start=authority.source_start+(expected.master_start-
+                    (authority.reference_start-plan.master_audio_start))*authority.source_rate,
+                source_duration=expected.duration*authority.source_rate)
         if (type(segment.source_index) is not int or segment.source_index != expected.source_index
                 or any(abs(getattr(segment, name)-getattr(expected, name)) > 1e-6
                 for name in ('master_start', 'source_start', 'duration', 'source_end'))

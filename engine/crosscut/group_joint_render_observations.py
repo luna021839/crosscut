@@ -42,7 +42,7 @@ class GroupJointRenderedObservations:
 @isolated_optional()
 def refresh_joint_group_render_observations(*, plan, timeline, domain, path,
         sync_scores, feature_cache_directory=None, feature_derived_cache_directory=None,
-        require_persistent_feature_cache=False):
+        require_persistent_feature_cache=False, shot_clock_context=None, shot_video_clocks=()):
     """Assemble both new sources/cameras before sensing dependent descriptors.
 
     Replacing B with C's source does not have to pass a solo constructor while
@@ -68,6 +68,13 @@ def refresh_joint_group_render_observations(*, plan, timeline, domain, path,
     assembler = (assemble_single_group_source_camera_state if len(path) == 3
         else assemble_joint_group_states)
     proposed,changed=assembler(plan=plan,domain=domain,path=path)
+    if shot_video_clocks:
+        from .shot_video_clock import FrozenShotVideoClockContext, attach_authorized_shot_video_clocks
+        if (not isinstance(shot_clock_context, FrozenShotVideoClockContext)
+                or shot_clock_context.incumbent_plan != plan or shot_clock_context.source_domain != domain):
+            raise ValueError('joint clock context differs from the external incumbent/source domain')
+        proposed = attach_authorized_shot_video_clocks(plan=proposed,
+            context=shot_clock_context, clocks=shot_video_clocks)
     if not changed:
         return GroupJointRenderedObservations(_plan_identity(plan),plan,timeline,path,(),())
     first=max(0,min(changed)-1);last=min(len(plan.segments)-1,max(changed)+1)
@@ -84,6 +91,6 @@ def refresh_joint_group_render_observations(*, plan, timeline, domain, path,
         first_segment_index=first,last_segment_index=last,source_domain=domain,
         sync_scores=sync_scores,feature_cache_directory=feature_cache_directory,
         feature_derived_cache_directory=feature_derived_cache_directory,
-        require_persistent_feature_cache=require_persistent_feature_cache)
+        require_persistent_feature_cache=require_persistent_feature_cache, shot_clock_context=shot_clock_context)
     return GroupJointRenderedObservations(_plan_identity(plan),proposed,fresh,path,
         changed,tuple(range(first,last+1)))

@@ -29,6 +29,10 @@ def render_plan_from_json(payload: Mapping[str, Any]) -> RenderPlan:
         args = values(RenderPlan, dict(payload))
         args['sources'] = tuple(Path(p) for p in payload['sources'])
         args['output'] = Path(payload['output'])
+        if 'authorized_shot_video_clocks' in payload:
+            from .shot_video_clock import shot_video_clock_from_dict
+            args['authorized_shot_video_clocks'] = tuple(shot_video_clock_from_dict(row)
+                for row in payload['authorized_shot_video_clocks'])
         segments = []
         for raw in payload['segments']:
             segment = values(RenderSegment, raw)

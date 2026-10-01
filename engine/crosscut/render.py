@@ -1081,6 +1081,7 @@ class RenderPlan:
     member_pose_dissolve_requested: bool | None = None
     member_pose_dissolve_effective: bool | None = None
     member_pose_dissolve_count: int | None = None
+    authorized_shot_video_clocks: tuple = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.aspect_ratio, AspectRatio):
@@ -1333,6 +1334,8 @@ class RenderPlan:
                 == self.segments[index + 1].source_index
             ):
                 raise ValueError("overlap transition requires a real source change")
+        from .shot_video_clock import validate_shot_video_clock_bindings
+        validate_shot_video_clock_bindings(self)
 
     @property
     def duration(self) -> float:
@@ -1374,6 +1377,8 @@ class RenderPlan:
         }
 
     def to_json(self) -> dict[str, object]:
+        from .shot_video_clock import validate_shot_video_clock_bindings
+        validate_shot_video_clock_bindings(self)
         serialized_segments: list[dict[str, object]] = []
         for segment in self.segments:
             payload = asdict(segment)
@@ -1407,6 +1412,8 @@ class RenderPlan:
         from .render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT
         return {
             "frame_clock_contract": RENDER_CLOCK_ARTIFACT_CONTRACT,
+            **({'authorized_shot_video_clocks': [clock.to_dict()
+                for clock in self.authorized_shot_video_clocks]} if self.authorized_shot_video_clocks else {}),
             "sources": [str(path) for path in self.sources],
             "segments": serialized_segments,
             "reference_source": self.reference_source,
@@ -2581,6 +2588,8 @@ def build_filter_graph(
     plan: RenderPlan,
     *, source_clocks: dict[int, VerifiedRenderFrameClock] | None = None,
 ) -> str:
+    from .shot_video_clock import validate_shot_video_clock_bindings
+    validate_shot_video_clock_bindings(plan, frame_clocks=source_clocks or {})
     frame_counts = segment_frame_counts(plan)
     units = _video_render_units(plan, frame_counts)
     parts = [
@@ -2738,6 +2747,8 @@ def render(
             )
             if clock is not None:
                 source_clocks[index] = clock
+    from .shot_video_clock import validate_shot_video_clock_bindings
+    validate_shot_video_clock_bindings(plan, frame_clocks=source_clocks)
     filter_graph = build_filter_graph(plan, source_clocks=source_clocks)
     remaining_runtime("filter graph construction")
     plan.output.parent.mkdir(parents=True, exist_ok=True)

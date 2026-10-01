@@ -2286,6 +2286,7 @@ def _visual_optimizer_input_identity(
     candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
     group_incumbent_render_segments: Sequence[Any] | None = None,
     maximum_results: int = 32,
+    group_incumbent_clock_slices: Sequence[Any] | None = None,
 ) -> str:
     segments = tuple(tuple(segment) for segment in candidates_by_segment)
     if not segments or any(not segment for segment in segments):
@@ -2345,6 +2346,8 @@ def _visual_optimizer_input_identity(
                 candidate_source_indices_by_segment
             ),
             "group_incumbent_render_segments": _optimizer_identity_value(group_incumbent_render_segments),
+            **({'group_incumbent_clock_slices': _optimizer_identity_value(group_incumbent_clock_slices)}
+                if group_incumbent_clock_slices is not None else {}),
             "maximum_results": maximum_results,
         },
     }
@@ -2410,6 +2413,7 @@ class VisualTimelineOptimizerWorkspace:
     prescribed_source_ids: tuple[str, ...] | None = None
     candidate_source_indices_by_segment: tuple[tuple[int, ...], ...] | None = None
     group_incumbent_render_segments: tuple[Any, ...] | None = field(default=None, repr=False)
+    group_incumbent_clock_slices: tuple[Any, ...] | None = field(default=None, repr=False)
     maximum_results: int = 32
     singleton: bool = False
 
@@ -2511,6 +2515,13 @@ class VisualTimelineOptimizerWorkspace:
                     or any(not isinstance(item, RenderSegment) for item in incumbent_segments)):
                 raise ValueError('workspace incumbent geometry must bind each non-prescribed segment')
             object.__setattr__(self, 'group_incumbent_render_segments', incumbent_segments)
+        if self.group_incumbent_clock_slices is not None:
+            from .shot_video_clock import ResolvedShotVideoClockSlice
+            slices = tuple(self.group_incumbent_clock_slices)
+            if (self.group_incumbent_render_segments is None or len(slices) != len(segments)
+                    or any(row is not None and not isinstance(row, ResolvedShotVideoClockSlice) for row in slices)):
+                raise ValueError('workspace shot clocks need typed exact incumbent cell slices')
+            object.__setattr__(self, 'group_incumbent_clock_slices', slices)
         object.__setattr__(self, "phrase_times", phrases)
         object.__setattr__(
             self,
@@ -2775,6 +2786,7 @@ class VisualTimelineCandidateSet:
                 ),
                 candidate_source_indices_by_segment=self.optimizer_workspace.candidate_source_indices_by_segment,
                 group_incumbent_render_segments=self.optimizer_workspace.group_incumbent_render_segments,
+                group_incumbent_clock_slices=self.optimizer_workspace.group_incumbent_clock_slices,
                 maximum_results=self.optimizer_workspace.maximum_results,
             )
             if (
@@ -3117,6 +3129,7 @@ class VisualTimelineOptimizerSeed:
             prescribed_source_ids=self.optimizer_workspace.prescribed_source_ids,
             candidate_source_indices_by_segment=self.optimizer_workspace.candidate_source_indices_by_segment,
             group_incumbent_render_segments=self.optimizer_workspace.group_incumbent_render_segments,
+            group_incumbent_clock_slices=self.optimizer_workspace.group_incumbent_clock_slices,
             maximum_results=self.optimizer_workspace.maximum_results,
         )
         if (
@@ -3399,6 +3412,7 @@ def regenerate_visual_timeline_candidate_set(
         prescribed_source_ids=workspace.prescribed_source_ids,
         candidate_source_indices_by_segment=workspace.candidate_source_indices_by_segment,
         group_incumbent_render_segments=workspace.group_incumbent_render_segments,
+        group_incumbent_clock_slices=workspace.group_incumbent_clock_slices,
         maximum_results=workspace.maximum_results,
     )
     if (
@@ -6469,6 +6483,13 @@ def materialize_visual_timeline_candidate(
                 raise ValueError("prescribed render source changed during materialization")
             source_local_start = segment.source_start
             source_local_end = segment.source_start + (segment.source_duration or segment.duration)
+        elif (candidate_set.optimizer_workspace is not None
+                and candidate_set.optimizer_workspace.group_incumbent_render_segments is not None):
+            segment = candidate_set.optimizer_workspace.group_incumbent_render_segments[choice.segment_index]
+            if segment.source_index == source_index:
+                # Sensing used this exact renderer clock above. Do not revert
+                # its source endpoints to the shared audio map on materialize.
+                source_local_start, source_local_end = segment.source_start, segment.source_end
         face_metadata = candidate_set.face_metadata_by_candidate.get(
             choice.candidate_id,
             _missing_candidate_face_metadata(),
@@ -6815,6 +6836,7 @@ def _build_visual_timeline(
     candidate_set_only: bool,
     optimizer_seed_only: bool = False,
     selection_arm_model_path: Path | None = None,
+    group_incumbent_clock_slices: Sequence[Any] | None = None,
 ) -> (
     VisualTimelinePlan
     | VisualTimelineCandidateSet
@@ -6875,22 +6897,38 @@ def _build_visual_timeline(
         source_count=source_count,
     )
     incumbent_segments = None
+    incumbent_clock_slices = None
+    if group_incumbent_clock_slices is not None:
+        from .shot_video_clock import ResolvedShotVideoClockSlice
+        incumbent_clock_slices = tuple(group_incumbent_clock_slices)
+        if (group_incumbent_render_segments is None or len(incumbent_clock_slices) != len(canonical_spans)
+                or any(row is not None and not isinstance(row, ResolvedShotVideoClockSlice)
+                    for row in incumbent_clock_slices)):
+            raise ValueError('GROUP shot-local clocks need typed incumbent slices')
     if group_incumbent_render_segments is not None:
         from .render import RenderSegment
         incumbent_segments = tuple(group_incumbent_render_segments)
         if (prescribed_source_indices is not None or len(incumbent_segments) != len(canonical_spans)):
             raise ValueError('GROUP incumbent geometry must bind each non-prescribed canonical span')
         common_start = canonical_spans[0][0]
-        for segment, (start, end) in zip(incumbent_segments, canonical_spans, strict=True):
+        for cell, (segment, (start, end)) in enumerate(zip(incumbent_segments, canonical_spans, strict=True)):
             if (not isinstance(segment, RenderSegment) or type(segment.source_index) is not int
                     or not 0 <= segment.source_index < source_count
                     or segment.outgoing_overlap_transform is not None
                     or not math.isclose(segment.duration, end-start, abs_tol=1e-6)
                     or not math.isclose(segment.master_start, start-common_start, abs_tol=1e-6)):
                 raise ValueError('GROUP incumbent geometry source/master span mismatch')
-            for master, local in ((start, segment.source_start), (end, segment.source_end)):
+            override = None if incumbent_clock_slices is None else incumbent_clock_slices[cell]
+            if override is not None and (override.eligible_source_index != segment.source_index
+                    or source_options is None or source_options[cell] != (segment.source_index,)
+                    or any(abs(a-b) > 1e-9 for a, b in ((override.reference_start, start),
+                        (override.reference_end, end), (override.source_start, segment.source_start),
+                        (override.source_end, segment.source_end)))):
+                raise ValueError('GROUP shot-local clock slice differs from exact fixed renderer cell')
+            for endpoint, (master, local) in enumerate(((start, segment.source_start), (end, segment.source_end))):
                 expected = _source_clock_time(master, source_index=segment.source_index,
-                    audio_offsets=audio_offsets, source_timewarps=clock_maps)
+                    audio_offsets=audio_offsets, source_timewarps=clock_maps) if override is None else (
+                        override.source_start if endpoint == 0 else override.source_end)
                 if not math.isclose(expected, local, rel_tol=0., abs_tol=1e-6):
                     raise ValueError('GROUP incumbent geometry source clock mismatch')
     preferred_indices = (
@@ -7484,6 +7522,8 @@ def _build_visual_timeline(
     source_clock_basis = (
         "prescribed_render_segment_clock_v1"
         if prescribed_render_segments is not None else
+        "authorized_shot_local_numeric_video_clock_not_semantic_admission_v1"
+        if incumbent_clock_slices is not None and any(row is not None for row in incumbent_clock_slices) else
         "mixed_group_incumbent_render_clock_and_alternative_source_clock_v1"
         if incumbent_segments is not None else
         "local_monotonic_timewarp_with_per_source_scalar_fallback"
@@ -7522,6 +7562,7 @@ def _build_visual_timeline(
         prescribed_source_ids=workspace_prescribed_source_ids,
         candidate_source_indices_by_segment=source_options,
         group_incumbent_render_segments=incumbent_segments,
+        group_incumbent_clock_slices=incumbent_clock_slices,
         maximum_results=maximum_candidate_results,
     )
     optimizer_workspace = VisualTimelineOptimizerWorkspace(
@@ -7536,6 +7577,7 @@ def _build_visual_timeline(
         prescribed_source_ids=workspace_prescribed_source_ids,
         candidate_source_indices_by_segment=source_options,
         group_incumbent_render_segments=incumbent_segments,
+        group_incumbent_clock_slices=incumbent_clock_slices,
         maximum_results=maximum_candidate_results,
         singleton=singleton,
     )
@@ -7744,6 +7786,7 @@ def build_visual_timeline_optimizer_seed(
     maximum_results: int = 32,
     candidate_source_indices_by_segment: Sequence[Sequence[int]] | None = None,
     group_incumbent_render_segments: Sequence[Any] | None = None,
+    group_incumbent_clock_slices: Sequence[Any] | None = None,
 ) -> VisualTimelineOptimizerSeed:
     """Build the exact transient lattice without running the legacy DP.
 
@@ -7776,6 +7819,7 @@ def build_visual_timeline_optimizer_seed(
         optimizer_seed_only=True,
         candidate_source_indices_by_segment=candidate_source_indices_by_segment,
         group_incumbent_render_segments=group_incumbent_render_segments,
+        group_incumbent_clock_slices=group_incumbent_clock_slices,
     )
     if not isinstance(
         result,
