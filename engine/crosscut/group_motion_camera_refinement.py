@@ -8,6 +8,7 @@ This grants only a better local candidate for final decoded QA, never a
 professional quality, temporal-phase or cross-camera identity certificate.
 """
 from dataclasses import dataclass,replace
+from collections.abc import Mapping
 import math
 from pathlib import Path
 from time import monotonic
@@ -27,6 +28,84 @@ from .timeline import ShotType
 from .timeline_review import review_timeline
 from .visual_boundary_repair import _visual_evidence,_updated_entry,_updated_exit,_new_hard_failures
 from .visual_score import _VideoSampler
+
+
+PROJECTED_ARM_HEAD_CONTRACT = 'exact_output_arm_motion_with_independently_measured_head_guard_v1'
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedArmHeadMotionEvidence(CloseupGestureEvidence):
+    """Arm ranking with a separate observed head-motion non-regression guard.
+
+    Head and arm units are not averaged, and an absent head is not zero cost.
+    This remains an optional camera-candidate comparison, not cut approval.
+    """
+    head_motion_guard: HeadMotionEvidence | None = None
+
+    def __post_init__(self):
+        CloseupGestureEvidence.__post_init__(self)
+        if self.motion is None:
+            raise ValueError('projected arm/head evidence requires real four-frame arm motion')
+        guard = self.head_motion_guard
+        if guard is not None and (not isinstance(guard, HeadMotionEvidence)
+                or guard.motion.native_frames != self.motion.native_frames
+                or guard.motion.output_intervals_seconds != self.motion.output_intervals_seconds):
+            raise ValueError('projected head guard must own the same exact four-frame output clock')
+        if guard is not None and guard.endpoint_arm_guard is not None:
+            raise ValueError('secondary head evidence must not replace moving arms with a static endpoint gate')
+
+    def to_dict(self):
+        payload = CloseupGestureEvidence.to_dict(self)
+        payload.update(contract=PROJECTED_ARM_HEAD_CONTRACT,
+            primary_motion_evidence_basis=MOTION_CONTRACT,
+            head_motion_guard=self.head_motion_guard.to_dict() if self.head_motion_guard else None,
+            head_motion_unknown_not_imputed=self.head_motion_guard is None,
+            head_and_arm_costs_averaged=False,
+            jointly_observed_motion_required_for_camera_promotion=True)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload):
+        """Do not inherit an arm-only decoder that silently drops the head."""
+        from .observed_head_motion import ObservedHeadMotion
+        from .closeup_gesture import ObservedArmMotion
+        if not isinstance(payload, Mapping) or payload.get('contract') != PROJECTED_ARM_HEAD_CONTRACT:
+            raise ValueError('unknown projected arm/head evidence contract')
+        guard = None
+        raw = payload.get('head_motion_guard')
+        if raw is not None:
+            if not isinstance(raw, Mapping) or not isinstance(raw.get('motion'), Mapping):
+                raise ValueError('projected head guard must contain measured scalar evidence')
+            measured = raw['motion']
+            guard = HeadMotionEvidence(ObservedHeadMotion(tuple(measured['native_frames']),
+                tuple(measured['output_intervals_seconds']),measured['predicted_pose_cost'],
+                measured['velocity_jump_per_output_tick']))
+            if guard.to_dict() != dict(raw):
+                raise ValueError('projected head payload disagrees with its measurements or authority')
+        value = cls(payload['outgoing_native_frame'],payload['incoming_native_frame'],
+            tuple(payload['bone_mismatches']),payload['outgoing_focal_basis'],payload['incoming_focal_basis'],
+            ObservedArmMotion.from_dict(payload['motion']),guard)
+        if value.to_dict() != dict(payload):
+            raise ValueError('projected arm/head payload lost observations or changed its authority')
+        return value
+
+
+def _projected_head_guard_preserved(candidate, before):
+    """A better arm rank cannot hide or discard an observed head regression."""
+    guard = before.head_motion_guard if isinstance(before, ProjectedArmHeadMotionEvidence) else None
+    if guard is None:
+        return True
+    return (isinstance(candidate, ProjectedArmHeadMotionEvidence)
+        and candidate.head_motion_guard is not None
+        and candidate.head_motion_guard.preserves_motion_of(guard))
+
+
+def _observed_head_evidence(evidence):
+    if isinstance(evidence, HeadMotionEvidence):
+        return evidence
+    if isinstance(evidence, ProjectedArmHeadMotionEvidence):
+        return evidence.head_motion_guard
+    return None
 
 
 def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis=None):
@@ -72,18 +151,28 @@ def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis
         working.append(frame);heads.append(head);arms.append(arm)
     endpoint=compare_arm_articulation(arms[1],arms[2],outgoing_native_frame=ids[1],
         incoming_native_frame=ids[2],allow_partial=True)
-    if required_basis!=HEAD_MOTION_BASIS:
-        motion=measure_arm_motion(tuple(arms),native_frames=ids,output_intervals_seconds=intervals)
-        if motion is not None and endpoint is not None:return replace(endpoint,motion=motion)
-        if required_basis==MOTION_CONTRACT:return None
+    arm_motion = (measure_arm_motion(tuple(arms),native_frames=ids,output_intervals_seconds=intervals)
+        if required_basis != HEAD_MOTION_BASIS else None)
+    if required_basis == MOTION_CONTRACT and (arm_motion is None or endpoint is None):
+        return None
+    paths_verified = True
     for a,b in ((0,1),(2,3)):
         ha,hb=heads[a],heads[b]
         if ha.landmarks_xy and hb.landmarks_xy and focal_landmarks_track(
                 working[a],working[b],ha.landmarks_xy,hb.landmarks_xy):continue
         box=_optical_flow_box(working[a],working[b],ha.bbox_xywh) if ha.bbox_xywh else None
-        if box is None or hb.bbox_xywh is None or _iou(box,hb.bbox_xywh)<.60:return None
+        if box is None or hb.bbox_xywh is None or _iou(box,hb.bbox_xywh)<.60:
+            paths_verified = False
+            break
     motion=measure_head_motion(tuple(head_motion_signature(h.geometry,h.landmarks_xy) for h in heads),
-        native_frames=ids,output_intervals_seconds=intervals,same_source_face_paths_pixel_verified=True)
+        native_frames=ids,output_intervals_seconds=intervals,same_source_face_paths_pixel_verified=paths_verified)
+    if arm_motion is not None and endpoint is not None:
+        # Arms already have a real four-frame motion comparator. Do not add a
+        # second frozen-pose requirement through the head-only fallback guard.
+        head = HeadMotionEvidence(motion) if motion is not None else None
+        return ProjectedArmHeadMotionEvidence(endpoint.outgoing_native_frame,endpoint.incoming_native_frame,
+            endpoint.bone_mismatches,endpoint.outgoing_focal_basis,endpoint.incoming_focal_basis,
+            arm_motion,head)
     return HeadMotionEvidence(motion,endpoint) if motion is not None else None
 
 
@@ -100,7 +189,9 @@ class GroupMotionCameraRefinement:
             changed_boundary_count=len(self.proposals),attempts=list(self.attempts),
             elapsed_seconds=self.elapsed_seconds,raw_geometry_gates_relabelled=False,
             quality_approved=False,temporal_phase_proven=False,
-            cross_camera_identity_proven=False,ranking_calibrated=False)
+            cross_camera_identity_proven=False,ranking_calibrated=False,
+            secondary_output_head_motion_not_discarded_when_arms_observed=True,
+            head_and_arm_costs_averaged=False)
 
 
 def camera_motion_rank(gesture, face_metrics, *, enforce_face_limits=True):
@@ -125,6 +216,8 @@ def measured_motion_improves(candidate, before):
     measurement. Static-only callers keep their separate, stricter comparator.
     New measured bones still contribute to the candidate's worst-bone cost.
     """
+    if not _projected_head_guard_preserved(candidate, before):
+        return False
     if isinstance(before,HeadMotionEvidence):
         return isinstance(candidate,HeadMotionEvidence) and candidate.improves_over(before)
     return bool(isinstance(candidate,CloseupGestureEvidence) and isinstance(before,CloseupGestureEvidence)
@@ -142,6 +235,8 @@ def motion_evidence_basis(evidence):
 
 def projected_motion_preserved(candidate,before):
     """A framing gain cannot buy lost bones or worse measured output motion."""
+    if not _projected_head_guard_preserved(candidate, before):
+        return False
     if isinstance(before,HeadMotionEvidence):
         return isinstance(candidate,HeadMotionEvidence) and candidate.preserves_motion_of(before)
     return bool(isinstance(before,CloseupGestureEvidence) and isinstance(candidate,CloseupGestureEvidence)
@@ -362,6 +457,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
             attempts.append(dict(stage='baseline_motion',boundary_index=boundary,admitted=False,
                 motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,
                 motion_evidence_basis=motion_evidence_basis(gesture),
+                observed_output_head_motion=(_observed_head_evidence(gesture).to_dict()
+                    if _observed_head_evidence(gesture) is not None else None),
                 source_motion_cost=source_gesture.ranking_cost if source_gesture is not None else None,
                 source_motion_evidence_basis=motion_evidence_basis(source_gesture),
                 motion_ranking_coordinate_basis='actual_projected_output_pixels',
@@ -405,7 +502,10 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     before_motion_bones=(sorted(before.motion.observed_bones) if isinstance(before,CloseupGestureEvidence) else []),
                     proposed_motion_bones=(sorted(gesture.motion.observed_bones)
                         if isinstance(gesture,CloseupGestureEvidence) and gesture.motion is not None else []),
-                    head_motion_dimensions=list(HEAD_DIMENSIONS) if isinstance(before,HeadMotionEvidence) else [],
+                    head_motion_dimensions=list(HEAD_DIMENSIONS) if _observed_head_evidence(before) is not None else [],
+                    secondary_head_motion_required=isinstance(before,ProjectedArmHeadMotionEvidence)
+                        and before.head_motion_guard is not None,
+                    secondary_head_motion_preserved=_projected_head_guard_preserved(gesture,before),
                     endpoint_only_bones_no_longer_observed=(sorted(before.observed_bones-gesture.observed_bones)
                         if gesture is not None else []),
                     proposed_motion_cost=gesture.ranking_cost if gesture is not None and gesture.motion is not None else None,

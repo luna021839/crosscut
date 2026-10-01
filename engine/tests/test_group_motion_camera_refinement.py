@@ -1,5 +1,6 @@
 from dataclasses import replace
 from fractions import Fraction
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -17,6 +18,7 @@ from crosscut.group_motion_camera_refinement import (
     measured_output_face_box,
     retimed_incumbent_camera_preview,
     projected_motion_preserved,measure_projected_motion,
+    ProjectedArmHeadMotionEvidence, PROJECTED_ARM_HEAD_CONTRACT,
 )
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (
@@ -37,6 +39,69 @@ class MotionCameraRankTests(unittest.TestCase):
         return CloseupGestureEvidence(13, 20, (.1, .2, None, None),
             motion=ObservedArmMotion((10, 13, 20, 23), (.1, 1/30., .1),
                 (pose, pose, None, None), (velocity, velocity, None, None)))
+
+    def paired(self, pose=.2, velocity=.1, head_pose=.1, head_velocity=.05):
+        arm = self.gesture(pose, velocity)
+        head = HeadMotionEvidence(ObservedHeadMotion(arm.motion.native_frames,
+            arm.motion.output_intervals_seconds, head_pose, head_velocity))
+        return ProjectedArmHeadMotionEvidence(arm.outgoing_native_frame,arm.incoming_native_frame,
+            arm.bone_mismatches,arm.outgoing_focal_basis,arm.incoming_focal_basis,arm.motion,head)
+
+    def test_arm_rank_gain_cannot_hide_a_measured_head_regression(self):
+        before = self.paired(head_pose=.08,head_velocity=.0458)
+        worse_head = self.paired(pose=.1,velocity=.01,head_pose=.10,head_velocity=.0495)
+        self.assertLess(camera_motion_rank(worse_head,(.02,.03)),
+            camera_motion_rank(before,(.13,.06)), 'the old summed rank would admit it')
+        self.assertFalse(measured_motion_improves(worse_head,before))
+        self.assertFalse(projected_motion_preserved(worse_head,before))
+        better = self.paired(pose=.1,velocity=.01,head_pose=.07,head_velocity=.04)
+        self.assertTrue(measured_motion_improves(better,before))
+        self.assertTrue(projected_motion_preserved(better,before))
+        self.assertTrue(projected_motion_preserved(before,before), 'equal motion may improve framing')
+
+    def test_previously_observed_head_cannot_be_lost_or_replaced_by_legacy_arm_only(self):
+        before = self.paired()
+        for after in (self.gesture(pose=.01,velocity=.01),
+                replace(self.paired(pose=.01,velocity=.01),head_motion_guard=None),None):
+            self.assertFalse(measured_motion_improves(after,before))
+            self.assertFalse(projected_motion_preserved(after,before))
+        unobserved = replace(before,head_motion_guard=None)
+        self.assertTrue(projected_motion_preserved(self.gesture(),unobserved),
+            'a genuinely unknown head creates no invented zero-cost constraint')
+        payload = before.to_dict()
+        self.assertEqual(payload['contract'],PROJECTED_ARM_HEAD_CONTRACT)
+        self.assertIsNotNone(payload['head_motion_guard'])
+        self.assertFalse(payload['head_and_arm_costs_averaged'])
+        self.assertIsNone(unobserved.to_dict()['head_motion_guard'])
+        self.assertTrue(unobserved.to_dict()['head_motion_unknown_not_imputed'])
+
+    def test_secondary_head_guard_must_own_the_exact_arm_clock(self):
+        before = self.paired()
+        for motion in (replace(before.head_motion_guard.motion,native_frames=(9,12,19,22)),
+                replace(before.head_motion_guard.motion,output_intervals_seconds=(.2,1/30.,.2))):
+            with self.assertRaisesRegex(ValueError,'same exact'):
+                replace(before,head_motion_guard=HeadMotionEvidence(motion))
+        with self.assertRaisesRegex(ValueError,'real four-frame'):
+            replace(before,motion=None)
+        with self.assertRaisesRegex(ValueError,'static endpoint gate'):
+            replace(before,head_motion_guard=replace(before.head_motion_guard,
+                endpoint_arm_guard=replace(before,head_motion_guard=None)))
+
+    def test_serialization_cannot_silently_erase_the_independent_head_guard(self):
+        for evidence in (self.paired(),replace(self.paired(),head_motion_guard=None)):
+            payload=json.loads(json.dumps(evidence.to_dict()))
+            self.assertEqual(ProjectedArmHeadMotionEvidence.from_dict(payload),evidence)
+            with self.assertRaisesRegex(ValueError,'arm-only'):
+                CloseupGestureEvidence.from_dict(payload)
+        for update in ({'head_motion_unknown_not_imputed':True},
+                {'head_and_arm_costs_averaged':True},{'quality_approved':True},
+                {'head_motion_guard':None}):
+            with self.subTest(update=update),self.assertRaises(ValueError):
+                ProjectedArmHeadMotionEvidence.from_dict(self.paired().to_dict()|update)
+        payload=self.paired().to_dict()
+        payload['head_motion_guard']['motion']['same_source_face_paths_pixel_verified']=False
+        with self.assertRaisesRegex(ValueError,'authority'):
+            ProjectedArmHeadMotionEvidence.from_dict(payload)
 
     def test_missing_evidence_is_not_a_perfect_numeric_score(self):
         gesture = self.gesture()
@@ -119,6 +184,34 @@ class MotionCameraRankTests(unittest.TestCase):
         with patch('crosscut.native_global_face.observe_native_global_face') as observe:
             self.assertIsNone(measure_projected_motion(frames,same,provider,output_fps=30.))
             observe.assert_not_called()
+
+    def test_output_arm_observation_does_not_short_circuit_independent_head_measurement(self):
+        from crosscut.native_global_face import NativeGlobalFace
+        from engine.tests.test_global_action_cut_camera import person,pose,observation
+        row=observation(0)
+        head=NativeGlobalFace(1,row.face_box_xywh,row.face_landmarks_xy,0.,.1,
+            (.4,.3,.5,.3,.1,0.,0.,.4,.8,0.))
+        frames=[np.zeros((480,854,3),np.uint8) for _ in range(4)]
+        samples=tuple(SimpleNamespace(source_index=s,native_frame_index=n,output_frame_index=o,terminal_clone=False)
+            for s,n,o in ((0,10,100),(0,13,103),(1,20,104),(1,23,107)))
+        provider=SimpleNamespace(pose=SimpleNamespace(describe=lambda *a,**k:pose(person())))
+        for paths_verified in (True,False):
+            with self.subTest(paths_verified=paths_verified), \
+                    patch('crosscut.native_global_face.observe_native_global_face',return_value=head), \
+                    patch('crosscut.visual_score.describe_frame',return_value=SimpleNamespace(formation_people=(person(),))), \
+                    patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=paths_verified), \
+                    patch('crosscut.boundary_subject_alignment._optical_flow_box',return_value=None):
+                result=measure_projected_motion(frames,samples,provider,output_fps=30.)
+            self.assertIsInstance(result,ProjectedArmHeadMotionEvidence)
+            self.assertEqual(result.motion.observed_bones,frozenset(range(4)))
+            if paths_verified:
+                guard=result.head_motion_guard
+                self.assertIsNotNone(guard,'observed arms cannot discard observed head motion')
+                self.assertEqual(guard.motion.native_frames,(10,13,20,23))
+                self.assertEqual(guard.motion.output_intervals_seconds,result.motion.output_intervals_seconds)
+                self.assertIsNone(guard.endpoint_arm_guard,'do not substitute static arms for moving arms')
+            else:
+                self.assertIsNone(result.head_motion_guard,'failed pixel paths remain unknown, not zero cost')
 
     def test_bound_is_checked_before_any_media_decode(self):
         with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock') as probe:

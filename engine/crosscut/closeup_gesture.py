@@ -185,8 +185,8 @@ class CloseupGestureEvidence:
 
     @classmethod
     def from_dict(cls, payload):
-        if not isinstance(payload,Mapping):
-            raise ValueError('gesture payload must contain scalar evidence')
+        if not isinstance(payload,Mapping) or payload.get('contract') not in (CONTRACT,MASKED_CONTRACT):
+            raise ValueError('gesture payload must contain a known arm-only scalar evidence contract')
         return cls(payload['outgoing_native_frame'],payload['incoming_native_frame'],
             tuple(payload['bone_mismatches']),payload['outgoing_focal_basis'],
             payload['incoming_focal_basis'],
