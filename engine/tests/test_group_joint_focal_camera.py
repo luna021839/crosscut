@@ -1,7 +1,7 @@
 import unittest
 
 from crosscut.group_joint_focal_camera import (propose_focal_face_roi_camera,
-    propose_endpoint_focal_face_roi_camera, retain_entry_camera_proposal)
+    propose_endpoint_focal_face_roi_camera, retain_entry_camera_proposal, propose_partial_face_roi_camera)
 from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack
 
 
@@ -87,3 +87,44 @@ class BothNeighborFocalCameraTests(unittest.TestCase):
         self.assertEqual(retained.to_dict()['preserved_entry_camera_frame_count'], 4)
         self.assertTrue(retained.to_dict()['camera_parameter_retention_is_not_encoded_pixel_identity'])
         self.assertFalse(retained.to_dict()['production_admitted'])
+
+    def test_dense_following_can_use_the_explicit_native_envelope_without_losing_cut_endpoints(self):
+        source = (.5102965355, .1259260248, .0860337973, .1920077006)
+        target = (.3616104762, .2172166047, .1579130014, .3323868363)
+        boxes = tuple((source[0]+.002*(n % 3), *source[1:]) for n in range(70))
+        endpoint = propose_endpoint_focal_face_roi_camera(source_face_boxes=(boxes[0], boxes[-1]),
+            fixed_neighbor_face_boxes=(target, target), frame_count=70, fps=30., maximum_center_shift=.25)
+        dense = propose_focal_face_roi_camera(source_face_boxes=boxes,
+            fixed_neighbor_face_boxes=(target, target), fps=30., maximum_center_shift=.25)
+        for n in (0, 69):
+            self.assertEqual(endpoint.track.evaluate(n/30.), dense.track.evaluate(n/30.))
+        self.assertEqual(len(dense.track.keyframes), 70)
+        self.assertGreaterEqual(dense.minimum_observed_face_roi_visible_fraction, .995)
+        self.assertGreater(abs(dense.track.keyframes[-1].center_y-.5), .1)
+        self.assertFalse(dense.to_dict()['required_arm_visibility_certified'])
+        self.assertFalse(dense.to_dict()['production_admitted'])
+        with self.assertRaises(ValueError):
+            propose_focal_face_roi_camera(source_face_boxes=boxes,
+                fixed_neighbor_face_boxes=(target, target), fps=30., maximum_center_shift=.251)
+
+    def test_partial_camera_authors_only_camera_gaps_and_cannot_claim_dense_observations(self):
+        boxes = tuple(None if 12 <= i < 16 else (.42+.001*i, .25, .10, .16) for i in range(30))
+        targets = ((.42, .25, .10, .16), (.405, .15, .18, .288))
+        value = propose_partial_face_roi_camera(source_face_boxes=boxes,
+            fixed_neighbor_face_boxes=targets, fps=30.)
+        self.assertEqual(value.observed_geometry_sample_count, 26)
+        self.assertEqual(value.unobserved_geometry_frame_indices, (12, 13, 14, 15))
+        self.assertEqual(len(value.track.keyframes), 30)
+        self.assertFalse(value.to_dict()['every_output_frame_face_roi_observed'])
+        self.assertTrue(value.to_dict()['interpolated_camera_parameters_are_not_subject_observations'])
+        self.assertFalse(value.to_dict()['production_admitted'])
+        self.assertFalse(value.to_dict()['required_arm_visibility_certified'])
+        self.assertEqual(boxes[12:16], (None,)*4)
+        for invalid in ((None, *boxes[1:]), (*boxes[:-1], None),
+                (*boxes[:12], None, None, None, None, None, *boxes[17:])):
+            with self.assertRaises(ValueError):
+                propose_partial_face_roi_camera(source_face_boxes=invalid,
+                    fixed_neighbor_face_boxes=targets, fps=30.)
+        with self.assertRaises(ValueError):
+            propose_focal_face_roi_camera(source_face_boxes=boxes,
+                fixed_neighbor_face_boxes=targets, fps=30.)

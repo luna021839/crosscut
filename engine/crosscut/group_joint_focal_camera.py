@@ -10,6 +10,7 @@ import math
 from .boundary_subject_alignment import (
     BoundarySubjectAlignmentConfig, _TransformState, _target_state,
     _track_for_segment, _follow_face_camera_path, _project_box, _center,
+    _project_point, _clamp_center,
 )
 from .render import EditorialTransformTrack, EditorialTransformKeyframe
 
@@ -37,15 +38,20 @@ class FocalFaceROICameraProposal:
     minimum_observed_face_roi_visible_fraction: float
     observed_geometry_sample_count: int
     preserved_entry_camera_frame_count: int = 0
+    unobserved_geometry_frame_indices: tuple[int, ...] = ()
 
     def to_dict(self):
-        return dict(contract='both_fixed_neighbors_whole_shot_native_face_roi_camera_proposal_v1',
+        return dict(contract=('authored_partial_native_face_roi_camera_proposal_v1'
+                if self.unobserved_geometry_frame_indices else
+                'both_fixed_neighbors_whole_shot_native_face_roi_camera_proposal_v1'),
             endpoint_before=self.endpoint_before, endpoint_after=self.endpoint_after,
             frame_count=self.frame_count,
             observed_geometry_sample_count=self.observed_geometry_sample_count,
             preserved_entry_camera_frame_count=self.preserved_entry_camera_frame_count,
             camera_parameter_retention_is_not_encoded_pixel_identity=True,
             every_output_frame_face_roi_observed=self.observed_geometry_sample_count == self.frame_count,
+            unobserved_geometry_frame_indices=self.unobserved_geometry_frame_indices,
+            interpolated_camera_parameters_are_not_subject_observations=bool(self.unobserved_geometry_frame_indices),
             minimum_observed_face_roi_visible_fraction=self.minimum_observed_face_roi_visible_fraction,
             face_inputs_are_geometry_only=True, native_subject_correspondence_certified=False,
             whole_head_extent_certified=False, required_arm_visibility_certified=False,
@@ -68,9 +74,13 @@ def propose_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_boxe
             or type(maximum_zoom) not in (int, float) or not math.isfinite(maximum_zoom)
             or not 1 <= maximum_zoom <= 2
             or type(maximum_center_shift) not in (int, float) or not math.isfinite(maximum_center_shift)
-            or not 0 < maximum_center_shift <= .10
+            or not 0 < maximum_center_shift <= .25
             or incumbent_track is not None and not isinstance(incumbent_track, EditorialTransformTrack)):
         raise ValueError('focal camera needs every actual native face ROI and both fixed neighbors')
+    # Keep the conservative caller default, but permit an explicit same
+    # physical quarter-frame envelope as the endpoint sibling. Every actual
+    # ROI and renderer keyframe still has to pass the native support checks.
+    # This is a proposal limit, not a motion/part-containment waiver.
     endpoints = (boxes[0], boxes[-1])
     states = []
     for source, target in zip(endpoints, targets):
@@ -102,6 +112,81 @@ def propose_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_boxe
         old = incumbent_track.evaluate(n/fps) if incumbent_track is not None else _TransformState()
         before.append(_residual(box, target, _TransformState(old.zoom, old.center_x, old.center_y, old.roll_degrees)))
     return FocalFaceROICameraProposal(track, tuple(before), tuple(after), len(boxes), min(fractions), len(boxes))
+
+
+def propose_partial_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_boxes,
+        fps, incumbent_track=None, maximum_zoom=2., maximum_center_shift=.25,
+        maximum_unobserved_run=4):
+    """Author camera-only gap parameters; never fill a missing face measurement.
+
+    A short motion-blurred/undetected interval need not prevent a diagnostic
+    camera render. It still CANNOT provide dense role/extent/identity admission.
+    Every input None remains declared. Endpoint/cut geometry is measured, and
+    all supplied visible ROIs must pass the unchanged visibility check. Unknown
+    frames get interpolated CAMERA centers, not invented boxes or body poses.
+    """
+    boxes = tuple(source_face_boxes)
+    if (not 2 <= len(boxes) <= 300 or boxes[0] is None or boxes[-1] is None
+            or type(maximum_unobserved_run) is not int or not 1 <= maximum_unobserved_run <= 4
+            or any(box is not None and not _valid_box(box) for box in boxes)):
+        raise ValueError('partial camera needs real endpoints and explicit bounded missing geometry')
+    missing = tuple(i for i, box in enumerate(boxes) if box is None)
+    run = 0
+    for box in boxes:
+        run = run+1 if box is None else 0
+        if run > maximum_unobserved_run:
+            raise ValueError('partial camera missing interval exceeds its authored-parameter policy')
+    endpoint = propose_endpoint_focal_face_roi_camera(source_face_boxes=(boxes[0], boxes[-1]),
+        fixed_neighbor_face_boxes=fixed_neighbor_face_boxes, frame_count=len(boxes), fps=fps,
+        incumbent_track=incumbent_track, maximum_zoom=maximum_zoom,
+        maximum_center_shift=maximum_center_shift)
+    keys = tuple(endpoint.track.evaluate(i/fps) for i in range(len(boxes)))
+    targets = tuple(_project_point(_center(box), _TransformState(key.zoom,
+        key.center_x, key.center_y, key.roll_degrees))
+        for box, key in ((boxes[0], keys[0]), (boxes[-1], keys[-1])))
+    centers = []
+    for i, (box, key) in enumerate(zip(boxes, keys, strict=True)):
+        if box is None:
+            centers.append(None)
+            continue
+        amount = i/(len(boxes)-1)
+        target = tuple(a*(1-amount)+b*amount for a, b in zip(*targets))
+        point = _project_point(_center(box), _TransformState(1., .5, .5, key.roll_degrees))
+        centers.append(tuple(point[j]-(target[j]-.5)/key.zoom for j in (0, 1)))
+    # Only centers are authored between observed neighbors. `boxes` stays
+    # untouched and None; no subject sample is supplied to the dense API.
+    for i in missing:
+        left = max(j for j in range(i) if boxes[j] is not None)
+        right = min(j for j in range(i+1, len(boxes)) if boxes[j] is not None)
+        amount = (i-left)/(right-left)
+        centers[i] = tuple(a*(1-amount)+b*amount for a, b in zip(centers[left], centers[right]))
+    smoothed = [tuple(sum(weight*centers[min(len(boxes)-1, max(0, i+offset-2))][j]
+        for offset, weight in enumerate((1., 2., 3., 2., 1.)))/9. for j in (0, 1))
+        for i in range(len(boxes))]
+    output = []
+    for i, (key, center) in enumerate(zip(keys, smoothed, strict=True)):
+        if i in (0, len(boxes)-1):
+            output.append(key)
+            continue
+        amount = i/(len(boxes)-1)
+        corrected = tuple(center[j]+(1-amount)*(centers[0][j]-smoothed[0][j])
+            +amount*(centers[-1][j]-smoothed[-1][j]) for j in (0, 1))
+        cx, cy = _clamp_center(*corrected, zoom=key.zoom, maximum_shift=maximum_center_shift)
+        output.append(EditorialTransformKeyframe(i/fps, key.zoom, cx, cy, key.roll_degrees))
+    track = EditorialTransformTrack(tuple(output),
+        reason='observed_face_rois_with_explicit_unobserved_camera_parameter_gaps_not_dense_part_proof_v1')
+    visible = []
+    for i, box in enumerate(boxes):
+        if box is None:
+            continue
+        key = track.evaluate(i/fps)
+        fraction = _project_box(box, _TransformState(key.zoom, key.center_x, key.center_y, key.roll_degrees))[1]
+        if fraction < .995:
+            raise ValueError(f'partial camera clips a supplied real face ROI at frame {i}')
+        visible.append(fraction)
+    return replace(endpoint, track=track, observed_geometry_sample_count=len(visible),
+        minimum_observed_face_roi_visible_fraction=min(visible),
+        unobserved_geometry_frame_indices=missing)
 
 
 def propose_endpoint_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_boxes,

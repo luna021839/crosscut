@@ -1942,7 +1942,7 @@ def _follow_face_camera_path(track, boxes, *, fps, maximum_center_shift):
     """
     if (not isinstance(track,EditorialTransformTrack) or len(boxes)<2
             or not math.isfinite(fps) or fps<=0
-            or not math.isfinite(maximum_center_shift) or not 0<maximum_center_shift<=.1
+            or not math.isfinite(maximum_center_shift) or not 0<maximum_center_shift<=.25
             or any(box is None or len(box)!=4 or any(not math.isfinite(v) for v in box)
                 or box[2]<=0 or box[3]<=0 or box[0]<0 or box[1]<0
                 or box[0]+box[2]>1.000001 or box[1]+box[3]>1.000001 for box in boxes)):
