@@ -13,11 +13,41 @@ from scipy.optimize import linear_sum_assignment
 
 
 @dataclass(frozen=True, slots=True)
+class ObservedFormationTemporalMotion:
+    state_key: str
+    output_frames: tuple[int, int]
+    native_frames: tuple[int, int]
+    output_fps: float
+    observation_ids: tuple[int, int]
+    bone_velocities: tuple[tuple[str, float, float], ...]
+    same_source_pixel_path_verified: bool
+
+    def __post_init__(self):
+        if (not isinstance(self.state_key,str) or len(self.state_key)!=64
+                or any(c not in '0123456789abcdef' for c in self.state_key)
+                or any(not isinstance(values,tuple) or len(values)!=2
+                    or any(type(n) is not int or n<0 for n in values)
+                    for values in (self.output_frames,self.native_frames,self.observation_ids))
+                or self.output_frames[1]-self.output_frames[0]!=3
+                or self.native_frames[1]<self.native_frames[0]
+                or type(self.output_fps) not in (int,float) or not math.isfinite(self.output_fps) or self.output_fps<=0
+                or not isinstance(self.bone_velocities,tuple) or len(self.bone_velocities)<2
+                or any(not isinstance(row,tuple) or len(row)!=3
+                    or row[0] not in {name for name,_,_ in _BONES}
+                    or any(type(v) not in (int,float) or not math.isfinite(v) for v in row[1:])
+                    for row in self.bone_velocities)
+                or len({row[0] for row in self.bone_velocities})!=len(self.bone_velocities)
+                or self.same_source_pixel_path_verified is not True):
+            raise ValueError('temporal formation evidence needs two exact three-tick chronological pixel-bound views')
+
+
+@dataclass(frozen=True, slots=True)
 class ObservedFormationPerson:
     observation_id: int
     box_xywh: tuple[float, float, float, float]
     upper_body_xyc: tuple[tuple[float, float, float], ...]
     confidence: float
+    temporal_motion: ObservedFormationTemporalMotion | None = None
 
     def __post_init__(self):
         box = self.box_xywh
@@ -31,7 +61,9 @@ class ObservedFormationPerson:
                 or len(self.upper_body_xyc) not in (0, 8)
                 or any(not isinstance(p, tuple) or len(p) != 3
                     or any(type(x) not in (int, float) or not math.isfinite(x) for x in p)
-                    or not 0 <= p[2] <= 1 for p in self.upper_body_xyc)):
+                    or not 0 <= p[2] <= 1 for p in self.upper_body_xyc)
+                or self.temporal_motion is not None and (not isinstance(self.temporal_motion,ObservedFormationTemporalMotion)
+                    or self.observation_id not in self.temporal_motion.observation_ids)):
             raise ValueError('formation person requires explicit observed screen geometry and eight-joint basis')
         # Off-screen points/boxes must remain distinguishable from visible ones.
         # Clipping them here would manufacture containment evidence.
@@ -77,6 +109,7 @@ class ProjectedFormationMatch:
     paired_subject_location_mismatch: float | None
     framing_cost: float | None
     common_bones: tuple[tuple[str, ...], ...] = ()
+    temporal_correspondence_used: bool = False
 
     @property
     def observed(self):
@@ -127,7 +160,8 @@ def _unknown(status, left, right, *, pairs=(), margin=None, common=()):
 
 
 def compare_projected_formation(outgoing, incoming, *, minimum_pairs=2,
-        minimum_cohort_coverage=2/3, maximum_pair_cost=.45, minimum_assignment_margin=.015):
+        minimum_cohort_coverage=2/3, maximum_pair_cost=.45, minimum_assignment_margin=.015,
+        use_temporal_correspondence=False):
     """Partial bipartite assignment with explicit ambiguity, never forced zip.
 
     Pair reachability uses observed pose and COHORT-relative positions, not
@@ -140,6 +174,7 @@ def compare_projected_formation(outgoing, incoming, *, minimum_pairs=2,
             or not isinstance(incoming, DeclaredFormationView)
             or outgoing.output_size != incoming.output_size
             or type(minimum_pairs) is not int or minimum_pairs < 2
+            or type(use_temporal_correspondence) is not bool
             or any(type(v) not in (int, float) or not math.isfinite(v)
                 or not 0 < v <= 1 for v in (minimum_cohort_coverage, maximum_pair_cost,
                     minimum_assignment_margin))):
@@ -166,6 +201,17 @@ def compare_projected_formation(outgoing, incoming, *, minimum_pairs=2,
             pose = float(np.mean([np.linalg.norm(bones_a[i][name]-bones_b[j][name])/2 for name in common]))
             location = min(1., float(np.linalg.norm(positions_a[i]-positions_b[j]))/3)
             value = .75*pose + .25*location
+            if use_temporal_correspondence:
+                aa,bb=left[i].temporal_motion,right[j].temporal_motion
+                if aa is None or bb is None:continue
+                va={name:np.asarray((x,y)) for name,x,y in aa.bone_velocities}
+                vb={name:np.asarray((x,y)) for name,x,y in bb.bone_velocities}
+                observed=tuple(name for name in common if name in va and name in vb)
+                if len(observed)<2:continue
+                velocity=float(np.mean([min(1.,np.linalg.norm(va[name]-vb[name])/
+                    max(1.,math.sqrt(float(np.dot(va[name],va[name])+np.dot(vb[name],vb[name])))))
+                    for name in observed]))
+                value=.55*pose+.25*location+.20*velocity
             costs[i, j] = value
             details[i, j] = (pose, common)
     rows, cols = linear_sum_assignment(costs)
@@ -206,4 +252,5 @@ def compare_projected_formation(outgoing, incoming, *, minimum_pairs=2,
     return ProjectedFormationMatch('observed_partial_correspondence', pairs,
         tuple(p.observation_id for p in left if p.observation_id not in {a for a, _ in pairs}),
         tuple(p.observation_id for p in right if p.observation_id not in {b for _, b in pairs}),
-        len(pairs)/n, len(pairs)/m, margin, pose, heights, span, center, location, framing, common)
+        len(pairs)/n, len(pairs)/m, margin, pose, heights, span, center, location, framing, common,
+        use_temporal_correspondence)

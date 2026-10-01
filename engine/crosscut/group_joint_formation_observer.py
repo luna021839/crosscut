@@ -6,10 +6,14 @@ are written to persistent raw caches; no assets are acquired by this module.
 The caller must declare the required cohort before camera/path evaluation.
 """
 from pathlib import Path
+from dataclasses import replace
 import hashlib
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from .body_pose_2d import BodyPose2DAnalyzer,RTMPOSE_BODY7_MODEL_SHA256
-from .group_joint_formation import ObservedFormationPerson,DeclaredFormationView
+from .group_joint_formation import (ObservedFormationPerson,DeclaredFormationView,
+    ObservedFormationTemporalMotion,_bones)
 from .pose import _NanoDetFormationDetector,_EXPECTED_SHA256,FORMATION_PERSON_DETECTOR_MODEL
 
 
@@ -55,3 +59,47 @@ def declared_formation_observation(session,state,output_tick,*,required_observat
     people=observe_formation_people(session,state,output_tick)
     if people is None or not set(required_observation_ids)<={p.observation_id for p in people}:return None
     return DeclaredFormationView(people,tuple(required_observation_ids),state.output_size)
+
+
+def observe_temporal_formation_people(session,state,*,outgoing):
+    """Sense actual three-tick articulation paths on this SAME whole camera.
+
+    A same-source body is associated through measured pixel optical flow and
+    one-to-one box correspondence, not screen sort or centrality. Uncertain
+    flow/ROI ownership or fewer than two observed bones yields NO velocity.
+    The caller still declares its foreground cohort and must sense the other
+    side of the cut. These two-view paths are not whole-shot/dense approval.
+    """
+    from .boundary_subject_alignment import _optical_flow_box
+    from .cut_anchored_containment import _iou
+    if type(outgoing) is not bool:raise ValueError('temporal formation side must be explicit')
+    if state.end_output_frame-state.first_output_frame<4:return None
+    ticks=((state.end_output_frame-4,state.end_output_frame-1) if outgoing else
+        (state.first_output_frame,state.first_output_frame+3))
+    pixels=tuple(session.projected_pixels(state,tick) for tick in ticks)
+    people=tuple(observe_formation_people(session,state,tick) for tick in ticks)
+    if any(p is None for p in pixels) or any(p is None for p in people):return None
+    endpoint=people[1] if outgoing else people[0]
+    if not people[0] or not people[1]:return endpoint
+    flow=tuple(_optical_flow_box(pixels[0],pixels[1],person.box_xywh) for person in people[0])
+    overlaps=np.asarray([[(_iou(box,p.box_xywh) if box is not None else 0.)
+        for p in people[1]] for box in flow])
+    rows,columns=linear_sum_assignment(1.-overlaps)
+    measured={};seconds=3/state.output_fps
+    native=tuple(state.native_frame_indices[tick-state.first_output_frame] for tick in ticks)
+    for i,j in zip(rows,columns):
+        if overlaps[i,j]<.60:continue
+        competing=np.delete(overlaps[i],j)
+        if len(competing) and overlaps[i,j]-float(competing.max())<.10:continue
+        prior_competition=np.delete(overlaps[:,j],i)
+        if len(prior_competition) and overlaps[i,j]-float(prior_competition.max())<.10:continue
+        previous,current=people[0][i],people[1][j]
+        a,b=_bones(previous,state.output_size),_bones(current,state.output_size)
+        common=tuple(name for name in a if name in b)
+        if len(common)<2:continue
+        velocities=tuple((name,*map(float,(b[name]-a[name])/seconds)) for name in common)
+        evidence=ObservedFormationTemporalMotion(state.key,ticks,native,state.output_fps,
+            (previous.observation_id,current.observation_id),velocities,True)
+        identity=current.observation_id if outgoing else previous.observation_id
+        measured[identity]=evidence
+    return tuple(replace(p,temporal_motion=measured.get(p.observation_id)) for p in endpoint)

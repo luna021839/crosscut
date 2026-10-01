@@ -14,7 +14,7 @@ from .group_joint_source_camera import GroupSourceCameraState,joint_state_from_r
 from .group_source_domain import GroupSourceDomain
 from .group_cut_camera_proposal import UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON
 from .render import (RenderPlan,RenderTransition,aligned_render_segment,segment_frame_counts,
-    _combined_identity_segment)
+    _combined_identity_segment,_can_share_source_clock)
 from .render_frame_schedule import sampler_frame_schedule
 from .shot_context_camera import slice_shot_camera_track
 
@@ -46,7 +46,7 @@ def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_in
         role=incumbent_state.role)
     if old.key!=incumbent_state.key:raise ValueError('joint factory incumbent is not bound to its complete renderer state')
     request_source=domain.request_index(eligible_source_index)
-    if end-first>1 and sum(counts[first:end])>300:
+    if sum(counts[first:end])>300:
         raise ValueError('joint source factory exceeds its mutable whole-shot frame budget')
     selected=[];cursor=0
     for index in range(first,end):
@@ -59,6 +59,10 @@ def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_in
             segment=replace(segment,editorial_transform=slice_shot_camera_track(camera_track,
                 frame_offset=cursor,frame_count=counts[index],fps=plan.fps))
         cursor+=counts[index];selected.append(segment)
+    temporary=list(plan.segments);temporary[first:end]=selected
+    if not _can_share_source_clock(replace(plan,segments=tuple(temporary)),
+            first_index=first,candidate_last_index=end-1):
+        raise ValueError('joint candidate source is not one complete linear renderer clock')
     # Exactly the renderer's identity coalescing arithmetic, including the
     # single-segment subtraction/half-native-frame rounding distinction.
     unit=selected[0] if len(selected)==1 else _combined_identity_segment(tuple(selected))

@@ -2,7 +2,7 @@ from dataclasses import replace
 import unittest
 
 from crosscut.group_joint_formation import (ObservedFormationPerson, DeclaredFormationView,
-    compare_projected_formation)
+    compare_projected_formation,ObservedFormationTemporalMotion)
 
 
 def person(index, x, *, height=.4, reverse=False, confidence=.9):
@@ -109,3 +109,34 @@ class GroupJointFormationTests(unittest.TestCase):
     def test_different_output_aspect_cannot_compare_different_coordinate_bases(self):
         a = view(person(0, .2), person(1, .8))
         with self.assertRaises(ValueError): compare_projected_formation(a, replace(a, output_size=(1080, 1920)))
+
+    def motion(self,person,velocity,*,outgoing=True):
+        ticks=(26,29) if outgoing else (30,33)
+        value=ObservedFormationTemporalMotion('a'*64,ticks,ticks,30.,
+            (person.observation_id,person.observation_id),
+            (('left_upper_arm',velocity,0.),('right_upper_arm',velocity,0.),
+                ('left_forearm',velocity,0.),('right_forearm',velocity,0.)),True)
+        return replace(person,temporal_motion=value)
+
+    def test_same_endpoint_pose_can_be_disambiguated_by_independently_observed_temporal_direction(self):
+        left=view(self.motion(person(0,.5),2.),self.motion(person(1,.5),-2.))
+        right=view(self.motion(person(10,.5),-2.,outgoing=False),self.motion(person(11,.5),2.,outgoing=False))
+        self.assertEqual(compare_projected_formation(left,right).status,'ambiguous_partial_correspondence')
+        result=compare_projected_formation(left,right,use_temporal_correspondence=True)
+        self.assertTrue(result.observed)
+        self.assertTrue(result.temporal_correspondence_used)
+        self.assertEqual(set(result.pairs),{(0,11),(1,10)})
+        self.assertFalse(result.to_dict()['motion_certified'])
+
+    def test_missing_temporal_velocity_is_unknown_not_observed_static_motion(self):
+        left=view(person(0,.2),person(1,.8))
+        right=view(self.motion(person(10,.2),0.,outgoing=False),self.motion(person(11,.8),0.,outgoing=False))
+        result=compare_projected_formation(left,right,use_temporal_correspondence=True)
+        self.assertFalse(result.observed)
+        self.assertIsNone(result.framing_cost)
+
+    def test_invalid_temporal_pixel_path_native_order_or_output_tick_ownership_rejects(self):
+        evidence=self.motion(person(0,.5),1.).temporal_motion
+        for extra in ({'same_source_pixel_path_verified':False},{'output_frames':(26,28)},
+                {'native_frames':(30,26)},{'bone_velocities':(('left_upper_arm',float('nan'),0.),)*2}):
+            with self.assertRaises(ValueError):replace(evidence,**extra)

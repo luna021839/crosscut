@@ -9,6 +9,7 @@ from crosscut.group_source_domain import GroupSourceDomain
 from crosscut.render import RenderPlan,RenderSegment,RenderTransition,EditorialTransformTrack,EditorialTransformKeyframe
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.group_cut_camera_proposal import UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON
+from crosscut.timewarp import TimeWarpMap,TimeWarpConfig,TimeWarpControlPoint,TimeWarpResidualDiagnostics
 
 
 class JointStateFactoryTests(unittest.TestCase):
@@ -82,6 +83,15 @@ class JointStateFactoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):candidate_joint_group_state(plan=plan,domain=domain,
             incumbent_state=states[1],eligible_source_index=4)
 
+    def test_single_cell_cannot_bypass_the_whole_shot_300_frame_work_budget(self):
+        plan,domain,states=self.fixture()
+        plan=replace(plan,segments=tuple(replace(s,source_start=11.*i,master_start=11.*i,duration=11.)
+            for i,s in enumerate(plan.segments)))
+        old=joint_state_from_render_plan(plan=plan,domain=domain,slot=1,
+            first_output_frame=330,end_output_frame=660,role=GroupOutputRole.FORMATION)
+        with self.assertRaisesRegex(ValueError,'whole-shot frame budget'):
+            candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=old,eligible_source_index=2)
+
     def test_coalesced_whole_camera_is_sliced_without_restart_at_internal_beat_cell(self):
         plan,domain,states=self.fixture()
         split=(plan.segments[0],replace(plan.segments[1],duration=.4),
@@ -97,3 +107,20 @@ class JointStateFactoryTests(unittest.TestCase):
         self.assertGreater(proposed.segments[2].editorial_transform.evaluate(0.).zoom,1.1)
         self.assertEqual(b.segment_output_frame_counts,(12,18))
         self.assertEqual(len(b.native_frame_indices),30)
+
+    def test_piecewise_source_warp_cannot_be_observed_as_one_incorrect_linear_shot_clock(self):
+        plan,domain,_=self.fixture()
+        segments=tuple(replace(s,source_start=10.*i,master_start=10.*i,duration=10.)
+            for i,s in enumerate(plan.segments))
+        plan=replace(plan,segments=(segments[0],replace(segments[1],duration=4.),
+            replace(segments[1],source_start=14.,master_start=14.,duration=6.),*segments[2:]),
+            transitions=(RenderTransition(),)*4)
+        old=joint_state_from_render_plan(plan=plan,domain=domain,slot=1,
+            first_output_frame=300,end_output_frame=600,role=GroupOutputRole.FORMATION)
+        warp=TimeWarpMap(0.,40.,40.,tuple(TimeWarpControlPoint(a,b) for a,b in
+            ((0.,0.),(10.,10.),(15.,15.03),(20.,20.),(40.,40.))),(),
+            TimeWarpResidualDiagnostics(None,None,None,0),TimeWarpConfig(),False,None)
+        domain=replace(domain,source_timewarps=(None,None,warp,None))
+        with self.assertRaisesRegex(ValueError,'not one complete linear renderer clock'):
+            candidate_joint_group_state(plan=plan,domain=domain,incumbent_state=old,
+                eligible_source_index=2)

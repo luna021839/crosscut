@@ -2,12 +2,15 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
+from dataclasses import replace
 
 import numpy as np
 
 from crosscut.group_joint_formation_observer import (observe_formation_people,
-    declared_formation_observation,register_formation_models)
+    declared_formation_observation,register_formation_models,observe_temporal_formation_people)
 from crosscut.group_joint_source_camera import JointGroupWorkBudget
+from engine.tests.test_group_joint_formation import person
 
 
 class FormationObserverTests(unittest.TestCase):
@@ -52,3 +55,39 @@ class FormationObserverTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'pinned asset'):
                 register_formation_models(session,person_model_path=path,pose_model_path=path)
             self.assertEqual(calls,[])
+
+    def temporal_fixture(self):
+        first=(person(0,.2),person(1,.8))
+        points=list(first[0].upper_body_xyc);x,y,c=points[2];points[2]=(x,y+.03,c)
+        second=(replace(first[0],upper_body_xyc=tuple(points)),first[1])
+        state=SimpleNamespace(first_output_frame=0,end_output_frame=30,output_fps=30.,
+            native_frame_indices=tuple(range(30)),key='a'*64,output_size=(100,50))
+        session=SimpleNamespace(projected_pixels=lambda s,t:np.zeros((50,100,3),np.uint8))
+        return state,session,first,second
+
+    def test_temporal_measurement_owns_exact_ticks_and_actual_source_side_pixel_path(self):
+        state,session,first,second=self.temporal_fixture()
+        with patch('crosscut.group_joint_formation_observer.observe_formation_people',side_effect=(first,second)),\
+                patch('crosscut.boundary_subject_alignment._optical_flow_box',side_effect=[p.box_xywh for p in second]):
+            result=observe_temporal_formation_people(session,state,outgoing=True)
+        value=result[0].temporal_motion
+        self.assertEqual(value.output_frames,(26,29))
+        self.assertEqual(value.native_frames,(26,29))
+        self.assertEqual(value.state_key,state.key)
+        self.assertTrue(value.same_source_pixel_path_verified)
+        self.assertTrue(any(abs(x)+abs(y)>0 for _,x,y in value.bone_velocities))
+        self.assertTrue(all(x==0 and y==0 for _,x,y in result[1].temporal_motion.bone_velocities))
+
+    def test_missing_pixel_flow_is_no_motion_not_zero_motion(self):
+        state,session,first,second=self.temporal_fixture()
+        with patch('crosscut.group_joint_formation_observer.observe_formation_people',side_effect=(first,second)),\
+                patch('crosscut.boundary_subject_alignment._optical_flow_box',return_value=None):
+            result=observe_temporal_formation_people(session,state,outgoing=False)
+        self.assertTrue(all(p.temporal_motion is None for p in result))
+
+    def test_two_previous_people_cannot_both_lend_motion_to_one_visible_current_person(self):
+        state,session,first,second=self.temporal_fixture()
+        with patch('crosscut.group_joint_formation_observer.observe_formation_people',side_effect=(first,second[:1])),\
+                patch('crosscut.boundary_subject_alignment._optical_flow_box',return_value=second[0].box_xywh):
+            result=observe_temporal_formation_people(session,state,outgoing=True)
+        self.assertIsNone(result[0].temporal_motion)
