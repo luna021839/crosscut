@@ -645,6 +645,23 @@ struct ContentView: View {
                     }
                 }
 
+                if runner.sceneReviewProposalURL != nil {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("별도 구도 제안 · 480p · 승인 아님")
+                            .font(.headline)
+                        Text("출연자·동작·박자·편집 품질은 확인되지 않았습니다. 기존 결과를 대체하지 않습니다.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button {
+                            if let url = runner.verifiedSceneReviewProposalURL() {
+                                NSWorkspace.shared.open(url)
+                            }
+                        } label: {
+                            Label("검토용 제안 열기", systemImage: "play.rectangle")
+                        }
+                    }
+                }
+
                 if !runner.state.isRunning || !runner.outputURLs.isEmpty {
                     Divider()
                     HStack(spacing: 10) {

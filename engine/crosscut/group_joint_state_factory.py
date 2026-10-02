@@ -121,17 +121,21 @@ def assemble_joint_group_states(*,plan,domain,path):
     return _assemble_group_state_path(plan=plan,domain=domain,path=path,state_count=4)
 
 
-def assemble_single_group_source_camera_state(*,plan,domain,path):
+def assemble_single_group_source_camera_state(*,plan,domain,path,
+        replace_incident_clock_jumps=False):
     """Fixed L -> one complete mutable X -> fixed R, not a fake B/C seam.
 
     X may span multiple canonical cells but owns one entire native/camera
     trajectory. This sibling numeric factory grants no semantic admission,
     and does not silently change the existing four-state editorial contract.
     """
-    return _assemble_group_state_path(plan=plan,domain=domain,path=path,state_count=3)
+    if type(replace_incident_clock_jumps) is not bool:
+        raise ValueError('incident clock-jump replacement policy must be explicit')
+    return _assemble_group_state_path(plan=plan,domain=domain,path=path,state_count=3,
+        replace_incident_clock_jumps=replace_incident_clock_jumps)
 
 
-def _assemble_group_state_path(*,plan,domain,path,state_count):
+def _assemble_group_state_path(*,plan,domain,path,state_count,replace_incident_clock_jumps=False):
     if (not isinstance(plan,RenderPlan) or not isinstance(domain,GroupSourceDomain)
             or not isinstance(path,tuple) or len(path)!=state_count or any(not isinstance(s,GroupSourceCameraState)
                 or s.slot!=i for i,s in enumerate(path))
@@ -162,7 +166,14 @@ def _assemble_group_state_path(*,plan,domain,path,state_count):
     # Retain native camera events and source-switch cadence, not cell counts.
     assert_native_cut_events_preserved(plan,proposed,domain)
     before,after=visible_group_cut_inventory(plan,domain),visible_group_cut_inventory(proposed,domain)
-    if tuple((e.first_incoming_output_frame,e.kind) for e in before)!=tuple((e.first_incoming_output_frame,e.kind) for e in after):
+    incident = {path[1].first_output_frame,path[-2].end_output_frame}
+    same_cadence = len(before)==len(after) and all(
+        a.first_incoming_output_frame==b.first_incoming_output_frame and (
+            a.kind==b.kind or replace_incident_clock_jumps
+            and a.first_incoming_output_frame in incident
+            and a.kind=='same_source_clock_jump' and b.kind=='source_switch')
+        for a,b in zip(before,after))
+    if not same_cadence:
         raise ValueError('joint source/camera replacement changed actual visible cut cadence')
     for state in path:
         builder=(fixed_neighbor_state_from_render_plan if state.slot in (0,state_count-1)

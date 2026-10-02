@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8F73DA457BE1598E4D960812 /* SceneReviewProposalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */; };
 		AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */; };
 		BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8314CA79E417414399736965 /* EngineProgressTests.swift */; };
 		3542E216A753B615C38AA1A3 /* EditConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058354DD2B1876E0B582A3B /* EditConfiguration.swift */; };
@@ -31,6 +32,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneReviewProposalTests.swift; sourceTree = "<group>"; };
 		3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		8314CA79E417414399736965 /* EngineProgressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProgressTests.swift; sourceTree = "<group>"; };
 		0BC05A356C48CF84522C559B /* EngineContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineContractTests.swift; sourceTree = "<group>"; };
@@ -53,6 +55,7 @@
 				3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */,
 				0BC05A356C48CF84522C559B /* EngineContractTests.swift */,
 				8314CA79E417414399736965 /* EngineProgressTests.swift */,
+				0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -220,6 +223,7 @@
 				AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */,
 				EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */,
 				BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */,
+				8F73DA457BE1598E4D960812 /* SceneReviewProposalTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

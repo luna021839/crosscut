@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -1352,6 +1353,9 @@ final class EngineRunner: ObservableObject {
     @Published private(set) var logs: [EngineLogEntry] = []
     @Published private(set) var outputURLs: [URL] = []
     @Published private(set) var renderedVideoURL: URL?
+    @Published private(set) var sceneReviewProposalURL: URL?
+    private var sceneReviewProposal: SceneReviewProposalDisposition?
+    private var sceneReviewProposalDirectory: URL?
     @Published private(set) var engineURL: URL?
     @Published private(set) var cancellationRequested = false
     @Published private(set) var isRestoringCompletedOutputs = false
@@ -1502,6 +1506,9 @@ final class EngineRunner: ObservableObject {
         progress = 0
         progressIsIndeterminate = false
         logs.removeAll()
+        sceneReviewProposalURL = nil
+        sceneReviewProposal = nil
+        sceneReviewProposalDirectory = nil
         outputURLs.removeAll()
         renderedVideoURL = nil
         pendingOutputURLs.removeAll()
@@ -1807,6 +1814,21 @@ final class EngineRunner: ObservableObject {
                 level: Self.logLevel(from: event.level)
             )
 
+        case "scene_review_proposal":
+            guard state.isRunning, !cancellationRequested, reportedError == nil,
+                  activeRequest?.editMode == EditMode.group.rawValue,
+                  let proposal = event.sceneReviewProposal,
+                  let directory = activeRequest?.outputDirectory,
+                  Self.validateSceneReviewProposal(proposal, directory: URL(fileURLWithPath: directory)) else {
+                appendLog("구도 제안의 파일·검증 계약을 확인하지 못했습니다.", level: .warning)
+                return
+            }
+            sceneReviewProposal = proposal
+            sceneReviewProposalDirectory = URL(fileURLWithPath: directory)
+            sceneReviewProposalURL = URL(fileURLWithPath: proposal.videoPath)
+            appendLog("별도 480p 구도 제안이 있습니다. 출연자·동작·박자·편집 품질은 미승인입니다.", level: .warning)
+            // Do not set outputURLs, progress=1, completed, or artifactResult.
+
         case "result":
             guard state.isRunning, !cancellationRequested, reportedError == nil else { return }
             pendingOutputURLs = event.outputPaths.map { URL(fileURLWithPath: $0) }
@@ -1825,6 +1847,58 @@ final class EngineRunner: ObservableObject {
         default:
             appendLog(event.message ?? "알 수 없는 이벤트: \(event.type)", level: .engine)
         }
+    }
+
+    /// Recheck on open as well as receive. A restored final result never
+    /// upgrades this sidecar, and a later file replacement invalidates it.
+    func verifiedSceneReviewProposalURL() -> URL? {
+        guard !cancellationRequested, let proposal = sceneReviewProposal,
+              let directory = sceneReviewProposalDirectory,
+              Self.validateSceneReviewProposal(proposal, directory: directory) else { return nil }
+        return URL(fileURLWithPath: proposal.videoPath)
+    }
+
+    static func validateSceneReviewProposal(_ proposal: SceneReviewProposalDisposition, directory: URL) -> Bool {
+        guard proposal.isReviewOnly else { return false }
+        let root = directory.resolvingSymlinksInPath().standardizedFileURL
+        let video = URL(fileURLWithPath: proposal.videoPath).resolvingSymlinksInPath().standardizedFileURL
+        let manifest = URL(fileURLWithPath: proposal.manifestPath).resolvingSymlinksInPath().standardizedFileURL
+        guard video.deletingLastPathComponent() == root, manifest.deletingLastPathComponent() == root,
+              video.pathExtension.lowercased() == "mp4", manifest.pathExtension.lowercased() == "json" else { return false }
+        func digest(_ url: URL, maximum: Int) -> String? {
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  size > 0, size <= maximum, let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            var hash = SHA256()
+            var read = 0
+            do {
+                while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                    read += chunk.count
+                    guard read <= maximum else { return nil }
+                    hash.update(data: chunk)
+                }
+            } catch { return nil }
+            guard read == size else { return nil }
+            return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        guard digest(video, maximum: 512 * 1024 * 1024) == proposal.videoSHA256,
+              let manifestSize = try? manifest.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              manifestSize > 0, manifestSize <= 16 * 1024 * 1024,
+              let data = try? Data(contentsOf: manifest), data.count == manifestSize,
+              SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == proposal.manifestSHA256,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["contract"] as? String == proposal.contract,
+              object["status"] as? String == "REVIEW_REQUIRED",
+              object["artifact_role"] as? String == "scene_review_only",
+              object["quality_approved"] as? Bool == false,
+              object["delivery_completion_message_allowed"] as? Bool == false,
+              object["video_sha256"] as? String == proposal.videoSHA256,
+              object["video_path"] as? String == proposal.videoPath,
+              let technical = object["technical_qa"] as? [String: Any],
+              technical["technical_only"] as? Bool == true,
+              technical["professional_qa_passed"] as? Bool == false,
+              let issues = technical["issue_codes"] as? [String], issues.isEmpty else { return false }
+        return true
     }
 
     private func finish(exitCode: Int32, runID: UUID, outputDrainTimedOut: Bool) async {

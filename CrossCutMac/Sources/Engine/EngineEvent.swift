@@ -11,6 +11,7 @@ struct EngineEvent: Decodable, Equatable {
     let acquisitionManifestPath: String?
     let workStatus: EngineWorkStatus?
     let artifactResult: EngineArtifactDisposition?
+    let sceneReviewProposal: SceneReviewProposalDisposition?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -26,6 +27,7 @@ struct EngineEvent: Decodable, Equatable {
         case sourcePaths = "source_paths"
         case acquisitionManifest = "acquisition_manifest"
         case artifactResult = "artifact_result"
+        case sceneReviewProposal = "scene_review_proposal"
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +59,7 @@ struct EngineEvent: Decodable, Equatable {
         )
         workStatus = try EngineWorkStatus.decode(type: type.lowercased(), from: decoder)
         artifactResult = try container.decodeIfPresent(EngineArtifactDisposition.self, forKey: .artifactResult)
+        sceneReviewProposal = try container.decodeIfPresent(SceneReviewProposalDisposition.self, forKey: .sceneReviewProposal)
     }
 }
 
@@ -222,5 +225,37 @@ private extension KeyedDecodingContainer where Key == EngineEvent.CodingKeys {
             }
         }
         return nil
+    }
+}
+
+/// Explicitly NOT EngineArtifactDisposition: cannot authorize result/delivery.
+struct SceneReviewProposalDisposition: Decodable, Equatable, Sendable {
+    let contract: String
+    let status: String
+    let artifactRole: String
+    let qualityApproved: Bool
+    let deliveryCompletionMessageAllowed: Bool
+    let videoPath: String
+    let videoSHA256: String
+    let manifestPath: String
+    let manifestSHA256: String
+
+    enum CodingKeys: String, CodingKey {
+        case contract, status
+        case artifactRole = "artifact_role"
+        case qualityApproved = "quality_approved"
+        case deliveryCompletionMessageAllowed = "delivery_completion_message_allowed"
+        case videoPath = "video_path"
+        case videoSHA256 = "video_sha256"
+        case manifestPath = "manifest_path"
+        case manifestSHA256 = "manifest_sha256"
+    }
+    var isReviewOnly: Bool {
+        contract == "normal_scene_review_proposal_v1" && status == "REVIEW_REQUIRED"
+        && artifactRole == "scene_review_only" && !qualityApproved
+        && !deliveryCompletionMessageAllowed
+        && [videoSHA256, manifestSHA256].allSatisfy {
+            $0.count == 64 && $0.allSatisfy { "0123456789abcdef".contains($0) }
+        }
     }
 }

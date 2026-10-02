@@ -1,10 +1,14 @@
 """Fixed-neighbor incident endpoints do not certify mutable whole shots."""
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
 from crosscut.group_joint_source_camera import GroupOutputRole
 from crosscut.group_scene_observations import SceneSensors, scene_anchor_ticks
+from crosscut.group_scene_intent import declared_shot_intent, validate_intent
+from crosscut.render import RenderPlan, RenderSegment
+from crosscut.ive import AspectRatio
 
 
 def fixture(unknown_ticks):
@@ -14,6 +18,16 @@ def fixture(unknown_ticks):
     sensors = object.__new__(SceneSensors)
     sensors.hypotheses = {}
     sensors.discoveries = {}
+    plan=RenderPlan(sources=(Path('endpoint-intent-fixture.mp4'),),
+        segments=(RenderSegment(0,0.,4.,0.),),reference_source=0,
+        aspect_ratio=AspectRatio.LANDSCAPE,output=Path('unused.mp4'),fps=30.)
+    context=SimpleNamespace(incumbent=SimpleNamespace(render_plan=plan,
+        visual_timeline=SimpleNamespace(choices=(SimpleNamespace(shot_type='medium'),)),
+        face_match_plan=SimpleNamespace(segments=(SimpleNamespace(alignment_subject=None,applied=False),))))
+    shot=SimpleNamespace(first_segment_index=0,last_segment_index=0,
+        first_output_frame=100,end_output_frame=120)
+    sensors.shot_intents = {(100,120,scope): declared_shot_intent(context,shot,endpoint_scope=scope)
+        for scope in ('entry','exit','whole')}
     calls = []
 
     def raw(state,tick,roll):
@@ -34,6 +48,8 @@ def test_unknown_far_endpoint_does_not_erase_fixed_incident_motion(scope,unknown
     assert len(found)==1
     assert found[0]['endpoint_scope']==scope
     assert found[0]['anchor_output_ticks']==expected
+    validate_intent(found[0]['shot_intent'],role=GroupOutputRole.FOCAL_HEAD.value,
+        first=100,end=120,endpoint_scope=scope)
     assert calls==expected
     # Cache scope must not relabel the same partial hypothesis as a whole shot.
     assert sensors.discover(state,rolls=(None,),endpoint_scope='whole')==()

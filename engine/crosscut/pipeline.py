@@ -35638,6 +35638,16 @@ def analyze(
                 # It never suppresses the established refinement families above.
                 # No experimental-pixel flag enables it, and no model download
                 # is permitted by its installed-only asset resolver.
+                # A separate, unapproved scene trial can be inspected without
+                # certifying every detector rectangle as a performer. It uses
+                # the SAME optional cutoff, before expensive strict inference,
+                # and never replaces this retained incumbent or final QA.
+                from .group_scene_review_proposal import attempt_review_proposal
+                attempt_review_proposal(controller=group_first, reporter=reporter,
+                    eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                    scene_cut_times=scene_cut_times,
+                    source_derivatives=source_derivative_diversity_result,
+                    archive_path=request.output_directory / f"{base_filename}-scene-review-proposal.json")
                 from .group_performer_family_owner import attempt_performer_family
                 attempt_performer_family(controller=group_first, request=request,
                     eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
