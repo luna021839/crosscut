@@ -110,7 +110,19 @@ def _observed_head_evidence(evidence):
     return None
 
 
-def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis=None):
+@dataclass(frozen=True, slots=True)
+class ProjectedBoundaryObservation:
+    """Motion and framing from the SAME four actual output pixel views.
+
+    This is run-local sensing, not stored geometry or quality authority. The
+    two endpoint heads have already been measured for motion; decoding,
+    projecting and detecting them again adds no independent evidence.
+    """
+    motion: CloseupGestureEvidence | HeadMotionEvidence | None = None
+    face_metrics: tuple[float, float] | None = None
+
+
+def observe_projected_boundary(frames,samples,provider,*,output_fps,required_basis=None):
     """Four actual output-coordinate pixel views, BEFORE a full encode.
 
     This reuses the loaded pose model; no output film/feature cache is needed.
@@ -131,7 +143,7 @@ def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis
         raise ValueError('projected motion must retain an explicit known evidence basis')
     if (type(output_fps) not in (int,float) or not math.isfinite(output_fps) or output_fps<=0
             or any(frame is None for frame in frames)):
-        return None
+        return ProjectedBoundaryObservation()
     ticks=tuple(sample.output_frame_index for sample in samples)
     if (ticks[1]-ticks[0],ticks[2]-ticks[1],ticks[3]-ticks[2])!=(3,1,3):
         raise ValueError('projected motion views must own the exact four output ticks')
@@ -139,7 +151,7 @@ def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis
             or samples[2].source_index!=samples[3].source_index
             or samples[0].source_index==samples[2].source_index
             or any(sample.terminal_clone for sample in samples)):
-        return None
+        return ProjectedBoundaryObservation()
     ids=tuple(sample.native_frame_index for sample in samples)
     intervals=(3/output_fps,1/output_fps,3/output_fps)
     working=[];heads=[];arms=[]
@@ -151,12 +163,14 @@ def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis
         arm=(provider.pose.describe(frame,bbox_xywh=owner.bbox_xywh,face_bbox_xywh=head.bbox_xywh)
             if head.bbox_xywh is not None and owner is not None else None)
         working.append(frame);heads.append(head);arms.append(arm)
+    face_metrics = (_box_discontinuity(heads[1].bbox_xywh,heads[2].bbox_xywh)
+        if heads[1].bbox_xywh is not None and heads[2].bbox_xywh is not None else None)
     endpoint=compare_arm_articulation(arms[1],arms[2],outgoing_native_frame=ids[1],
         incoming_native_frame=ids[2],allow_partial=True)
     arm_motion = (measure_arm_motion(tuple(arms),native_frames=ids,output_intervals_seconds=intervals)
         if required_basis != HEAD_MOTION_BASIS else None)
     if required_basis == MOTION_CONTRACT and (arm_motion is None or endpoint is None):
-        return None
+        return ProjectedBoundaryObservation(face_metrics=face_metrics)
     paths_verified = True
     for a,b in ((0,1),(2,3)):
         ha,hb=heads[a],heads[b]
@@ -172,10 +186,18 @@ def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis
         # Arms already have a real four-frame motion comparator. Do not add a
         # second frozen-pose requirement through the head-only fallback guard.
         head = HeadMotionEvidence(motion) if motion is not None else None
-        return ProjectedArmHeadMotionEvidence(endpoint.outgoing_native_frame,endpoint.incoming_native_frame,
+        measured = ProjectedArmHeadMotionEvidence(endpoint.outgoing_native_frame,endpoint.incoming_native_frame,
             endpoint.bone_mismatches,endpoint.outgoing_focal_basis,endpoint.incoming_focal_basis,
             arm_motion,head)
-    return HeadMotionEvidence(motion,endpoint) if motion is not None else None
+    else:
+        measured = HeadMotionEvidence(motion,endpoint) if motion is not None else None
+    return ProjectedBoundaryObservation(measured,face_metrics)
+
+
+def measure_projected_motion(frames,samples,provider,*,output_fps,required_basis=None):
+    """Compatibility entry point for callers needing only the measured motion."""
+    return observe_projected_boundary(frames,samples,provider,
+        output_fps=output_fps,required_basis=required_basis).motion
 
 
 @dataclass(frozen=True)
@@ -406,33 +428,19 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
         if gesture is None and hasattr(provider,'compare_head_motion'):
             gesture=provider.compare_head_motion(*values,output_fps=plan.fps)
         return gesture,tuple(descriptors),samples
-    def faces(candidate,boundary,samples):
-        counts=segment_frame_counts(candidate)
-        boxes=[]
-        for index,sample in zip((boundary,boundary+1),samples[1:3]):
-            frame=provider.capture.frame_at_native_index(sample.source_index,sample.native_frame_index,
-                clocks[sample.source_index])
-            if frame is None:
-                return None
-            geometry=PrescribedGeometrySampler(sampler(sample.source_index),candidate.segments[index],
-                master_start=candidate.master_audio_start+candidate.segments[index].master_start)
-            relative=(sample.output_frame_index-sum(counts[:index]))/candidate.fps
-            output=_reference_view_for_span(frame,geometry.span,relative_time=relative,
-                size=(candidate.width,candidate.height))
-            boxes.append(measured_output_face_box(output))
-        return _box_discontinuity(*boxes) if all(box is not None for box in boxes) else None
     def projected(candidate,boundary,samples,required_basis=None):
         counts=segment_frame_counts(candidate);frames=[]
         for index,sample in zip((boundary,boundary,boundary+1,boundary+1),samples):
             frame=provider.capture.frame_at_native_index(sample.source_index,sample.native_frame_index,
                 clocks[sample.source_index])
-            if frame is None:return None
+            if frame is None:return ProjectedBoundaryObservation()
             geometry=PrescribedGeometrySampler(sampler(sample.source_index),candidate.segments[index],
                 master_start=candidate.master_audio_start+candidate.segments[index].master_start)
             frames.append(_reference_view_for_span(frame,geometry.span,
                 relative_time=(sample.output_frame_index-sum(counts[:index]))/candidate.fps,
                 size=(candidate.width,candidate.height)))
-        return measure_projected_motion(frames,samples,provider,output_fps=candidate.fps,required_basis=required_basis)
+        return observe_projected_boundary(frames,samples,provider,
+            output_fps=candidate.fps,required_basis=required_basis)
     # These cameras belong to an independent complete context transaction.
     # Editing one of its fixed neighbors is not a proposal this stage can
     # compose. Avoid decoding/ranking a candidate known to lose its receipt.
@@ -444,9 +452,9 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 break
             try:
                 source_gesture,source_descriptors,samples=measured(plan,boundary)
-                gesture=projected(plan,boundary,samples) if samples is not None else None
-                baseline_faces=(faces(plan,boundary,samples) if gesture is not None
-                    and gesture.motion is not None and samples is not None else None)
+                observation=(projected(plan,boundary,samples) if samples is not None
+                    else ProjectedBoundaryObservation())
+                gesture,baseline_faces=observation.motion,observation.face_metrics
             except ValueError as error:
                 attempts.append(dict(stage='baseline_motion',boundary_index=boundary,
                     admitted=False,reason=str(error)))
@@ -502,11 +510,12 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 except ValueError:
                     continue
                 if native is None:continue
-                gesture=projected(preview,boundary,native,required_basis=motion_evidence_basis(before))
+                observation=projected(preview,boundary,native,required_basis=motion_evidence_basis(before))
+                gesture=observation.motion
                 improves=measured_motion_improves(gesture,before)
                 preview_faces=preview_rank=None
                 if projected_motion_preserved(gesture,before):
-                    preview_faces=faces(preview,boundary,native)
+                    preview_faces=observation.face_metrics
                     preview_rank=camera_motion_rank(gesture,preview_faces,enforce_face_limits=False)
                 attempts.append(dict(stage='directional_candidate',boundary_index=boundary,
                     offset_frames=offset,admitted=False,motion_rank_improved=improves,
@@ -583,10 +592,10 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     if any((a.source_index,a.native_frame_index,a.output_frame_index)!=(b.source_index,b.native_frame_index,b.output_frame_index)
                            for a,b in zip(native,final_native,strict=True)):
                         raise ValueError('camera construction changed the measured native motion clock')
-                    projected_faces=faces(proposal.plan,boundary,native)
-                    after_projected=(projected(proposal.plan,boundary,native,
+                    observation=(projected(proposal.plan,boundary,native,
                         required_basis=motion_evidence_basis(before_projected))
-                        if before_projected is not None else None)
+                        if before_projected is not None else ProjectedBoundaryObservation())
+                    projected_faces,after_projected=observation.face_metrics,observation.motion
                     output_before_rank=camera_motion_rank(before_projected,before_faces,enforce_face_limits=False)
                     rank=camera_motion_rank(after_projected,projected_faces)
                     row.update(proposed_output_face_metrics=projected_faces,

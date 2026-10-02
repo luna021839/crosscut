@@ -19,6 +19,7 @@ from crosscut.group_motion_camera_refinement import (
     retimed_incumbent_camera_preview,
     projected_motion_preserved,measure_projected_motion,
     ProjectedArmHeadMotionEvidence, PROJECTED_ARM_HEAD_CONTRACT,
+    ProjectedBoundaryObservation, observe_projected_boundary,
 )
 from crosscut.ive import AspectRatio
 from crosscut.pipeline import (
@@ -35,6 +36,10 @@ from engine.tests.test_post_render_qa_current_group_contract import produced_pla
 
 
 class MotionCameraRankTests(unittest.TestCase):
+    @staticmethod
+    def observation(motion):
+        return ProjectedBoundaryObservation(motion, (.0, .0))
+
     def gesture(self, pose=.2, velocity=.1):
         return CloseupGestureEvidence(13, 20, (.1, .2, None, None),
             motion=ObservedArmMotion((10, 13, 20, 23), (.1, 1/30., .1),
@@ -213,6 +218,31 @@ class MotionCameraRankTests(unittest.TestCase):
             else:
                 self.assertIsNone(result.head_motion_guard,'failed pixel paths remain unknown, not zero cost')
 
+    def test_motion_and_framing_share_the_same_four_head_measurements(self):
+        from crosscut.native_global_face import NativeGlobalFace
+        from engine.tests.test_global_action_cut_camera import person,pose,observation
+        row=observation(0)
+        head=NativeGlobalFace(1,row.face_box_xywh,row.face_landmarks_xy,0.,.1,
+            (.4,.3,.5,.3,.1,0.,0.,.4,.8,0.))
+        frames=[np.zeros((480,854,3),np.uint8) for _ in range(4)]
+        samples=tuple(SimpleNamespace(source_index=s,native_frame_index=n,output_frame_index=o,terminal_clone=False)
+            for s,n,o in ((0,10,100),(0,13,103),(1,20,104),(1,23,107)))
+        provider=SimpleNamespace(pose=SimpleNamespace(describe=lambda *a,**k:pose(person())))
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=head) as detect, \
+                patch('crosscut.visual_score.describe_frame',return_value=SimpleNamespace(formation_people=(person(),))), \
+                patch('crosscut.group_focal_attention.focal_landmarks_track',return_value=True):
+            measured=observe_projected_boundary(frames,samples,provider,output_fps=30.)
+        self.assertEqual(detect.call_count,4)
+        self.assertEqual(measured.face_metrics,(.0,.0))
+        self.assertIsInstance(measured.motion,ProjectedArmHeadMotionEvidence)
+        self.assertIsNotNone(measured.motion.head_motion_guard)
+        with patch('crosscut.native_global_face.observe_native_global_face',return_value=head), \
+                patch('crosscut.visual_score.describe_frame',return_value=SimpleNamespace(formation_people=())):
+            measured=observe_projected_boundary(frames,samples,provider,output_fps=30.,
+                required_basis='exact_four_frame_observed_arm_motion_cost_v1')
+        self.assertIsNone(measured.motion,'face framing cannot replace missing required moving arms')
+        self.assertEqual(measured.face_metrics,(.0,.0),'observed faces remain available diagnostics')
+
     def test_bound_is_checked_before_any_media_decode(self):
         with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock') as probe:
             for options in ({'maximum_boundaries': 5}, {'maximum_boundaries': True},
@@ -292,7 +322,8 @@ class MotionCameraRankTests(unittest.TestCase):
                     VerifiedRenderFrameClock(Fraction(30),3000,'a'*64)), \
                 patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                 patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=sampler), \
-                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.observe_projected_boundary',side_effect=
+                    lambda *a,**k:self.observation(projected(*a,**k))), \
                 patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=ValueError('native camera cannot be bound')) as camera, \
                 patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)) as observed, \
                 patch('crosscut.group_motion_camera_refinement.measured_motion_improves',return_value=False):
@@ -303,8 +334,7 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertEqual([r['boundary_index'] for r in baseline],list(range(13)))
         self.assertFalse(any(r['complete_measured_candidate'] for r in baseline[:12]))
         self.assertTrue(baseline[12]['complete_measured_candidate'])
-        observed.assert_called();self.assertEqual(observed.call_count,14,
-            'twelve unknown baselines did not trigger faces; one known baseline and six equal-motion previews did')
+        observed.assert_not_called()
         budget=next(r for r in result.attempts if r['stage']=='bounded_measured_focal_frontier')
         self.assertEqual(budget['measured_boundary_indices'],[12])
         self.assertEqual(result.proposals,())
@@ -337,8 +367,8 @@ class MotionCameraRankTests(unittest.TestCase):
                     patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                     patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                         SimpleNamespace(feature_descriptor_at=descriptor,close=lambda:None)), \
-                    patch('crosscut.group_motion_camera_refinement.measure_projected_motion',return_value=
-                        self.gesture() if arm_available else HeadMotionEvidence(ObservedHeadMotion((10,13,20,23),(.1,1/30.,.1),.2,.1))) as output_motion, \
+                    patch('crosscut.group_motion_camera_refinement.observe_projected_boundary',return_value=self.observation(
+                        self.gesture() if arm_available else HeadMotionEvidence(ObservedHeadMotion((10,13,20,23),(.1,1/30.,.1),.2,.1)))) as output_motion, \
                     patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=ValueError('native camera cannot be bound')), \
                     patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)):
                 result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
@@ -390,7 +420,8 @@ class MotionCameraRankTests(unittest.TestCase):
                     patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                     patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                         SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
-                    patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=output_measure), \
+                    patch('crosscut.group_motion_camera_refinement.observe_projected_boundary',side_effect=
+                        lambda *a,**k:self.observation(output_measure(*a,**k))), \
                     patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
                     patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=camera):
                 result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
@@ -428,7 +459,8 @@ class MotionCameraRankTests(unittest.TestCase):
                 patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                 patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                     SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
-                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.observe_projected_boundary',side_effect=
+                    lambda *a,**k:self.observation(projected(*a,**k))), \
                 patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
                 patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=camera):
             result=refine_group_motion_camera(plan=plan,timeline=timeline,audio_offsets=(0.,0.),
@@ -460,7 +492,8 @@ class MotionCameraRankTests(unittest.TestCase):
                 patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
                 patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
                     SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
-                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.observe_projected_boundary',side_effect=
+                    lambda *a,**k:self.observation(projected(*a,**k))), \
                 patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
                 patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=
                     ValueError('native camera cannot be bound')):
