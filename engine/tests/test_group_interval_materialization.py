@@ -156,6 +156,50 @@ class GroupIntervalMaterializationTests(unittest.TestCase):
         self.assertIs(observed.incumbent_timeline.choices[-1], original)
         self.assertIsNone(observed.timeline.choices[-1].transition_evidence_authority_from_previous)
 
+    def test_disjoint_split_windows_do_not_reanalyse_or_overwrite_the_unchanged_gap(self):
+        from crosscut.group_source_span_proposal import refresh_fixed_group_render_observations
+        plan, domain, timeline = self.fixture(30., Fraction(30))
+        plan = replace(plan,segments=tuple(replace(plan.segments[i%4],
+            source_start=float(i),master_start=float(i)) for i in range(10)),
+            transitions=tuple(RenderTransition() for _ in range(9)))
+        timeline = replace(timeline,choices=tuple(replace(_choice(i,i%4),
+            quality_score=.99,face_match_candidate_failure='unchanged-gap-history') for i in range(10)))
+        scaffold = split_group_render_intervals(plan=plan,domain=domain,split_output_frames=(45,225))
+        self.assertEqual(scaffold.refreshed_segment_indices,(0,1,2,3,7,8,9,10))
+        Sampler.instances=[];Sampler.unreadable_source=None
+        with patch('crosscut.visual_score._VideoSampler',JointSampler), \
+                patch('crosscut.group_interval_materialization.refresh_fixed_group_render_observations',
+                    wraps=refresh_fixed_group_render_observations) as refresh:
+            observed = refresh_split_group_render_observations(scaffold=scaffold,timeline=timeline,
+                domain=domain,sync_scores=(1.,)*4)
+        ranges=[(call.kwargs['first_segment_index'],call.kwargs['last_segment_index'])
+            for call in refresh.call_args_list]
+        self.assertEqual(ranges,[(0,3),(7,10)])
+        for item in scaffold.cell_map:
+            if item.new_segment_index not in scaffold.refreshed_segment_indices:
+                self.assertEqual(observed.timeline.choices[item.new_segment_index],
+                    replace(timeline.choices[item.old_segment_index],segment_index=item.new_segment_index))
+        self.assertAlmostEqual(observed.timeline.choices[1].quality_score,.8)
+        self.assertAlmostEqual(observed.timeline.choices[8].quality_score,.8)
+        self.assertTrue(all(s.closed for s in Sampler.instances))
+
+    def test_split_refresh_rejects_a_consumer_that_overwrites_an_unrequested_cell(self):
+        from crosscut.group_source_span_proposal import refresh_fixed_group_render_observations
+        plan, domain, timeline = self.fixture(30., Fraction(30))
+        scaffold = split_group_render_intervals(plan=plan,domain=domain,split_output_frames=(45,))
+        def corrupt(**kwargs):
+            result = refresh_fixed_group_render_observations(**kwargs)
+            last = replace(result.choices[-1],quality_score=.123)
+            return replace(result,choices=(*result.choices[:-1],last))
+        Sampler.instances=[];Sampler.unreadable_source=None
+        with patch('crosscut.visual_score._VideoSampler',JointSampler), \
+                patch('crosscut.group_interval_materialization.refresh_fixed_group_render_observations',side_effect=corrupt), \
+                self.assertRaisesRegex(ValueError,'outside its declared local window'):
+            refresh_split_group_render_observations(scaffold=scaffold,timeline=timeline,
+                domain=domain,sync_scores=(1.,)*4)
+        self.assertEqual(timeline.choices[-1].quality_score,.99)
+        self.assertTrue(all(s.closed for s in Sampler.instances))
+
     def test_unreadable_split_anchor_never_reuses_old_descriptors_or_expands_donors(self):
         plan, domain, timeline = self.fixture(30., Fraction(30))
         result = split_group_render_intervals(plan=plan, domain=domain, split_output_frames=(45,))

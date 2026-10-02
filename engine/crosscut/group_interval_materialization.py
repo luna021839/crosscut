@@ -253,11 +253,27 @@ def refresh_split_group_render_observations(*, scaffold, timeline, domain, sync_
         choices.append(replace(old, **updates))
     clock_timeline = replace(timeline, choices=tuple(choices), candidate_review_summaries=(),
         analysis_basis='UNREFRESHED_split_native_epoch_scaffold_not_a_selected_timeline')
-    fresh = refresh_fixed_group_render_observations(plan=scaffold.plan, clock_timeline=clock_timeline,
-        first_segment_index=min(incident), last_segment_index=max(incident), source_domain=domain,
-        sync_scores=sync_scores, feature_cache_directory=feature_cache_directory,
-        feature_derived_cache_directory=feature_derived_cache_directory,
-        require_persistent_feature_cache=require_persistent_feature_cache)
+    # Disjoint epoch changes must not silently broaden into a whole-song
+    # refresh. The declared inventory is a union of local neighborhoods, not
+    # its convex hull. Keep the unchanged gap rows and their history intact.
+    windows = []
+    for index in sorted(incident):
+        if windows and index == windows[-1][1]+1:
+            windows[-1] = (windows[-1][0], index)
+        else:
+            windows.append((index, index))
+    fresh = clock_timeline
+    for first, last in windows:
+        previous = fresh
+        fresh = refresh_fixed_group_render_observations(plan=scaffold.plan, clock_timeline=previous,
+            first_segment_index=first, last_segment_index=last, source_domain=domain,
+            sync_scores=sync_scores, feature_cache_directory=feature_cache_directory,
+            feature_derived_cache_directory=feature_derived_cache_directory,
+            require_persistent_feature_cache=require_persistent_feature_cache)
+        if (len(fresh.choices) != len(previous.choices)
+                or any(new != old for index, (old, new) in enumerate(zip(previous.choices, fresh.choices))
+                    if not first <= index <= last)):
+            raise ValueError('split GROUP refresh changed observations outside its declared local window')
     if 'UNREFRESHED' in fresh.analysis_basis or len(fresh.choices) != len(scaffold.plan.segments):
         raise ValueError('split GROUP descriptor observer returned an unfinished timeline')
     return GroupIntervalRenderedObservations(scaffold, fresh, timeline, tuple(sorted(unrebound)))
