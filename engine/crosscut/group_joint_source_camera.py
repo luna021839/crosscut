@@ -204,12 +204,16 @@ class JointGroupWorkBudget:
     """One shared absolute deadline and independently counted work dimensions."""
     def __init__(self,*,absolute_deadline,maximum_states=24,maximum_edges=512,
             maximum_dense_paths=4,maximum_new_decodes=1200,maximum_model_calls=2400,
+            maximum_pose_comparisons=4096,
+            maximum_pose_evidence_bytes=8*1024*1024,
             maximum_projected_cache_bytes=64*1024*1024,clock=monotonic):
         values=dict(states=maximum_states,edges=maximum_edges,dense_paths=maximum_dense_paths,
-            new_decodes=maximum_new_decodes,model_calls=maximum_model_calls)
+            new_decodes=maximum_new_decodes,model_calls=maximum_model_calls,
+            pose_comparisons=maximum_pose_comparisons,pose_evidence_bytes=maximum_pose_evidence_bytes)
         if (type(absolute_deadline) not in (float,int) or not math.isfinite(absolute_deadline)
                 or any(type(v) is not int or v<1 for v in (*values.values(),maximum_projected_cache_bytes))
-                or maximum_states>24 or maximum_edges>512 or maximum_dense_paths>4):
+                or maximum_states>24 or maximum_edges>512 or maximum_dense_paths>4
+                or maximum_pose_comparisons>4096 or maximum_pose_evidence_bytes>8*1024*1024):
             raise ValueError('joint GROUP requires explicit bounded state/edge/dense/decode/model/time budgets')
         self.clock=clock;self.deadline=absolute_deadline;self.limits=values
         self.counts={k:0 for k in values};self.model_calls={}

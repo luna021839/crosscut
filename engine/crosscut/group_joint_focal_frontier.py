@@ -493,6 +493,38 @@ def match_focal_trajectory(reference, alternatives, *, path_available, maximum_h
         hypotheses=hypotheses, identity_certified=False, required_part_coverage_certified=False)
 
 
+def native_pose_hypotheses_for_face_paths(*, domain, rows, face_paths, duties, maximum_hypotheses=64):
+    """Measure ALL raw body alternatives of supplied face paths, independently of LK.
+
+    The face path remains discovery, not whole-head/arm or named identity. An
+    ambiguous body can have measurable geometry without becoming visible duty.
+    No successful camera, lowest pose cost or LK survivor chooses a body owner.
+    """
+    from .group_joint_temporal_pose import native_pose_windows_from_rows, TemporalPoseUnavailable
+    if (not isinstance(face_paths, tuple) or type(maximum_hypotheses) is not int
+            or not 1 <= maximum_hypotheses <= 256):
+        raise ValueError('native face/body motion needs an immutable bounded face-path inventory')
+    inputs = []; count = 0
+    for faces in face_paths:
+        if (not isinstance(faces, tuple) or len(faces) != len(rows)
+                or any(type(n) is not int or n < 0 for n in faces)):
+            raise ValueError('temporal face path must identify every actual raw anchor')
+        choices = []
+        for row, face in zip(rows, faces, strict=True):
+            head = next((h for h in row.heads if h.observation_id == face), None)
+            if head is None:
+                raise ValueError('temporal face path names an absent raw face')
+            choices.append(head.candidate_body_observation_ids or (None,))
+        count += math.prod(len(values) for n, values in enumerate(choices)
+            if n == 0 or rows[n].native_frame_index != rows[n-1].native_frame_index)
+        inputs.append((faces, tuple(choices)))
+    if count > maximum_hypotheses:
+        raise TemporalPoseUnavailable('all-face/body pose hypothesis overflow, not success-biased truncation')
+    return tuple((faces, window) for faces, choices in inputs for window in
+        native_pose_windows_from_rows(domain=domain, rows=rows, choices=choices, duties=duties,
+            maximum_hypotheses=maximum_hypotheses))
+
+
 def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False,
         inherited_reference=None):
     """At most three rasters per eligible source; no full-song reanalysis.
@@ -513,7 +545,13 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         raise ValueError('focal discovery reference differs from the predeclared source')
     reference_basis = ('parent_frozen_raw_native_seed_not_identity_certification'
         if inherited_reference is not None else 'diagnostic_area_seed_not_inherited_subject')
-    observed = {}; appearances = {}; candidates = []; graphs = []
+    from .group_joint_temporal_pose import (FrozenPoseMotionDutiesV1,
+        TemporalPoseUnavailable, compare_pose_phase_windows, independent_native_pose_hypotheses)
+    # Fixed SENSOR obligations before source ordering, not a narrower
+    # editorial head-only role derived from failing body/arm measurements.
+    pose_duties = FrozenPoseMotionDutiesV1('native-focal-discovery-head-and-arm-sensor-not-semantic-parent',
+        (0, 5, 6, 7, 8, 9, 10), .3)
+    observed = {}; appearances = {}; candidates = []; graphs = []; pose_windows = {}
     # Declare reference first, not after seeing favorable donor/camera scores.
     sources = (reference_source, *(s for s in session.domain.eligible_indices if s != reference_source))
     for source in sources:
@@ -561,10 +599,31 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         # parts/all competing hypotheses are still the normal owner's duty.
         ranking_linked = provisional is not None
         anchors = provisional
+        session.budget.check()
+        try:
+            seed_body_ids = None
+            if source == reference_source:
+                seed = next(head for head in rows[0].heads if head.observation_id == reference[0].face_observation_id)
+                seed_body_ids = seed.candidate_body_observation_ids or (None,)
+            pose_windows[source] = tuple(((), window) for window in independent_native_pose_hypotheses(
+                domain=session.domain,rows=rows,duties=pose_duties,initial_person_ids=seed_body_ids))
+            pose_status = ('raw_temporal_hypotheses_measured_not_association_or_phase_certification'
+                if pose_windows[source] else 'no_eligible_native_face_path_for_temporal_body_hypotheses')
+        except TemporalPoseUnavailable as exc:
+            pose_windows[source] = ()
+            pose_status = str(exc)
+        session.budget.check()
+        pose_payload = [dict(face_observation_ids=faces, track=window.to_dict())
+            for faces, window in pose_windows[source]]
+        session.budget.spend('pose_evidence_bytes',len(json.dumps(pose_payload,sort_keys=True,
+            separators=(',', ':'),allow_nan=False).encode()))
         candidates.append(dict(source_index=source, shortlist_available=linked, reason=reason if linked else
             reason, similarities=ranking_similarities, competing_trajectory_margin=trajectory_margin,
             ranking_only_path_available=ranking_linked, ranking_similarities=ranking_similarities,
             native_trajectory_hypotheses=path_info['hypotheses'], source_eligibility_changed=False,
+            independent_native_pose_motion_status=pose_status,
+            independent_native_pose_motion_association_basis='all_raw_person_alternatives_not_conditioned_on_face_or_joint_lk',
+            independent_native_pose_motion=pose_payload,
             anchors=[] if anchors is None else [dict(native_frame_index=row.native_frame_index,
                 native_presentation_seconds=row.native_frame_index/float(session.domain.clocks_by_request[source].frame_rate),
                 observation_sha256=row.sha256, person_observation_id=item.person_observation_id,
@@ -574,11 +633,26 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
                 face_box_xywh=next(head.box_xywh for head in row.heads if head.observation_id == item.face_observation_id))
                 for row, item in zip(observed[source], anchors)]))
         graphs.append(dict(source_index=source, **graph.to_dict()))
+    comparisons = []
+    for candidate in candidates:
+        source = candidate['source_index']
+        session.budget.spend('pose_comparisons', len(pose_windows[reference_source])*len(pose_windows[source]))
+        pairs = product(pose_windows[reference_source], pose_windows[source])
+        comparison = dict(source_index=source, all_owner_pair_hypotheses=[dict(
+            reference_face_observation_ids=a[0], candidate_face_observation_ids=b[0],
+            evidence=compare_pose_phase_windows(a[1], b[1])) for a, b in pairs],
+            empty_is_zero_cost=False, minimum_over_convenient_owner_used=False,
+            source_eligibility_or_appearance_ranking_changed=False)
+        session.budget.spend('pose_evidence_bytes',len(json.dumps(comparison,sort_keys=True,
+            separators=(',', ':'),allow_nan=False).encode()))
+        comparisons.append(comparison)
+        session.budget.check()
     return dict(contract='bounded_synchronized_owned_focal_source_frontier_v1', status='measured_shortlist',
         canonical_times=times, reference_source_index=reference_source, candidates=candidates,
         reference_basis=reference_basis,
         inherited_reference=None if inherited_reference is None else inherited_reference.to_dict(),
         source_local_pair_graphs=graphs,
+        independent_raw17_temporal_pose_comparisons=comparisons,
         raw_observations=[row.to_dict() for rows in observed.values() for row in rows],
         target_declared_before_donor_comparison=True, evidence_basis=(
             'native_face_roi_appearance_and_local_landmark_paths_not_body_ownership' if face_roi_only else

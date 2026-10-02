@@ -33,12 +33,13 @@ class NativeInstancePromptHypothesis:
     policy_sha256: str
 
     def to_dict(self):
-        return dict(contract='native_raw_pose_grounded_instance_prompt_hypothesis_v1',
+        return dict(contract='native_raw_pose_grounded_instance_prompt_hypothesis_v2',
             raw_observation_sha256=self.raw_observation_sha256,
             face_observation_id=self.face_observation_id, body_observation_id=self.body_observation_id,
             point_coords_xy=self.point_coords_xy, point_labels=self.point_labels,
             box_xyxy=self.box_xyxy, used_raw_joint_indices=self.used_raw_joint_indices,
             unused_raw_joints=self.unused_raw_joints, policy_sha256=self.policy_sha256,
+            raw_score_basis='rtmpose_simcc_raw_peak_not_probability_v1', raw_scores_clipped=False,
             body_alternatives_not_merged=True, prompt_is_identity_certificate=False,
             prompt_is_surface_certificate=False, quality_approved=False)
 
@@ -89,8 +90,9 @@ def native_instance_prompt_hypotheses(*, raw_observation, face_observation_id,
         raise ValueError('instance prompt refers to an absent raw body alternative')
     raw_sha = hashlib.sha256(json.dumps(dict(raw_observation), sort_keys=True,
         separators=(',', ':'), allow_nan=False).encode()).hexdigest()
-    policy_sha = hashlib.sha256(json.dumps(dict(contract='raw_pose_positive_instance_prompts_v1',
+    policy_sha = hashlib.sha256(json.dumps(dict(contract='raw_pose_positive_instance_prompts_v2',
         minimum_joint_confidence=minimum_joint_confidence,
+        raw_score_basis='rtmpose_simcc_raw_peak_not_probability_v1',
         prompt_joint_inventory=(5, 6, 7, 8, 9, 10, 11, 12),
         no_body_union=True, native_points_not_clamped=True), sort_keys=True,
         separators=(',', ':')).encode()).hexdigest()
@@ -102,7 +104,7 @@ def native_instance_prompt_hypotheses(*, raw_observation, face_observation_id,
         joints = body.get('raw_pose_xyc')
         if (not isinstance(joints, (list, tuple)) or len(joints) != 17
                 or any(not isinstance(j, (list, tuple)) or len(j) != 3
-                    or any(not _number(v) for v in j) or not 0 <= j[2] <= 1 for j in joints)):
+                    or any(not _number(v) for v in j) for j in joints)):
             raise ValueError('instance prompt needs every original raw17 joint, not a simplified skeleton')
         affine = body.get('source_pixel_to_pose_input_affine')
         if (not isinstance(affine, (list, tuple)) or len(affine) != 2

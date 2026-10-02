@@ -57,13 +57,26 @@ class NativeInstancePromptTests(unittest.TestCase):
             self.assertEqual(row['people'][0]['raw_pose_xyc'][7], (x, y, .9))
 
     def test_invalid_raw_confidence_or_negative_inventory_id_is_not_a_prompt(self):
-        for confidence in (-.1, 1.1):
+        for confidence in (True, float('nan'), float('inf')):
             row = self.row(); row['people'][0]['raw_pose_xyc'][7] = (.4, .4, confidence)
             with self.subTest(confidence=confidence), self.assertRaises(ValueError):
                 native_instance_prompt_hypotheses(raw_observation=row, face_observation_id=2)
         row = self.row(); row['heads'][1]['observation_id'] = -1
         with self.assertRaises(ValueError):
             native_instance_prompt_hypotheses(raw_observation=row, face_observation_id=2)
+
+    def test_simcc_raw_peak_above_one_is_preserved_and_negative_peak_is_unused(self):
+        row = self.row(); row['people'][0]['raw_pose_xyc'][7] = (.4,.4,1.0234019756317139)
+        original = deepcopy(row)
+        output = native_instance_prompt_hypotheses(raw_observation=row,face_observation_id=2)[0]
+        self.assertIn(7,output.used_raw_joint_indices)
+        self.assertEqual(output.to_dict()['raw_score_basis'],'rtmpose_simcc_raw_peak_not_probability_v1')
+        self.assertFalse(output.to_dict()['raw_scores_clipped'])
+        self.assertEqual(row,original)
+        row['people'][0]['raw_pose_xyc'][7] = (.4,.4,-.1)
+        output = native_instance_prompt_hypotheses(raw_observation=row,face_observation_id=2)[0]
+        self.assertNotIn(7,output.used_raw_joint_indices)
+        self.assertIn((7,'raw_joint_below_unchanged_prompt_floor'),output.unused_raw_joints)
 
     def test_missing_raw17_or_affine_never_invents_a_body_prompt(self):
         for field, value in (('raw_pose_xyc', ()), ('source_pixel_to_pose_input_affine', ()),
