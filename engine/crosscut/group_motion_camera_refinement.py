@@ -21,7 +21,7 @@ from .closeup_gesture import (CloseupGestureProvider,CloseupGestureEvidence,
     compare_arm_articulation,measure_arm_motion,MOTION_CONTRACT)
 from .observed_head_motion import HeadMotionEvidence,HEAD_MOTION_BASIS,HEAD_DIMENSIONS
 from .group_cut_camera_proposal import build_group_cut_camera_proposal,retime_base_pan
-from .group_cut_timing import propose_numeric_group_cut_timing
+from .group_cut_timing import propose_numeric_group_cut_timing,native_flash_timing_frontier
 from .group_source_domain import GroupSourceDomain
 from .prescribed_render_geometry import PrescribedGeometrySampler
 from .post_render_perceptual_quality import _reference_view_for_span
@@ -353,6 +353,22 @@ def focal_boundary_shortlist(timeline, *, maximum_candidates=12):
     return tuple(index for _,index in sorted(targets)[:maximum_candidates])
 
 
+def boundary_timing_hypotheses(*,boundary_index,native_flashes,allow_retiming):
+    """Try exact native collisions before the ordinary even-frame offsets.
+
+    These are source-ownership proposals, not motion/geometry approval. The
+    explicit collapse policy is never lent to a different nearby offset.
+    Fixed-clock callers cannot gain a flash-removal exception through this list.
+    """
+    if type(allow_retiming) is not bool:
+        raise TypeError('cut-time hypothesis policy must be boolean')
+    if not allow_retiming:return ()
+    exact=tuple((flash.timing_offset_frames,True) for flash in native_flashes
+        if flash.boundary_index==boundary_index)
+    used={offset for offset,_ in exact}
+    return (*exact,*tuple((offset,False) for offset in (-6,-4,-2,2,4,6) if offset not in used))
+
+
 @isolated_optional()
 def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,scene_cut_times,
         model_path,source_index_map=None,feature_cache_directory=None,
@@ -398,11 +414,25 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     attempts=[dict(stage='protected_context',boundary_index=index,admitted=False,
         reason='independently_bound_whole_shot_or_fixed_neighbor_not_a_two_cell_edit')
         for index in shortlist if index not in targets]
-    if not targets:
+    if not targets and (not allow_retiming or not any(scene_cut_times)):
         return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
     clocks={i:probe_render_frame_clock(plan.sources[i]) for i in mapping}
     domain=GroupSourceDomain(tuple(plan.sources),mapping,tuple(audio_offsets),tuple(source_timewarps),
         tuple(tuple(cuts) for cuts in scene_cut_times),tuple(clocks[index] for index in mapping))
+    native_flashes=(native_flash_timing_frontier(plan=plan,domain=domain)
+        if allow_retiming and plan.output_frame_count<=20_000 else ())
+    # The old focal label belongs to the short wide that is being removed.
+    # Let a real native/source collision reach motion sensing without treating
+    # that label as a permanent veto. The same measured/camera work limits and
+    # known-motion preservation checks still apply; missing motion is not zero.
+    flash_targets=tuple(dict.fromkeys(f.boundary_index for f in native_flashes
+        if not {f.boundary_index,f.boundary_index+1}.intersection(protected)))
+    targets=(*flash_targets,*tuple(i for i in targets if i not in flash_targets))[:maximum_candidate_boundaries]
+    attempts.append(dict(stage='exact_native_flash_frontier',admitted=False,
+        collisions=[f.to_dict() for f in native_flashes],candidate_generation_only=True,
+        motion_geometry_or_quality_gates_relaxed=False))
+    if not targets:
+        return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
     provider=CloseupGestureProvider(plan.sources,Path(model_path),verify_native_global_focal=True)
     samplers={}
     local_index={source:index for index,source in enumerate(mapping)}
@@ -492,7 +522,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
             if any(abs(boundary-proposal.boundary_index)<=1 for proposal in selected):
                 continue
             offsets=[]
-            for offset in ((-6,-4,-2,2,4,6) if allow_retiming else ()):
+            for offset,collapse_flash in boundary_timing_hypotheses(boundary_index=boundary,
+                    native_flashes=native_flashes,allow_retiming=allow_retiming):
                 delta=offset/plan.fps
                 left,right=timeline.choices[boundary:boundary+2]
                 cut=right.canonical_master_start+delta
@@ -505,7 +536,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 # typed local-clock receipts must be renewed, never transferred.
                 try:
                     timing=propose_numeric_group_cut_timing(plan=plan,domain=domain,
-                        boundary_index=boundary,timing_offset_frames=offset)
+                        boundary_index=boundary,timing_offset_frames=offset,
+                        collapse_incident_native_flash=collapse_flash)
                 except ValueError as error:
                     attempts.append(dict(stage='directional_clock_preview',boundary_index=boundary,
                         offset_frames=offset,admitted=False,reason=str(error),
@@ -554,17 +586,18 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 # timing whose worse FACE framing is exactly what the complete
                 # dense camera is supposed to repair. Motion must still survive.
                 if preview_rank is not None and projected_motion_preserved(gesture,before):
-                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native,preview_rank,source_gesture))
+                    offsets.append((gesture.ranking_cost,offset,pair,gesture,descriptors,native,
+                        preview_rank,source_gesture,timing if collapse_flash else None))
             eligible=[];before_projected=before
             ranked=sorted(offsets,key=lambda row:(row[6],row[0],abs(row[1]),row[1]))
             # A bad cut can need camera alignment without any timing change.
             # Reserve one of the SAME two slots for this unchanged-clock recipe,
             # rather than requiring a source-motion gain before trying a camera.
             unchanged=(before.ranking_cost,0,plan.segments[boundary:boundary+2],before,
-                before_descriptors,samples,before_rank,source_before)
+                before_descriptors,samples,before_rank,source_before,None)
             frontier=((*ranked[:maximum_camera_candidates-1],unchanged)
                 if maximum_camera_candidates>1 else tuple(ranked[:1] or [unchanged]))
-            for _,offset,pair,gesture,descriptors,native,preview_rank,source_gesture in frontier:
+            for _,offset,pair,gesture,descriptors,native,preview_rank,source_gesture,flash_timing in frontier:
                 row=dict(stage='complete_camera_candidate',boundary_index=boundary,offset_frames=offset,
                     before_motion_cost=before.ranking_cost,proposed_motion_cost=gesture.ranking_cost,
                     motion_evidence_basis=motion_evidence_basis(before),
@@ -579,9 +612,13 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     camera_arguments=dict(plan=plan,timeline=timeline,boundary_index=boundary,
                         shifted_segments=pair,source_clocks=clocks,scene_cut_times=scene_cut_times,
                         source_index_map=mapping,preserved_boundary_frames=4)
+                    if flash_timing is not None:
+                        camera_arguments.update(native_flash_cut_timing=flash_timing,source_domain=domain)
                     try:
                         proposal=build_group_cut_camera_proposal(**camera_arguments)
                     except ValueError as error:
+                        if hasattr(error,'alignment'):
+                            row['ordinary_dense_camera_failure']=error.alignment.to_dict()
                         reason=str(error).split(': ',1)[-1]
                         if reason not in {'shot_policy_family_mismatch','exact_subject_would_be_clipped',
                                 'per_frame_layout_mismatch_gate'}:
@@ -690,6 +727,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     eligible.append((rank,abs(offset),offset,proposal,refreshed,row))
                     attempts.append(row)
                 except ValueError as error:
+                    if hasattr(error,'alignment'):
+                        row['dense_camera_failure']=error.alignment.to_dict()
                     row['reason']=str(error)
                     attempts.append(row)
             if eligible:

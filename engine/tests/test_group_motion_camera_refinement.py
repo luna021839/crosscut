@@ -299,6 +299,34 @@ class MotionCameraRankTests(unittest.TestCase):
                         scene_cut_times=(),model_path='unused',**options)
             probe.assert_not_called()
 
+    def test_native_flash_reaches_normal_sensing_even_when_old_endpoints_are_all_wide(self):
+        from engine.tests import test_group_cut_timing as timing_fixture
+        plan,domain=timing_fixture.GroupCutTimingTests().fixture()
+        domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        timeline=VisualTimelinePlan(tuple(replace(_choice(i,domain.eligible_index(s.source_index),
+            start=s.master_start,end=s.master_start+s.duration),
+            shot_type=ShotType.WIDE,entry_shot_type=ShotType.WIDE,exit_shot_type=ShotType.WIDE,
+            shot_scale=.15,entry_shot_scale=.15,exit_shot_scale=.15)
+            for i,s in enumerate(plan.segments)),1.)
+        self.assertEqual(focal_boundary_shortlist(timeline),())
+        sensor=SimpleNamespace(feature_descriptor_at=lambda *a,**k:None,close=lambda:None)
+        provider=SimpleNamespace(close=lambda:None)
+        with patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',
+                    return_value=domain.render_frame_clocks[0]), \
+                patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=sensor), \
+                patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider) as owned:
+            result=refine_group_motion_camera.__wrapped__(plan=plan,timeline=timeline,
+                audio_offsets=domain.audio_offsets,source_timewarps=domain.source_timewarps,
+                scene_cut_times=domain.scene_cut_times,source_index_map=domain.eligible_indices,
+                model_path='not-opened-stub-pose.onnx')
+        owned.assert_called_once()
+        attempts=[row for row in result.attempts if row['stage']=='baseline_motion']
+        self.assertEqual([row['boundary_index'] for row in attempts],[2])
+        self.assertFalse(attempts[0]['complete_measured_candidate'],
+            'generating a timing repair must not invent missing output motion')
+        self.assertEqual(result.plan,plan)
+        self.assertEqual(result.proposals,())
+
     def test_unknown_motion_does_not_consume_the_complete_measured_frontier(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
             entry_shot_type=ShotType.MEDIUM,exit_shot_type=ShotType.MEDIUM,

@@ -24,6 +24,18 @@ from .visual_score import VisualTimelinePlan
 UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON = 'unreviewed_group_source_span_replacement'
 
 
+class GroupCutCameraConstructionUnavailable(ValueError):
+    """Keep already measured dense rejection evidence for the owning audit.
+
+    The normal refiner catches this inside its optional worker and serializes
+    the alignment report before IPC. A string alone made its measured ratios,
+    headroom and failures unavailable to the next quality decision.
+    """
+    def __init__(self,reason,alignment):
+        super().__init__(f'camera proposal lacks dense local subject alignment: {reason}')
+        self.alignment=alignment
+
+
 def _neutral(keyframe):
     return all(math.isclose(actual, expected, rel_tol=0., abs_tol=1e-9)
         for actual, expected in zip((keyframe.zoom,keyframe.center_x,keyframe.center_y,keyframe.roll_degrees),
@@ -100,6 +112,7 @@ class GroupCutCameraProposal:
     preserved_neighbor_boundaries: tuple[int, ...]
     preserved_boundary_frames: int = 14
     preserved_same_source_seams: tuple[int, ...] = ()
+    native_flash_cut_timing: object = None
 
     def to_dict(self):
         return dict(contract='bounded_clock_preserving_group_cut_camera_proposal_v1',
@@ -108,6 +121,8 @@ class GroupCutCameraProposal:
             preserved_neighbor_boundaries=list(self.preserved_neighbor_boundaries),
             preserved_output_frames_per_neighbor_side=self.preserved_boundary_frames,
             preserved_same_source_seams=list(self.preserved_same_source_seams),
+            native_flash_cut_timing=(None if self.native_flash_cut_timing is None
+                else self.native_flash_cut_timing.to_dict()),
             neighbor_preservation_basis='native_frame_ids_and_numeric_camera_states_not_encoded_pixel_identity',
             subject_alignment=self.alignment.to_dict(),
             source_reference_alignment_authority='caller_supplied_not_proven_by_camera_geometry',
@@ -117,7 +132,8 @@ class GroupCutCameraProposal:
 def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_segments,
                                    source_clocks, scene_cut_times, source_index_map=None,
                                    local_focal_attention=False, action_framing_model_path=None,
-                                   preserved_boundary_frames=14, global_action_framing=False):
+                                   preserved_boundary_frames=14, global_action_framing=False,
+                                   native_flash_cut_timing=None,source_domain=None):
     """Bind one proposed aligned pair to dense local geometry and its neighbors.
 
     ``clock_timeline`` deliberately is NOT a refreshed visual selection or
@@ -157,6 +173,29 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
     if any(not isinstance(new,RenderSegment) or new.source_index != old.source_index
            for old,new in zip(old_pair,shifted_segments)):
         raise ValueError('camera proposal cannot change source selection')
+    collapsed=None
+    if native_flash_cut_timing is not None:
+        # A coarse "near" flag cannot describe a broadcast shot that this
+        # exact ownership edit no longer displays. Reconstruct the numeric
+        # edit from the complete bound domain, rather than accepting a caller
+        # boolean or relabelling a still-visible native cut as safe.
+        from .group_cut_timing import NumericGroupCutTimingProposal,propose_numeric_group_cut_timing
+        from .group_source_domain import GroupSourceDomain
+        if (not isinstance(native_flash_cut_timing,NumericGroupCutTimingProposal)
+                or native_flash_cut_timing.collapsed_native_camera_event is None
+                or not isinstance(source_domain,GroupSourceDomain)
+                or source_domain.eligible_indices!=source_index_map
+                or source_domain.scene_cut_times!=tuple(tuple(c) for c in scene_cut_times)
+                or source_domain.clocks_by_request!=source_clocks
+                or native_flash_cut_timing.boundary_index!=boundary_index):
+            raise ValueError('native flash camera needs its complete exact timing/source preimage')
+        rebuilt=propose_numeric_group_cut_timing(plan=plan,domain=source_domain,
+            boundary_index=boundary_index,timing_offset_frames=native_flash_cut_timing.timing_offset_frames,
+            collapse_incident_native_flash=True)
+        if (rebuilt!=native_flash_cut_timing
+                or tuple(rebuilt.plan.segments[boundary_index:boundary_index+2])!=tuple(shifted_segments)):
+            raise ValueError('native flash camera timing receipt differs from independently rebuilt ownership')
+        collapsed=rebuilt.collapsed_native_camera_event
     left,right = shifted_segments
     movement_frames=(right.master_start-old_pair[1].master_start)*plan.fps
     if abs(movement_frames) > 8+1e-7 or abs(movement_frames-round(movement_frames)) > 1e-7:
@@ -177,18 +216,24 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
             pan_crop=retime_base_pan(old.pan_crop,relative_shift=relative,duration=new.duration),
             crop=None,editorial_transform=None,look_adjustment=old.look_adjustment,
             outgoing_overlap_transform=None,boundary_look_track=None)
+        cuts=scene_cut_times[choices[index].source_index]
+        near_cuts=cuts
+        if collapsed is not None and collapsed.incoming_source_index==new.source_index:
+            native_rate=float(source_clocks[new.source_index].frame_rate)
+            near_cuts=tuple(seconds for seconds in cuts
+                if math.ceil(seconds*native_rate-1e-9)!=collapsed.native_cut_frame)
         choices[index] = replace(choices[index],
             canonical_master_start=new.master_start+plan.master_audio_start,
             canonical_master_end=new.master_start+new.duration+plan.master_audio_start,
             source_local_start=new.source_start,source_local_end=new.source_end,
             internal_scene_cut_master_seconds=tuple(new.master_start+plan.master_audio_start
                 +(seconds-new.source_start)/new.source_playback_rate
-                for seconds in scene_cut_times[choices[index].source_index]
+                for seconds in cuts
                 if new.source_start < seconds < new.source_end),
             entry_scene_cut_near=any(abs(seconds-new.source_start) <= 3/plan.fps
-                for seconds in scene_cut_times[choices[index].source_index]),
+                for seconds in near_cuts),
             exit_scene_cut_near=any(abs(seconds-new.source_end) <= 3/plan.fps
-                for seconds in scene_cut_times[choices[index].source_index]))
+                for seconds in near_cuts))
     clock_timeline = replace(timeline,choices=tuple(choices))
     local_sources = tuple(plan.sources[index] for index in source_index_map)
     face_plan = FaceMatchPlan(tuple(FaceMatchSegment(i,choice.source_index,
@@ -221,7 +266,7 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
     if decision is None or not decision.eligible:
         reason = ('missing_boundary_decision' if decision is None else
             decision.rejection_reason or 'ineligible_boundary_decision')
-        raise ValueError(f'camera proposal lacks dense local subject alignment: {reason}')
+        raise GroupCutCameraConstructionUnavailable(reason,alignment)
     for index in (boundary_index,boundary_index+1):
         old,new = plan.segments[index],segments[index]
         track=alignment.track_for(index)
@@ -240,7 +285,7 @@ def build_group_cut_camera_proposal(*, plan, timeline, boundary_index, shifted_s
         allow_same_source_seams=preserved_boundary_frames==4)
     same_source=tuple(i for i in preserved if plan.segments[i].source_index==plan.segments[i+1].source_index)
     return GroupCutCameraProposal(proposal,clock_timeline,alignment,boundary_index,round(movement_frames),
-        preserved,preserved_boundary_frames,same_source)
+        preserved,preserved_boundary_frames,same_source,native_flash_cut_timing)
 
 
 def assert_preserved_output_boundaries(plan, proposal, source_clocks, neighbors, *,

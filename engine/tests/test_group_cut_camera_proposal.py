@@ -179,12 +179,71 @@ class GroupCutCameraProposalTests(unittest.TestCase):
             build_group_cut_camera_proposal(**args,preserved_boundary_frames=4)
         self.assertEqual(1,align.call_count)
 
+    def test_rejected_camera_keeps_its_already_measured_alignment_report(self):
+        from crosscut.group_cut_camera_proposal import GroupCutCameraConstructionUnavailable
+        args=self.fixture()
+        alignment=SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=False,
+            rejection_reason='geometry_improvement_too_small'))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',return_value=alignment), \
+                self.assertRaises(GroupCutCameraConstructionUnavailable) as failure:
+            build_group_cut_camera_proposal(**args)
+        self.assertIs(failure.exception.alignment,alignment)
+        self.assertIn('geometry_improvement_too_small',str(failure.exception))
+
     def test_newly_exposed_native_cut_is_refreshed_before_geometry(self):
         args=self.fixture()
         args['scene_cut_times']=((),(),(3.9,),())
         with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
             build_group_cut_camera_proposal(**args)
         self.assertEqual(self.aligned_timeline.choices[2].internal_scene_cut_master_seconds,(3.9,))
+
+    def _native_flash_camera(self):
+        from engine.tests import test_group_cut_timing as fixture
+        from crosscut.group_cut_timing import propose_numeric_group_cut_timing
+        plan,domain=fixture.GroupCutTimingTests().fixture()
+        domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        numeric=propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+            timing_offset_frames=-5,collapse_incident_native_flash=True)
+        timeline=VisualTimelinePlan(tuple(_choice(i,domain.eligible_index(s.source_index),
+            start=s.master_start,end=s.master_start+s.duration) for i,s in enumerate(plan.segments)),1.)
+        return dict(plan=plan,timeline=timeline,boundary_index=2,
+            shifted_segments=numeric.plan.segments[2:4],source_clocks=domain.clocks_by_request,
+            scene_cut_times=domain.scene_cut_times,source_index_map=domain.eligible_indices,
+            source_domain=domain,native_flash_cut_timing=numeric,preserved_boundary_frames=4)
+
+    def test_removed_native_flash_does_not_retain_a_coarse_near_cut_veto(self):
+        args=self._native_flash_camera()
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
+            result=build_group_cut_camera_proposal(**args)
+        self.assertFalse(self.aligned_timeline.choices[2].exit_scene_cut_near)
+        self.assertIs(result.native_flash_cut_timing,args['native_flash_cut_timing'])
+        self.assertEqual(result.timing_offset_frames,-5)
+        # An ordinary caller with no independently rebuilt ownership receipt
+        # retains the original conservative coarse flag.
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',side_effect=self.alignment):
+            build_group_cut_camera_proposal(**dict(args,native_flash_cut_timing=None))
+        self.assertTrue(self.aligned_timeline.choices[2].exit_scene_cut_near)
+
+    def test_native_flash_camera_cannot_borrow_a_forged_or_mismatching_receipt(self):
+        args=self._native_flash_camera();receipt=args['native_flash_cut_timing']
+        for changes in ({'source_domain':None},
+                {'native_flash_cut_timing':replace(receipt,timing_offset_frames=-4)},
+                {'native_flash_cut_timing':replace(receipt,collapsed_native_camera_event=None)},
+                {'native_flash_cut_timing':replace(receipt,candidate_plan_sha256='b'*64)},
+                {'scene_cut_times':((),(),())}):
+            with self.subTest(changes=tuple(changes)), \
+                    patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan') as align, \
+                    self.assertRaises(ValueError):
+                build_group_cut_camera_proposal(**dict(args,**changes))
+            align.assert_not_called()
+
+    def test_flash_timing_cannot_excuse_actual_dense_containment_failure(self):
+        args=self._native_flash_camera()
+        rejected=SimpleNamespace(decision_for=lambda _:SimpleNamespace(eligible=False,
+            rejection_reason='per_frame_subject_containment_failed'))
+        with patch('crosscut.group_cut_camera_proposal.build_boundary_subject_alignment_plan',return_value=rejected), \
+                self.assertRaisesRegex(ValueError,'per_frame_subject_containment_failed'):
+            build_group_cut_camera_proposal(**args)
 
     def test_source_clock_change_at_the_neighbor_is_not_hidden_by_geometry_success(self):
         args=self.fixture()

@@ -10,7 +10,8 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 
-from .group_actual_shots import assert_native_cut_events_preserved, visible_group_cut_inventory
+from .group_actual_shots import (VisibleGroupCut, assert_native_cut_events_preserved,
+    visible_group_cut_inventory)
 from .group_source_domain import GroupSourceDomain
 from .group_cut_camera_proposal import retime_base_pan, UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON
 from .render import (RenderPlan, EditorialTransformTrack, RenderTransition,
@@ -44,6 +45,7 @@ class NumericGroupCutTimingProposal:
     changed_cell_indices: tuple[int,int]
     changed_source_owner_ticks: tuple[int,...]
     actual_native_camera_events_preserved: bool
+    collapsed_native_camera_event: VisibleGroupCut | None = None
 
     def to_dict(self):
         return dict(contract='numeric_absolute_whole_source_clock_group_cut_timing_preview_v1',
@@ -52,6 +54,10 @@ class NumericGroupCutTimingProposal:
             old_cut_output_tick=self.old_cut_output_tick,new_cut_output_tick=self.new_cut_output_tick,
             changed_cell_indices=self.changed_cell_indices,changed_source_owner_ticks=self.changed_source_owner_ticks,
             actual_native_camera_events_preserved=self.actual_native_camera_events_preserved,
+            collapsed_native_camera_event=(None if self.collapsed_native_camera_event is None
+                else self.collapsed_native_camera_event.to_dict()),
+            unaffected_native_camera_events_preserved=True,
+            single_incident_native_flash_replaced_with_source_switch=self.collapsed_native_camera_event is not None,
             original_source_clock_phase_retained=True,cadence_positions_changed_only_at_target=True,
             source_selection_and_switch_count_unchanged=True,master_audio_unchanged=True,
             descriptors_roles_motion_receipts_require_refresh=True,
@@ -61,14 +67,70 @@ class NumericGroupCutTimingProposal:
             normal_app_bundle_created=False,candidate_admitted=False,quality_approved=False)
 
 
-def propose_numeric_group_cut_timing(*,plan,domain,boundary_index,timing_offset_frames):
+@dataclass(frozen=True,slots=True)
+class NativeGroupCutFlash:
+    boundary_index: int
+    source_switch: VisibleGroupCut
+    native_event: VisibleGroupCut
+
+    @property
+    def timing_offset_frames(self):
+        return self.native_event.first_incoming_output_frame-self.source_switch.first_incoming_output_frame
+
+    def to_dict(self):
+        return dict(boundary_index=self.boundary_index,
+            source_switch=self.source_switch.to_dict(),native_event=self.native_event.to_dict(),
+            timing_offset_frames=self.timing_offset_frames,
+            flash_frame_count=abs(self.timing_offset_frames),
+            observation_basis='caller_observed_native_cuts_on_exact_renderer_samples',
+            decoded_pixels_reclassified=False,motion_or_quality_certified=False)
+
+
+def native_flash_timing_frontier(*,plan,domain,maximum_flash_frames=8):
+    """Exact adjacent native/source-cut collisions, not every short shot.
+
+    The same output scheduler used for rendering maps the caller's native cut
+    observations. Ordinary source-to-source quick cuts are not collapsed. This
+    is a candidate domain; selecting a new cut still needs refreshed camera,
+    descriptors, motion, look and decoded-output review.
+    """
+    if type(maximum_flash_frames) is not int or not 1<=maximum_flash_frames<=8:
+        raise ValueError('native flash frontier requires a one-to-eight-frame bound')
+    if not isinstance(plan,RenderPlan) or plan.output_frame_count>20_000:
+        raise ValueError('native flash frontier exceeds the bounded full-event replay inventory')
+    counts=segment_frame_counts(plan);cursor=0;boundaries={}
+    for index,count in enumerate(counts[:-1]):
+        cursor+=count
+        if plan.segments[index].source_index!=plan.segments[index+1].source_index:
+            boundaries[cursor]=index
+    events=visible_group_cut_inventory(plan,domain);result=[]
+    for index,event in enumerate(events):
+        if event.kind!='source_switch' or event.first_incoming_output_frame not in boundaries:
+            continue
+        for neighbor_index in (index-1,index+1):
+            if not 0<=neighbor_index<len(events):continue
+            native=events[neighbor_index]
+            delta=native.first_incoming_output_frame-event.first_incoming_output_frame
+            expected_source=(event.outgoing_source_index if delta<0 else event.incoming_source_index)
+            if (native.kind=='native_camera_cut' and 1<=abs(delta)<=maximum_flash_frames
+                    and native.outgoing_source_index==native.incoming_source_index==expected_source):
+                result.append(NativeGroupCutFlash(boundaries[event.first_incoming_output_frame],event,native))
+    return tuple(result)
+
+
+def propose_numeric_group_cut_timing(*,plan,domain,boundary_index,timing_offset_frames,
+        collapse_incident_native_flash=False):
     """One changed hypothesis, not an unconstrained cut-time search or gate.
 
-    In particular, this cannot drop a broadcaster cut hidden inside the old
-    cell, manufacture an internal cell seam, shorten a cell below two frames,
+    The default cannot drop a broadcaster cut hidden inside the old cell. An
+    explicit flash repair may merge exactly one adjacent native event into the
+    source switch at its exact tick, never waive other native events or shorten
+    a cell below two frames. It cannot manufacture an internal cell seam
     or copy a declared shot-clock authority across changed output intervals.
     Final whole-plan sampling is independently recomputed on both sides.
     """
+    if type(collapse_incident_native_flash) is not bool:
+        raise TypeError('native flash repair policy must be an explicit boolean')
     if (not isinstance(plan,RenderPlan) or not isinstance(domain,GroupSourceDomain)
             or plan.sources!=domain.request_sources or type(boundary_index) is not int
             or not 0<=boundary_index<len(plan.segments)-1
@@ -132,14 +194,22 @@ def propose_numeric_group_cut_timing(*,plan,domain,boundary_index,timing_offset_
             raise ValueError('GROUP cut-time preview cannot retain or introduce terminal clones')
         if tick not in interval and (a.source_index,a.native_frame_index)!=(b.source_index,b.native_frame_index):
             raise ValueError('GROUP cut-time preview changed an outside actual native sample')
-    assert_native_cut_events_preserved(plan,proposed,domain)
     events_before=visible_group_cut_inventory(plan,domain);events_after=visible_group_cut_inventory(proposed,domain)
+    collapsed=None
+    if collapse_incident_native_flash:
+        matches=tuple(row for row in native_flash_timing_frontier(plan=plan,domain=domain)
+            if row.boundary_index==boundary_index and row.timing_offset_frames==timing_offset_frames)
+        if len(matches)!=1:
+            raise ValueError('flash repair requires one exact adjacent native flash anchor')
+        collapsed=matches[0].native_event
+    else:
+        assert_native_cut_events_preserved(plan,proposed,domain)
     def signature(event):
         tick=(new_tick if event.kind=='source_switch' and event.first_incoming_output_frame==old_tick
             else event.first_incoming_output_frame)
         return tick,event.kind,event.outgoing_source_index,event.incoming_source_index,event.native_cut_frame
-    if tuple(signature(e) for e in events_before)!=tuple((e.first_incoming_output_frame,e.kind,
+    if tuple(signature(e) for e in events_before if e!=collapsed)!=tuple((e.first_incoming_output_frame,e.kind,
             e.outgoing_source_index,e.incoming_source_index,e.native_cut_frame) for e in events_after):
         raise ValueError('GROUP cut-time preview changed an unrelated actual cut event')
     return NumericGroupCutTimingProposal(proposed,_plan_hash(plan),_plan_hash(proposed),boundary_index,
-        timing_offset_frames,old_tick,new_tick,(boundary_index,boundary_index+1),interval,True)
+        timing_offset_frames,old_tick,new_tick,(boundary_index,boundary_index+1),interval,collapsed is None,collapsed)

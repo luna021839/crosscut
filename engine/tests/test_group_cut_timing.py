@@ -4,12 +4,13 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from crosscut.group_cut_timing import propose_numeric_group_cut_timing
+from crosscut.group_cut_timing import propose_numeric_group_cut_timing,native_flash_timing_frontier
 from crosscut.group_source_domain import GroupSourceDomain
 from crosscut.render import (RenderPlan,RenderSegment,RenderTransition,EditorialTransformTrack,
     EditorialTransformKeyframe,TransitionKind,segment_frame_counts)
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut.render_boundary_clock import native_frame_clocks_for_output
+from crosscut.group_actual_shots import visible_group_cut_inventory
 
 
 class GroupCutTimingTests(unittest.TestCase):
@@ -60,6 +61,97 @@ class GroupCutTimingTests(unittest.TestCase):
         plan,domain=self.fixture();domain=replace(domain,scene_cut_times=((),(),(3.05,)))
         with self.assertRaisesRegex(ValueError,'actual native camera cut'):
             propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,timing_offset_frames=4)
+
+    def test_explicit_repair_collapses_five_frame_outgoing_native_flash(self):
+        plan,domain=self.fixture()
+        domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        result=propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+            timing_offset_frames=-5,collapse_incident_native_flash=True)
+        self.assertEqual((result.old_cut_output_tick,result.new_cut_output_tick),(90,85))
+        self.assertEqual(result.changed_source_owner_ticks,tuple(range(85,90)))
+        self.assertEqual([(e.kind,e.first_incoming_output_frame)
+            for e in visible_group_cut_inventory(result.plan,domain)],
+            [('source_switch',30),('source_switch',85)])
+        row=result.to_dict()
+        self.assertFalse(row['actual_native_camera_events_preserved'])
+        self.assertTrue(row['unaffected_native_camera_events_preserved'])
+        self.assertEqual(row['collapsed_native_camera_event']['native_cut_frame'],85)
+        self.assertFalse(row['candidate_admitted'])
+
+    def test_explicit_repair_collapses_incoming_flash_at_its_native_cut(self):
+        plan,domain=self.fixture()
+        domain=replace(domain,scene_cut_times=((),(),(95/30,)))
+        result=propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+            timing_offset_frames=5,collapse_incident_native_flash=True)
+        self.assertEqual(result.changed_source_owner_ticks,tuple(range(90,95)))
+        self.assertEqual([(e.kind,e.first_incoming_output_frame)
+            for e in visible_group_cut_inventory(result.plan,domain)],
+            [('source_switch',30),('source_switch',95)])
+
+    def test_flash_repair_does_not_waive_other_native_camera_events(self):
+        plan,domain=self.fixture()
+        # Extending outgoing source 2 would add a different native cut at 93.
+        domain=replace(domain,scene_cut_times=((),(93/30,),(95/30,)))
+        with self.assertRaisesRegex(ValueError,'unrelated actual cut'):
+            propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+                timing_offset_frames=5,collapse_incident_native_flash=True)
+
+    def test_flash_repair_requires_exact_adjacent_native_anchor_not_nearby_timestamp(self):
+        plan,domain=self.fixture()
+        domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        with self.assertRaisesRegex(ValueError,'exact adjacent native flash'):
+            propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+                timing_offset_frames=-4,collapse_incident_native_flash=True)
+
+    def test_flash_repair_preserves_every_native_sample_outside_owned_interval(self):
+        plan,domain=self.fixture()
+        domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        result=propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+            timing_offset_frames=-5,collapse_incident_native_flash=True)
+        before=native_frame_clocks_for_output(plan,domain.clocks_by_request,range(150))
+        after=native_frame_clocks_for_output(result.plan,domain.clocks_by_request,range(150))
+        for tick in (*range(85),*range(90,150)):
+            self.assertEqual((before[tick].source_index,before[tick].native_frame_index),
+                (after[tick].source_index,after[tick].native_frame_index))
+
+    def test_native_flash_policy_requires_explicit_boolean(self):
+        plan,domain=self.fixture()
+        for policy in (None,1,'yes'):
+            with self.assertRaisesRegex(TypeError,'boolean'):
+                propose_numeric_group_cut_timing(plan=plan,domain=domain,boundary_index=2,
+                    timing_offset_frames=5,collapse_incident_native_flash=policy)
+
+    def test_native_flash_frontier_uses_exact_renderer_ticks_and_not_source_quick_cuts(self):
+        plan,domain=self.fixture()
+        self.assertEqual(native_flash_timing_frontier(plan=plan,domain=domain),())
+        domain=replace(domain,scene_cut_times=((),(85/30,),(95/30,)))
+        hints=native_flash_timing_frontier(plan=plan,domain=domain)
+        self.assertEqual([(h.boundary_index,h.timing_offset_frames) for h in hints],[(2,-5),(2,5)])
+        self.assertTrue(all(h.to_dict()['decoded_pixels_reclassified'] is False for h in hints))
+        self.assertEqual(native_flash_timing_frontier(plan=plan,domain=domain,maximum_flash_frames=4),())
+        for limit in (True,0,9):
+            with self.assertRaises(ValueError):native_flash_timing_frontier(plan=plan,domain=domain,
+                maximum_flash_frames=limit)
+
+    def test_normal_motion_camera_offset_list_keeps_exact_odd_frame_flash_hypothesis(self):
+        from crosscut.group_motion_camera_refinement import boundary_timing_hypotheses
+        plan,domain=self.fixture();domain=replace(domain,scene_cut_times=((),(85/30,),()))
+        hints=native_flash_timing_frontier(plan=plan,domain=domain)
+        rows=boundary_timing_hypotheses(boundary_index=2,native_flashes=hints,allow_retiming=True)
+        self.assertEqual(rows[0],(-5,True))
+        self.assertEqual(rows[1:],tuple((offset,False) for offset in (-6,-4,-2,2,4,6)))
+        self.assertEqual(boundary_timing_hypotheses(boundary_index=2,native_flashes=hints,
+            allow_retiming=False),())
+        self.assertTrue(all(not flag for _,flag in boundary_timing_hypotheses(boundary_index=0,
+            native_flashes=hints,allow_retiming=True)))
+
+    def test_even_frame_exact_flash_does_not_keep_a_duplicate_ordinary_hypothesis(self):
+        from crosscut.group_motion_camera_refinement import boundary_timing_hypotheses
+        plan,domain=self.fixture();domain=replace(domain,scene_cut_times=((),(86/30,),()))
+        hints=native_flash_timing_frontier(plan=plan,domain=domain)
+        rows=boundary_timing_hypotheses(boundary_index=2,native_flashes=hints,allow_retiming=True)
+        self.assertEqual(rows[0],(-4,True))
+        self.assertEqual(sum(offset==-4 for offset,_ in rows),1)
 
     def test_moving_cut_cannot_introduce_a_new_outgoing_native_camera_event(self):
         plan,domain=self.fixture();domain=replace(domain,scene_cut_times=((),(3.05,),()))
