@@ -298,14 +298,24 @@ class SceneSourceIntegrationTests(unittest.TestCase):
 
     def test_dense_consumer_cannot_drop_background_head_or_invent_head_extent(self):
         original=family.plain(self.result.performer_family_review)['source_camera_refresh']
-        for field in ('head_drop','visibility','anatomy','hypothesis','duplicate'):
+        for field in ('head_drop','visibility','anatomy','hypothesis','duplicate',
+                'head_duplicate','visibility_nan','headroom_nan','missing_tick','duplicate_tick',
+                'row_role','legacy_contract'):
             with self.subTest(field=field):
                 dense=deepcopy(original);row=dense['mutable_shots'][0]['rows'][0]
                 if field=='head_drop':row['scene_heads']=row['scene_heads'][:1]
                 elif field=='visibility':next(h for h in row['scene_heads'] if h['required_by_role'])['visible_fraction']=.5
                 elif field=='anatomy':row['scene_heads'][0]['physical_head_extent']=[0,0,1,1]
                 elif field=='hypothesis':row['scene_hypothesis_sha256']='f'*64
-                else:dense['source_derivative_binding']['audit']['pairs']=[]
+                elif field=='duplicate':dense['source_derivative_binding']['audit']['pairs']=[]
+                elif field=='head_duplicate':row['scene_heads'].append(deepcopy(row['scene_heads'][0]))
+                elif field=='visibility_nan':row['scene_heads'][0]['visible_fraction']=float('nan')
+                elif field=='headroom_nan':next(h for h in row['scene_heads']
+                    if h['observation_id']==row['selected_frame_local_head_id'])['headroom_visible_fraction']=float('nan')
+                elif field=='missing_tick':dense['mutable_shots'][0]['rows'].pop()
+                elif field=='duplicate_tick':dense['mutable_shots'][0]['rows'][1]['output_tick']=row['output_tick']
+                elif field=='row_role':row['role']='formation'
+                elif field=='legacy_contract':dense['contract']='source_native_scene_whole_camera_refresh_v2'
                 with self.assertRaises(ValueError):sensors_module.validate_scene_dense(dense)
 
     def test_fixed_subcell_neighbor_complete_refresh_and_final_native_replay(self):
@@ -502,6 +512,21 @@ class SceneFormationPixelTests(unittest.TestCase):
         self.assertEqual(evidence['assignments'],[[1,0]])
         self.assertFalse(evidence['complete_required_joint_paths'])
         self.assertEqual(evidence['required_body_observation_ids'],[[0],[]])
+
+    def test_single_known_arm_has_its_own_pixel_mask_without_inventing_the_other(self):
+        sensors,rows=self.focal_fixture()
+        for row in rows:
+            row.people=tuple(replace(person,
+                upper_body_xyc=tuple((x,y,0. if i in (3,5) else c)
+                    for i,(x,y,c) in enumerate(person.upper_body_xyc)),
+                part_states=(('left_arm','observed'),('right_arm','unknown')))
+                for person in row.people)
+        one=sensors_module.native_body_links(sensors,*rows,
+            selected_head_ids=(0,10),selected_part_names=('left_arm',))
+        both=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        self.assertTrue(one['complete_required_joint_paths'])
+        self.assertEqual(one['required_part_names'],['left_arm'])
+        self.assertFalse(both['complete_required_joint_paths'])
 
     def test_selected_head_link_cannot_replace_missing_joint_pixels(self):
         sensors,rows=self.focal_fixture(flat=True)

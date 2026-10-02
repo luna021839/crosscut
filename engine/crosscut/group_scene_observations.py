@@ -9,6 +9,7 @@ module produces diagnostic native screen evidence, not semantic/quality QA.
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from collections import Counter
 from itertools import product
 import math
 from statistics import median
@@ -353,17 +354,23 @@ class SceneSensors(source.NativeFamilySensors):
                     expected = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
                     if current_head != expected:
                         raise ValueError('scene left/right endpoint hypotheses lack one whole temporal path')
+                row = dict(self.frame(state, tick, head_id=current_head))
                 body_link=None
-                if previous is not None and state.role in (GroupOutputRole.FORMATION,GroupOutputRole.FOCAL_HEAD_ARMS):
+                prior_parts=() if not rows else tuple(sorted({name for _,name in
+                    rows[-1]['role_obligations']['required_parts']}))
+                current_parts=tuple(sorted({name for _,name in row['role_obligations']['required_parts']}))
+                if previous is not None and (state.role==GroupOutputRole.FORMATION or prior_parts or current_parts):
                     if previous.native_frame_index == raw.native_frame_index:
                         if previous.sha256 != raw.sha256: raise ValueError('repeated scene body raster differs')
                     else:
+                        if state.role!=GroupOutputRole.FORMATION and prior_parts!=current_parts:
+                            raise ValueError('scene dense selected-arm observation lifecycle unknown')
                         body_link=native_body_links(self,previous,raw,
                             selected_head_ids=(previous_head,current_head)
-                                if state.role==GroupOutputRole.FOCAL_HEAD_ARMS else None)
+                                if state.role!=GroupOutputRole.FORMATION else None,
+                            selected_part_names=current_parts if state.role!=GroupOutputRole.FORMATION else None)
                         if not body_link['complete_required_joint_paths']:
                             raise ValueError('scene dense required body/arm joint pixel lifecycle unknown')
-                row = dict(self.frame(state, tick, head_id=current_head))
                 row['required_body_temporal_link']=body_link
                 projected = self.session.projected_pixels(state, tick)
                 if projected is None:
@@ -390,7 +397,7 @@ def formation_view(row, state):
 
 
 
-def native_body_links(sensors, previous, current, *, selected_head_ids=None):
+def native_body_links(sensors, previous, current, *, selected_head_ids=None,selected_part_names=None):
     """Measured joint-local paths for every required body/arm, never head-only authority.
 
     Unique head paths and frame-local head/body mapping are retained as a
@@ -402,7 +409,13 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None):
     if selected_head_ids is not None and (not isinstance(selected_head_ids,tuple)
             or len(selected_head_ids)!=2 or any(type(i) is not int for i in selected_head_ids)):
         raise ValueError('focal body scope requires two measured frame-local head IDs')
-    key = ('bodies', previous.sha256, current.sha256, selected_head_ids)
+    if selected_part_names is not None and (selected_head_ids is None
+            or not isinstance(selected_part_names,tuple) or not selected_part_names
+            or len(set(selected_part_names))!=len(selected_part_names)
+            or not set(selected_part_names)<={'left_arm','right_arm'}):
+        raise ValueError('focal joint path requires explicit observed arm names')
+    required_names=tuple(sorted(selected_part_names or ('left_arm','right_arm')))
+    key = ('bodies', previous.sha256, current.sha256, selected_head_ids,required_names)
     if key in sensors.link_cache: return sensors.link_cache[key]
     pixels = tuple(sensors.session.native_pixels(r.request_source_index,r.native_frame_index) for r in (previous,current))
     flows = native_joint_pixel_flows(*pixels, previous.people)
@@ -418,10 +431,6 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None):
             rivals=[v for i,v in enumerate(costs[a]) if i!=b and v is not None]
             reverse=[row[b] for i,row in enumerate(costs) if i!=a and row[b] is not None]
             if any(v-value<.025 for v in (*rivals,*reverse)): continue
-            # All four arm bones need their actual endpoint joint pixel paths.
-            # A torso path alone is not a measured left/right arm lifecycle.
-            joints={row[0] for row in flows[a].joints}
-            if not {0,1,2,3,4,5} <= joints: continue
             assignments.append((int(a),int(b)))
     heads=sensors._head_links(previous,current)
     if selected_head_ids is None:
@@ -438,6 +447,17 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None):
         complete=bool(required_assignments) and all(pair in assignments for pair in required_assignments)
     contradicted=False
     for a,b in required_assignments:
+        # A known single arm on a head role needs its own measured joints, not
+        # an invented obligation for an unknown other arm. Formation/both-arm
+        # roles retain all six required arm joints.
+        required_joints={joint for name in required_names
+            for joint in ((0,2,4) if name=='left_arm' else (1,3,5))}
+        if flows[a] is None or not required_joints<={item[0] for item in flows[a].joints}:
+            complete=False
+        if selected_head_ids is not None and any(
+                dict(getattr(person,'part_states',())).get(name)!='observed'
+                for person in (previous.people[a],current.people[b]) for name in required_names):
+            complete=False
         x=getattr(previous.people[a],'unique_head_observation_id',None)
         y=getattr(current.people[b],'unique_head_observation_id',None)
         observed=[v for u,v in heads['unique_links'] if u==x]
@@ -449,10 +469,30 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None):
         body_association_basis='native_joint_local_pixel_paths_all_required_arm_joints',
         required_body_scope='all_formation_people' if selected_head_ids is None else 'selected_focal_owner',
         required_body_observation_ids=required_ids,selected_head_ids=selected_head_ids,
+        required_part_names=list(required_names),
         complete_required_joint_paths=complete,head_joint_assignment_contradiction=contradicted,
         named_identity_certified=False,body_phase_certified=False,quality_approved=False)
     sensors.session.budget.spend('pose_evidence_bytes',len(__import__('json').dumps(evidence,sort_keys=True).encode()))
     sensors.link_cache[key]=evidence
+    return evidence
+
+
+def endpoint_focal_part_paths(sensors,state,first,last):
+    """Known focal arms at fixed endpoints need pixels, not static skeletons."""
+    before=tuple(sorted({name for _,name in first['role_obligations']['required_parts']}))
+    after=tuple(sorted({name for _,name in last['role_obligations']['required_parts']}))
+    if not before and not after:return None
+    if before!=after:
+        raise ValueError('scene endpoint selected-arm observation lifecycle unknown')
+    h=sensors.hypothesis(state)
+    raw=tuple(sensors.raw(state,row['output_tick'],h['analysis_roll']) for row in (first,last))
+    if raw[0].native_frame_index==raw[1].native_frame_index:
+        raise ValueError('scene repeated native endpoint is not observed arm motion')
+    evidence=native_body_links(sensors,*raw,
+        selected_head_ids=(first['selected_frame_local_head_id'],last['selected_frame_local_head_id']),
+        selected_part_names=before)
+    if not evidence['complete_required_joint_paths']:
+        raise ValueError('scene endpoint required arm native pixel path unknown')
     return evidence
 
 
@@ -541,8 +581,13 @@ def selected_focal_motion(rows, states):
     face_metrics = None if boxes[1] is None or boxes[2] is None else _box_discontinuity(boxes[1],boxes[2])
     limits = ProxyReviewConfig()
     face_ok = face_metrics is not None and face_metrics[0] <= limits.maximum_face_scale_discontinuity and face_metrics[1] <= limits.maximum_face_position_discontinuity
-    required_arms = any(s.role == GroupOutputRole.FOCAL_HEAD_ARMS for s in states)
-    complete = face_ok and (arm is not None if required_arms else head is not None)
+    required_arms = (any(s.role == GroupOutputRole.FOCAL_HEAD_ARMS for s in states)
+        or any(row['role_obligations']['required_parts'] for row in rows))
+    required_bones={bone for row in rows for _,name in row['role_obligations']['required_parts']
+        for bone in ((0,1) if name=='left_arm' else (2,3))}
+    if any(s.role==GroupOutputRole.FOCAL_HEAD_ARMS for s in states):required_bones.update(range(4))
+    complete = face_ok and head is not None and (not required_arms or
+        arm is not None and required_bones<=set(arm.observed_bones))
     return bool(complete),metrics,dict(head_motion=None if head is None else head.to_dict(),
         arm_motion=None if arm is None else arm.to_dict(),face_metrics=face_metrics,
         face_limits=dict(scale=limits.maximum_face_scale_discontinuity,position=limits.maximum_face_position_discontinuity),
@@ -597,6 +642,11 @@ def compare_scene_edge(sensors, left, right):
         metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
         velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
         metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
+        try:
+            evidence['required_endpoint_arm_paths']=[endpoint_focal_part_paths(sensors,left,*rows[:2]),
+                endpoint_focal_part_paths(sensors,right,*rows[2:])]
+        except ValueError as exc:
+            return dict(evidence,available=False,reason=str(exc))
         complete, measured, motion = selected_focal_motion(rows, (left,left,right,right))
         metrics.update(measured); evidence['selected_focal_motion'] = motion
         if not complete:
@@ -652,6 +702,8 @@ def validate_scene_dense(dense):
     """Consumer-side structure and per-tick evidence; fresh replay still required."""
     from .group_scene_source_owner import relation
     from .source_derivative_diversity import DERIVATIVE_DISTINCT
+    if dense.get('contract')!=DENSE_CONTRACT:
+        raise ValueError('scene dense consumer requires its explicit role contract')
     hypotheses=dense.get('scene_hypotheses');keys=dense.get('hypothesis_keys')
     if not isinstance(hypotheses,dict) or not isinstance(keys,list) or len(keys)!=len(dense['state_keys']):
         raise ValueError('scene dense hypothesis inventory missing')
@@ -661,6 +713,8 @@ def validate_scene_dense(dense):
             raise ValueError('scene hypothesis hash/contract changed')
         if h.get('required_cohorts')!=ROLE_CONTRACT:
             raise ValueError('scene hypothesis does not bind declared role obligations')
+        if h['role']!=h['span_key'][-1]:
+            raise ValueError('scene hypothesis role differs from its bound source span')
         scope=h.get('endpoint_scope','whole')
         allowed=('whole','exit') if index==0 else ('whole','entry') if index==len(keys)-1 else ('whole',)
         if scope not in allowed:
@@ -676,43 +730,80 @@ def validate_scene_dense(dense):
         if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
             raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
     minimum=BoundarySubjectAlignmentConfig().minimum_face_visible_fraction
+    def fraction(value):
+        return type(value) in (int,float) and math.isfinite(value) and 0<=value<=1
     for span,key in zip(dense['mutable_shots'],keys[1:-1],strict=True):
         h=hypotheses[key]
         if (span['first_output_frame'],span['end_output_frame'],span['role'])!=(h['span_key'][1],h['span_key'][2],h['role']):
             raise ValueError('scene dense role/clock differs from frozen hypothesis')
+        ticks=[r.get('output_tick') for r in span['rows']]
+        if (any(type(t) is not int for t in ticks) or
+                ticks!=list(range(span['first_output_frame'],span['end_output_frame']))):
+            raise ValueError('scene dense omitted/duplicated a mutable output tick')
         previous_row=None
         for row in span['rows']:
-            if row.get('scene_hypothesis_sha256')!=key or row.get('anatomical_occlusion_inferred') is not False:
+            if (row.get('scene_hypothesis_sha256')!=key or row.get('anatomical_occlusion_inferred') is not False
+                    or row.get('role')!=h['role']):
                 raise ValueError('scene dense row borrowed another hypothesis/anatomy claim')
             native=row.get('native_observation') or {}
             obligations=scene_role_obligations(native,row['role'],row['selected_frame_local_head_id'])
             if family.plain(row.get('role_obligations'))!=family.plain(obligations.to_dict()):
                 raise ValueError('scene dense required/context scope changed after native observation')
-            original_heads={p['observation_id'] for p in native.get('heads',[])}
-            original_people={p['observation_id'] for p in native.get('people',[])}
-            if (not original_heads or original_heads != {p['observation_id'] for p in row['scene_heads']}
-                    or original_people != {p['observation_id'] for p in row['scene_people']}):
-                raise ValueError('scene dense omitted an original head/body cohort member')
+            original_heads=Counter(p['observation_id'] for p in native.get('heads',[]))
+            original_people=Counter(p['observation_id'] for p in native.get('people',[]))
+            if (not original_heads or original_heads != Counter(p['observation_id'] for p in row['scene_heads'])
+                    or original_people != Counter(p['observation_id'] for p in row['scene_people'])):
+                raise ValueError('scene dense omitted or duplicated an original head/body cohort member')
             if any(x.get('required_by_role')!=(x['observation_id'] in obligations.required_head_ids)
                     or x.get('physical_head_extent') is not None
+                    or not fraction(x['visible_fraction'])
                     or x['observation_id'] in obligations.required_head_ids and x['visible_fraction']<minimum
                     for x in row['scene_heads']):
                 raise ValueError('scene camera lost a head or invented physical head extent')
+            for head in row['scene_heads']:
+                if head['observation_id']==row['selected_frame_local_head_id'] and (
+                        head.get('native_cropped') is not False
+                        or not fraction(head.get('headroom_visible_fraction'))
+                        or head['headroom_visible_fraction']<minimum):
+                    raise ValueError('scene selected focal native face/headroom is unavailable')
             required_parts=set(obligations.required_parts)
-            measured_parts={(a['person_observation_id'],a['part']) for a in row['projected_observed_arms']}
-            if not required_parts<=measured_parts:
-                raise ValueError('scene dense omitted role-required observed parts')
+            measured_parts=Counter((a['person_observation_id'],a['part']) for a in row['projected_observed_arms'])
+            observed_parts=Counter((p['observation_id'],name) for p in native.get('people',[])
+                for name,status in p.get('part_states',[]) if name in ('left_arm','right_arm') and status=='observed')
+            if measured_parts!=observed_parts or not required_parts<=set(measured_parts):
+                raise ValueError('scene dense omitted, duplicated or promoted original observed parts')
             for arm in row['projected_observed_arms']:
                 required=(arm['person_observation_id'],arm['part']) in required_parts
+                if arm['visible_fraction'] is not None and not fraction(arm['visible_fraction']):
+                    raise ValueError('scene dense arm visibility is not a finite fraction')
                 if arm.get('required_by_role')!=required or required and (
                         arm.get('measured_joints_visible') is not True or arm['visible_fraction'] is None
                         or arm['visible_fraction']<BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction
                         or arm['native_action_envelope_xywh'] is None):
                     raise ValueError('scene dense lost required arm visibility or borrowed context')
+                if required and (len(arm['projected_joint_xy'])!=3 or any(
+                        len(point)!=2 or any(not fraction(v) for v in point)
+                        for point in arm['projected_joint_xy'])):
+                    raise ValueError('scene dense required arm joints are not measured visible coordinates')
             if any(p.get('required_by_role')!=(p['observation_id'] in obligations.required_person_ids)
                     for p in row['scene_people']):
                 raise ValueError('scene dense required body scope changed')
-            if row['role'] in (GroupOutputRole.FORMATION.value,GroupOutputRole.FOCAL_HEAD_ARMS.value):
+            flattened=[]
+            for person in row['scene_people']:
+                original=next(p for p in native['people'] if p['observation_id']==person['observation_id'])
+                if (person['part_states']!=dict(original.get('part_states',[])) or
+                        person['unique_head_observation_id']!=original.get('unique_head_observation_id')
+                        or not fraction(person['visible_fraction'])):
+                    raise ValueError('scene dense altered original body ownership or visibility')
+                if any(a['person_observation_id']!=person['observation_id'] for a in person['observed_arms']):
+                    raise ValueError('scene dense borrowed another body observed-arm inventory')
+                flattened.extend(person['observed_arms'])
+            if Counter(family.digest(a) for a in flattened)!=Counter(family.digest(a) for a in row['projected_observed_arms']):
+                raise ValueError('scene dense body and flat arm inventories disagree')
+            previous_parts=() if previous_row is None else tuple(sorted({name for _,name in
+                previous_row['role_obligations']['required_parts']}))
+            current_parts=tuple(sorted({name for _,name in obligations.required_parts}))
+            if row['role']==GroupOutputRole.FORMATION.value or previous_parts or current_parts:
                 if row['output_tick']>span['first_output_frame'] and not row['native_repeated_alias']:
                     link=row.get('required_body_temporal_link')
                     if not isinstance(link,dict) or link.get('complete_required_joint_paths') is not True:
@@ -722,6 +813,8 @@ def validate_scene_dense(dense):
                     if link.get('required_body_scope')!=expected_scope:
                         raise ValueError('scene dense temporal body evidence has another role scope')
                     if expected_scope=='selected_focal_owner':
+                        if previous_parts!=current_parts or link.get('required_part_names')!=list(current_parts):
+                            raise ValueError('scene dense required arm lifecycle or pixel mask changed')
                         expected_ids=[[previous_row['role_obligations']['focal_owner_id']],[obligations.focal_owner_id]]
                         if link.get('required_body_observation_ids')!=expected_ids or None in (
                                 previous_row['role_obligations']['focal_owner_id'],obligations.focal_owner_id):
