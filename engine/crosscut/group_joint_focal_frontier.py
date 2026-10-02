@@ -43,13 +43,18 @@ def locally_associated_face_roi_target(before_heads, after_heads, reference):
                 and ranked[1][0] >= .35 and ranked[0][0]-ranked[1][0] < .1):
             return None
         return ranked[0][1]
-    for head in (*before_heads, *after_heads, reference):
+    def inside(head):
         box = head.box_xywh
-        if (min(box[:2]) < 0 or box[0]+box[2] > 1.000001 or box[1]+box[3] > 1.000001):
-            return None
-    left, right = unique_near(before_heads, .7), unique_near(after_heads, .55)
-    if left is None or left.observation_id != reference.observation_id or right is None:
+        return min(box[:2]) >= 0 and box[0]+box[2] <= 1.000001 and box[1]+box[3] <= 1.000001
+    if not inside(reference):
         return None
+    left, right = unique_near(before_heads, .7), unique_near(after_heads, .55)
+    if (left is None or left.observation_id != reference.observation_id or right is None
+            or not inside(left) or not inside(right)):
+        return None
+    # An unrelated face clipped at the opposite edge cannot invalidate this
+    # in-frame reference. All detections still competed above; a nearby
+    # off-frame alternative is not erased from the uniqueness test.
     a, b = reference.box_xywh, right.box_xywh
     shift = math.hypot(b[0]+b[2]/2-a[0]-a[2]/2, b[1]+b[3]/2-a[1]-a[3]/2)
     if shift > .08 or any(not .85 <= b[n]/a[n] <= 1.18 for n in (2, 3)):

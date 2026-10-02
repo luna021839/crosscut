@@ -57,6 +57,18 @@ class FocalFrontierTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             match_focal_appearance_anchors(refs[:2], ((appearance(),),) * 2)
 
+    def test_unrelated_clipped_edge_face_does_not_erase_an_in_frame_reference(self):
+        head=replace(self.row().heads[0],box_xywh=(.37,.27,.15,.29))
+        moved=replace(head,observation_id=11,box_xywh=(.371,.273,.14,.282))
+        clipped=replace(head,observation_id=12,box_xywh=(.925,.31,.08,.26))
+        self.assertEqual(locally_associated_face_roi_target((head,clipped),(moved,clipped),head),moved)
+
+    def test_nearby_clipped_competitor_and_selected_outside_roi_still_fail(self):
+        head=replace(self.row().heads[0],box_xywh=(.92,.2,.08,.2))
+        clipped=replace(head,observation_id=12,box_xywh=(.921,.2,.08,.2))
+        self.assertIsNone(locally_associated_face_roi_target((head,),(head,clipped),head))
+        self.assertIsNone(locally_associated_face_roi_target((head,),(clipped,),head))
+
     def test_owned_cropped_hips_can_supply_actual_face_embedding_without_claiming_torso(self):
         row = self.row()
         session = SimpleNamespace(observe_native=Mock(return_value=appearance().embedding))
