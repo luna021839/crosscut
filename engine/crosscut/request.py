@@ -107,6 +107,10 @@ class AnalysisRequest:
     # ``from_dict`` so the user-facing automatic workflow produces one bounded
     # review render before attempting research-grade candidate expansion.
     review_first_enabled: bool = False
+    # Pixel contrast is not performer/pose evidence. Keep the numeric owner
+    # available for explicit integration experiments, never as an automatic
+    # replacement for established face/pose/look refinement in ordinary jobs.
+    experimental_pixel_camera_review: bool = False
     source_mode: SourceMode = SourceMode.LOCAL
     desired_source_count: int = DEFAULT_AUTOMATIC_SOURCE_COUNT
     source_cache_directory: Path | None = None
@@ -154,6 +158,13 @@ class AnalysisRequest:
             raise ValueError("member_pose_dissolve_enabled must be a boolean")
         if not isinstance(self.review_first_enabled, bool):
             raise ValueError("review_first_enabled must be a boolean")
+        if not isinstance(self.experimental_pixel_camera_review, bool):
+            raise ValueError("experimental_pixel_camera_review must be a boolean")
+        if self.experimental_pixel_camera_review and (
+            not self.review_first_enabled or self.edit_mode is not EditMode.GROUP
+            or self.source_mode is not SourceMode.AUTOMATIC or self.acquire_only
+        ):
+            raise ValueError("experimental_pixel_camera_review requires an automatic GROUP review render")
         render_range = (
             self.render_range_start_seconds,
             self.render_range_end_seconds,
@@ -561,6 +572,9 @@ class AnalysisRequest:
         raw_review_first_enabled = payload.get("review_first_enabled", True)
         if not isinstance(raw_review_first_enabled, bool):
             raise ValueError("review_first_enabled must be a boolean")
+        raw_pixel_review = payload.get("experimental_pixel_camera_review", False)
+        if not isinstance(raw_pixel_review, bool):
+            raise ValueError("experimental_pixel_camera_review must be a boolean")
 
         raw_output = payload.get("output_directory") or "outputs"
         if not isinstance(raw_output, str):
@@ -879,6 +893,7 @@ class AnalysisRequest:
             member_anchors=member_anchors,
             member_pose_dissolve_enabled=raw_member_pose_dissolve_enabled,
             review_first_enabled=raw_review_first_enabled,
+            experimental_pixel_camera_review=raw_pixel_review,
             source_mode=source_mode,
             desired_source_count=desired_source_count,
             source_cache_directory=source_cache_directory,
@@ -933,6 +948,7 @@ class AnalysisRequest:
             "member_anchors": [anchor.as_dict() for anchor in self.member_anchors],
             "member_pose_dissolve_enabled": self.member_pose_dissolve_enabled,
             "review_first_enabled": self.review_first_enabled,
+            "experimental_pixel_camera_review": self.experimental_pixel_camera_review,
             "source_mode": self.source_mode.value,
             "desired_source_count": self.desired_source_count,
             "source_cache_directory": (

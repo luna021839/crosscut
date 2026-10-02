@@ -397,10 +397,13 @@ class EditorialMotionPlan:
             **({'coupled_shot_cameras': _thaw_audit_value(self.coupled_shot_cameras)}
                if self.coupled_shot_cameras else {}),
         }
-        if self.analysis_basis.startswith('stage_edit_learned_render_track_inventory_v'):
+        if (self.analysis_basis.startswith('stage_edit_learned_render_track_inventory_v')
+                or self.analysis_basis == 'normal_interval_review_numeric_tracks_v1'):
             result['policy'] = {
                 'calibration':'exact_final_renderer_track_inventory_only',
-                'camera_values':'retained_learned_track_after_renderer_precedence',
+                'camera_values': ('bounded_pixel_rank_camera_not_semantic_authority'
+                    if self.analysis_basis == 'normal_interval_review_numeric_tracks_v1'
+                    else 'retained_learned_track_after_renderer_precedence'),
                 'subject_safety':'not_certified_by_numeric_motion_inventory',
                 'pose_continuity':'not_certified_by_numeric_motion_inventory',
                 'quality_approved':False,

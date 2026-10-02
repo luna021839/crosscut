@@ -220,6 +220,7 @@ _GROUP_PROXY_MEASUREMENT_CODES = {
 
 _GROUP_EDITORIAL_CODES = frozenset(
     {
+        "normal_interval_review_quality_unapproved",
         "boundary_professional_combined_evidence_gate_failed",
         "decoded_proxy_review_failed",
         "dominant_source_share_above_preferred",
@@ -528,6 +529,12 @@ def finalize_review_first_runtime_payload(payload: object, status: ReviewFirstSt
         payload["elapsed_includes_final_qa"] = True
 
 
+def _normal_interval_editorial_evidence_valid(report):
+    from .group_normal_interval_owner import qa_metrics_valid
+    metrics = (_mapping(report.get('metrics')) or {}).get('normal_interval_review')
+    return qa_metrics_valid(metrics)
+
+
 def classify_review_first_qa(
     report_payload: Mapping[str, Any],
     *,
@@ -566,6 +573,8 @@ def classify_review_first_qa(
         code
         for code in codes
         if code in editorial_catalog
+        and (code != 'normal_interval_review_quality_unapproved'
+             or _normal_interval_editorial_evidence_valid(report_payload))
         and (member or code not in proxy_codes or proxy_integrity_valid)
         and (member or code not in _GROUP_PROXY_MEASUREMENT_CODES
              or _group_proxy_measurement_evidence_valid(code, report_payload))
@@ -581,6 +590,9 @@ def classify_review_first_qa(
                 *(code for code in codes if code not in editorial),
                 *(() if passed_contract_valid else ("qa_passed_flag_invalid",)),
                 *(() if content_binding_passed else ("content_binding_failed",)),
+                *(("normal_interval_unapproved_quality_issue_missing",)
+                  if (_mapping(report_payload.get("metrics")) or {}).get("normal_interval_review") is not None
+                  and "normal_interval_review_quality_unapproved" not in codes else ()),
                 *(("proxy_nested_technical_integrity_invalid",)
                   if not member and not proxy_integrity_valid else ()),
                 *(("member_continuity_measurements_invalid",)

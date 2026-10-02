@@ -355,7 +355,18 @@ def _validate_selected_timeline_and_map_native_cuts(
         for source_index, items in enumerate(raw_by_source)
     )
 
-    mapped_output_clocks: list[float] = []
+    global_epoch_clock = timeline.get('analysis_basis') == 'normal_interval_global_native_pixel_observations_v1'
+    exact_native_cuts = None
+    if global_epoch_clock:
+        from .group_normal_interval_owner import validate_epoch_clock
+        try:
+            exact_native_cuts = validate_epoch_clock(plan, timeline, source_clocks, eligible_to_request)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GroupBoundaryGrammarAdapterError(str(exc)) from exc
+    from .render import segment_frame_counts
+    output_counts = segment_frame_counts(plan) if global_epoch_clock else ()
+    output_starts = [sum(output_counts[:i]) for i in range(len(output_counts))]
+    mapped_output_clocks: list[float] = list(exact_native_cuts or ())
     validated_choices: list[Mapping[str, Any]] = []
     for index, (segment, raw_choice) in enumerate(
         zip(plan.segments, choices, strict=True)
@@ -396,7 +407,11 @@ def _validate_selected_timeline_and_map_native_cuts(
             )
 
         expected_canonical: list[float] = []
-        for source_cut in source_clocks[segment.source_index]:
+        if global_epoch_clock:
+            expected_canonical = [plan.master_audio_start+segment.master_start
+                +(round(cut*plan.fps)-output_starts[index])/plan.fps for cut in exact_native_cuts
+                if output_starts[index] < round(cut*plan.fps) < output_starts[index]+output_counts[index]]
+        for source_cut in (() if global_epoch_clock else source_clocks[segment.source_index]):
             if (
                 source_cut > segment.source_start + _CLOCK_ABS_TOLERANCE
                 and source_cut < segment.source_end - _CLOCK_ABS_TOLERANCE
@@ -447,6 +462,7 @@ def _validate_timeline_review(
     native_cut_times: Sequence[float],
     eligible_to_request: Sequence[int],
     selected_choices: Sequence[Mapping[str, Any]],
+    native_cuts_include_seams: bool = False,
 ) -> None:
     review = _payload(timeline_review, "timeline_review")
     _boolean(_required(review, "passed", "timeline_review"), "timeline_review.passed")
@@ -592,7 +608,8 @@ def _validate_timeline_review(
         visual_boundary_count += int(visual_boundary)
         switch_count += int(expected_switch)
 
-    internal_count = len(native_cut_times)
+    internal_count = (sum(len(choice['internal_scene_cut_master_seconds']) for choice in selected_choices)
+        if native_cuts_include_seams else len(native_cut_times))
     comparable = visual_boundary_count + internal_count
     expected_values = (
         ("internal_scene_cut_count", internal_count),
@@ -1438,6 +1455,8 @@ def validate_group_boundary_grammar_plan(
         plan=render_plan, timeline_review=timeline_review,
         native_cut_times=native_cuts, eligible_to_request=eligible_to_request,
         selected_choices=selected_choices,
+        native_cuts_include_seams=(_payload(selected_timeline, 'selected_timeline').get('analysis_basis')
+            == 'normal_interval_global_native_pixel_observations_v1'),
     )
     sections = _validated_sections(plan=render_plan, section_plan=section_plan)
     transforms = _validated_transforms(

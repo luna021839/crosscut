@@ -20435,12 +20435,13 @@ class _GroupRenderCandidateBundle:
     ) = None
     cut_local_sync: Mapping[str, Any] | None = None
     phrase_times: tuple[float,...] | None = None
+    normal_interval_review: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         from .visual_boundary_repair import _freeze_audit_value
         # These dictionaries are executable authority, not mutable diagnostics.
         # Copy/freeze them when ownership changes; serialize only through to_dict.
-        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync'):
+        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync', 'normal_interval_review'):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _freeze_audit_value(value))
@@ -20454,6 +20455,9 @@ class _GroupRenderCandidateBundle:
     def to_dict(self) -> dict[str, Any]:
         from .visual_boundary_repair import _thaw_audit_value
         return {
+            "normal_interval_review": (
+                _thaw_audit_value(self.normal_interval_review)
+                if self.normal_interval_review is not None else None),
             "candidate_index": self.candidate_index,
             "review_rank": self.review_rank,
             "cadence_profile": self.cadence_profile,
@@ -27417,6 +27421,8 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
         phrase_times=None, shot_clock_context=None):
     if not isinstance(bundle, _GroupRenderCandidateBundle) or bundle.timeline_review is None:
         raise ValueError('complete GROUP bundle requires its timeline review')
+    from .group_normal_interval_owner import validate_bundle_binding
+    validate_bundle_binding(bundle)
     if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
         raise ValueError('complete GROUP bundle requires finite review and section authority')
     plan, timeline = bundle.render_plan, bundle.visual_timeline
@@ -27537,6 +27543,9 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
 def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices,offsets,
         timewarps,scene_cut_times,phrase_times,model_path=None):
     """Promote only an owned timeline/camera/review transaction before look fit."""
+    if bundle.normal_interval_review is not None:
+        raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+
     from .group_motion_camera_refinement import refine_group_motion_camera
     from .boundary_subject_alignment import ANALYSIS_BASIS, GLOBAL_ACTION_BASIS
     from .editorial_transform_events import rendered_transform_event_records
@@ -27680,6 +27689,9 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
 
 def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
     """Apply two-sided whole-shot framing before grading, without retiming."""
+    if bundle.normal_interval_review is not None:
+        raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+
     from .shot_context_refinement import refine_shot_context_cameras
     if (bundle.editorial_motion_plan is None or bundle.boundary_look_match is not None
             or bundle.cut_local_sync is not None or bundle.dynamic_crop_application is not None):
@@ -27714,6 +27726,9 @@ def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
 
 def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):
     """Preserve the complete incumbent and add only decoded-admitted look ramps."""
+    if bundle.normal_interval_review is not None:
+        raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+
     from .review_first_boundary_look import refine_review_first_boundary_look
     plan, result = refine_review_first_boundary_look(
         bundle.render_plan, group_16x9_safe=group_16x9_safe)
@@ -34343,6 +34358,16 @@ def analyze(
                         automatic_group_editorial_authority = _enforce_automatic_group_stage_edit_requirement(
                             request, registered_stage_edit_bundle, review_rendered_proxies=review_rendered_proxies)
 
+        if group_first is not None and request.experimental_pixel_camera_review:
+            from .group_normal_interval_owner import attempt_normal_interval
+            normal_interval_candidate = attempt_normal_interval(controller=group_first,
+                eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                scene_cut_times=scene_cut_times,
+                archive_path=request.output_directory / f"{base_filename}-normal-interval-proposal.json")
+            if normal_interval_candidate is not None:
+                visual_timeline = group_first.incumbent.visual_timeline
+                review_first_verified_candidate_bundle = group_first.incumbent
+
         def optional_group_refinement(stage, operation, validate=None):
             return group_first.run_optional(stage, operation, validate=validate) if group_first is not None else operation()
         def validate_boundary_repair(proposal):
@@ -35974,6 +35999,10 @@ def analyze(
                     f"over_threshold={cut_local_sync_payload.get('threshold_exceeding_boundary_count')}; "
                     f"reasons={cut_local_sync_payload.get('unknown_reason_counts')}"
                 )
+        if group_first is not None and group_first.incumbent.normal_interval_review is not None:
+            from .group_normal_interval_owner import validate_bundle_binding, replay_final_sources
+            validate_bundle_binding(group_first.incumbent)
+            replay_final_sources(plan.to_json(), group_first.incumbent.to_dict()['normal_interval_review'])
         write_plan(plan, render_plan_path)
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
         from .render_process import render_log_callback
@@ -36008,6 +36037,9 @@ def analyze(
             project_name=f"IVE {request.song} group crosscut",
         )
         render_payload = {
+            "normal_interval_review": (
+                group_first.incumbent.to_dict()['normal_interval_review']
+                if group_first is not None else None),
             "coverage": render_coverage_payload(plan, common_start=common_start, common_end=common_end),
             "release_policy": (
                 joint_release_policy_payload()

@@ -8172,6 +8172,20 @@ def evaluate_post_render_qa(
             created_at=created_at or datetime.now(UTC),
         )
 
+    from .group_normal_interval_owner import consume_normal_interval_qa, QUALITY_CODE
+    try:
+        normal_metrics = consume_normal_interval_qa(analysis, plan, selection)
+        if normal_metrics is not None:
+            metrics['normal_interval_review'] = normal_metrics
+            collector.add(QUALITY_CODE, QAIssueSeverity.FAIL,
+                'Numeric normal camera is bound, but identity/body/phase and final editorial quality are unapproved.',
+                path='render.normal_interval_review')
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+        metrics['normal_interval_review'] = {'binding_valid': False, 'error': str(exc)}
+        collector.add('normal_interval_review_binding_invalid', QAIssueSeverity.FAIL,
+            'Normal camera source/clock/metadata/live pixel replay failed.',
+            path='render.normal_interval_review', value=str(exc))
+
     if 'authorized_shot_video_clocks' in plan:
         from .render_clock_artifact import render_clock_path
         try:

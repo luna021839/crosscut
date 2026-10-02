@@ -1818,9 +1818,9 @@ class VisualTimelineChoice:
     source_local_start: float
     source_local_end: float
     quality_score: float
-    composition_score: float
-    boundary_score: float
-    shot_scale: float
+    composition_score: float | None
+    boundary_score: float | None
+    shot_scale: float | None
     shot_type: ShotType
     shot_id: str
     entry_shot_scale: float | None = None
@@ -3463,7 +3463,31 @@ class VisualTimelinePlan:
     source_clock_basis: str = "global_scalar_offset"
     geometry_basis: str = "source_pixels"
 
+    actual_epoch_clock: Mapping[str, Any] | None = None
+
+    def __post_init__(self):
+        if self.actual_epoch_clock is not None:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self, 'actual_epoch_clock', _freeze_audit_value(self.actual_epoch_clock))
+
     def to_dict(self) -> dict[str, Any]:
+        if self.analysis_basis == 'normal_interval_global_native_pixel_observations_v1':
+            from .visual_boundary_repair import _thaw_audit_value
+            return {
+                'actual_epoch_clock': _thaw_audit_value(self.actual_epoch_clock),
+                'analysis_basis': self.analysis_basis, 'optimizer_score': self.optimizer_score,
+                'selected_candidate_index': self.selected_candidate_index,
+                'candidate_generation_basis': self.candidate_generation_basis,
+                'candidate_count': 1, 'candidate_review_summaries': [],
+                'source_clock_basis': self.source_clock_basis, 'geometry_basis': self.geometry_basis,
+                'observation_policy': {
+                    'geometry': 'exact_global_native_samples_projected_with_renderer_camera',
+                    'numeric_quality': 'pixel_contrast_not_professional_quality',
+                    'identity': None, 'body_visibility': None, 'motion_phase': None,
+                    'quality_approved': False,
+                },
+                'choices': [choice.to_dict() for choice in self.choices],
+            }
         return {
             "analysis_basis": self.analysis_basis,
             "optimizer_score": self.optimizer_score,

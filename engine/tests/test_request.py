@@ -21,6 +21,8 @@ class RequestTests(unittest.TestCase):
         )
         self.assertTrue(automatic.review_first_enabled)
         self.assertTrue(automatic.as_dict()["review_first_enabled"])
+        self.assertFalse(automatic.experimental_pixel_camera_review)
+        self.assertFalse(automatic.as_dict()["experimental_pixel_camera_review"])
 
         strict = AnalysisRequest.from_dict(
             {
@@ -44,6 +46,20 @@ class RequestTests(unittest.TestCase):
                     "review_first_enabled": "yes",
                 }
             )
+
+    def test_pixel_camera_review_requires_explicit_typed_group_review_opt_in(self) -> None:
+        payload = dict(song="XOXZ", edit_mode="group", source_mode="automatic",
+            sources=[], experimental_pixel_camera_review=True)
+        request = AnalysisRequest.from_dict(payload)
+        self.assertTrue(request.experimental_pixel_camera_review)
+        self.assertEqual(AnalysisRequest.from_dict(request.as_dict()), request)
+        for value in ("true", 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must be a boolean"):
+                AnalysisRequest.from_dict({**payload, "experimental_pixel_camera_review": value})
+        for changes in ({"review_first_enabled": False}, {"acquire_only": True},
+                {"edit_mode": "member", "aspect_ratio": "9:16", "target_member": "가을"}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "automatic GROUP review"):
+                AnalysisRequest.from_dict({**payload, **changes})
 
     def test_automatic_member_render_range_round_trips_and_materializes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

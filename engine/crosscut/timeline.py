@@ -113,6 +113,7 @@ class TimelineNoGoodConstraintIndex:
 
 
 class ShotType(str, Enum):
+    UNKNOWN = "unknown"
     GROUP_WIDE = "group_wide"
     WIDE = "wide"
     MEDIUM = "medium"

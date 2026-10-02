@@ -22,6 +22,7 @@ REVIEW_FIRST_ALLOWED_AUTHORITIES = frozenset(
         "stage_edit_generation",
         "stage_edit_candidate_reranker",
         "deterministic_full_song_visual_selector",
+        "normal_interval_pixel_review_owner_v1",
     }
 )
 
@@ -56,6 +57,9 @@ def build_review_first_selection_payload(
     selected_path_authority: str,
 ) -> dict[str, object]:
     """The actual singleton producer, shared by pipeline and contract tests."""
+    if selected_path_authority == 'normal_interval_pixel_review_owner_v1':
+        from .group_normal_interval_owner import validate_serialized_metadata
+        validate_serialized_metadata(complete_candidate)
     payload = deepcopy(dict(decoded_selection))
     candidates = _sequence(payload.get("candidates"))
     candidate = candidates[0] if candidates and len(candidates) == 1 else None
@@ -102,8 +106,17 @@ def review_first_release_binding_valid(
     object or by changing a serialized count.
     """
 
-    policy = review_first_release_policy_payload()
     authority = selection.get("selected_path_authority")
+    if authority == 'normal_interval_pixel_review_owner_v1':
+        try:
+            from .group_normal_interval_owner import validate_serialized_metadata
+            complete_normal = selection['complete_candidates'][0]
+            validate_serialized_metadata(complete_normal)
+            if complete_normal['normal_interval_review'] != render.get('normal_interval_review'):
+                return False
+        except (ValueError, KeyError, IndexError, TypeError):
+            return False
+    policy = review_first_release_policy_payload()
     candidates = _sequence(selection.get("candidates"))
     complete_candidates = _sequence(selection.get("complete_candidates"))
     candidate = (
