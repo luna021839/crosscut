@@ -111,22 +111,34 @@ def body_support_links(sensors, previous, current):
         value['reason'] = 'unsupported_native_gap_or_fewer_than_two_body_supports'
         sensors.link_cache[key] = value
         return value
-    frames = [sensors.session.native_pixels(previous.request_source_index, n)
-        for n in range(previous.native_frame_index, current.native_frame_index+1)]
-    if any(p is None for p in frames):
+    source = previous.request_source_index
+    previous_pixels = sensors.session.native_pixels(source, previous.native_frame_index)
+    if previous_pixels is None:
         value['reason'] = 'intermediate_native_pixels_unavailable'
         sensors.link_cache[key] = value
         return value
-    value['native_pixel_sha256'] = [hashlib.sha256(memoryview(p)).hexdigest() for p in frames]
-    predicted = []
-    for person in previous.people:
-        box = person.box_xywh
-        for a, b in zip(frames, frames[1:]):
-            sensors.session.budget.spend('pose_comparisons')
-            box = _optical_flow_box(a, b, box)
+    hashes = [hashlib.sha256(memoryview(previous_pixels)).hexdigest()]
+    predicted = [person.box_xywh for person in previous.people]
+    # Stream one adjacent native pair for ALL still-live ROI paths. Keeping
+    # the entire gap in a local list defeated the session's byte LRU: thirteen
+    # 4K rasters can remain alive even after its cache evicts them. The same
+    # frames, hashes, per-person sequence and LK/assignment thresholds remain;
+    # only loop order and these local raster lifetimes change. Do not flush the
+    # shared cache or immutable model evidence to achieve the local bound.
+    for native in range(previous.native_frame_index+1, current.native_frame_index+1):
+        current_pixels = sensors.session.native_pixels(source, native)
+        if current_pixels is None:
+            value['reason'] = 'intermediate_native_pixels_unavailable'
+            sensors.link_cache[key] = value
+            return value
+        hashes.append(hashlib.sha256(memoryview(current_pixels)).hexdigest())
+        for index, box in enumerate(predicted):
             if box is None:
-                break
-        predicted.append(box)
+                continue
+            sensors.session.budget.spend('pose_comparisons')
+            predicted[index] = _optical_flow_box(previous_pixels, current_pixels, box)
+        previous_pixels = current_pixels
+    value['native_pixel_sha256'] = hashes
     overlaps = np.asarray([[0. if b is None else _iou(b, p.box_xywh)
         for p in current.people] for b in predicted], dtype=float)
     aa, bb = linear_sum_assignment(1.-overlaps)
