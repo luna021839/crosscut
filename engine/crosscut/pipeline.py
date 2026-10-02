@@ -20543,6 +20543,61 @@ class _GroupRenderCandidateBundle:
         }
 
 
+def _stage_edit_render_motion_inventory(bundle, plan, materialized):
+    """Bind the exact learned renderer curves, not an ordinary camera recipe.
+
+    These rows are numeric source/track authority only. They do not assert
+    measured pose continuity, part visibility or professional editing quality.
+    Old pixel-bound receipts cannot be copied across a changed camera here.
+    """
+    from .editorial_transform_events import rendered_transform_event_records
+    old = bundle.editorial_motion_plan
+    choices = bundle.visual_timeline.choices
+    if len(choices) != len(plan.segments):
+        raise StageEditVisualCandidateError('learned camera inventory changed timeline cardinality')
+    request_paths = tuple(path.resolve() for path in plan.sources)
+    eligible_paths = tuple(path.resolve() for path in materialized.retained_candidate.edit.sources)
+    if len(set(request_paths)) != len(request_paths) or any(path not in request_paths for path in eligible_paths):
+        raise StageEditVisualCandidateError('learned camera inventory has an ambiguous source domain')
+    mapping = tuple(request_paths.index(path) for path in eligible_paths)
+    if any(type(choice.source_index) is not int or not 0 <= choice.source_index < len(mapping)
+            or mapping[choice.source_index] != segment.source_index
+            for choice,segment in zip(choices,plan.segments,strict=True)):
+        raise StageEditVisualCandidateError('learned camera inventory source domain differs from renderer')
+    if old is not None and (len(old.segments) != len(plan.segments)
+            or old.eligible_request_indices not in (None,mapping)
+            or any(item.segment_index != index or item.source_index != choices[index].source_index
+                or item.track != segment.editorial_transform
+                for index,(item,segment) in enumerate(zip(old.segments,bundle.render_plan.segments,strict=True)))):
+        raise StageEditVisualCandidateError('learned overlay received stale ordinary motion authority')
+    changed = tuple(index for index,(before,after) in enumerate(zip(bundle.render_plan.segments,plan.segments,strict=True))
+        if (before.crop,before.pan_crop,before.editorial_transform) !=
+            (after.crop,after.pan_crop,after.editorial_transform))
+    if old is not None and not changed:
+        return old
+    if old is not None and (old.boundary_subject_alignment_plan is not None
+            or old.shot_context_cameras or old.coupled_shot_cameras
+            or old.accepted_boundary_indices or old.natural_match_boundary_indices
+            or old.required_boundary_failures or old.boundary_residual_attention_mismatches
+            or old.member_roll_audit or old.member_containment_trial_audit
+            or old.boundary_match_count or old.affine_boundary_match_count):
+        raise StageEditVisualCandidateError('learned camera overlay needs replay of existing motion receipts')
+    records = rendered_transform_event_records(plan.segments,plan.fps)
+    return EditorialMotionPlan(
+        segments=tuple(EditorialMotionSegment(index,choice.source_index,segment.editorial_transform,
+            ('exact_learned_renderer_track_inventory_not_pixel_quality_evidence',))
+            for index,(choice,segment) in enumerate(zip(choices,plan.segments,strict=True))),
+        boundary_match_count=0, zoom_event_count=len(records['zoom']),
+        pan_event_count=len(records['pan']), roll_event_count=len(records['roll']),
+        blocked_dissolve_segment_count=len({index for edge,transition in enumerate(plan.transitions)
+            if transition.kind is TransitionKind.FACE_DISSOLVE for index in (edge,edge+1)}),
+        # Learned framing targets are not authored heuristic zoom/pan gestures.
+        # An explicit zero inventory selects strict frame-visible count replay.
+        authored_event_counts=(('zoom',0),('pan',0),('roll',0)),
+        analysis_basis=f'stage_edit_learned_render_track_inventory_v{materialized.dynamic_crop_version}',
+        eligible_request_indices=mapping)
+
+
 def _apply_stage_edit_candidate_render_contract(
     bundle: _GroupRenderCandidateBundle,
     materialized: StageEditMaterializedVisualCandidate,
@@ -20697,13 +20752,14 @@ def _apply_stage_edit_candidate_render_contract(
             }
         )
     lineage = stripped_materialized_lineage + (overlay_event,)
+    motion_inventory = _stage_edit_render_motion_inventory(bundle,plan,materialized)
+    overlay_event['complete_render_motion_inventory_rebuilt'] = motion_inventory is not bundle.editorial_motion_plan
+    overlay_event['superseded_ordinary_motion_inventory'] = (
+        bundle.editorial_motion_plan.to_dict() if bundle.editorial_motion_plan is not None
+        and motion_inventory is not bundle.editorial_motion_plan else None)
     return replace(
         bundle,
-        editorial_motion_plan=(
-            bundle.editorial_motion_plan
-            if dynamic_crop_version == 3
-            else None
-        ),
+        editorial_motion_plan=motion_inventory,
         render_plan=plan,
         diagnostics=bundle.diagnostics
         + (

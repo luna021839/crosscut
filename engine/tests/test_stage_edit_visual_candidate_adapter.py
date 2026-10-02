@@ -327,6 +327,7 @@ def _bridge_result(count: int = 8) -> StageEditPipelineBridgeResult:
 
 
 def _visual_fixture(*, passed: bool = True):
+    from engine.tests.test_pipeline import _visual_choice
     review = SimpleNamespace(
         passed=passed,
         hard_failures=()
@@ -357,7 +358,8 @@ def _visual_fixture(*, passed: bool = True):
         },
     )
     base_materialized = SimpleNamespace(
-        visual_plan=VisualTimelinePlan(choices=(), optimizer_score=4.0),
+        visual_plan=VisualTimelinePlan(choices=(_visual_choice(0,0,0.,2.),
+            _visual_choice(1,1,2.,4.)), optimizer_score=4.0),
         segments=(
             RenderSegment(0, 0.0, 2.0, 0.0),
             RenderSegment(1, 2.0, 2.0, 2.0),

@@ -732,6 +732,42 @@ class GroupBoundaryGrammarAdapterTests(unittest.TestCase):
             (1.0 / 30.0, 15.0 + 1.0 / 30.0),
         )
 
+    def test_declared_request_domain_motion_roundtrips_nonidentity_mapping(self):
+        bundle = self._bundle()
+        expected = self._adapt(bundle)
+        bundle['editorial_motion'] = replace(bundle['editorial_motion'],
+            eligible_request_indices=tuple(bundle['source_index_mapping']['eligible_to_request']))
+        self.assertEqual(self._adapt(bundle),expected)
+        payload = bundle['editorial_motion'].to_dict()
+        payload['eligible_request_indices'] = list(reversed(payload['eligible_request_indices']))
+        bundle['editorial_motion'] = payload
+        with self.assertRaisesRegex(GroupBoundaryGrammarAdapterError,'source mapping'):
+            self._adapt(bundle)
+
+    def test_v3_numeric_inventory_is_replayed_but_cannot_replace_learned_authority(self):
+        from crosscut.editorial_transform_events import rendered_transform_event_records
+        bundle = self._bundle()
+        old = bundle['editorial_motion']
+        self._attach_v3_motion(bundle)
+        expected = self._adapt(bundle)
+        plan = bundle['render_plan']
+        records = rendered_transform_event_records(plan.segments,plan.fps)
+        numeric = replace(old,segments=tuple(replace(item,track=segment.editorial_transform)
+            for item,segment in zip(old.segments,plan.segments,strict=True)),
+            analysis_basis='stage_edit_learned_render_track_inventory_v3',
+            boundary_match_count=0,zoom_event_count=len(records['zoom']),
+            pan_event_count=len(records['pan']),roll_event_count=len(records['roll']),
+            eligible_request_indices=tuple(bundle['source_index_mapping']['eligible_to_request']))
+        bundle['editorial_motion'] = numeric
+        self.assertEqual(self._adapt(bundle),expected)
+        for mutation in ({'zoom_event_count':999},
+                {'analysis_basis':'ordinary_heuristic'}, {'accepted_boundary_indices':(0,)},
+                {'segments':(replace(numeric.segments[0],track=None),*numeric.segments[1:])}):
+            with self.subTest(mutation=mutation),self.assertRaises(GroupBoundaryGrammarAdapterError):
+                self._adapt({**bundle,'editorial_motion':replace(numeric,**mutation)})
+        with self.assertRaisesRegex(GroupBoundaryGrammarAdapterError,'typed motion timeline'):
+            self._adapt({**bundle,'dynamic_crop_motion_v3':None})
+
     def test_source_local_cut_authority_and_timeline_clock_are_both_required(self) -> None:
         for case in (
             "missing_timeline_clock",

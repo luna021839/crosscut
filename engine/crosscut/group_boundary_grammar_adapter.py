@@ -1249,9 +1249,23 @@ def _validated_transforms(
                 "Dynamic Crop v3 requires typed motion timeline evidence"
             )
         if editorial_motion is not None:
-            raise GroupBoundaryGrammarAdapterError(
-                "Dynamic Crop v3 cannot mix ordinary editorial-motion authority"
-            )
+            inventory = _payload(editorial_motion, 'editorial_motion')
+            if (inventory.get('analysis_basis') != 'stage_edit_learned_render_track_inventory_v3'
+                    or inventory.get('boundary_subject_alignment') is not None
+                    or any(inventory.get(key) for key in ('boundary_match_count',
+                        'affine_boundary_match_count','accepted_boundary_indices',
+                        'natural_match_boundary_indices','required_boundary_failures',
+                        'boundary_residual_attention_mismatches','shot_context_cameras',
+                        'coupled_shot_cameras','member_roll_audit','member_containment_trial_audit'))):
+                raise GroupBoundaryGrammarAdapterError(
+                    "Dynamic Crop v3 cannot mix ordinary editorial-motion authority"
+                )
+            # A complete owner carries numeric source/track rows as well as
+            # learned v3 authority. Replay those rows, but never use their
+            # presence/counts as learned motion admission or quality evidence.
+            _validated_transforms(plan=plan,editorial_motion=inventory,
+                eligible_to_request=eligible_to_request,dynamic_crop_version=2,
+                dynamic_crop_motion_v3=None)
         return _dynamic_crop_v3_transform_evidence(
             _validated_dynamic_crop_motion_v3(
                 plan=plan,
@@ -1268,9 +1282,9 @@ def _validated_transforms(
     )
     payload: Mapping[str, Any] | None
     if editorial_motion is None:
-        # StageEdit Dynamic Crop v2/v3 deliberately discards the ordinary
-        # EditorialMotionPlan after copying its learned tracks onto the final
-        # typed RenderPlan.  The actual RenderSegment tracks are the authority;
+        # Legacy StageEdit payloads may omit ordinary motion metadata. New
+        # complete owners retain an exact numeric learned-track inventory.
+        # The actual RenderSegment tracks are the authority;
         # accepting None without at least one such track would instead turn a
         # missing payload into a silent zero-transform assessment.
         if not attached_track_count:
@@ -1280,6 +1294,15 @@ def _validated_transforms(
         payload = None
     else:
         payload = _payload(editorial_motion, "editorial_motion")
+        index_domain = payload.get('source_index_domain', 'eligible_local')
+        if index_domain not in ('eligible_local','request'):
+            raise GroupBoundaryGrammarAdapterError('editorial motion source index domain is unknown')
+        if index_domain == 'request':
+            raw_mapping = _sequence(_required(payload,'eligible_request_indices','editorial_motion'),
+                'editorial_motion.eligible_request_indices')
+            declared_mapping = tuple(_integer(n,'editorial_motion.eligible_request_indices') for n in raw_mapping)
+            if declared_mapping != tuple(eligible_to_request):
+                raise GroupBoundaryGrammarAdapterError('editorial motion source mapping differs from external authority')
         segments = _sequence(
             _required(payload, "segments", "editorial_motion"),
             "editorial_motion.segments",
@@ -1305,11 +1328,11 @@ def _validated_transforms(
                 _required(motion_segment, "source_index", f"motion segment[{index}]"),
                 f"motion segment[{index}].source_index",
             )
-            if (
-                eligible_index < 0
-                or eligible_index >= len(eligible_to_request)
-                or eligible_to_request[eligible_index] != render_segment.source_index
-            ):
+            source_matches = (eligible_index == render_segment.source_index
+                and eligible_index in eligible_to_request if index_domain == 'request'
+                else 0 <= eligible_index < len(eligible_to_request)
+                and eligible_to_request[eligible_index] == render_segment.source_index)
+            if not source_matches:
                 raise GroupBoundaryGrammarAdapterError(
                     f"motion segment[{index}] source_index mismatch"
                 )

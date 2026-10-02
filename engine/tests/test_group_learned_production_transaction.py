@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import json
 from time import monotonic
 from types import SimpleNamespace
 import unittest
@@ -70,7 +71,7 @@ class GroupLearnedProductionTransactionTests(unittest.TestCase):
             segment=RenderSegment(index + 1, index * 4., 4., index * 4.,
                                   editorial_transform=self.track),
             decision_id=f"learned-{index}", section_role="verse_like",
-            section_progress=index / 2., phrase_progress=float(index),
+            section_progress=index / 2., phrase_progress=index / 2.,
         ) for index in range(2))
         retained = SimpleNamespace(rank=0, score=1., edit=SimpleNamespace(
             sources=self.sources, shots=shots, candidate_history=({"dynamic_crop_version": 2},),
@@ -132,10 +133,21 @@ class GroupLearnedProductionTransactionTests(unittest.TestCase):
         self.stack.enter_context(patch("crosscut.pipeline.build_face_match_plan",
                                       side_effect=ValueError("fixture has no face measurements")))
         self.stack.enter_context(patch("crosscut.pipeline.build_group_transition_plan", return_value=None))
+        def write_fixture_artifacts(plan, output=None, **kwargs):
+            # This is deliberately not video. Only the artifact identity path
+            # is real; decoded quality/model measurements are explicitly mocked.
+            output = Path(output or plan.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"SYNTHETIC-TEST-ARTIFACT-NOT-ENCODED-MEDIA")
+            output.with_suffix(".plan.json").write_text(json.dumps(plan.to_json(), sort_keys=True))
+            return "fixture_encoder"
+        def proxy_fixture(plan, output, **kwargs):
+            write_fixture_artifacts(plan, output)
+            return plan, SimpleNamespace(payload={
+                "passed": False, "weighted_score": 45., "boundary_issue_indices": [0], "proxy": {},
+            })
         self.proxy = self.stack.enter_context(patch("crosscut.pipeline.render_and_review_proxy",
-            side_effect=lambda plan, output, **kwargs: (plan, SimpleNamespace(payload={
-                "passed": False, "weighted_score": 45., "boundary_issue_indices": [0],
-            }))))
+            side_effect=proxy_fixture))
         # Keep the montage serialization/identity producer real. Only expensive
         # pixel/montage measurements are scripted, as an editorial quality miss.
         import crosscut.pipeline as pipeline
@@ -146,12 +158,20 @@ class GroupLearnedProductionTransactionTests(unittest.TestCase):
             return {"passed": False, "weighted_score": 45.}, analysis
         self.stack.enter_context(patch("crosscut.pipeline._review_stage_edit_bundle_montage", side_effect=montage))
         self.stack.enter_context(patch("crosscut.pipeline._apply_bounded_human_target_proxy_rank"))
-        self.render = self.stack.enter_context(patch("crosscut.pipeline.render", return_value="fixture_encoder"))
+        self.render = self.stack.enter_context(patch("crosscut.pipeline.render", side_effect=write_fixture_artifacts))
         self.sync_payload = dict(passed=True, retained_cross_source_boundary_count=1,
             measured_boundary_count=1, unknown_boundary_count=0, residual_p95_frames=0.)
         self.sync = self.stack.enter_context(patch("crosscut.pipeline.analyze_cut_local_sync",
                                                  return_value=self.sync_payload))
         self.manifest = None
+        from crosscut.first_result_controller import FirstResultController
+        self.promoted_bundles = []
+        promote = FirstResultController.promote
+        def capture_promoted(controller, value, **kwargs):
+            result = promote(controller, value, **kwargs)
+            self.promoted_bundles.append(controller.incumbent)
+            return result
+        self.stack.enter_context(patch.object(FirstResultController, 'promote', new=capture_promoted))
         def final_qa(**kwargs):
             self.manifest = kwargs["manifest"]
             self.registry_at_qa = kwargs["registered_stage_edit_bundle"]
@@ -183,6 +203,56 @@ class GroupLearnedProductionTransactionTests(unittest.TestCase):
         # provenance is accepted by the independent contract consumer.
         self.assertFalse(selection["passed"])
         self.assertFalse(selection["stage_edit_render_promotion"]["decoded_selected_proxy_passed"])
+        owned = self.promoted_bundles[-1]
+        self.assertEqual(owned.render_plan.to_json(),plan.to_json())
+        self.assertEqual(owned.editorial_motion_plan.to_dict(),self.manifest['render']['editorial_motion'])
+        self.assertEqual(tuple(item.track for item in owned.editorial_motion_plan.segments),
+            tuple(segment.editorial_transform for segment in plan.segments))
+        self.assertEqual(owned.to_dict()['dynamic_crop_application'],
+            self.manifest['review_first_visual_selection']['dynamic_crop_application'])
+        self.assertFalse(owned.editorial_motion_plan.to_dict()['policy']['quality_approved'])
+
+    def test_missing_complete_motion_after_learned_overlay_retains_baseline_before_sync(self):
+        import crosscut.pipeline as pipeline
+        original = pipeline._apply_stage_edit_candidate_render_contract
+        def incomplete(*args,**kwargs):
+            return replace(original(*args,**kwargs),editorial_motion_plan=None)
+        with patch('crosscut.pipeline._apply_stage_edit_candidate_render_contract',side_effect=incomplete) as apply:
+            plan = self.reach_final_qa()
+        apply.assert_called_once()
+        self.sync.assert_not_called()
+        self.assertEqual(tuple(segment.source_index for segment in plan.segments),(0,0))
+        rejected = self.manifest['review_first_visual_selection']['stage_edit_rejections']
+        self.assertTrue(any('complete motion source/camera' in item.get('error','') for item in rejected))
+
+    def test_stale_learned_camera_inventory_is_not_silently_refreshed_by_validator(self):
+        import crosscut.pipeline as pipeline
+        original = pipeline._apply_stage_edit_candidate_render_contract
+        def stale(*args,**kwargs):
+            bundle = original(*args,**kwargs)
+            motion = bundle.editorial_motion_plan
+            return replace(bundle,editorial_motion_plan=replace(motion,segments=(
+                replace(motion.segments[0],track=None),*motion.segments[1:])))
+        with patch('crosscut.pipeline._apply_stage_edit_candidate_render_contract',side_effect=stale) as apply:
+            plan = self.reach_final_qa()
+        apply.assert_called_once()
+        self.sync.assert_not_called()
+        self.assertEqual(tuple(segment.source_index for segment in plan.segments),(0,0))
+        self.assertIsNone(self.registry_at_qa)
+
+    def test_overlay_does_not_drop_prior_boundary_receipts_to_build_numeric_inventory(self):
+        import crosscut.pipeline as pipeline
+        original = pipeline._review_first_group_bundle
+        def with_prior_receipt(**kwargs):
+            bundle = original(**kwargs)
+            return replace(bundle,editorial_motion_plan=replace(bundle.editorial_motion_plan,
+                required_boundary_failures=((0,('old-measured-failure',),None),)))
+        with patch('crosscut.pipeline._review_first_group_bundle',side_effect=with_prior_receipt):
+            plan = self.reach_final_qa()
+        self.sync.assert_not_called()
+        self.assertEqual(tuple(segment.source_index for segment in plan.segments),(0,0))
+        rejected = self.manifest['review_first_visual_selection']['stage_edit_rejections']
+        self.assertTrue(any('replay of existing motion receipts' in item.get('error','') for item in rejected))
 
     def test_learned_singleton_identity_cannot_be_forged_by_copying_the_pool_token(self):
         self.reach_final_qa()
@@ -224,7 +294,7 @@ class GroupLearnedProductionTransactionTests(unittest.TestCase):
             )
             shots.append(StageShot(index, 0, segment, decision_id=f"v3-{index}",
                 section_role="verse_like", section_progress=index / 10.,
-                phrase_progress=(index % 4) / 4., dynamic_crop_decode_v3=decode))
+                phrase_progress=index / 10., dynamic_crop_decode_v3=decode))
         retained = SimpleNamespace(rank=0, score=1., edit=SimpleNamespace(
             sources=self.sources, shots=tuple(shots), candidate_history=({"dynamic_crop_version": 3},),
         ))
