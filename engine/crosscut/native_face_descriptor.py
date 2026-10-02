@@ -97,12 +97,20 @@ class NativeArcFaceR50:
     def __init__(self,model_path):
         self.path=Path(model_path)
         with self.path.open('rb') as handle:
-            digest=hashlib.file_digest(handle,'sha256').hexdigest()
+            # Hash and load the SAME bytes. Loading the path after hashing
+            # permits a replacement between the two operations to run an
+            # unpinned model under the expected descriptor-space identity.
+            # Bound the read even when an invalid file grows while being read.
+            model_bytes=handle.read(192*1024*1024+1)
+        if len(model_bytes)>192*1024*1024:
+            raise ValueError('native ArcFace descriptor exceeds its pinned asset size budget')
+        digest=hashlib.sha256(model_bytes).hexdigest()
         if digest!=ARCFACE_R50_SHA256:
             raise ValueError('native ArcFace descriptor differs from pinned official R50 asset')
+        self.asset_sha256=digest
         import onnxruntime as ort
         options=ort.SessionOptions();options.intra_op_num_threads=2;options.inter_op_num_threads=1
-        self.session=ort.InferenceSession(str(self.path),sess_options=options,providers=['CPUExecutionProvider'])
+        self.session=ort.InferenceSession(model_bytes,sess_options=options,providers=['CPUExecutionProvider'])
         inputs=self.session.get_inputs();outputs=self.session.get_outputs()
         if (len(inputs)!=1 or len(outputs)!=1 or inputs[0].type!='tensor(float)'
                 or len(inputs[0].shape)!=4 or tuple(inputs[0].shape[1:])!=(3,112,112)
@@ -126,7 +134,8 @@ def register_native_arcface_model(session,model_path):
     """Exactly one ORT inference per counted source/ROI invocation."""
     session.budget.check();model=NativeArcFaceR50(model_path);session.budget.check()
     import onnxruntime as ort
-    session.register_model(ARCFACE_MODEL_NAME,model.path,model.embedding,adapter_fingerprint=dict(
+    session.register_model(ARCFACE_MODEL_NAME,model.path,model.embedding,
+        expected_asset_sha256=model.asset_sha256,adapter_fingerprint=dict(
         contract='source_native_arcface_r50_512d_similarity_not_semantic_identity_v1',
         implementation_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         model_sha256=ARCFACE_R50_SHA256,onnxruntime_version=ort.__version__,opencv_version=cv2.__version__,

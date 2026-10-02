@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -96,6 +97,22 @@ class JointObservationSessionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'excluded'):session.native_pixels(1,15)
             self.assertEqual(session.budget.counts['model_calls'],0)
             self.assertEqual(session.captures,{})
+
+    def test_loaded_asset_digest_must_match_before_registering_any_observer(self):
+        expected=hashlib.sha256(self.model.read_bytes()).hexdigest()
+        self.model.write_bytes(b'changed between model load and session registration')
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            with self.assertRaisesRegex(ValueError,'bytes loaded'):
+                session.register_model('fixture',self.model,lambda p:p.shape,
+                    expected_asset_sha256=expected)
+            self.assertEqual(session.models,{})
+            self.assertEqual(session.model_adapters,{})
+            self.assertEqual(session.model_asset_dependencies,{})
+            self.assertEqual(session.model_adapter_preimages,{})
+            fresh=hashlib.sha256(self.model.read_bytes()).hexdigest()
+            session.register_model('fixture',self.model,lambda p:p.shape,
+                expected_asset_sha256=fresh)
+            self.assertEqual(session.models['fixture'][2],fresh)
 
     def test_same_frame_different_body_rois_do_not_borrow_cached_pose(self):
         with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:

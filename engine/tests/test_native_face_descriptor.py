@@ -54,6 +54,24 @@ class NativeFaceDescriptorTests(unittest.TestCase):
         self.assertEqual(len(result),512);self.assertAlmostEqual(np.linalg.norm(result),1.)
         self.assertEqual(backend.run.call_count,1)
         self.assertEqual(factory.call_args.kwargs['providers'],['CPUExecutionProvider'])
+        self.assertEqual(factory.call_args.args[0],b'synthetic-not-executed')
+
+    def test_path_replacement_at_load_cannot_change_verified_model_bytes(self):
+        backend=Mock(get_inputs=Mock(return_value=[SimpleNamespace(name='input',type='tensor(float)',shape=[None,3,112,112])]),
+            get_outputs=Mock(return_value=[SimpleNamespace(name='output',shape=[None,512])]))
+        with TemporaryDirectory() as tmp:
+            path=Path(tmp)/'synthetic.onnx';verified=b'synthetic-verified-before-swap'
+            path.write_bytes(verified)
+            def load(model_bytes,**kwargs):
+                path.write_bytes(b'different-asset-at-the-same-path')
+                self.assertIsInstance(model_bytes,bytes)
+                self.assertEqual(model_bytes,verified)
+                return backend
+            with patch('crosscut.native_face_descriptor.ARCFACE_R50_SHA256',hashlib.sha256(verified).hexdigest()), \
+                    patch('onnxruntime.InferenceSession',side_effect=load):
+                model=NativeArcFaceR50(path)
+            self.assertEqual(model.asset_sha256,hashlib.sha256(verified).hexdigest())
+            self.assertNotEqual(hashlib.sha256(path.read_bytes()).hexdigest(),model.asset_sha256)
 
     def test_wrong_asset_is_rejected_before_model_loading(self):
         with TemporaryDirectory() as tmp:

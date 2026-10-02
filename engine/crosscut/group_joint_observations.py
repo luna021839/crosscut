@@ -166,15 +166,22 @@ class GroupJointObservationSession:
         self._assert_source_identity(source)
         return pixels
 
-    def register_model(self,name,asset_path,observer,*,adapter_fingerprint=None,asset_dependencies=()):
+    def register_model(self,name,asset_path,observer,*,adapter_fingerprint=None,asset_dependencies=(),
+            expected_asset_sha256=None):
         """The worker loads each actual model once and supplies its observer."""
         self.budget.check()
         if not isinstance(name,str) or not name or name in self.models or not callable(observer):
             raise ValueError('joint model needs one explicit worker-owned name/observer')
+        if expected_asset_sha256 is not None and (not isinstance(expected_asset_sha256,str)
+                or len(expected_asset_sha256)!=64
+                or any(c not in '0123456789abcdef' for c in expected_asset_sha256)):
+            raise ValueError('joint model loaded-asset identity must be a SHA256 digest')
         identity=_file_identity(asset_path)
         with asset_path.open('rb') as stream:
             digest=hashlib.file_digest(stream,'sha256').hexdigest()
         if _file_identity(asset_path)!=identity:raise ValueError('joint model changed while binding its content identity')
+        if expected_asset_sha256 is not None and digest!=expected_asset_sha256:
+            raise ValueError('joint model asset differs from the bytes loaded by its observer')
         dependencies=tuple(asset_dependencies)
         if (len(dependencies)>16 or len(set(dependencies))!=len(dependencies)
                 or asset_path in dependencies):
