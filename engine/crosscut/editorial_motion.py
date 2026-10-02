@@ -216,8 +216,14 @@ class EditorialMotionPlan:
     # Planners use eligible-local indices, receipts and RenderPlan request
     # indices. Freeze the mapping and convert only at the serialization seam.
     eligible_request_indices: tuple[int, ...] | None = None
+    # Independently replayed new source/camera rows must not inherit the legacy
+    # boundary-local dense planner's header or head-extent certificate.
+    source_camera_refresh: Any | None = None
 
     def __post_init__(self):
+        if self.source_camera_refresh is not None:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self, 'source_camera_refresh', _freeze_audit_value(self.source_camera_refresh))
         mapping = self.eligible_request_indices
         if mapping is not None:
             if (not isinstance(mapping, tuple) or not mapping
@@ -385,6 +391,8 @@ class EditorialMotionPlan:
                 else None
             ),
             "segments": [item.to_dict() for item in self.segments],
+            **({'source_camera_refresh': _thaw_audit_value(self.source_camera_refresh)}
+                if self.source_camera_refresh is not None else {}),
             **({"required_boundary_failures": [
                 {"boundary_index": index, "reasons": list(reasons), "context": context}
                 for index, reasons, context in self.required_boundary_failures

@@ -297,7 +297,8 @@ class SingleGroupSelection(JointGroupSelection):
 
 
 def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,declared_roles,
-        observe_edge,verify_dense,budget,editorial_contract=None,baseline_path=None):
+        observe_edge,verify_dense,budget,editorial_contract=None,baseline_path=None,
+        baseline_unknown_policy="retain"):
     """Search A -> B -> C -> D without first solving B or C on its own.
 
     Every edge owns the SAME complete state and shared exact boundary tick.
@@ -309,12 +310,13 @@ def select_joint_group_source_camera_path(*,domain,left,right,states_by_slot,dec
     return _select_group_source_camera_path(domain=domain,left=left,right=right,
         states_by_slot=states_by_slot,declared_roles=declared_roles,observe_edge=observe_edge,
         verify_dense=verify_dense,budget=budget,editorial_contract=editorial_contract,
-        baseline_path=baseline_path,state_count=4,editorial_type=GroupJointEditorialContract,
+        baseline_path=baseline_path,baseline_unknown_policy=baseline_unknown_policy,state_count=4,editorial_type=GroupJointEditorialContract,
         dense_type=JointGroupDenseVerification,selection_type=JointGroupSelection)
 
 
 def select_single_group_source_camera_path(*,domain,left,right,states,declared_roles,
-        observe_edge,verify_dense,budget,editorial_contract=None,baseline_path=None):
+        observe_edge,verify_dense,budget,editorial_contract=None,baseline_path=None,
+        baseline_unknown_policy="retain"):
     """Fixed L -> the SAME complete X -> fixed R, across any internal cells.
 
     The two ends cannot choose different cameras, subjects or source clocks.
@@ -324,12 +326,12 @@ def select_single_group_source_camera_path(*,domain,left,right,states,declared_r
     return _select_group_source_camera_path(domain=domain,left=left,right=right,
         states_by_slot=(states,),declared_roles=declared_roles,observe_edge=observe_edge,
         verify_dense=verify_dense,budget=budget,editorial_contract=editorial_contract,
-        baseline_path=baseline_path,state_count=3,editorial_type=GroupSingleShotEditorialContract,
+        baseline_path=baseline_path,baseline_unknown_policy=baseline_unknown_policy,state_count=3,editorial_type=GroupSingleShotEditorialContract,
         dense_type=SingleGroupDenseVerification,selection_type=SingleGroupSelection)
 
 
 def _select_group_source_camera_path(*,domain,left,right,states_by_slot,declared_roles,
-        observe_edge,verify_dense,budget,editorial_contract,baseline_path,state_count,
+        observe_edge,verify_dense,budget,editorial_contract,baseline_path,baseline_unknown_policy,state_count,
         editorial_type,dense_type,selection_type):
     if (not isinstance(budget,JointGroupWorkBudget) or not isinstance(states_by_slot,tuple)
             or len(states_by_slot)!=state_count-2 or not isinstance(declared_roles,tuple) or len(declared_roles)!=state_count
@@ -337,7 +339,13 @@ def _select_group_source_camera_path(*,domain,left,right,states_by_slot,declared
             or not isinstance(left,GroupSourceCameraState) or left.slot!=0
             or not isinstance(right,GroupSourceCameraState) or right.slot!=state_count-1):
         raise ValueError('joint GROUP requires the declared actual-shot slots and fixed roles/neighbors')
-    attempts=[];edges={};seen=set();states=[];baseline_costs=()
+    if baseline_unknown_policy not in ('retain', 'observe_candidate'):
+        raise ValueError('unknown baseline observation policy')
+    # The opt-in policy permits a fully observed replacement of UNKNOWN. It
+    # does NOT turn missing measurements into zero, or waive ANY known cost.
+    # Domain owners must additionally preserve each independently known motion
+    # component: a scalar framing score cannot represent that obligation.
+    attempts=[];edges={};seen=set();states=[];baseline_costs=();baseline_unknown=()
     if baseline_path is not None:
         if (not isinstance(baseline_path,tuple) or len(baseline_path)!=state_count
                 or any(not isinstance(s,GroupSourceCameraState) or s.slot!=i
@@ -365,7 +373,7 @@ def _select_group_source_camera_path(*,domain,left,right,states_by_slot,declared
                 if state.key in seen:continue
                 seen.add(state.key);budget.spend('states');unique.append(state)
             states.append(tuple(unique))
-        def edge(a,b):
+        def edge(a,b,*,raw=False):
             if a.end_output_frame!=b.first_output_frame:return None
             key=(a.key,b.key)
             if key not in edges:
@@ -377,13 +385,18 @@ def _select_group_source_camera_path(*,domain,left,right,states_by_slot,declared
                     raise ValueError('joint edge observation belongs to another camera or native/output clock')
                 edges[key]=value
             value=edges[key]
-            return value if value is not None and value.feasible else None
+            return value if raw or value is not None and value.feasible else None
         if baseline_path is not None:
-            baseline_edges=tuple(edge(a,b) for a,b in zip(baseline_path,baseline_path[1:]))
-            if any(value is None for value in baseline_edges):
+            baseline_edges=tuple(edge(a,b,raw=True) for a,b in zip(baseline_path,baseline_path[1:]))
+            baseline_unknown=tuple(i for i,value in enumerate(baseline_edges)
+                if value is None or not value.feasible)
+            if baseline_unknown and baseline_unknown_policy == 'retain':
                 return selection_type(None,(),({'complete':False,'reason':'baseline_edge_unknown'},),
                     'baseline_edge_unknown_retained',budget.to_dict())
-            baseline_costs=tuple(value.framing_cost for value in baseline_edges)
+            baseline_costs=tuple(None if value is None else value.framing_cost for value in baseline_edges)
+            if baseline_unknown:
+                attempts.append(dict(complete=False,reason='baseline_unknown_preserved_not_imputed',
+                    unknown_edge_slots=list(baseline_unknown),baseline_edge_costs=list(baseline_costs)))
         paths=[]
         for mutable in product(*states[1:-1]):
             budget.check();path=(left,*mutable,right)
@@ -396,8 +409,9 @@ def _select_group_source_camera_path(*,domain,left,right,states_by_slot,declared
             observed=tuple(observed)
             if baseline_costs:
                 costs=tuple(e.framing_cost for e in observed)
-                regressed=tuple(i for i,(old,new) in enumerate(zip(baseline_costs,costs)) if new>old+1e-9)
-                if regressed or not any(new<old-1e-6 for old,new in zip(baseline_costs,costs)):
+                regressed=tuple(i for i,(old,new) in enumerate(zip(baseline_costs,costs)) if old is not None and new>old+1e-9)
+                if regressed or not (baseline_unknown or any(
+                        old is not None and new<old-1e-6 for old,new in zip(baseline_costs,costs))):
                     attempts.append(dict(state_keys=[s.key for s in path],complete=False,
                         reason='protected_edge_framing_regression' if regressed else 'no_observed_edge_gain',
                         regressed_edge_slots=list(regressed),baseline_edge_costs=list(baseline_costs),

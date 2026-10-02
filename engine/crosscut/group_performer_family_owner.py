@@ -30,6 +30,8 @@ from .post_render_perceptual_quality import _reference_view_for_span
 from .visual_boundary_repair import _thaw_audit_value
 
 CONTRACT = 'normal_performer_family_camera_owner_v1'
+SOURCE_CONTRACT = 'normal_source_changing_family_owner_v1'
+FAMILY_CONTRACTS = (CONTRACT, SOURCE_CONTRACT)
 QUALITY_CODE = 'performer_family_quality_unapproved'
 MAX_OUTPUT_FRAMES = 36000
 MAX_REFRESHED_CELLS = 4
@@ -530,7 +532,14 @@ class PerformerFamilyRejection:
 @isolated_optional()
 def propose_performer_family(context):
     from .pipeline import _review_first_group_motion_camera_bundle
+    from .group_source_changing_owner import propose_source_changes
     _fresh(context)
+    # Normal app source-changing producer, not an opt-in contrast mode. The
+    # complete source/clock/camera family transaction runs before the legacy
+    # fixed-source refinement; no single-source success is a prerequisite.
+    source_candidate = propose_source_changes(context)
+    if not isinstance(source_candidate, PerformerFamilyRejection):
+        return source_candidate
     old = context.incumbent
     # An internal geometry-only work view is not an adopted bundle. Full old
     # look stays in context; complete_candidate MUST put fresh/preserved look
@@ -547,19 +556,26 @@ def propose_performer_family(context):
         allow_retiming=False,require_incident_edge_replay=True,maximum_boundaries=4,maximum_accepted_boundaries=1)
     if candidate is None or candidate.render_plan == work.render_plan:
         return PerformerFamilyRejection('no complete observed performer camera candidate',
-            candidate.to_dict() if candidate is not None else None)
+            {**(candidate.to_dict() if candidate is not None else {}), 'source_search': source_candidate.evidence})
     try:
-        return complete_candidate(context, candidate)
+        completed = complete_candidate(context, candidate)
+        receipt = plain(completed.performer_family_review)
+        receipt['source_search_rejection'] = dict(error=source_candidate.error, evidence=source_candidate.evidence)
+        return replace(completed, performer_family_review=receipt)
     except Exception as exc:
         # A typed outcome survives the native-worker IPC (exception attributes
         # do not). The parent archives the FULL proposed family before rejection.
-        return PerformerFamilyRejection(f'{type(exc).__name__}: {exc}', candidate.to_dict())
+        return PerformerFamilyRejection(f'{type(exc).__name__}: {exc}',
+            {**candidate.to_dict(), 'source_search': source_candidate.evidence})
 
 
 def validate_bundle_binding(bundle):
     receipt = plain(getattr(bundle, 'performer_family_review', None))
+    if receipt is not None and receipt.get('contract') == SOURCE_CONTRACT:
+        from .group_source_changing_owner import validate_binding
+        return validate_binding(bundle)
     if receipt is None:
-        if bundle.candidate_origin == CONTRACT:
+        if bundle.candidate_origin in FAMILY_CONTRACTS or getattr(bundle.editorial_motion_plan, 'source_camera_refresh', None) is not None:
             raise ValueError('performer complete bundle receipt was removed')
         return
     if (receipt.get('contract') != CONTRACT or bundle.candidate_origin != CONTRACT
@@ -574,6 +590,9 @@ def validate_bundle_binding(bundle):
 
 
 def validate_parent(candidate, context):
+    if plain(candidate.performer_family_review).get('contract') == SOURCE_CONTRACT:
+        from .group_source_changing_owner import validate_parent as validate_source_parent
+        return validate_source_parent(candidate, context)
     _fresh(context)
     validate_bundle_binding(candidate)
     changed_scope(context.incumbent.render_plan,candidate.render_plan,context.domain)
@@ -616,7 +635,7 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
             archive.update(status='pending_independent_parent_replay',candidate_bundle=candidate.to_dict(),
                 candidate_plan=candidate.render_plan.to_json())
             publish()
-            controller.compare_and_promote(candidate,plan=candidate.render_plan,authority=CONTRACT,
+            controller.compare_and_promote(candidate,plan=candidate.render_plan,authority=candidate.candidate_origin,
                 token=context.token,validate=lambda value:validate_parent(value,context))
             # The pre-CAS durable record is authoritative. Journal owns commit.
             return candidate
@@ -633,14 +652,20 @@ def validate_serialized_metadata(complete):
         raise ValueError('performer selected complete metadata missing')
     metadata = dict(complete)
     receipt = metadata.pop('performer_family_review',None)
-    if (not isinstance(receipt,Mapping) or receipt.get('contract') != CONTRACT
-            or complete.get('candidate_origin') != CONTRACT
+    if (not isinstance(receipt,Mapping) or receipt.get('contract') not in FAMILY_CONTRACTS
+            or complete.get('candidate_origin') != receipt.get('contract')
+            or receipt.get('source_changes_supported') is not (receipt.get('contract') == SOURCE_CONTRACT)
+            or receipt.get('contract') == SOURCE_CONTRACT and receipt.get('source_camera_refresh') !=
+                (complete.get('editorial_motion') or {}).get('source_camera_refresh')
             or receipt.get('metadata_sha256') != digest(metadata)
             or receipt.get('quality_approved') is not False
             or receipt.get('decoded_output_quality_certified') is not False
             or receipt.get('body_phase_certified') is not False
             or receipt.get('cross_camera_identity_certified') is not False):
         raise ValueError('performer selected metadata, family or uncertainty changed')
+    if receipt.get('contract') == SOURCE_CONTRACT:
+        from .group_source_changing_owner import validate_dense_uncertainty
+        validate_dense_uncertainty(plain(receipt.get('source_camera_refresh')))
     return receipt
 
 
@@ -696,14 +721,19 @@ def _final_live_replay(plan_json, receipt, deadline):
 def replay_final_sources(plan_json,receipt):
     deadline=min(current_optional_deadline() or float('inf'),monotonic()+45.)
     with optional_native_scope(deadline):
+        if plain(receipt).get('contract') == SOURCE_CONTRACT:
+            from .group_source_changing_owner import final_live_replay
+            return final_live_replay(plan_json,plain(receipt),deadline)
         return _final_live_replay(plan_json,plain(receipt),deadline)
 
 
 def consume_performer_family_qa(analysis,plan_json,selection):
     render=analysis.get('render') or {};complete=selection.get('complete_candidates') or ()
     receipt=render.get('performer_family_review')
-    marked=(render.get('candidate_origin')==CONTRACT or selection.get('selected_path_authority')==CONTRACT
-        or any(isinstance(c,Mapping) and c.get('performer_family_review') is not None for c in complete))
+    marked=(render.get('candidate_origin') in FAMILY_CONTRACTS or selection.get('selected_path_authority') in FAMILY_CONTRACTS
+        or (render.get('editorial_motion') or {}).get('source_camera_refresh') is not None
+        or any(isinstance(c,Mapping) and (c.get('performer_family_review') is not None
+            or (c.get('editorial_motion') or {}).get('source_camera_refresh') is not None) for c in complete))
     if receipt is None and not marked:
         return None
     if len(complete)!=1 or validate_serialized_metadata(complete[0])!=receipt:
@@ -721,9 +751,15 @@ def consume_performer_family_qa(analysis,plan_json,selection):
 def qa_metrics_valid(metrics):
     if not isinstance(metrics,Mapping):return False
     value=dict(metrics);identity=value.pop('evidence_sha256',None)
-    return bool(value.get('contract')==CONTRACT and value.get('binding_valid') is True
+    return bool(value.get('contract') in FAMILY_CONTRACTS and value.get('binding_valid') is True
         and value.get('source_live_replay') is True and value.get('quality_approved') is False
         and value.get('decoded_output_quality_certified') is False
         and value.get('final_quality_status')=='UNAPPROVED_PERFORMER_REVIEW_CANDIDATE'
+        and (value.get('contract') != SOURCE_CONTRACT or (
+            value.get('semantic_raw_v2_admission') is False
+            and value.get('cross_camera_identity_certified') is False
+            and value.get('body_phase_certified') is False
+            and type(value.get('dense_native_output_tick_count')) is int
+            and 1 <= value['dense_native_output_tick_count'] <= 600))
         and type(value.get('sampled_native_pixel_count')) is int
         and 1<=value['sampled_native_pixel_count']<=MAX_NATIVE_READS and identity==digest(value))
