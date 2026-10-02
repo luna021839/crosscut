@@ -138,6 +138,13 @@ class FaceMatchSegment:
     target_silhouette_height: float | None = None
     continuous_run_stitched: bool = False
     alignment_purpose: str | None = None
+    projected_output_observations: dict[str, Any] | None = None
+
+    def __post_init__(self):
+        if self.projected_output_observations is not None:
+            from .visual_boundary_repair import _freeze_audit_value
+            object.__setattr__(self, 'projected_output_observations',
+                _freeze_audit_value(self.projected_output_observations))
 
     @property
     def transition_tier(self) -> str:
@@ -148,7 +155,10 @@ class FaceMatchSegment:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        from .visual_boundary_repair import _thaw_audit_value
         return {
+            **({'projected_output_observations': _thaw_audit_value(self.projected_output_observations)}
+                if self.projected_output_observations is not None else {}),
             "segment_index": self.segment_index,
             "source_index": self.source_index,
             "mode": (

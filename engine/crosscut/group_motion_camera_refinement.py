@@ -358,9 +358,15 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
         model_path,source_index_map=None,feature_cache_directory=None,
         feature_derived_cache_directory=None,require_persistent_feature_cache=False,
         maximum_boundaries=4,maximum_camera_candidates=2,protected_segment_indices=(),
-        maximum_candidate_boundaries=32,maximum_measured_boundaries=12):
+        maximum_candidate_boundaries=32,maximum_measured_boundaries=12,
+        allow_retiming=True,require_incident_edge_replay=False,maximum_accepted_boundaries=None):
+    if type(allow_retiming) is not bool or type(require_incident_edge_replay) is not bool:
+        raise TypeError("motion/camera clock and incident replay policies must be boolean")
     if type(maximum_boundaries) is not int or not 1 <= maximum_boundaries <= 4:
         raise ValueError('motion/camera refinement permits at most four boundaries')
+    if maximum_accepted_boundaries is not None and (type(maximum_accepted_boundaries) is not int
+            or not 1 <= maximum_accepted_boundaries <= maximum_boundaries):
+        raise ValueError('accepted boundary budget must fit the measured frontier')
     if type(maximum_camera_candidates) is not int or not 1 <= maximum_camera_candidates <= 2:
         raise ValueError('motion/camera refinement permits at most two camera candidates per boundary')
     if (type(maximum_candidate_boundaries) is not int or not 1<=maximum_candidate_boundaries<=48
@@ -394,7 +400,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
         for index in shortlist if index not in targets]
     if not targets:
         return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
-    clocks={i:probe_render_frame_clock(source) for i,source in enumerate(plan.sources)}
+    clocks={i:probe_render_frame_clock(plan.sources[i]) for i in mapping}
     domain=GroupSourceDomain(tuple(plan.sources),mapping,tuple(audio_offsets),tuple(source_timewarps),
         tuple(tuple(cuts) for cuts in scene_cut_times),tuple(clocks[index] for index in mapping))
     provider=CloseupGestureProvider(plan.sources,Path(model_path),verify_native_global_focal=True)
@@ -481,10 +487,12 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
             measured_boundary_indices=[row[1] for row in triage],
             cached_geometry_used_only_for_sensing_order=True,quality_approved=False))
         for _,boundary,before,samples,before_faces,before_rank,source_before,before_descriptors in measured_motion_frontier(triage,maximum_boundaries):
+            if maximum_accepted_boundaries is not None and len(selected)>=maximum_accepted_boundaries:
+                break
             if any(abs(boundary-proposal.boundary_index)<=1 for proposal in selected):
                 continue
             offsets=[]
-            for offset in (-6,-4,-2,2,4,6):
+            for offset in ((-6,-4,-2,2,4,6) if allow_retiming else ()):
                 delta=offset/plan.fps
                 left,right=timeline.choices[boundary:boundary+2]
                 cut=right.canonical_master_start+delta
@@ -635,6 +643,48 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                         row['reason']='new_non_camera_or_unrelated_timeline_failure'
                         attempts.append(row)
                         continue
+                    if require_incident_edge_replay:
+                        # A paired recipe changes two cells. The opposite real
+                        # edges constrain selection too, not just a post-hoc QA.
+                        # Internal broadcast cuts need a whole-epoch owner; do
+                        # not stretch this two-cell receipt over such a cut.
+                        if any(timeline.choices[i].internal_scene_cut_master_seconds
+                               for i in (boundary,boundary+1)):
+                            row['reason']='performer_family_internal_epoch_refresh_required'
+                            attempts.append(row);continue
+                        incident=[];neighbor_safe=True
+                        for edge in (boundary-1,boundary+1):
+                            if not 0<=edge<len(plan.transitions):
+                                continue
+                            if plan.segments[edge].source_index==plan.segments[edge+1].source_index:
+                                # Same-native cell seams are not real cuts. The
+                                # complete owner checks identical exterior pixels.
+                                continue
+                            _,_,old_samples=measured(plan,edge)
+                            _,_,new_samples=measured(proposal.plan,edge)
+                            if old_samples is None or new_samples is None or old_samples!=new_samples:
+                                neighbor_safe=False
+                                incident.append(dict(boundary_index=edge,reason='incident_clock_unavailable_or_changed'))
+                                continue
+                            old_observation=projected(plan,edge,old_samples)
+                            new_observation=projected(proposal.plan,edge,new_samples,
+                                required_basis=motion_evidence_basis(old_observation.motion))
+                            old_motion,new_motion=old_observation.motion,new_observation.motion
+                            old_faces,new_faces=old_observation.face_metrics,new_observation.face_metrics
+                            safe=(old_motion is None or projected_motion_preserved(new_motion,old_motion))
+                            if old_faces is not None:
+                                safe=safe and new_faces is not None and all(
+                                    a<=b+1e-9 for a,b in zip(new_faces,old_faces,strict=True))
+                            neighbor_safe=neighbor_safe and safe
+                            incident.append(dict(boundary_index=edge,preserved=safe,
+                                before_motion=old_motion.to_dict() if old_motion else None,
+                                after_motion=new_motion.to_dict() if new_motion else None,
+                                before_faces=old_faces,after_faces=new_faces,
+                                unknown_motion_not_imputed=old_motion is None))
+                        row['incident_edge_replay']=incident
+                        if not neighbor_safe:
+                            row['reason']='performer_incident_edge_observation_lost_or_regressed'
+                            attempts.append(row);continue
                     row.update(eligible=True,reason='complete_local_candidate_for_final_decoded_qa',
                         raw_new_failures=failures,proposal=proposal.to_dict())
                     eligible.append((rank,abs(offset),offset,proposal,refreshed,row))

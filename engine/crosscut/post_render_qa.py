@@ -8186,6 +8186,21 @@ def evaluate_post_render_qa(
             'Normal camera source/clock/metadata/live pixel replay failed.',
             path='render.normal_interval_review', value=str(exc))
 
+    from .group_performer_family_owner import consume_performer_family_qa
+    from .group_performer_family_owner import QUALITY_CODE as PERFORMER_QUALITY_CODE
+    try:
+        performer_metrics = consume_performer_family_qa(analysis, plan, selection)
+        if performer_metrics is not None:
+            metrics['performer_family_review'] = performer_metrics
+            collector.add(PERFORMER_QUALITY_CODE, QAIssueSeverity.FAIL,
+                'Performer camera and retained families are bound; identity, body phase and final editorial quality remain unapproved.',
+                path='render.performer_family_review')
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+        metrics['performer_family_review'] = {'binding_valid': False, 'error': str(exc)}
+        collector.add('performer_family_binding_invalid', QAIssueSeverity.FAIL,
+            'Performer source/clock/face/motion/look live replay failed.',
+            path='render.performer_family_review', value=str(exc))
+
     if 'authorized_shot_video_clocks' in plan:
         from .render_clock_artifact import render_clock_path
         try:

@@ -1678,6 +1678,8 @@ def analyze_boundary_look_match(
     group_16x9_safe: bool,
     config: BoundaryLookMatchConfig | None = None,
     measurement_cache: BoundaryLookMeasurementCache | None = None,
+    boundary_indices: tuple[int, ...] | None = None,
+    projected_cache: Any | None = None,
 ) -> BoundaryLookMatchResult:
     """Measure and attach residual look ramps without rendering any files."""
 
@@ -1705,6 +1707,12 @@ def analyze_boundary_look_match(
             analysis_config=settings,
         )
 
+    scope = set(range(len(plan.transitions))) if boundary_indices is None else set(boundary_indices)
+    if (boundary_indices is not None and len(scope) != len(boundary_indices)
+            or any(type(i) is not int or not 0 <= i < len(plan.transitions) for i in scope)):
+        raise ValueError("boundary look refresh scope is invalid")
+    if projected_cache is not None:
+        cache = projected_cache
     counts = segment_frame_counts(plan)
     raw_specs: list[tuple[tuple[float, ...], tuple[float, ...]] | None] = []
     times_by_source: dict[int, list[float]] = {}
@@ -1716,7 +1724,8 @@ def analyze_boundary_look_match(
         left = plan.segments[index]
         right = plan.segments[index + 1]
         if (
-            transition.kind is not TransitionKind.HARD_CUT
+            index not in scope
+            or transition.kind is not TransitionKind.HARD_CUT
             or left.source_index == right.source_index
         ):
             raw_specs.append(None)
@@ -1744,17 +1753,27 @@ def analyze_boundary_look_match(
     decoded_before = cache.decoded_frame_count
     hits_before = cache.cache_hit_count
     measured: dict[int, dict[int, LookMetricVector | None]] = {}
-    for source_index in sorted(times_by_source):
-        measured[source_index] = cache.measure_many(
-            plan.sources[source_index],
-            times_by_source[source_index],
-        )
+    by_segment: dict[int, dict[int, LookMetricVector | None]] = {}
+    if projected_cache is None:
+        for source_index in sorted(times_by_source):
+            measured[source_index] = cache.measure_many(
+                plan.sources[source_index], times_by_source[source_index])
+    else:
+        segment_times: dict[int, list[float]] = {}
+        for index, spec in enumerate(raw_specs):
+            if spec is not None:
+                segment_times.setdefault(index, []).extend(spec[0])
+                segment_times.setdefault(index+1, []).extend(spec[1])
+        for index, times in sorted(segment_times.items()):
+            by_segment[index] = cache.measure_many_for_segment(plan, index, times)
 
     decisions: list[BoundaryLookDecision] = []
     endpoint_adjustments: dict[
         int, dict[str, SourceLookAdjustment]
     ] = {}
     for boundary_index, raw_spec in enumerate(raw_specs):
+        if boundary_index not in scope:
+            continue
         left = plan.segments[boundary_index]
         right = plan.segments[boundary_index + 1]
         if raw_spec is None:
@@ -1778,10 +1797,10 @@ def analyze_boundary_look_match(
             for left_time, right_time in zip(left_times, right_times, strict=True)
             for left_metric, right_metric in (
                 (
-                    measured[left.source_index].get(
+                    (measured[left.source_index] if projected_cache is None else by_segment[boundary_index]).get(
                         int(round(left_time * 1_000_000.0))
                     ),
-                    measured[right.source_index].get(
+                    (measured[right.source_index] if projected_cache is None else by_segment[boundary_index+1]).get(
                         int(round(right_time * 1_000_000.0))
                     ),
                 ),

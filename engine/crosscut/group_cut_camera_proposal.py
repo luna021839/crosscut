@@ -36,6 +36,8 @@ def retime_base_pan(track, *, relative_shift, duration):
         raise ValueError('pan retiming requires finite shift and positive duration')
     if track is None:
         return None
+    if relative_shift == 0. and duration >= track.keyframes[-1].time_seconds:
+        return track
     times = sorted({0., duration, *(key.time_seconds-relative_shift for key in track.keyframes
         if 0. < key.time_seconds-relative_shift < duration)})
     return PanCropTrack(tuple(PanCropKeyframe(time, NormalizedCrop(*_fixed_crop_at(

@@ -20436,12 +20436,13 @@ class _GroupRenderCandidateBundle:
     cut_local_sync: Mapping[str, Any] | None = None
     phrase_times: tuple[float,...] | None = None
     normal_interval_review: Mapping[str, Any] | None = None
+    performer_family_review: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         from .visual_boundary_repair import _freeze_audit_value
         # These dictionaries are executable authority, not mutable diagnostics.
         # Copy/freeze them when ownership changes; serialize only through to_dict.
-        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync', 'normal_interval_review'):
+        for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync', 'normal_interval_review', 'performer_family_review'):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _freeze_audit_value(value))
@@ -20455,6 +20456,9 @@ class _GroupRenderCandidateBundle:
     def to_dict(self) -> dict[str, Any]:
         from .visual_boundary_repair import _thaw_audit_value
         return {
+            "performer_family_review": (
+                _thaw_audit_value(self.performer_family_review)
+                if self.performer_family_review is not None else None),
             "normal_interval_review": (
                 _thaw_audit_value(self.normal_interval_review)
                 if self.normal_interval_review is not None else None),
@@ -27423,6 +27427,8 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
         raise ValueError('complete GROUP bundle requires its timeline review')
     from .group_normal_interval_owner import validate_bundle_binding
     validate_bundle_binding(bundle)
+    from .group_performer_family_owner import validate_bundle_binding as validate_performer_binding
+    validate_performer_binding(bundle)
     if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
         raise ValueError('complete GROUP bundle requires finite review and section authority')
     plan, timeline = bundle.render_plan, bundle.visual_timeline
@@ -27541,10 +27547,13 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
 
 
 def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices,offsets,
-        timewarps,scene_cut_times,phrase_times,model_path=None):
+        timewarps,scene_cut_times,phrase_times,model_path=None,
+        allow_retiming=True,require_incident_edge_replay=False,maximum_boundaries=4,maximum_accepted_boundaries=None):
     """Promote only an owned timeline/camera/review transaction before look fit."""
     if bundle.normal_interval_review is not None:
         raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+    if bundle.performer_family_review is not None:
+        raise ValueError('performer family candidate requires a fresh complete replay before downstream camera/look mutation')
 
     from .group_motion_camera_refinement import refine_group_motion_camera
     from .boundary_subject_alignment import ANALYSIS_BASIS, GLOBAL_ACTION_BASIS
@@ -27572,6 +27581,14 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     for row in raw_motion.get('coupled_shot_cameras',()):
         rebind_unchanged_coupled_shot(row,bundle.render_plan,bundle.render_plan)
         protected.update(range(row['segment_index']-1,row['segment_index']+3))
+    if not allow_retiming and require_incident_edge_replay:
+        # This retained-family slice does not replace a previously dense-owned
+        # cell with a second, overlapping proof recipe. Preserve that authority
+        # and let the bounded proposer measure other available real edges.
+        # Whole-shot overlapping proof refresh remains a separate OPEN owner.
+        prior_bound = _bound_local_alignment_tracks(raw_motion,
+            json.loads(json.dumps(bundle.render_plan.to_json())))
+        protected.update(prior_bound[0])
     if model_path is None:
         cache=getattr(request,'source_cache_directory',None)
         if cache is None:
@@ -27581,7 +27598,10 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     result=refine_group_motion_camera(plan=bundle.render_plan,timeline=bundle.visual_timeline,
         audio_offsets=offsets,source_timewarps=timewarps,scene_cut_times=scene_cut_times,
         source_index_map=eligible_indices,model_path=model_path,
-        protected_segment_indices=tuple(sorted(protected)),**_visual_feature_cache_arguments(request))
+        protected_segment_indices=tuple(sorted(protected)),allow_retiming=allow_retiming,
+        require_incident_edge_replay=require_incident_edge_replay,maximum_boundaries=maximum_boundaries,
+        maximum_accepted_boundaries=maximum_accepted_boundaries,
+        **_visual_feature_cache_arguments(request))
     if not result.proposals:
         # Keep the measured reasons on the actual owned bundle. Returning
         # None discarded an entire optional pass's evidence and encouraged
@@ -27610,7 +27630,11 @@ def _review_first_group_motion_camera_bundle(bundle, *, request,eligible_indices
     alignment_segments=list(alignment.segments)
     changed=set()
     for proposal in result.proposals:
-        decisions.update({item.boundary_index:item for item in proposal.alignment.decisions})
+        # The scoped producer returns a complete inventory, including
+        # NOT-SELECTED rows. Those rows carry no new authority and must not
+        # erase a previous neighbor/disjoint boundary's dense proof.
+        decisions.update({item.boundary_index:item for item in proposal.alignment.decisions
+            if item.boundary_index == proposal.boundary_index})
         for index in (proposal.boundary_index,proposal.boundary_index+1):
             alignment_segments[index]=proposal.alignment.segments[index]
             changed.add(index)
@@ -27691,6 +27715,8 @@ def _review_first_group_shot_context_bundle(bundle, *, scene_cut_times):
     """Apply two-sided whole-shot framing before grading, without retiming."""
     if bundle.normal_interval_review is not None:
         raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+    if bundle.performer_family_review is not None:
+        raise ValueError('performer family candidate requires a fresh complete replay before downstream camera/look mutation')
 
     from .shot_context_refinement import refine_shot_context_cameras
     if (bundle.editorial_motion_plan is None or bundle.boundary_look_match is not None
@@ -27728,6 +27754,8 @@ def _review_first_group_boundary_look_bundle(bundle, *, group_16x9_safe):
     """Preserve the complete incumbent and add only decoded-admitted look ramps."""
     if bundle.normal_interval_review is not None:
         raise ValueError('normal interval review candidate requires a fresh complete replay before downstream camera/look mutation')
+    if bundle.performer_family_review is not None:
+        raise ValueError('performer family candidate requires a fresh complete replay before downstream camera/look mutation')
 
     from .review_first_boundary_look import refine_review_first_boundary_look
     plan, result = refine_review_first_boundary_look(
@@ -35606,6 +35634,15 @@ def analyze(
                     if look_bundle is not None:
                         group_first.promote(look_bundle, plan=look_bundle.render_plan,
                                             authority=look_bundle.cadence_profile)
+                # Normal performer owner composes retained face/motion/look.
+                # It never suppresses the established refinement families above.
+                # No experimental-pixel flag enables it, and no model download
+                # is permitted by its installed-only asset resolver.
+                from .group_performer_family_owner import attempt_performer_family
+                attempt_performer_family(controller=group_first, request=request,
+                    eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                    scene_cut_times=scene_cut_times, sync_scores=sync_scores,
+                    archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
                 # Consume one owned bundle, including clock/review/geometry.
                 # A rejected proposal cannot leak any of its local metadata.
                 kept = review_first_singleton_bundle = group_first.incumbent
@@ -35618,6 +35655,7 @@ def analyze(
                     from .visual_boundary_repair import _thaw_audit_value
                     cut_local_sync_payload = _thaw_audit_value(kept.cut_local_sync)
                 selected_path_authority = group_first.to_dict()["selected_authority"]
+                review_first_visual_selection_payload["authority"] = selected_path_authority
                 if kept.dynamic_crop_application is not None:
                     from .visual_boundary_repair import _thaw_audit_value
                     review_first_visual_selection_payload['dynamic_crop_application'] = _thaw_audit_value(kept.dynamic_crop_application)
@@ -36003,6 +36041,11 @@ def analyze(
             from .group_normal_interval_owner import validate_bundle_binding, replay_final_sources
             validate_bundle_binding(group_first.incumbent)
             replay_final_sources(plan.to_json(), group_first.incumbent.to_dict()['normal_interval_review'])
+        if group_first is not None and group_first.incumbent.performer_family_review is not None:
+            from .group_performer_family_owner import validate_bundle_binding as validate_performer_binding
+            from .group_performer_family_owner import replay_final_sources as replay_performer_sources
+            validate_performer_binding(group_first.incumbent)
+            replay_performer_sources(plan.to_json(), group_first.incumbent.to_dict()['performer_family_review'])
         write_plan(plan, render_plan_path)
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
         from .render_process import render_log_callback
@@ -36037,6 +36080,9 @@ def analyze(
             project_name=f"IVE {request.song} group crosscut",
         )
         render_payload = {
+            "performer_family_review": (
+                group_first.incumbent.to_dict()['performer_family_review']
+                if group_first is not None else None),
             "normal_interval_review": (
                 group_first.incumbent.to_dict()['normal_interval_review']
                 if group_first is not None else None),
@@ -36132,7 +36178,9 @@ def analyze(
                 else None
             ),
             "face_match": (
-                {
+                face_match_plan.to_dict()
+                if group_first is not None and group_first.incumbent.performer_family_review is not None
+                else {
                     "analysis_basis": face_match_plan.analysis_basis,
                     "applied_count": face_match_plan.applied_count,
                     "fallback_count": face_match_plan.fallback_count,
