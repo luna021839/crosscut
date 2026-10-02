@@ -260,13 +260,17 @@ def propose_scene_changes(context):
         if len(context.domain.eligible_indices)>source.MAX_SOURCES:
             return rejected('scene source budget exceeded without truncating sources')
         assets=source.installed_native_assets(context)
+        request_limits=dict(source.WORK_LIMITS,
+            maximum_states=MAX_WINDOWS*source.WORK_LIMITS['maximum_states'],
+            maximum_edges=MAX_WINDOWS*source.WORK_LIMITS['maximum_edges'],maximum_frontiers=MAX_WINDOWS)
         session=GroupJointObservationSession(domain=context.domain,budget=JointGroupWorkBudget(
-            absolute_deadline=context.deadline,**source.WORK_LIMITS),maximum_raw_cache_bytes=32*1024*1024)
+            absolute_deadline=context.deadline,**request_limits),maximum_raw_cache_bytes=32*1024*1024)
         sensors=SceneSensors(session,assets)
         plan=context.incumbent.render_plan;shots=source.visible_group_shots(plan,context.domain)
         # Interleave paired and solo numeric domains. The current state frontier
-        # is source-balanced but NOT request-window-fair; later windows may remain
-        # unobserved. Do not claim that this solves the global prefix budget.
+        # has separate bounded state/edge frontiers. Native/model/time work is
+        # still shared, so later windows may remain unobserved; do not claim
+        # full-song coverage or hard completion/parent reserve guarantees.
         windows=[]
         for i in range(max(0,len(shots)-2)):
             if i+4<=len(shots): windows.append(shots[i:i+4])
@@ -359,6 +363,9 @@ def propose_scene_changes(context):
                     continue
                 evaluated_hypothesis_frontiers.add(fixed_signature)
             graph_windows+=1
+            session.budget.begin_frontier(label=wi,
+                maximum_states=source.WORK_LIMITS['maximum_states'],
+                maximum_edges=source.WORK_LIMITS['maximum_edges'])
             # All numerically available sources are observed before choosing a
             # donor/camera, but only after the shared incident endpoints exist.
             all_native=tuple((s,'whole') for s in baseline[1:-1])+tuple(
@@ -392,8 +399,9 @@ def propose_scene_changes(context):
                     # Native then camera, round-robin over SOURCE, not the first
                     # source's many head/camera variants monopolizing the cap.
                     by_source.append(camera_balanced_source_frontier(values,cameras))
-                remaining=session.budget.limits['states']-session.budget.counts['states']-len(lefts)-len(rights)
-                # At most 24 states globally. Discovery still preserves all the
+                remaining=session.budget.frontier_remaining('states')-len(lefts)-len(rights)
+                # At most 24 states per graph, three bounded request frontiers.
+                # Discovery still preserves all the
                 # omitted hypotheses and numeric source options in its archive.
                 quota=max(0,remaining//len(raw_slots))
                 groups.append(round_robin(by_source,quota))
@@ -412,7 +420,7 @@ def propose_scene_changes(context):
             def read(a,b):
                 key=a.key,b.key
                 if key not in edges:
-                    if session.budget.counts['edges']>=session.budget.limits['edges']:
+                    if session.budget.frontier_remaining('edges')<=0:
                         raise _EdgeFrontierFull('bounded edge frontier reached')
                     session.budget.spend('edges')
                     evidence=compare_scene_edge(sensors,a,b)
@@ -507,6 +515,10 @@ def propose_scene_changes(context):
                         fixed_window_probe_limit=MAX_FIXED_WINDOW_PROBES,
                         evaluated_graph_windows=graph_windows,
                         bounded_edge_frontier_attempts=[a for a in attempts if a.get('stage')=='bounded_edge_frontier'],
+                        state_edge_frontiers_explicit=True,
+                        per_graph_state_limit=source.WORK_LIMITS['maximum_states'],
+                        per_graph_edge_limit=source.WORK_LIMITS['maximum_edges'],
+                        state_edge_prefix_starvation_removed=True,native_caps_not_multiplied=True,
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,
                         reserve_check_basis="before_window_only_not_hard_phase_partition")
                     search['scene_replay_program']=dict(contract='frozen_scene_source_camera_program_v1',

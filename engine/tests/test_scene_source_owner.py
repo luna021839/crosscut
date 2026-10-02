@@ -423,6 +423,53 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         family.validate_bundle_binding(candidate)
         self.assertFalse(family.plain(candidate.performer_family_review)['quality_approved'])
 
+    def test_spent_first_graph_does_not_hide_later_source_camera_window(self):
+        # NONHUMAN edge-unavailability control. Unlike the missing-hypothesis
+        # test above, the first graph actually spends its full state frontier.
+        # Real chart decoding, pixel paths, family refresh and look encode stay
+        # active. This is allocation evidence, not actual IVE media quality.
+        real_discover=sensors_module.SceneSensors.discover
+        real_edge=scene.compare_scene_edge
+        blocked=[];later=[]
+        def discover(sensor,state,**kwargs):
+            if kwargs.get('endpoint_scope','whole')=='whole':
+                bounds=(state.first_output_frame,state.end_output_frame)
+                if not blocked:blocked.append(bounds)
+                elif bounds!=blocked[0]:later.append(bounds)
+            return real_discover(sensor,state,**kwargs)
+        def edge(sensor,left,right):
+            row=real_edge(sensor,left,right)
+            if blocked and any((s.first_output_frame,s.end_output_frame)==blocked[0]
+                    for s in (left,right)):
+                return dict(row,available=False,
+                    reason='EXPLICIT_NONHUMAN_FIRST_WINDOW_UNAVAILABLE_EDGE_CONTROL')
+            return row
+        context=replace(self.context,deadline=monotonic()+180.)
+        with optional_native_scope(context.deadline),scene_chart_sensors(), \
+                patch.object(sensors_module.SceneSensors,'discover',discover), \
+                patch.object(scene,'compare_scene_edge',edge):
+            candidate=scene.propose_scene_changes(context)
+        evidence=family.plain(candidate.evidence) if isinstance(candidate,family.PerformerFamilyRejection) else {}
+        self.assertTrue(blocked and later,dict(blocked=blocked,later=later,
+            error=getattr(candidate,'error',None),native_work=evidence.get('native_work'),
+            last_attempt=evidence.get('attempts',[None])[-1]))
+        self.assertNotIsInstance(candidate,family.PerformerFamilyRejection,
+            getattr(candidate,'error',None))
+        family.validate_bundle_binding(candidate)
+        receipt=family.plain(candidate.performer_family_review)
+        self.assertGreater(receipt['native_work']['counts']['states'],24)
+        self.assertLessEqual(receipt['native_work']['counts']['states'],72)
+        self.assertLessEqual(receipt['native_work']['counts']['edges'],384)
+        frontiers=receipt['native_work']['state_edge_frontiers']
+        self.assertGreaterEqual(len(frontiers),2)
+        self.assertTrue(all(row['spent']['states']<=24 and row['spent']['edges']<=128
+            for row in frontiers))
+        self.assertEqual(sum(row['spent']['states'] for row in frontiers),
+            receipt['native_work']['counts']['states'])
+        self.assertTrue(receipt['search']['state_edge_frontiers_explicit'])
+        self.assertFalse(receipt['search']['window_fairness_guaranteed'])
+        self.assertFalse(receipt['quality_approved'])
+
     def test_no_fixed_heads_preserves_numeric_donors_without_spending_native_inference_on_them(self):
         def unknown(*a,**kw):return replace(scene_native(*a,**kw),heads=())
         with optional_native_scope(monotonic()+90),scene_chart_sensors(),patch.object(source,'observe_native_group',side_effect=unknown):

@@ -202,26 +202,34 @@ class JointGroupBudgetExhausted(ValueError):
 
 
 class JointGroupWorkBudget:
-    """One shared absolute deadline and independently counted work dimensions."""
+    """Shared native/time caps; explicitly bounded scene state/edge frontiers.
+
+    Default callers still own at most one 24-state graph. A normal scene
+    request can explicitly own at most three such graphs, without multiplying
+    the decoder/model/dense/evidence limits or refreshing its absolute clock.
+    Enlarged state caps require a declared active frontier, not a silent reset.
+    """
     def __init__(self,*,absolute_deadline,maximum_states=24,maximum_edges=512,
             maximum_dense_paths=4,maximum_new_decodes=1200,maximum_model_calls=2400,
             maximum_pose_comparisons=4096,
             maximum_pose_evidence_bytes=8*1024*1024,
             maximum_association_nodes=1536, maximum_association_edges=18000,
-            maximum_projected_cache_bytes=64*1024*1024,clock=monotonic):
+            maximum_projected_cache_bytes=64*1024*1024,maximum_frontiers=1,clock=monotonic):
         values=dict(states=maximum_states,edges=maximum_edges,dense_paths=maximum_dense_paths,
             new_decodes=maximum_new_decodes,model_calls=maximum_model_calls,
             pose_comparisons=maximum_pose_comparisons,pose_evidence_bytes=maximum_pose_evidence_bytes,
             association_nodes=maximum_association_nodes,association_edges=maximum_association_edges)
         if (type(absolute_deadline) not in (float,int) or not math.isfinite(absolute_deadline)
                 or any(type(v) is not int or v<1 for v in (*values.values(),maximum_projected_cache_bytes))
-                or maximum_states>24 or maximum_edges>512 or maximum_dense_paths>4
+                or type(maximum_frontiers) is not int or not 1<=maximum_frontiers<=3
+                or maximum_states>24*maximum_frontiers or maximum_edges>512 or maximum_dense_paths>4
                 or maximum_pose_comparisons>4096 or maximum_pose_evidence_bytes>8*1024*1024
                 or maximum_association_nodes>1536 or maximum_association_edges>18000):
             raise ValueError('joint GROUP requires explicit bounded state/edge/dense/decode/model/time budgets')
         self.clock=clock;self.deadline=absolute_deadline;self.limits=values
         self.counts={k:0 for k in values};self.model_calls={}
         self.projected_cache_bytes=maximum_projected_cache_bytes
+        self.maximum_frontiers=maximum_frontiers;self.frontiers=[];self.active_frontier=None
 
     def check(self):
         if self.clock()>=self.deadline:raise JointGroupBudgetExhausted('joint GROUP absolute work deadline reached')
@@ -232,15 +240,54 @@ class JointGroupWorkBudget:
             raise ValueError('unknown or malformed joint GROUP work dimension')
         if kind=='model_calls' and (not isinstance(model,str) or not model):
             raise ValueError('model work must name its measured model')
+        if kind in ('states','edges'):
+            if self.maximum_frontiers>1 and self.active_frontier is None:
+                raise ValueError('multi-frontier state/edge work requires an explicit active frontier')
+            if self.active_frontier is not None and count>self.frontier_remaining(kind):
+                raise JointGroupBudgetExhausted('joint GROUP frontier '+kind+' work budget reached')
         if self.counts[kind]+count>self.limits[kind]:
             raise JointGroupBudgetExhausted('joint GROUP '+kind+' work budget reached')
         self.counts[kind]+=count
         if kind=='model_calls':
             self.model_calls[model]=self.model_calls.get(model,0)+count
 
+    def begin_frontier(self,*,label,maximum_states,maximum_edges):
+        """Declare the next finite graph; keep ALL request work/time counters.
+
+        Only state/edge accounting changes scope. Fixed/donor pixels, model
+        observations, dense checks and proof work keep their shared counters.
+        The previous frontier is closed with its actual spent amounts.
+        """
+        self.check()
+        if (type(label) not in (int,str) or not str(label)
+                or type(maximum_states) is not int or not 1<=maximum_states<=24
+                or type(maximum_edges) is not int or not 1<=maximum_edges<=512):
+            raise ValueError('joint GROUP frontier requires explicit bounded label/state/edge limits')
+        if len(self.frontiers)>=self.maximum_frontiers:
+            raise JointGroupBudgetExhausted('joint GROUP frontier count reached')
+        if self.active_frontier is not None:
+            row=self.frontiers[self.active_frontier]
+            row['spent']={k:self.counts[k]-row['start'][k] for k in ('states','edges')}
+        self.active_frontier=len(self.frontiers)
+        self.frontiers.append(dict(label=label,limits=dict(states=maximum_states,edges=maximum_edges),
+            start={k:self.counts[k] for k in ('states','edges')}))
+
+    def frontier_remaining(self,kind):
+        if kind not in ('states','edges'):
+            raise ValueError('only state/edge work has frontier-local allocation')
+        remaining=self.limits[kind]-self.counts[kind]
+        if self.active_frontier is None:return remaining
+        row=self.frontiers[self.active_frontier]
+        return min(remaining,row['limits'][kind]-(self.counts[kind]-row['start'][kind]))
+
     def to_dict(self):
+        frontiers=[dict(label=row['label'],limits=dict(row['limits']),start=dict(row['start']),
+            spent=dict(row.get('spent',{k:self.counts[k]-row['start'][k] for k in ('states','edges')})))
+            for row in self.frontiers]
         return dict(limits=dict(self.limits),counts=dict(self.counts),model_calls=dict(self.model_calls),
-            absolute_deadline=self.deadline,maximum_projected_cache_bytes=self.projected_cache_bytes)
+            absolute_deadline=self.deadline,maximum_projected_cache_bytes=self.projected_cache_bytes,
+            maximum_frontiers=self.maximum_frontiers,state_edge_frontiers=frontiers,
+            native_and_time_caps_not_multiplied=True)
 
 
 class JointProjectedPixelCache:
