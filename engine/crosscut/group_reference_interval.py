@@ -79,7 +79,7 @@ def _different(left, right, tolerance):
 
 def compare_group_reference_interval(*, reference, candidate, reference_source_clocks,
         candidate_source_clocks, output_intervals, maximum_output_frames=16384,
-        numeric_tolerance=1e-9):
+        maximum_complete_plan_frames=36000, numeric_tolerance=1e-9):
     """Report numeric regressions, without banning a tested better alternative.
 
     Ranges are unique, ordered, disjoint [first, end) OUTPUT ticks. A source
@@ -97,10 +97,15 @@ def compare_group_reference_interval(*, reference, candidate, reference_source_c
             or reference.authorized_shot_video_clocks or candidate.authorized_shot_video_clocks):
         raise ValueError('GROUP reference comparison needs the supported pure hard-cut sampler')
     if (type(maximum_output_frames) is not int or not 1 <= maximum_output_frames <= 16384
+            or type(maximum_complete_plan_frames) is not int or not 1 <= maximum_complete_plan_frames <= 36000
             or type(numeric_tolerance) not in (int, float) or not math.isfinite(numeric_tolerance)
             or not 0 <= numeric_tolerance <= 1e-6 or not isinstance(output_intervals, tuple)
             or not output_intervals):
         raise ValueError('GROUP reference interval policy must be explicit and bounded')
+    # The renderer scheduler materializes each selected render unit's complete
+    # sampler. A tiny liked range must not hide an arbitrarily long unit.
+    if reference.output_frame_count > maximum_complete_plan_frames:
+        raise ValueError('GROUP reference complete-plan sampler exceeds its explicit frame budget')
     previous_end, ticks = -1, []
     for interval in output_intervals:
         if (not isinstance(interval, tuple) or len(interval) != 2

@@ -98,6 +98,10 @@ class GroupReferenceIntervalTests(unittest.TestCase):
                 self.compare(plan, plan, domain, intervals)
         with self.assertRaisesRegex(ValueError, 'frame budget'):
             self.compare(plan, plan, domain, maximum_output_frames=29)
+        with patch('crosscut.group_reference_interval.native_frame_clocks_for_output') as sampler:
+            with self.assertRaisesRegex(ValueError, 'complete-plan sampler'):
+                self.compare(plan, plan, domain, maximum_complete_plan_frames=89)
+            sampler.assert_not_called()
         with self.assertRaisesRegex(ValueError, 'output grid'):
             self.compare(plan, replace(plan, fps=29.97), domain)
         with self.assertRaisesRegex(ValueError, 'verified native clock'):
