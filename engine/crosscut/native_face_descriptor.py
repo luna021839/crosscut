@@ -138,8 +138,10 @@ def register_native_arcface_model(session,model_path):
         expected_asset_sha256=model.asset_sha256,adapter_fingerprint=dict(
         contract='source_native_arcface_r50_512d_similarity_not_semantic_identity_v1',
         implementation_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        geometry_validation_sha256=hashlib.sha256(Path(__file__).with_name('face_identity.py').read_bytes()).hexdigest(),
+        asset_binding_sha256=hashlib.sha256(Path(__file__).with_name('group_joint_observations.py').read_bytes()).hexdigest(),
         model_sha256=ARCFACE_R50_SHA256,onnxruntime_version=ort.__version__,opencv_version=cv2.__version__,
         execution_provider='CPUExecutionProvider',input_size=(112,112),input_color='RGB',
         input_mean=127.5,input_std=127.5,alignment='five_observed_points_proper_similarity_svd',
-        embedding_dimension=512,source_coordinates_clamped=False))
+        embedding_dimension=512,output_normalization='finite_nonzero_l2_unit',source_coordinates_clamped=False))
     return ARCFACE_MODEL_NAME

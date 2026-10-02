@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .group_joint_native_observer import NativeGroupHead
+from .group_joint_observations import _file_identity
 from .visual_score import YUNET_EXPECTED_SHA256, _working_frame
 
 
@@ -86,13 +87,24 @@ def inverse_mapped_head(row, *, working_size_wh, analysis_affine,
 def register_native_head_orientation_models(session, model_path, *, angles=SUPPORTED_ANALYSIS_ROLLS):
     angles = _angles(angles); path = Path(model_path)
     session.budget.check()
+    loaded_identity = _file_identity(path)
     with path.open('rb') as handle:
         digest = hashlib.file_digest(handle,'sha256').hexdigest()
+    if _file_identity(path) != loaded_identity:
+        raise ValueError('native head orientation asset changed while hashing')
     if digest != YUNET_EXPECTED_SHA256:
         raise ValueError('native head orientation differs from the pinned YuNet model')
-    names = []
+    # Load every declared variant before publishing any observer. A change
+    # during a later load must not leave an earlier variant registered stale.
+    detectors = []
     for angle in angles:
+        session.budget.check()
         detector = cv2.FaceDetectorYN.create(str(path),'',(960,540),.76,.3,5000)
+        if _file_identity(path) != loaded_identity:
+            raise ValueError('native head orientation asset changed during model loading')
+        detectors.append(detector)
+    names = []
+    for angle, detector in zip(angles, detectors, strict=True):
         name = _model_name(angle); names.append(name)
         def observe(pixels, *, _angle=angle, _detector=detector):
             working = _working_frame(pixels,maximum_width=960)
@@ -110,9 +122,12 @@ def register_native_head_orientation_models(session, model_path, *, angles=SUPPO
                 for index,row in enumerate(rows))
         # One registered call is exactly one actual detector invocation. The
         # ensemble is never hidden inside a single model-budget debit.
-        session.register_model(name,path,observe,adapter_fingerprint=dict(
+        session.register_model(name,path,observe,expected_file_identity=loaded_identity,
+            expected_asset_sha256=YUNET_EXPECTED_SHA256,adapter_fingerprint=dict(
             contract='original_source_inverse_mapped_analysis_roll_face_alternatives_v1',
             implementation_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            working_frame_sha256=hashlib.sha256(Path(__file__).with_name('visual_score.py').read_bytes()).hexdigest(),
+            asset_binding_sha256=hashlib.sha256(Path(__file__).with_name('group_joint_observations.py').read_bytes()).hexdigest(),
             opencv_version=cv2.__version__,angle=angle,maximum_width=960,
             confidence=.76,nms=.3,top_k=5000,interpolation='linear',border='constant_zero',
             center_basis='working_raster_pixel_centers'))

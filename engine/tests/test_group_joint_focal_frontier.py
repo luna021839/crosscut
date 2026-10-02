@@ -313,7 +313,7 @@ class FocalFrontierTests(unittest.TestCase):
                 self.assertEqual(path, (values[0][0],)*3)
                 self.assertFalse(report['part_feature_ownership_verified'])
 
-    def test_failed_pair_is_cached_and_cut_or_repeated_native_is_not_linked(self):
+    def test_failed_pair_and_cut_stay_unlinked_but_exact_repeat_is_identity_alias(self):
         session, rows, values = self.graph_fixture((100, 50))
         graph = NativeFocalLinkGraph(session)
         with patch('crosscut.group_joint_focal_frontier.focal_landmarks_track', return_value=False) as flow, \
@@ -327,7 +327,10 @@ class FocalFrontierTests(unittest.TestCase):
             right = own_rows[0] if not cut else own_rows[1]
             graph = NativeFocalLinkGraph(session)
             graph.add_pair(own_rows[0], right, own_values[0], own_values[1])
-            self.assertFalse(graph.path_available((own_rows[0], right), (own_values[0][0], own_values[1][0])))
+            self.assertEqual(graph.path_available((own_rows[0], right),
+                (own_values[0][0], own_values[1][0])), not bool(cut))
+            self.assertFalse(graph.path_available((own_rows[0], right),
+                (own_values[0][0], own_values[1][1])))
             session.native_pixels.assert_not_called()
 
     def test_pair_graph_rejects_changed_pixels_and_live_binding_even_with_recomputed_row_hash(self):

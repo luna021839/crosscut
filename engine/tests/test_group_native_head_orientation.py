@@ -65,7 +65,10 @@ class NativeHeadOrientationTests(unittest.TestCase):
         session=SimpleNamespace(budget=budget,domain=domain,models={},model_adapters={},callbacks={},
             _assert_source_identity=Mock(return_value=(1,2,3,4,5)),
             native_pixels=Mock(return_value=pixels))
-        def register(name,path,observer,adapter_fingerprint):
+        def register(name,path,observer,adapter_fingerprint,expected_file_identity,expected_asset_sha256):
+            from crosscut.group_joint_observations import _file_identity
+            self.assertEqual(_file_identity(path),expected_file_identity)
+            self.assertEqual(hashlib.sha256(Path(path).read_bytes()).hexdigest(),expected_asset_sha256)
             session.models[name]=(Path(path),observer,hashlib.sha256(Path(path).read_bytes()).hexdigest())
             session.model_adapters[name]='a'*64;session.callbacks[name]=observer
         session.register_model=Mock(side_effect=register)
