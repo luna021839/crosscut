@@ -106,6 +106,9 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
                     return replace(candidate,performer_family_review=receipt)
                 return candidate
             stack.enter_context(patch.object(family,'propose_performer_family',side_effect=proposer))
+            from crosscut import group_scene_selected_replay as selected_replay
+            from engine.tests.test_scene_source_owner import scene_chart_selected_replay
+            stack.enter_context(patch.object(selected_replay,'replay_selected_scene',new=scene_chart_selected_replay))
             stack.enter_context(patch.object(source,'final_live_replay',new=scene_chart_final))
             stack.enter_context(patch('crosscut.pipeline._apply_bounded_human_target_proxy_rank'))
             def montage(**kw):
@@ -164,7 +167,7 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
 
     def test_source_change_reaches_real_normal_renderer_and_original_failing_qa(self):
         baseline,manifest,reports,rendered,calls,failure=self.run_normal()
-        self.assertEqual(len(calls),2,failure)
+        self.assertEqual(len(calls),1,failure)
         self.assertGreaterEqual(len(rendered),2,failure)
         chosen=manifest['rendered_candidate_selection']['complete_candidates'][0]
         self.assertEqual(chosen['candidate_origin'],source.CONTRACT,failure)
@@ -189,7 +192,7 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
 
     def test_tampered_child_preserves_original_full_families_through_real_normal_renderer(self):
         baseline,manifest,reports,rendered,calls,failure=self.run_normal(corrupt_parent=True)
-        self.assertEqual(len(calls),2,failure)
+        self.assertEqual(len(calls),1,failure)
         self.assertGreaterEqual(len(rendered),2,failure)
         chosen=manifest['rendered_candidate_selection']['complete_candidates'][0]
         self.assertNotEqual(chosen['candidate_origin'],source.CONTRACT)

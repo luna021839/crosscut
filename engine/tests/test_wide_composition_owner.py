@@ -28,6 +28,7 @@ from crosscut import group_scene_source_owner as scene
 from crosscut import group_scene_observations as observations
 from crosscut import group_scene_composition as composition
 from crosscut import group_scene_editorial_policy as policy
+from crosscut import group_scene_selected_replay as selected_replay
 from crosscut.group_scene_intent import role_from_cells, declared_shot_intent, validate_intent
 from crosscut.group_scene_role_obligations import scene_role_obligations
 from crosscut.group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget
@@ -156,6 +157,12 @@ def wide_chart_propose(context):
 def wide_chart_final(plan_json,receipt,deadline):
     with wide_chart_sensors():
         return source.final_live_replay.__wrapped__(plan_json,receipt,deadline)
+
+
+@isolated_optional()
+def wide_chart_selected_replay(context,candidate):
+    with wide_chart_sensors():
+        return selected_replay.replay_selected_scene.__wrapped__(context,candidate)
 
 
 def partial_chart_detector(pixels):
@@ -361,6 +368,57 @@ class WideOwnerIntegrationTests(unittest.TestCase):
                 family.plain(self.result.performer_family_review),self.context.deadline)
         self.assertGreaterEqual(metrics['dense_native_output_tick_count'],60)
         self.assertIs(metrics['quality_approved'],False)
+
+    def test_parent_replays_frozen_program_not_whole_donor_search(self):
+        self.dense()
+        with optional_native_scope(self.context.deadline), \
+                patch.object(selected_replay,'replay_selected_scene',new=wide_chart_selected_replay), \
+                patch.object(family,'propose_performer_family',side_effect=AssertionError('selected parent must not search again')):
+            proof=source.validate_parent(self.result,self.context)
+        self.assertTrue(proof['fresh_complete_family_equal'])
+        self.assertFalse(proof['unselected_donor_search_repeated'])
+        self.assertTrue(proof['unselected_discovery_archive_preserved_not_reobserved'])
+        self.assertEqual(proof['native_work']['counts']['states'],0)
+        self.assertEqual(proof['native_work']['counts']['dense_paths'],1)
+        self.assertLess(len(proof['raw_scene_observed_request_source_indices']),8)
+        self.assertFalse(proof['quality_approved'])
+
+    def test_rehashed_baseline_hypothesis_omission_is_not_newly_unknown_gain(self):
+        self.dense();receipt=family.plain(self.result.performer_family_review)
+        program=receipt['selected_scene_program']
+        program['baseline_hypothesis_keys'][1]=[]
+        payload=dict(program);payload.pop('program_sha256')
+        program['program_sha256']=family.digest(payload)
+        altered=replace(self.result,performer_family_review=receipt)
+        with optional_native_scope(self.context.deadline), \
+                patch.object(selected_replay,'replay_selected_scene',new=wide_chart_selected_replay), \
+                patch.object(family,'propose_performer_family',side_effect=AssertionError('no fallback search')):
+            with self.assertRaisesRegex((ValueError,RuntimeError),'baseline hypotheses changed'):
+                source.validate_parent(altered,self.context)
+
+    def test_missing_program_or_rehashed_weakened_role_rejected_before_worker(self):
+        for mode in ('missing','role'):
+            receipt=family.plain(self.result.performer_family_review)
+            if mode=='missing':receipt.pop('selected_scene_program')
+            else:
+                program=receipt['selected_scene_program']
+                program['baseline_states'][1]['key_preimage']['role']=GroupOutputRole.FOCAL_HEAD.value
+                payload=dict(program);payload.pop('program_sha256')
+                program['program_sha256']=family.digest(payload)
+            altered=replace(self.result,performer_family_review=receipt)
+            with self.subTest(mode=mode),patch.object(selected_replay,'replay_selected_scene',
+                    side_effect=AssertionError('malformed program cannot reach a worker')):
+                with self.assertRaises(ValueError):source.validate_binding(altered)
+
+    def test_rehashed_unrelated_numeric_plan_edit_fails_before_model_observation(self):
+        receipt=family.plain(self.result.performer_family_review)
+        program=receipt['selected_scene_program']
+        program['numeric_plan']['transitions'][-1]['reason']='EXPLICIT_UNRELATED_TRANSITION_CORRUPTION'
+        payload=dict(program);payload.pop('program_sha256');program['program_sha256']=family.digest(payload)
+        altered=replace(self.result,performer_family_review=receipt)
+        with patch.object(source,'installed_native_assets',side_effect=AssertionError('numeric preimage must fail before assets')):
+            with self.assertRaisesRegex(ValueError,'unrelated clock/camera/transition'):
+                selected_replay.replay_selected_scene.__wrapped__(self.context,altered)
 
     def test_partial_actual_roi_paths_reach_normal_owner_and_final_replay(self):
         with optional_native_scope(self.context.deadline),wide_chart_sensors(detector=partial_chart_detector):

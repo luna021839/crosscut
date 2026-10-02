@@ -499,7 +499,8 @@ def _fresh_face(context,plan,timeline,observed,dense,changed,refreshed):
     return replace(context.incumbent.face_match_plan,segments=tuple(rows))
 
 
-def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edge_rows,search_record):
+def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edge_rows,search_record,
+        *,frozen_scene_discovery=None):
     """Every enabled supported family is fresh before a candidate reaches CAS."""
     from .group_joint_render_observations import refresh_joint_group_render_observations
     from .group_boundary_evidence_preservation import preserve_boundary_evidence
@@ -550,10 +551,16 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if context.source_derivative_binding is not None:
         dense.update(source_derivative_binding=context.source_derivative_binding,
             derivative_window_source_indices=[s.eligible_source_index for s in final_states])
+    selected_program=None
     if scene:
+        selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json())
+        if family.digest(selected_program['selected_states']) != family.digest([s.to_dict() for s in path]):
+            raise ValueError('scene completion changed the frozen selected program')
+        selected_program['program_sha256']=family.digest(selected_program)
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
             hypothesis_keys=[s.editorial_contract_sha256 for s in path],
-            scene_discovery=sensors.archive(),source_derivative_binding=context.source_derivative_binding)
+            scene_discovery=sensors.archive() if frozen_scene_discovery is None else frozen_scene_discovery,
+            source_derivative_binding=context.source_derivative_binding)
     motion=_fresh_motion(context,plan,observations.timeline,changed,edges,dense)
     face=_fresh_face(context,plan,observations.timeline,observed,dense,changed,refreshed)
     repairs,affine,preserved=preserve_boundary_evidence(old_plan=old.render_plan,new_plan=plan,
@@ -591,6 +598,8 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         search=search_record,native_work=session.budget.to_dict(),
         resource_scope='single_native_session_only_legacy_refresh_parent_and_final_qa_counters_not_aggregated',
         final_quality_status='UNAPPROVED_PERFORMER_REVIEW_CANDIDATE')
+    if scene:
+        receipt['selected_scene_program']=selected_program
     candidate=replace(candidate,performer_family_review=receipt)
     _validate_review_first_group_bundle(candidate,eligible_indices=context.domain.eligible_indices,
         offsets=context.domain.audio_offsets,timewarps=context.domain.source_timewarps,
@@ -823,7 +832,9 @@ def validate_binding(bundle):
     validate_dense_uncertainty(dense)
     if dense['contract']==SCENE_DENSE_CONTRACT:
         from .group_scene_observations import validate_scene_dense
+        from .group_scene_selected_replay import validate_program
         validate_scene_dense(dense)
+        validate_program(receipt.get('selected_scene_program'),dense)
     static=dense.get('predeclared_source_static_looks')
     if (not isinstance(static,list) or any(not isinstance(row,dict)
             or type(row.get('request_source_index')) is not int
@@ -865,7 +876,12 @@ def validate_parent(candidate,context):
             if shot is None or h.get('shot_intent')!=declared_shot_intent(context,shot,
                     endpoint_scope=h.get('endpoint_scope','whole')):
                 raise ValueError('scene child role intent differs from the original output-owned shot')
-    replay=family.propose_performer_family(context)  # independent isolated worker, same absolute deadline
+    if receipt['source_camera_refresh']['contract']==SCENE_DENSE_CONTRACT:
+        from .group_scene_selected_replay import replay_selected_scene
+        proof=replay_selected_scene(context,candidate)
+        family._fresh(context)
+        return proof
+    replay=family.propose_performer_family(context)  # legacy independent isolated worker
     if isinstance(replay,family.PerformerFamilyRejection):
         raise ValueError('source-changing parent independent replay rejected: '+replay.error)
     if candidate.to_dict()!=replay.to_dict() or candidate.render_plan!=replay.render_plan:
@@ -897,7 +913,9 @@ def final_live_replay(plan_json,receipt,deadline):
     try:
         if dense['contract']==SCENE_DENSE_CONTRACT:
             from .group_scene_observations import SceneSensors, validate_scene_dense
+            from .group_scene_selected_replay import validate_program
             validate_scene_dense(dense)
+            validate_program(receipt.get('selected_scene_program'),dense)
             sensors=SceneSensors(session,assets)
             sensors.hypotheses=dict(dense['scene_hypotheses'])
             keys=dense['hypothesis_keys']

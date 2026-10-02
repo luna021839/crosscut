@@ -190,6 +190,12 @@ def scene_chart_final(plan_json,receipt,deadline):
     with scene_chart_sensors():return _REAL_FINAL(plan_json,receipt,deadline)
 
 
+@isolated_optional()
+def scene_chart_selected_replay(context,candidate):
+    from crosscut.group_scene_selected_replay import replay_selected_scene
+    with scene_chart_sensors():return replay_selected_scene.__wrapped__(context,candidate)
+
+
 class ScenePureContractTests(unittest.TestCase):
     def test_unknown_and_same_family_are_not_independent(self):
         result=scene_derivative_fixture(3)

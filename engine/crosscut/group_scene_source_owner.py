@@ -208,6 +208,39 @@ def _native_target(row):
     return x,y,max(b[0]+b[2] for b in boxes)-x,max(b[1]+b[3] for b in boxes)-y
 
 
+def preserve_incumbent_required_parts(sensors, baseline, path, dense):
+    """Recheck known old duties on every changed output tick, not cast counts."""
+    preserved=[]
+    for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
+        for row in span['rows']:
+            raw=sensors.raw(old,row['output_tick'],None)
+            if old.role==GroupOutputRole.COMPOSITION:
+                people=();old_subject_state='raw_native_roi_inventory_not_cross_camera_cast_duty'
+            elif old.role==GroupOutputRole.FORMATION:
+                people=raw.people;old_subject_state='formation_cohort'
+            else:
+                try:
+                    _,person=source._dominant(raw,GroupOutputRole.FOCAL_HEAD)
+                    people=() if person is None else (person,)
+                    old_subject_state='unknown_body_owner' if person is None else 'unique_native_focal_owner'
+                except ValueError:
+                    people=();old_subject_state='unknown_native_focal_assignment'
+            required=Counter(name for p in people for name,status in getattr(p,'part_states',())
+                if name in ('left_arm','right_arm') and status=='observed')
+            if old.role==GroupOutputRole.FOCAL_HEAD_ARMS:
+                required|=Counter(left_arm=1,right_arm=1)
+            actual=Counter(a['part'] for a in row['projected_observed_arms'] if a['required_by_role'])
+            if any(actual[name]<count for name,count in required.items()):
+                raise ValueError('scene source change loses an incumbent observed arm')
+            preserved.append(dict(output_tick=row['output_tick'],required_parts=dict(sorted(required.items())),
+                incumbent_subject_scope=old_subject_state,
+                all_incumbent_raw_people_retained=len(raw.people),
+                detector_count_is_not_cross_camera_cast_obligation=True,
+                part_count_is_not_cross_camera_actor_correspondence=True,
+                native_observation_sha256=raw.sha256,absence_is_not_a_negative_detection_certificate=True))
+    return preserved
+
+
 def propose_scene_changes(context):
     attempts=[];numeric_inventory=[];alternatives=[];session=None;sensors=None
     def rejected(error):
@@ -456,37 +489,7 @@ def propose_scene_changes(context):
                     dense=sensors.dense(path)
                     # Per-tick known incumbent parts are preserved independent
                     # of whether its old dominant face was decisive.
-                    preserved=[]
-                    for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
-                        for row in span['rows']:
-                            raw=sensors.raw(old,row['output_tick'],None)
-                            if old.role==GroupOutputRole.COMPOSITION:
-                                # All old raw rectangles remain archived, but their
-                                # detector count is not a cross-camera cast duty.
-                                # Dense candidate visibility and actual ROI support
-                                # are independently required on its own pixels.
-                                people=();old_subject_state='raw_native_roi_inventory_not_cross_camera_cast_duty'
-                            elif old.role==GroupOutputRole.FORMATION:
-                                people=raw.people;old_subject_state='formation_cohort'
-                            else:
-                                try:
-                                    _,person=source._dominant(raw,GroupOutputRole.FOCAL_HEAD)
-                                    people=() if person is None else (person,)
-                                    old_subject_state='unknown_body_owner' if person is None else 'unique_native_focal_owner'
-                                except ValueError:
-                                    people=();old_subject_state='unknown_native_focal_assignment'
-                            required=Counter(name for p in people for name,status in getattr(p,'part_states',())
-                                if name in ('left_arm','right_arm') and status=='observed')
-                            if old.role==GroupOutputRole.FOCAL_HEAD_ARMS:
-                                required|=Counter(left_arm=1,right_arm=1)
-                            actual=Counter(a['part'] for a in row['projected_observed_arms'] if a['required_by_role'])
-                            if any(actual[name]<count for name,count in required.items()):raise ValueError('scene source change loses an incumbent observed arm')
-                            preserved.append(dict(output_tick=row['output_tick'],required_parts=dict(sorted(required.items())),
-                                incumbent_subject_scope=old_subject_state,
-                                all_incumbent_raw_people_retained=len(raw.people),
-                                detector_count_is_not_cross_camera_cast_obligation=True,
-                                part_count_is_not_cross_camera_actor_correspondence=True,
-                                native_observation_sha256=raw.sha256,absence_is_not_a_negative_detection_certificate=True))
+                    preserved=preserve_incumbent_required_parts(sensors,baseline,path,dense)
                     search=dict(producer=CONTRACT,generated_numeric_states=numeric['states'],
                         numeric_inventory=numeric_inventory,prior_solo_success_required=False,
                         fixed_geometry_unchanged=True,baseline_components={str(k):v for k,v in known.items()},
@@ -506,6 +509,11 @@ def propose_scene_changes(context):
                         bounded_edge_frontier_attempts=[a for a in attempts if a.get('stage')=='bounded_edge_frontier'],
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,
                         reserve_check_basis="before_window_only_not_hard_phase_partition")
+                    search['scene_replay_program']=dict(contract='frozen_scene_source_camera_program_v1',
+                        selected_states=[s.to_dict() for s in path],baseline_states=[s.to_dict() for s in baseline],
+                        baseline_hypothesis_keys=[[s.editorial_contract_sha256 for s in group]
+                            for group in baseline_hypotheses],analysis_rolls=list(rolls),
+                        composition_window=composition_window,quality_approved=False)
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)
                     alternative['status']='complete_unapproved'
                     return result

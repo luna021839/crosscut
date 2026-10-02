@@ -647,8 +647,13 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
             archive.update(status='pending_independent_parent_replay',candidate_bundle=candidate.to_dict(),
                 candidate_plan=candidate.render_plan.to_json())
             publish()
+            def parent_checked(value):
+                proof=validate_parent(value,context)
+                if proof is not None:
+                    archive['independent_parent_replay']=proof
+                    publish()
             controller.compare_and_promote(candidate,plan=candidate.render_plan,authority=candidate.candidate_origin,
-                token=context.token,validate=lambda value:validate_parent(value,context))
+                token=context.token,validate=parent_checked)
             # The pre-CAS durable record is authoritative. Journal owns commit.
             return candidate
         except Exception as exc:
