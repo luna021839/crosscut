@@ -20494,6 +20494,11 @@ class _GroupRenderCandidateBundle:
                 if self.boundary_look_match is not None
                 else None
             ),
+            "dynamic_crop_application": (
+                _thaw_audit_value(self.dynamic_crop_application)
+                if self.dynamic_crop_application is not None
+                else None
+            ),
             "output_geometry_deferral": (
                 deepcopy(dict(self.output_geometry_deferral))
                 if self.output_geometry_deferral is not None

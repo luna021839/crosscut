@@ -177,6 +177,39 @@ class JointCompleteMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no-op'):
             complete_joint_group_bundle_metadata(**dict(args, observations=rows))
 
+    def test_serialized_complete_owner_keeps_frozen_dynamic_crop_authority(self):
+        baseline = self.fixture(no_op=True)['incumbent']
+        source = {'revision': 'first', 'camera': {'source_indices': [1, 2]}}
+        owned = replace(baseline, dynamic_crop_application=source)
+        source['camera']['source_indices'][0] = 999
+        serialized = owned.to_dict()
+        self.assertEqual(serialized['dynamic_crop_application'],
+            {'revision': 'first', 'camera': {'source_indices': [1, 2]}})
+        serialized['dynamic_crop_application']['camera']['source_indices'][0] = 555
+        self.assertEqual(owned.to_dict()['dynamic_crop_application']['camera']['source_indices'], [1, 2])
+        self.assertIsNone(baseline.to_dict()['dynamic_crop_application'])
+
+    def test_dynamic_crop_only_owner_change_invalidates_full_bundle_transaction(self):
+        from crosscut.first_result_controller import FirstResultController
+        from crosscut.review_first_runtime import ReviewFirstRuntime
+        baseline = self.fixture(no_op=True)['incumbent']
+        before = replace(baseline, dynamic_crop_application={'revision': 'first'})
+        after = replace(baseline, dynamic_crop_application={'revision': 'second'})
+        plan = baseline.render_plan
+        controller = FirstResultController(ReviewFirstRuntime(enabled=True),
+            sources=plan.sources, source_durations=(10.,)*len(plan.sources),
+            master_start=plan.master_audio_start, duration=plan.duration)
+        controller.install_baseline(before, plan=plan, authority='synthetic-complete-owner')
+        token = controller.transaction_token()
+        # Adversarial in-place owner replacement, without a revision bump:
+        # content comparison must still catch the changed learned authority.
+        controller.incumbent = after
+        self.assertNotEqual(controller.transaction_token().content_sha256, token.content_sha256)
+        with self.assertRaisesRegex(ValueError, 'before parent validation'):
+            controller.compare_and_promote(before, plan=plan, authority='stale', token=token,
+                validate=lambda _: self.fail('stale camera authority reached the validator'))
+        self.assertIs(controller.incumbent, after)
+
 
 if __name__ == '__main__':
     unittest.main()
