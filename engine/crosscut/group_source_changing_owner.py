@@ -49,6 +49,8 @@ from .render import segment_frame_counts
 
 CONTRACT = 'normal_source_changing_family_owner_v1'
 DENSE_CONTRACT = 'source_native_focal_whole_camera_refresh_v1'
+SCENE_DENSE_CONTRACT = 'source_native_scene_whole_camera_refresh_v2'
+DENSE_CONTRACTS = (DENSE_CONTRACT, SCENE_DENSE_CONTRACT)
 MAX_REFRESHED_CELLS = 24
 MAX_MUTABLE_FRAMES = 300
 MAX_SOURCES = 8
@@ -491,14 +493,18 @@ def _fresh_face(context,plan,timeline,observed,dense,changed,refreshed):
                 basis=observed['basis'])) if i in refreshed else old)
             continue
         raw=[samples[t] for t in range(offsets[i],offsets[i+1])]
-        height=median(r['raw_face_roi_xywh'][3] for r in raw)
+        is_formation = all(r['role']==GroupOutputRole.FORMATION.value for r in raw)
+        height=None if is_formation else median(r['raw_face_roi_xywh'][3] for r in raw)
+        silhouette=(median(max(p['box_xywh'][1]+p['box_xywh'][3] for p in r['native_observation']['people'])
+            -min(p['box_xywh'][1] for p in r['native_observation']['people']) for r in raw) if is_formation else None)
         pan=plan.segments[i].pan_crop
         zoom=median(1./_fixed_crop_at(pan,(t-offsets[i])/plan.fps)[3]
             for t in range(offsets[i],offsets[i+1])) if pan else 1.
         rows.append(FaceMatchSegment(i,timeline.choices[i].source_index,pan is not None,
             None if pan else 'fresh_face_fit_owned_by_whole_editorial_camera',height,
-            old.target_face_height,old.target_face_height/height if old.target_face_height else None,
-            zoom,pan,alignment_subject='face',continuous_run_stitched=any(
+            None if is_formation else old.target_face_height,old.target_face_height/height if old.target_face_height and height else None,
+            zoom,pan,alignment_subject='formation' if is_formation else 'face',
+            observed_silhouette_height=silhouette,continuous_run_stitched=any(
                 span['first_output_frame']<=offsets[i] and span['end_output_frame']>=offsets[i+1]
                 and (span['first_output_frame']<offsets[i] or span['end_output_frame']>offsets[i+1])
                 for span in dense['mutable_shots']),
@@ -515,6 +521,9 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     from .pipeline import _deterministic_exact_shot_clock_from_timeline,_validate_review_first_group_bundle
     from .timeline_review import review_timeline
     from .group_transition import GroupTransitionPlan
+    if context.source_derivative_binding is not None:
+        from .group_scene_source_owner import validate_bound_derivative_path
+        validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
     old=context.incumbent
     observations=refresh_joint_group_render_observations.__wrapped__(plan=old.render_plan,
         timeline=old.visual_timeline,domain=context.domain,path=path,sync_scores=context.sync_scores,
@@ -532,8 +541,10 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if geometry_payload(plan)!=geometry_payload(proposed):
         raise ValueError('look refresh changed an admitted source clock/camera')
     final_states=tuple(joint_state_from_render_plan(plan=plan,domain=context.domain,slot=s.slot,
-        first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role) for s in path)
-    dense=dict(contract=DENSE_CONTRACT,geometry_sha256=family.digest(geometry_payload(plan)),
+        first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
+        editorial_contract_sha256=s.editorial_contract_sha256) for s in path)
+    scene = getattr(sensors,'scene_family',False)
+    dense=dict(contract=SCENE_DENSE_CONTRACT if scene else DENSE_CONTRACT,geometry_sha256=family.digest(geometry_payload(plan)),
         changed_cells=list(changed),incident_edges=list(edges),state_keys=[s.key for s in final_states],
         window_bounds=[[s.first_output_frame,s.end_output_frame] for s in final_states],
         roles=[s.role.value for s in final_states],mutable_shots=dense_rows,
@@ -543,6 +554,13 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         every_mutable_output_tick_observed=True,face_roi_is_not_physical_head_extent=True,
         semantic_raw_v2_admission=False,cross_camera_identity_certified=False,body_phase_certified=False,
         decoded_output_quality_certified=False,quality_approved=False)
+    if context.source_derivative_binding is not None:
+        dense.update(source_derivative_binding=context.source_derivative_binding,
+            derivative_window_source_indices=[s.eligible_source_index for s in final_states])
+    if scene:
+        dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
+            hypothesis_keys=[s.editorial_contract_sha256 for s in path],
+            scene_discovery=sensors.archive(),source_derivative_binding=context.source_derivative_binding)
     motion=_fresh_motion(context,plan,observations.timeline,changed,edges,dense)
     face=_fresh_face(context,plan,observations.timeline,observed,dense,changed,refreshed)
     repairs,affine,preserved=preserve_boundary_evidence(old_plan=old.render_plan,new_plan=plan,
@@ -677,6 +695,11 @@ def propose_source_changes(context):
                     baseline_observed[b.first_output_frame]=read_edge(a,b)[0]
                 def edge(a,b,budget):
                     if a.eligible_source_index==b.eligible_source_index: return None
+                    if context.source_derivative_binding is not None:
+                        from .group_scene_source_owner import relation
+                        from .source_derivative_diversity import DERIVATIVE_DISTINCT
+                        if relation(context.source_derivative_binding,a.eligible_source_index,b.eligible_source_index)!=DERIVATIVE_DISTINCT:
+                            return None
                     observed,raw=read_edge(a,b)
                     if observed is None or observed.face_metrics is None: return None
                     before=baseline_observed.get(b.first_output_frame)
@@ -769,7 +792,7 @@ def propose_source_changes(context):
 
 
 def validate_dense_uncertainty(dense):
-    if (not isinstance(dense,dict) or dense.get('contract')!=DENSE_CONTRACT
+    if (not isinstance(dense,dict) or dense.get('contract') not in DENSE_CONTRACTS
             or dense.get('every_mutable_output_tick_observed') is not True
             or dense.get('face_roi_is_not_physical_head_extent') is not True
             or any(dense.get(k) is not False for k in ('semantic_raw_v2_admission',
@@ -777,6 +800,9 @@ def validate_dense_uncertainty(dense):
                 'decoded_output_quality_certified','quality_approved'))
             or not isinstance(dense.get('mutable_shots'),list) or not 1<=len(dense['mutable_shots'])<=2):
         raise ValueError('fresh native family cannot acquire semantic or quality authority')
+    if dense.get('source_derivative_binding') is not None:
+        from .group_scene_source_owner import validate_bound_derivative_path
+        validate_bound_derivative_path(dense['source_derivative_binding'],dense.get('derivative_window_source_indices',[]))
     for span in dense['mutable_shots']:
         rows=span.get('rows')
         if not isinstance(rows,list) or not 1<=len(rows)<=MAX_MUTABLE_FRAMES:
@@ -798,10 +824,13 @@ def validate_binding(bundle):
             or receipt.get('plan_sha256')!=family.digest(family.plan_payload(bundle.render_plan))
             or receipt.get('metadata_sha256')!=family.digest(family.metadata_payload(bundle))
             or dense!=receipt.get('source_camera_refresh')
-            or dense.get('contract')!=DENSE_CONTRACT
+            or dense.get('contract') not in DENSE_CONTRACTS
             or dense.get('geometry_sha256')!=family.digest(geometry_payload(bundle.render_plan))):
         raise ValueError('source-changing complete camera/family/uncertainty binding changed')
     validate_dense_uncertainty(dense)
+    if dense['contract']==SCENE_DENSE_CONTRACT:
+        from .group_scene_observations import validate_scene_dense
+        validate_scene_dense(dense)
     static=dense.get('predeclared_source_static_looks')
     if (not isinstance(static,list) or any(not isinstance(row,dict)
             or type(row.get('request_source_index')) is not int
@@ -817,7 +846,9 @@ def validate_binding(bundle):
     for span in dense['mutable_shots']:
         if [r['output_tick'] for r in span['rows']]!=list(range(span['first_output_frame'],span['end_output_frame'])):
             raise ValueError('source-changing dense family omitted an output tick')
-        if any(r['face_roi_visible_fraction']<.995 or r['role']!=span['role'] for r in span['rows']):
+        if any((r['face_roi_visible_fraction'] is None if r['role']!=GroupOutputRole.FORMATION.value else False)
+                or (r['face_roi_visible_fraction'] is not None and r['face_roi_visible_fraction']<.995)
+                or r['role']!=span['role'] for r in span['rows']):
             raise ValueError('source-changing dense family lost required role/face visibility')
 
 
@@ -830,6 +861,8 @@ def validate_parent(candidate,context):
             or receipt['synchronization_scores']!=list(context.sync_scores)
             or receipt['original_metadata_sha256']!=family.digest(family.metadata_payload(context.incumbent))):
         raise ValueError('source-changing parent preimage changed')
+    if context.source_derivative_binding is not None and receipt['source_camera_refresh'].get('source_derivative_binding')!=context.source_derivative_binding:
+        raise ValueError('scene parent derivative preimage changed')
     replay=family.propose_performer_family(context)  # independent isolated worker, same absolute deadline
     if isinstance(replay,family.PerformerFamilyRejection):
         raise ValueError('source-changing parent independent replay rejected: '+replay.error)
@@ -860,9 +893,33 @@ def final_live_replay(plan_json,receipt,deadline):
     session=GroupJointObservationSession(domain=domain,budget=JointGroupWorkBudget(
         absolute_deadline=deadline,**WORK_LIMITS),maximum_raw_cache_bytes=32*1024*1024)
     try:
-        sensors=NativeFamilySensors(session,assets,frozen_declarations=dense['pre_camera_native_declarations'])
+        if dense['contract']==SCENE_DENSE_CONTRACT:
+            from .group_scene_observations import SceneSensors, validate_scene_dense
+            validate_scene_dense(dense)
+            sensors=SceneSensors(session,assets)
+            sensors.hypotheses=dict(dense['scene_hypotheses'])
+            keys=dense['hypothesis_keys']
+        else:
+            sensors=NativeFamilySensors(session,assets,frozen_declarations=dense['pre_camera_native_declarations'])
+            keys=[None]*len(dense['window_bounds'])
         path=tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=i,first_output_frame=b[0],
-            end_output_frame=b[1],role=GroupOutputRole(dense['roles'][i])) for i,b in enumerate(dense['window_bounds']))
+            end_output_frame=b[1],role=GroupOutputRole(dense['roles'][i]),
+            editorial_contract_sha256=keys[i]) for i,b in enumerate(dense['window_bounds']))
+        if dense['contract']==SCENE_DENSE_CONTRACT:
+            # Fresh original pixels and observations also bind FIXED neighbors;
+            # child hashes alone are insufficient to establish scene hypotheses.
+            for state in path:
+                h=sensors.hypothesis(state)
+                fresh=[sensors.raw(state,t,h['analysis_roll']).sha256 for t in h['anchor_output_ticks']]
+                if fresh!=h['raw_observation_sha256']:
+                    raise ValueError('scene final fixed/mutable anchor observations changed')
+                if state.role!=GroupOutputRole.FORMATION:
+                    for i in range(0,len(h['anchor_output_ticks']),2):
+                        j=i+1
+                        a=sensors.raw(state,h['anchor_output_ticks'][i],h['analysis_roll'])
+                        b=sensors.raw(state,h['anchor_output_ticks'][j],h['analysis_roll'])
+                        if h['anchor_head_ids'][i:i+2] not in sensors._head_links(a,b)['unique_links']:
+                            raise ValueError('scene final fixed/mutable head pixel hypothesis changed')
         if [s.key for s in path]!=dense['state_keys'] or family.digest(sensors.dense(path))!=family.digest(dense['mutable_shots']):
             raise ValueError('source-changing final all-tick native/camera replay disagrees')
     finally: session.close()

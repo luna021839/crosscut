@@ -131,6 +131,7 @@ class PerformerFamilyContext:
     sync_scores: tuple[float, ...]
     cache_directory: Path | None = None
     derived_cache_directory: Path | None = None
+    source_derivative_binding: Any = None
 
 
 def _supported(bundle):
@@ -162,7 +163,7 @@ def _supported(bundle):
         raise ValueError('performer owner numeric schedule exceeds its explicit frame budget')
 
 
-def freeze_context(*, controller, request, eligible_indices, offsets, timewarps, scene_cut_times, sync_scores):
+def freeze_context(*, controller, request, eligible_indices, offsets, timewarps, scene_cut_times, sync_scores, source_derivatives=None):
     from .pipeline import _validate_review_first_group_bundle
     incumbent = controller.incumbent
     _supported(incumbent)
@@ -184,10 +185,12 @@ def freeze_context(*, controller, request, eligible_indices, offsets, timewarps,
         raise ValueError('performer source changed during native clock preparation')
     domain = GroupSourceDomain(tuple(sources), tuple(eligible_indices), tuple(offsets),
         tuple(timewarps), tuple(tuple(v) for v in scene_cut_times), clocks)
+    from .group_scene_source_owner import freeze_derivatives
+    derivative_binding = freeze_derivatives(source_derivatives, domain, identities)
     return PerformerFamilyContext(incumbent, domain, identities, tuple(sorted(dependencies(model).items())),
         model, _file_identity(model), _file_hash(model), controller.transaction_token(), deadline, tuple(sync_scores),
         getattr(request, 'source_cache_directory', None),
-        getattr(request, 'visual_feature_derived_cache_directory', None))
+        getattr(request, 'visual_feature_derived_cache_directory', None), derivative_binding)
 
 
 def _fresh(context):
@@ -537,9 +540,17 @@ def propose_performer_family(context):
     # Normal app source-changing producer, not an opt-in contrast mode. The
     # complete source/clock/camera family transaction runs before the legacy
     # fixed-source refinement; no single-source success is a prerequisite.
+    from .group_scene_source_owner import propose_scene_changes
+    scene_candidate = propose_scene_changes(context)
+    if not isinstance(scene_candidate, PerformerFamilyRejection):
+        return scene_candidate
     source_candidate = propose_source_changes(context)
     if not isinstance(source_candidate, PerformerFamilyRejection):
-        return source_candidate
+        receipt = plain(source_candidate.performer_family_review)
+        receipt['scene_search_rejection'] = dict(error=scene_candidate.error,evidence=scene_candidate.evidence)
+        return replace(source_candidate,performer_family_review=receipt)
+    source_candidate = PerformerFamilyRejection(source_candidate.error,
+        dict(source_search=source_candidate.evidence,scene_search=scene_candidate.evidence))
     old = context.incumbent
     # An internal geometry-only work view is not an adopted bundle. Full old
     # look stays in context; complete_candidate MUST put fresh/preserved look
@@ -612,7 +623,7 @@ def validate_parent(candidate, context):
 
 
 def attempt_performer_family(*, controller, request, eligible_indices, offsets, timewarps,
-        scene_cut_times, sync_scores, archive_path):
+        scene_cut_times, sync_scores, archive_path, source_derivatives=None):
     from .pipeline import _write_analysis_manifest_atomically
     def transaction():
         old = controller.incumbent
@@ -625,7 +636,8 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
         publish()  # Even a missing sensor asset leaves the complete predecessor.
         try:
             context = freeze_context(controller=controller,request=request,eligible_indices=eligible_indices,
-                offsets=offsets,timewarps=timewarps,scene_cut_times=scene_cut_times,sync_scores=sync_scores)
+                offsets=offsets,timewarps=timewarps,scene_cut_times=scene_cut_times,sync_scores=sync_scores,
+                source_derivatives=source_derivatives)
             archive['transaction_token']=asdict(context.token)
             candidate = propose_performer_family(context)
             if isinstance(candidate, PerformerFamilyRejection):

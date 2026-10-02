@@ -35642,6 +35642,7 @@ def analyze(
                 attempt_performer_family(controller=group_first, request=request,
                     eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
                     scene_cut_times=scene_cut_times, sync_scores=sync_scores,
+                    source_derivatives=source_derivative_diversity_result,
                     archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
                 # Consume one owned bundle, including clock/review/geometry.
                 # A rejected proposal cannot leak any of its local metadata.
