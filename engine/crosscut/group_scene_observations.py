@@ -274,7 +274,7 @@ class SceneSensors(source.NativeFamilySensors):
                     anchor_output_ticks=list(ticks), analysis_roll=roll,
                     anchor_head_ids=list(ids), raw_observation_sha256=[r.sha256 for r in rows],
                     role=state.role.value, required_cohorts=ROLE_CONTRACT,
-                    shot_intent=self.shot_intents.get((state.first_output_frame,state.end_output_frame)),
+                    shot_intent=self.shot_intents.get((state.first_output_frame,state.end_output_frame,endpoint_scope)),
                     body_anchor_ids=[[p.observation_id for p in r.people] for r in rows]
                         if state.role == GroupOutputRole.COMPOSITION else None,
                     temporal_identity_certified=False, cross_camera_identity_certified=False,
@@ -808,8 +808,8 @@ def validate_scene_dense(dense):
             raise ValueError('scene hypothesis does not bind declared role obligations')
         if h['role']!=h['span_key'][-1]:
             raise ValueError('scene hypothesis role differs from its bound source span')
-        validate_intent(h.get('shot_intent'),role=h['role'],first=h['span_key'][1],end=h['span_key'][2])
         scope=h.get('endpoint_scope','whole')
+        validate_intent(h.get('shot_intent'),role=h['role'],first=h['span_key'][1],end=h['span_key'][2],endpoint_scope=scope)
         allowed=('whole','exit') if index==0 else ('whole','entry') if index==len(keys)-1 else ('whole',)
         if scope not in allowed:
             raise ValueError('scene endpoint scope does not own this fixed/mutable position')

@@ -248,10 +248,12 @@ def propose_scene_changes(context):
             numeric_inventory.append(record)
             try:
                 from .group_scene_intent import declared_shot_intent
-                intents = tuple(declared_shot_intent(context, shot) for shot in window)
+                intents = tuple(declared_shot_intent(context, shot,
+                    endpoint_scope='exit' if index==0 else 'entry' if index==len(window)-1 else 'whole')
+                    for index,shot in enumerate(window))
                 roles = tuple(GroupOutputRole(intent['role']) for intent in intents)
                 for intent in intents:
-                    sensors.shot_intents[intent['first_output_frame'],intent['end_output_frame']] = intent
+                    sensors.shot_intents[intent['first_output_frame'],intent['end_output_frame'],intent['endpoint_scope']] = intent
                 baseline=source._states(plan,context.domain,window,roles,fixed_subcell_views=True)
                 by_slot=[]
                 for incumbent in baseline[1:-1]:

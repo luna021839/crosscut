@@ -188,12 +188,14 @@ class WidePolicyTests(unittest.TestCase):
 
     def test_neighbor_pair_does_not_rewrite_whole_shot_intent(self):
         context=SimpleNamespace(incumbent=SimpleNamespace(
+            render_plan=SimpleNamespace(),
             visual_timeline=SimpleNamespace(choices=[SimpleNamespace(shot_type='wide')]),
             face_match_plan=SimpleNamespace(segments=[SimpleNamespace(alignment_subject=None,applied=False)]),
             editorial_motion_plan=SimpleNamespace(boundary_subject_alignment_plan=SimpleNamespace(
                 decisions=[SimpleNamespace(eligible=True,boundary_index=0,subject_kind='upper_body')]))))
         shot=SimpleNamespace(first_segment_index=0,last_segment_index=0,first_output_frame=0,end_output_frame=60)
-        self.assertEqual(source._shot_roles(context,[shot]),(GroupOutputRole.COMPOSITION,))
+        with patch('crosscut.group_scene_intent.segment_frame_counts',return_value=(60,)):
+            self.assertEqual(source._shot_roles(context,[shot]),(GroupOutputRole.COMPOSITION,))
 
     def test_unknown_intent_is_not_source_dependent_fallback(self):
         with self.assertRaises(ValueError):role_from_cells([self.cell('unresolved')])

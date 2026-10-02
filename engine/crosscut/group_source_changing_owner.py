@@ -855,7 +855,8 @@ def validate_parent(candidate,context):
             for s in visible_group_shots(context.incumbent.render_plan,context.domain)}
         for h in receipt['source_camera_refresh']['scene_hypotheses'].values():
             shot=original_shots.get((h['span_key'][1],h['span_key'][2]))
-            if shot is None or h.get('shot_intent')!=declared_shot_intent(context,shot):
+            if shot is None or h.get('shot_intent')!=declared_shot_intent(context,shot,
+                    endpoint_scope=h.get('endpoint_scope','whole')):
                 raise ValueError('scene child role intent differs from the original output-owned shot')
     replay=family.propose_performer_family(context)  # independent isolated worker, same absolute deadline
     if isinstance(replay,family.PerformerFamilyRejection):
