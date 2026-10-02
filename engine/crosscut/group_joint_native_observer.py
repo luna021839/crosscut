@@ -141,12 +141,24 @@ def register_joint_native_models(session, *, person_model_path, pose_model_path,
             'confidence':.76,'nms':.3,'top_k':5000})
 
 
-def observe_native_group(session, *, request_source_index, native_frame_index):
+def observe_native_group(session, *, request_source_index, native_frame_index,
+        head_analysis_roll=None):
     """Bound all original geometry, even if it is missing or later cropped.
 
     Camera variants do not re-detect/select a smaller cohort. Source-relative
     temporal tracking and role declaration must consume these original rows.
+    A caller may predeclare ONE analysis-only detector roll for a source
+    window. Its inverse-mapped heads replace, never concatenate with, the
+    unrotated detector's alternatives. The actual named model/adapter is part
+    of the raw row hash. Missing results never fall back to another variant.
     """
+    from .group_native_head_orientation import (
+        OrientedNativeHeadAlternative, native_head_analysis_spec)
+    head_model, id_base = native_head_analysis_spec(head_analysis_roll)
+    required_models = ('nanodet_people', 'rtmpose_body7', head_model)
+    if any(name not in session.models or name not in session.model_adapters
+            for name in required_models):
+        raise ValueError('native group needs its predeclared registered detector variant')
     source, native = request_source_index, native_frame_index
     pixels = session.native_pixels(source, native)
     local = session.domain.eligible_index(source)
@@ -154,8 +166,7 @@ def observe_native_group(session, *, request_source_index, native_frame_index):
     clock_identity = hashlib.sha256(json.dumps(clock.to_dict(), sort_keys=True,
         separators=(',', ':')).encode()).hexdigest()
     identity = _file_identity(session.domain.request_sources[source])
-    models = tuple((name, session.models[name][2]) for name in
-        ('nanodet_people', 'rtmpose_body7', 'yunet_head_faces'))
+    models = tuple((name, session.models[name][2]) for name in required_models)
     adapters=tuple((name,session.model_adapters[name]) for name,_ in models)
     def snapshot(reason, people=(), heads=()):
         return NativeGroupObservation(source, native,
@@ -164,10 +175,19 @@ def observe_native_group(session, *, request_source_index, native_frame_index):
             models, tuple(people), tuple(heads), reason,adapters,ownership_policy_fingerprint())
     if pixels is None:
         return snapshot('exact_native_decode_unavailable')
-    heads=session.observe_native(source,native,model='yunet_head_faces')
+    heads=session.observe_native(source,native,model=head_model)
     head_missing=heads is None
     if head_missing:
         heads=()
+    elif head_analysis_roll is not None:
+        if (not isinstance(heads, tuple) or len(heads) > 24
+                or any(not isinstance(value, OrientedNativeHeadAlternative)
+                    or value.model_name != head_model
+                    or value.analysis_roll_degrees != head_analysis_roll
+                    or not 0 <= value.head.observation_id < 24 for value in heads)):
+            raise ValueError('native oriented heads differ from the frozen detector variant')
+        heads = tuple(replace(value.head, observation_id=id_base + value.head.observation_id)
+            for value in heads)
     rows = session.observe_native(source, native, model='nanodet_people')
     if rows is None:
         return snapshot('person_model_unavailable',heads=heads)

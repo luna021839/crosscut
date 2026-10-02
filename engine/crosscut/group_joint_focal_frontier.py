@@ -624,13 +624,33 @@ def native_pose_hypotheses_for_face_paths(*, domain, rows, face_paths, duties, m
 
 
 def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False,
-        inherited_reference=None, descriptor_model=SFACE_MODEL_NAME):
+        inherited_reference=None, descriptor_model=SFACE_MODEL_NAME, head_analysis_rolls=()):
     """At most three rasters per eligible source; no full-song reanalysis.
 
     The normal caller supplies its parent-frozen reference BEFORE discovery.
     Without it, area-based seeding is explicitly diagnostic, never labelled
     an inherited subject. Neither path proves a dense final render schedule.
     """
+    from .group_native_head_orientation import native_head_analysis_spec
+    # Freeze the source-specific sensor choices before decoding/ranking.
+    # Do not merge several rotated detections into artificial competitors or
+    # switch the source's variant independently at each favorable anchor.
+    if (not isinstance(head_analysis_rolls, tuple)
+            or any(not isinstance(item, tuple) or len(item) != 2
+                or type(item[0]) is not int for item in head_analysis_rolls)
+            or len({item[0] for item in head_analysis_rolls}) != len(head_analysis_rolls)):
+        raise ValueError('focal frontier needs a frozen distinct request-source detector policy')
+    analysis_rolls = dict(head_analysis_rolls)
+    for source, angle in head_analysis_rolls:
+        session.domain.eligible_index(source)
+        name, _ = native_head_analysis_spec(angle)
+        if name not in session.models or name not in session.model_adapters:
+            raise ValueError('focal frontier detector variant is not registered')
+        session._assert_model_assets(name)
+    analysis_policy = dict(contract='one_predeclared_native_detector_variant_per_source_window_v1',
+        request_source_analysis_roll_degrees=head_analysis_rolls,
+        variants_combined_as_people=False, per_anchor_variant_selection=False,
+        render_rotation_changed=False)
     times = tuple(canonical_times)
     if (len(times) != 3 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
             or not times[0] < times[1] < times[2] or times[-1]-times[0] > .35):
@@ -661,7 +681,8 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         for time in times:
             session.retain_native_pixels(((source,rows[-1].native_frame_index),) if rows else ())
             row = observe_native_group(session, request_source_index=source,
-                native_frame_index=_native_for_canonical(session.domain, source, time))
+                native_frame_index=_native_for_canonical(session.domain, source, time),
+                **({'head_analysis_roll': analysis_rolls[source]} if source in analysis_rolls else {}))
             rows.append(row); values.append(appearance_observer(session, row, descriptor_model=descriptor_model))
             if any((item.descriptor_space is None and descriptor_model != SFACE_MODEL_NAME)
                     or (item.descriptor_space is not None and item.descriptor_space.model_name != descriptor_model)
@@ -686,6 +707,7 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
                 return dict(contract='bounded_synchronized_owned_focal_source_frontier_v1',
                     status='inherited_focal_reference_unavailable', canonical_times=times,
                     reference_basis=reference_basis,
+                    head_analysis_policy=analysis_policy,
                     candidates=[], raw_observations=[row.to_dict() for row in rows],
                     production_admitted=False, cross_source_identity_certified=False, quality_approved=False)
         # Only the already sensed pair graph is needed now. Three 4K native
@@ -774,6 +796,7 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         canonical_times=times, reference_source_index=reference_source, candidates=candidates,
         reference_basis=reference_basis,
         inherited_reference=None if inherited_reference is None else inherited_reference.to_dict(),
+        head_analysis_policy=analysis_policy,
         source_local_pair_graphs=graphs,
         independent_raw17_temporal_pose_comparisons=comparisons,
         raw_observations=[row.to_dict() for rows in observed.values() for row in rows],

@@ -33,6 +33,19 @@ def _model_name(angle):
     return f'yunet_native_analysis_roll_{"minus" if angle < 0 else "plus"}_{int(abs(angle))}'
 
 
+def native_head_analysis_spec(angle=None):
+    """One predeclared detector variant, not a person ensemble.
+
+    The disjoint IDs identify detector observations only. They never claim
+    that two variants are different physical people or persistent tracks.
+    Original detector IDs/serialized rows are unchanged.
+    """
+    if angle is None:
+        return 'yunet_head_faces', 0
+    angle = _angles((angle,))[0]
+    return _model_name(angle), 32 * (SUPPORTED_ANALYSIS_ROLLS.index(angle) + 1)
+
+
 @dataclass(frozen=True, slots=True)
 class OrientedNativeHeadAlternative:
     model_name: str
