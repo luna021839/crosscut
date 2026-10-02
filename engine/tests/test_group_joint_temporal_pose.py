@@ -13,12 +13,12 @@ import numpy as np
 from crosscut.group_joint_temporal_pose import (FrozenPoseMotionDutiesV1,
     PoseJointObservationState, TemporalPoseUnavailable, native_pose_windows_from_rows,
     render_pose_windows_from_rows, compare_pose_phase_windows, compare_pose_boundary_windows,
-    independent_native_pose_hypotheses, supported_pose_spans)
+    independent_native_pose_hypotheses, supported_pose_spans, native_pose_association_graph)
 from crosscut.group_joint_native_observer import NativeGroupObservation, NativeGroupHead
 from crosscut.group_joint_person_ownership import (OwnedPersonObservation,
     bind_person_ownership, ownership_policy_fingerprint)
 from crosscut.group_source_domain import GroupSourceDomain
-from crosscut.group_joint_source_camera import JointGroupWorkBudget
+from crosscut.group_joint_source_camera import JointGroupWorkBudget, JointGroupBudgetExhausted
 from crosscut.group_joint_focal_frontier import (NativeFaceAppearance,
     native_pose_hypotheses_for_face_paths, observe_synchronized_focal_frontier)
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
@@ -67,6 +67,14 @@ class NativeTemporalPoseTests(unittest.TestCase):
         rows = tuple(self.row(domain, source, native, shift, **kw) for native, shift in zip(frames, shifts))
         choices = ((0,1),)*len(rows) if kw.get('duplicate') else ((0,),)*len(rows)
         return native_pose_windows_from_rows(domain=domain, rows=rows, choices=choices, duties=self.duties)
+
+    def row_people(self, domain, source, native, ids):
+        row = self.row(domain, source, native)
+        people, owners = bind_person_ownership(tuple(self.person(index=n) for n in ids),
+            row.heads, row.frame_size_wh)
+        heads = tuple(replace(h, candidate_body_observation_ids=tuple(owners[h.observation_id]))
+            for h in row.heads)
+        return replace(row, people=people, heads=heads)
 
     def joint(self, report, n=9):
         return next(j for j in report['joints'] if j['joint_index'] == n)
@@ -285,11 +293,37 @@ class NativeTemporalPoseTests(unittest.TestCase):
         encoded_size = lambda value: len(json.dumps(value,sort_keys=True,
             separators=(',', ':'),allow_nan=False).encode())
         self.assertEqual(budget.counts['pose_evidence_bytes'],
-            sum(encoded_size(c['independent_native_pose_motion']) for c in result['candidates'])
+            sum(encoded_size(dict(conditional_raw_person_pose=c['independent_native_pose_motion'],
+                unresolved_subject_graph=c['independent_subject_association_graph'])) for c in result['candidates'])
             + sum(encoded_size(c) for c in result['independent_raw17_temporal_pose_comparisons']))
+        self.assertEqual(budget.counts['association_nodes'],15)
+        self.assertEqual(budget.counts['association_edges'],26)
+        self.assertTrue(all(c['independent_subject_association_graph']['resolved_subject_path'] is None
+            for c in result['candidates']))
         self.assertTrue(all('partial_sensor_spans' not in pair['evidence']
             for c in result['independent_raw17_temporal_pose_comparisons']
             for pair in c['all_owner_pair_hypotheses']))
+        # The unresolved graph survives even when the legacy Cartesian pose
+        # inventory is too large. It does not become a chosen identity path.
+        for n in (0,3,6):
+            raw[1,n] = replace(self.row_people(domain,1,n,tuple(range(12))),native_pixel_sha256=digest)
+        owner.budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.)
+        with patch('crosscut.group_joint_focal_frontier.observe_native_group',
+                side_effect=lambda _owner,request_source_index,native_frame_index:raw[request_source_index,native_frame_index]), \
+                patch('crosscut.group_joint_focal_frontier.observe_native_face_appearances',side_effect=appearance), \
+                patch('crosscut.group_joint_focal_frontier.focal_landmarks_track',return_value=True):
+            overflow_result = observe_synchronized_focal_frontier(owner,reference_source=0,
+                canonical_times=(0.,.1,.2),face_roi_only=True)
+        overflow = next(c for c in overflow_result['candidates'] if c['source_index'] == 1)
+        self.assertEqual(overflow['independent_native_pose_motion'],[])
+        graph = overflow['independent_subject_association_graph']
+        self.assertEqual(len(graph['nodes']),39)
+        self.assertEqual(len(graph['edges']),338)
+        self.assertIsNone(graph['resolved_subject_path'])
+        self.assertTrue(overflow['unresolved_subject_association_prevents_identity_or_motion_admission'])
+        self.assertFalse(overflow_result['production_admitted'])
+        self.assertEqual(owner.budget.counts['association_nodes'],45)
+        self.assertEqual(owner.budget.counts['association_edges'],346)
         from crosscut.group_joint_source_camera import JointGroupBudgetExhausted
         owner.budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.,
             maximum_pose_evidence_bytes=1)
@@ -312,6 +346,116 @@ class NativeTemporalPoseTests(unittest.TestCase):
         self.assertTrue(all(not w.to_dict()['source_local_identity_certified'] for w in result))
         with self.assertRaises(ValueError):
             independent_native_pose_hypotheses(domain=domain,rows=rows,duties=self.duties,initial_person_ids=(7,))
+
+    def test_remaining_person_does_not_erase_unassociated_subject_layer(self):
+        domain = self.domain()
+        rows = tuple(self.row_people(domain,0,n,ids) for n,ids in
+            ((0,(0,1)),(3,(1,)),(6,(0,1))))
+        graph = native_pose_association_graph(domain=domain,rows=rows,initial_person_ids=(0,))
+        choices = tuple(tuple(graph.nodes[n][1] for n in layer) for layer in graph.layer_node_indices)
+        self.assertEqual(choices, ((0,None),(1,None),(0,1,None)))
+        unknown = graph.layer_node_indices[1][-1]
+        self.assertTrue(any(b == unknown for _,b in graph.edges))
+        self.assertTrue(any(a == unknown for a,_ in graph.edges))
+        self.assertEqual(graph.to_dict()['possible_path_count'],12)
+        self.assertIsNone(graph.to_dict()['resolved_subject_path'])
+        self.assertFalse(graph.to_dict()['physical_subject_seed_verified'])
+        self.assertFalse(graph.to_dict()['candidate_admitted'])
+        self.assertTrue(graph.to_dict()['unassociated_subject_is_not_source_occlusion'])
+
+    def test_repeated_first_native_layer_keeps_frozen_seed_and_all_raw_head_links(self):
+        domain = self.domain(); first = self.row_people(domain,0,0,(0,1))
+        rows = (first,first,self.row_people(domain,0,3,(0,1)),self.row_people(domain,0,6,(0,1)))
+        graph = native_pose_association_graph(domain=domain,rows=rows,initial_person_ids=(0,))
+        self.assertEqual(graph.native_frame_indices,(0,3,6))
+        self.assertEqual(graph.anchor_layer_indices,(0,0,1,2))
+        self.assertEqual(tuple(graph.nodes[n][1] for n in graph.layer_node_indices[0]),(0,None))
+        self.assertEqual(graph.raw_head_body_alternatives[0],((0,(0,1)),))
+        self.assertEqual(graph.to_dict()['possible_path_count'],18)
+
+    def test_empty_detection_layer_is_unknown_not_other_person_or_occlusion(self):
+        domain = self.domain()
+        rows = tuple(self.row_people(domain,0,n,ids) for n,ids in
+            ((0,(0,)),(3,()),(6,(0,))))
+        graph = native_pose_association_graph(domain=domain,rows=rows)
+        self.assertEqual(tuple(graph.nodes[n][1] for n in graph.layer_node_indices[1]),(None,))
+        self.assertEqual(len(graph.edges),4)
+        self.assertEqual(graph.to_dict()['materialized_subject_path_count'],0)
+        self.assertTrue(graph.to_dict()['unassociated_subject_is_not_source_occlusion'])
+
+    def test_dense_all_person_alternatives_are_compact_not_cartesian_paths(self):
+        domain = self.domain()
+        rows = tuple(self.row_people(domain,0,n,tuple(range(12))) for n in range(14))
+        budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.)
+        graph = native_pose_association_graph(domain=domain,rows=rows,budget=budget)
+        self.assertEqual(len(graph.nodes),182)
+        self.assertEqual(len(graph.edges),2197)
+        self.assertEqual(graph.to_dict()['possible_path_count'],13**14)
+        self.assertEqual(graph.to_dict()['materialized_subject_path_count'],0)
+        self.assertEqual(budget.counts['association_nodes'],182)
+        self.assertEqual(budget.counts['association_edges'],2197)
+        self.assertFalse(graph.to_dict()['geometric_duplicate_or_performer_alternatives_merged'])
+        with self.assertRaisesRegex(TemporalPoseUnavailable,'not success-biased truncation'):
+            independent_native_pose_hypotheses(domain=domain,rows=rows,duties=self.duties)
+
+    def test_graph_overflow_and_shared_capacity_fail_without_pruning_or_partial_reservation(self):
+        domain = self.domain(); rows = tuple(self.row_people(domain,0,n,(0,1)) for n in (0,3,6))
+        for bounds in ({'maximum_nodes':8},{'maximum_edges':17}):
+            budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.)
+            with self.subTest(bounds=bounds),self.assertRaisesRegex(TemporalPoseUnavailable,'budget_unresolved'):
+                native_pose_association_graph(domain=domain,rows=rows,budget=budget,**bounds)
+            self.assertEqual(budget.counts['association_nodes'],0)
+            self.assertEqual(budget.counts['association_edges'],0)
+        budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.,maximum_association_edges=18)
+        budget.spend('association_edges',1)
+        before = budget.to_dict()
+        with self.assertRaisesRegex(JointGroupBudgetExhausted,'association_edges'):
+            native_pose_association_graph(domain=domain,rows=rows,budget=budget)
+        self.assertEqual(budget.to_dict(),before)
+        self.assertEqual(tuple(len(row.people) for row in rows),(2,2,2))
+
+    def test_graph_binding_cut_and_repeated_raw_corruption_are_not_zero_cost_unknowns(self):
+        domain = self.domain(); rows = tuple(self.row(domain,0,n) for n in (0,3,6))
+        bad = (*rows[:2],replace(rows[2],model_adapter_fingerprints=(
+            ('nanodet_people','b'*64),('rtmpose_body7','f'*64),('yunet_head_faces','f'*64))))
+        with self.assertRaises(ValueError) as cm:
+            native_pose_association_graph(domain=domain,rows=bad)
+        self.assertNotIsInstance(cm.exception,TemporalPoseUnavailable)
+        with self.assertRaisesRegex(ValueError,'contradictory raw'):
+            native_pose_association_graph(domain=domain,rows=(rows[0],replace(rows[0],reason='altered'),*rows[1:]))
+        cut_domain = self.domain(cuts=((.1,),()))
+        with self.assertRaisesRegex(TemporalPoseUnavailable,'broadcaster cut'):
+            native_pose_association_graph(domain=cut_domain,
+                rows=tuple(self.row(cut_domain,0,n) for n in (0,3,6)))
+
+    def test_detection_order_does_not_choose_or_merge_a_subject(self):
+        domain = self.domain()
+        forward = tuple(self.row_people(domain,0,n,(0,1)) for n in (0,3,6))
+        reversed_rows = tuple(self.row_people(domain,0,n,(1,0)) for n in (0,3,6))
+        a = native_pose_association_graph(domain=domain,rows=forward)
+        b = native_pose_association_graph(domain=domain,rows=reversed_rows)
+        self.assertEqual((a.nodes,a.edges,a.layer_node_indices),(b.nodes,b.edges,b.layer_node_indices))
+        # Graph topology is order-independent, but raw preimages retain their
+        # original detector enumeration and are not silently canonicalized.
+        self.assertEqual(tuple(tuple((head,set(ids)) for head,ids in layer)
+            for layer in a.raw_head_body_alternatives),tuple(tuple((head,set(ids)) for head,ids in layer)
+            for layer in b.raw_head_body_alternatives))
+        self.assertNotEqual(a.raw_observation_sha256,b.raw_observation_sha256)
+
+    def test_graph_limits_and_frozen_seed_have_strict_types(self):
+        domain = self.domain(); rows = tuple(self.row(domain,0,n) for n in (0,3,6))
+        for args in ({'maximum_nodes':True},{'maximum_nodes':193},{'maximum_edges':2201},
+                {'maximum_edges':0},{'budget':object()},{'initial_person_ids':(True,)},
+                {'initial_person_ids':(0,0)},{'initial_person_ids':(7,)},{'initial_person_ids':[]}):
+            with self.subTest(args=args),self.assertRaises(ValueError):
+                native_pose_association_graph(domain=domain,rows=rows,**args)
+        for args in ({'maximum_association_nodes':1537},{'maximum_association_edges':18001},
+                {'maximum_association_nodes':True},{'maximum_association_edges':0}):
+            with self.subTest(args=args),self.assertRaises(ValueError):
+                JointGroupWorkBudget(absolute_deadline=10.,**args)
+        with self.assertRaisesRegex(JointGroupBudgetExhausted,'absolute work deadline'):
+            native_pose_association_graph(domain=domain,rows=rows,
+                budget=JointGroupWorkBudget(absolute_deadline=1.,clock=lambda:1.))
 
     def test_pose_comparison_work_has_distinct_shared_deadline_counter_and_hard_cap(self):
         from crosscut.group_joint_source_camera import JointGroupBudgetExhausted

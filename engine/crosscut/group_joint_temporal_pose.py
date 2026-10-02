@@ -17,7 +17,8 @@ import numpy as np
 from .group_joint_native_observer import NativeGroupObservation
 from .group_joint_person_ownership import (OwnedPersonObservation, ownership_policy_fingerprint,
     bind_person_ownership)
-from .group_joint_source_camera import GroupSourceCameraState
+from .group_joint_source_camera import (GroupSourceCameraState, JointGroupWorkBudget,
+    JointGroupBudgetExhausted)
 from .group_source_domain import GroupSourceDomain
 
 
@@ -293,13 +294,118 @@ def native_pose_windows_from_rows(*, domain, rows, choices, duties, maximum_hypo
         maximum_hypotheses=maximum_hypotheses)
 
 
+@dataclass(frozen=True, slots=True)
+class NativePoseAssociationGraphV1:
+    """Compact unresolved subject alternatives, not identity/pose proof.
+
+    One layer per distinct native raster; repeated output anchors reference
+    that same layer. Every layer includes an unassociated-subject node even
+    when some other performer is detected. Edges are possible links, not
+    measured identity links. The graph chooses no best skeleton or person.
+    """
+    request_source_index: int
+    native_frame_indices: tuple[int, ...]
+    raw_observation_sha256: tuple[str, ...]
+    anchor_layer_indices: tuple[int, ...]
+    layer_node_indices: tuple[tuple[int, ...], ...]
+    nodes: tuple[tuple[int, int | None], ...]
+    edges: tuple[tuple[int, int], ...]
+    initial_person_ids: tuple[int | None, ...] | None
+    raw_head_body_alternatives: tuple[tuple[tuple[int, tuple[int, ...]], ...], ...]
+
+    def to_dict(self):
+        return dict(contract='compact_native_subject_association_alternatives_v1',
+            request_source_index=self.request_source_index,
+            native_frame_indices=self.native_frame_indices,
+            raw_observation_sha256=self.raw_observation_sha256,
+            anchor_layer_indices=self.anchor_layer_indices,
+            layer_node_indices=self.layer_node_indices,
+            nodes=[dict(layer_index=layer, person_observation_id=person,
+                observation_state='unassociated_subject' if person is None else 'raw_person_alternative')
+                for layer, person in self.nodes], edges=self.edges,
+            initial_person_ids=self.initial_person_ids,
+            raw_head_body_alternatives=self.raw_head_body_alternatives,
+            possible_path_count=math.prod(len(layer) for layer in self.layer_node_indices),
+            materialized_subject_path_count=0,
+            edge_basis='unresolved_possible_links_not_measured_identity_edges',
+            unassociated_subject_is_not_source_occlusion=True,
+            raw_person_enumeration_is_not_persistent_identity=True,
+            geometric_duplicate_or_performer_alternatives_merged=False,
+            jointwise_minimum_or_frankenstein_skeleton_used=False,
+            physical_subject_seed_verified=False, resolved_subject_path=None,
+            candidate_admitted=False, quality_approved=False)
+
+
+def native_pose_association_graph(*, domain, rows, initial_person_ids=None,
+        budget=None, maximum_nodes=192, maximum_edges=2200):
+    """Keep dropout alternatives without enumerating their Cartesian paths.
+
+    A later owner must resolve actual subject links from independent evidence.
+    A small graph alone does not make all possible paths physically feasible.
+    Bounds are checked before allocating the node/edge inventories; raw binding
+    replay and the shared absolute deadline are not bypassed.
+    """
+    if (type(maximum_nodes) is not int or not 1 <= maximum_nodes <= 192
+            or type(maximum_edges) is not int or not 1 <= maximum_edges <= 2200
+            or budget is not None and not isinstance(budget, JointGroupWorkBudget)):
+        raise ValueError('native association graph needs explicit bounded node/edge work')
+    if budget is not None:
+        budget.check()
+    _bound_rows(domain, rows)
+    first_ids = tuple(p.observation_id for p in rows[0].people)
+    if initial_person_ids is not None and (
+            not isinstance(initial_person_ids, tuple) or not initial_person_ids
+            or len(set(initial_person_ids)) != len(initial_person_ids)
+            or any(n is not None and (type(n) is not int or n not in first_ids) for n in initial_person_ids)):
+        raise ValueError('native association graph has an absent or malformed frozen first-native cohort')
+    unique, joins = [], []
+    for row in rows:
+        if not unique or row.native_frame_index != unique[-1].native_frame_index:
+            unique.append(row)
+        joins.append(len(unique)-1)
+    choices = []
+    for layer, row in enumerate(unique):
+        ids = initial_person_ids if layer == 0 and initial_person_ids is not None else tuple(
+            p.observation_id for p in row.people)
+        # Sorting makes this representation independent of raw detection order.
+        # None is retained even when the target vanished but another person did
+        # not. It never silently becomes that other person's measured pose.
+        choices.append((*sorted(n for n in ids if n is not None), None))
+    nodes_needed = sum(len(layer) for layer in choices)
+    edges_needed = sum(len(a)*len(b) for a, b in zip(choices, choices[1:]))
+    if nodes_needed > maximum_nodes or edges_needed > maximum_edges:
+        raise TemporalPoseUnavailable('native association graph budget_unresolved, no alternative truncation')
+    if budget is not None:
+        budget.check()
+        for name, count in (('association_nodes', nodes_needed), ('association_edges', edges_needed)):
+            if budget.counts[name]+count > budget.limits[name]:
+                raise JointGroupBudgetExhausted('joint GROUP '+name+' work budget reached before graph allocation')
+        budget.spend('association_nodes', nodes_needed)
+        budget.spend('association_edges', edges_needed)
+    nodes, layers = [], []
+    for layer, ids in enumerate(choices):
+        start = len(nodes); nodes.extend((layer, person) for person in ids)
+        layers.append(tuple(range(start, len(nodes))))
+    edges = tuple((a, b) for left, right in zip(layers, layers[1:]) for a in left for b in right)
+    if budget is not None:
+        budget.check()
+    return NativePoseAssociationGraphV1(unique[0].request_source_index,
+        tuple(row.native_frame_index for row in unique), tuple(row.sha256 for row in unique),
+        tuple(joins), tuple(layers), tuple(nodes), edges, initial_person_ids,
+        tuple(tuple((head.observation_id, head.candidate_body_observation_ids) for head in row.heads)
+            for row in unique))
+
+
 def independent_native_pose_hypotheses(*, domain, rows, duties, initial_person_ids=None,
         maximum_hypotheses=64):
     """All raw source-local person associations, not conditioned on LK success.
 
     The optional FIRST-anchor cohort is external, frozen before donor search.
-    Later missing rows retain None. These alternatives include unresolved
-    identity switches; a small pose cost is never permission to pick one.
+    Legacy conditional raw-person geometry enumeration. An empty detection row
+    retains None, but dropout while other people remain is represented by the
+    separate compact native_pose_association_graph, not a Cartesian expansion
+    here. These measurements are not exhaustive physical-subject trajectories.
+    They include unresolved identity switches; a small pose cost cannot pick one.
     """
     _bound_rows(domain, rows)
     choices = tuple(tuple(p.observation_id for p in row.people) or (None,) for row in rows)

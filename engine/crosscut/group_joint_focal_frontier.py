@@ -547,7 +547,7 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         if inherited_reference is not None else 'diagnostic_area_seed_not_inherited_subject')
     from .group_joint_temporal_pose import (FrozenPoseMotionDutiesV1,
         TemporalPoseUnavailable, compare_pose_phase_windows, independent_native_pose_hypotheses,
-        supported_pose_spans)
+        supported_pose_spans, native_pose_association_graph)
     # Fixed SENSOR obligations before source ordering, not a narrower
     # editorial head-only role derived from failing body/arm measurements.
     pose_duties = FrozenPoseMotionDutiesV1('native-focal-discovery-head-and-arm-sensor-not-semantic-parent',
@@ -601,11 +601,14 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         ranking_linked = provisional is not None
         anchors = provisional
         session.budget.check()
+        association = None
         try:
             seed_body_ids = None
             if source == reference_source:
                 seed = next(head for head in rows[0].heads if head.observation_id == reference[0].face_observation_id)
                 seed_body_ids = seed.candidate_body_observation_ids or (None,)
+            association = native_pose_association_graph(domain=session.domain, rows=rows,
+                initial_person_ids=seed_body_ids, budget=session.budget)
             pose_windows[source] = tuple(((), window) for window in independent_native_pose_hypotheses(
                 domain=session.domain,rows=rows,duties=pose_duties,initial_person_ids=seed_body_ids))
             pose_status = ('raw_temporal_hypotheses_measured_not_association_or_phase_certification'
@@ -621,7 +624,9 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             partial_sensor_spans=[supported_pose_spans(window, joint).to_dict()
                 for joint in pose_duties.required_joint_indices])
             for faces, window in pose_windows[source]]
-        session.budget.spend('pose_evidence_bytes',len(json.dumps(pose_payload,sort_keys=True,
+        graph_payload = None if association is None else association.to_dict()
+        session.budget.spend('pose_evidence_bytes',len(json.dumps(dict(
+            conditional_raw_person_pose=pose_payload, unresolved_subject_graph=graph_payload),sort_keys=True,
             separators=(',', ':'),allow_nan=False).encode()))
         candidates.append(dict(source_index=source, shortlist_available=linked, reason=reason if linked else
             reason, similarities=ranking_similarities, competing_trajectory_margin=trajectory_margin,
@@ -630,6 +635,9 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             independent_native_pose_motion_status=pose_status,
             independent_native_pose_motion_association_basis='all_raw_person_alternatives_not_conditioned_on_face_or_joint_lk',
             independent_native_pose_motion=pose_payload,
+            independent_subject_association_graph=graph_payload,
+            raw_person_pose_hypotheses_are_not_exhaustive_physical_subject_paths=True,
+            unresolved_subject_association_prevents_identity_or_motion_admission=True,
             anchors=[] if anchors is None else [dict(native_frame_index=row.native_frame_index,
                 native_presentation_seconds=row.native_frame_index/float(session.domain.clocks_by_request[source].frame_rate),
                 observation_sha256=row.sha256, person_observation_id=item.person_observation_id,
@@ -648,6 +656,8 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             reference_face_observation_ids=a[0], candidate_face_observation_ids=b[0],
             evidence=compare_pose_phase_windows(a[1], b[1])) for a, b in pairs],
             empty_is_zero_cost=False, minimum_over_convenient_owner_used=False,
+            unassociated_subject_paths_are_not_zero_cost_or_measured_pose=True,
+            association_graph_resolution_required=True,
             source_eligibility_or_appearance_ranking_changed=False)
         session.budget.spend('pose_evidence_bytes',len(json.dumps(comparison,sort_keys=True,
             separators=(',', ':'),allow_nan=False).encode()))
