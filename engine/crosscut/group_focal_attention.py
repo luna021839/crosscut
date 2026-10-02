@@ -74,6 +74,12 @@ def focal_landmarks_track(reference, target, before, after):
     This alternative still requires four measured points, forward/backward
     pixel agreement, and agreement with the independently detected new face.
     Similar boxes or central screen position alone cannot pass it.
+
+    Four pyramid levels permit coarse-to-fine search in a UHD source; the
+    former two-level limit missed observed motion at native 4K resolution.
+    Residuals below are still checked in ORIGINAL pixels, with the same 1.25px
+    forward/backward limit. Neither downsampled residuals nor larger admission
+    tolerances substitute for a measured path.
     """
     if reference.shape != target.shape or before is None or after is None:
         return False
@@ -89,7 +95,7 @@ def focal_landmarks_track(reference, target, before, after):
     if eye_span < 4.:
         return False
     a, b = cv2.cvtColor(reference,cv2.COLOR_BGR2GRAY), cv2.cvtColor(target,cv2.COLOR_BGR2GRAY)
-    options = dict(winSize=(15,15),maxLevel=2,
+    options = dict(winSize=(15,15),maxLevel=4,
         criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,.01))
     points = first.reshape(-1,1,2)
     forward, valid_forward, _ = cv2.calcOpticalFlowPyrLK(a,b,points,None,**options)
