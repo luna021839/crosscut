@@ -16,6 +16,8 @@ import numpy as np
 from .onnx_cpu_inference import OnnxCpuNetwork
 
 CONTRACT = 'native_yolo11_coco_person_rectangles_onnx_cpu_v1'
+MODEL_NAME = 'yolo11l_native_people'
+PINNED_YOLO11L_ONNX_SHA256 = 'd7da2dd3cd23bffb3b2b24dee0e4575a8aa50ccdb2b3510aa9f8a57a0b232562'
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,3 +122,25 @@ class NativePersonOnnxDetector:
             coco_class=0, single_label=True, raw_person_count_not_truncated=True,
             inference_calls_per_observation=1, cast_identity_or_pose_certified=False,
             implementation_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+
+
+def register_native_person_model(session, model_path, *, config=None):
+    """Explicit normal-session integration, retaining its budget/cache ownership.
+
+    The source owner still opts in and chooses its editorial cohort separately.
+    The YOLO call is never labelled NanoDet or charged as a free cached result.
+    A changed/corrupt pinned asset fails rather than silently selecting another
+    backend. No person list, existing registration, or production default is
+    replaced by this helper.
+    """
+    session.budget.check()
+    if MODEL_NAME in session.models:
+        raise ValueError('native person detector already registered in this session')
+    path = Path(model_path)
+    detector = NativePersonOnnxDetector(path, expected_sha256=PINNED_YOLO11L_ONNX_SHA256,
+                                        config=config)
+    session.budget.check()
+    session.register_model(MODEL_NAME, path, detector.infer,
+        adapter_fingerprint=detector.fingerprint(),
+        expected_asset_sha256=PINNED_YOLO11L_ONNX_SHA256)
+    return MODEL_NAME

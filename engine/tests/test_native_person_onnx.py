@@ -1,11 +1,17 @@
 from pathlib import Path
 from unittest.mock import patch
 import unittest
+import hashlib
+import shutil
+import subprocess
+import tempfile
+from time import monotonic
 
 import numpy as np
 
 from crosscut.native_person_onnx import (
-    PersonDetectorConfig, NativePersonOnnxDetector, native_letterbox, person_rows)
+    PersonDetectorConfig, NativePersonOnnxDetector, native_letterbox, person_rows,
+    register_native_person_model, MODEL_NAME)
 
 
 class NativePersonOnnxTests(unittest.TestCase):
@@ -87,6 +93,71 @@ class NativePersonOnnxTests(unittest.TestCase):
             self.assertEqual(model.fingerprint()['inference_calls_per_observation'],1)
             factory.assert_called_once_with(Path('explicit.onnx'),expected_sha256='a'*64,
                                            output_names=('output0',),intra_op_threads=4)
+
+
+@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg required')
+class NativePersonSessionTests(unittest.TestCase):
+    """Real session/chart decoder, explicit fake network (not human evidence)."""
+    def setUp(self):
+        from crosscut.group_joint_observations import GroupJointObservationSession
+        from crosscut.group_joint_source_camera import JointGroupWorkBudget
+        from crosscut.group_source_domain import GroupSourceDomain
+        from crosscut.render_frame_schedule import probe_render_frame_clock
+        self.temporary=tempfile.TemporaryDirectory(prefix='crosscut-person-session-')
+        self.addCleanup(self.temporary.cleanup)
+        root=Path(self.temporary.name);self.model=root/'fixture.onnx'
+        self.model.write_bytes(b'explicit fake network for registration/budget tests')
+        self.sha=hashlib.sha256(self.model.read_bytes()).hexdigest()
+        self.video=root/'chart.mp4'
+        subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=s=96x54:r=30',
+            '-frames:v','8','-c:v','libx264','-pix_fmt','yuv420p',str(self.video)],
+            capture_output=True,check=True,timeout=10.)
+        clock=probe_render_frame_clock(self.video)
+        domain=GroupSourceDomain((self.video,),(0,),(0.,),(None,),((),),(clock,))
+        self.budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.,maximum_model_calls=1)
+        self.session=GroupJointObservationSession(domain=domain,budget=self.budget)
+        self.addCleanup(self.session.close)
+        _,transform=native_letterbox(np.zeros((54,96,3),np.uint8),maximum_side=320)
+        prediction=NativePersonOnnxTests().tensor(transform,[(100,100,40,80,.8,0)])
+        self.network_patch=patch('crosscut.native_person_onnx.OnnxCpuNetwork')
+        self.factory=self.network_patch.start();self.addCleanup(self.network_patch.stop)
+        self.factory.return_value.forward.return_value=prediction
+        self.factory.return_value.fingerprint.return_value={'model_sha256':self.sha,'test_fixture':True}
+        self.digest_patch=patch('crosscut.native_person_onnx.PINNED_YOLO11L_ONNX_SHA256',self.sha)
+        self.digest_patch.start();self.addCleanup(self.digest_patch.stop)
+
+    def register(self):
+        return register_native_person_model(self.session,self.model,config=PersonDetectorConfig(maximum_side=320))
+
+    def test_actual_session_names_charges_and_reuses_one_inference(self):
+        from crosscut.group_joint_source_camera import JointGroupBudgetExhausted
+        name=self.register();self.assertEqual(name,MODEL_NAME)
+        first=self.session.observe_native(0,2,model=name)
+        first[0,0]=999
+        repeated=self.session.observe_native(0,2,model=name)
+        self.assertNotEqual(repeated[0,0],999)
+        self.assertEqual(self.budget.model_calls,{MODEL_NAME:1})
+        self.factory.return_value.forward.assert_called_once_with()
+        self.assertEqual(self.budget.counts['new_decodes'],1)
+        with self.assertRaises(JointGroupBudgetExhausted):self.session.observe_native(0,3,model=name)
+        self.assertFalse(self.session.model_adapter_preimages[name]['cast_identity_or_pose_certified'])
+        self.assertNotIn('nanodet_people',self.session.models)
+
+    def test_model_changed_after_loading_is_not_registered(self):
+        original=self.factory.return_value.fingerprint
+        def replace_asset():
+            self.model.write_bytes(b'replaced fixture model')
+            return original.return_value
+        self.factory.return_value.fingerprint.side_effect=replace_asset
+        with self.assertRaisesRegex(ValueError,'bytes loaded'):self.register()
+        self.assertEqual(self.session.models,{})
+
+    def test_duplicate_registration_cannot_silently_replace_config_or_cache(self):
+        name=self.register();before=self.session.model_adapters[name]
+        with self.assertRaisesRegex(ValueError,'already registered'):
+            register_native_person_model(self.session,self.model,config=PersonDetectorConfig(maximum_side=640))
+        self.assertEqual(self.session.model_adapters[name],before)
+        self.assertEqual(self.factory.call_count,1)
 
 
 if __name__ == '__main__':

@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+native-person-onnx = [
+  "onnxruntime==1.30.0",
+]
 semantic-parts-onnx = [
   "onnxruntime==1.30.0",
   "Pillow==12.2.0",
