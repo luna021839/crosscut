@@ -8,11 +8,13 @@ The owner is deliberately a review-candidate producer, never semantic/quality QA
 from dataclasses import replace
 from collections import Counter
 from itertools import product, zip_longest
+import math
 from time import monotonic
 
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
-from .group_scene_observations import SceneSensors, compare_scene_edge, preserves_known, DENSE_CONTRACT
+from .group_scene_observations import (SceneSensors, compare_scene_edge,
+    coherent_baseline, preserves_known, DENSE_CONTRACT)
 from .group_scene_observations import VARIANTS, scene_anchor_ticks
 from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget
 from .group_joint_observations import GroupJointObservationSession
@@ -23,6 +25,7 @@ from .source_derivative_diversity import (SourceDerivativeDiversityResult,
 CONTRACT = 'normal_scene_source_whole_camera_producer_v1'
 # Search allocation, not a confidence/visibility/quality threshold.
 MAX_WINDOWS = 3
+MAX_FIXED_WINDOW_PROBES = 12
 FIXED_HYPOTHESES = 2
 COMPLETE_REFRESH_RESERVE_SECONDS = 8.
 
@@ -135,6 +138,54 @@ def time_stratified_window_frontier(prepared, limit):
     return tuple((i, prepared[i]) for i in sorted(selected, key=lambda i: centers[i]))
 
 
+def observed_wide_repair_priority(timeline, mutable_shots):
+    """Work priority from the incumbent, not a verdict or raw-donor family gate.
+
+    Spend one scarce window on a distant existing wide before revisiting an
+    already close/medium window. Missing scale is not replaced with zero; a
+    wide reveal is not rejected, and every proposed replacement still needs
+    the same two-sided/dense checks. No song or timestamp is special-cased.
+    """
+    duration=0.;weighted=0.
+    for shot in mutable_shots:
+        for choice in timeline.choices[shot.first_segment_index:shot.last_segment_index+1]:
+            seconds=choice.canonical_master_end-choice.canonical_master_start
+            if seconds<=0:continue
+            duration+=seconds
+            if getattr(choice.shot_type,'value',choice.shot_type) not in ('wide','group_wide'):
+                continue
+            values=tuple(v for v in (choice.entry_shot_scale,choice.exit_shot_scale)
+                if type(v) in (int,float) and math.isfinite(v) and 0<=v<=1)
+            if values:weighted+=seconds*(1-sum(values)/len(values))
+    return weighted/duration if duration else 0.
+
+
+def repair_window_frontier(prepared,limit):
+    distributed=time_stratified_window_frontier(prepared,limit)
+    if not distributed:return distributed
+    ranked=[(item[2].get('observed_wide_repair_priority',0.),i,item)
+        for i,item in enumerate(prepared)]
+    score,index,item=max(ranked,key=lambda value:(value[0],-value[1]))
+    if score<=0:return distributed
+    return ((index,item),*tuple(row for row in distributed if row[0]!=index)[:limit-1])
+
+
+def fixed_window_probe_order(prepared,limit):
+    """Cheap fixed endpoints may fail without consuming an eight-source search.
+
+    Keep the primary distributed/weak-wide choices, then visit distinct pending
+    wide work. This is a bounded ordering, not evidence that an unobserved
+    source/shot is absent, or a relaxation of any path/admission check.
+    """
+    if type(limit) is not int or limit<1:
+        raise ValueError('scene fixed probe budget must be positive')
+    primary=repair_window_frontier(prepared,min(MAX_WINDOWS,limit))
+    used={i for i,_ in primary}
+    remaining=sorted(((i,item) for i,item in enumerate(prepared) if i not in used),
+        key=lambda row:(-row[1][2].get('observed_wide_repair_priority',0.),row[0]))
+    return (*primary,*remaining)[:limit]
+
+
 def _target(row):
     if row['role'] != GroupOutputRole.FORMATION.value:
         return tuple(row['projected_face_roi_xywh'])
@@ -186,11 +237,13 @@ def propose_scene_changes(context):
         # Pure numeric inventory is complete BEFORE ANY fixed-head discovery.
         for window in windows:
             if any(s.frame_count>source.MAX_MUTABLE_FRAMES for s in window[1:-1]): continue
-            record=dict(bounds=[[s.first_output_frame,s.end_output_frame] for s in window],states=[],errors=[])
+            record=dict(bounds=[[s.first_output_frame,s.end_output_frame] for s in window],states=[],errors=[],
+                observed_wide_repair_priority=observed_wide_repair_priority(
+                    context.incumbent.visual_timeline,window[1:-1]))
             numeric_inventory.append(record)
             try:
                 roles=source._shot_roles(context,window)
-                baseline=source._states(plan,context.domain,window,roles)
+                baseline=source._states(plan,context.domain,window,roles,fixed_subcell_views=True)
                 by_slot=[]
                 for incumbent in baseline[1:-1]:
                     values=[]
@@ -205,23 +258,24 @@ def propose_scene_changes(context):
                 record['errors'].append(dict(stage='retained_epoch_topology',error=str(exc)))
         # Upright observations for time-distributed windows precede rotated
         # retries. A failed intro must not consume every selected work slot.
-        frontier=time_stratified_window_frontier(prepared,MAX_WINDOWS)
+        frontier=fixed_window_probe_order(prepared,MAX_FIXED_WINDOW_PROBES)
         scheduled=tuple((wi,item,rolls) for rolls in ((None,),VARIANTS)
             for wi,item in frontier)
+        graph_windows=0
         for wi,(baseline,raw_slots,numeric),rolls in scheduled:
             if monotonic()+COMPLETE_REFRESH_RESERVE_SECONDS >= context.deadline:
                 attempts.append(dict(stage='reserve',reason='complete_refresh_reserve_preserved'));break
             if session.budget.counts['states']>=session.budget.limits['states']:
                 attempts.append(dict(stage='state_frontier_exhausted',numeric_windows=len(prepared)));break
+            if graph_windows>=MAX_WINDOWS:
+                attempts.append(dict(stage='graph_window_budget',evaluated=graph_windows));break
             start_counts=dict(session.budget.counts)
-            # All available sources get their upright observations before any
-            # camera choice. Rotated hypotheses remain a separately named pass.
+            # A fixed endpoint with no measured path makes this whole window
+            # unavailable regardless of donor. Test it before decoding/inferring
+            # all eight sources. Their numeric options remain in the inventory;
+            # skipped native observations are not relabelled negative evidence.
             def scope_for(index):
                 return 'exit' if index==0 else 'entry' if index==len(baseline)-1 else 'whole'
-            all_native=tuple((s,scope_for(i)) for i,s in enumerate(baseline))+tuple(
-                (s,'whole') for group in raw_slots for s in group)
-            for state,scope in all_native:
-                sensors.discover(state,rolls=rolls,endpoint_scope=scope)
             def bound(state,scope='whole'):
                 return tuple(sensors.bind(state,h) for h in sensors.discover(state,rolls=rolls,endpoint_scope=scope))
             lefts=bound(baseline[0],'exit');rights=bound(baseline[-1],'entry')
@@ -235,7 +289,16 @@ def propose_scene_changes(context):
             lefts=fixed(lefts,False);rights=fixed(rights,True)
             if not lefts or not rights:
                 attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
-                    analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable'));continue
+                    analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
+                    donor_native_observations_skipped=True,
+                    donor_absence_inferred=False));continue
+            graph_windows+=1
+            # All numerically available sources are observed before choosing a
+            # donor/camera, but only after the shared incident endpoints exist.
+            all_native=tuple((s,'whole') for s in baseline[1:-1])+tuple(
+                (s,'whole') for group in raw_slots for s in group)
+            for state,scope in all_native:
+                sensors.discover(state,rolls=rolls,endpoint_scope=scope)
             groups=[];camera_errors=[]
             for slot,raw_values in enumerate(raw_slots,1):
                 by_source=[]
@@ -268,10 +331,16 @@ def propose_scene_changes(context):
                 # omitted hypotheses and numeric source options in its archive.
                 quota=max(0,remaining//len(raw_slots))
                 groups.append(round_robin(by_source,quota))
+            if any(not group for group in groups):
+                if remaining//len(raw_slots)<=0:
+                    attempts.append(dict(stage='state_budget',window=wi,unexplored=True));break
+                attempts.append(dict(stage='scene_mutable_hypotheses_unavailable',window=wi,
+                    analysis_rolls=list(rolls),source_options_by_slot=[len(g) for g in raw_slots],
+                    bound_state_counts_by_slot=[len(g) for g in groups],
+                    numeric_inventory_retained=True))
+                continue
             all_states=tuple(dict((v.key,v) for v in (*lefts,*(s for g in groups for s in g),*rights)).values())
             for state in all_states:session.budget.spend('states')
-            if any(not group for group in groups):
-                attempts.append(dict(stage='state_budget',window=wi,unexplored=True));break
             baseline_hypotheses=[bound(s,scope_for(i)) for i,s in enumerate(baseline)]
             edges={};known={}
             def read(a,b):
@@ -285,20 +354,17 @@ def propose_scene_changes(context):
                     if evidence['source_relation'] != DERIVATIVE_DISTINCT:evidence['available']=False
                     edges[key]=evidence
                 return edges[key]
-            # A candidate cannot win by choosing a conveniently poor incumbent
-            # hypothesis. Retain every observed baseline component's best value.
+            # Freeze one observed incumbent comparison. Combining different
+            # alternatives' component minima invents an unattainable reference.
             for index in range(len(baseline)-1):
                 values=[]
                 for a,b in product(baseline_hypotheses[index],baseline_hypotheses[index+1]):
                     if len(values)>=4:break
                     values.append(read(a,b))
-                metrics={}
                 # Cohort geometry is observed independent of focal assignment.
                 # A disputed focal hypothesis is NOT an unconditional incumbent
                 # fact. In particular its minimum conditional cost is not zero
                 # uncertainty, nor a licence to erase known cohort components.
-                unconditional={'occupancy','attention','scale','span','screen_motion',
-                    'formation_pose','formation_framing'}
                 unique=True
                 for old_index in (index,index+1):
                     old_state=baseline[old_index]
@@ -307,13 +373,7 @@ def propose_scene_changes(context):
                                 old_state.end_output_frame,scope_for(old_index)):
                             source._dominant(sensors.raw(old_state,tick,None),old_state.role)
                     except ValueError:unique=False
-                for row in values:
-                    for key,value in (row.get('metrics') or {}).items():
-                        if value is not None and (unique or key in unconditional):
-                            metrics[key]=min(metrics.get(key,float('inf')),value)
-                known[index]=dict(metrics=metrics,observed_alternatives=values,
-                    focal_assignment_unique=unique,focal_conditional_cost_not_imputed=True,
-                    available=any(v.get('available') for v in values))
+                known[index]=coherent_baseline(values,focal_assignment_unique=unique)
             paths=[]
             for path in product(lefts,*groups,rights):
                 measured=[]
@@ -368,8 +428,11 @@ def propose_scene_changes(context):
                         candidate_search_exhaustive=False,rotated_pass_exhaustive=False,
                         source_balanced_state_allocation=True,full_epoch_retained_family_owner_implemented=False,
                         within_source_frontier_policy='native_fitted_camera_interleave_v1',
-                        window_frontier_policy='time_stratified_midpoints_upright_before_rotated_retry_v1',
+                        window_frontier_policy='observed_wide_repair_then_time_stratified_upright_v2',
                         selected_frontier_window_indices=[i for i,_ in frontier],
+                        fixed_endpoints_before_donor_observations=True,
+                        fixed_window_probe_limit=MAX_FIXED_WINDOW_PROBES,
+                        evaluated_graph_windows=graph_windows,
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,
                         reserve_check_basis="before_window_only_not_hard_phase_partition")
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)

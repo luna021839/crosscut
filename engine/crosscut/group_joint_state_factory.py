@@ -27,6 +27,37 @@ def _cell_interval(plan,first,end):
     return ticks.index(first),ticks.index(end),counts
 
 
+def fixed_neighbor_state_from_render_plan(*,plan,domain,slot,first_output_frame,
+        end_output_frame,role,raw_shot_family=None,editorial_contract_sha256=None):
+    """Read an unchanged actual neighbor without publishing a split timeline.
+
+    A broadcaster cut can end the neighbor inside a canonical cell while the
+    mutable middle shot is already aligned. The numeric split scaffold proves
+    every original native sample, crop, camera/canvas and look value unchanged;
+    only a read-only fixed state is returned. The assembler still reconstructs
+    it from the original plan, and mutable states retain strict cell ownership.
+    This is not a complete mutable-epoch metadata/receipt owner.
+    """
+    if type(slot) is not int or slot not in (0,2,3):
+        raise ValueError('partial-cell neighbor view is only for a fixed outer state')
+    counts=segment_frame_counts(plan);ticks=[0]
+    for count in counts:ticks.append(ticks[-1]+count)
+    if (type(first_output_frame) is not int or type(end_output_frame) is not int
+            or not 0<=first_output_frame<end_output_frame<=ticks[-1]):
+        raise ValueError('fixed neighbor interval is outside the original renderer')
+    source_plan=plan
+    if first_output_frame not in ticks or end_output_frame not in ticks:
+        from .group_interval_materialization import split_group_render_intervals
+        split=tuple(t for t in (first_output_frame,end_output_frame) if t not in ticks)
+        scaffold=split_group_render_intervals(plan=plan,domain=domain,
+            split_output_frames=split,maximum_additional_cells=2)
+        source_plan=scaffold.plan
+    return joint_state_from_render_plan(plan=source_plan,domain=domain,slot=slot,
+        first_output_frame=first_output_frame,end_output_frame=end_output_frame,
+        role=role,raw_shot_family=raw_shot_family,
+        editorial_contract_sha256=editorial_contract_sha256)
+
+
 def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_index,camera_track=None):
     """Construct an entire alternative native source unit, not a solo edit.
 
@@ -109,15 +140,15 @@ def _assemble_group_state_path(*,plan,domain,path,state_count):
     segments=list(plan.segments);changed=set()
     for state in path:
         state.bind_source(domain)
-        first,end,counts=_cell_interval(plan,state.first_output_frame,state.end_output_frame)
-        if state.segment_output_frame_counts!=tuple(counts[first:end]) or len(state.segments)!=end-first:
-            raise ValueError('joint state changed canonical cell/frame authority')
         if state.slot in (0,state_count-1):
-            original=joint_state_from_render_plan(plan=plan,domain=domain,slot=state.slot,
+            original=fixed_neighbor_state_from_render_plan(plan=plan,domain=domain,slot=state.slot,
                 first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role,
                 editorial_contract_sha256=state.editorial_contract_sha256)
             if original.key!=state.key:raise ValueError('joint replacement changed a fixed outer neighbor')
         else:
+            first,end,counts=_cell_interval(plan,state.first_output_frame,state.end_output_frame)
+            if state.segment_output_frame_counts!=tuple(counts[first:end]) or len(state.segments)!=end-first:
+                raise ValueError('joint state changed canonical cell/frame authority')
             for index,segment in zip(range(first,end),state.segments,strict=True):
                 if (segment.master_start,segment.duration)!=(plan.segments[index].master_start,plan.segments[index].duration):
                     raise ValueError('joint state changed fixed source/output interval bounds')
@@ -134,7 +165,9 @@ def _assemble_group_state_path(*,plan,domain,path,state_count):
     if tuple((e.first_incoming_output_frame,e.kind) for e in before)!=tuple((e.first_incoming_output_frame,e.kind) for e in after):
         raise ValueError('joint source/camera replacement changed actual visible cut cadence')
     for state in path:
-        rebound=joint_state_from_render_plan(plan=proposed,domain=domain,slot=state.slot,
+        builder=(fixed_neighbor_state_from_render_plan if state.slot in (0,state_count-1)
+            else joint_state_from_render_plan)
+        rebound=builder(plan=proposed,domain=domain,slot=state.slot,
             first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,role=state.role,
             editorial_contract_sha256=state.editorial_contract_sha256)
         if rebound.key!=state.key:

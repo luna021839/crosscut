@@ -308,6 +308,31 @@ class SceneSourceIntegrationTests(unittest.TestCase):
                 else:dense['source_derivative_binding']['audit']['pairs']=[]
                 with self.assertRaises(ValueError):sensors_module.validate_scene_dense(dense)
 
+    def test_fixed_subcell_neighbor_complete_refresh_and_final_native_replay(self):
+        # Explicit chart cut-time fixture: topology/clock/producer behavior,
+        # not a human cut detector or actual professional editing approval.
+        with optional_native_scope(monotonic()+120),scene_chart_sensors(), \
+                patch.object(family,'installed_pose_model',return_value=self.model):
+            context=family.freeze_context(controller=self.controller,request=self.request,
+                eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
+                scene_cut_times=((2.,),(),(),(),(),(),(),()),sync_scores=(.93,.91)*4,
+                source_derivatives=scene_derivative_fixture())
+            # Allocate the first valid partial-neighbor window explicitly in
+            # this regression; normal scheduler behavior is separately tested.
+            with patch.object(scene,'time_stratified_window_frontier',
+                    side_effect=lambda prepared,limit:tuple(enumerate(prepared[:1]))):
+                candidate=scene.propose_scene_changes(context)
+            self.assertNotIsInstance(candidate,family.PerformerFamilyRejection,
+                getattr(candidate,'error',None))
+            family.validate_bundle_binding(candidate)
+            receipt=family.plain(candidate.performer_family_review)
+            self.assertEqual(receipt['source_camera_refresh']['window_bounds'][0],[30,60])
+            self.assertEqual(len(candidate.render_plan.segments),len(self.bundle.render_plan.segments))
+            self.assertEqual(candidate.render_plan.segments[0],self.bundle.render_plan.segments[0])
+            metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90)
+            self.assertTrue(family.qa_metrics_valid(metrics))
+            self.assertFalse(metrics['quality_approved'])
+
     def test_internal_native_epoch_keeps_numeric_sampling_but_is_not_a_full_family(self):
         # The requested complete epoch owner is NOT implemented. Assert the
         # exact retained boundary rather than dressing a numeric split as a pass.
@@ -360,13 +385,46 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
         self.assertIs(self.controller.incumbent,self.bundle)
 
-    def test_no_heads_still_archives_observed_alternatives_with_unknown_not_zero(self):
+    def test_one_unknown_mutable_window_does_not_end_later_complete_search(self):
+        # Explicit non-human missing-hypothesis fixture. There is still work
+        # budget: this is NOT the state-budget exhaustion condition.
+        original=sensors_module.SceneSensors.discover
+        blocked=[]
+        later=[]
+        def discover(sensor,state,**kwargs):
+            if kwargs.get('endpoint_scope','whole')=='whole':
+                bounds=(state.first_output_frame,state.end_output_frame)
+                if not blocked:blocked.append(bounds)
+                if bounds==blocked[0]:return ()
+                later.append(bounds)
+            return original(sensor,state,**kwargs)
+        with optional_native_scope(monotonic()+120),scene_chart_sensors(), \
+                patch.object(sensors_module.SceneSensors,'discover',discover):
+            candidate=scene.propose_scene_changes(self.context)
+        self.assertTrue(blocked and later)
+        self.assertNotIsInstance(candidate,family.PerformerFamilyRejection,
+            getattr(candidate,'error',None))
+        family.validate_bundle_binding(candidate)
+        self.assertFalse(family.plain(candidate.performer_family_review)['quality_approved'])
+
+    def test_no_fixed_heads_preserves_numeric_donors_without_spending_native_inference_on_them(self):
         def unknown(*a,**kw):return replace(scene_native(*a,**kw),heads=())
         with optional_native_scope(monotonic()+90),scene_chart_sensors(),patch.object(source,'observe_native_group',side_effect=unknown):
             value=scene.propose_scene_changes(self.context)
         self.assertIsInstance(value,family.PerformerFamilyRejection)
         evidence=family.plain(value.evidence)
-        self.assertEqual({r['request_source_index'] for r in evidence['scene_observations']['native_rows']},set(range(8)))
+        native=evidence['scene_observations']['native_rows']
+        self.assertTrue(native)
+        # Unchanged endpoints are the only observations needed to reject this
+        # window. All donors remain numeric choices, NOT negative detections.
+        self.assertTrue(all(row['endpoint_scope'] in ('entry','exit')
+            for row in evidence['scene_observations']['discoveries']))
+        self.assertEqual({s['source'] for row in evidence['numeric_source_inventory']
+            for s in row['states']},set(range(8)))
+        skipped=[a for a in evidence['attempts'] if a.get('stage')=='scene_fixed_hypotheses']
+        self.assertTrue(skipped)
+        self.assertTrue(all(a['donor_native_observations_skipped'] and
+            not a['donor_absence_inferred'] for a in skipped))
         self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
         self.assertFalse(evidence['quality_approved'])
         self.assertIs(self.controller.incumbent,self.bundle)

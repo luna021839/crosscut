@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from crosscut.group_scene_source_owner import (time_stratified_window_frontier,
-    camera_balanced_source_frontier,round_robin)
+    camera_balanced_source_frontier,round_robin,repair_window_frontier,
+    observed_wide_repair_priority,fixed_window_probe_order)
 
 
 def window(first):
@@ -60,3 +61,40 @@ def test_camera_interleave_keeps_all_unique_states_and_does_not_create_a_camera(
     assert camera_balanced_source_frontier((a,b),())==(a,b)
     assert camera_balanced_source_frontier((),(c,))==(c,)
     assert camera_balanced_source_frontier((),())==()
+
+
+def test_one_distant_existing_wide_precedes_uniform_middle_song_revisit():
+    prepared=tuple(window(90*i) for i in range(30))
+    prepared[10][2]['observed_wide_repair_priority']=.8
+    chosen=repair_window_frontier(prepared,3)
+    assert [i for i,_ in chosen]==[10,4,14]
+    assert repair_window_frontier(prepared,1)[0][0]==10
+    assert len({i for i,_ in chosen})==3
+
+
+def test_without_observed_wide_priority_time_allocation_is_unchanged():
+    prepared=tuple(window(90*i) for i in range(30))
+    assert repair_window_frontier(prepared,3)==time_stratified_window_frontier(prepared,3)
+    assert repair_window_frontier((),3)==()
+
+
+def test_wide_work_priority_never_fills_unknown_scale_with_zero():
+    shot=SimpleNamespace(first_segment_index=0,last_segment_index=0)
+    def timeline(kind,scale):
+        return SimpleNamespace(choices=(SimpleNamespace(canonical_master_start=0.,
+            canonical_master_end=2.,shot_type=kind,entry_shot_scale=scale,exit_shot_scale=scale),))
+    assert observed_wide_repair_priority(timeline('group_wide',.1),(shot,))==pytest.approx(.9)
+    assert observed_wide_repair_priority(timeline('medium',.1),(shot,))==0.
+    for scale in (None,float('nan'),-1,2):
+        assert observed_wide_repair_priority(timeline('group_wide',scale),(shot,))==0.
+
+
+def test_failed_primary_windows_leave_distinct_weak_wide_probe_work_reachable():
+    prepared=tuple(window(90*i) for i in range(30))
+    prepared[10][2]['observed_wide_repair_priority']=.9
+    prepared[18][2]['observed_wide_repair_priority']=.8
+    chosen=fixed_window_probe_order(prepared,6)
+    assert [i for i,_ in chosen][:4]==[10,4,14,18]
+    assert len({i for i,_ in chosen})==6
+    assert all(item is prepared[i] for i,item in chosen)
+    assert fixed_window_probe_order((),6)==()

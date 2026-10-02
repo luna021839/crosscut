@@ -35,7 +35,8 @@ from .group_joint_source_camera import (
     joint_state_from_render_plan, select_single_group_source_camera_path,
     select_joint_group_source_camera_path)
 from .group_joint_state_factory import (candidate_joint_group_state,
-    assemble_single_group_source_camera_state, assemble_joint_group_states)
+    assemble_single_group_source_camera_state, assemble_joint_group_states,
+    fixed_neighbor_state_from_render_plan)
 from .group_joint_focal_camera import propose_endpoint_focal_face_roi_camera
 from .group_joint_native_observer import observe_native_group, register_joint_native_models
 from .group_native_head_orientation import (SUPPORTED_ANALYSIS_ROLLS,
@@ -301,8 +302,10 @@ class NativeFamilySensors:
         return result
 
 
-def _states(plan,domain,shots,roles):
-    return tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=i,
+def _states(plan,domain,shots,roles,*,fixed_subcell_views=False):
+    return tuple((fixed_neighbor_state_from_render_plan
+        if fixed_subcell_views and i in (0,len(shots)-1) else joint_state_from_render_plan)(
+        plan=plan,domain=domain,slot=i,
         first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=roles[i])
         for i,s in enumerate(shots))
 
@@ -547,10 +550,11 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     plan,look,look_evidence=family.refresh_look(old,proposed,edges,session,context.domain)
     if geometry_payload(plan)!=geometry_payload(proposed):
         raise ValueError('look refresh changed an admitted source clock/camera')
-    final_states=tuple(joint_state_from_render_plan(plan=plan,domain=context.domain,slot=s.slot,
-        first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
-        editorial_contract_sha256=s.editorial_contract_sha256) for s in path)
     scene = getattr(sensors,'scene_family',False)
+    final_states=tuple((fixed_neighbor_state_from_render_plan if scene and i in (0,len(path)-1)
+        else joint_state_from_render_plan)(plan=plan,domain=context.domain,slot=s.slot,
+        first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
+        editorial_contract_sha256=s.editorial_contract_sha256) for i,s in enumerate(path))
     dense=dict(contract=SCENE_DENSE_CONTRACT if scene else DENSE_CONTRACT,geometry_sha256=family.digest(geometry_payload(plan)),
         changed_cells=list(changed),incident_edges=list(edges),state_keys=[s.key for s in final_states],
         window_bounds=[[s.first_output_frame,s.end_output_frame] for s in final_states],
@@ -909,7 +913,9 @@ def final_live_replay(plan_json,receipt,deadline):
         else:
             sensors=NativeFamilySensors(session,assets,frozen_declarations=dense['pre_camera_native_declarations'])
             keys=[None]*len(dense['window_bounds'])
-        path=tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=i,first_output_frame=b[0],
+        path=tuple((fixed_neighbor_state_from_render_plan if dense['contract']==SCENE_DENSE_CONTRACT
+            and i in (0,len(dense['window_bounds'])-1) else joint_state_from_render_plan)(
+            plan=plan,domain=domain,slot=i,first_output_frame=b[0],
             end_output_frame=b[1],role=GroupOutputRole(dense['roles'][i]),
             editorial_contract_sha256=keys[i]) for i,b in enumerate(dense['window_bounds']))
         if dense['contract']==SCENE_DENSE_CONTRACT:

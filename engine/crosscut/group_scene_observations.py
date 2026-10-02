@@ -605,9 +605,43 @@ def compare_scene_edge(sensors, left, right):
     return evidence
 
 
+def coherent_baseline(values, *, focal_assignment_unique=True):
+    """One observed conditional reference, never a best-of-different-actors vector.
+
+    Prefer an available whole comparison, ranked by the existing capped mean.
+    Ambiguous focal assignment still cannot create an unconditional actor fact:
+    only its observed scene components become nonregression requirements. Keep
+    every alternative and the chosen keys so this ranking remains auditable.
+    """
+    scene_components={'occupancy','attention','scale','span','screen_motion',
+        'formation_pose','formation_framing'}
+    measured=[row for row in values if row.get('metrics') and any(
+        value is not None for value in row['metrics'].values()) and all(
+        value is None or type(value) in (int,float) and math.isfinite(value) and value>=0
+        for value in row['metrics'].values())]
+    complete=[row for row in measured if row.get('available')]
+    def rank(row):
+        numbers=[v for v in row['metrics'].values() if v is not None]
+        return (sum(min(1.,v) for v in numbers)/len(numbers),
+            str(row.get('left_state','')),str(row.get('right_state','')))
+    selected=min(complete or measured,key=rank) if measured else None
+    metrics={} if selected is None else {key:value for key,value in selected['metrics'].items()
+        if value is not None and (focal_assignment_unique or key in scene_components)}
+    return dict(metrics=metrics,available=bool(complete),observed_alternatives=values,
+        coherent_reference_state_keys=None if selected is None else
+            [selected.get('left_state'),selected.get('right_state')],
+        focal_assignment_unique=focal_assignment_unique,
+        focal_conditional_cost_not_imputed=True,
+        conditional_reference_is_not_actor_certainty=True,
+        componentwise_minimum_across_incompatible_hypotheses=False)
+
+
 def preserves_known(before, after):
     """Semantic unknown is distinct from a technical invariant and style cost."""
-    if not after.get('available'):
+    if (not after.get('available') or not after.get('metrics') or any(
+            value is not None and (type(value) not in (int,float)
+                or not math.isfinite(value) or value<0)
+            for value in after['metrics'].values())):
         return False
     known = before.get('metrics') or {}
     return all(value is None or (key in after['metrics'] and after['metrics'][key] is not None
