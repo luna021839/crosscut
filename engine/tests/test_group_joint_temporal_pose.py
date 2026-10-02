@@ -13,7 +13,7 @@ import numpy as np
 from crosscut.group_joint_temporal_pose import (FrozenPoseMotionDutiesV1,
     PoseJointObservationState, TemporalPoseUnavailable, native_pose_windows_from_rows,
     render_pose_windows_from_rows, compare_pose_phase_windows, compare_pose_boundary_windows,
-    independent_native_pose_hypotheses)
+    independent_native_pose_hypotheses, supported_pose_spans)
 from crosscut.group_joint_native_observer import NativeGroupObservation, NativeGroupHead
 from crosscut.group_joint_person_ownership import (OwnedPersonObservation,
     bind_person_ownership, ownership_policy_fingerprint)
@@ -268,6 +268,11 @@ class NativeTemporalPoseTests(unittest.TestCase):
         candidates = {c['source_index']:c for c in result['candidates']}
         self.assertEqual(len(candidates[0]['independent_native_pose_motion']), 1)
         self.assertEqual(len(candidates[1]['independent_native_pose_motion']), 8)
+        for source in (0,1):
+            for hypothesis in candidates[source]['independent_native_pose_motion']:
+                spans = hypothesis['partial_sensor_spans']
+                self.assertEqual(tuple(row['joint_index'] for row in spans),self.duties.required_joint_indices)
+                self.assertTrue(all(not row['required_duty_satisfied'] for row in spans))
         comparisons = {c['source_index']:c for c in result['independent_raw17_temporal_pose_comparisons']}
         self.assertEqual(len(comparisons[1]['all_owner_pair_hypotheses']), 8)
         self.assertFalse(comparisons[1]['source_eligibility_or_appearance_ranking_changed'])
@@ -277,6 +282,25 @@ class NativeTemporalPoseTests(unittest.TestCase):
         self.assertEqual(budget.counts['edges'], 0)
         self.assertFalse(result['production_admitted'])
         self.assertFalse(result['inherited_role_or_required_parts_downgraded'])
+        encoded_size = lambda value: len(json.dumps(value,sort_keys=True,
+            separators=(',', ':'),allow_nan=False).encode())
+        self.assertEqual(budget.counts['pose_evidence_bytes'],
+            sum(encoded_size(c['independent_native_pose_motion']) for c in result['candidates'])
+            + sum(encoded_size(c) for c in result['independent_raw17_temporal_pose_comparisons']))
+        self.assertTrue(all('partial_sensor_spans' not in pair['evidence']
+            for c in result['independent_raw17_temporal_pose_comparisons']
+            for pair in c['all_owner_pair_hypotheses']))
+        from crosscut.group_joint_source_camera import JointGroupBudgetExhausted
+        owner.budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.,
+            maximum_pose_evidence_bytes=1)
+        with patch('crosscut.group_joint_focal_frontier.observe_native_group',
+                side_effect=lambda _owner,request_source_index,native_frame_index:raw[request_source_index,native_frame_index]), \
+                patch('crosscut.group_joint_focal_frontier.observe_native_face_appearances',side_effect=appearance), \
+                patch('crosscut.group_joint_focal_frontier.focal_landmarks_track',return_value=True):
+            with self.assertRaisesRegex(JointGroupBudgetExhausted,'pose_evidence_bytes'):
+                observe_synchronized_focal_frontier(owner,reference_source=0,
+                    canonical_times=(0.,.1,.2),face_roi_only=True)
+        self.assertEqual(owner.budget.counts['pose_evidence_bytes'],0)
 
     def test_no_lk_face_paths_do_not_erase_actual_raw_pose_hypotheses(self):
         domain = self.domain(); rows = tuple(self.row(domain,0,n,duplicate=True) for n in (0,3,6))
@@ -326,6 +350,156 @@ class NativeTemporalPoseTests(unittest.TestCase):
         self.assertEqual(budget.counts['pose_evidence_bytes'],8)
         with self.assertRaises(ValueError):
             JointGroupWorkBudget(absolute_deadline=10.,maximum_pose_evidence_bytes=8*1024*1024+1)
+
+
+    def test_partial_spans_keep_both_sides_of_missing_wrist_without_imputation(self):
+        domain = self.domain()
+        rows = tuple(self.row(domain,0,n,shift=.001*n,
+            lost_joint=9 if n == 6 else None) for n in (0,3,6,9,12))
+        window = native_pose_windows_from_rows(domain=domain,rows=rows,
+            choices=((0,),)*5,duties=self.duties)[0]
+        evidence = supported_pose_spans(window,9)
+        self.assertEqual([s.unique_anchor_indices for s in evidence.spans],[(0,1),(3,4)])
+        self.assertEqual([len(s.secant_velocity_xy_per_second) for s in evidence.spans],[1,1])
+        self.assertEqual(evidence.unavailable_anchor_reasons[0][0],2)
+        self.assertIsNone(window.anchors[2].torso_local_xy[9])
+        report = compare_pose_phase_windows(window,window)
+        self.assertIsNone(self.joint(report)['multi_anchor_residual'])
+        self.assertFalse(report['candidate_admitted'])
+        self.assertFalse(evidence.to_dict()['required_duty_satisfied'])
+        json.dumps(report,allow_nan=False)
+
+    def test_ambiguous_owner_keeps_nominal_raw_cost_but_breaks_supported_span(self):
+        domain = self.domain()
+        rows = tuple(self.row(domain,0,n,duplicate=n == 6) for n in (0,3,6,9,12))
+        windows = native_pose_windows_from_rows(domain=domain,rows=rows,
+            choices=((0,),(0,),(0,1),(0,),(0,)),duties=self.duties)
+        self.assertEqual(len(windows),2)
+        for window in windows:
+            evidence = supported_pose_spans(window,9)
+            self.assertEqual([s.unique_anchor_indices for s in evidence.spans],[(0,1),(3,4)])
+            self.assertTrue(any('ownership_ambiguous' in reason
+                for _, reasons in evidence.unavailable_anchor_reasons for reason in reasons))
+            report = compare_pose_phase_windows(window,window)
+            self.assertIsNotNone(self.joint(report)['multi_anchor_residual'])
+            self.assertFalse(report['all_required_source_support_observed'])
+            self.assertFalse(report['candidate_admitted'])
+
+    def test_degenerate_shoulders_do_not_certify_torso_local_kinematics(self):
+        domain = self.domain(); rows = []
+        for n in (0,3,6):
+            row = self.row(domain,0,n); person = row.people[0]
+            raw = list(person.raw_pose_xyc); raw[6] = raw[5]
+            person = replace(person,raw_pose_xyc=tuple(raw),
+                upper_body_xyc=tuple(raw[i] for i in (5,6,7,8,9,10,11,12)))
+            people,_ = bind_person_ownership((person,),row.heads,row.frame_size_wh)
+            rows.append(replace(row,people=people))
+        window = native_pose_windows_from_rows(domain=domain,rows=tuple(rows),
+            choices=((0,),)*3,duties=self.duties)[0]
+        self.assertTrue(all(a.joint_states[9] == PoseJointObservationState.VISIBLE_SUPPORTED
+            for a in window.anchors))
+        evidence = supported_pose_spans(window,9)
+        self.assertEqual(evidence.spans,())
+        self.assertFalse(evidence.all_scheduled_kinematic_samples_observed)
+        self.assertTrue(all('torso_local_coordinate_unavailable' in reasons
+            for _,reasons in evidence.unavailable_anchor_reasons))
+        report = compare_pose_phase_windows(window,window)
+        # Preserve legacy raw detector diagnostics, but distinguish coordinate
+        # readiness instead of letting that flag certify valid kinematics.
+        self.assertTrue(self.joint(report)['all_source_support_observed'])
+        self.assertFalse(self.joint(report)['all_torso_local_kinematic_samples_observed'])
+        self.assertFalse(report['all_required_torso_local_kinematic_samples_observed'])
+        self.assertFalse(report['independent_physical_source_visibility_certified'])
+
+    def test_frozen_first_native_cohort_covers_repeated_first_raster(self):
+        domain = self.domain()
+        first = self.row(domain,0,0,duplicate=True)
+        rows = (first,first,self.row(domain,0,3,duplicate=True),
+            self.row(domain,0,6,duplicate=True))
+        windows = independent_native_pose_hypotheses(domain=domain,rows=rows,
+            duties=self.duties,initial_person_ids=(0,))
+        self.assertEqual(len(windows),4)
+        self.assertTrue(all(tuple(a.person_observation_id for a in w.anchors[:2]) == (0,0)
+            for w in windows))
+        with self.assertRaises(TemporalPoseUnavailable):
+            independent_native_pose_hypotheses(domain=domain,rows=rows,
+                duties=self.duties,initial_person_ids=(0,),maximum_hypotheses=3)
+
+    def test_predeclared_gap_limit_splits_secants_but_not_observed_points(self):
+        window = self.window()[0]
+        evidence = supported_pose_spans(window,9,maximum_gap_seconds=.05)
+        self.assertEqual([len(s.unique_anchor_indices) for s in evidence.spans],[1,1,1])
+        self.assertTrue(evidence.all_scheduled_kinematic_samples_observed)
+        self.assertTrue(all(s.secant_velocity_xy_per_second == () for s in evidence.spans))
+        self.assertFalse(evidence.to_dict()['whole_interval_visibility_certified'])
+        for value in (True,0.,-1.,float('nan'),float('inf')):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                supported_pose_spans(window,9,maximum_gap_seconds=value)
+
+    def test_model_point_outside_raster_does_not_become_anatomical_absence(self):
+        window = self.window(off_joint=9)[0]
+        evidence = supported_pose_spans(window,9)
+        self.assertEqual(evidence.spans,())
+        self.assertTrue(all(any('not_anatomical_proof' in reason for reason in reasons)
+            for _, reasons in evidence.unavailable_anchor_reasons))
+        self.assertFalse(evidence.to_dict()['physical_source_occlusion_or_out_of_frame_certified'])
+
+    def test_repeated_native_raster_does_not_add_zero_velocity_to_partial_spans(self):
+        domain = self.domain(); first = self.row(domain,0,0)
+        rows = (first,first,self.row(domain,0,3,shift=.01),self.row(domain,0,6,shift=.02))
+        window = native_pose_windows_from_rows(domain=domain,rows=rows,
+            choices=((0,),)*4,duties=self.duties)[0]
+        evidence = supported_pose_spans(window,9)
+        self.assertEqual(evidence.repeated_native_anchor_count,1)
+        self.assertEqual(len(evidence.spans[0].secant_velocity_xy_per_second),2)
+        self.assertTrue(all(v[0] > 0 for v in evidence.spans[0].secant_velocity_xy_per_second))
+
+    def test_partial_spans_preserve_real_seconds_for_30_and_60_fps_sources(self):
+        domain = self.domain((Fraction(30),Fraction(60)))
+        a = supported_pose_spans(self.window(domain)[0],9)
+        b = supported_pose_spans(self.window(domain,source=1,frames=(0,6,12))[0],9)
+        self.assertEqual(a.spans[0].measurement_seconds,b.spans[0].measurement_seconds)
+        self.assertEqual(a.spans[0].secant_velocity_xy_per_second,
+            b.spans[0].secant_velocity_xy_per_second)
+        with self.assertRaises(ValueError):
+            supported_pose_spans(self.window(domain)[0],11)
+
+
+    def test_supported_then_ambiguous_then_missing_wrist_keeps_entry_velocity_unknown(self):
+        domain = self.domain()
+        rows = (self.row(domain,0,6168),self.row(domain,0,6169,duplicate=True),
+            self.row(domain,0,6170,lost_joint=10))
+        windows = native_pose_windows_from_rows(domain=domain,rows=rows,
+            choices=((0,),(0,1),(0,)),duties=self.duties)
+        self.assertEqual(len(windows),2)
+        for window in windows:
+            evidence = supported_pose_spans(window,10)
+            self.assertEqual(tuple(span.unique_anchor_indices for span in evidence.spans),((0,),))
+            self.assertEqual(evidence.spans[0].secant_velocity_xy_per_second,())
+            self.assertEqual(tuple(i for i,_ in evidence.unavailable_anchor_reasons),(1,2))
+            self.assertIsNone(self.joint(compare_pose_phase_windows(window,window),10)[
+                'maximum_velocity_difference_per_second'])
+            self.assertFalse(evidence.to_dict()['required_duty_satisfied'])
+
+    def test_missing_shoulder_invalidates_high_confidence_wrist_coordinate_not_wrist_duty(self):
+        window = self.window(lost_joint=5)[0]
+        # The actual ownership binder can also lose the body's supported
+        # state when a shoulder disappears. A high raw wrist score is not
+        # permission to override that independently replayed owner state.
+        self.assertGreater(window.anchors[0].observation.people[0].raw_pose_xyc[9][2],.3)
+        evidence = supported_pose_spans(window,9)
+        self.assertEqual(evidence.spans,())
+        self.assertTrue(all('joint_5:detector_unknown' in reasons
+            for _,reasons in evidence.unavailable_anchor_reasons))
+        self.assertIn(9,window.duties.required_joint_indices)
+        self.assertFalse(self.joint(compare_pose_phase_windows(window,window))[
+            'all_torso_local_kinematic_samples_observed'])
+
+    def test_partial_spans_keep_fractional_native_seconds(self):
+        domain = self.domain((Fraction(30000,1001),)*2)
+        evidence = supported_pose_spans(self.window(domain)[0],9)
+        self.assertAlmostEqual(evidence.spans[0].measurement_seconds[1],.1001)
+        self.assertAlmostEqual(evidence.spans[0].secant_velocity_xy_per_second[0][0],.1/.1001)
 
 
 if __name__ == '__main__':

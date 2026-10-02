@@ -546,7 +546,8 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
     reference_basis = ('parent_frozen_raw_native_seed_not_identity_certification'
         if inherited_reference is not None else 'diagnostic_area_seed_not_inherited_subject')
     from .group_joint_temporal_pose import (FrozenPoseMotionDutiesV1,
-        TemporalPoseUnavailable, compare_pose_phase_windows, independent_native_pose_hypotheses)
+        TemporalPoseUnavailable, compare_pose_phase_windows, independent_native_pose_hypotheses,
+        supported_pose_spans)
     # Fixed SENSOR obligations before source ordering, not a narrower
     # editorial head-only role derived from failing body/arm measurements.
     pose_duties = FrozenPoseMotionDutiesV1('native-focal-discovery-head-and-arm-sensor-not-semantic-parent',
@@ -613,7 +614,12 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             pose_windows[source] = ()
             pose_status = str(exc)
         session.budget.check()
-        pose_payload = [dict(face_observation_ids=faces, track=window.to_dict())
+        # Export once per track, not once per Cartesian owner-pair. Comparison
+        # rows already reference these track hashes. Charge the expanded record
+        # through the existing pose_evidence_bytes accounting immediately below.
+        pose_payload = [dict(face_observation_ids=faces, track=window.to_dict(),
+            partial_sensor_spans=[supported_pose_spans(window, joint).to_dict()
+                for joint in pose_duties.required_joint_indices])
             for faces, window in pose_windows[source]]
         session.budget.spend('pose_evidence_bytes',len(json.dumps(pose_payload,sort_keys=True,
             separators=(',', ':'),allow_nan=False).encode()))

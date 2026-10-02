@@ -94,6 +94,8 @@ class NativePoseAnchorV1:
             measurement_seconds=self.measurement_seconds,
             joint_states=[s.value for s in self.joint_states],
             torso_local_xy=self.torso_local_xy,
+            joint_states_are_detector_and_raw_ownership_not_anatomical_visibility=True,
+            model_point_outside_raster_is_not_physical_anatomical_absence=True,
             geometry_for_ambiguous_owner_is_not_visible_subject_evidence=True)
 
 
@@ -306,7 +308,11 @@ def independent_native_pose_hypotheses(*, domain, rows, duties, initial_person_i
                 or any(n is not None and (type(n) is not int or n not in choices[0]) for n in initial_person_ids)
                 or len(set(initial_person_ids)) != len(initial_person_ids)):
             raise ValueError('independent pose cohort needs actual externally frozen first-anchor person IDs')
-        choices = (initial_person_ids, *choices[1:])
+        # One raster may occupy several output anchors. The frozen seed
+        # belongs to the raster, not only to its first array occurrence.
+        first_native = rows[0].native_frame_index
+        choices = tuple(initial_person_ids if row.native_frame_index == first_native
+            else values for row, values in zip(rows, choices, strict=True))
     return native_pose_windows_from_rows(domain=domain, rows=rows, choices=choices, duties=duties,
         maximum_hypotheses=maximum_hypotheses)
 
@@ -341,6 +347,119 @@ def _unique_anchors(window):
     return tuple(result)
 
 
+@dataclass(frozen=True, slots=True)
+class SupportedPoseSpanV1:
+    """Observed endpoint secants within ONE unresolved association hypothesis.
+
+    Consecutive scheduled anchors are not proof that all intermediate video
+    frames are visible. This record is diagnostic, not an admission receipt.
+    """
+    unique_anchor_indices: tuple[int, ...]
+    native_frame_indices: tuple[int, ...]
+    measurement_seconds: tuple[float, ...]
+    torso_local_xy: tuple[tuple[float, float], ...]
+    secant_velocity_xy_per_second: tuple[tuple[float, float], ...]
+
+    def to_dict(self):
+        return dict(**asdict(self), interior_visibility_certified=False,
+            instantaneous_velocity_certified=False, association_certified=False)
+
+
+@dataclass(frozen=True, slots=True)
+class JointSensorSpansV1:
+    """Partial measured support; never removes or satisfies editorial duties."""
+    track_sha256: str
+    joint_index: int
+    time_basis: str
+    maximum_gap_seconds: float | None
+    unique_anchor_count: int
+    repeated_native_anchor_count: int
+    spans: tuple[SupportedPoseSpanV1, ...]
+    unavailable_anchor_reasons: tuple[tuple[int, tuple[str, ...]], ...]
+
+    @property
+    def all_scheduled_kinematic_samples_observed(self):
+        return (not self.unavailable_anchor_reasons
+            and sum(len(span.unique_anchor_indices) for span in self.spans)
+                == self.unique_anchor_count)
+
+    def to_dict(self):
+        return dict(contract='partial_raw17_sensor_spans_v1',
+            track_sha256=self.track_sha256, joint_index=self.joint_index,
+            time_basis=self.time_basis, maximum_gap_seconds=self.maximum_gap_seconds,
+            unique_anchor_count=self.unique_anchor_count,
+            repeated_native_anchor_count=self.repeated_native_anchor_count,
+            spans=[span.to_dict() for span in self.spans],
+            unavailable_anchor_reasons=self.unavailable_anchor_reasons,
+            all_scheduled_kinematic_samples_observed=
+                self.all_scheduled_kinematic_samples_observed,
+            whole_interval_visibility_certified=False,
+            physical_source_occlusion_or_out_of_frame_certified=False,
+            required_duty_satisfied=False, candidate_admitted=False)
+
+
+def supported_pose_spans(window, joint, *, maximum_gap_seconds=None):
+    """Keep observed runs, including singletons, without bridging missing poses.
+
+    A torso-local coordinate also depends on BOTH observed shoulders. The
+    optional gap limit must be selected before candidate measurement. None
+    imposes no sampling-gap threshold and provides diagnostic secants only.
+    Repeated native rasters retain their original raw record in ``window``,
+    but do not add another pose sample or an artificial zero velocity.
+    """
+    if (not isinstance(window, NativePoseTrackEvidenceV1) or type(joint) is not int
+            or joint not in window.duties.required_joint_indices):
+        raise ValueError('partial spans require a bound window and a declared joint')
+    if maximum_gap_seconds is not None and (
+            type(maximum_gap_seconds) not in (int, float)
+            or not math.isfinite(maximum_gap_seconds) or maximum_gap_seconds <= 0):
+        raise ValueError('sensor gap limit must be finite and strictly positive')
+    anchors = _unique_anchors(window)
+    spans, unavailable, run = [], [], []
+
+    def flush():
+        if not run:
+            return
+        selected = tuple(anchors[i] for i in run)
+        times = tuple(float(a.measurement_seconds) for a in selected)
+        points = tuple(a.torso_local_xy[joint] for a in selected)
+        velocities = tuple(
+            tuple((q[d]-p[d])/(tb-ta) for d in range(2))
+            for p, q, ta, tb in zip(points, points[1:], times, times[1:]))
+        spans.append(SupportedPoseSpanV1(tuple(run),
+            tuple(a.observation.native_frame_index for a in selected),
+            times, points, velocities))
+        run.clear()
+
+    for index, anchor in enumerate(anchors):
+        reasons = []
+        for dependency in sorted({joint, 5, 6}):
+            state = anchor.joint_states[dependency]
+            if state != PoseJointObservationState.VISIBLE_SUPPORTED:
+                # OUT_OF_SOURCE_FRAME describes a detector prediction here;
+                # it does not establish a physical limb being outside frame.
+                reason = ('model_point_outside_source_raster_not_anatomical_proof'
+                    if state == PoseJointObservationState.OUT_OF_SOURCE_FRAME
+                    else state.value)
+                reasons.append(f'joint_{dependency}:{reason}')
+        if anchor.torso_local_xy[joint] is None:
+            reasons.append('torso_local_coordinate_unavailable')
+        if reasons:
+            flush()
+            unavailable.append((index, tuple(reasons)))
+            continue
+        if run:
+            dt = anchor.measurement_seconds-anchors[run[-1]].measurement_seconds
+            if dt <= 0 or maximum_gap_seconds is not None and dt > maximum_gap_seconds:
+                flush()
+        run.append(index)
+    flush()
+    return JointSensorSpansV1(window.sha256, joint, window.time_basis,
+        None if maximum_gap_seconds is None else float(maximum_gap_seconds),
+        len(anchors), len(window.anchors)-len(anchors), tuple(spans),
+        tuple(unavailable))
+
+
 def _motion(window, joint):
     anchors = _unique_anchors(window)
     points = tuple(a.torso_local_xy[joint] for a in anchors)
@@ -359,6 +478,12 @@ def _motion(window, joint):
 def _cosine(a, b):
     norm = float(np.linalg.norm(a)*np.linalg.norm(b))
     return None if norm < 1e-12 else float(np.clip(np.dot(a, b)/norm, -1., 1.))
+
+
+def _kinematic_sample_supported(anchor, joint):
+    return (anchor.torso_local_xy[joint] is not None and all(
+        anchor.joint_states[index] == PoseJointObservationState.VISIBLE_SUPPORTED
+        for index in {joint, 5, 6}))
 
 
 def compare_pose_phase_windows(reference, candidate):
@@ -380,6 +505,9 @@ def compare_pose_phase_windows(reference, candidate):
         supported = all(anchor.joint_states[joint] == PoseJointObservationState.VISIBLE_SUPPORTED
             for anchor in (*reference.anchors, *candidate.anchors))
         raw = dict(joint_index=joint, required=True, all_source_support_observed=supported,
+            all_torso_local_kinematic_samples_observed=all(
+                _kinematic_sample_supported(anchor, joint)
+                for anchor in (*reference.anchors, *candidate.anchors)),
             reference_states=[anchor.joint_states[joint].value for anchor in reference.anchors],
             candidate_states=[anchor.joint_states[joint].value for anchor in candidate.anchors],
             multi_anchor_residual=None, maximum_velocity_difference_per_second=None,
@@ -395,7 +523,11 @@ def compare_pose_phase_windows(reference, candidate):
         reference_track_sha256=reference.sha256, candidate_track_sha256=candidate.sha256,
         duty_sha256=reference.duties.sha256, time_basis=reference.time_basis, joints=rows,
         raw_geometry_may_remain_ownership_ambiguous=True,
+        source_support_flag_basis='raw_joint_detector_and_ownership_states_only_not_coordinate_or_semantic_visibility',
         all_required_source_support_observed=all(row['all_source_support_observed'] for row in rows),
+        all_required_torso_local_kinematic_samples_observed=all(
+            row['all_torso_local_kinematic_samples_observed'] for row in rows),
+        independent_physical_source_visibility_certified=False,
         missing_is_zero_cost=False, minimum_over_convenient_owner_used=False,
         alignment_certified=False, source_local_association_certified=False,
         cross_source_identity_certified=False, temporal_phase_certified=False,
@@ -421,6 +553,9 @@ def compare_pose_boundary_windows(outgoing, incoming):
         item = dict(joint_index=joint, required=True, predicted_pose_jump=None,
             velocity_difference_per_output_second=None, velocity_direction_cosine=None,
             outgoing_reversals=None, incoming_reversals=None,
+            all_torso_local_kinematic_samples_observed=all(
+                _kinematic_sample_supported(anchor, joint)
+                for anchor in (*outgoing.anchors, *incoming.anchors)),
             all_source_support_observed=all(anchor.joint_states[joint] == PoseJointObservationState.VISIBLE_SUPPORTED
                 for anchor in (*outgoing.anchors, *incoming.anchors)))
         if a is not None and b is not None:
@@ -434,7 +569,11 @@ def compare_pose_boundary_windows(outgoing, incoming):
         outgoing_state_key=outgoing.state_key, incoming_state_key=incoming.state_key,
         boundary_gap_output_seconds=gap, duty_sha256=outgoing.duties.sha256, joints=measured,
         lk_feature_survival_prerequisite=False, missing_is_zero_cost=False,
+        source_support_flag_basis='raw_joint_detector_and_ownership_states_only_not_coordinate_or_semantic_visibility',
         all_required_source_support_observed=all(row['all_source_support_observed'] for row in measured),
+        all_required_torso_local_kinematic_samples_observed=all(
+            row['all_torso_local_kinematic_samples_observed'] for row in measured),
+        independent_physical_source_visibility_certified=False,
         surface_or_extent_certified=False, source_local_association_certified=False,
         cross_source_identity_certified=False, temporal_phase_certified=False,
         calibrated=False, candidate_admitted=False, quality_approved=False)
