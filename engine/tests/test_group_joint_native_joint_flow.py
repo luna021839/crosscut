@@ -4,7 +4,7 @@ import unittest
 import cv2
 import numpy as np
 
-from crosscut.group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost
+from crosscut.group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost, native_joint_pixel_flow_stream
 from engine.tests.test_group_joint_formation import person
 
 
@@ -77,3 +77,16 @@ class NativeJointFlowTests(unittest.TestCase):
             native_joint_pixel_flows(previous, current, (subject,), intermediate_pixels=(None,))
         with self.assertRaises(ValueError):
             native_joint_pixel_flows(previous, current, (subject,), intermediate_pixels=(previous,)*13)
+
+    def test_streaming_native_steps_equal_same_pixel_sequence_and_keep_failures(self):
+        previous, current, subject, _ = self.fixture()
+        eager = native_joint_pixel_flows(previous,current,(subject,),
+            intermediate_pixels=(previous,current))
+        stream = native_joint_pixel_flow_stream(previous,current,(subject,),
+            intermediate_pixels=(image for image in (previous,current)))
+        self.assertEqual(eager,stream)
+        self.assertEqual(native_joint_pixel_flow_stream(previous,current,(subject,),
+            intermediate_pixels=(image for image in (np.zeros_like(previous),current))), (None,))
+        with self.assertRaises(ValueError):
+            native_joint_pixel_flow_stream(previous,current,(subject,),
+                intermediate_pixels=(previous for _ in range(13)))

@@ -5,6 +5,7 @@ ownership/lifetime negatives; a separate test compares actual OpenCV LK to
 the previous person-major loop. No models or private media are loaded.
 """
 from dataclasses import replace
+from copy import deepcopy
 import hashlib
 from time import monotonic
 from types import SimpleNamespace
@@ -107,6 +108,77 @@ class SceneCompositionStreamingTests(unittest.TestCase):
         self.assertEqual(len(calls),6)
         self.assertNotIn((2,3,True),calls)
         self.assertNotIn((3,4,True),calls)
+
+    def test_disappearing_extra_rectangle_preserves_two_actual_support_paths(self):
+        sensors=self.sensors();first,last=observation(0),observation(3)
+        first=replace(first,people=first.people+(
+            ObservedFormationPerson(7,(.43,.15,.11,.65),(),.9),))
+        with patch.object(composition,'_optical_flow_box',new=self.shifted):
+            result=composition.body_support_links(sensors,first,last)
+        self.assertTrue(result['observed_support_paths'])
+        self.assertFalse(result['complete_support_paths'])
+        self.assertEqual(result['assignments'],[[0,0],[1,1]])
+        self.assertEqual(result['required_body_observation_ids'],[[0,1,7],[0,1]])
+        self.assertEqual(result['observed_body_observation_ids'],[[0,1],[0,1]])
+        self.assertEqual(result['unmatched_body_observation_ids'],[[7],[]])
+        composition.validate_support_link(result,first.to_dict(),last.to_dict())
+        self.assertEqual(len(first.to_dict()['people']),3,'raw detector inventory must not be erased')
+        self.assertFalse(result['semantic_cast_membership_certified'])
+        for key in ('complete_support_paths','observed_support_paths',
+                'unmatched_body_observation_ids','observed_body_observation_ids'):
+            forged=deepcopy(result)
+            forged[key]=True if key=='complete_support_paths' else False if key=='observed_support_paths' else [[],[]]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                composition.validate_support_link(forged,first.to_dict(),last.to_dict())
+
+    def test_entering_rectangle_and_reordered_detector_ids_are_explicitly_unmatched(self):
+        sensors=self.sensors();first,last=observation(0),observation(3)
+        last=replace(last,people=(replace(last.people[1],observation_id=11),
+            replace(last.people[0],observation_id=12),
+            ObservedFormationPerson(9,(.445,.15,.11,.65),(),.9)))
+        with patch.object(composition,'_optical_flow_box',new=self.shifted):
+            result=composition.body_support_links(sensors,first,last)
+        self.assertTrue(result['observed_support_paths'])
+        self.assertFalse(result['complete_support_paths'])
+        self.assertEqual(result['assignments'],[[0,12],[1,11]])
+        self.assertEqual(result['unmatched_body_observation_ids'],[[],[9]])
+        composition.validate_support_link(result,first.to_dict(),last.to_dict())
+
+    def test_lost_third_roi_does_not_invalidate_two_measured_paths(self):
+        sensors=self.sensors();first,last=observation(0),observation(3)
+        first=replace(first,people=first.people+(
+            ObservedFormationPerson(7,(.43,.15,.11,.65),(),.9),))
+        last=replace(last,people=last.people+(
+            ObservedFormationPerson(7,(.445,.15,.11,.65),(),.9),))
+        def flow(a,b,box):
+            return None if .4 < box[0] < .5 else self.shifted(a,b,box)
+        with patch.object(composition,'_optical_flow_box',new=flow):
+            result=composition.body_support_links(sensors,first,last)
+        self.assertTrue(result['observed_support_paths'])
+        self.assertFalse(result['complete_support_paths'])
+        self.assertEqual(result['unmatched_body_observation_ids'],[[7],[7]])
+        composition.validate_support_link(result,first.to_dict(),last.to_dict())
+
+    def test_duplicate_rectangles_cannot_supply_two_unique_paths(self):
+        sensors=self.sensors();first,last=observation(0),observation(3)
+        last=replace(last,people=last.people+(replace(last.people[0],observation_id=9),))
+        with patch.object(composition,'_optical_flow_box',new=self.shifted):
+            result=composition.body_support_links(sensors,first,last)
+        self.assertEqual(result['assignments'],[[1,1]])
+        self.assertFalse(result['observed_support_paths'])
+        self.assertFalse(result['complete_support_paths'])
+        with self.assertRaises(ValueError):
+            composition.validate_support_link(result,first.to_dict(),last.to_dict())
+
+    def test_complete_flag_and_duplicate_partial_pair_cannot_be_forged(self):
+        sensors=self.sensors();first,last=observation(0),observation(3)
+        with patch.object(composition,'_optical_flow_box',new=self.shifted):
+            result=composition.body_support_links(sensors,first,last)
+        for change in (dict(complete_support_paths=False),dict(assignments=[[0,0],[0,1]]),
+                dict(assignments=[[0,0],[1,6]])):
+            forged=deepcopy(result);forged.update(change)
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                composition.validate_support_link(forged,first.to_dict(),last.to_dict())
 
     def test_invalid_gap_and_source_fail_before_any_raster(self):
         sensors=self.sensors()

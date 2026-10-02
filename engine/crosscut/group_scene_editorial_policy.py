@@ -13,6 +13,7 @@ import math
 
 CONTRACT = 'declared_composition_required_evidence_then_utility_v1'
 GEOMETRY_METRICS = ('occupancy', 'attention', 'scale', 'span', 'screen_motion')
+ARTICULATION_METRICS = ('composition_pose_shape', 'composition_pose_velocity')
 
 
 def known_metrics(row):
@@ -62,6 +63,7 @@ def evaluate_composition_path(reference, measured):
             or r.get('required_semantics_available') is not True for r in measured):
         return dict(result, reason='new_required_measurement_unavailable')
     baseline_known, candidate_known = [], []
+    baseline_articulation, candidate_articulation = [], []
     unknown = False
     for before, after in zip(reference['edges'], measured, strict=True):
         if before is None or not known_metrics(before):
@@ -75,6 +77,10 @@ def evaluate_composition_path(reference, measured):
                 return dict(result, reason='known_non_geometry_evidence_lost_or_worse')
         baseline_known.append(composition_cost(before))
         candidate_known.append(composition_cost(after))
+        for key in ARTICULATION_METRICS:
+            if key in before['metrics']:
+                baseline_articulation.append(before['metrics'][key]/(1.+before['metrics'][key]))
+                candidate_articulation.append(after['metrics'][key]/(1.+after['metrics'][key]))
     before_cost, after_cost = sum(baseline_known), sum(candidate_known)
     if candidate_known and max(candidate_known) > max(baseline_known)+1e-9:
         return dict(result, reason='known_worst_boundary_composition_utility_worse',
@@ -82,13 +88,19 @@ def evaluate_composition_path(reference, measured):
             matched_candidate_worst_boundary_cost=max(candidate_known))
     if candidate_known and after_cost > before_cost+1e-9:
         return dict(result, reason='known_edge_aggregate_composition_utility_worse')
-    gain = unknown or after_cost < before_cost-1e-6
+    pose_before, pose_after = sum(baseline_articulation), sum(candidate_articulation)
+    pose_gain = bool(baseline_articulation) and pose_after < pose_before-1e-6
+    gain = unknown or after_cost < before_cost-1e-6 or pose_gain
     return dict(result, admitted=gain,
         reason='newly_observable_not_proven_improvement' if unknown else
+            'known_partial_articulation_improved' if pose_gain else
             'aggregate_composition_utility_improved' if gain else 'no_editorial_gain',
         comparison_kind='newly_observable' if unknown else 'complete_observed_baseline',
         known_baseline_cost=before_cost if baseline_known else None,
         matched_candidate_cost=after_cost if candidate_known else None,
         known_baseline_worst_boundary_cost=max(baseline_known) if baseline_known else None,
         matched_candidate_worst_boundary_cost=max(candidate_known) if candidate_known else None,
-        candidate_cost=sum(composition_cost(r) for r in measured))
+        known_baseline_articulation_cost=pose_before if baseline_articulation else None,
+        matched_candidate_articulation_cost=pose_after if candidate_articulation else None,
+        articulated_identity_or_complete_cohort_certified=False,
+        candidate_cost=sum(composition_cost(r) for r in measured)+pose_after)

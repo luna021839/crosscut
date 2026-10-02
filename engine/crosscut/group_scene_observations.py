@@ -31,7 +31,7 @@ from .group_focal_attention import focal_landmarks_track
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
 
 SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
-DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v4'
+DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v5'
 MAX_HYPOTHESES_PER_SPAN = 32
 # Bounded exploration, NOT detection/confidence/visibility thresholds.
 VARIANTS = (None, *SUPPORTED_ANALYSIS_ROLLS)
@@ -116,6 +116,8 @@ class SceneSensors(source.NativeFamilySensors):
         self.dense_cache = {}
         self.shot_intents = {}
         self.endpoint_cache = {}
+        self.articulation_raw_rows = {}
+        self.articulation_endpoint_cache = {}
 
     def raw(self, state, tick, roll):
         if state.role != GroupOutputRole.COMPOSITION:
@@ -152,7 +154,7 @@ class SceneSensors(source.NativeFamilySensors):
             quality_approved=False)
         if state.role == GroupOutputRole.COMPOSITION:
             link = body_support_links(self, *raw)
-            if not link['complete_support_paths']:
+            if not link['observed_support_paths']:
                 raise ValueError('composition endpoint native support path unknown')
             evidence['composition_support_link'] = link
         else:
@@ -243,7 +245,7 @@ class SceneSensors(source.NativeFamilySensors):
                     if rows[i].native_frame_index < rows[i+1].native_frame_index else None
                     for i in range(0, len(rows), 2)]
                 variant['body_support_links'] = links
-                if any(link is None or not link['complete_support_paths'] for link in links):
+                if any(link is None or not link['observed_support_paths'] for link in links):
                     variant['unavailable'] = 'composition_endpoint_pixel_support_unknown'; continue
                 candidates = [(None,)*len(ticks)]
             elif state.role == GroupOutputRole.FORMATION:
@@ -439,7 +441,7 @@ class SceneSensors(source.NativeFamilySensors):
                     else:
                         from .group_scene_composition import body_support_links
                         support_link = body_support_links(self, previous, raw)
-                        if not support_link['complete_support_paths']:
+                        if not support_link['observed_support_paths']:
                             raise ValueError('composition dense body support lifecycle unknown')
                 current_parts = scene_role_obligations(raw, state.role, current_head).required_parts
                 previous_parts = () if previous is None else scene_role_obligations(
@@ -473,6 +475,8 @@ class SceneSensors(source.NativeFamilySensors):
     def archive(self):
         return dict(contract=SCENE_CONTRACT, discoveries=list(self.discoveries.values()),
             hypotheses=self.hypotheses, native_rows=[r.to_dict() for r in self.raw_rows.values()],
+            parallel_articulation_rows=[None if r is None else r.to_dict()
+                for r in self.articulation_raw_rows.values()],
             endpoint_pixel_links=list(self.link_cache.values()),
             quality_approved=False, association_hypotheses_are_not_named_actors=True)
 
@@ -710,8 +714,12 @@ def compare_scene_edge(sensors, left, right):
         cross_camera_identity_certified=False, body_phase_certified=False)
     if GroupOutputRole.COMPOSITION in (left.role, right.role):
         from .group_scene_editorial_policy import composition_cost
+        from .group_scene_articulation import compare_composition_articulation
+        articulation = compare_composition_articulation(sensors, left, right)
+        if articulation['available']:
+            metrics.update(articulation['metrics'])
         evidence.update(comparison_mode='predeclared_composition_cut',
-            articulated_cross_camera_motion=None, cross_camera_actor_correspondence=None,
+            articulated_cross_camera_motion=articulation, cross_camera_actor_correspondence=None,
             framing_cost=composition_cost(evidence), quality_approved=False)
         return evidence
     if formation:
@@ -797,6 +805,11 @@ def validate_scene_dense(dense):
     family.digest(dense)  # Recursively reject nonfinite evidence before comparisons.
     from .group_scene_intent import validate_intent
     from .group_scene_composition import validate_raw_composition,validate_support_link
+    from .group_scene_articulation import validate_articulation_evidence
+    for edge in dense.get('incident_projected_observations', ()):
+        if edge.get('comparison_mode') == 'predeclared_composition_cut':
+            validate_articulation_evidence(edge.get('articulated_cross_camera_motion'),
+                edge.get('metrics'), dense.get('native_assets'))
     hypotheses=dense.get('scene_hypotheses');keys=dense.get('hypothesis_keys')
     if not isinstance(hypotheses,dict) or not isinstance(keys,list) or len(keys)!=len(dense['state_keys']):
         raise ValueError('scene dense hypothesis inventory missing')

@@ -461,11 +461,11 @@ def propose_scene_changes(context):
                         for row in span['rows']:
                             raw=sensors.raw(old,row['output_tick'],None)
                             if old.role==GroupOutputRole.COMPOSITION:
-                                people=();old_subject_state='all_native_body_supports_not_semantic_cast'
-                                # Measured body-support cardinality cannot be bought
-                                # with a lower style cost. Counts still are NOT actors.
-                                if len(row['scene_people'])<len(raw.people):
-                                    raise ValueError('composition source change loses known native body support cardinality')
+                                # All old raw rectangles remain archived, but their
+                                # detector count is not a cross-camera cast duty.
+                                # Dense candidate visibility and actual ROI support
+                                # are independently required on its own pixels.
+                                people=();old_subject_state='raw_native_roi_inventory_not_cross_camera_cast_duty'
                             elif old.role==GroupOutputRole.FORMATION:
                                 people=raw.people;old_subject_state='formation_cohort'
                             else:
@@ -484,6 +484,7 @@ def propose_scene_changes(context):
                             preserved.append(dict(output_tick=row['output_tick'],required_parts=dict(sorted(required.items())),
                                 incumbent_subject_scope=old_subject_state,
                                 all_incumbent_raw_people_retained=len(raw.people),
+                                detector_count_is_not_cross_camera_cast_obligation=True,
                                 part_count_is_not_cross_camera_actor_correspondence=True,
                                 native_observation_sha256=raw.sha256,absence_is_not_a_negative_detection_certificate=True))
                     search=dict(producer=CONTRACT,generated_numeric_states=numeric['states'],

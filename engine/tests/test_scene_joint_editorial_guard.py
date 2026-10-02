@@ -57,3 +57,22 @@ def test_geometry_cannot_buy_known_articulated_evidence_loss():
     assert not evaluate_composition_path(dict(edges=[before]), [after])['admitted']
     after['metrics']['pose_velocity'] = .2
     assert not evaluate_composition_path(dict(edges=[before]), [after])['admitted']
+
+
+def test_known_motion_improvement_is_a_gain_with_equal_framing():
+    before, after = edge(.2), edge(.2)
+    before['metrics'].update(composition_pose_shape=.5, composition_pose_velocity=.6)
+    after['metrics'].update(composition_pose_shape=.2, composition_pose_velocity=.1)
+    result = evaluate_composition_path(dict(edges=[before]), [after])
+    assert result['admitted']
+    assert result['reason'] == 'known_partial_articulation_improved'
+    assert result['matched_candidate_articulation_cost'] < result['known_baseline_articulation_cost']
+    assert not result['articulated_identity_or_complete_cohort_certified']
+
+
+def test_unknown_articulation_cannot_be_called_zero_cost_motion_gain():
+    before, after = edge(.2), edge(.2)
+    after['metrics'].update(composition_pose_shape=0., composition_pose_velocity=0.)
+    result = evaluate_composition_path(dict(edges=[before]), [after])
+    assert not result['admitted']
+    assert result['known_baseline_articulation_cost'] is None

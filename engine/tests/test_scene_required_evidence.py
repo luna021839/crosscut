@@ -78,6 +78,7 @@ class BodySupportPixelTests(unittest.TestCase):
             frame_size_wh=(320,180)
             def __init__(self,n):
                 self.native_frame_index=n;self.sha256=f'RAW-CHART-{n}'
+                self.native_pixel_sha256=hashlib.sha256(memoryview((a,b)[n])).hexdigest()
                 self.people=tuple(ObservedFormationPerson(i,box,(),.99) for i,box in zip(ids,
                     ((.1,.2,.22,.5),(.6,.2,.22,.5))))
         counts={}

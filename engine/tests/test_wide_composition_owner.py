@@ -92,11 +92,12 @@ def describe_headless_chart(frame, **kwargs):
 
 
 @contextmanager
-def wide_chart_sensors():
+def wide_chart_sensors(detector=chart_detector):
     with source_chart_sensors(), ExitStack() as stack:
         def register(session, **assets):
-            session.register_model('nanodet_people',assets['person_model_path'],chart_detector,
+            session.register_model('nanodet_people',assets['person_model_path'],detector,
                 adapter_fingerprint=dict(contract='EXPLICIT_NONHUMAN_RECTANGLE_SENSOR_NOT_NANODET_INFERENCE',
+                    detector_fixture=detector.__name__,
                     fixture_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()))
         stack.enter_context(patch.object(source,'register_joint_native_models',side_effect=register))
         stack.enter_context(patch.object(source,'observe_native_group',side_effect=ValueError(
@@ -154,6 +155,25 @@ def wide_chart_propose(context):
 @isolated_optional()
 def wide_chart_final(plan_json,receipt,deadline):
     with wide_chart_sensors():
+        return source.final_live_replay.__wrapped__(plan_json,receipt,deadline)
+
+
+def partial_chart_detector(pixels):
+    rows=chart_detector(pixels)
+    if len(rows)!=2:return rows
+    # Deliberately untrackable tiny NONHUMAN context rectangle between the two
+    # textured supports. It has fewer than the unchanged LK corner minimum.
+    # Do not erase this raw detector row to make the two real pixel paths pass.
+    height,width=pixels.shape[:2]
+    left=min(row[0] for row in rows);right=max(row[2] for row in rows)
+    top=min(row[1] for row in rows);bottom=max(row[3] for row in rows)
+    x,y=(left+right)/2,(top+bottom)/2
+    return (*rows,(x,y,min(width,x+3),min(height,y+3),.99))
+
+
+@isolated_optional()
+def partial_wide_chart_final(plan_json,receipt,deadline):
+    with wide_chart_sensors(detector=partial_chart_detector):
         return source.final_live_replay.__wrapped__(plan_json,receipt,deadline)
 
 
@@ -339,5 +359,25 @@ class WideOwnerIntegrationTests(unittest.TestCase):
         with optional_native_scope(self.context.deadline):
             metrics=wide_chart_final(self.result.render_plan.to_json(),
                 family.plain(self.result.performer_family_review),self.context.deadline)
+        self.assertGreaterEqual(metrics['dense_native_output_tick_count'],60)
+        self.assertIs(metrics['quality_approved'],False)
+
+    def test_partial_actual_roi_paths_reach_normal_owner_and_final_replay(self):
+        with optional_native_scope(self.context.deadline),wide_chart_sensors(detector=partial_chart_detector):
+            result=scene.propose_scene_changes(self.context)
+        self.assertNotIsInstance(result,family.PerformerFamilyRejection,getattr(result,'error',None))
+        dense=family.plain(result.editorial_motion_plan.source_camera_refresh)
+        observations.validate_scene_dense(dense)
+        rows=[r for span in dense['mutable_shots'] for r in span['rows']]
+        self.assertTrue(all(len(row['native_observation']['people'])==3 for row in rows))
+        self.assertTrue(all(len(row['scene_people'])==3 for row in rows))
+        links=[row['composition_support_link'] for row in rows if row['composition_support_link'] is not None]
+        self.assertTrue(links)
+        self.assertTrue(all(link['observed_support_paths'] for link in links))
+        self.assertTrue(all(not link['complete_support_paths'] for link in links))
+        self.assertTrue(all(link['unmatched_body_observation_ids']==[[2],[2]] for link in links))
+        with optional_native_scope(self.context.deadline):
+            metrics=partial_wide_chart_final(result.render_plan.to_json(),
+                family.plain(result.performer_family_review),self.context.deadline)
         self.assertGreaterEqual(metrics['dense_native_output_tick_count'],60)
         self.assertIs(metrics['quality_approved'],False)

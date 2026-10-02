@@ -47,6 +47,22 @@ def native_joint_pixel_flows(previous_pixels, current_pixels, people, *, interme
         raise ValueError('joint pixel flow needs actual BGR8 rasters')
     if any(frame.shape != previous_pixels.shape for frame in frames[1:]):
         return tuple(None for _ in people)
+    return native_joint_pixel_flow_stream(previous_pixels, current_pixels, people,
+        intermediate_pixels=iter(middle))
+
+
+def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, intermediate_pixels=()):
+    """Same joint checks, with at most one live intermediate native raster.
+
+    Caller supplies chronological actual rasters, not interpolated frames. A
+    no-feature result is UNKNOWN and does not assert that unread steps passed.
+    """
+    if any(not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
+            or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 3
+            for frame in (previous_pixels, current_pixels)):
+        raise ValueError('joint pixel flow needs actual BGR8 rasters')
+    if previous_pixels.shape != current_pixels.shape:
+        return tuple(None for _ in people)
     previous = cv2.cvtColor(previous_pixels, cv2.COLOR_BGR2GRAY)
     height, width = previous.shape
     feature_rows, groups = [], []
@@ -80,7 +96,18 @@ def native_joint_pixel_flows(previous_pixels, current_pixels, people, *, interme
     moving = original
     valid = np.ones(len(original), dtype=bool)
     errors = np.zeros(len(original), dtype=np.float32)
-    for frame in frames[1:]:
+    def steps():
+        for index, frame in enumerate(intermediate_pixels):
+            if index >= 12:
+                raise ValueError('joint pixel flow accepts at most twelve actual intervening rasters')
+            yield frame
+        yield current_pixels
+    for frame in steps():
+        if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
+                or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 3):
+            raise ValueError('joint pixel flow needs actual BGR8 rasters')
+        if frame.shape != previous_pixels.shape:
+            return tuple(None for _ in people)
         current = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(previous, current, moving, None, **options)
         if forward is None or forward_status is None:

@@ -50,7 +50,7 @@ from .render import segment_frame_counts
 
 CONTRACT = 'normal_source_changing_family_owner_v1'
 DENSE_CONTRACT = 'source_native_focal_whole_camera_refresh_v1'
-SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v4'
+SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v5'
 DENSE_CONTRACTS = (DENSE_CONTRACT, SCENE_DENSE_CONTRACT)
 MAX_REFRESHED_CELLS = 24
 MAX_MUTABLE_FRAMES = 300
@@ -530,6 +530,13 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         else joint_state_from_render_plan)(plan=plan,domain=context.domain,slot=s.slot,
         first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
         editorial_contract_sha256=s.editorial_contract_sha256) for i,s in enumerate(path))
+    if scene:
+        from .group_scene_observations import compare_scene_edge
+        fresh_edges = [compare_scene_edge(sensors,a,b) for a,b in zip(final_states,final_states[1:])]
+        if any(not fresh.get('available') or family.digest(fresh.get('metrics'))!=family.digest(before.get('metrics'))
+                for before,fresh in zip(edge_rows,fresh_edges,strict=True)):
+            raise ValueError('scene selected incident metrics changed during complete family refresh')
+        edge_rows = fresh_edges
     dense=dict(contract=SCENE_DENSE_CONTRACT if scene else DENSE_CONTRACT,geometry_sha256=family.digest(geometry_payload(plan)),
         changed_cells=list(changed),incident_edges=list(edges),state_keys=[s.key for s in final_states],
         window_bounds=[[s.first_output_frame,s.end_output_frame] for s in final_states],
@@ -921,6 +928,11 @@ def final_live_replay(plan_json,receipt,deadline):
                     sensors.endpoint(state,outgoing=outgoing)
         if [s.key for s in path]!=dense['state_keys'] or family.digest(sensors.dense(path))!=family.digest(dense['mutable_shots']):
             raise ValueError('source-changing final all-tick native/camera replay disagrees')
+        if dense['contract']==SCENE_DENSE_CONTRACT:
+            from .group_scene_observations import compare_scene_edge
+            fresh_edges=[compare_scene_edge(sensors,a,b) for a,b in zip(path,path[1:])]
+            if family.digest(fresh_edges)!=family.digest(dense['incident_projected_observations']):
+                raise ValueError('scene final selected incident articulation/geometry replay disagrees')
     finally: session.close()
     if [list(_file_identity(p)) for p in domain.eligible_sources]!=receipt['source_identities']:
         raise ValueError('source-changing source changed during final dense replay')
