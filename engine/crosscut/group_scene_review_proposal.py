@@ -35,7 +35,7 @@ from .optional_native_worker import current_optional_deadline, isolated_optional
 from .render import RenderPlan, render, segment_frame_counts
 from .render_frame_schedule import probe_render_frame_clock
 
-CONTRACT = 'normal_scene_review_proposal_v1'
+CONTRACT = 'normal_scene_review_proposal_v2'
 MAX_WINDOWS = 3
 MAX_MUTABLE_FRAMES = 240  # Includes producer + independent replay within 1200 source reads.
 MAX_OUTPUT_FRAMES = 18000
@@ -237,6 +237,47 @@ def scene_edge(a, b):
         quality_improvement_established=False, semantics=dict(UNKNOWN))
 
 
+def compare_review_path(baseline_edges, candidate_edges):
+    """Keep the incumbent unless the two-sided incident path has a gain.
+
+    This is only an explicit review-artifact ranking rule, not a human pose
+    verdict. Unknown texture cannot be charged as a measured baseline cost.
+    Component costs may trade; a lower total cannot hide a new worst seam.
+    """
+    result = dict(contract='scene_review_incumbent_two_sided_ranking_v1',
+        admitted=False, quality_approved=False, unknown_imputed_as_zero=False)
+    if (not isinstance(baseline_edges, (list, tuple))
+            or not isinstance(candidate_edges, (list, tuple))
+            or len(baseline_edges) != 2 or len(candidate_edges) != 2):
+        return dict(result, reason='two_incident_edges_required')
+    before, after = [], []
+    for edges, costs in ((baseline_edges, before), (candidate_edges, after)):
+        for row in edges:
+            if (not isinstance(row, dict) or row.get('unknown_metric_count') != 0
+                    or type(row.get('unknown_metric_count')) is not int):
+                return dict(result, reason='unknown_texture_is_not_measured_gain')
+            metrics = row.get('metrics')
+            if (not isinstance(metrics, dict)
+                    or set(metrics) != {'spatial_texture', 'color', 'contrast'}
+                    or any(type(v) not in (int, float) or not math.isfinite(v)
+                        or not 0 <= v <= 1.00001 for v in metrics.values())):
+                return dict(result, reason='texture_measurement_unavailable')
+            cost = sum(metrics.values())/3
+            if (type(row.get('ranking_cost')) not in (int, float)
+                    or not math.isfinite(row['ranking_cost'])
+                    or abs(row['ranking_cost']-cost) > 1e-12):
+                return dict(result, reason='texture_ranking_cost_not_measured')
+            costs.append(cost)
+    result.update(baseline_cost=sum(before)/2, candidate_cost=sum(after)/2,
+        baseline_worst_cost=max(before), candidate_worst_cost=max(after),
+        gain=(sum(before)-sum(after))/2)
+    if max(after) > max(before)+1e-9:
+        return dict(result, reason='new_worst_incident_texture_seam')
+    if result['gain'] <= 1e-6:
+        return dict(result, reason='incumbent_has_no_lower_two_sided_cost')
+    return dict(result, admitted=True, reason='two_sided_texture_gain_not_quality_approval')
+
+
 def _sample(session, state, tick):
     native = state.native_frame_indices[tick-state.first_output_frame]
     index = session.domain.request_index(state.eligible_source_index)
@@ -320,15 +361,19 @@ def propose(context):
                     errors.append(str(exc)); continue
                 session.budget.spend('states')
                 edges = _measure(session, path)
-                candidates.append((sum(e['ranking_cost'] for e in edges)/2,
-                    window[1].first_output_frame, donor, window, assembly, intents, baseline_edges, edges))
+                comparison = compare_review_path(baseline_edges, edges)
+                if not comparison['admitted']:
+                    errors.append(comparison['reason']); continue
+                candidates.append((-comparison['gain'],
+                    window[1].first_output_frame, donor, window, assembly, intents, baseline_edges, edges, comparison))
         if not candidates:
             return None, dict(contract=CONTRACT, status='unavailable', errors=errors,
                 work=session.budget.to_dict(), semantics=dict(UNKNOWN))
-        # Rank only. No detector confidence or all-person lifecycle is an
-        # admission gate. A worse/unknown surrogate is explicitly NOT a gain.
+        # The unchanged incumbent is an explicit zero-gain option. Rank the
+        # measured improvement, not absolute costs of different baseline shots.
         best = min(candidates, key=lambda value: value[:3])
-        cost, _, donor, window, assembly, intents, old_edges, edges = best
+        _, _, donor, window, assembly, intents, old_edges, edges, comparison = best
+        cost = comparison['candidate_cost']
         baseline, path, check, _ = _path(context, window, donor)
         if check[0] != assembly[0]:
             raise ValueError('scene numeric assembly is not deterministic')
@@ -349,7 +394,7 @@ def propose(context):
             bounds=[[s.first_output_frame,s.end_output_frame] for s in window],
             donor_eligible_index=donor, intents=intents, dense=dense, baseline_edges=old_edges,
             candidate_edges=edges, ranking_cost=cost,
-            measured_surrogate_gain=sum(e['ranking_cost'] for e in old_edges)/2-cost,
+            measured_surrogate_gain=comparison['gain'], path_comparison=comparison,
             surrogate_is_not_a_quality_verdict=True, semantics=dict(UNKNOWN),
             derivative_audit=context.source_derivative_binding,
             source_identities=context.source_identities, code_dependencies=context.code_dependencies,
@@ -369,6 +414,10 @@ def _rederive(context, plan, receipt):
             or family.digest(receipt.get('semantics')) != family.digest(UNKNOWN)
             or receipt.get('artifact_role') != 'scene_review_only'):
         raise ValueError('scene review tier/uncertainty contract changed')
+    comparison = compare_review_path(receipt.get('baseline_edges', []), receipt.get('candidate_edges', []))
+    if (not comparison['admitted']
+            or family.digest(receipt.get('path_comparison')) != family.digest(comparison)):
+        raise ValueError('scene review incumbent/two-sided comparison unavailable or changed')
     original = context.incumbent.render_plan
     shots = visible_group_shots(original, context.domain)
     bounds = receipt.get('bounds')
@@ -404,13 +453,18 @@ def replay(context, plan, receipt):
     try:
         session.budget.spend('dense_paths')
         old_edges, edges = _measure(session, baseline), _measure(session, path)
+        comparison = compare_review_path(old_edges, edges)
+        if not comparison['admitted']:
+            raise ValueError('scene review incumbent wins fresh two-sided comparison: '+comparison['reason'])
+        if family.digest(receipt.get('path_comparison')) != family.digest(comparison):
+            raise ValueError('scene review two-sided comparison changed')
         dense = _dense(session, baseline, path)
         if (family.digest(dense) != family.digest(receipt.get('dense'))
                 or family.digest(old_edges) != family.digest(receipt.get('baseline_edges'))
                 or family.digest(edges) != family.digest(receipt.get('candidate_edges'))):
             raise ValueError('scene review exact ordered native/projected evidence changed')
-        expected_cost = sum(e['ranking_cost'] for e in edges)/2
-        expected_gain = sum(e['ranking_cost'] for e in old_edges)/2-expected_cost
+        expected_cost = comparison['candidate_cost']
+        expected_gain = comparison['gain']
         if (family.digest(receipt.get('ranking_cost')) != family.digest(expected_cost)
                 or family.digest(receipt.get('measured_surrogate_gain')) != family.digest(expected_gain)):
             raise ValueError('scene review ranking metrics changed')

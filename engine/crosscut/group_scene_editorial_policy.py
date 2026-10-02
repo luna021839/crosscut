@@ -4,7 +4,9 @@ Required observation availability, containment and local support paths are
 checked first. The five scene-framing statistics are tradeable editorial
 costs, not five independently mandatory nonregression duties. UNKNOWN is
 never a zero-cost observation. A baseline is one whole, realizable path,
-including a single middle hypothesis shared by both incident edges.
+including a single middle hypothesis shared by both incident edges. An
+improved entry must not hide a new worst exit: compare the worst known
+incident boundary before comparing the aggregate utility.
 """
 from itertools import islice, product
 import math
@@ -74,6 +76,10 @@ def evaluate_composition_path(reference, measured):
         baseline_known.append(composition_cost(before))
         candidate_known.append(composition_cost(after))
     before_cost, after_cost = sum(baseline_known), sum(candidate_known)
+    if candidate_known and max(candidate_known) > max(baseline_known)+1e-9:
+        return dict(result, reason='known_worst_boundary_composition_utility_worse',
+            known_baseline_worst_boundary_cost=max(baseline_known),
+            matched_candidate_worst_boundary_cost=max(candidate_known))
     if candidate_known and after_cost > before_cost+1e-9:
         return dict(result, reason='known_edge_aggregate_composition_utility_worse')
     gain = unknown or after_cost < before_cost-1e-6
@@ -83,4 +89,6 @@ def evaluate_composition_path(reference, measured):
         comparison_kind='newly_observable' if unknown else 'complete_observed_baseline',
         known_baseline_cost=before_cost if baseline_known else None,
         matched_candidate_cost=after_cost if candidate_known else None,
+        known_baseline_worst_boundary_cost=max(baseline_known) if baseline_known else None,
+        matched_candidate_worst_boundary_cost=max(candidate_known) if candidate_known else None,
         candidate_cost=sum(composition_cost(r) for r in measured))

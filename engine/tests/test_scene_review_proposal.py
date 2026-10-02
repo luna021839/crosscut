@@ -26,6 +26,54 @@ from engine.tests.test_scene_normal_analyze import Reporter
 
 
 class SceneReviewPolicyTests(unittest.TestCase):
+    @staticmethod
+    def ranking_edge(cost):
+        # Synthetic scalar texture costs, explicitly NOT performer evidence.
+        return dict(metrics=dict(spatial_texture=cost, color=cost, contrast=cost),
+            ranking_cost=cost, unknown_metric_count=0)
+
+    def test_recorded_negative_seam_gain_keeps_incumbent(self):
+        verdict=trial.compare_review_path([self.ranking_edge(.108629),self.ranking_edge(.003683)],
+            [self.ranking_edge(.109570),self.ranking_edge(.110049)])
+        self.assertFalse(verdict['admitted'])
+        self.assertLess(verdict['gain'],0)
+        self.assertFalse(verdict['quality_approved'])
+
+    def test_better_entry_cannot_hide_new_worst_exit(self):
+        verdict=trial.compare_review_path([self.ranking_edge(.3)]*2,
+            [self.ranking_edge(0),self.ranking_edge(.4)])
+        self.assertFalse(verdict['admitted'])
+        self.assertEqual(verdict['reason'],'new_worst_incident_texture_seam')
+
+    def test_zero_gain_is_incumbent_not_changed_donor(self):
+        verdict=trial.compare_review_path([self.ranking_edge(.3)]*2,[self.ranking_edge(.3)]*2)
+        self.assertFalse(verdict['admitted'])
+
+    def test_lower_worst_and_total_is_rank_only(self):
+        verdict=trial.compare_review_path([self.ranking_edge(.5),self.ranking_edge(.2)],
+            [self.ranking_edge(.4),self.ranking_edge(.21)])
+        self.assertTrue(verdict['admitted'])
+        self.assertFalse(verdict['quality_approved'])
+
+    def test_unknown_and_forged_costs_cannot_manufacture_gain(self):
+        before=[self.ranking_edge(.3)]*2
+        for changed in (dict(unknown_metric_count=1),dict(unknown_metric_count=False),
+                dict(ranking_cost=0),dict(ranking_cost=float('nan'))):
+            after=[self.ranking_edge(.1),dict(self.ranking_edge(.1),**changed)]
+            with self.subTest(changed=changed):
+                verdict=trial.compare_review_path(before,after)
+                self.assertFalse(verdict['admitted'])
+                self.assertFalse(verdict['unknown_imputed_as_zero'])
+
+    def test_unknown_baseline_is_not_a_measured_high_cost(self):
+        before=[dict(self.ranking_edge(.9),unknown_metric_count=1),self.ranking_edge(.9)]
+        verdict=trial.compare_review_path(before,[self.ranking_edge(.1)]*2)
+        self.assertFalse(verdict['admitted'])
+
+    def test_malformed_two_sided_inventory_rejected(self):
+        for edges in (None,{},[],[self.ranking_edge(.1)]):
+            self.assertFalse(trial.compare_review_path(edges,[self.ranking_edge(.1)]*2)['admitted'])
+
     def test_clock_publication_rejects_stale_video_or_plan_without_overwriting(self):
         from crosscut.render_clock_artifact import render_clock_path, RENDER_CLOCK_ARTIFACT_CONTRACT
         with tempfile.TemporaryDirectory() as directory:
@@ -108,6 +156,16 @@ class SceneReviewProductionTests(unittest.TestCase):
     def test_exact_dense_order_not_set_or_cardinality(self):
         bad=deepcopy(self.receipt);bad['dense'][0],bad['dense'][1]=bad['dense'][1],bad['dense'][0]
         with self.assertRaises(ValueError):trial.replay.__wrapped__(self.context_now(),self.plan,bad)
+
+    def test_independent_consumer_rejects_forged_path_comparison(self):
+        bad=deepcopy(self.receipt);bad['path_comparison']['gain']+=.01
+        with self.assertRaisesRegex(ValueError,'two-sided comparison'):
+            trial.replay.__wrapped__(self.context_now(),self.plan,bad)
+
+    def test_old_negative_gain_contract_cannot_be_rendered_as_current(self):
+        bad=deepcopy(self.receipt);bad['contract']='normal_scene_review_proposal_v1'
+        with self.assertRaisesRegex(ValueError,'tier/uncertainty'):
+            trial._rederive(self.context_now(),self.plan,bad)
 
     def test_duplicate_dense_tick_rejected(self):
         bad=deepcopy(self.receipt);bad['dense'][1]=bad['dense'][0]
