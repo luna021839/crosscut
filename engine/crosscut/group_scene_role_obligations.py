@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from .group_joint_source_camera import GroupOutputRole
 
 
-CONTRACT = 'declared_scene_role_obligations_v1'
+CONTRACT = 'declared_scene_role_obligations_v2'
 ARM_PARTS = ('left_arm', 'right_arm')
 
 
@@ -46,6 +46,13 @@ def scene_role_obligations(raw, role, selected_head_id):
     if (any(type(i) is not int for i in (*head_ids, *person_ids))
             or len(set(head_ids)) != len(head_ids) or len(set(person_ids)) != len(person_ids)):
         raise ValueError('scene role raw observation IDs are invalid or duplicated')
+    if role == GroupOutputRole.COMPOSITION:
+        if selected_head_id is not None or heads or len(people) < 2:
+            raise ValueError('composition duty needs body support, never a fake focal head')
+        # This v1 conservative inventory is NOT a semantic cast/cohort solver.
+        # Unknown poses remain unknown and cannot create an arm obligation.
+        return SceneRoleObligations(role.value, None, (), person_ids, (), None,
+            'not_requested_body_support_only', (), ())
     if role == GroupOutputRole.FORMATION:
         if selected_head_id is not None or len(people) < 2:
             raise ValueError('formation duty cannot be replaced by a selected focal head')

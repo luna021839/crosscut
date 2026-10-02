@@ -28,7 +28,7 @@ def fixture(role=Role.FOCAL_HEAD,*,parts=('left_arm','right_arm')):
         tuple(range(8)),role,'a'*64,30.,(320,180),(8,))
     sensors=object.__new__(scene.SceneSensors)
     sensors.hypotheses={};sensors.discoveries={};sensors.link_cache={};sensors.frame_cache={}
-    sensors.raw_rows={};sensors.dense_cache={}
+    sensors.raw_rows={};sensors.dense_cache={};sensors.shot_intents={};sensors.endpoint_cache={}
     pixels=np.zeros((180,320,3),np.uint8)
     sensors.session=NS(budget=JointGroupWorkBudget(absolute_deadline=monotonic()+30),
         native_pixels=lambda *a:pixels,projected_pixels=lambda *a:pixels)

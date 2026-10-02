@@ -30,6 +30,11 @@ FIXED_HYPOTHESES = 2
 COMPLETE_REFRESH_RESERVE_SECONDS = 8.
 
 
+class _EdgeFrontierFull(ValueError):
+    """Stop search without discarding already measured complete candidates."""
+
+
+
 def freeze_derivatives(result, domain, identities):
     """Bind an existing typed app audit, including uncertainty, to this domain.
 
@@ -187,7 +192,7 @@ def fixed_window_probe_order(prepared,limit):
 
 
 def _target(row):
-    if row['role'] != GroupOutputRole.FORMATION.value:
+    if row['role'] not in (GroupOutputRole.FORMATION.value, GroupOutputRole.COMPOSITION.value):
         return tuple(row['projected_face_roi_xywh'])
     boxes=[p['projected_box_xywh'] for p in row['scene_people']]
     if not boxes: raise ValueError('formation screen cohort unavailable')
@@ -196,7 +201,7 @@ def _target(row):
 
 
 def _native_target(row):
-    if row['role'] != GroupOutputRole.FORMATION.value: return tuple(row['raw_face_roi_xywh'])
+    if row['role'] not in (GroupOutputRole.FORMATION.value, GroupOutputRole.COMPOSITION.value): return tuple(row['raw_face_roi_xywh'])
     boxes=[p['box_xywh'] for p in row['native_observation']['people']]
     if not boxes: raise ValueError('formation native cohort unavailable')
     x=min(b[0] for b in boxes);y=min(b[1] for b in boxes)
@@ -242,7 +247,11 @@ def propose_scene_changes(context):
                     context.incumbent.visual_timeline,window[1:-1]))
             numeric_inventory.append(record)
             try:
-                roles=source._shot_roles(context,window)
+                from .group_scene_intent import declared_shot_intent
+                intents = tuple(declared_shot_intent(context, shot) for shot in window)
+                roles = tuple(GroupOutputRole(intent['role']) for intent in intents)
+                for intent in intents:
+                    sensors.shot_intents[intent['first_output_frame'],intent['end_output_frame']] = intent
                 baseline=source._states(plan,context.domain,window,roles,fixed_subcell_views=True)
                 by_slot=[]
                 for incumbent in baseline[1:-1]:
@@ -262,6 +271,7 @@ def propose_scene_changes(context):
         scheduled=tuple((wi,item,rolls) for rolls in ((None,),VARIANTS)
             for wi,item in frontier)
         graph_windows=0
+        evaluated_hypothesis_frontiers=set()
         for wi,(baseline,raw_slots,numeric),rolls in scheduled:
             if monotonic()+COMPLETE_REFRESH_RESERVE_SECONDS >= context.deadline:
                 attempts.append(dict(stage='reserve',reason='complete_refresh_reserve_preserved'));break
@@ -269,6 +279,8 @@ def propose_scene_changes(context):
                 attempts.append(dict(stage='state_frontier_exhausted',numeric_windows=len(prepared)));break
             if graph_windows>=MAX_WINDOWS:
                 attempts.append(dict(stage='graph_window_budget',evaluated=graph_windows));break
+            if session.budget.counts['edges'] >= session.budget.limits['edges']:
+                attempts.append(dict(stage='edge_frontier_exhausted',unmeasured_is_unknown=True));break
             start_counts=dict(session.budget.counts)
             # A fixed endpoint with no measured path makes this whole window
             # unavailable regardless of donor. Test it before decoding/inferring
@@ -287,11 +299,30 @@ def propose_scene_changes(context):
                     if key not in seen:seen.add(key);result.append(value)
                 return tuple(result[:FIXED_HYPOTHESES])
             lefts=fixed(lefts,False);rights=fixed(rights,True)
+            # Discovery is not enough: clipping and required arm/support paths
+            # on the unchanged incident endpoint must fail BEFORE donor work.
+            def measured_fixed(values, outgoing):
+                valid=[]
+                for value in values:
+                    try:
+                        sensors.endpoint(value,outgoing=outgoing)
+                        valid.append(value)
+                    except ValueError as exc:
+                        attempts.append(dict(stage='fixed_required_measurement',window=wi,
+                            state_key=value.key,error=str(exc),donor_native_observations_skipped=True))
+                return tuple(valid)
+            lefts=measured_fixed(lefts,True);rights=measured_fixed(rights,False)
             if not lefts or not rights:
                 attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
                     analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
                     donor_native_observations_skipped=True,
                     donor_absence_inferred=False));continue
+            fixed_signature=(wi,tuple(v.key for v in lefts),tuple(v.key for v in rights))
+            if all(s.role==GroupOutputRole.COMPOSITION for s in baseline):
+                if fixed_signature in evaluated_hypothesis_frontiers:
+                    attempts.append(dict(stage='unchanged_composition_frontier_skipped',window=wi))
+                    continue
+                evaluated_hypothesis_frontiers.add(fixed_signature)
             graph_windows+=1
             # All numerically available sources are observed before choosing a
             # donor/camera, but only after the shared incident endpoints exist.
@@ -346,6 +377,8 @@ def propose_scene_changes(context):
             def read(a,b):
                 key=a.key,b.key
                 if key not in edges:
+                    if session.budget.counts['edges']>=session.budget.limits['edges']:
+                        raise _EdgeFrontierFull('bounded edge frontier reached')
                     session.budget.spend('edges')
                     evidence=compare_scene_edge(sensors,a,b)
                     evidence['source_relation']=relation(context.source_derivative_binding,a.eligible_source_index,b.eligible_source_index)
@@ -354,44 +387,70 @@ def propose_scene_changes(context):
                     if evidence['source_relation'] != DERIVATIVE_DISTINCT:evidence['available']=False
                     edges[key]=evidence
                 return edges[key]
-            # Freeze one observed incumbent comparison. Combining different
-            # alternatives' component minima invents an unattainable reference.
-            for index in range(len(baseline)-1):
-                values=[]
-                for a,b in product(baseline_hypotheses[index],baseline_hypotheses[index+1]):
-                    if len(values)>=4:break
-                    values.append(read(a,b))
-                # Cohort geometry is observed independent of focal assignment.
-                # A disputed focal hypothesis is NOT an unconditional incumbent
-                # fact. In particular its minimum conditional cost is not zero
-                # uncertainty, nor a licence to erase known cohort components.
-                unique=True
-                for old_index in (index,index+1):
-                    old_state=baseline[old_index]
-                    try:
-                        for tick in scene_anchor_ticks(old_state.first_output_frame,
-                                old_state.end_output_frame,scope_for(old_index)):
-                            source._dominant(sensors.raw(old_state,tick,None),old_state.role)
-                    except ValueError:unique=False
-                known[index]=coherent_baseline(values,focal_assignment_unique=unique)
+            composition_window=any(v.role==GroupOutputRole.COMPOSITION for v in baseline)
+            composition_reference=None
+            if composition_window:
+                from .group_scene_editorial_policy import coherent_path_reference,evaluate_composition_path
+                composition_reference=coherent_path_reference(baseline_hypotheses,read)
+                known={i:(row if row is not None else dict(available=False,metrics=None))
+                    for i,row in enumerate(composition_reference['edges'])}
+            else:
+                # Freeze one observed incumbent comparison. Combining different
+                # alternatives' component minima invents an unattainable reference.
+                for index in range(len(baseline)-1):
+                    values=[]
+                    for a,b in product(baseline_hypotheses[index],baseline_hypotheses[index+1]):
+                        if len(values)>=4:break
+                        values.append(read(a,b))
+                    # Cohort geometry is observed independent of focal assignment.
+                    # A disputed focal hypothesis is NOT an unconditional incumbent
+                    # fact. In particular its minimum conditional cost is not zero
+                    # uncertainty, nor a licence to erase known cohort components.
+                    unique=True
+                    for old_index in (index,index+1):
+                        old_state=baseline[old_index]
+                        try:
+                            for tick in scene_anchor_ticks(old_state.first_output_frame,
+                                    old_state.end_output_frame,scope_for(old_index)):
+                                source._dominant(sensors.raw(old_state,tick,None),old_state.role)
+                        except ValueError:unique=False
+                    known[index]=coherent_baseline(values,focal_assignment_unique=unique)
             paths=[]
             for path in product(lefts,*groups,rights):
-                measured=[]
-                for index,(a,b) in enumerate(zip(path,path[1:])):
-                    row=read(a,b)
-                    if not preserves_known(known[index],row):break
-                    measured.append(row)
+                # An unchanged-source path cannot become this owner's result;
+                # do not let it consume scarce edge/dense/family refresh work.
+                if not any(old.eligible_source_index!=new.eligible_source_index
+                        for old,new in zip(baseline[1:-1],path[1:-1],strict=True)):
+                    continue
+                measured=[];decision=None
+                try:
+                    for index,(a,b) in enumerate(zip(path,path[1:])):
+                        row=read(a,b)
+                        if composition_window:
+                            if not row.get('available'): break
+                        elif not preserves_known(known[index],row):break
+                        measured.append(row)
+                except _EdgeFrontierFull:
+                    attempts.append(dict(stage='bounded_edge_frontier',window=wi,
+                        retained_complete_paths=len(paths),unmeasured_edges_are_not_negative=True))
+                    break
                 if len(measured)!=len(path)-1:continue
-                gain=any(not known[i]['available'] or any(v<known[i]['metrics'][k]-1e-6
-                    for k,v in m['metrics'].items() if k in known[i]['metrics']) for i,m in enumerate(measured))
-                if not gain:continue
-                paths.append((sum(row['framing_cost'] for row in measured),tuple(s.key for s in path),path,measured))
-            for _,_,path,measured in sorted(paths,key=lambda p:p[:2]):
-                session.budget.spend('dense_paths')
+                if composition_window:
+                    decision=evaluate_composition_path(composition_reference,measured)
+                    if not decision['admitted']:continue
+                    score=decision['candidate_cost']
+                else:
+                    gain=any(not known[i]['available'] or any(v<known[i]['metrics'][k]-1e-6
+                        for k,v in m['metrics'].items() if k in known[i]['metrics']) for i,m in enumerate(measured))
+                    if not gain:continue
+                    score=sum(row['framing_cost'] for row in measured)
+                paths.append((score,tuple(s.key for s in path),path,measured,decision))
+            for _,_,path,measured,decision in sorted(paths,key=lambda p:p[:2]):
                 alternative=dict(states=[s.to_dict() for s in path],status='dense_pending');alternatives.append(alternative)
                 try:
                     assembled,changed=source._assembler(path)(plan=plan,domain=context.domain,path=path)
                     if not any(assembled.segments[i].source_index!=plan.segments[i].source_index for i in changed):continue
+                    session.budget.spend('dense_paths')
                     dense=sensors.dense(path)
                     # Per-tick known incumbent parts are preserved independent
                     # of whether its old dominant face was decisive.
@@ -399,7 +458,13 @@ def propose_scene_changes(context):
                     for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
                         for row in span['rows']:
                             raw=sensors.raw(old,row['output_tick'],None)
-                            if old.role==GroupOutputRole.FORMATION:
+                            if old.role==GroupOutputRole.COMPOSITION:
+                                people=();old_subject_state='all_native_body_supports_not_semantic_cast'
+                                # Measured body-support cardinality cannot be bought
+                                # with a lower style cost. Counts still are NOT actors.
+                                if len(row['scene_people'])<len(raw.people):
+                                    raise ValueError('composition source change loses known native body support cardinality')
+                            elif old.role==GroupOutputRole.FORMATION:
                                 people=raw.people;old_subject_state='formation_cohort'
                             else:
                                 try:
@@ -423,6 +488,8 @@ def propose_scene_changes(context):
                         numeric_inventory=numeric_inventory,prior_solo_success_required=False,
                         fixed_geometry_unchanged=True,baseline_components={str(k):v for k,v in known.items()},
                         selected_scene_hypotheses=[s.editorial_contract_sha256 for s in path],
+                        composition_reference=composition_reference,editorial_decision=decision,
+                        required_semantics_and_editorial_utility_separated=composition_window,
                         source_derivative_binding=context.source_derivative_binding,
                         incumbent_known_parts=preserved,camera_errors=camera_errors,
                         candidate_search_exhaustive=False,rotated_pass_exhaustive=False,
@@ -433,6 +500,7 @@ def propose_scene_changes(context):
                         fixed_endpoints_before_donor_observations=True,
                         fixed_window_probe_limit=MAX_FIXED_WINDOW_PROBES,
                         evaluated_graph_windows=graph_windows,
+                        bounded_edge_frontier_attempts=[a for a in attempts if a.get('stage')=='bounded_edge_frontier'],
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,
                         reserve_check_basis="before_window_only_not_hard_phase_partition")
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)

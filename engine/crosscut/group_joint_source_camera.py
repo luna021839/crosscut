@@ -24,6 +24,7 @@ class GroupOutputRole(str,Enum):
     FOCAL_HEAD='focal_head'
     FOCAL_HEAD_ARMS='focal_head_and_observed_arms'
     FORMATION='required_formation'
+    COMPOSITION='observed_body_composition'
 
 
 @dataclass(frozen=True,slots=True)

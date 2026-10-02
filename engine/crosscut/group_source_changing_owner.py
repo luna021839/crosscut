@@ -50,7 +50,7 @@ from .render import segment_frame_counts
 
 CONTRACT = 'normal_source_changing_family_owner_v1'
 DENSE_CONTRACT = 'source_native_focal_whole_camera_refresh_v1'
-SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v3'
+SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v4'
 DENSE_CONTRACTS = (DENSE_CONTRACT, SCENE_DENSE_CONTRACT)
 MAX_REFRESHED_CELLS = 24
 MAX_MUTABLE_FRAMES = 300
@@ -310,36 +310,9 @@ def _states(plan,domain,shots,roles,*,fixed_subcell_views=False):
         for i,s in enumerate(shots))
 
 
-def _shot_roles(context,shots):
-    # An incoming source's raw wide/close label never chooses its duty. Retain
-    # existing declared face/formation obligations before visiting alternatives.
-    alignment=context.incumbent.editorial_motion_plan.boundary_subject_alignment_plan
-    roles=[]
-    for shot in shots:
-        decisions=[d for d in alignment.decisions if d.eligible and
-            shot.first_segment_index-1<=d.boundary_index<=shot.last_segment_index]
-        kinds={d.subject_kind for d in decisions}
-        if kinds & {'formation','silhouette'}:
-            role=GroupOutputRole.FORMATION
-        elif 'upper_body' in kinds:
-            role=GroupOutputRole.FOCAL_HEAD_ARMS
-        elif kinds and kinds <= {'face'}:
-            role=GroupOutputRole.FOCAL_HEAD
-        else:
-            # A failed/ambiguous face crop is UNKNOWN crop evidence, not an
-            # authored demand to show both arms. Preserve the existing output
-            # close/medium intent even when that legacy face fit was disabled.
-            # An explicit non-face family still keeps its stronger duty. Any
-            # actually observed arm of the chosen owner remains required by
-            # scene_role_obligations; no missing arm becomes an observation.
-            choices=context.incumbent.visual_timeline.choices[shot.first_segment_index:shot.last_segment_index+1]
-            face=context.incumbent.face_match_plan.segments[shot.first_segment_index:shot.last_segment_index+1]
-            role=(GroupOutputRole.FOCAL_HEAD if all(getattr(c.shot_type,'value',c.shot_type) in
-                ('closeup','close_up','medium') for c in choices)
-                and all(f.alignment_subject in (None,'face') for f in face)
-                else GroupOutputRole.FOCAL_HEAD_ARMS)
-        roles.append(role)
-    return tuple(roles)
+def _shot_roles(context, shots):
+    from .group_scene_intent import declared_shot_intent
+    return tuple(GroupOutputRole(declared_shot_intent(context, shot)['role']) for shot in shots)
 
 
 def source_static_looks(context):
@@ -503,8 +476,10 @@ def _fresh_face(context,plan,timeline,observed,dense,changed,refreshed):
                 basis=observed['basis'])) if i in refreshed else old)
             continue
         raw=[samples[t] for t in range(offsets[i],offsets[i+1])]
+        is_composition = all(r['role']==GroupOutputRole.COMPOSITION.value for r in raw)
         is_formation = all(r['role']==GroupOutputRole.FORMATION.value for r in raw)
-        height=None if is_formation else median(r['raw_face_roi_xywh'][3] for r in raw)
+        no_face = is_formation or is_composition
+        height=None if no_face else median(r['raw_face_roi_xywh'][3] for r in raw)
         silhouette=(median(max(p['box_xywh'][1]+p['box_xywh'][3] for p in r['native_observation']['people'])
             -min(p['box_xywh'][1] for p in r['native_observation']['people']) for r in raw) if is_formation else None)
         pan=plan.segments[i].pan_crop
@@ -512,8 +487,8 @@ def _fresh_face(context,plan,timeline,observed,dense,changed,refreshed):
             for t in range(offsets[i],offsets[i+1])) if pan else 1.
         rows.append(FaceMatchSegment(i,timeline.choices[i].source_index,pan is not None,
             None if pan else 'fresh_face_fit_owned_by_whole_editorial_camera',height,
-            None if is_formation else old.target_face_height,old.target_face_height/height if old.target_face_height and height else None,
-            zoom,pan,alignment_subject='formation' if is_formation else 'face',
+            None if no_face else old.target_face_height,old.target_face_height/height if old.target_face_height and height else None,
+            zoom,pan,alignment_subject='composition' if is_composition else 'formation' if is_formation else 'face',
             observed_silhouette_height=silhouette,continuous_run_stitched=any(
                 span['first_output_frame']<=offsets[i] and span['end_output_frame']>=offsets[i+1]
                 and (span['first_output_frame']<offsets[i] or span['end_output_frame']>offsets[i+1])
@@ -857,7 +832,7 @@ def validate_binding(bundle):
     for span in dense['mutable_shots']:
         if [r['output_tick'] for r in span['rows']]!=list(range(span['first_output_frame'],span['end_output_frame'])):
             raise ValueError('source-changing dense family omitted an output tick')
-        if any((r['face_roi_visible_fraction'] is None if r['role']!=GroupOutputRole.FORMATION.value else False)
+        if any((r['face_roi_visible_fraction'] is None if r['role'] not in (GroupOutputRole.FORMATION.value,GroupOutputRole.COMPOSITION.value) else False)
                 or (r['face_roi_visible_fraction'] is not None and r['face_roi_visible_fraction']<.995)
                 or r['role']!=span['role'] for r in span['rows']):
             raise ValueError('source-changing dense family lost required role/face visibility')
@@ -874,6 +849,14 @@ def validate_parent(candidate,context):
         raise ValueError('source-changing parent preimage changed')
     if context.source_derivative_binding is not None and receipt['source_camera_refresh'].get('source_derivative_binding')!=context.source_derivative_binding:
         raise ValueError('scene parent derivative preimage changed')
+    if receipt['source_camera_refresh']['contract']==SCENE_DENSE_CONTRACT:
+        from .group_scene_intent import declared_shot_intent
+        original_shots={(s.first_output_frame,s.end_output_frame):s
+            for s in visible_group_shots(context.incumbent.render_plan,context.domain)}
+        for h in receipt['source_camera_refresh']['scene_hypotheses'].values():
+            shot=original_shots.get((h['span_key'][1],h['span_key'][2]))
+            if shot is None or h.get('shot_intent')!=declared_shot_intent(context,shot):
+                raise ValueError('scene child role intent differs from the original output-owned shot')
     replay=family.propose_performer_family(context)  # independent isolated worker, same absolute deadline
     if isinstance(replay,family.PerformerFamilyRejection):
         raise ValueError('source-changing parent independent replay rejected: '+replay.error)
@@ -926,13 +909,15 @@ def final_live_replay(plan_json,receipt,deadline):
                 fresh=[sensors.raw(state,t,h['analysis_roll']).sha256 for t in h['anchor_output_ticks']]
                 if fresh!=h['raw_observation_sha256']:
                     raise ValueError('scene final fixed/mutable anchor observations changed')
-                if state.role!=GroupOutputRole.FORMATION:
+                if state.role not in (GroupOutputRole.FORMATION,GroupOutputRole.COMPOSITION):
                     for i in range(0,len(h['anchor_output_ticks']),2):
                         j=i+1
                         a=sensors.raw(state,h['anchor_output_ticks'][i],h['analysis_roll'])
                         b=sensors.raw(state,h['anchor_output_ticks'][j],h['analysis_roll'])
                         if h['anchor_head_ids'][i:i+2] not in sensors._head_links(a,b)['unique_links']:
                             raise ValueError('scene final fixed/mutable head pixel hypothesis changed')
+                for outgoing in ((True,) if state is path[0] else (False,) if state is path[-1] else (False,True)):
+                    sensors.endpoint(state,outgoing=outgoing)
         if [s.key for s in path]!=dense['state_keys'] or family.digest(sensors.dense(path))!=family.digest(dense['mutable_shots']):
             raise ValueError('source-changing final all-tick native/camera replay disagrees')
     finally: session.close()

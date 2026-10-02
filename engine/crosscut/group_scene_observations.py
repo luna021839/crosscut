@@ -30,8 +30,8 @@ from .boundary_subject_alignment import BoundarySubjectAlignmentConfig, _action_
 from .group_focal_attention import focal_landmarks_track
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
 
-SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v2'
-DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v3'
+SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
+DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v4'
 MAX_HYPOTHESES_PER_SPAN = 32
 # Bounded exploration, NOT detection/confidence/visibility thresholds.
 VARIANTS = (None, *SUPPORTED_ANALYSIS_ROLLS)
@@ -114,6 +114,65 @@ class SceneSensors(source.NativeFamilySensors):
         self.link_cache = {}
         self.frame_cache = {}
         self.dense_cache = {}
+        self.shot_intents = {}
+        self.endpoint_cache = {}
+
+    def raw(self, state, tick, roll):
+        if state.role != GroupOutputRole.COMPOSITION:
+            return super().raw(state, tick, roll)
+        from .group_scene_composition import observe_native_composition
+        if roll is not None:
+            raise ValueError('body-composition detector has no head-roll variants')
+        request = self.session.domain.request_index(state.eligible_source_index)
+        native = state.native_frame_indices[tick-state.first_output_frame]
+        key = ('body_composition', request, native)
+        if key not in self.raw_rows:
+            row = observe_native_composition(self.session, request_source_index=request,
+                native_frame_index=native)
+            self.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(
+                row.to_dict(), sort_keys=True, allow_nan=False).encode()))
+            self.raw_rows[key] = row
+        return self.raw_rows[key]
+
+    def endpoint(self, state, *, outgoing):
+        """Own-side required pixels BEFORE donors or cross-camera utility."""
+        from .group_scene_composition import body_support_links
+        ticks = (state.end_output_frame-4, state.end_output_frame-1) if outgoing else (
+            state.first_output_frame, state.first_output_frame+3)
+        key = state.key, outgoing
+        if key in self.endpoint_cache:
+            return self.endpoint_cache[key]
+        h = self.hypothesis(state)
+        rows = [self.frame(state, t) for t in ticks]
+        raw = [self.raw(state, t, h['analysis_roll']) for t in ticks]
+        if raw[0].native_frame_index == raw[1].native_frame_index:
+            raise ValueError('repeated native endpoint is not measured motion')
+        evidence = dict(output_ticks=list(ticks), required_semantics_available=True,
+            head_pixel_link=None, joint_pixel_link=None, composition_support_link=None,
+            quality_approved=False)
+        if state.role == GroupOutputRole.COMPOSITION:
+            link = body_support_links(self, *raw)
+            if not link['complete_support_paths']:
+                raise ValueError('composition endpoint native support path unknown')
+            evidence['composition_support_link'] = link
+        else:
+            if state.role != GroupOutputRole.FORMATION:
+                ids = [r['selected_frame_local_head_id'] for r in rows]
+                link = self._head_links(*raw)
+                if ids not in link['unique_links']:
+                    raise ValueError('required focal endpoint head pixel path unknown')
+                evidence['head_pixel_link'] = link
+            parts = set(p for row in rows for p in map(tuple,row['role_obligations']['required_parts']))
+            if state.role == GroupOutputRole.FORMATION or parts:
+                ids = None if state.role == GroupOutputRole.FORMATION else tuple(
+                    r['selected_frame_local_head_id'] for r in rows)
+                required = None if ids is None else tuple(sorted({name for _, name in parts}))
+                link = native_body_links(self, *raw, selected_head_ids=ids, selected_part_names=required)
+                if not link['complete_required_joint_paths']:
+                    raise ValueError('required endpoint joint pixel paths unknown')
+                evidence['joint_pixel_link'] = link
+        self.endpoint_cache[key] = evidence
+        return evidence
 
     def _head_links(self, a, b):
         key = a.sha256, b.sha256
@@ -147,6 +206,8 @@ class SceneSensors(source.NativeFamilySensors):
 
     def discover(self, state, *, rolls=VARIANTS, endpoint_scope='whole'):
         span_key = self.span_key(state)
+        if state.role == GroupOutputRole.COMPOSITION:
+            rolls = (None,)
         key = (*span_key, endpoint_scope)
         if key in self.discoveries and all(roll in [v['analysis_roll'] for v in self.discoveries[key]['variants']] for roll in rolls):
             return tuple(self.hypotheses[h] for h in self.discoveries[key]['hypothesis_ids'])
@@ -174,7 +235,18 @@ class SceneSensors(source.NativeFamilySensors):
             record['variants'].append(variant)
             # Observe every source/variant BEFORE judging a complete assignment.
             # A formation uses all bodies, not the global face winner.
-            if state.role == GroupOutputRole.FORMATION:
+            if state.role == GroupOutputRole.COMPOSITION:
+                from .group_scene_composition import body_support_links
+                if any(len(r.people) < 2 for r in rows):
+                    variant['unavailable'] = 'composition_body_support_unknown'; continue
+                links = [body_support_links(self, rows[i], rows[i+1])
+                    if rows[i].native_frame_index < rows[i+1].native_frame_index else None
+                    for i in range(0, len(rows), 2)]
+                variant['body_support_links'] = links
+                if any(link is None or not link['complete_support_paths'] for link in links):
+                    variant['unavailable'] = 'composition_endpoint_pixel_support_unknown'; continue
+                candidates = [(None,)*len(ticks)]
+            elif state.role == GroupOutputRole.FORMATION:
                 if any(len(r.people) < 2 for r in rows):
                     variant['unavailable'] = 'formation_cohort_unknown'; continue
                 candidates = [(None,)*len(ticks)]
@@ -202,6 +274,9 @@ class SceneSensors(source.NativeFamilySensors):
                     anchor_output_ticks=list(ticks), analysis_roll=roll,
                     anchor_head_ids=list(ids), raw_observation_sha256=[r.sha256 for r in rows],
                     role=state.role.value, required_cohorts=ROLE_CONTRACT,
+                    shot_intent=self.shot_intents.get((state.first_output_frame,state.end_output_frame)),
+                    body_anchor_ids=[[p.observation_id for p in r.people] for r in rows]
+                        if state.role == GroupOutputRole.COMPOSITION else None,
                     temporal_identity_certified=False, cross_camera_identity_certified=False,
                     whole_head_extent_certified=False, body_phase_certified=False, quality_approved=False)
                 identity = family.digest(value)
@@ -236,7 +311,7 @@ class SceneSensors(source.NativeFamilySensors):
         if raw.native_pixel_sha256 is None:
             raise ValueError('scene original raster unavailable')
         primary = next((h for h in raw.heads if h.observation_id == head_id), None)
-        if state.role != GroupOutputRole.FORMATION and primary is None:
+        if state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION) and primary is None:
             raise ValueError('scene focal hypothesis missing, not replaced by background actor')
         obligations = scene_role_obligations(raw, state.role, head_id)
         required_parts = set(obligations.required_parts)
@@ -272,6 +347,9 @@ class SceneSensors(source.NativeFamilySensors):
             box, fraction = source.project_box(person.box_xywh, state, tick)
             points = tuple((*source.project_point(p[:2], state, tick), p[2]) for p in person.upper_body_xyc)
             parts = dict(getattr(person, 'part_states', ()))
+            if state.role == GroupOutputRole.COMPOSITION and (
+                    fraction < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction):
+                raise ValueError('composition camera clips required measured native body support')
             if state.role == GroupOutputRole.FORMATION:
                 if (not trackable_person_ownership(person)
                         or fraction < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction
@@ -344,7 +422,7 @@ class SceneSensors(source.NativeFamilySensors):
             for tick in range(state.first_output_frame, state.end_output_frame):
                 raw = self.raw(state, tick, hypothesis['analysis_roll'])
                 previous_head = current_head
-                if previous is not None and state.role != GroupOutputRole.FORMATION:
+                if previous is not None and state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION):
                     links = self._head_links(previous, raw)
                     choices = [b for a, b in links['unique_links'] if a == current_head]
                     if len(choices) != 1:
@@ -354,29 +432,38 @@ class SceneSensors(source.NativeFamilySensors):
                     expected = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
                     if current_head != expected:
                         raise ValueError('scene left/right endpoint hypotheses lack one whole temporal path')
-                row = dict(self.frame(state, tick, head_id=current_head))
-                body_link=None
-                prior_parts=() if not rows else tuple(sorted({name for _,name in
-                    rows[-1]['role_obligations']['required_parts']}))
-                current_parts=tuple(sorted({name for _,name in row['role_obligations']['required_parts']}))
-                if previous is not None and (state.role==GroupOutputRole.FORMATION or prior_parts or current_parts):
+                body_link=None; support_link=None
+                if previous is not None and state.role == GroupOutputRole.COMPOSITION:
+                    if previous.native_frame_index == raw.native_frame_index:
+                        if previous.sha256 != raw.sha256: raise ValueError('repeated composition raw raster differs')
+                    else:
+                        from .group_scene_composition import body_support_links
+                        support_link = body_support_links(self, previous, raw)
+                        if not support_link['complete_support_paths']:
+                            raise ValueError('composition dense body support lifecycle unknown')
+                current_parts = scene_role_obligations(raw, state.role, current_head).required_parts
+                previous_parts = () if previous is None else scene_role_obligations(
+                    previous,state.role,previous_head).required_parts
+                required_names = tuple(sorted({name for _,name in (*previous_parts,*current_parts)}))
+                if previous is not None and (state.role == GroupOutputRole.FORMATION or required_names):
                     if previous.native_frame_index == raw.native_frame_index:
                         if previous.sha256 != raw.sha256: raise ValueError('repeated scene body raster differs')
                     else:
-                        if state.role!=GroupOutputRole.FORMATION and prior_parts!=current_parts:
-                            raise ValueError('scene dense selected-arm observation lifecycle unknown')
                         body_link=native_body_links(self,previous,raw,
                             selected_head_ids=(previous_head,current_head)
                                 if state.role!=GroupOutputRole.FORMATION else None,
-                            selected_part_names=current_parts if state.role!=GroupOutputRole.FORMATION else None)
+                            selected_part_names=required_names if state.role!=GroupOutputRole.FORMATION else None)
                         if not body_link['complete_required_joint_paths']:
                             raise ValueError('scene dense required body/arm joint pixel lifecycle unknown')
+                row = dict(self.frame(state, tick, head_id=current_head))
                 row['required_body_temporal_link']=body_link
+                row['composition_support_link']=support_link
                 projected = self.session.projected_pixels(state, tick)
                 if projected is None:
                     raise ValueError('scene dense projected pixels unavailable')
                 row['projected_pixels_sha256'] = source.sha256(memoryview(projected)).hexdigest()
-                row['same_source_previous_pixel_link_observed'] = previous is not None and state.role != GroupOutputRole.FORMATION
+                row['same_source_previous_pixel_link_observed'] = (support_link is not None if state.role == GroupOutputRole.COMPOSITION
+                    else previous is not None and state.role != GroupOutputRole.FORMATION)
                 row['native_repeated_alias'] = previous is not None and previous.native_frame_index == raw.native_frame_index
                 rows.append(row); previous = raw
             result.append(dict(first_output_frame=state.first_output_frame, end_output_frame=state.end_output_frame,
@@ -600,6 +687,7 @@ def compare_scene_edge(sensors, left, right):
         right.first_output_frame, right.first_output_frame+3)
     try:
         rows = [sensors.frame(s, t) for s, t in zip((left, left, right, right), ticks)]
+        endpoints = [sensors.endpoint(left, outgoing=True), sensors.endpoint(right, outgoing=False)]
     except ValueError as exc:
         return dict(available=False, reason=str(exc), metrics=None,
             cross_camera_identity_certified=False, body_phase_certified=False)
@@ -615,10 +703,17 @@ def compare_scene_edge(sensors, left, right):
     metrics['screen_motion'] = float(np.linalg.norm(va-vb))
     formation = left.role == GroupOutputRole.FORMATION or right.role == GroupOutputRole.FORMATION
     evidence = dict(left_state=left.key, right_state=right.key, rows=rows,
-        metrics=metrics, available=True, first_incoming_output_frame=right.first_output_frame,
+        metrics=metrics, available=True, required_semantics_available=True,
+        required_endpoint_evidence=endpoints, first_incoming_output_frame=right.first_output_frame,
         screen_velocity_outgoing=va.tolist(), screen_velocity_incoming=vb.tolist(),
         camera_direction_basis='measured_screen_attention_motion_not_inferred_3d_camera',
         cross_camera_identity_certified=False, body_phase_certified=False)
+    if GroupOutputRole.COMPOSITION in (left.role, right.role):
+        from .group_scene_editorial_policy import composition_cost
+        evidence.update(comparison_mode='predeclared_composition_cut',
+            articulated_cross_camera_motion=None, cross_camera_actor_correspondence=None,
+            framing_cost=composition_cost(evidence), quality_approved=False)
+        return evidence
     if formation:
         outgoing, eo = temporal_formation(sensors, left, True)
         incoming, ei = temporal_formation(sensors, right, False)
@@ -642,11 +737,6 @@ def compare_scene_edge(sensors, left, right):
         metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
         velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
         metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
-        try:
-            evidence['required_endpoint_arm_paths']=[endpoint_focal_part_paths(sensors,left,*rows[:2]),
-                endpoint_focal_part_paths(sensors,right,*rows[2:])]
-        except ValueError as exc:
-            return dict(evidence,available=False,reason=str(exc))
         complete, measured, motion = selected_focal_motion(rows, (left,left,right,right))
         metrics.update(measured); evidence['selected_focal_motion'] = motion
         if not complete:
@@ -704,6 +794,9 @@ def validate_scene_dense(dense):
     from .source_derivative_diversity import DERIVATIVE_DISTINCT
     if dense.get('contract')!=DENSE_CONTRACT:
         raise ValueError('scene dense consumer requires its explicit role contract')
+    family.digest(dense)  # Recursively reject nonfinite evidence before comparisons.
+    from .group_scene_intent import validate_intent
+    from .group_scene_composition import validate_raw_composition,validate_support_link
     hypotheses=dense.get('scene_hypotheses');keys=dense.get('hypothesis_keys')
     if not isinstance(hypotheses,dict) or not isinstance(keys,list) or len(keys)!=len(dense['state_keys']):
         raise ValueError('scene dense hypothesis inventory missing')
@@ -715,6 +808,7 @@ def validate_scene_dense(dense):
             raise ValueError('scene hypothesis does not bind declared role obligations')
         if h['role']!=h['span_key'][-1]:
             raise ValueError('scene hypothesis role differs from its bound source span')
+        validate_intent(h.get('shot_intent'),role=h['role'],first=h['span_key'][1],end=h['span_key'][2])
         scope=h.get('endpoint_scope','whole')
         allowed=('whole','exit') if index==0 else ('whole','entry') if index==len(keys)-1 else ('whole',)
         if scope not in allowed:
@@ -751,7 +845,9 @@ def validate_scene_dense(dense):
                 raise ValueError('scene dense required/context scope changed after native observation')
             original_heads=Counter(p['observation_id'] for p in native.get('heads',[]))
             original_people=Counter(p['observation_id'] for p in native.get('people',[]))
-            if (not original_heads or original_heads != Counter(p['observation_id'] for p in row['scene_heads'])
+            if (any(n!=1 for n in (*original_heads.values(),*original_people.values()))
+                    or not original_heads and row['role']!=GroupOutputRole.COMPOSITION.value
+                    or original_heads != Counter(p['observation_id'] for p in row['scene_heads'])
                     or original_people != Counter(p['observation_id'] for p in row['scene_people'])):
                 raise ValueError('scene dense omitted or duplicated an original head/body cohort member')
             if any(x.get('required_by_role')!=(x['observation_id'] in obligations.required_head_ids)
@@ -760,6 +856,11 @@ def validate_scene_dense(dense):
                     or x['observation_id'] in obligations.required_head_ids and x['visible_fraction']<minimum
                     for x in row['scene_heads']):
                 raise ValueError('scene camera lost a head or invented physical head extent')
+            for projected in (*row['scene_heads'],*row['scene_people']):
+                box=projected.get('projected_box_xywh')
+                if (not fraction(projected.get('visible_fraction'))
+                        or not isinstance(box,(list,tuple)) or len(box)!=4 or min(box[2:])<=0):
+                    raise ValueError('scene projected support has invalid finite visibility/geometry')
             for head in row['scene_heads']:
                 if head['observation_id']==row['selected_frame_local_head_id'] and (
                         head.get('native_cropped') is not False
@@ -808,6 +909,8 @@ def validate_scene_dense(dense):
                     link=row.get('required_body_temporal_link')
                     if not isinstance(link,dict) or link.get('complete_required_joint_paths') is not True:
                         raise ValueError('scene dense required arm temporal pixel producer missing')
+                    if link.get('raw_observation_sha256')!=[family.digest(previous_row['native_observation']),family.digest(native)]:
+                        raise ValueError('scene dense temporal joint evidence has another raw pair')
                     expected_scope=('all_formation_people' if row['role']==GroupOutputRole.FORMATION.value
                         else 'selected_focal_owner')
                     if link.get('required_body_scope')!=expected_scope:
@@ -826,4 +929,30 @@ def validate_scene_dense(dense):
                     if person['visible_fraction']<BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction or any(
                             person['part_states'].get(k)!='observed' for k in ('left_arm','right_arm')):
                         raise ValueError('scene formation loses required original body/arms')
+            if row['role']==GroupOutputRole.COMPOSITION.value:
+                validate_raw_composition(native)
+                if any(row.get(k) is not None for k in ('selected_frame_local_head_id',
+                        'raw_face_roi_xywh','raw_landmarks_xy','projected_landmarks_xy',
+                        'projected_face_roi_xywh','face_roi_visible_fraction')) or row['projected_observed_arms']:
+                    raise ValueError('composition row fabricated face or arm authority')
+                if any(p['visible_fraction']<BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction
+                        for p in row['scene_people']):
+                    raise ValueError('composition dense lost required native body support visibility')
+                if previous_row is not None:
+                    before=previous_row['native_observation']
+                    repeated=before['native_frame_index']==native['native_frame_index']
+                    if row.get('native_repeated_alias')!=repeated:
+                        raise ValueError('composition repeated-native marker changed')
+                    if repeated:
+                        if before!=native or row.get('composition_support_link') is not None:
+                            raise ValueError('native alias cannot manufacture composition motion')
+                    else:
+                        validate_support_link(row.get('composition_support_link'),before,native)
+                elif row.get('composition_support_link') is not None:
+                    raise ValueError('first composition row has no previous mutable native support')
+                if row['output_tick'] in h['anchor_output_ticks']:
+                    n=h['anchor_output_ticks'].index(row['output_tick'])
+                    if (family.digest(native)!=h['raw_observation_sha256'][n]
+                            or [p['observation_id'] for p in native['people']]!=h['body_anchor_ids'][n]):
+                        raise ValueError('composition dense does not join the frozen endpoint hypothesis')
             previous_row=row
