@@ -506,8 +506,12 @@ class SceneFormationPixelTests(unittest.TestCase):
         current=np.maximum(np.roll(b,-200,axis=1),np.roll(b,200,axis=1))
         if flat:previous[:]=0;current[:]=0
         rows=(SimpleNamespace(request_source_index=0,native_frame_index=6,frame_size_wh=(1000,800),
+                source_clock_identity='c'*64,source_file_identity=(1,2,3,4,5),
+                native_pixel_sha256=source.sha256(memoryview(previous)).hexdigest(),
                 people=(move(p,-.2,0),move(p,.2,1)),sha256='a'*64),
             SimpleNamespace(request_source_index=0,native_frame_index=9,frame_size_wh=(1000,800),
+                source_clock_identity='c'*64,source_file_identity=(1,2,3,4,5),
+                native_pixel_sha256=source.sha256(memoryview(current)).hexdigest(),
                 people=(move(q,-.2,10),move(q,.2,11)),sha256='b'*64))
         sensors=SimpleNamespace(link_cache={},session=SimpleNamespace(
             budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10),
@@ -525,6 +529,52 @@ class SceneFormationPixelTests(unittest.TestCase):
         self.assertEqual(len(evidence['joint_pixel_flow']),2)
         self.assertFalse(evidence['body_phase_certified'])
         self.assertFalse(evidence['quality_approved'])
+
+    def test_required_body_path_uses_every_intermediate_original_raster(self):
+        sensors,rows=self.fixture()
+        reads=[];pixels=sensors.session.native_pixels
+        def record(source_id,native):
+            reads.append(native)
+            return pixels(source_id,native)
+        sensors.session.native_pixels=record
+        evidence=sensors_module.native_body_links(sensors,*rows)
+        self.assertTrue(evidence['complete_required_joint_paths'])
+        self.assertEqual(sorted(reads),[6,7,8,9])
+        self.assertEqual(evidence['native_frame_indices'],[6,7,8,9])
+        self.assertTrue(evidence['native_steps_complete'])
+        self.assertEqual(evidence['native_pixel_sha256'][0],rows[0].native_pixel_sha256)
+        self.assertEqual(evidence['native_pixel_sha256'][-1],rows[1].native_pixel_sha256)
+
+    def test_matching_endpoint_joints_cannot_skip_an_occluded_middle_raster(self):
+        sensors,rows=self.fixture()
+        pixels=sensors.session.native_pixels
+        sensors.session.native_pixels=lambda source_id,native:(
+            np.zeros_like(pixels(source_id,native)) if native==7 else pixels(source_id,native))
+        evidence=sensors_module.native_body_links(sensors,*rows)
+        self.assertFalse(evidence['complete_required_joint_paths'])
+        self.assertEqual(evidence['assignments'],[])
+
+    def test_required_body_path_rejects_missing_middle_or_changed_endpoint_pixels(self):
+        for mismatch in ('middle_missing','endpoint_hash','clock','file','raster','gap'):
+            with self.subTest(mismatch=mismatch):
+                sensors,rows=self.fixture()
+                if mismatch=='middle_missing':
+                    pixels=sensors.session.native_pixels
+                    sensors.session.native_pixels=lambda source_id,native:(
+                        None if native==7 else pixels(source_id,native))
+                elif mismatch=='endpoint_hash':rows[1].native_pixel_sha256='0'*64
+                elif mismatch=='clock':rows[1].source_clock_identity='d'*64
+                elif mismatch=='file':rows[1].source_file_identity=(1,2,3,4,6)
+                elif mismatch=='raster':rows[1].frame_size_wh=(999,800)
+                else:rows[1].native_frame_index=20
+                with self.assertRaises(ValueError):sensors_module.native_body_links(sensors,*rows)
+
+    def test_unread_native_steps_are_not_certified_when_no_joint_texture_exists(self):
+        sensors,rows=self.fixture(flat=True)
+        evidence=sensors_module.native_body_links(sensors,*rows)
+        self.assertFalse(evidence['complete_required_joint_paths'])
+        self.assertFalse(evidence['native_steps_complete'])
+        self.assertEqual(evidence['native_frame_indices'],[6,9])
 
     def test_perfect_head_hypotheses_cannot_certify_unknown_joint_motion(self):
         sensors,rows=self.fixture(flat=True)

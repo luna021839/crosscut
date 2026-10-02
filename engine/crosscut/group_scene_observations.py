@@ -23,7 +23,7 @@ from . import group_performer_family_owner as family
 from .group_joint_source_camera import GroupOutputRole
 from .group_joint_formation import (ObservedFormationPerson, DeclaredFormationView,
     ObservedFormationTemporalMotion, compare_projected_formation, _bones)
-from .group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost
+from .group_joint_native_joint_flow import native_joint_pixel_flow_stream, native_joint_assignment_cost
 from .group_joint_person_ownership import trackable_person_ownership
 from .group_native_head_orientation import SUPPORTED_ANALYSIS_ROLLS
 from .boundary_subject_alignment import BoundarySubjectAlignmentConfig, _action_envelope, _close_face_head_envelope
@@ -31,7 +31,9 @@ from .group_focal_attention import focal_landmarks_track
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
 
 SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
-DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v5'
+DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v6'
+JOINT_LINK_CONTRACT = 'native_required_body_joint_pixel_path_v2'
+MAX_JOINT_NATIVE_GAP = 12
 MAX_HYPOTHESES_PER_SPAN = 32
 # Bounded exploration, NOT detection/confidence/visibility thresholds.
 VARIANTS = (None, *SUPPORTED_ANALYSIS_ROLLS)
@@ -495,7 +497,12 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None,sele
     DIFFERENT diagnostic hypothesis. They cannot set an LK cost to zero or
     mint ObservedFormationTemporalMotion.same_source_pixel_path_verified.
     """
-    if previous.request_source_index != current.request_source_index or previous.native_frame_index >= current.native_frame_index:
+    gap=current.native_frame_index-previous.native_frame_index
+    if (previous.request_source_index != current.request_source_index
+            or previous.source_clock_identity != current.source_clock_identity
+            or previous.source_file_identity != current.source_file_identity
+            or previous.frame_size_wh != current.frame_size_wh
+            or not 0 < gap <= MAX_JOINT_NATIVE_GAP):
         raise ValueError('scene temporal body measurement needs a chronological original-source pair')
     if selected_head_ids is not None and (not isinstance(selected_head_ids,tuple)
             or len(selected_head_ids)!=2 or any(type(i) is not int for i in selected_head_ids)):
@@ -506,10 +513,28 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None,sele
             or not set(selected_part_names)<={'left_arm','right_arm'}):
         raise ValueError('focal joint path requires explicit observed arm names')
     required_names=tuple(sorted(selected_part_names or ('left_arm','right_arm')))
-    key = ('bodies', previous.sha256, current.sha256, selected_head_ids,required_names)
+    key = (JOINT_LINK_CONTRACT, previous.sha256, current.sha256, selected_head_ids,required_names)
     if key in sensors.link_cache: return sensors.link_cache[key]
-    pixels = tuple(sensors.session.native_pixels(r.request_source_index,r.native_frame_index) for r in (previous,current))
-    flows = native_joint_pixel_flows(*pixels, previous.people)
+    pixel_hashes={}
+    def pixels(native):
+        image=sensors.session.native_pixels(previous.request_source_index,native)
+        if (not isinstance(image,np.ndarray) or image.dtype!=np.uint8 or image.ndim!=3
+                or image.shape!=(previous.frame_size_wh[1],previous.frame_size_wh[0],3)):
+            raise ValueError('required joint path needs every actual same-raster native frame')
+        pixel_hashes[native]=source.sha256(memoryview(image)).hexdigest()
+        return image
+    first,last=pixels(previous.native_frame_index),pixels(current.native_frame_index)
+    if [pixel_hashes[r.native_frame_index] for r in (previous,current)]!=[
+            previous.native_pixel_sha256,current.native_pixel_sha256]:
+        raise ValueError('required joint path native pixels differ from raw observations')
+    # Follow the three-output-tick endpoint through its ACTUAL native rasters,
+    # with identical LK/error/assignment limits. Keep only the endpoints and
+    # one live intermediate here; the session owns its bounded shared LRU.
+    # Early no-feature failures do not imply that unread frames passed.
+    flows=native_joint_pixel_flow_stream(first,last,previous.people,
+        intermediate_pixels=(pixels(n) for n in range(previous.native_frame_index+1,current.native_frame_index)))
+    native_indices=sorted(pixel_hashes)
+    steps_complete=native_indices==list(range(previous.native_frame_index,current.native_frame_index+1))
     costs = [[native_joint_assignment_cost(f,p,current.frame_size_wh) for p in current.people] for f in flows]
     matrix=np.asarray([[1e6 if c is None else c for c in row] for row in costs])
     assignments=[]
@@ -553,8 +578,14 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None,sele
         y=getattr(current.people[b],'unique_head_observation_id',None)
         observed=[v for u,v in heads['unique_links'] if u==x]
         if x is not None and y is not None and observed and observed != [y]: contradicted=True
-    complete=complete and not contradicted
-    evidence=dict(raw_observation_sha256=[previous.sha256,current.sha256], costs=costs,
+    complete=complete and not contradicted and steps_complete
+    evidence=dict(contract=JOINT_LINK_CONTRACT,
+        raw_observation_sha256=[previous.sha256,current.sha256],
+        request_source_index=previous.request_source_index,
+        source_clock_identity=previous.source_clock_identity,
+        source_file_identity=list(previous.source_file_identity),frame_size_wh=list(previous.frame_size_wh),
+        native_frame_indices=native_indices,native_pixel_sha256=[pixel_hashes[n] for n in native_indices],
+        native_steps_complete=steps_complete,costs=costs,
         assignments=[list(v) for v in assignments],joint_pixel_flow=[None if f is None else f.to_dict() for f in flows],
         head_pixel_links=heads,head_body_hypotheses_are_not_joint_path_authority=True,
         body_association_basis='native_joint_local_pixel_paths_all_required_arm_joints',
@@ -566,6 +597,30 @@ def native_body_links(sensors, previous, current, *, selected_head_ids=None,sele
     sensors.session.budget.spend('pose_evidence_bytes',len(__import__('json').dumps(evidence,sort_keys=True).encode()))
     sensors.link_cache[key]=evidence
     return evidence
+
+
+def validate_required_body_native_sequence(link,previous,current):
+    """Bind the required path's actual native sequence; fresh pixel replay remains mandatory."""
+    first,last=previous['native_frame_index'],current['native_frame_index']
+    sha=lambda value:isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+    if (not isinstance(link,dict) or link.get('contract')!=JOINT_LINK_CONTRACT
+            or link.get('complete_required_joint_paths') is not True
+            or link.get('native_steps_complete') is not True
+            or any(type(n) is not int for n in (first,last)) or not 0 < last-first <= MAX_JOINT_NATIVE_GAP
+            or previous['request_source_index']!=current['request_source_index']
+            or link.get('request_source_index')!=previous['request_source_index']
+            or any(family.plain(previous.get(k))!=family.plain(current.get(k))
+                or family.plain(link.get(k))!=family.plain(previous.get(k)) for k in (
+                    'source_clock_identity','source_file_identity','frame_size_wh'))
+            or link.get('raw_observation_sha256')!=[family.digest(previous),family.digest(current)]
+            or link.get('native_frame_indices')!=list(range(first,last+1))
+            or any(link.get(k) is not False for k in ('named_identity_certified',
+                'body_phase_certified','quality_approved','head_joint_assignment_contradiction'))):
+        raise ValueError('required body joint path changed its original source/native sequence or authority')
+    hashes=link.get('native_pixel_sha256')
+    if (not isinstance(hashes,list) or len(hashes)!=last-first+1 or any(not sha(v) for v in hashes)
+            or hashes[0]!=previous['native_pixel_sha256'] or hashes[-1]!=current['native_pixel_sha256']):
+        raise ValueError('required body joint path skipped or changed an actual native raster')
 
 
 def endpoint_focal_part_paths(sensors,state,first,last):
@@ -922,8 +977,7 @@ def validate_scene_dense(dense):
                     link=row.get('required_body_temporal_link')
                     if not isinstance(link,dict) or link.get('complete_required_joint_paths') is not True:
                         raise ValueError('scene dense required arm temporal pixel producer missing')
-                    if link.get('raw_observation_sha256')!=[family.digest(previous_row['native_observation']),family.digest(native)]:
-                        raise ValueError('scene dense temporal joint evidence has another raw pair')
+                    validate_required_body_native_sequence(link,previous_row['native_observation'],native)
                     expected_scope=('all_formation_people' if row['role']==GroupOutputRole.FORMATION.value
                         else 'selected_focal_owner')
                     if link.get('required_body_scope')!=expected_scope:

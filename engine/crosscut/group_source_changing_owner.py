@@ -50,7 +50,7 @@ from .render import segment_frame_counts
 
 CONTRACT = 'normal_source_changing_family_owner_v1'
 DENSE_CONTRACT = 'source_native_focal_whole_camera_refresh_v1'
-SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v5'
+SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v6'
 DENSE_CONTRACTS = (DENSE_CONTRACT, SCENE_DENSE_CONTRACT)
 MAX_REFRESHED_CELLS = 24
 MAX_MUTABLE_FRAMES = 300
