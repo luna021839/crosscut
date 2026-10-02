@@ -8,7 +8,7 @@ import numpy as np
 from crosscut.group_joint_focal_frontier import (OwnedFocalAppearance,
     NativeFaceAppearance, observe_native_face_appearances,
     InheritedFocalReference, NativeFocalLinkGraph, resolve_inherited_focal_reference, resolve_diagnostic_focal_reference,
-    match_focal_trajectory,
+    match_focal_trajectory, observe_synchronized_focal_frontier,
     locally_associated_face_roi_target,
     match_focal_appearance_anchors, observe_owned_focal_appearances, _dominant_owned_face, _same_source_links)
 from crosscut.group_joint_person_ownership import bind_person_ownership, ownership_policy_fingerprint
@@ -16,6 +16,7 @@ from crosscut.native_face_descriptor import (NativeFaceDescriptorSpace, native_d
     native_descriptor_schema, SFACE_MODEL_NAME, ARCFACE_MODEL_NAME)
 from engine.tests import test_group_joint_person_ownership as ownership_fixtures
 from engine.tests import test_group_joint_native_tracks as track_fixtures
+from engine.tests import test_group_joint_temporal_pose as pose_fixtures
 
 
 def appearance(person=0, face=7, axis=0):
@@ -29,6 +30,55 @@ class FocalFrontierTests(unittest.TestCase):
             1. if i == axis else 0. for i in range(dimension))),
             _assert_model_assets=Mock(), models={model:(None,None,digest,None)},
             model_adapters={model:'d'*64})
+
+    def test_discovery_can_defer_unassociated_cartesian_pose_without_deleting_raw_tracks(self):
+        session,rows,_=self.graph_fixture((1000,800))
+        source=rows[0].request_source_index
+        local=session.domain.eligible_index(source)
+        session.domain=replace(session.domain,eligible_indices=(source,),audio_offsets=session.domain.audio_offsets[local:local+1],
+            source_timewarps=session.domain.source_timewarps[local:local+1],scene_cut_times=session.domain.scene_cut_times[local:local+1],
+            render_frame_clocks=session.domain.render_frame_clocks[local:local+1])
+        session.retain_native_pixels=Mock()
+        fixture=pose_fixtures.NativeTemporalPoseTests()
+        rows=tuple(replace(fixture.row(session.domain,source,row.native_frame_index),
+            native_pixel_sha256=row.native_pixel_sha256) for row in rows)
+        session._assert_source_identity=Mock(return_value=rows[0].source_file_identity)
+        session.models={name:(None,None,digest,None) for name,digest in rows[0].model_content_sha256}
+        session.model_adapters=dict(rows[0].model_adapter_fingerprints)
+        values=(NativeFaceAppearance(0,appearance().embedding,()),)
+        dimension,digest=native_descriptor_schema(SFACE_MODEL_NAME)
+        session.models[SFACE_MODEL_NAME]=(None,None,digest,None)
+        session.model_adapters[SFACE_MODEL_NAME]='c'*64
+        with patch('crosscut.group_joint_focal_frontier._native_for_canonical',
+                    side_effect=lambda _domain,_source,time:round((time-10.)*30.)), \
+                patch('crosscut.group_joint_focal_frontier.observe_native_group',
+                    side_effect=lambda _session,**kw:rows[kw['native_frame_index']]), \
+                patch('crosscut.group_joint_focal_frontier.observe_native_face_appearances',return_value=values), \
+                patch('crosscut.group_joint_focal_frontier.focal_landmarks_track',return_value=True), \
+                patch('crosscut.group_joint_temporal_pose.compare_pose_phase_windows') as comparisons:
+            result=observe_synchronized_focal_frontier(session,reference_source=source,
+                canonical_times=(10.,10.+1/30.,10.+2/30.),face_roi_only=True,
+                pose_comparison_mode='defer_unresolved_association')
+        comparisons.assert_not_called()
+        self.assertEqual(result['status'],'measured_shortlist')
+        self.assertEqual(len(result['raw_observations']),3)
+        candidate=result['candidates'][0]
+        self.assertIsNotNone(candidate['independent_subject_association_graph'])
+        self.assertEqual(len(candidate['independent_native_pose_motion']),1)
+        missing=result['independent_raw17_temporal_pose_comparisons'][0]
+        self.assertIsNone(missing['all_owner_pair_hypotheses'],'not an empty list masquerading as a zero cost')
+        self.assertEqual(missing['comparisons_executed'],0)
+        self.assertEqual(missing['potential_unassociated_pair_count'],1)
+        self.assertTrue(missing['association_graph_resolution_required'])
+        self.assertFalse(missing['temporal_phase_certified'])
+        self.assertFalse(result['cross_source_identity_certified'])
+
+    def test_automatic_sensor_policy_cannot_override_explicit_rolls_or_unknown_pose_policy(self):
+        for kwargs in ({'automatic_head_windows':True,'head_analysis_rolls':((0,60.),)},
+                {'pose_comparison_mode':'invented'}, {'automatic_head_windows':1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                observe_synchronized_focal_frontier(None,reference_source=0,
+                    canonical_times=(10.,10.+1/30.,10.+2/30.),**kwargs)
 
     def row(self):
         fixture = ownership_fixtures.PersonOwnershipTests()

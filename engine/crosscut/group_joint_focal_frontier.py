@@ -624,7 +624,8 @@ def native_pose_hypotheses_for_face_paths(*, domain, rows, face_paths, duties, m
 
 
 def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False,
-        inherited_reference=None, descriptor_model=SFACE_MODEL_NAME, head_analysis_rolls=()):
+        inherited_reference=None, descriptor_model=SFACE_MODEL_NAME, head_analysis_rolls=(),
+        automatic_head_windows=False, pose_comparison_mode='all_unassociated_pairs'):
     """At most three rasters per eligible source; no full-song reanalysis.
 
     The normal caller supplies its parent-frozen reference BEFORE discovery.
@@ -632,6 +633,11 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
     an inherited subject. Neither path proves a dense final render schedule.
     """
     from .group_native_head_orientation import native_head_analysis_spec
+    from .group_native_head_window import observe_native_head_window_policy
+    if type(automatic_head_windows) is not bool or automatic_head_windows and head_analysis_rolls:
+        raise ValueError('automatic head windows cannot silently override an explicit detector policy')
+    if pose_comparison_mode not in ('all_unassociated_pairs', 'defer_unresolved_association'):
+        raise ValueError('focal frontier needs an explicit bounded pose-comparison policy')
     # Freeze the source-specific sensor choices before decoding/ranking.
     # Do not merge several rotated detections into artificial competitors or
     # switch the source's variant independently at each favorable anchor.
@@ -651,6 +657,9 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         request_source_analysis_roll_degrees=head_analysis_rolls,
         variants_combined_as_people=False, per_anchor_variant_selection=False,
         render_rotation_changed=False)
+    if automatic_head_windows:
+        analysis_policy.update(contract='native_eye_area_pixel_link_window_policy_before_camera_v2',
+            automatic_head_windows=True, window_policies=[])
     times = tuple(canonical_times)
     if (len(times) != 3 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
             or not times[0] < times[1] < times[2] or times[-1]-times[0] > .35):
@@ -675,6 +684,21 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
     # Declare reference first, not after seeing favorable donor/camera scores.
     sources = (reference_source, *(s for s in session.domain.eligible_indices if s != reference_source))
     for source in sources:
+        window_policy = None
+        if automatic_head_windows:
+            window_policy = observe_native_head_window_policy(session,
+                request_source_index=source,
+                native_frame_indices=tuple(_native_for_canonical(session.domain, source, time) for time in times))
+            analysis_policy['window_policies'].append(dict(sha256=window_policy.sha256,
+                **window_policy.to_dict()))
+            if window_policy.selected:
+                analysis_rolls[source] = window_policy.selected_analysis_roll_degrees
+            elif source == reference_source:
+                return dict(contract='bounded_synchronized_owned_focal_source_frontier_v1',
+                    status='native_reference_head_window_unresolved', canonical_times=times,
+                    reference_basis=reference_basis, head_analysis_policy=analysis_policy,
+                    candidates=[], raw_observations=[], production_admitted=False,
+                    cross_source_identity_certified=False, quality_approved=False)
         rows, values = [], []
         graph = NativeFocalLinkGraph(session)
         appearance_observer = observe_native_face_appearances if face_roi_only else observe_owned_focal_appearances
@@ -721,13 +745,16 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         trajectory_margin = path_info.get('competing_trajectory_margin')
         linked = (descriptor_model == SFACE_MODEL_NAME and provisional is not None and min(ranking_similarities) >= .5
             and (trajectory_margin is None or trajectory_margin >= .06))
+        linked = linked and (window_policy is None or window_policy.selected)
         reason = ('appearance_shortlist_only' if linked else 'descriptor_space_uncalibrated_ranking_only'
             if provisional is not None and descriptor_model != SFACE_MODEL_NAME else path_info['reason'])
+        if window_policy is not None and not window_policy.selected:
+            reason = window_policy.reason
         # Candidate ordering is not identity admission. Retain weak/ambiguous
         # appearance as a provisional hypothesis rather than permanently
         # excluding a source using an uncalibrated bank threshold. Required
         # parts/all competing hypotheses are still the normal owner's duty.
-        ranking_linked = provisional is not None
+        ranking_linked = provisional is not None and (window_policy is None or window_policy.selected)
         anchors = provisional
         session.budget.check()
         association = None
@@ -759,6 +786,8 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             separators=(',', ':'),allow_nan=False).encode()))
         candidates.append(dict(source_index=source, shortlist_available=linked, reason=reason if linked else
             reason, similarities=ranking_similarities, competing_trajectory_margin=trajectory_margin,
+            native_head_window_resolved=None if window_policy is None else window_policy.selected,
+            native_head_window_reason=None if window_policy is None else window_policy.reason,
             ranking_only_path_available=ranking_linked, ranking_similarities=ranking_similarities,
             native_trajectory_hypotheses=path_info['hypotheses'], source_eligibility_changed=False,
             independent_native_pose_motion_status=pose_status,
@@ -779,6 +808,22 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
     comparisons = []
     for candidate in candidates:
         source = candidate['source_index']
+        if pose_comparison_mode == 'defer_unresolved_association':
+            # Discovery has already preserved ALL raw person tracks and the
+            # association graph. Comparing their Cartesian products cannot
+            # establish which physical subject owns the motion. Keep that
+            # missing obligation explicit, not an empty list or a zero cost.
+            comparisons.append(dict(source_index=source,
+                all_owner_pair_hypotheses=None, comparisons_deferred=True,
+                reason='physical_subject_association_unresolved_not_zero_pose_cost',
+                reference_raw_track_count=len(pose_windows[reference_source]),
+                candidate_raw_track_count=len(pose_windows[source]),
+                potential_unassociated_pair_count=len(pose_windows[reference_source])*len(pose_windows[source]),
+                comparisons_executed=0, association_graph_resolution_required=True,
+                all_raw_tracks_and_association_graph_retained=True,
+                source_eligibility_or_appearance_ranking_changed=False,
+                temporal_phase_certified=False, candidate_admitted=False))
+            continue
         session.budget.spend('pose_comparisons', len(pose_windows[reference_source])*len(pose_windows[source]))
         pairs = product(pose_windows[reference_source], pose_windows[source])
         comparison = dict(source_index=source, all_owner_pair_hypotheses=[dict(
@@ -799,6 +844,7 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         head_analysis_policy=analysis_policy,
         source_local_pair_graphs=graphs,
         independent_raw17_temporal_pose_comparisons=comparisons,
+        pose_comparison_mode=pose_comparison_mode,
         raw_observations=[row.to_dict() for rows in observed.values() for row in rows],
         target_declared_before_donor_comparison=True, evidence_basis=(
             'native_face_roi_appearance_and_local_landmark_paths_not_body_ownership' if face_roi_only else
