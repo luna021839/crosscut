@@ -265,7 +265,7 @@ class NativeTemporalPoseTests(unittest.TestCase):
             native_pixels=lambda *_:pixels, _assert_source_identity=lambda source:(1,source,3,4,5),
             _assert_model_assets=Mock(), models={name:(None,None,'e'*64) for name in names},
             model_adapters={name:'f'*64 for name in names})
-        def appearance(_owner,row):
+        def appearance(_owner,row,**_kwargs):
             return (NativeFaceAppearance(0,tuple(1. if n==0 else 0. for n in range(128)),
                 row.heads[0].candidate_body_observation_ids),)
         with patch('crosscut.group_joint_focal_frontier.observe_native_group',
@@ -346,6 +346,44 @@ class NativeTemporalPoseTests(unittest.TestCase):
         self.assertTrue(all(not w.to_dict()['source_local_identity_certified'] for w in result))
         with self.assertRaises(ValueError):
             independent_native_pose_hypotheses(domain=domain,rows=rows,duties=self.duties,initial_person_ids=(7,))
+
+    def test_arcface_frontier_keeps_weak_ranked_donor_without_claiming_sface_shortlist(self):
+        from crosscut.native_face_descriptor import (ARCFACE_MODEL_NAME, ARCFACE_R50_SHA256)
+        domain = self.domain(); pixels = np.zeros((800,1000,3),np.uint8)
+        digest = hashlib.sha256(memoryview(pixels)).hexdigest()
+        raw = {(s,n):replace(self.row(domain,s,n,shift=.001*n),native_pixel_sha256=digest)
+            for s in (0,1) for n in (0,3,6)}
+        names = ('nanodet_people','rtmpose_body7','yunet_head_faces')
+        budget = JointGroupWorkBudget(absolute_deadline=10.,clock=lambda:0.)
+        def actual_counted_descriptor(source,native,*,model,arguments):
+            self.assertEqual(model,ARCFACE_MODEL_NAME)
+            budget.spend('model_calls',model=model)
+            self.assertEqual(arguments['bbox_xywh'],list(raw[source,native].heads[0].box_xywh))
+            return tuple((1. if source==0 else .42) if i==0 else
+                float(np.sqrt(1-.42**2)) if i==1 and source==1 else 0. for i in range(512))
+        owner = SimpleNamespace(domain=domain,budget=budget,retain_native_pixels=Mock(),
+            native_pixels=lambda *_:pixels,_assert_source_identity=lambda source:(1,source,3,4,5),
+            _assert_model_assets=Mock(),models={**{name:(None,None,'e'*64) for name in names},
+                ARCFACE_MODEL_NAME:(None,None,ARCFACE_R50_SHA256)},
+            model_adapters={**{name:'f'*64 for name in names},ARCFACE_MODEL_NAME:'d'*64},
+            observe_native=Mock(side_effect=actual_counted_descriptor))
+        with patch('crosscut.group_joint_focal_frontier.observe_native_group',
+                side_effect=lambda _owner,request_source_index,native_frame_index:raw[request_source_index,native_frame_index]), \
+                patch('crosscut.group_joint_focal_frontier.focal_landmarks_track',return_value=True):
+            result = observe_synchronized_focal_frontier(owner,reference_source=0,
+                canonical_times=(0.,.1,.2),face_roi_only=True,descriptor_model=ARCFACE_MODEL_NAME)
+        donor = next(c for c in result['candidates'] if c['source_index']==1)
+        self.assertTrue(donor['ranking_only_path_available'])
+        self.assertFalse(donor['shortlist_available'])
+        self.assertEqual(donor['reason'],'descriptor_space_uncalibrated_ranking_only')
+        self.assertEqual(tuple(donor['ranking_similarities']),(.42,)*3)
+        self.assertFalse(donor['source_eligibility_changed'])
+        self.assertIsNone(result['appearance_policy']['minimum_similarity'])
+        self.assertEqual(result['appearance_policy']['descriptor_space']['dimension'],512)
+        self.assertEqual(budget.model_calls,{ARCFACE_MODEL_NAME:6})
+        self.assertFalse(result['production_admitted'])
+        self.assertFalse(result['cross_source_identity_certified'])
+        self.assertFalse(result['full_required_part_coverage_verified'])
 
     def test_remaining_person_does_not_erase_unassociated_subject_layer(self):
         domain = self.domain()

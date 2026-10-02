@@ -12,6 +12,8 @@ from crosscut.group_joint_focal_frontier import (OwnedFocalAppearance,
     locally_associated_face_roi_target,
     match_focal_appearance_anchors, observe_owned_focal_appearances, _dominant_owned_face, _same_source_links)
 from crosscut.group_joint_person_ownership import bind_person_ownership, ownership_policy_fingerprint
+from crosscut.native_face_descriptor import (NativeFaceDescriptorSpace, native_descriptor_space,
+    native_descriptor_schema, SFACE_MODEL_NAME, ARCFACE_MODEL_NAME)
 from engine.tests import test_group_joint_person_ownership as ownership_fixtures
 from engine.tests import test_group_joint_native_tracks as track_fixtures
 
@@ -21,6 +23,13 @@ def appearance(person=0, face=7, axis=0):
 
 
 class FocalFrontierTests(unittest.TestCase):
+    def descriptor_session(self, model=SFACE_MODEL_NAME, axis=0):
+        dimension, digest = native_descriptor_schema(model)
+        return SimpleNamespace(observe_native=Mock(return_value=tuple(
+            1. if i == axis else 0. for i in range(dimension))),
+            _assert_model_assets=Mock(), models={model:(None,None,digest,None)},
+            model_adapters={model:'d'*64})
+
     def row(self):
         fixture = ownership_fixtures.PersonOwnershipTests()
         head = replace(fixture.head(), candidate_body_observation_ids=(0,))
@@ -71,9 +80,9 @@ class FocalFrontierTests(unittest.TestCase):
 
     def test_owned_cropped_hips_can_supply_actual_face_embedding_without_claiming_torso(self):
         row = self.row()
-        session = SimpleNamespace(observe_native=Mock(return_value=appearance().embedding))
+        session = self.descriptor_session()
         values = observe_owned_focal_appearances(session, row)
-        self.assertEqual(values, (appearance(),))
+        self.assertEqual(values, (replace(appearance(),descriptor_space=native_descriptor_space(session,SFACE_MODEL_NAME)),))
         self.assertEqual(row.people[0].body_ownership_state, 'unknown')
         self.assertEqual(dict(row.people[0].part_states)['head_extent'], 'unknown')
         self.assertEqual(session.observe_native.call_args.kwargs['model'], 'sface_owned_face')
@@ -81,7 +90,7 @@ class FocalFrontierTests(unittest.TestCase):
 
     def test_legacy_policy_and_forged_owned_parts_cannot_supply_embeddings(self):
         row = self.row()
-        session = SimpleNamespace(observe_native=Mock(return_value=appearance().embedding))
+        session = self.descriptor_session()
         for wrong in (replace(row, person_ownership_policy_sha256='a'*64),
                 replace(row, people=(replace(row.people[0], body_ownership_state='observed'),)),
                 replace(row, heads=(replace(row.heads[0], candidate_body_observation_ids=(1,)),))):
@@ -104,10 +113,11 @@ class FocalFrontierTests(unittest.TestCase):
         people, _ = bind_person_ownership((row.people[0], other), (head,), row.frame_size_wh)
         row = replace(row, people=people, heads=(head,))
         self.assertEqual(tuple(p.upper_body_ownership_state for p in row.people), ('ambiguous', 'ambiguous'))
-        session = SimpleNamespace(observe_native=Mock(return_value=appearance().embedding))
+        session = self.descriptor_session()
         self.assertEqual(observe_owned_focal_appearances(session, row), ())
         values = observe_native_face_appearances(session, row)
-        self.assertEqual(values, (NativeFaceAppearance(7, appearance().embedding, (0, 1)),))
+        self.assertEqual(values, (NativeFaceAppearance(7, appearance().embedding, (0, 1),
+            native_descriptor_space(session,SFACE_MODEL_NAME)),))
         self.assertIsNone(values[0].person_observation_id)
         self.assertEqual(values[0].candidate_body_observation_ids, (0, 1))
 
@@ -214,6 +224,56 @@ class FocalFrontierTests(unittest.TestCase):
         self.assertEqual(info['hypothesis_count'], 8)
         available.assert_not_called()
 
+    def test_arcface_backend_is_counted_by_existing_observer_and_keeps_body_alternatives(self):
+        row = self.row()
+        session = self.descriptor_session(ARCFACE_MODEL_NAME)
+        values = observe_native_face_appearances(session,row,descriptor_model=ARCFACE_MODEL_NAME)
+        self.assertEqual(len(values[0].embedding),512)
+        self.assertEqual(values[0].candidate_body_observation_ids,(0,))
+        self.assertIsNone(values[0].person_observation_id)
+        self.assertEqual(values[0].descriptor_space,native_descriptor_space(session,ARCFACE_MODEL_NAME))
+        session.observe_native.assert_called_once_with(row.request_source_index,row.native_frame_index,
+            model=ARCFACE_MODEL_NAME,arguments={'bbox_xywh':list(row.heads[0].box_xywh),
+                'landmarks_xy':[list(p) for p in row.heads[0].landmarks_xy]})
+        owned = observe_owned_focal_appearances(session,row,descriptor_model=ARCFACE_MODEL_NAME)
+        self.assertEqual(owned[0].descriptor_space,values[0].descriptor_space)
+        self.assertEqual(owned[0].person_observation_id,0)
+
+    def test_models_adapters_and_legacy_spaces_cannot_mix_before_path_work(self):
+        a_session = self.descriptor_session(ARCFACE_MODEL_NAME)
+        arc = observe_native_face_appearances(a_session,self.row(),descriptor_model=ARCFACE_MODEL_NAME)[0]
+        sf = observe_native_face_appearances(self.descriptor_session(),self.row())[0]
+        changed = replace(arc,descriptor_space=replace(arc.descriptor_space,adapter_sha256='e'*64))
+        for candidate in (sf,changed,appearance()):
+            path = Mock(return_value=True)
+            with self.subTest(candidate=candidate.descriptor_space),self.assertRaisesRegex(ValueError,'mix descriptor'):
+                match_focal_trajectory((arc,)*3,((candidate,),)*3,path_available=path)
+            path.assert_not_called()
+        with self.assertRaises(ValueError):
+            replace(arc,embedding=appearance().embedding)
+
+    def test_arcface_scores_are_ranked_without_a_borrowed_sface_gate(self):
+        arc = observe_native_face_appearances(self.descriptor_session(ARCFACE_MODEL_NAME),
+            self.row(),descriptor_model=ARCFACE_MODEL_NAME)[0]
+        candidate = replace(arc,embedding=tuple(.42 if i==0 else float(np.sqrt(1-.42**2))
+            if i==1 else 0. for i in range(512)))
+        chosen, info = match_focal_trajectory((arc,)*3,((candidate,),)*3,path_available=lambda _:True)
+        self.assertEqual(chosen,(candidate,)*3)
+        self.assertAlmostEqual(info['mean_similarity'],.42)
+        self.assertFalse(info['identity_certified'])
+        self.assertEqual(info['descriptor_space']['dimension'],512)
+        with self.assertRaisesRegex(ValueError,'SFace shortlist thresholds'):
+            match_focal_appearance_anchors((arc,)*3,((candidate,),)*3)
+
+    def test_unregistered_or_wrong_weight_backend_cannot_masquerade_as_a_space(self):
+        session = self.descriptor_session()
+        with self.assertRaisesRegex(ValueError,'not registered'):
+            observe_native_face_appearances(session,self.row(),descriptor_model=ARCFACE_MODEL_NAME)
+        session.models[SFACE_MODEL_NAME]=(None,None,'f'*64,None)
+        with self.assertRaisesRegex(ValueError,'pinned asset'):
+            observe_native_face_appearances(session,self.row())
+        session.observe_native.assert_not_called()
+
     def graph_fixture(self, size=(1920, 1080), cuts=()):
         session, rows = track_fixtures.NativeGroupTrackTests().fixture(((),)*3, cuts=cuts)
         base = self.row().heads[0]
@@ -293,3 +353,18 @@ class FocalFrontierTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'overflow|byte budget'):
                 graph.add_pair(rows[0], rows[1], values[0], values[1])
             self.assertEqual(graph.pairs, {})
+
+    def test_pixel_graph_replays_bound_descriptor_adapter_after_sensing(self):
+        session, rows, values = self.graph_fixture((100,50))
+        dimension,digest = native_descriptor_schema(ARCFACE_MODEL_NAME)
+        space = NativeFaceDescriptorSpace(ARCFACE_MODEL_NAME,dimension,digest,'c'*64)
+        session.models[ARCFACE_MODEL_NAME]=(None,None,digest,None)
+        session.model_adapters[ARCFACE_MODEL_NAME]=space.adapter_sha256
+        value = NativeFaceAppearance(0,(1.,)+(0.,)*511,(),space)
+        graph = NativeFocalLinkGraph(session)
+        with patch('crosscut.group_joint_focal_frontier.focal_landmarks_track',return_value=True):
+            graph.add_pair(rows[0],rows[1],(value,),(value,))
+        self.assertTrue(graph.path_available(rows[:2],(value,)*2))
+        session.model_adapters[ARCFACE_MODEL_NAME]='d'*64
+        with self.assertRaisesRegex(ValueError,'descriptor adapter binding changed'):
+            graph.path_available(rows[:2],(value,)*2)

@@ -4,20 +4,61 @@ This does not identify a named person or turn descriptor similarity into
 semantic identity. No model is downloaded here; the caller supplies its
 verified local asset. Existing SFace descriptors are never reinterpreted.
 """
+from dataclasses import asdict, dataclass
 import hashlib
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .face_identity import _validate_normalized_face
+from .face_identity import SFACE_SHA256, _validate_normalized_face
 
 
 ARCFACE_R50_SHA256 = '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43'
 ARCFACE_MODEL_NAME = 'arcface_r50_native_face'
+SFACE_MODEL_NAME = 'sface_owned_face'
 ARCFACE_TARGET = np.asarray(((38.2946,51.6963),(73.5318,51.5014),(56.0252,71.7366),
     (41.5493,92.3655),(70.7299,92.2041)),dtype=np.float64)
 ARCFACE_TARGET.setflags(write=False)
+
+
+def native_descriptor_schema(model_name):
+    """Pinned spaces are incompatible even when a cosine looks plausible."""
+    if model_name == SFACE_MODEL_NAME:
+        return 128, SFACE_SHA256
+    if model_name == ARCFACE_MODEL_NAME:
+        return 512, ARCFACE_R50_SHA256
+    raise ValueError('unknown native face descriptor space')
+
+
+@dataclass(frozen=True, slots=True)
+class NativeFaceDescriptorSpace:
+    model_name: str
+    dimension: int
+    model_sha256: str
+    adapter_sha256: str
+
+    def __post_init__(self):
+        dimension, digest = native_descriptor_schema(self.model_name)
+        if (type(self.dimension) is not int or self.dimension != dimension
+                or self.model_sha256 != digest or not isinstance(self.adapter_sha256, str)
+                or len(self.adapter_sha256) != 64
+                or any(c not in '0123456789abcdef' for c in self.adapter_sha256)):
+            raise ValueError('native descriptor space needs pinned model, dimension and adapter')
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def native_descriptor_space(session, model_name):
+    """Resolve the live registered asset, not a caller's display model label."""
+    dimension, digest = native_descriptor_schema(model_name)
+    if model_name not in session.models:
+        raise ValueError('native descriptor backend is not registered in this worker')
+    session._assert_model_assets(model_name)
+    if session.models[model_name][2] != digest:
+        raise ValueError('native descriptor backend differs from its pinned asset')
+    return NativeFaceDescriptorSpace(model_name, dimension, digest, session.model_adapters[model_name])
 
 
 def face_similarity_affine(source_points):

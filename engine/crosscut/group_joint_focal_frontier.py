@@ -17,6 +17,8 @@ import cv2
 import numpy as np
 
 from .face_identity import SFaceEmbedder, SFACE_SHA256, _validate_normalized_face
+from .native_face_descriptor import (NativeFaceDescriptorSpace, SFACE_MODEL_NAME,
+    native_descriptor_schema, native_descriptor_space)
 from .group_joint_native_observer import observe_native_group
 from .group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost
 from .group_focal_attention import focal_landmarks_track
@@ -67,10 +69,14 @@ class OwnedFocalAppearance:
     person_observation_id: int
     face_observation_id: int
     embedding: tuple[float, ...]
+    descriptor_space: NativeFaceDescriptorSpace | None = None
 
     def __post_init__(self):
+        if self.descriptor_space is not None and not isinstance(self.descriptor_space, NativeFaceDescriptorSpace):
+            raise ValueError('focal appearance descriptor space must be explicitly typed')
+        dimension = 128 if self.descriptor_space is None else self.descriptor_space.dimension
         if (any(type(n) is not int or n < 0 for n in (self.person_observation_id, self.face_observation_id))
-                or not isinstance(self.embedding, tuple) or len(self.embedding) != 128
+                or not isinstance(self.embedding, tuple) or len(self.embedding) != dimension
                 or any(type(v) not in (int, float) or not math.isfinite(v) for v in self.embedding)
                 or abs(float(np.linalg.norm(self.embedding))-1.) > 1e-5):
             raise ValueError('focal appearance needs an actual normalized owned face embedding')
@@ -82,9 +88,10 @@ class NativeFaceAppearance:
     face_observation_id: int
     embedding: tuple[float, ...]
     candidate_body_observation_ids: tuple[int, ...]
+    descriptor_space: NativeFaceDescriptorSpace | None = None
 
     def __post_init__(self):
-        OwnedFocalAppearance(0, self.face_observation_id, self.embedding)
+        OwnedFocalAppearance(0, self.face_observation_id, self.embedding, self.descriptor_space)
         if (not isinstance(self.candidate_body_observation_ids, tuple)
                 or len(set(self.candidate_body_observation_ids)) != len(self.candidate_body_observation_ids)
                 or any(type(n) is not int or n < 0 for n in self.candidate_body_observation_ids)):
@@ -137,13 +144,14 @@ def register_owned_focal_appearance_model(session, model_path):
         'opencv_version': cv2.__version__, 'native_normalized_geometry_not_clamped': True})
 
 
-def observe_owned_focal_appearances(session, row):
+def observe_owned_focal_appearances(session, row, *, descriptor_model=SFACE_MODEL_NAME):
     if row.person_ownership_policy_sha256 != ownership_policy_fingerprint():
         raise ValueError('focal ordering cannot upgrade stale/legacy part ownership')
     rebound, owners = bind_person_ownership(row.people, row.heads, row.frame_size_wh)
     if rebound != row.people or any(head.candidate_body_observation_ids != tuple(owners[head.observation_id])
             for head in row.heads):
         raise ValueError('focal appearance raw part ownership does not independently replay')
+    space = native_descriptor_space(session, descriptor_model)
     heads = {head.observation_id: head for head in row.heads}
     values = []
     for person in row.people:
@@ -160,14 +168,14 @@ def observe_owned_focal_appearances(session, row):
             # substituted with a neighboring/background face.
             continue
         embedding = session.observe_native(row.request_source_index, row.native_frame_index,
-            model='sface_owned_face', arguments={'bbox_xywh': list(head.box_xywh),
+            model=descriptor_model, arguments={'bbox_xywh': list(head.box_xywh),
                 'landmarks_xy': [list(point) for point in head.landmarks_xy]})
         if embedding is not None:
-            values.append(OwnedFocalAppearance(person.observation_id, head.observation_id, tuple(embedding)))
+            values.append(OwnedFocalAppearance(person.observation_id, head.observation_id, tuple(embedding), space))
     return tuple(values)
 
 
-def observe_native_face_appearances(session, row):
+def observe_native_face_appearances(session, row, *, descriptor_model=SFACE_MODEL_NAME):
     """Body duplicates do not erase a separately detected native face.
 
     This is HEAD-ROI sensing, not changing the inherited editorial role to
@@ -176,6 +184,7 @@ def observe_native_face_appearances(session, row):
     """
     if row.person_ownership_policy_sha256 != ownership_policy_fingerprint():
         raise ValueError('native face ordering cannot upgrade stale part ownership')
+    space = native_descriptor_space(session, descriptor_model)
     values = []
     for head in row.heads:
         try:
@@ -183,11 +192,11 @@ def observe_native_face_appearances(session, row):
         except ValueError:
             continue
         embedding = session.observe_native(row.request_source_index, row.native_frame_index,
-            model='sface_owned_face', arguments={'bbox_xywh': list(head.box_xywh),
+            model=descriptor_model, arguments={'bbox_xywh': list(head.box_xywh),
                 'landmarks_xy': [list(point) for point in head.landmarks_xy]})
         if embedding is not None:
             values.append(NativeFaceAppearance(head.observation_id, tuple(embedding),
-                head.candidate_body_observation_ids))
+                head.candidate_body_observation_ids, space))
     return tuple(values)
 
 
@@ -248,7 +257,13 @@ class NativeFocalLinkGraph:
     def _appearance_key(item):
         if not isinstance(item, (NativeFaceAppearance, OwnedFocalAppearance)):
             raise ValueError('native focal graph requires explicit face/body appearance alternatives')
-        return (type(item).__name__, item.face_observation_id, item.person_observation_id)
+        return (type(item).__name__, item.face_observation_id, item.person_observation_id,
+            item.descriptor_space)
+
+    def _assert_appearance_bindings(self, values):
+        for space in {item.descriptor_space for item in values if item.descriptor_space is not None}:
+            if native_descriptor_space(self.session, space.model_name) != space:
+                raise ValueError('native focal graph descriptor adapter binding changed')
 
     def _assert_row_binding(self, row):
         identity = self.session._assert_source_identity(row.request_source_index)
@@ -268,6 +283,8 @@ class NativeFocalLinkGraph:
     def add_pair(self, left, right, before_values, after_values):
         self.session.budget.check()
         self._assert_row_binding(left); self._assert_row_binding(right)
+        _shared_descriptor_space((*before_values, *after_values))
+        self._assert_appearance_bindings((*before_values, *after_values))
         key = (left.sha256, right.sha256)
         if key in self.pairs:
             raise ValueError('native focal graph pair may be measured only once per window')
@@ -336,8 +353,10 @@ class NativeFocalLinkGraph:
         self.session.budget.check()
         if len(rows) != len(chosen) or len(rows) < 2:
             raise ValueError('native focal graph path must name every measured anchor')
+        _shared_descriptor_space(chosen)
         for row in rows:
             self._assert_row_binding(row)
+        self._assert_appearance_bindings(chosen)
         for left, right, before, after in zip(rows, rows[1:], chosen, chosen[1:]):
             self.lookups += 1
             values = self.pairs.get((left.sha256, right.sha256))
@@ -392,10 +411,26 @@ def _same_source_links(session, rows, chosen):
     return True
 
 
+def _shared_descriptor_space(values):
+    spaces = set()
+    for item in values:
+        if item is None:
+            continue
+        if not isinstance(item, (NativeFaceAppearance, OwnedFocalAppearance)):
+            raise ValueError('focal comparison requires typed descriptor observations')
+        spaces.add(item.descriptor_space)
+    if len(spaces) > 1:
+        raise ValueError('focal comparison cannot mix descriptor models, adapters or unbound legacy vectors')
+    return next(iter(spaces), None)
+
+
 def match_focal_appearance_anchors(reference, alternatives, *, minimum_similarity=.5, minimum_margin=.06):
     """Shortlist only. Policies are NOT calibrated identity/quality confidence."""
     if len(reference) != 3 or len(alternatives) != 3:
         raise ValueError('focal source ordering needs exactly three synchronized anchors')
+    space = _shared_descriptor_space((*reference, *(item for values in alternatives for item in values)))
+    if space is not None and space.model_name != SFACE_MODEL_NAME:
+        raise ValueError('SFace shortlist thresholds cannot be reused in another descriptor space; use ranking only')
     if any(type(v) not in (float, int) or not math.isfinite(v) or not 0 <= v <= 1
             for v in (minimum_similarity, minimum_margin)):
         raise ValueError('focal appearance ordering policy must be finite and explicit')
@@ -420,6 +455,11 @@ def _resolve_seeded_focal_reference(session, rows, appearances, seed, *, pixel_p
     chosen, info = match_focal_trajectory((seed,) * 3, appearances,
         path_available=lambda path: path[0].face_observation_id == seed.face_observation_id
             and (pixel_path_available(path) if pixel_path_available is not None else _same_source_links(session, rows, path)))
+    space = _shared_descriptor_space((seed,))
+    if space is not None and space.model_name != SFACE_MODEL_NAME:
+        # Native seed + measured local pixel paths supply a discovery reference,
+        # never calibrated cross-camera identity. No SFace score floor applies.
+        return chosen
     return chosen if chosen is not None and min(info['similarities']) >= .5 else None
 
 
@@ -475,6 +515,7 @@ def match_focal_trajectory(reference, alternatives, *, path_available, maximum_h
         raise ValueError('focal trajectory requires three anchors and actual pixel-path sensing')
     if type(maximum_hypotheses) is not int or not 1 <= maximum_hypotheses <= 256:
         raise ValueError('focal trajectory hypothesis cap must be bounded and explicit')
+    space = _shared_descriptor_space((*reference, *(item for values in alternatives for item in values)))
     count = math.prod(len(values) for values in alternatives)
     if not count or any(item is None for item in reference):
         return None, dict(reason='missing_native_face_path', similarities=(), hypotheses=[])
@@ -495,6 +536,7 @@ def match_focal_trajectory(reference, alternatives, *, path_available, maximum_h
     score, similarities, chosen = paths[0]
     return chosen, dict(reason='native_trajectory_appearance_rank_only', similarities=similarities,
         mean_similarity=score, competing_trajectory_margin=score-paths[1][0] if len(paths)>1 else None,
+        descriptor_space=None if space is None else space.to_dict(),
         hypotheses=hypotheses, identity_certified=False, required_part_coverage_certified=False)
 
 
@@ -531,7 +573,7 @@ def native_pose_hypotheses_for_face_paths(*, domain, rows, face_paths, duties, m
 
 
 def observe_synchronized_focal_frontier(session, *, reference_source, canonical_times, face_roi_only=False,
-        inherited_reference=None):
+        inherited_reference=None, descriptor_model=SFACE_MODEL_NAME):
     """At most three rasters per eligible source; no full-song reanalysis.
 
     The normal caller supplies its parent-frozen reference BEFORE discovery.
@@ -543,6 +585,7 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             or not times[0] < times[1] < times[2] or times[-1]-times[0] > .35):
         raise ValueError('focal frontier requires three distinct bounded canonical music times')
     session.domain.eligible_index(reference_source)
+    native_descriptor_schema(descriptor_model)
     if type(face_roi_only) is not bool:
         raise ValueError('face-ROI-only sensing must be an explicit non-admission policy')
     if inherited_reference is not None and (not isinstance(inherited_reference, InheritedFocalReference)
@@ -568,7 +611,11 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
             session.retain_native_pixels(((source,rows[-1].native_frame_index),) if rows else ())
             row = observe_native_group(session, request_source_index=source,
                 native_frame_index=_native_for_canonical(session.domain, source, time))
-            rows.append(row); values.append(appearance_observer(session, row))
+            rows.append(row); values.append(appearance_observer(session, row, descriptor_model=descriptor_model))
+            if any((item.descriptor_space is None and descriptor_model != SFACE_MODEL_NAME)
+                    or (item.descriptor_space is not None and item.descriptor_space.model_name != descriptor_model)
+                    for item in values[-1]):
+                raise ValueError('frontier observation differs from its requested descriptor backend')
             # Stream a pair BEFORE decoding the third raster. An overflow
             # remains the trajectory selector's explicit unavailable result.
             if len(rows) > 1 and math.prod(len(items) for items in values) <= 64:
@@ -596,9 +643,10 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
                 and pixel_path_available(path))
         ranking_similarities = path_info['similarities']
         trajectory_margin = path_info.get('competing_trajectory_margin')
-        linked = (provisional is not None and min(ranking_similarities) >= .5
+        linked = (descriptor_model == SFACE_MODEL_NAME and provisional is not None and min(ranking_similarities) >= .5
             and (trajectory_margin is None or trajectory_margin >= .06))
-        reason = 'appearance_shortlist_only' if linked else path_info['reason']
+        reason = ('appearance_shortlist_only' if linked else 'descriptor_space_uncalibrated_ranking_only'
+            if provisional is not None and descriptor_model != SFACE_MODEL_NAME else path_info['reason'])
         # Candidate ordering is not identity admission. Retain weak/ambiguous
         # appearance as a provisional hypothesis rather than permanently
         # excluding a source using an uncalibrated bank threshold. Required
@@ -682,7 +730,11 @@ def observe_synchronized_focal_frontier(session, *, reference_source, canonical_
         source_local_tracking_policy=dict(face_raster_maximum_width=960,
             implementation_sha256=hashlib.sha256(Path(__file__).with_name('group_focal_attention.py').read_bytes()).hexdigest(),
             basis='four_of_five_landmark_flow_or_actual_face_box_flow_iou_060_not_whole_head_motion'),
-        appearance_policy=dict(minimum_similarity=.5, minimum_margin=.06, calibrated_identity_confidence=False),
+        appearance_policy=dict(descriptor_model=descriptor_model,
+            descriptor_space=None if reference[0].descriptor_space is None else reference[0].descriptor_space.to_dict(),
+            minimum_similarity=.5 if descriptor_model == SFACE_MODEL_NAME else None,
+            minimum_margin=.06 if descriptor_model == SFACE_MODEL_NAME else None,
+            calibrated_identity_confidence=False),
         source_clock_authority=session.domain.to_dict(), production_admitted=False,
         whole_head_extent_verified=False, full_required_part_coverage_verified=False,
         final_render_schedule_join_verified=False,
