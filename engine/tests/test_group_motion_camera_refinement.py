@@ -442,6 +442,81 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertEqual(proposal['before_source_motion_evidence']['motion']['observed_bone_indices'],[0,1,2])
         self.assertFalse(proposal['admitted'],'a better preview cannot bypass the dense camera failure')
 
+    def _normal_cut_preview(self,plan,domain):
+        choices=tuple(replace(_choice(index,domain.eligible_index(segment.source_index),
+            start=segment.master_start,end=segment.master_start+segment.duration),
+            source_local_start=segment.source_start,source_local_end=segment.source_end)
+            for index,segment in enumerate(plan.segments))
+        measured=[]
+        def projected(_frames,samples,_provider,**_kwargs):
+            measured.append(tuple((sample.output_frame_index,sample.source_index,
+                sample.native_frame_index) for sample in samples))
+            return self.gesture()
+        provider=SimpleNamespace(compare_motion=lambda *a,**k:self.gesture(),close=lambda:None,
+            capture=SimpleNamespace(frame_at_native_index=lambda *a:np.zeros((90,160,3),np.uint8)))
+        with patch('crosscut.group_motion_camera_refinement.focal_boundary_shortlist',return_value=(2,)), \
+                patch('crosscut.group_motion_camera_refinement.probe_render_frame_clock',return_value=
+                    domain.render_frame_clocks[0]), \
+                patch('crosscut.group_motion_camera_refinement.CloseupGestureProvider',return_value=provider), \
+                patch('crosscut.group_motion_camera_refinement._VideoSampler',return_value=
+                    SimpleNamespace(feature_descriptor_at=lambda *a,**k:SimpleNamespace(),close=lambda:None)), \
+                patch('crosscut.group_motion_camera_refinement.measure_projected_motion',side_effect=projected), \
+                patch('crosscut.group_motion_camera_refinement.measured_output_face_box',return_value=(.4,.25,.1,.15)), \
+                patch('crosscut.group_motion_camera_refinement.build_group_cut_camera_proposal',side_effect=
+                    ValueError('native camera cannot be bound')):
+            result=refine_group_motion_camera(plan=plan,timeline=VisualTimelinePlan(choices,1.),
+                audio_offsets=domain.audio_offsets,source_timewarps=domain.source_timewarps,
+                scene_cut_times=domain.scene_cut_times,source_index_map=domain.eligible_indices,
+                model_path='unused',maximum_boundaries=1,maximum_measured_boundaries=1)
+        return result,measured
+
+    def test_normal_refiner_keeps_the_incumbent_whole_unit_phase_when_moving_a_cut(self):
+        from engine.tests.test_group_cut_timing import GroupCutTimingTests
+        plan,domain=GroupCutTimingTests().fixture()
+        plan=replace(plan,segments=tuple(replace(segment,source_start=segment.source_start+.1)
+            if segment.source_index==2 else segment for segment in plan.segments))
+        result,measured=self._normal_cut_preview(plan,domain)
+        directional=[row for row in result.attempts if row['stage']=='directional_candidate']
+        self.assertEqual([row['offset_frames'] for row in directional],[-6,-4,-2,2,4,6],
+            'moving the cut must not reset phase and break the preceding same-native hold')
+        self.assertEqual(len(measured),7)
+        for samples in measured:
+            for tick,source,native in samples:
+                self.assertEqual(native,tick+3 if source==2 else tick,
+                    'actual source2 whole-unit phase is retained, not realigned from global audio')
+        self.assertEqual(result.plan,plan)
+        self.assertFalse(result.proposals,'clock fidelity is not dense-camera or quality approval')
+
+    def test_normal_refiner_cannot_drop_an_incoming_native_cut_before_candidate_sensing(self):
+        from engine.tests.test_group_cut_timing import GroupCutTimingTests
+        plan,domain=GroupCutTimingTests().fixture()
+        domain=replace(domain,scene_cut_times=((),(),(3.15,)))
+        result,measured=self._normal_cut_preview(plan,domain)
+        rejected=[row for row in result.attempts if row['stage']=='directional_clock_preview']
+        self.assertEqual([row['offset_frames'] for row in rejected],[6])
+        self.assertIn('actual native camera cut',rejected[0]['reason'])
+        self.assertTrue(rejected[0]['failed_before_candidate_motion_sensing'])
+        self.assertFalse(any(samples[2][0]==96 for samples in measured),
+            'a reset that clips the real broadcaster cut must not reach NN ranking')
+        self.assertEqual(result.plan,plan)
+
+    def test_normal_refiner_does_not_borrow_local_phase_receipts_across_new_cut_bounds(self):
+        from tests import test_shot_video_clock as fixture
+        from crosscut.group_joint_state_factory import assemble_single_group_source_camera_state
+        from crosscut.shot_video_clock import attach_authorized_shot_video_clocks
+        args,context,_,phase,clock=fixture.ShotVideoClockTests().prepare()
+        path=args['observations'].path
+        plan,_=assemble_single_group_source_camera_state(plan=context.incumbent_plan,
+            domain=args['domain'],path=(path[0],phase,path[2]))
+        plan=attach_authorized_shot_video_clocks(plan=plan,context=context,clocks=(clock,))
+        result,measured=self._normal_cut_preview(plan,args['domain'])
+        rejected=[row for row in result.attempts if row['stage']=='directional_clock_preview']
+        self.assertEqual([row['offset_frames'] for row in rejected],[-6,-4,-2,2,4,6])
+        self.assertTrue(all('renewed external shot-clock authority' in row['reason'] for row in rejected))
+        self.assertEqual(len(measured),1,'unchanged incumbent baseline only, not stale phase candidates')
+        self.assertEqual(result.plan,plan)
+        self.assertEqual(result.plan.authorized_shot_video_clocks,(clock,))
+
     def test_shortlist_uses_cut_endpoint_sizes_not_interior_labels(self):
         choices=tuple(replace(_choice(i,i%2,start=float(i),end=float(i+1)),
             shot_type=ShotType.CLOSE_UP,shot_scale=.9,

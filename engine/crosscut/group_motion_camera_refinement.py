@@ -14,13 +14,15 @@ from pathlib import Path
 from time import monotonic
 
 from .optional_native_worker import isolated_optional
-from .render import aligned_render_segment,segment_frame_counts,EditorialTransformTrack
+from .render import segment_frame_counts,EditorialTransformTrack
 from .render_boundary_clock import hard_cut_boundary_sample_clocks
 from .render_frame_schedule import probe_render_frame_clock
 from .closeup_gesture import (CloseupGestureProvider,CloseupGestureEvidence,
     compare_arm_articulation,measure_arm_motion,MOTION_CONTRACT)
 from .observed_head_motion import HeadMotionEvidence,HEAD_MOTION_BASIS,HEAD_DIMENSIONS
 from .group_cut_camera_proposal import build_group_cut_camera_proposal,retime_base_pan
+from .group_cut_timing import propose_numeric_group_cut_timing
+from .group_source_domain import GroupSourceDomain
 from .prescribed_render_geometry import PrescribedGeometrySampler
 from .post_render_perceptual_quality import _reference_view_for_span
 from .rendered_proxy_review import _default_geometry_provider,_box_discontinuity,ProxyReviewConfig
@@ -371,6 +373,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     if not targets:
         return GroupMotionCameraRefinement(plan,timeline,(),tuple(attempts),monotonic()-started)
     clocks={i:probe_render_frame_clock(source) for i,source in enumerate(plan.sources)}
+    domain=GroupSourceDomain(tuple(plan.sources),mapping,tuple(audio_offsets),tuple(source_timewarps),
+        tuple(tuple(cuts) for cuts in scene_cut_times),tuple(clocks[index] for index in mapping))
     provider=CloseupGestureProvider(plan.sources,Path(model_path),verify_native_global_focal=True)
     samplers={}
     local_index={source:index for index,source in enumerate(mapping)}
@@ -478,18 +482,26 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 cut=right.canonical_master_start+delta
                 if min(cut-left.canonical_master_start,right.canonical_master_end-cut)<.55:
                     continue
-                pair=tuple(aligned_render_segment(source_index=mapping[choice.source_index],
-                    reference_start=start,common_master_start=plan.master_audio_start,
-                    source_offset=audio_offsets[choice.source_index],duration=end-start,
-                    timewarp=source_timewarps[choice.source_index])
-                    for choice,start,end in ((left,left.canonical_master_start,cut),(right,cut,right.canonical_master_end)))
-                numeric=replace(plan,segments=(*plan.segments[:boundary],*pair,*plan.segments[boundary+2:]))
+                # A boundary-time change is not a new source phase. Rebuilding
+                # two cells from global audio offsets discarded incumbent local
+                # video timing and broke adjacent same-native renderer units.
+                # Preserve the complete absolute native/camera curves instead;
+                # typed local-clock receipts must be renewed, never transferred.
                 try:
-                    source_gesture,descriptors,native=measured(numeric,boundary,required_basis=motion_evidence_basis(before))
+                    timing=propose_numeric_group_cut_timing(plan=plan,domain=domain,
+                        boundary_index=boundary,timing_offset_frames=offset)
+                except ValueError as error:
+                    attempts.append(dict(stage='directional_clock_preview',boundary_index=boundary,
+                        offset_frames=offset,admitted=False,reason=str(error),
+                        failed_before_candidate_motion_sensing=True))
+                    continue
+                preview=timing.plan
+                pair=preview.segments[boundary:boundary+2]
+                try:
+                    source_gesture,descriptors,native=measured(preview,boundary,required_basis=motion_evidence_basis(before))
                 except ValueError:
                     continue
                 if native is None:continue
-                preview=retimed_incumbent_camera_preview(plan,numeric,boundary)
                 gesture=projected(preview,boundary,native,required_basis=motion_evidence_basis(before))
                 improves=measured_motion_improves(gesture,before)
                 preview_faces=preview_rank=None
@@ -514,6 +526,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                     motion_ranking_coordinate_basis='actual_projected_output_pixels',
                     incumbent_camera_preview_face_metrics=preview_faces,
                     incumbent_camera_preview_joint_rank=preview_rank,
+                    numeric_cut_time_preview=timing.to_dict(),
                     preview_grants_dense_camera_authority=False,
                     unknown_motion_bones_imputed=False))
                 # A crop can hide a bone genuinely seen in the raw source.
