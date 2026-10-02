@@ -97,6 +97,18 @@ def round_robin(groups, limit):
     return tuple(selected)
 
 
+def camera_balanced_source_frontier(native, fitted):
+    """Keep camera fitting reachable before one source's many head hypotheses.
+
+    The outer allocator balances source IDs. Concatenating all native head
+    hypotheses before fitted cameras would still starve zoom/pan alternatives
+    under that finite quota. Alternate both kinds without admitting either:
+    original-pixel duties, edge measurements and dense checks remain required.
+    """
+    native, fitted = tuple(native), tuple(fitted)
+    return round_robin((native, fitted), len(native)+len(fitted))
+
+
 def time_stratified_window_frontier(prepared, limit):
     """Spend the bounded first pass across the song, not a chronological prefix.
 
@@ -250,7 +262,7 @@ def propose_scene_changes(context):
                                 if len(camera_errors)<source.MAX_RECORDED_FAILURES:camera_errors.append(str(exc))
                     # Native then camera, round-robin over SOURCE, not the first
                     # source's many head/camera variants monopolizing the cap.
-                    by_source.append(tuple(dict((v.key,v) for v in (*values,*cameras)).values()))
+                    by_source.append(camera_balanced_source_frontier(values,cameras))
                 remaining=session.budget.limits['states']-session.budget.counts['states']-len(lefts)-len(rights)
                 # At most 24 states globally. Discovery still preserves all the
                 # omitted hypotheses and numeric source options in its archive.
@@ -327,10 +339,24 @@ def propose_scene_changes(context):
                     for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
                         for row in span['rows']:
                             raw=sensors.raw(old,row['output_tick'],None)
-                            required=Counter(name for p in raw.people for name,status in getattr(p,'part_states',()) if name in ('left_arm','right_arm') and status=='observed')
-                            actual=Counter(a['part'] for a in row['projected_observed_arms'])
+                            if old.role==GroupOutputRole.FORMATION:
+                                people=raw.people;old_subject_state='formation_cohort'
+                            else:
+                                try:
+                                    _,person=source._dominant(raw,GroupOutputRole.FOCAL_HEAD)
+                                    people=() if person is None else (person,)
+                                    old_subject_state='unknown_body_owner' if person is None else 'unique_native_focal_owner'
+                                except ValueError:
+                                    people=();old_subject_state='unknown_native_focal_assignment'
+                            required=Counter(name for p in people for name,status in getattr(p,'part_states',())
+                                if name in ('left_arm','right_arm') and status=='observed')
+                            if old.role==GroupOutputRole.FOCAL_HEAD_ARMS:
+                                required|=Counter(left_arm=1,right_arm=1)
+                            actual=Counter(a['part'] for a in row['projected_observed_arms'] if a['required_by_role'])
                             if any(actual[name]<count for name,count in required.items()):raise ValueError('scene source change loses an incumbent observed arm')
                             preserved.append(dict(output_tick=row['output_tick'],required_parts=dict(sorted(required.items())),
+                                incumbent_subject_scope=old_subject_state,
+                                all_incumbent_raw_people_retained=len(raw.people),
                                 part_count_is_not_cross_camera_actor_correspondence=True,
                                 native_observation_sha256=raw.sha256,absence_is_not_a_negative_detection_certificate=True))
                     search=dict(producer=CONTRACT,generated_numeric_states=numeric['states'],
@@ -341,6 +367,7 @@ def propose_scene_changes(context):
                         incumbent_known_parts=preserved,camera_errors=camera_errors,
                         candidate_search_exhaustive=False,rotated_pass_exhaustive=False,
                         source_balanced_state_allocation=True,full_epoch_retained_family_owner_implemented=False,
+                        within_source_frontier_policy='native_fitted_camera_interleave_v1',
                         window_frontier_policy='time_stratified_midpoints_upright_before_rotated_retry_v1',
                         selected_frontier_window_indices=[i for i,_ in frontier],
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,

@@ -49,7 +49,7 @@ from .render import segment_frame_counts
 
 CONTRACT = 'normal_source_changing_family_owner_v1'
 DENSE_CONTRACT = 'source_native_focal_whole_camera_refresh_v1'
-SCENE_DENSE_CONTRACT = 'source_native_scene_whole_camera_refresh_v2'
+SCENE_DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v3'
 DENSE_CONTRACTS = (DENSE_CONTRACT, SCENE_DENSE_CONTRACT)
 MAX_REFRESHED_CELLS = 24
 MAX_MUTABLE_FRAMES = 300
@@ -318,15 +318,22 @@ def _shot_roles(context,shots):
         kinds={d.subject_kind for d in decisions}
         if kinds & {'formation','silhouette'}:
             role=GroupOutputRole.FORMATION
+        elif 'upper_body' in kinds:
+            role=GroupOutputRole.FOCAL_HEAD_ARMS
         elif kinds and kinds <= {'face'}:
             role=GroupOutputRole.FOCAL_HEAD
         else:
-            # Explicit output closeups in the incumbent's face family are a
-            # pre-existing duty, not a source-ID or raw candidate-family gate.
+            # A failed/ambiguous face crop is UNKNOWN crop evidence, not an
+            # authored demand to show both arms. Preserve the existing output
+            # close/medium intent even when that legacy face fit was disabled.
+            # An explicit non-face family still keeps its stronger duty. Any
+            # actually observed arm of the chosen owner remains required by
+            # scene_role_obligations; no missing arm becomes an observation.
             choices=context.incumbent.visual_timeline.choices[shot.first_segment_index:shot.last_segment_index+1]
             face=context.incumbent.face_match_plan.segments[shot.first_segment_index:shot.last_segment_index+1]
             role=(GroupOutputRole.FOCAL_HEAD if all(getattr(c.shot_type,'value',c.shot_type) in
-                ('closeup','close_up','medium') for c in choices) and all(f.alignment_subject=='face' for f in face)
+                ('closeup','close_up','medium') for c in choices)
+                and all(f.alignment_subject in (None,'face') for f in face)
                 else GroupOutputRole.FOCAL_HEAD_ARMS)
         roles.append(role)
     return tuple(roles)

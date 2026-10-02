@@ -302,7 +302,7 @@ class SceneSourceIntegrationTests(unittest.TestCase):
             with self.subTest(field=field):
                 dense=deepcopy(original);row=dense['mutable_shots'][0]['rows'][0]
                 if field=='head_drop':row['scene_heads']=row['scene_heads'][:1]
-                elif field=='visibility':row['scene_heads'][0]['visible_fraction']=.5
+                elif field=='visibility':next(h for h in row['scene_heads'] if h['required_by_role'])['visible_fraction']=.5
                 elif field=='anatomy':row['scene_heads'][0]['physical_head_extent']=[0,0,1,1]
                 elif field=='hypothesis':row['scene_hypothesis_sha256']='f'*64
                 else:dense['source_derivative_binding']['audit']['pairs']=[]
@@ -411,6 +411,62 @@ class SceneFormationPixelTests(unittest.TestCase):
         self.assertEqual(evidence['costs'],[[None,None],[None,None]])
         self.assertFalse(evidence['complete_required_joint_paths'])
         self.assertTrue(evidence['head_body_hypotheses_are_not_joint_path_authority'])
+
+    def focal_fixture(self,flat=False):
+        from dataclasses import asdict
+        from crosscut.group_joint_person_ownership import OwnedPersonObservation
+        sensors,rows=self.fixture(flat=flat)
+        for row in rows:
+            row.people=tuple(OwnedPersonObservation(**asdict(p),
+                candidate_head_observation_ids=(p.observation_id,),
+                unique_head_observation_id=p.observation_id,
+                body_ownership_state='observed',
+                part_states=(('left_arm','observed'),('right_arm','observed')))
+                for p in row.people)
+        return sensors,rows
+
+    def test_focal_joint_path_does_not_require_disappearing_background_body(self):
+        sensors,rows=self.focal_fixture()
+        rows[1].people=rows[1].people[:1]
+        focal=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        formation=sensors_module.native_body_links(sensors,*rows)
+        self.assertTrue(focal['complete_required_joint_paths'])
+        self.assertEqual(focal['required_body_scope'],'selected_focal_owner')
+        self.assertEqual(focal['required_body_observation_ids'],[[0],[10]])
+        self.assertEqual(len(focal['joint_pixel_flow']),2)
+        self.assertFalse(formation['complete_required_joint_paths'])
+        self.assertEqual(formation['required_body_observation_ids'],[[0,1],[10]])
+
+    def test_background_joint_path_cannot_replace_missing_selected_owner(self):
+        sensors,rows=self.focal_fixture()
+        rows[1].people=rows[1].people[1:]
+        evidence=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        self.assertEqual(evidence['assignments'],[[1,0]])
+        self.assertFalse(evidence['complete_required_joint_paths'])
+        self.assertEqual(evidence['required_body_observation_ids'],[[0],[]])
+
+    def test_selected_head_link_cannot_replace_missing_joint_pixels(self):
+        sensors,rows=self.focal_fixture(flat=True)
+        evidence=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        self.assertFalse(evidence['complete_required_joint_paths'])
+        self.assertEqual(evidence['assignments'],[])
+
+    def test_selected_head_joint_contradiction_is_not_hidden_by_scoping(self):
+        sensors,rows=self.focal_fixture()
+        sensors._head_links=lambda *args:{'unique_links':[[0,11],[1,10]]}
+        evidence=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        self.assertTrue(evidence['head_joint_assignment_contradiction'])
+        self.assertFalse(evidence['complete_required_joint_paths'])
+
+    def test_selected_temporal_scope_rejects_ambiguous_owners_and_invalid_ids(self):
+        sensors,rows=self.focal_fixture()
+        rows[1].people=tuple(replace(p,candidate_head_observation_ids=(10,),
+            unique_head_observation_id=10) for p in rows[1].people)
+        evidence=sensors_module.native_body_links(sensors,*rows,selected_head_ids=(0,10))
+        self.assertFalse(evidence['complete_required_joint_paths'])
+        for ids in ((False,10),(0,),[0,10]):
+            with self.subTest(ids=ids),self.assertRaises(ValueError):
+                sensors_module.native_body_links(sensors,*rows,selected_head_ids=ids)
 
     def test_reversed_or_foreign_source_is_not_a_body_path(self):
         sensors,rows=self.fixture()

@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from crosscut.group_scene_source_owner import time_stratified_window_frontier
+from crosscut.group_scene_source_owner import (time_stratified_window_frontier,
+    camera_balanced_source_frontier,round_robin)
 
 
 def window(first):
@@ -40,3 +41,22 @@ def test_small_or_empty_inventory_is_preserved_and_duplicate_windows_not_created
 def test_invalid_work_budget_is_rejected(limit):
     with pytest.raises(ValueError):
         time_stratified_window_frontier((window(0),), limit)
+
+
+def test_source_quota_reaches_fitted_cameras_before_many_native_head_hypotheses():
+    groups=[]
+    for source in range(8):
+        native=tuple(SimpleNamespace(key=f'{source}:native:{i}') for i in range(12))
+        fitted=tuple(SimpleNamespace(key=f'{source}:fitted:{i}') for i in range(12))
+        groups.append(camera_balanced_source_frontier(native,fitted))
+    chosen=round_robin(groups,16)
+    assert [s.key for s in chosen]==([f'{source}:native:0' for source in range(8)]+
+        [f'{source}:fitted:0' for source in range(8)])
+
+
+def test_camera_interleave_keeps_all_unique_states_and_does_not_create_a_camera():
+    a,b,c=(SimpleNamespace(key=name) for name in ('a','b','c'))
+    assert camera_balanced_source_frontier((a,b),(a,c))==(a,b,c)
+    assert camera_balanced_source_frontier((a,b),())==(a,b)
+    assert camera_balanced_source_frontier((),(c,))==(c,)
+    assert camera_balanced_source_frontier((),())==()
