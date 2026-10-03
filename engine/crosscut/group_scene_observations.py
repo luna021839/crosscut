@@ -768,13 +768,12 @@ def compare_scene_edge(sensors, left, right):
         right.first_output_frame, right.first_output_frame+3)
     try:
         rows = [sensors.frame(s, t) for s, t in zip((left, left, right, right), ticks)]
-        endpoints = [sensors.endpoint(left, outgoing=True), sensors.endpoint(right, outgoing=False)]
     except ValueError as exc:
-        return dict(available=False, reason=str(exc), metrics=None,
+        return dict(available=False, required_semantics_available=False, reason=str(exc), metrics=None,
             cross_camera_identity_certified=False, body_phase_certified=False)
     a, b = rows[1]['scene_geometry'], rows[2]['scene_geometry']
     if a is None or b is None:
-        return dict(available=False, reason='scene geometry unknown', metrics=None)
+        return dict(available=False, required_semantics_available=False, reason='scene geometry unknown', metrics=None)
     metrics = dict(occupancy=abs(a['occupancy']-b['occupancy']),
         attention=float(np.linalg.norm(np.asarray(a['attention_xy'])-b['attention_xy'])),
         scale=float(np.mean(np.abs(np.log(np.asarray(a['subject_height_quantiles'])/b['subject_height_quantiles'])))),
@@ -784,11 +783,28 @@ def compare_scene_edge(sensors, left, right):
     metrics['screen_motion'] = float(np.linalg.norm(va-vb))
     formation = left.role == GroupOutputRole.FORMATION or right.role == GroupOutputRole.FORMATION
     evidence = dict(left_state=left.key, right_state=right.key, rows=rows,
-        metrics=metrics, available=True, required_semantics_available=True,
-        required_endpoint_evidence=endpoints, first_incoming_output_frame=right.first_output_frame,
+        metrics=metrics, available=False, required_semantics_available=False,
+        required_endpoint_evidence=None, first_incoming_output_frame=right.first_output_frame,
         screen_velocity_outgoing=va.tolist(), screen_velocity_incoming=vb.tolist(),
         camera_direction_basis='measured_screen_attention_motion_not_inferred_3d_camera',
         cross_camera_identity_certified=False, body_phase_certified=False)
+    # Projected geometry is independently known even when required native
+    # motion is UNKNOWN. Never erase it or convert UNKNOWN into a zero cost.
+    if not formation and GroupOutputRole.COMPOSITION not in (left.role, right.role):
+        boxes = [r['projected_face_roi_xywh'] for r in rows]
+        if any(v is None for v in boxes):
+            return dict(evidence, reason='focal hypothesis unobserved')
+        centers = [np.asarray((v[0]+v[2]/2, v[1]+v[3]/2)) for v in boxes]
+        metrics['focal_position'] = float(np.linalg.norm(centers[1]-centers[2]))
+        metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
+        velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
+        metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
+    try:
+        endpoints = [sensors.endpoint(left, outgoing=True), sensors.endpoint(right, outgoing=False)]
+    except ValueError as exc:
+        return dict(evidence, reason=str(exc), known_geometry_retained_on_missing_motion=True,
+            required_motion_unknown_not_zero=True)
+    evidence.update(available=True, required_semantics_available=True, required_endpoint_evidence=endpoints)
     if GroupOutputRole.COMPOSITION in (left.role, right.role):
         from .group_scene_editorial_policy import composition_cost
         from .group_scene_articulation import compare_composition_articulation
@@ -814,14 +830,6 @@ def compare_scene_edge(sensors, left, right):
     else:
         # Raw face-landmark shape, roll and screen velocity are measured. This
         # is a visual correspondence hypothesis, never a named actor/phase.
-        boxes = [r['projected_face_roi_xywh'] for r in rows]
-        if any(v is None for v in boxes):
-            return dict(evidence, available=False, reason='focal hypothesis unobserved')
-        centers = [np.asarray((v[0]+v[2]/2, v[1]+v[3]/2)) for v in boxes]
-        metrics['focal_position'] = float(np.linalg.norm(centers[1]-centers[2]))
-        metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
-        velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
-        metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
         complete, measured, motion = selected_focal_motion(rows, (left,left,right,right))
         metrics.update(measured); evidence['selected_focal_motion'] = motion
         if not complete:
@@ -871,6 +879,21 @@ def preserves_known(before, after):
     known = before.get('metrics') or {}
     return all(value is None or (key in after['metrics'] and after['metrics'][key] is not None
         and after['metrics'][key] <= value+1e-9) for key, value in known.items())
+
+
+def has_editorial_gain(before, after):
+    """Actual known-value improvement, never availability-only coverage gain.
+
+    The required-duty gate and known nonregression remain independent. A
+    missing old arm measurement is not a perfect arm cost or an automatic
+    improvement when a candidate finally has a measurement.
+    """
+    known = before.get('metrics') or {}
+    if any(value is not None and (type(value) not in (int,float)
+            or not math.isfinite(value) or value < 0) for value in known.values()):
+        return False
+    return preserves_known(before, after) and any(value is not None
+        and after['metrics'][key] < value-1e-6 for key,value in known.items())
 
 
 def validate_scene_dense(dense):

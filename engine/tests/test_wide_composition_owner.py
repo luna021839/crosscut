@@ -250,9 +250,11 @@ class WidePolicyTests(unittest.TestCase):
         before=self.edge(arm_velocity=.1);after=self.edge(occupancy=0,attention=0,scale=0,span=0,screen_motion=0)
         self.assertFalse(policy.evaluate_composition_path(dict(edges=[before]),[after])['admitted'])
 
-    def test_unknown_baseline_is_newly_observable_not_numerically_improved(self):
+    def test_unknown_baseline_is_coverage_not_editorial_improvement(self):
         verdict=policy.evaluate_composition_path(dict(edges=[None],state_keys=None),[self.edge()])
-        self.assertTrue(verdict['admitted']);self.assertEqual(verdict['comparison_kind'],'newly_observable')
+        self.assertFalse(verdict['admitted']);self.assertEqual(verdict['reason'],'no_editorial_gain')
+        self.assertEqual(verdict['comparison_kind'],'partial_observed_baseline')
+        self.assertFalse(verdict['observation_coverage_change_is_editorial_gain'])
         self.assertIsNone(verdict['known_baseline_cost'])
 
     def test_baseline_never_combines_incompatible_middle_hypotheses(self):

@@ -91,7 +91,7 @@ def validate_program(program,dense):
 def replay_selected_scene(context,candidate):
     """Fresh independent worker validates one frozen program, not its rivals."""
     from . import group_scene_source_owner as scene
-    from .group_scene_observations import SceneSensors,compare_scene_edge,coherent_baseline,preserves_known,scene_anchor_ticks
+    from .group_scene_observations import SceneSensors,compare_scene_edge,coherent_baseline,preserves_known,has_editorial_gain,scene_anchor_ticks
     from .group_scene_intent import declared_shot_intent
     from .group_scene_editorial_policy import coherent_path_reference,evaluate_composition_path
     from .render_plan_serialization import render_plan_from_json
@@ -173,8 +173,7 @@ def replay_selected_scene(context,candidate):
         decision=evaluate_composition_path(reference,measured) if program['composition_window'] else None
         if (decision is not None and not decision['admitted']
                 or decision is None and (not all(preserves_known(known[i],row) for i,row in enumerate(measured))
-                    or not any(not known[i]['available'] or any(v<known[i]['metrics'][k]-1e-6
-                        for k,v in row['metrics'].items() if k in known[i]['metrics']) for i,row in enumerate(measured)))):
+                    or not any(has_editorial_gain(known[i],row) for i,row in enumerate(measured)))):
             raise ValueError('selected scene program no longer beats its actual incumbent reference')
         search=receipt['search']
         if (family.digest(reference)!=family.digest(search['composition_reference'])

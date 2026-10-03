@@ -14,7 +14,7 @@ from time import monotonic
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 from .group_scene_observations import (SceneSensors, compare_scene_edge,
-    coherent_baseline, preserves_known, DENSE_CONTRACT)
+    coherent_baseline, preserves_known, has_editorial_gain, DENSE_CONTRACT)
 from .group_scene_observations import VARIANTS, scene_anchor_ticks
 from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget
 from .group_joint_observations import GroupJointObservationSession
@@ -483,8 +483,7 @@ def propose_scene_changes(context):
                     if not decision['admitted']:continue
                     score=decision['candidate_cost']
                 else:
-                    gain=any(not known[i]['available'] or any(v<known[i]['metrics'][k]-1e-6
-                        for k,v in m['metrics'].items() if k in known[i]['metrics']) for i,m in enumerate(measured))
+                    gain=any(has_editorial_gain(known[i],m) for i,m in enumerate(measured))
                     if not gain:continue
                     score=sum(row['framing_cost'] for row in measured)
                 paths.append((score,tuple(s.key for s in path),path,measured,decision))
