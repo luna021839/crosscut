@@ -16,7 +16,7 @@ from .group_joint_source_camera import joint_state_from_render_plan
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 
-CONTRACT='frozen_scene_source_camera_program_v2'
+CONTRACT='frozen_scene_source_camera_program_v3'
 
 
 def _path(plan,domain,rows):
@@ -73,6 +73,18 @@ def validate_program(program,dense):
         raise ValueError('selected scene state/role inventory missing') from exc
     from .group_scene_archive import validate_archive
     validate_archive(program, dense)
+    from .render_plan_serialization import render_plan_from_json
+    from .group_scene_dependency_support import validate_support
+    try:
+        original=render_plan_from_json(payload['original_numeric_plan'])
+        numeric=render_plan_from_json(payload['numeric_plan'])
+        support=payload['dependency_support']
+        edges=tuple(support['retained_applied_look_edges'])
+        validate_support(support,original,numeric,retained_applied_look_edges=edges)
+        if support['numeric_write_cells']!=dense['changed_cells']:
+            raise ValueError('scene dependency numeric writes differ from completed dense scope')
+    except (KeyError,TypeError) as exc:
+        raise ValueError('scene program lost its original/dependency preimage') from exc
 
 
 @isolated_optional()
@@ -90,6 +102,13 @@ def replay_selected_scene(context,candidate):
     dense=receipt['source_camera_refresh'];program=receipt['selected_scene_program']
     validate_program(program,dense)
     numeric=render_plan_from_json(program['numeric_plan'])
+    if render_plan_from_json(program['original_numeric_plan'])!=context.incumbent.render_plan:
+        raise ValueError('scene dependency original plan differs from the external incumbent')
+    retained_look_edges=tuple(sorted(d.boundary_index for d in context.incumbent.boundary_look_match.decisions
+        if d.applied))
+    from .group_scene_dependency_support import validate_support
+    validate_support(program['dependency_support'],context.incumbent.render_plan,numeric,
+        retained_applied_look_edges=retained_look_edges)
     path=_path(numeric,context.domain,program['selected_states'])
     baseline=_path(context.incumbent.render_plan,context.domain,program['baseline_states'])
     assembled,_=source._assembler(path)(plan=context.incumbent.render_plan,domain=context.domain,path=path)
@@ -184,6 +203,8 @@ def replay_selected_scene(context,candidate):
         selected_and_original_hypotheses_reobserved=True,unselected_donor_search_repeated=False,
         unselected_discovery_archive_preserved_not_reobserved=True,
         referenced_discovery_archive_preserved=True,
+        renderer_dependency_support_independently_rederived=True,
+        selected_dependency_support_sha256=program['dependency_support']['support_sha256'],
         received_scene_discovery_sha256=program['discovery_archive_binding']['archive_sha256'],
         archive_history_authority='received_candidate_reference_closure_only',
         pre_receipt_history_completeness_certified=False,

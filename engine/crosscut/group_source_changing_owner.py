@@ -511,11 +511,23 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         from .group_scene_source_owner import validate_bound_derivative_path
         validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
     old=context.incumbent
+    # Numeric assembly and scope size are knowable BEFORE expensive projected
+    # descriptors, look fitting or native family refresh. The materializer
+    # independently derives the same scope below; no oversized path gets work.
+    from .group_scene_dependency_support import derive_support
+    numeric,planned_changed=_assembler(path)(plan=old.render_plan,domain=context.domain,path=path)
+    retained_look_edges=tuple(sorted(d.boundary_index for d in old.boundary_look_match.decisions if d.applied))
+    planned_support=derive_support(old.render_plan,numeric,retained_applied_look_edges=retained_look_edges)
+    if len(planned_support['descriptor_refresh_cells'])>MAX_REFRESHED_CELLS:
+        raise ValueError('source-family refresh cell budget exceeded before descriptor work')
     observations=refresh_joint_group_render_observations.__wrapped__(plan=old.render_plan,
         timeline=old.visual_timeline,domain=context.domain,path=path,sync_scores=context.sync_scores,
         feature_cache_directory=None,feature_derived_cache_directory=None,
-        require_persistent_feature_cache=False)
+        require_persistent_feature_cache=False,maximum_refreshed_cells=MAX_REFRESHED_CELLS,
+        retained_applied_look_edges=retained_look_edges)
     proposed,changed=observations.plan,observations.changed_segment_indices
+    if (proposed!=numeric or changed!=planned_changed or observations.dependency_support!=planned_support):
+        raise ValueError('source family descriptor work changed its preflight numeric/dependency scope')
     if not changed or not any(proposed.segments[i].source_index!=old.render_plan.segments[i].source_index for i in changed):
         raise ValueError('source-changing owner requires an actual source change')
     refreshed=observations.refreshed_segment_indices
@@ -553,7 +565,8 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
             derivative_window_source_indices=[s.eligible_source_index for s in final_states])
     selected_program=None
     if scene:
-        selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json())
+        selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json(),
+            original_numeric_plan=old.render_plan.to_json(),dependency_support=planned_support)
         if family.digest(selected_program['selected_states']) != family.digest([s.to_dict() for s in path]):
             raise ValueError('scene completion changed the frozen selected program')
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
