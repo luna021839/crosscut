@@ -109,6 +109,16 @@ def trackable_person_ownership(person):
 def bind_person_ownership(people,heads,frame_size_wh):
     """Resolve only explicit support/anchor facts, preserving all observations."""
     size=np.asarray(frame_size_wh,dtype=float)
+    # A padded crop may include a neighboring performer's pose. Distinguish
+    # that raw association possibility from a supported native owner. An
+    # invalid ROI's copied nose must not erase a separately observed owner;
+    # multiple supported owners and duplicate supports remain ambiguous.
+    body_support={person.observation_id:(person.pose_reason=='observed'
+        and person.pose_crop_xywh is not None
+        and bool(person.source_pixel_to_pose_input_affine) and torso_owned_by_detector(person)
+        and all(_inside(person.upper_body_xyc[n][:2],person.pose_crop_xywh) for n in (0,1,6,7)))
+        for person in people}
+    upper_support={person.observation_id:_shoulder_anchor_owned(person) for person in people}
     duplicates={person.observation_id:set() for person in people}
     for i,left in enumerate(people):
         for right in people[i+1:]:
@@ -136,6 +146,7 @@ def bind_person_ownership(people,heads,frame_size_wh):
                 duplicates[right.observation_id].add(left.observation_id)
     head_candidates={person.observation_id:[] for person in people}
     owners={head.observation_id:[] for head in heads}
+    supported_owners={head.observation_id:[] for head in heads}
     for person in people:
         if len(person.raw_pose_xyc)!=17 or person.pose_crop_xywh is None:
             continue
@@ -148,16 +159,19 @@ def bind_person_ownership(people,heads,frame_size_wh):
             if distance<=.8 and _inside((x,y),person.pose_crop_xywh):
                 head_candidates[person.observation_id].append(head.observation_id)
                 owners[head.observation_id].append(person.observation_id)
+                if (person.face_anchor_consistent is not False
+                        and (body_support[person.observation_id] or upper_support[person.observation_id])
+                        and _inside((x,y),person.box_xywh,padding=.005)):
+                    supported_owners[head.observation_id].append(person.observation_id)
     result=[]
     for person in people:
         competing=tuple(sorted(duplicates[person.observation_id]))
-        body_valid=(person.pose_reason=='observed' and person.pose_crop_xywh is not None
-            and bool(person.source_pixel_to_pose_input_affine) and torso_owned_by_detector(person)
-            and all(_inside(person.upper_body_xyc[n][:2],person.pose_crop_xywh) for n in (0,1,6,7)))
+        body_valid=body_support[person.observation_id]
         body_state='ambiguous' if competing and body_valid else 'observed' if body_valid else 'unknown'
         candidates=tuple(head_candidates[person.observation_id])
-        unique_face = len(candidates) == 1 and len(owners[candidates[0]]) == 1
-        upper_valid = _shoulder_anchor_owned(person)
+        unique_face = (len(candidates) == 1
+            and supported_owners[candidates[0]] == [person.observation_id])
+        upper_valid = upper_support[person.observation_id]
         upper_state = ('ambiguous' if upper_valid and (competing or candidates and not unique_face) else
             'observed' if upper_valid and unique_face else 'unknown')
         head_id=(candidates[0] if unique_face and not competing

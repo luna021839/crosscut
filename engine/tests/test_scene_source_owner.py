@@ -57,6 +57,79 @@ _REAL_PROPOSE=family.propose_performer_family.__wrapped__
 _REAL_FINAL=source.final_live_replay.__wrapped__
 
 
+class FixedEndpointInventoryTests(unittest.TestCase):
+    def fixture(self, failed=(), interrupted=None):
+        states=tuple(SimpleNamespace(key=str(i)*64,index=i) for i in range(4))
+        calls=[]
+        def hypothesis(value):
+            return dict(analysis_roll=None,anchor_head_ids=[value.index]*2)
+        def endpoint(value,*,outgoing):
+            calls.append(value.index)
+            if value.index==interrupted:
+                raise scene.JointGroupBudgetExhausted('EXPLICIT_FIXED_PROBE_BUDGET_INTERRUPTION')
+            if value.index in failed:
+                raise ValueError('EXPLICIT_OBSERVED_ENDPOINT_UNAVAILABLE')
+            return ()
+        return states,SimpleNamespace(hypothesis=hypothesis,endpoint=endpoint),calls
+
+    def run_inventory(self,failed=(),interrupted=None):
+        states,sensors,calls=self.fixture(failed,interrupted)
+        inventory=scene.fixed_endpoint_inventory(states,sensors=sensors,entry=False)
+        record={}
+        return inventory,sensors,calls,record
+
+    def test_failed_first_two_do_not_starve_already_discovered_third(self):
+        inventory,sensors,calls,record=self.run_inventory(failed=(0,1))
+        result=scene.measure_fixed_endpoint_inventory(inventory,sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(tuple(value.index for value in result),(2,3))
+        self.assertEqual(calls,[0,1,2,3])
+        self.assertEqual(record['outcome'],'USABLE')
+        self.assertTrue(record['inventory_exhausted'])
+        self.assertEqual(record['next_cursor'],4)
+        self.assertFalse(record['new_budget_retry_started'])
+
+    def test_all_observed_failures_are_not_an_unexecuted_suffix(self):
+        inventory,sensors,calls,record=self.run_inventory(failed=(0,1,2,3))
+        result=scene.measure_fixed_endpoint_inventory(inventory,sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(result,())
+        self.assertEqual(calls,[0,1,2,3])
+        self.assertEqual(record['outcome'],'OBSERVED_UNAVAILABLE')
+        self.assertTrue(record['inventory_exhausted'])
+        self.assertEqual(record['unexecuted_suffix_count'],0)
+
+    def test_budget_before_third_retains_cursor_and_never_restarts(self):
+        inventory,sensors,calls,record=self.run_inventory(failed=(0,1),interrupted=2)
+        with self.assertRaises(scene.JointGroupBudgetExhausted):
+            scene.measure_fixed_endpoint_inventory(inventory,sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(calls,[0,1,2])
+        self.assertEqual(record['outcome'],'BUDGET_PARTIAL')
+        self.assertEqual(record['next_cursor'],2)
+        self.assertEqual(record['completed_measurement_count'],2)
+        self.assertFalse(record['inventory_exhausted'])
+        self.assertEqual(record['unexecuted_suffix_count'],1)
+        self.assertEqual(record['pending_candidate_count'],2)
+        self.assertEqual(record['interrupted_current_state_key'],inventory[2].key)
+        self.assertEqual(record['attempts'][-1]['status'],'BUDGET_PARTIAL')
+        self.assertFalse(record['new_budget_retry_started'])
+
+    def test_two_usable_stops_with_explicit_unmeasured_suffix_not_exhaustiveness(self):
+        inventory,sensors,calls,record=self.run_inventory()
+        result=scene.measure_fixed_endpoint_inventory(inventory,sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(tuple(value.index for value in result),(0,1))
+        self.assertEqual(calls,[0,1])
+        self.assertEqual(record['outcome'],'USABLE')
+        self.assertFalse(record['inventory_exhausted'])
+        self.assertEqual(record['unexecuted_suffix_count'],2)
+
+    def test_empty_inventory_is_not_a_measurement_of_negative_evidence(self):
+        _,sensors,_,record=self.run_inventory()
+        result=scene.measure_fixed_endpoint_inventory((),sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(result,())
+        self.assertEqual(record['outcome'],'NOT_STARTED')
+        self.assertEqual(record['attempts'],[])
+        self.assertEqual(record['completed_measurement_count'],0)
+
+
 def scene_derivative_fixture(count=8):
     pairs=tuple(SourceDerivativePairEvidence(a,b,DERIVATIVE_DISTINCT,
         'EXPLICIT_NONHUMAN_CAMERA_RELATION_SENSOR_FIXTURE_NOT_ACTUAL_DERIVATIVE_ANALYSIS',
@@ -493,6 +566,26 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(evidence['native_work']['counts']['edges'],0)
         self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
         self.assertFalse(evidence['quality_approved'])
+
+    def test_normal_numeric_paths_bind_explicit_global_original_units(self):
+        from crosscut.group_scene_owned_program import freeze_owned_scene_program
+        self.assertNotIsInstance(self.result,family.PerformerFamilyRejection)
+        receipt=family.plain(self.result.performer_family_review)
+        search=receipt['search'];programme=freeze_owned_scene_program(self.context,self.context.domain)
+        allocation=search['explicit_global_numeric_ownership']
+        bounds={tuple(interval) for interval in allocation['mutable_output_intervals']}
+        expected=tuple(unit.unit_id for unit in programme.units
+            if (unit.first_output_frame,unit.end_output_frame) in bounds)
+        self.assertEqual(tuple(allocation['mutable_unit_ids']),expected)
+        self.assertEqual(allocation['original_program_sha256'],programme.program_sha256)
+        self.assertFalse(allocation['positional_fixed_endpoints_assumed'])
+        self.assertFalse(search['global_search_and_completion_owner_implemented'])
+        selected=receipt['selected_scene_program']
+        self.assertEqual(search['global_numeric_union_plan_sha256'],family.digest(selected['numeric_plan']))
+        self.assertEqual(search['global_numeric_union_dependency_sha256'],
+            selected['dependency_support']['support_sha256'])
+        self.assertEqual(len(search['global_numeric_camera_sha256']),len(expected))
+        self.assertFalse(receipt['quality_approved'])
 
     def test_fixed_preflight_versions_do_not_change_complete_original_duties(self):
         self.assertNotIsInstance(self.result,family.PerformerFamilyRejection)

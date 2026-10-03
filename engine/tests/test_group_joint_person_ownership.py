@@ -60,6 +60,35 @@ class PersonOwnershipTests(unittest.TestCase):
         self.assertEqual(rows[0].upper_body_ownership_state, 'unknown')
         self.assertIsNone(rows[0].unique_head_observation_id)
 
+    def test_context_pose_outside_its_detector_does_not_erase_a_supported_owner(self):
+        p = self.closeup()
+        # A padded pose crop can see another dancer. The observed nose and
+        # shoulders still lie OUTSIDE q's claimed detector ROI. Preserve q's
+        # possible face association, but it is not a second supported owner.
+        q = replace(p, observation_id=1, box_xywh=(.8, .2, .15, .4),
+            pose_crop_xywh=(0., 0., 1., 1.))
+        rows, owners = bind_person_ownership((p, q), (self.head(),), (1000, 800))
+        self.assertEqual(owners[7], [0, 1], 'raw association alternatives must remain available')
+        self.assertEqual(rows[1].candidate_head_observation_ids, (7,))
+        self.assertEqual(rows[1].upper_body_ownership_state, 'unknown')
+        self.assertIsNone(rows[1].unique_head_observation_id)
+        self.assertEqual(rows[0].upper_body_ownership_state, 'observed')
+        self.assertEqual(rows[0].unique_head_observation_id, 7)
+        self.assertEqual(dict(rows[0].part_states)['left_arm'], 'observed')
+        self.assertEqual(dict(rows[0].part_states)['torso'], 'unknown')
+
+    def test_two_supported_closeup_owners_still_leave_the_shared_face_ambiguous(self):
+        p = self.closeup()
+        points = tuple((x+.03, y, c) for x, y, c in p.upper_body_xyc)
+        q = replace(p, observation_id=1, box_xywh=(.48, .2, .1, .4),
+            upper_body_xyc=points, pose_crop_xywh=(0., 0., 1., 1.))
+        rows, owners = bind_person_ownership((p, q), (self.head(),), (1000, 800))
+        self.assertEqual(owners[7], [0, 1])
+        self.assertEqual(tuple(row.upper_body_ownership_state for row in rows),
+            ('ambiguous', 'ambiguous'))
+        self.assertTrue(all(row.unique_head_observation_id is None for row in rows))
+        self.assertEqual(len(rows), 2)
+
     def test_closeup_pixel_assignment_uses_real_shoulders_not_offscreen_hips(self):
         fixture = flow_fixtures.NativeJointFlowTests()
         previous, current, _, moved = fixture.fixture()

@@ -14,7 +14,7 @@ from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 from .group_scene_observations import (SceneSensors, compare_scene_edge,
     coherent_baseline, preserves_known, has_editorial_gain, DENSE_CONTRACT)
-from .group_scene_observations import VARIANTS, scene_anchor_ticks
+from .group_scene_observations import VARIANTS, scene_anchor_ticks, MAX_HYPOTHESES_PER_SPAN
 from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget,JointGroupBudgetExhausted
 from .group_joint_observations import GroupJointObservationSession
 from .face_match import FaceMatchConfig
@@ -29,6 +29,77 @@ MAX_WINDOWS = 3
 MAX_FIXED_WINDOW_PROBES = 12
 FIXED_HYPOTHESES = 2
 COMPLETE_REFRESH_RESERVE_SECONDS = 8.
+
+
+def fixed_endpoint_inventory(values, *, sensors, entry):
+    """Keep the entire bounded canonical discovery inventory BEFORE probing.
+
+    This deduplicates identical endpoint hypotheses only. The full original
+    branch list remains a separate duty input, never the allocated subset.
+    """
+    if not isinstance(values,tuple) or len(values)>MAX_HYPOTHESES_PER_SPAN or type(entry) is not bool:
+        raise ValueError('fixed inventory needs the complete bounded discovered endpoint list')
+    seen=set();result=[]
+    for value in values:
+        h=sensors.hypothesis(value)
+        key=(h['analysis_roll'],tuple(h['anchor_head_ids'][:2] if entry else h['anchor_head_ids'][-2:]))
+        if key not in seen:seen.add(key);result.append(value)
+    return tuple(result)
+
+
+def measure_fixed_endpoint_inventory(values, *, sensors, outgoing, record):
+    """Allocate two USABLE endpoints, not two unexamined possibilities.
+
+    Endpoint sensing spends the same caller-owned native budget. Preserve the
+    measured prefix and continuation cursor before propagating an interrupted
+    primitive; no retry or new quota is started here. This child-local record
+    is not the still-missing controller-wide phase lease/history authority.
+    """
+    if (not isinstance(values,tuple) or len(values)>MAX_HYPOTHESES_PER_SPAN
+            or type(outgoing) is not bool or not isinstance(record,dict)):
+        raise ValueError('fixed endpoint measurement needs a bounded inventory and retained record')
+    record.update(contract='bounded_discovered_fixed_endpoint_measurement_prefix_v1',
+        inventory_state_keys=[value.key for value in values], next_cursor=0,
+        completed_measurement_count=0, selected_state_keys=[], attempts=[],
+        outcome='NOT_STARTED', inventory_exhausted=False, unexecuted_suffix_count=len(values),
+        pending_candidate_count=len(values), interrupted_current_state_key=None,
+        maximum_usable_endpoints=FIXED_HYPOTHESES, new_budget_retry_started=False,
+        original_duty_branches_redefined=False, controller_owned_history=False,
+        quality_approved=False)
+    valid=[]
+    if not values:
+        record['inventory_exhausted']=True
+        return ()
+    for index,value in enumerate(values):
+        attempt=dict(state_key=value.key,status='STARTED')
+        record['attempts'].append(attempt)
+        record['next_cursor']=index
+        record['unexecuted_suffix_count']=len(values)-index-1
+        record['outcome']='PARTIAL'
+        try:
+            sensors.endpoint(value,outgoing=outgoing)
+        except JointGroupBudgetExhausted:
+            attempt['status']='BUDGET_PARTIAL'
+            record['outcome']='BUDGET_PARTIAL'
+            record['interrupted_current_state_key']=value.key
+            raise
+        except ValueError as exc:
+            attempt.update(status='OBSERVED_UNAVAILABLE',error=str(exc))
+        except BaseException as exc:
+            attempt.update(status='PRODUCER_FAILED',error_type=type(exc).__name__)
+            record['outcome']='PRODUCER_FAILED'
+            raise
+        else:
+            attempt['status']='USABLE'
+            valid.append(value)
+            record['selected_state_keys'].append(value.key)
+        record.update(next_cursor=index+1,completed_measurement_count=index+1,
+            unexecuted_suffix_count=len(values)-index-1,
+            pending_candidate_count=len(values)-index-1)
+        if len(valid)==FIXED_HYPOTHESES:break
+    record.update(outcome='USABLE' if valid else 'OBSERVED_UNAVAILABLE',
+        inventory_exhausted=record['next_cursor']==len(values))
+    return tuple(valid)
 
 
 class _EdgeFrontierFull(ValueError):
@@ -294,9 +365,12 @@ def propose_scene_changes(context):
         # path can reject a mixed shot, and before any donor/model observation.
         # Sidecars alone do not grant the old positional assembler mixed-role
         # authority; the still-unsupported global owner remains explicit.
-        from .group_scene_epoch_program import freeze_original_role_epochs
-        role_programme_refs={(shot.first_output_frame,shot.end_output_frame):
-            sensors.record_original_role_program(freeze_original_role_epochs(context,shot)) for shot in shots}
+        from .group_scene_owned_program import (freeze_owned_scene_program,own_scene_intervals,
+            camera_unit_from_plan,assemble_owned_scene_union)
+        owned_program=freeze_owned_scene_program(context,context.domain)
+        owned_units={(unit.first_output_frame,unit.end_output_frame):unit for unit in owned_program.units}
+        role_programme_refs={(unit.first_output_frame,unit.end_output_frame):
+            sensors.record_original_role_program(unit.role_program) for unit in owned_program.units}
         # Interleave paired and solo numeric domains. The current state frontier
         # has separate bounded state/edge frontiers. Native/model/time work is
         # still shared, so later windows may remain unobserved; do not claim
@@ -311,6 +385,9 @@ def propose_scene_changes(context):
             if any(s.frame_count>source.MAX_MUTABLE_FRAMES for s in window[1:-1]): continue
             record=dict(bounds=[[s.first_output_frame,s.end_output_frame] for s in window],states=[],errors=[],
                 original_role_programme_sha256=[role_programme_refs[s.first_output_frame,s.end_output_frame] for s in window],
+                explicit_global_mutable_unit_ids=[owned_units[s.first_output_frame,s.end_output_frame].unit_id
+                    for s in window[1:-1]],
+                global_original_numeric_programme_sha256=owned_program.program_sha256,
                 global_mixed_role_camera_owner_implemented=False,
                 observed_wide_repair_priority=observed_wide_repair_priority(
                     context.incumbent.visual_timeline,window[1:-1]))
@@ -366,13 +443,8 @@ def propose_scene_changes(context):
             original_lefts=bound(baseline[0],'exit')
             original_rights=bound(baseline[-1],'entry')
             # Fixed R needs distinct ENTRY hypotheses; fixed L distinct EXIT.
-            def fixed(values,entry):
-                seen=set();result=[]
-                for value in values:
-                    h=sensors.hypothesis(value);key=(h['analysis_roll'],tuple(h['anchor_head_ids'][:2] if entry else h['anchor_head_ids'][-2:]))
-                    if key not in seen:seen.add(key);result.append(value)
-                return tuple(result[:FIXED_HYPOTHESES])
-            lefts=fixed(original_lefts,False);rights=fixed(original_rights,True)
+            lefts=fixed_endpoint_inventory(original_lefts,sensors=sensors,entry=False)
+            rights=fixed_endpoint_inventory(original_rights,sensors=sensors,entry=True)
             if not lefts or not rights:
                 attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
                     analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
@@ -386,18 +458,6 @@ def propose_scene_changes(context):
             # original hypothesis (not only the allocated two search states).
             # A one-unit programme grants no mutable/donor/full-window duty.
             # Prior versions remain archived; no native/time budget is reset.
-            def measured_fixed(values, outgoing):
-                valid=[]
-                for value in values:
-                    try:
-                        sensors.endpoint(value,outgoing=outgoing)
-                        valid.append(value)
-                    except JointGroupBudgetExhausted:
-                        raise
-                    except ValueError as exc:
-                        attempts.append(dict(stage='fixed_required_measurement',window=wi,
-                            state_key=value.key,error=str(exc),donor_native_observations_skipped=True))
-                return tuple(valid)
             from .group_scene_original_duties import freeze_original_duty_program
             original_plan_identity=family.digest(family.plan_payload(plan))
             fixed_programs=[]
@@ -416,7 +476,12 @@ def propose_scene_changes(context):
                         original_ambiguity_is_not_a_waiver=True))
                     return ()
                 fixed_programs.append(program)
-                return measured_fixed(values,outgoing)
+                probe_record=dict(stage='fixed_endpoint_inventory',window=wi,outgoing=outgoing,
+                    original_mutable_native_observations_skipped=True,
+                    donor_native_observations_skipped=True)
+                attempts.append(probe_record)  # Retained BEFORE any endpoint work.
+                return measure_fixed_endpoint_inventory(values,sensors=sensors,
+                    outgoing=outgoing,record=probe_record)
             lefts=preflight_original_fixed(original_lefts,lefts,True)
             if lefts:
                 rights=preflight_original_fixed(original_rights,rights,False)
@@ -592,6 +657,20 @@ def propose_scene_changes(context):
                 try:
                     assembled,changed=source._assembler(path)(plan=plan,domain=context.domain,path=path)
                     if not any(assembled.segments[i].source_index!=plan.segments[i].source_index for i in changed):continue
+                    # Transitional consumer: the existing local sensor path is
+                    # still 3/4 states. Its numeric proposal must ALSO close on
+                    # explicit global units before dense/completion. The new
+                    # assembler can union arbitrary compatible mutable units;
+                    # this bridge is NOT a global search/completion owner.
+                    owned_intervals=own_scene_intervals(owned_program,
+                        mutable_unit_ids=tuple(numeric['explicit_global_mutable_unit_ids']),
+                        maximum_mutable_units=2,maximum_mutable_frames=2*source.MAX_MUTABLE_FRAMES)
+                    owned_cameras=tuple(camera_unit_from_plan(program=owned_program,unit_id=unit_id,
+                        plan=assembled,domain=context.domain) for unit_id in owned_intervals.mutable_unit_ids)
+                    numeric_union=assemble_owned_scene_union(context=context,domain=context.domain,
+                        allocation=owned_intervals,cameras=owned_cameras)
+                    if numeric_union.plan!=assembled or numeric_union.changed_segment_indices!=changed:
+                        raise ValueError('scene local proposal differs from its explicit global owned numeric union')
                     session.budget.spend('dense_paths')
                     dense=sensors.dense(path)
                     # Per-tick known incumbent parts are preserved independent
@@ -607,6 +686,11 @@ def propose_scene_changes(context):
                         incumbent_known_parts=preserved,camera_errors=camera_errors,
                         original_duties_frozen_before_donor_discovery=True,
                         original_duty_program_sha256=original_program['program_sha256'],
+                        explicit_global_numeric_ownership=owned_intervals.to_dict(),
+                        global_numeric_union_plan_sha256=family.digest(numeric_union.plan.to_json()),
+                        global_numeric_union_dependency_sha256=numeric_union.dependency_support['support_sha256'],
+                        global_numeric_camera_sha256=[camera.camera_sha256 for camera in numeric_union.cameras],
+                        global_search_and_completion_owner_implemented=False,
                         candidate_search_exhaustive=False,rotated_pass_exhaustive=False,
                         source_balanced_state_allocation=True,full_epoch_retained_family_owner_implemented=False,
                         within_source_frontier_policy='native_fitted_camera_interleave_v1',
