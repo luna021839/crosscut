@@ -212,18 +212,21 @@ class JointGroupWorkBudget:
     def __init__(self,*,absolute_deadline,maximum_states=24,maximum_edges=512,
             maximum_dense_paths=4,maximum_new_decodes=1200,maximum_model_calls=2400,
             maximum_pose_comparisons=4096,
+            maximum_region_flow_feature_updates=65536,
             maximum_pose_evidence_bytes=8*1024*1024,
             maximum_association_nodes=1536, maximum_association_edges=18000,
             maximum_projected_cache_bytes=64*1024*1024,maximum_frontiers=1,clock=monotonic):
         values=dict(states=maximum_states,edges=maximum_edges,dense_paths=maximum_dense_paths,
             new_decodes=maximum_new_decodes,model_calls=maximum_model_calls,
             pose_comparisons=maximum_pose_comparisons,pose_evidence_bytes=maximum_pose_evidence_bytes,
+            region_flow_feature_updates=maximum_region_flow_feature_updates,
             association_nodes=maximum_association_nodes,association_edges=maximum_association_edges)
         if (type(absolute_deadline) not in (float,int) or not math.isfinite(absolute_deadline)
                 or any(type(v) is not int or v<1 for v in (*values.values(),maximum_projected_cache_bytes))
                 or type(maximum_frontiers) is not int or not 1<=maximum_frontiers<=3
                 or maximum_states>24*maximum_frontiers or maximum_edges>512 or maximum_dense_paths>4
                 or maximum_pose_comparisons>4096 or maximum_pose_evidence_bytes>8*1024*1024
+                or maximum_region_flow_feature_updates>131072
                 or maximum_association_nodes>1536 or maximum_association_edges>18000):
             raise ValueError('joint GROUP requires explicit bounded state/edge/dense/decode/model/time budgets')
         self.clock=clock;self.deadline=absolute_deadline;self.limits=values

@@ -243,8 +243,9 @@ def preserve_incumbent_required_parts(sensors, baseline, path, dense):
 
 def propose_scene_changes(context):
     attempts=[];numeric_inventory=[];alternatives=[];session=None;sensors=None
-    def rejected(error):
+    def rejected(error, *, error_type='ValueError'):
         return family.PerformerFamilyRejection(error,dict(contract=CONTRACT,
+            error=error,error_type=error_type,
             attempts=attempts,numeric_source_inventory=numeric_inventory,candidate_alternatives=alternatives,
             scene_observations=None if sensors is None else sensors.archive(),
             native_work=None if session is None else session.budget.to_dict(),
@@ -537,6 +538,9 @@ def propose_scene_changes(context):
                 window_native_end_counts=dict(session.budget.counts),camera_errors=camera_errors))
         return rejected('no complete bounded scene/source/whole-camera family candidate')
     except (ValueError,RuntimeError,OSError) as exc:
-        return rejected(type(exc).__name__+': '+str(exc))
+        # The legacy sibling/fixed-camera fallback may also fail. Preserve this
+        # exact native/lease/asset cause inside its evidence, not only in the
+        # transient rejection object that the final fallback can replace.
+        return rejected(type(exc).__name__+': '+str(exc),error_type=type(exc).__name__)
     finally:
         if session is not None:session.close()

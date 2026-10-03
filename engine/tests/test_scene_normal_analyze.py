@@ -26,6 +26,7 @@ from crosscut.source_derivative_diversity import SourceDerivativeConfig, SourceD
 from crosscut.visual_boundary_repair import VisualBoundaryRepairPlan
 from engine.tests.test_scene_source_owner import encode_scene_chart, build_scene_fixture, scene_derivative_fixture
 from engine.tests.test_scene_source_owner import scene_chart_propose, scene_chart_final, scene_chart_sensors
+from engine.tests.test_scene_source_owner import scene_chart_selected_replay
 from crosscut.group_scene_observations import DENSE_CONTRACT
 
 _REAL_PROXY=pipeline.render_and_review_proxy
@@ -107,7 +108,6 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
                 return candidate
             stack.enter_context(patch.object(family,'propose_performer_family',side_effect=proposer))
             from crosscut import group_scene_selected_replay as selected_replay
-            from engine.tests.test_scene_source_owner import scene_chart_selected_replay
             stack.enter_context(patch.object(selected_replay,'replay_selected_scene',new=scene_chart_selected_replay))
             stack.enter_context(patch.object(source,'final_live_replay',new=scene_chart_final))
             stack.enter_context(patch('crosscut.pipeline._apply_bounded_human_target_proxy_rank'))

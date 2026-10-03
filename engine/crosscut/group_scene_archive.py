@@ -29,6 +29,7 @@ def validate_archive(program, dense):
         _discovery_rolls, scene_anchor_ticks)
     from .group_scene_intent import validate_intent
     from .group_scene_composition import LINK_CONTRACT, validate_support_link
+    from .group_scene_region_flow import CONTRACT as REGION_CONTRACT
     from .group_native_detector_result import validate_serialized_detector_result
     archive = dense.get('scene_discovery')
     if (not isinstance(archive, dict) or archive.get('contract') != SCENE_CONTRACT
@@ -163,7 +164,7 @@ def validate_archive(program, dense):
         raise ValueError('scene archive omitted selected or original baseline hypotheses')
     walk(archive); walk(dense.get('mutable_shots')); walk(dense.get('incident_projected_observations'))
     for link in archive['endpoint_pixel_links']:
-        if link.get('contract') == LINK_CONTRACT and link.get('observed_support_paths') is True:
+        if link.get('contract') in (LINK_CONTRACT,REGION_CONTRACT) and link.get('observed_support_paths') is True:
             a, b = references(link['raw_observation_sha256'])
             validate_support_link(link, a, b)
     return archive_binding(archive)

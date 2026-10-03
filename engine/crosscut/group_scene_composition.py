@@ -95,6 +95,19 @@ def observe_native_composition(session, *, request_source_index, native_frame_in
 
 
 def body_support_links(sensors, previous, current):
+    """Typed native body-only rows use nonrigid image-region distributions.
+
+    Legacy generic charts/receipts keep the old ROI-path contract. There is
+    no success-dependent fallback: an unavailable new measurement stays
+    unavailable rather than being relabelled a legacy rigid body path.
+    """
+    if isinstance(previous,NativeCompositionObservation) and isinstance(current,NativeCompositionObservation):
+        from .group_scene_region_flow import measure_region_distribution
+        return measure_region_distribution(sensors,previous,current)
+    return legacy_body_support_links(sensors,previous,current)
+
+
+def legacy_body_support_links(sensors, previous, current):
     """Follow each native ROI through ACTUAL intervening native rasters.
 
     Existing containment LK thresholds are unchanged and used only for ROI
@@ -196,6 +209,9 @@ def validate_raw_composition(native):
 
 
 def validate_support_link(link, previous, current):
+    from .group_scene_region_flow import CONTRACT as REGION_CONTRACT,validate_region_distribution
+    if isinstance(link,dict) and link.get('contract')==REGION_CONTRACT:
+        return validate_region_distribution(link,previous,current)
     digest = lambda r: hashlib.sha256(json.dumps(r, sort_keys=True,
         separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     ids = [[p['observation_id'] for p in r['people']] for r in (previous, current)]

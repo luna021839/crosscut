@@ -11,7 +11,8 @@ from crosscut.group_joint_source_camera import GroupOutputRole
 from crosscut import group_performer_family_owner as family
 from engine.tests import test_scene_normal_analyze as normal
 from engine.tests.test_wide_composition_owner import (
-    build_wide_fixture, encode_wide_chart, wide_chart_propose,wide_chart_final,wide_chart_sensors)
+    build_wide_fixture, encode_wide_chart, wide_chart_propose,wide_chart_final,wide_chart_sensors,
+    wide_chart_selected_replay)
 
 
 class WideCompositionNormalAnalyzeTests(normal.SceneSourceNormalAnalyzeTests):
@@ -19,7 +20,8 @@ class WideCompositionNormalAnalyzeTests(normal.SceneSourceNormalAnalyzeTests):
         with ExitStack() as stack:
             for name,value in dict(build_scene_fixture=build_wide_fixture,
                     encode_scene_chart=encode_wide_chart,scene_chart_propose=wide_chart_propose,
-                    scene_chart_final=wide_chart_final,scene_chart_sensors=wide_chart_sensors).items():
+                    scene_chart_final=wide_chart_final,scene_chart_sensors=wide_chart_sensors,
+                    scene_chart_selected_replay=wide_chart_selected_replay).items():
                 stack.enter_context(patch.object(normal,name,new=value))
             result=super().run_normal(corrupt_parent=corrupt_parent)
         baseline,manifest,reports,rendered,calls,failure=result

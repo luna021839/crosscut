@@ -1,5 +1,6 @@
 """Bound raw raster lifetime without weakening any body-support judgement.
 
+Explicit legacy affine-loop coverage, not the new typed region dispatcher.
 Small, explicitly nonhuman rasters. Synthetic flow is used only for exact
 ownership/lifetime negatives; a separate test compares actual OpenCV LK to
 the previous person-major loop. No models or private media are loaded.
@@ -67,7 +68,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
         # A MagicMock would retain every ndarray in call_args_list and itself
         # recreate the lifetime defect being measured.
         with patch.object(composition,'_optical_flow_box',new=self.shifted):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         self.assertTrue(result['complete_support_paths'])
         self.assertEqual(result['assignments'],[[0,0],[1,1]])
         self.assertEqual(sensors.session.reads,[(0,n) for n in range(composition.MAX_NATIVE_GAP+1)])
@@ -80,16 +81,16 @@ class SceneCompositionStreamingTests(unittest.TestCase):
     def test_cached_link_neither_redecodes_nor_retracks(self):
         sensors=self.sensors();first,last=observation(0),observation(3)
         with patch.object(composition,'_optical_flow_box',side_effect=self.shifted) as flow:
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
             work=dict(sensors.session.budget.counts)
-            self.assertIs(composition.body_support_links(sensors,first,last),result)
+            self.assertIs(composition.legacy_body_support_links(sensors,first,last),result)
         self.assertEqual(sensors.session.budget.counts,work)
         self.assertEqual(flow.call_count,6)
 
     def test_missing_intermediate_frame_stays_unavailable(self):
         sensors=self.sensors(missing=2)
         with patch.object(composition,'_optical_flow_box',side_effect=self.shifted):
-            result=composition.body_support_links(sensors,observation(0),observation(3))
+            result=composition.legacy_body_support_links(sensors,observation(0),observation(3))
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(result['reason'],'intermediate_native_pixels_unavailable')
         self.assertEqual(result['assignments'],[])
@@ -101,7 +102,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
             calls.append((int(a[0,0,0]),int(b[0,0,0]),box[0]>.5))
             return None if box[0]>.5 and int(b[0,0,0])==2 else self.shifted(a,b,box)
         with patch.object(composition,'_optical_flow_box',side_effect=flow):
-            result=composition.body_support_links(sensors,observation(0),observation(4))
+            result=composition.legacy_body_support_links(sensors,observation(0),observation(4))
         self.assertEqual(result['assignments'],[[0,0]])
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(result['predicted_boxes'][1],None)
@@ -114,7 +115,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
         first=replace(first,people=first.people+(
             ObservedFormationPerson(7,(.43,.15,.11,.65),(),.9),))
         with patch.object(composition,'_optical_flow_box',new=self.shifted):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         self.assertTrue(result['observed_support_paths'])
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(result['assignments'],[[0,0],[1,1]])
@@ -137,7 +138,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
             replace(last.people[0],observation_id=12),
             ObservedFormationPerson(9,(.445,.15,.11,.65),(),.9)))
         with patch.object(composition,'_optical_flow_box',new=self.shifted):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         self.assertTrue(result['observed_support_paths'])
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(result['assignments'],[[0,12],[1,11]])
@@ -153,7 +154,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
         def flow(a,b,box):
             return None if .4 < box[0] < .5 else self.shifted(a,b,box)
         with patch.object(composition,'_optical_flow_box',new=flow):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         self.assertTrue(result['observed_support_paths'])
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(result['unmatched_body_observation_ids'],[[7],[7]])
@@ -163,7 +164,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
         sensors=self.sensors();first,last=observation(0),observation(3)
         last=replace(last,people=last.people+(replace(last.people[0],observation_id=9),))
         with patch.object(composition,'_optical_flow_box',new=self.shifted):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         self.assertEqual(result['assignments'],[[1,1]])
         self.assertFalse(result['observed_support_paths'])
         self.assertFalse(result['complete_support_paths'])
@@ -173,7 +174,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
     def test_complete_flag_and_duplicate_partial_pair_cannot_be_forged(self):
         sensors=self.sensors();first,last=observation(0),observation(3)
         with patch.object(composition,'_optical_flow_box',new=self.shifted):
-            result=composition.body_support_links(sensors,first,last)
+            result=composition.legacy_body_support_links(sensors,first,last)
         for change in (dict(complete_support_paths=False),dict(assignments=[[0,0],[0,1]]),
                 dict(assignments=[[0,0],[1,6]])):
             forged=deepcopy(result);forged.update(change)
@@ -182,11 +183,11 @@ class SceneCompositionStreamingTests(unittest.TestCase):
 
     def test_invalid_gap_and_source_fail_before_any_raster(self):
         sensors=self.sensors()
-        result=composition.body_support_links(sensors,observation(0),observation(13))
+        result=composition.legacy_body_support_links(sensors,observation(0),observation(13))
         self.assertFalse(result['complete_support_paths'])
         self.assertEqual(sensors.session.reads,[])
         with self.assertRaises(ValueError):
-            composition.body_support_links(sensors,observation(0),replace(observation(3),request_source_index=1))
+            composition.legacy_body_support_links(sensors,observation(0),replace(observation(3),request_source_index=1))
         self.assertEqual(sensors.session.reads,[])
 
     def test_real_lk_matches_prior_person_major_loop(self):
@@ -208,7 +209,7 @@ class SceneCompositionStreamingTests(unittest.TestCase):
             legacy.append(None if box is None else list(box))
         del frames,a,b
         sensors=self.sensors(factory=textured)
-        result=composition.body_support_links(sensors,first,last)
+        result=composition.legacy_body_support_links(sensors,first,last)
         self.assertEqual(result['predicted_boxes'],legacy)
         self.assertTrue(all(box is not None for box in legacy),'nonhuman LK positive must actually track')
         self.assertTrue(result['complete_support_paths'])
