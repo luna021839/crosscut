@@ -426,6 +426,94 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
         self.assertIs(self.controller.incumbent,self.bundle)
 
+    def test_failed_fixed_geometry_skips_original_mutable_native_work(self):
+        # Explicit NONHUMAN failed incident endpoint. The unchanged endpoint
+        # cannot be repaired by any donor; do not spend the entire mutable
+        # original lifecycle before learning that fact. Decoding/discovery and
+        # original duty construction stay real and use ONE unchanged budget.
+        original=sensors_module.SceneSensors.discover
+        mutable=[];fixed=[];budgets=set()
+        def discover(sensor,state,**kwargs):
+            budgets.add(id(sensor.session.budget))
+            scope=kwargs.get('endpoint_scope','whole')
+            (mutable if scope=='whole' else fixed).append(
+                (state.first_output_frame,state.end_output_frame,scope))
+            return original(sensor,state,**kwargs)
+        def unavailable(sensor,state,*,outgoing):
+            raise ValueError('EXPLICIT_NONHUMAN_FIXED_REQUIRED_GEOMETRY_UNAVAILABLE')
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),scene_chart_sensors(), \
+                patch.object(sensors_module.SceneSensors,'discover',discover), \
+                patch.object(sensors_module.SceneSensors,'endpoint',unavailable):
+            result=scene.propose_scene_changes(context)
+        self.assertIsInstance(result,family.PerformerFamilyRejection)
+        self.assertTrue(fixed)
+        self.assertEqual(mutable,[],
+            'failed unchanged endpoints still triggered original mutable sensing')
+        self.assertEqual(len(budgets),1)
+        evidence=family.plain(result.evidence)
+        self.assertEqual(evidence['native_work']['counts']['states'],0)
+        self.assertEqual(evidence['native_work']['counts']['edges'],0)
+        self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
+        programs=evidence['scene_observations']['original_programme_records']['native_duty_programmes']
+        self.assertTrue(programs,'fixed preflight erased its original duty evidence')
+        self.assertTrue(all(len(program['units'])==1 for program in programs.values()))
+        self.assertTrue(all(not program['donor_observations_define_duties']
+            for program in programs.values()))
+        self.assertFalse(evidence['quality_approved'])
+        self.assertIs(self.controller.incumbent,self.bundle)
+
+    def test_failed_right_preflight_keeps_both_original_units_without_mutable_query(self):
+        original_discover=sensors_module.SceneSensors.discover
+        original_endpoint=sensors_module.SceneSensors.endpoint
+        mutable=[];right_failures=[]
+        def discover(sensor,state,**kwargs):
+            if kwargs.get('endpoint_scope','whole')=='whole':mutable.append(state.key)
+            return original_discover(sensor,state,**kwargs)
+        def endpoint(sensor,state,*,outgoing):
+            if outgoing:return original_endpoint(sensor,state,outgoing=outgoing)
+            right_failures.append(state.key)
+            raise ValueError('EXPLICIT_NONHUMAN_RIGHT_FIXED_ENDPOINT_UNAVAILABLE')
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),scene_chart_sensors(), \
+                patch.object(sensors_module.SceneSensors,'discover',discover), \
+                patch.object(sensors_module.SceneSensors,'endpoint',endpoint):
+            result=scene.propose_scene_changes(context)
+        self.assertIsInstance(result,family.PerformerFamilyRejection)
+        self.assertTrue(right_failures,'right-side control was never reached')
+        self.assertEqual(mutable,[])
+        evidence=family.plain(result.evidence)
+        records=evidence['scene_observations']['original_programme_records']
+        programs=records['native_duty_programmes']
+        self.assertTrue(all(len(program['units'])==1 for program in programs.values()))
+        scopes={branch['original_hypothesis']['endpoint_scope']
+            for program in programs.values() for branch in program['units'][0]['branches']}
+        self.assertEqual(scopes,{'entry','exit'})
+        self.assertIn(records['active_native_duty_programme_sha256'],programs)
+        self.assertEqual(evidence['native_work']['counts']['edges'],0)
+        self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
+        self.assertFalse(evidence['quality_approved'])
+
+    def test_fixed_preflight_versions_do_not_change_complete_original_duties(self):
+        self.assertNotIsInstance(self.result,family.PerformerFamilyRejection)
+        family.validate_bundle_binding(self.result)
+        receipt=family.plain(self.result.performer_family_review)
+        search=receipt['search'];dense=receipt['source_camera_refresh']
+        complete=dense['original_duty_program']
+        refs=search['fixed_preflight_programme_sha256']
+        self.assertEqual(len(refs),2)
+        self.assertTrue(search['fixed_endpoints_before_original_mutable_observations'])
+        programs=dense['scene_discovery']['original_programme_records']['native_duty_programmes']
+        for index,ref in zip((0,-1),refs,strict=True):
+            self.assertEqual(len(programs[ref]['units']),1)
+            self.assertEqual(programs[ref]['units'][0],complete['units'][index])
+        self.assertIn(complete['program_sha256'],programs)
+        self.assertGreater(len(complete['units']),2)
+        for span in dense['mutable_shots']:
+            for row in span['rows']:
+                self.assertEqual(row['original_duty_reference']['program_sha256'],
+                    complete['program_sha256'])
+
     def test_one_unknown_mutable_window_does_not_end_later_complete_search(self):
         # Explicit non-human missing-hypothesis fixture. There is still work
         # budget: this is NOT the state-budget exhaustion condition.

@@ -363,7 +363,8 @@ def propose_scene_changes(context):
                 return 'exit' if index==0 else 'entry' if index==len(baseline)-1 else 'whole'
             def bound(state,scope='whole'):
                 return tuple(sensors.bind(state,h) for h in sensors.discover(state,rolls=rolls,endpoint_scope=scope))
-            lefts=bound(baseline[0],'exit');rights=bound(baseline[-1],'entry')
+            original_lefts=bound(baseline[0],'exit')
+            original_rights=bound(baseline[-1],'entry')
             # Fixed R needs distinct ENTRY hypotheses; fixed L distinct EXIT.
             def fixed(values,entry):
                 seen=set();result=[]
@@ -371,30 +372,20 @@ def propose_scene_changes(context):
                     h=sensors.hypothesis(value);key=(h['analysis_roll'],tuple(h['anchor_head_ids'][:2] if entry else h['anchor_head_ids'][-2:]))
                     if key not in seen:seen.add(key);result.append(value)
                 return tuple(result[:FIXED_HYPOTHESES])
-            lefts=fixed(lefts,False);rights=fixed(rights,True)
+            lefts=fixed(original_lefts,False);rights=fixed(original_rights,True)
             if not lefts or not rights:
                 attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
                     analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
                     original_mutable_native_observations_skipped=True,
                     donor_native_observations_skipped=True,donor_absence_inferred=False))
                 continue
-            # Freeze all original hypotheses/lifecycles before ANY donor query.
-            # Conditional original hypotheses remain separate; missing later
-            # measurements cannot erase their already observed required parts.
-            baseline_hypotheses=[bound(s,scope_for(i)) for i,s in enumerate(baseline)]
-            from .group_scene_original_duties import freeze_original_duty_program
-            try:
-                original_program=freeze_original_duty_program(sensors,baseline_hypotheses,
-                    original_plan_identity=family.digest(family.plan_payload(plan)))
-                sensors.install_original_duty_program(original_program)
-            except JointGroupBudgetExhausted:
-                raise
-            except ValueError as exc:
-                attempts.append(dict(stage='original_duty_freeze',window=wi,error=str(exc),
-                    donor_native_observations_skipped=True,original_ambiguity_is_not_a_waiver=True))
-                continue
             # Discovery is not enough: clipping and required arm/support paths
-            # on the unchanged incident endpoint must fail BEFORE donor work.
+            # on the unchanged endpoint must fail BEFORE mutable-original work,
+            # not only before donor work. Each fixed endpoint is checked under
+            # its own complete ORIGINAL unit, including every conditional
+            # original hypothesis (not only the allocated two search states).
+            # A one-unit programme grants no mutable/donor/full-window duty.
+            # Prior versions remain archived; no native/time budget is reset.
             def measured_fixed(values, outgoing):
                 valid=[]
                 for value in values:
@@ -407,12 +398,56 @@ def propose_scene_changes(context):
                         attempts.append(dict(stage='fixed_required_measurement',window=wi,
                             state_key=value.key,error=str(exc),donor_native_observations_skipped=True))
                 return tuple(valid)
-            lefts=measured_fixed(lefts,True);rights=measured_fixed(rights,False)
+            from .group_scene_original_duties import freeze_original_duty_program
+            original_plan_identity=family.digest(family.plan_payload(plan))
+            fixed_programs=[]
+            def preflight_original_fixed(original_values,values,outgoing):
+                try:
+                    program=freeze_original_duty_program(sensors,(original_values,),
+                        original_plan_identity=original_plan_identity)
+                    sensors.install_original_duty_program(program)
+                except JointGroupBudgetExhausted:
+                    raise
+                except ValueError as exc:
+                    attempts.append(dict(stage='original_fixed_duty_freeze',window=wi,
+                        outgoing=outgoing,error=str(exc),
+                        original_mutable_native_observations_skipped=True,
+                        donor_native_observations_skipped=True,
+                        original_ambiguity_is_not_a_waiver=True))
+                    return ()
+                fixed_programs.append(program)
+                return measured_fixed(values,outgoing)
+            lefts=preflight_original_fixed(original_lefts,lefts,True)
+            if lefts:
+                rights=preflight_original_fixed(original_rights,rights,False)
+            else:
+                rights=()
             if not lefts or not rights:
                 attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
-                    analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
+                    analysis_rolls=list(rolls),reason='allocated_fixed_endpoint_paths_unavailable',
+                    original_mutable_native_observations_skipped=True,
                     donor_native_observations_skipped=True,
                     donor_absence_inferred=False));continue
+            # BOTH unchanged incident endpoints survived. Freeze ALL original
+            # units before ANY donor query; the preflight programme cannot
+            # substitute for this complete programme or waive a mutable duty.
+            baseline_hypotheses=[original_lefts,
+                *(bound(s,scope_for(i)) for i,s in enumerate(baseline[1:-1],1)),
+                original_rights]
+            try:
+                original_program=freeze_original_duty_program(sensors,baseline_hypotheses,
+                    original_plan_identity=original_plan_identity)
+                if any(family.digest(original_program['units'][index])!=
+                        family.digest(program['units'][0])
+                        for index,program in zip((0,-1),fixed_programs,strict=True)):
+                    raise ValueError('original fixed duties changed between preflight and complete freeze')
+                sensors.install_original_duty_program(original_program)
+            except JointGroupBudgetExhausted:
+                raise
+            except ValueError as exc:
+                attempts.append(dict(stage='original_duty_freeze',window=wi,error=str(exc),
+                    donor_native_observations_skipped=True,original_ambiguity_is_not_a_waiver=True))
+                continue
             fixed_signature=(wi,tuple(v.key for v in lefts),tuple(v.key for v in rights))
             if all(s.role==GroupOutputRole.COMPOSITION for s in baseline):
                 if fixed_signature in evaluated_hypothesis_frontiers:
@@ -578,6 +613,9 @@ def propose_scene_changes(context):
                         window_frontier_policy='observed_wide_repair_then_time_stratified_upright_v2',
                         selected_frontier_window_indices=[i for i,_ in frontier],
                         fixed_endpoints_before_donor_observations=True,
+                        fixed_endpoints_before_original_mutable_observations=True,
+                        fixed_preflight_programme_sha256=[p['program_sha256'] for p in fixed_programs],
+                        fixed_preflight_units_equal_complete_original_units=True,
                         fixed_window_probe_limit=len(frontier),fixed_probe_batch_size=MAX_FIXED_WINDOW_PROBES,
                         fixed_probe_batches_share_native_session=True,
                         fixed_probe_batch_count=len(probe_batches),

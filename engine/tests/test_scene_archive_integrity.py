@@ -144,3 +144,26 @@ class SceneArchiveIntegrityTests(unittest.TestCase):
                 program['discovery_archive_binding']=archive_binding(archive)
                 program.pop('program_sha256');program['program_sha256']=family.digest(program)
                 with self.assertRaises(ValueError):validate_archive(program,dense)
+
+    def test_single_fixed_preflight_cannot_replace_complete_selected_programme(self):
+        from crosscut.group_scene_archive import archive_binding,validate_archive
+        from crosscut.group_scene_original_duties import _program,validate_original_duty_program
+        receipt=family.plain(self.result.performer_family_review)
+        dense=deepcopy(receipt['source_camera_refresh'])
+        program=deepcopy(receipt['selected_scene_program'])
+        complete=program['original_duty_program']
+        self.assertGreater(len(complete['units']),1)
+        single=_program([deepcopy(complete['units'][0])],
+            complete['original_plan_identity'],complete['eligible_request_indices'])
+        archive=dense['scene_discovery']
+        raw={family.digest(row):row for row in archive['native_rows']}
+        validate_original_duty_program(single,raw_inventory=raw)
+        records=archive['original_programme_records']
+        records['native_duty_programmes'][single['program_sha256']]=single
+        records['active_native_duty_programme_sha256']=single['program_sha256']
+        program['original_duty_program']=single
+        program['discovery_archive_binding']=archive_binding(archive)
+        program.pop('program_sha256');program['program_sha256']=family.digest(program)
+        # A valid original endpoint programme is not full-window authority,
+        # even when the received archive and selection are consistently signed.
+        with self.assertRaises(ValueError):validate_archive(program,dense)
