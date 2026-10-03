@@ -36,8 +36,15 @@ class SceneRoleObligations:
             named_identity_certified=False, physical_extent_certified=False)
 
 
-def scene_role_obligations(raw, role, selected_head_id):
+def scene_role_obligations(raw, role, selected_head_id, *, required_part_names=None):
     role = GroupOutputRole(role)
+    if required_part_names is not None and (
+            not isinstance(required_part_names,tuple)
+            or len(set(required_part_names)) != len(required_part_names)
+            or not set(required_part_names) <= set(ARM_PARTS)
+            or role not in (GroupOutputRole.FOCAL_HEAD,GroupOutputRole.FOCAL_HEAD_ARMS)
+            or role == GroupOutputRole.FOCAL_HEAD_ARMS and set(required_part_names) != set(ARM_PARTS)):
+        raise ValueError('original required arm names must be an explicit valid focal duty tuple')
     heads, people = _get(raw, 'heads'), _get(raw, 'people')
     if heads is None or people is None:
         raise ValueError('scene role needs the complete native observation inventory')
@@ -69,10 +76,14 @@ def scene_role_obligations(raw, role, selected_head_id):
     if role == GroupOutputRole.FOCAL_HEAD_ARMS and (owner is None
             or any(parts.get(part) != 'observed' for part in ARM_PARTS)):
         raise ValueError('scene focal required arms lack unique original-pixel ownership')
+    if required_part_names and (owner is None or any(parts.get(part) != 'observed'
+            for part in required_part_names)):
+        raise ValueError('scene original required arm lacks selected native owner/observation')
     # A known arm of the selected owner remains a duty even on a head role.
     # An unbound OTHER body is neither assigned to this head nor erased.
     required_parts = tuple((owner_id, part) for part in ARM_PARTS
-        if owner is not None and parts.get(part) == 'observed')
+        if owner is not None and (parts.get(part) == 'observed' if required_part_names is None
+            else part in required_part_names))
     return SceneRoleObligations(role.value, selected_head_id, (selected_head_id,),
         () if owner_id is None else (owner_id,), required_parts, owner_id, state,
         tuple(i for i in head_ids if i != selected_head_id),

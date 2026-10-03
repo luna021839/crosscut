@@ -577,8 +577,11 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
             raise ValueError('scene completion changed the frozen selected program')
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
             hypothesis_keys=[s.editorial_contract_sha256 for s in path],
+            original_duty_program=sensors.original_duty_program,
             scene_discovery=sensors.archive() if frozen_scene_discovery is None else frozen_scene_discovery,
             source_derivative_binding=context.source_derivative_binding)
+        if selected_program.get('original_duty_program')!=sensors.original_duty_program:
+            raise ValueError('scene completion changed the presearch original duty programme')
         from .group_scene_archive import archive_binding, validate_archive
         selected_program['discovery_archive_binding']=archive_binding(dense['scene_discovery'])
         selected_program['program_sha256']=family.digest(selected_program)
@@ -939,7 +942,29 @@ def final_live_replay(plan_json,receipt,deadline):
             validate_scene_dense(dense)
             validate_program(receipt.get('selected_scene_program'),dense)
             sensors=SceneSensors(session,assets)
-            sensors.hypotheses=dict(dense['scene_hypotheses'])
+            # Reobserve originals first; a selected/candidate-only receipt
+            # cannot redefine already known original parts at final replay.
+            from .group_scene_selected_replay import _path
+            from .group_scene_original_duties import freeze_original_duty_program
+            program=receipt['selected_scene_program']
+            original_plan=render_plan_from_json(program['original_numeric_plan'])
+            baseline=_path(original_plan,domain,program['baseline_states'])
+            original_groups=[]
+            for index,state in enumerate(baseline):
+                scope='exit' if index==0 else 'entry' if index==len(baseline)-1 else 'whole'
+                unit=program['original_duty_program']['units'][index]
+                intent=unit['branches'][0]['original_hypothesis']['shot_intent']
+                sensors.shot_intents[state.first_output_frame,state.end_output_frame,scope]=intent
+                original_groups.append(tuple(sensors.bind(state,h) for h in sensors.discover(state,
+                    rolls=tuple(program['analysis_rolls']),endpoint_scope=scope)))
+            if [[s.editorial_contract_sha256 for s in group] for group in original_groups]!=program['baseline_hypothesis_keys']:
+                raise ValueError('scene final original hypothesis inventory changed')
+            original_duties=freeze_original_duty_program(sensors,original_groups,
+                original_plan_identity=family.digest(family.plan_payload(original_plan)))
+            if original_duties!=program['original_duty_program']:
+                raise ValueError('scene final fresh original required duty lifecycle changed')
+            sensors.install_original_duty_program(original_duties)
+            sensors.hypotheses.update(dense['scene_hypotheses'])
             keys=dense['hypothesis_keys']
         else:
             sensors=NativeFamilySensors(session,assets,frozen_declarations=dense['pre_camera_native_declarations'])

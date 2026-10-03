@@ -16,7 +16,7 @@ from .group_joint_source_camera import joint_state_from_render_plan
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 
-CONTRACT='frozen_scene_source_camera_program_v3'
+CONTRACT='frozen_scene_source_camera_program_v4'
 
 
 def _path(plan,domain,rows):
@@ -73,10 +73,30 @@ def validate_program(program,dense):
         raise ValueError('selected scene state/role inventory missing') from exc
     from .group_scene_archive import validate_archive
     validate_archive(program, dense)
+    from .group_scene_original_duties import validate_original_duty_program
+    original_duties=payload.get('original_duty_program')
+    if original_duties is None or original_duties!=dense.get('original_duty_program'):
+        raise ValueError('selected scene lost its presearch original duty programme')
+    validate_original_duty_program(original_duties,raw_inventory={family.digest(row):row
+        for row in dense['scene_discovery']['native_rows']})
+    units=original_duties['units']
+    if len(units)!=len(baseline):
+        raise ValueError('selected scene original duty programme has another window')
+    for old,group,unit in zip(baseline,groups,units,strict=True):
+        if [b['original_subject_hypothesis_id'] for b in unit['branches']]!=group:
+            raise ValueError('selected scene original baseline hypotheses changed duty ownership')
+        for branch in unit['branches']:
+            received=dict(branch['original_state']['key_preimage'])
+            received.pop('editorial_contract_sha256',None)
+            expected=dict(old['key_preimage']);expected.pop('editorial_contract_sha256',None)
+            if family.digest(received)!=family.digest(expected):
+                raise ValueError('selected scene original duty unit changed the original full camera')
     from .render_plan_serialization import render_plan_from_json
     from .group_scene_dependency_support import validate_support
     try:
         original=render_plan_from_json(payload['original_numeric_plan'])
+        if original_duties['original_plan_identity']!=family.digest(family.plan_payload(original)):
+            raise ValueError('selected scene original duties changed their original plan identity')
         numeric=render_plan_from_json(payload['numeric_plan'])
         support=payload['dependency_support']
         edges=tuple(support['retained_applied_look_edges'])
@@ -137,6 +157,12 @@ def replay_selected_scene(context,candidate):
         groups=[derive(state,index) for index,state in enumerate(baseline)]
         if [[s.editorial_contract_sha256 for s in group] for group in groups]!=program['baseline_hypothesis_keys']:
             raise ValueError('selected scene original baseline hypotheses changed')
+        from .group_scene_original_duties import freeze_original_duty_program
+        original_duties=freeze_original_duty_program(sensors,groups,
+            original_plan_identity=family.digest(family.plan_payload(context.incumbent.render_plan)))
+        if original_duties!=program['original_duty_program']:
+            raise ValueError('selected scene fresh original required duty lifecycle changed')
+        sensors.install_original_duty_program(original_duties)
         for index,state in enumerate(path):
             alternatives=derive(state,index)
             if state.key not in {s.key for s in alternatives}:

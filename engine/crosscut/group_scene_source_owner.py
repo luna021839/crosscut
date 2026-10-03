@@ -6,7 +6,6 @@ and one/two mutable cameras jointly. No successful solo is a prerequisite.
 The owner is deliberately a review-candidate producer, never semantic/quality QA.
 """
 from dataclasses import replace
-from collections import Counter
 from itertools import product, zip_longest
 import math
 from time import monotonic
@@ -209,35 +208,28 @@ def _native_target(row):
 
 
 def preserve_incumbent_required_parts(sensors, baseline, path, dense):
-    """Recheck known old duties on every changed output tick, not cast counts."""
+    """Check the PRESEARCH original programme, never reselect a dominant actor."""
+    from .group_scene_original_duties import duty_at,FOCAL
+    program=getattr(sensors,'original_duty_program',None)
+    if program is None:
+        raise ValueError('scene source change has no presearch original duty programme')
     preserved=[]
     for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
         for row in span['rows']:
-            raw=sensors.raw(old,row['output_tick'],None)
-            if old.role==GroupOutputRole.COMPOSITION:
-                people=();old_subject_state='raw_native_roi_inventory_not_cross_camera_cast_duty'
-            elif old.role==GroupOutputRole.FORMATION:
-                people=raw.people;old_subject_state='formation_cohort'
-            else:
-                try:
-                    _,person=source._dominant(raw,GroupOutputRole.FOCAL_HEAD)
-                    people=() if person is None else (person,)
-                    old_subject_state='unknown_body_owner' if person is None else 'unique_native_focal_owner'
-                except ValueError:
-                    people=();old_subject_state='unknown_native_focal_assignment'
-            required=Counter(name for p in people for name,status in getattr(p,'part_states',())
-                if name in ('left_arm','right_arm') and status=='observed')
-            if old.role==GroupOutputRole.FOCAL_HEAD_ARMS:
-                required|=Counter(left_arm=1,right_arm=1)
-            actual=Counter(a['part'] for a in row['projected_observed_arms'] if a['required_by_role'])
-            if any(actual[name]<count for name,count in required.items()):
-                raise ValueError('scene source change loses an incumbent observed arm')
-            preserved.append(dict(output_tick=row['output_tick'],required_parts=dict(sorted(required.items())),
-                incumbent_subject_scope=old_subject_state,
-                all_incumbent_raw_people_retained=len(raw.people),
-                detector_count_is_not_cross_camera_cast_obligation=True,
+            ref=duty_at(program,old,row['output_tick'])
+            if row.get('original_duty_reference')!=ref:
+                raise ValueError('scene source change loses its original required duty reference')
+            if old.role.value in FOCAL:
+                owner=row['role_obligations']['focal_owner_id']
+                expected={(owner,name) for name in ref['required_part_names']}
+                actual={(a['person_observation_id'],a['part']) for a in row['projected_observed_arms']
+                    if a['required_by_role']}
+                if expected!=actual or expected and owner is None:
+                    raise ValueError('scene source change loses a selected-owner original required arm')
+            preserved.append(dict(output_tick=row['output_tick'],original_duty_reference=ref,
                 part_count_is_not_cross_camera_actor_correspondence=True,
-                native_observation_sha256=raw.sha256,absence_is_not_a_negative_detection_certificate=True))
+                missing_original_measurement_is_not_a_duty_waiver=True,
+                fresh_original_dominant_reselection=False))
     return preserved
 
 
@@ -339,6 +331,25 @@ def propose_scene_changes(context):
                     if key not in seen:seen.add(key);result.append(value)
                 return tuple(result[:FIXED_HYPOTHESES])
             lefts=fixed(lefts,False);rights=fixed(rights,True)
+            if not lefts or not rights:
+                attempts.append(dict(stage='scene_fixed_hypotheses',window=wi,
+                    analysis_rolls=list(rolls),reason='all_fixed_endpoint_paths_unavailable',
+                    original_mutable_native_observations_skipped=True,
+                    donor_native_observations_skipped=True,donor_absence_inferred=False))
+                continue
+            # Freeze all original hypotheses/lifecycles before ANY donor query.
+            # Conditional original hypotheses remain separate; missing later
+            # measurements cannot erase their already observed required parts.
+            baseline_hypotheses=[bound(s,scope_for(i)) for i,s in enumerate(baseline)]
+            from .group_scene_original_duties import freeze_original_duty_program
+            try:
+                original_program=freeze_original_duty_program(sensors,baseline_hypotheses,
+                    original_plan_identity=family.digest(family.plan_payload(plan)))
+                sensors.install_original_duty_program(original_program)
+            except ValueError as exc:
+                attempts.append(dict(stage='original_duty_freeze',window=wi,error=str(exc),
+                    donor_native_observations_skipped=True,original_ambiguity_is_not_a_waiver=True))
+                continue
             # Discovery is not enough: clipping and required arm/support paths
             # on the unchanged incident endpoint must fail BEFORE donor work.
             def measured_fixed(values, outgoing):
@@ -369,8 +380,7 @@ def propose_scene_changes(context):
                 maximum_edges=source.WORK_LIMITS['maximum_edges'])
             # All numerically available sources are observed before choosing a
             # donor/camera, but only after the shared incident endpoints exist.
-            all_native=tuple((s,'whole') for s in baseline[1:-1])+tuple(
-                (s,'whole') for group in raw_slots for s in group)
+            all_native=tuple((s,'whole') for group in raw_slots for s in group)
             for state,scope in all_native:
                 sensors.discover(state,rolls=rolls,endpoint_scope=scope)
             groups=[];camera_errors=[]
@@ -416,7 +426,6 @@ def propose_scene_changes(context):
                 continue
             all_states=tuple(dict((v.key,v) for v in (*lefts,*(s for g in groups for s in g),*rights)).values())
             for state in all_states:session.budget.spend('states')
-            baseline_hypotheses=[bound(s,scope_for(i)) for i,s in enumerate(baseline)]
             edges={};known={}
             def read(a,b):
                 key=a.key,b.key
@@ -506,6 +515,8 @@ def propose_scene_changes(context):
                         required_semantics_and_editorial_utility_separated=composition_window,
                         source_derivative_binding=context.source_derivative_binding,
                         incumbent_known_parts=preserved,camera_errors=camera_errors,
+                        original_duties_frozen_before_donor_discovery=True,
+                        original_duty_program_sha256=original_program['program_sha256'],
                         candidate_search_exhaustive=False,rotated_pass_exhaustive=False,
                         source_balanced_state_allocation=True,full_epoch_retained_family_owner_implemented=False,
                         within_source_frontier_policy='native_fitted_camera_interleave_v1',
@@ -526,6 +537,7 @@ def propose_scene_changes(context):
                         selected_states=[s.to_dict() for s in path],baseline_states=[s.to_dict() for s in baseline],
                         baseline_hypothesis_keys=[[s.editorial_contract_sha256 for s in group]
                             for group in baseline_hypotheses],analysis_rolls=list(rolls),
+                        original_duty_program=original_program,
                         composition_window=composition_window,quality_approved=False)
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)
                     alternative['status']='complete_unapproved'

@@ -150,6 +150,21 @@ class SceneSensors(source.NativeFamilySensors):
         self.endpoint_cache = {}
         self.articulation_raw_rows = {}
         self.articulation_endpoint_cache = {}
+        self.original_duty_program = None
+
+    def install_original_duty_program(self, program):
+        from .group_scene_original_duties import validate_original_duty_program
+        validate_original_duty_program(program, raw_inventory={r.sha256:r.to_dict()
+            for r in self.raw_rows.values()})
+        self.original_duty_program = program
+
+    def duty_binding(self, state, tick):
+        from .group_scene_original_duties import bind_row_obligations
+        return bind_row_obligations(getattr(self,'original_duty_program',None),state,tick)
+
+    def obligations(self, raw, state, tick, head_id):
+        _,names = self.duty_binding(state,tick)
+        return scene_role_obligations(raw,state.role,head_id,required_part_names=names)
 
     def raw(self, state, tick, roll):
         if state.role != GroupOutputRole.COMPOSITION:
@@ -173,7 +188,8 @@ class SceneSensors(source.NativeFamilySensors):
         from .group_scene_composition import body_support_links
         ticks = (state.end_output_frame-4, state.end_output_frame-1) if outgoing else (
             state.first_output_frame, state.first_output_frame+3)
-        key = state.key, outgoing
+        program = getattr(self,'original_duty_program',None)
+        key = state.key, outgoing, None if program is None else program['program_sha256']
         if key in self.endpoint_cache:
             return self.endpoint_cache[key]
         h = self.hypothesis(state)
@@ -184,6 +200,7 @@ class SceneSensors(source.NativeFamilySensors):
         evidence = dict(output_ticks=list(ticks), required_semantics_available=True,
             head_pixel_link=None, joint_pixel_link=None, composition_support_link=None,
             verified_source_clock=self.session.domain.render_frame_clocks[state.eligible_source_index].to_dict(),
+            original_duty_program_sha256=None if program is None else program['program_sha256'],
             quality_approved=False)
         if state.role == GroupOutputRole.COMPOSITION:
             link = body_support_links(self, *raw)
@@ -346,7 +363,8 @@ class SceneSensors(source.NativeFamilySensors):
             if tick not in hypothesis['anchor_output_ticks']:
                 raise ValueError('non-anchor scene frame requires the dense measured head link')
             head_id = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
-        cache_key = state.key, tick, head_id
+        duty_reference,required_names = self.duty_binding(state,tick)
+        cache_key = state.key, tick, head_id, None if duty_reference is None else duty_reference['program_sha256']
         if cache_key in self.frame_cache:
             row = self.frame_cache[cache_key]
             if row.get('frame_admission_violations'):
@@ -365,7 +383,7 @@ class SceneSensors(source.NativeFamilySensors):
         if state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION) and primary is None:
             reject('scene focal hypothesis missing, not replaced by background actor')
         try:
-            obligations = scene_role_obligations(raw, state.role, head_id)
+            obligations = scene_role_obligations(raw, state.role, head_id,required_part_names=required_names)
             obligations_error = None
         except ValueError as exc:
             # A missing/ambiguous duty is UNKNOWN, never a zero-part duty.
@@ -465,6 +483,7 @@ class SceneSensors(source.NativeFamilySensors):
             projected_observed_arms=observed_arms, scene_heads=heads, scene_people=people,
             role_obligations=None if obligations is None else obligations.to_dict(),
             role_obligations_unknown_reason=obligations_error,
+            original_duty_reference=duty_reference,
             frame_admission_violations=violations,
             role_geometry_constraints_satisfied=not violations,
             scene_geometry=_scene_geometry(heads, people), role=state.role.value,
@@ -505,9 +524,9 @@ class SceneSensors(source.NativeFamilySensors):
                         support_link = body_support_links(self, previous, raw)
                         if not support_link['observed_support_paths']:
                             raise ValueError('composition dense body support lifecycle unknown')
-                current_parts = scene_role_obligations(raw, state.role, current_head).required_parts
-                previous_parts = () if previous is None else scene_role_obligations(
-                    previous,state.role,previous_head).required_parts
+                current_parts = self.obligations(raw,state,tick,current_head).required_parts
+                previous_parts = () if previous is None else self.obligations(
+                    previous,state,tick-1,previous_head).required_parts
                 required_names = tuple(sorted({name for _,name in (*previous_parts,*current_parts)}))
                 if previous is not None and (state.role == GroupOutputRole.FORMATION or required_names):
                     if previous.native_frame_index == raw.native_frame_index:
@@ -1147,6 +1166,12 @@ def validate_scene_dense(dense):
     from .group_native_detector_result import validate_serialized_detector_result
     from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available,validate_focal_pose_view
     raw_inventory={family.digest(row):row for row in (dense.get('scene_discovery') or {}).get('native_rows',())}
+    program=dense.get('original_duty_program')
+    if program is not None:
+        from .group_scene_original_duties import validate_original_duty_program,duty_at,FOCAL
+        validate_original_duty_program(program,raw_inventory=raw_inventory)
+        if program['eligible_request_indices']!=dense['source_domain']['eligible_request_indices']:
+            raise ValueError('original duty programme changed source-domain ownership')
     for edge in dense.get('incident_projected_observations', ()):
         if (edge.get('frame_admission_violations') or any(
                 row.get('frame_admission_violations')
@@ -1179,6 +1204,27 @@ def validate_scene_dense(dense):
         if any(h.get(k) is not False for k in ('temporal_identity_certified','cross_camera_identity_certified',
                 'whole_head_extent_certified','body_phase_certified','quality_approved')):
             raise ValueError('scene hypotheses cannot become anatomy, identity, phase or quality proof')
+    if program is not None:
+        for index,edge in enumerate(dense.get('incident_projected_observations',())):
+            rows=edge.get('rows');endpoints=edge.get('required_endpoint_evidence')
+            if (index+1>=len(keys) or not isinstance(rows,list) or len(rows)!=4
+                    or not isinstance(endpoints,list) or len(endpoints)!=2
+                    or any(e.get('original_duty_program_sha256')!=program['program_sha256'] for e in endpoints)):
+                raise ValueError('scene incident lost the original required endpoint duty programme')
+            for position,row in enumerate(rows):
+                side=position//2;h=hypotheses[keys[index+side]]
+                first,end=h['span_key'][1:3]
+                expected_tick=(end-4,end-1)[position] if side==0 else (first,first+3)[position-2]
+                if row.get('output_tick')!=expected_tick or row.get('role')!=h['role']:
+                    raise ValueError('scene incident duty borrowed another output tick/role')
+                ref=duty_at(program,dict(first=first,end=end,role=h['role']),expected_tick)
+                if row.get('original_duty_reference')!=ref:
+                    raise ValueError('scene incident changed its original required duty reference')
+                names=tuple(ref['required_part_names']) if h['role'] in FOCAL else None
+                obligations=scene_role_obligations(row['native_observation'],h['role'],
+                    row['selected_frame_local_head_id'],required_part_names=names)
+                if family.digest(row.get('role_obligations'))!=family.digest(obligations.to_dict()):
+                    raise ValueError('scene incident changed original required/context part scope')
     for index,edge in enumerate(dense.get('incident_projected_observations',())):
         if index+1>=len(keys):raise ValueError('scene edge inventory exceeds its complete state path')
         validate_composition_edge_motion(edge,hypotheses=hypotheses,
@@ -1229,7 +1275,16 @@ def validate_scene_dense(dense):
                 raise ValueError('scene dense row borrowed another hypothesis/anatomy claim')
             native=row.get('native_observation') or {}
             validate_serialized_detector_result(native)
-            obligations=scene_role_obligations(native,row['role'],row['selected_frame_local_head_id'])
+            names=None
+            if program is not None:
+                preimage=dict(first=span['first_output_frame'],end=span['end_output_frame'],role=span['role'])
+                ref=duty_at(program,preimage,row['output_tick'])
+                if row.get('original_duty_reference')!=ref:
+                    raise ValueError('scene dense changed its externally frozen original duty reference')
+                if row['role'] in FOCAL:names=tuple(ref['required_part_names'])
+            elif row.get('original_duty_reference') is not None:
+                raise ValueError('scene dense lost its referenced original duty programme')
+            obligations=scene_role_obligations(native,row['role'],row['selected_frame_local_head_id'],required_part_names=names)
             if family.plain(row.get('role_obligations'))!=family.plain(obligations.to_dict()):
                 raise ValueError('scene dense required/context scope changed after native observation')
             original_heads=Counter(p['observation_id'] for p in native.get('heads',[]))
@@ -1310,7 +1365,9 @@ def validate_scene_dense(dense):
                     if link.get('required_body_scope')!=expected_scope:
                         raise ValueError('scene dense temporal body evidence has another role scope')
                     if expected_scope=='selected_focal_owner':
-                        if previous_parts!=current_parts or link.get('required_part_names')!=list(current_parts):
+                        required_names=sorted(set(previous_parts)|set(current_parts))
+                        if (not set(previous_parts)<=set(current_parts)
+                                or link.get('required_part_names')!=required_names):
                             raise ValueError('scene dense required arm lifecycle or pixel mask changed')
                         expected_ids=[[previous_row['role_obligations']['focal_owner_id']],[obligations.focal_owner_id]]
                         if link.get('required_body_observation_ids')!=expected_ids or None in (

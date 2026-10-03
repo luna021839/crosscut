@@ -102,3 +102,28 @@ class SceneArchiveIntegrityTests(unittest.TestCase):
                         required_semantics_available=True)
                 with self.assertRaisesRegex(ValueError,'role/visibility rejection'):
                     scene.validate_scene_dense(dense)
+
+    def test_normal_owner_binds_original_duties_in_complete_dense_and_incident_consumers(self):
+        receipt=family.plain(self.result.performer_family_review)
+        dense=receipt['source_camera_refresh'];program=dense['original_duty_program']
+        self.assertEqual(receipt['selected_scene_program']['original_duty_program'],program)
+        self.assertTrue(receipt['search']['original_duties_frozen_before_donor_discovery'])
+        self.assertFalse(program['donor_observations_define_duties'])
+        self.assertFalse(program['coherent_cross_camera_actor_correspondence_certified'])
+        for span in dense['mutable_shots']:
+            for row in span['rows']:
+                self.assertEqual(row['original_duty_reference']['program_sha256'],program['program_sha256'])
+        for edge in dense['incident_projected_observations']:
+            for endpoint in edge['required_endpoint_evidence']:
+                self.assertEqual(endpoint['original_duty_program_sha256'],program['program_sha256'])
+
+    def test_received_original_duties_cannot_be_removed_from_any_consumer_scope(self):
+        original=family.plain(self.result.performer_family_review)['source_camera_refresh']
+        for scope in ('programme','mutable_ref','incident_ref','incident_parts','endpoint_ref'):
+            dense=deepcopy(original)
+            if scope=='programme':dense.pop('original_duty_program')
+            elif scope=='mutable_ref':dense['mutable_shots'][0]['rows'][0]['original_duty_reference']=None
+            elif scope=='incident_ref':dense['incident_projected_observations'][0]['rows'][0]['original_duty_reference']=None
+            elif scope=='incident_parts':dense['incident_projected_observations'][0]['rows'][0]['role_obligations']['required_parts']=[(99,'left_arm')]
+            else:dense['incident_projected_observations'][0]['required_endpoint_evidence'][0]['original_duty_program_sha256']=None
+            with self.subTest(scope=scope),self.assertRaises(ValueError):scene.validate_scene_dense(dense)

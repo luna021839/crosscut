@@ -1,0 +1,298 @@
+"""Original-native focal duties frozen before donor discovery.
+
+Each original hypothesis owns a separate anonymous, source-local lifecycle.
+An observed part stays required through later missing/unresolved measurements.
+The union of required part NAMES is a conservative candidate constraint, NOT
+a cast count or resolved original/cross-camera actor correspondence. Composition
+and formation keep their existing inventory policy; mixed-role/global programme,
+hard phase reserves and coherent original hypothesis selection remain separate.
+"""
+from collections.abc import Mapping
+from copy import deepcopy
+import json
+
+from . import group_performer_family_owner as family
+from .group_joint_source_camera import GroupOutputRole
+from .group_scene_intent import validate_intent
+from .group_scene_role_obligations import ARM_PARTS
+
+CONTRACT = 'original_native_focal_duty_lifecycle_v1'
+FOCAL = (GroupOutputRole.FOCAL_HEAD.value, GroupOutputRole.FOCAL_HEAD_ARMS.value)
+MAX_ORIGINAL_NATIVE_SAMPLE_TICKS = 16
+
+
+def original_sample_ticks(first,end,anchors):
+    """Bound original NN scope, not candidate dense admission or confidence.
+
+    Unrequested original ticks are explicit not_requested observations. A
+    previously known required part remains required across them. This is not
+    an all-original-frames NN/identity certificate or a hard phase lease.
+    """
+    if end-first<=MAX_ORIGINAL_NATIVE_SAMPLE_TICKS:return tuple(range(first,end))
+    selected=set(anchors)|set(range(first,min(end,first+4)))|set(range(max(first,end-4),end))
+    for tick in (first+round((end-first-1)*i/(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS-1))
+            for i in range(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS)):
+        if len(selected)>=MAX_ORIGINAL_NATIVE_SAMPLE_TICKS:break
+        selected.add(tick)
+    return tuple(sorted(selected))
+
+
+def _get(value, key, default=None):
+    return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
+
+
+def _raw_dict(raw):
+    return raw.to_dict() if hasattr(raw, 'to_dict') else raw
+
+
+def _branch(*, state, hypothesis, raw_at, head_link):
+    preimage = state['key_preimage']
+    role = preimage['role']
+    intent = hypothesis['shot_intent']
+    validate_intent(intent, role=role, first=preimage['first'], end=preimage['end'],
+        endpoint_scope=hypothesis['endpoint_scope'])
+    first, end = intent['required_output_interval']
+    sampled=original_sample_ticks(first,end,hypothesis['anchor_output_ticks'])
+    selected = hypothesis['anchor_head_ids'][0] if role in FOCAL else None
+    previous = None
+    rows, links, latched = [], [], {}
+    explicit = role == GroupOutputRole.FOCAL_HEAD_ARMS.value
+    for tick in range(first, end):
+        if tick not in sampled:
+            # No decode/NN/LK call, no negative detection, no interpolated
+            # original actor or pose. Retain already known/explicit duties.
+            parts={name:dict(obligation='required' if role in FOCAL and (explicit or name in latched) else 'unknown',
+                observation='not_requested',
+                became_required_at_output_tick=first if explicit else latched.get(name,{}).get('output_tick'),
+                original_required_reason='explicit_original_output_role' if explicit else
+                    'observed_selected_original_hypothesis_latched' if name in latched else 'original_measurement_unknown',
+                original_first_observed_reference=latched.get(name)) for name in ARM_PARTS}
+            rows.append(dict(output_tick=tick,native_frame_index=preimage['native'][tick-preimage['first']],
+                native_observation_sha256=None,selected_frame_local_head_id=None,
+                original_person_observation_id=None,head_obligation='required' if role in FOCAL else 'not_requested',
+                head_observation='not_requested',parts=parts,raw_context_retained=True))
+            previous=None;selected=None
+            continue
+        raw = _raw_dict(raw_at(tick))
+        sha = family.digest(raw)
+        native = preimage['native'][tick-preimage['first']]
+        if (raw['native_frame_index'] != native or raw['source_clock_identity'] != preimage['clock']
+                or raw['native_pixel_sha256'] is None):
+            raise ValueError('original duty raw source/native clock/raster changed')
+        if tick in hypothesis['anchor_output_ticks']:
+            anchor = hypothesis['anchor_output_ticks'].index(tick)
+            if sha != hypothesis['raw_observation_sha256'][anchor]:
+                raise ValueError('original duty observation differs from its original hypothesis anchor')
+            if previous is None:
+                # Separate conditional endpoint of this original hypothesis,
+                # not a measured actor bridge across the unobserved middle.
+                selected=hypothesis['anchor_head_ids'][anchor] if role in FOCAL else None
+        if previous is not None and role in FOCAL and selected is not None:
+            link = head_link(previous, raw)
+            if link.get('raw_pair') != [family.digest(previous), sha]:
+                raise ValueError('original duty head link borrowed another native pair')
+            links.append(deepcopy(link))
+            choices = [b for a,b in link['unique_links'] if a == selected]
+            selected = choices[0] if len(choices) == 1 else None
+        head_ids = [head['observation_id'] for head in raw['heads']]
+        if selected not in head_ids:
+            selected = None
+        if role in FOCAL and tick in hypothesis['anchor_output_ticks'] and selected is not None:
+            anchor = hypothesis['anchor_output_ticks'].index(tick)
+            if selected != hypothesis['anchor_head_ids'][anchor]:
+                selected = None  # Keep known duties; never switch to the endpoint's other actor.
+        owners = [p for p in raw['people'] if p.get('unique_head_observation_id') == selected] if selected is not None else []
+        owner = owners[0] if len(owners) == 1 else None
+        parts = {}
+        for name in ARM_PARTS:
+            if role not in FOCAL:
+                observation = 'not_requested'
+            elif raw.get('pose_state') == 'not_requested':
+                observation = 'not_requested'
+            elif selected is None or len(owners) > 1:
+                observation = 'unresolved'
+            elif owner is None:
+                observation = 'missing'
+            else:
+                status = dict(owner.get('part_states', ())).get(name)
+                observation = 'observed' if status == 'observed' else 'unresolved' if status == 'ambiguous' else 'missing'
+            if observation == 'observed' and name not in latched:
+                latched[name] = dict(output_tick=tick, native_observation_sha256=sha,
+                    original_person_observation_id=owner['observation_id'])
+            required = role in FOCAL and (explicit or name in latched)
+            parts[name] = dict(obligation='required' if required else 'unknown',
+                observation=observation,
+                became_required_at_output_tick=first if explicit else latched.get(name, {}).get('output_tick'),
+                original_required_reason='explicit_original_output_role' if explicit else
+                    'observed_selected_original_hypothesis_latched' if name in latched else 'original_measurement_unknown',
+                original_first_observed_reference=latched.get(name))
+        rows.append(dict(output_tick=tick, native_frame_index=native,
+            native_observation_sha256=sha, selected_frame_local_head_id=selected,
+            original_person_observation_id=None if owner is None else owner['observation_id'],
+            head_obligation='required' if role in FOCAL else 'not_requested',
+            head_observation='not_requested' if role not in FOCAL else
+                'observed' if selected is not None else 'missing' if not head_ids else 'unresolved',
+            parts=parts, raw_context_retained=True))
+        previous = raw
+    return dict(original_subject_hypothesis_id=family.digest(hypothesis),
+        original_state=state, original_hypothesis=hypothesis, rows=rows, head_pixel_links=links,
+        original_requested_output_ticks=list(sampled),
+        every_original_native_tick_observed=len(sampled)==end-first,
+        unobserved_actor_bridges_certified=False,
+        named_identity_certified=False, cross_camera_identity_certified=False)
+
+
+def _unit(branches, eligible_request_indices):
+    if not branches:
+        raise ValueError('original duties need explicit original hypotheses before donor search')
+    first = branches[0]
+    state = first['original_state']['key_preimage']
+    interval = first['original_hypothesis']['shot_intent']['required_output_interval']
+    for branch in branches:
+        p = branch['original_state']['key_preimage']
+        if any(p[k] != state[k] for k in ('first','end','source','role','native','clock','slot')):
+            raise ValueError('original duty alternatives changed original source/camera unit')
+        if branch['original_hypothesis']['shot_intent'] != first['original_hypothesis']['shot_intent']:
+            raise ValueError('original duty alternatives changed external original intent')
+        request = eligible_request_indices[p['source']]
+        for row in branch['rows']:
+            # Source ownership is checked against the canonical raw inventory by the validator.
+            row['original_request_source_index'] = request
+    rows = []
+    for offset, tick in enumerate(range(*interval)):
+        required = sorted({name for branch in branches for name,part in branch['rows'][offset]['parts'].items()
+            if part['obligation'] == 'required'})
+        rows.append(dict(output_tick=tick, required_part_names=required,
+            branch_row_sha256=[family.digest(branch['rows'][offset]) for branch in branches]))
+    identity = family.digest(dict(original_source=state['source'], clock=state['clock'],
+        bounds=[state['first'],state['end']], role=state['role'], intent=first['original_hypothesis']['shot_intent']))
+    return dict(original_unit_id=identity, first_output_frame=state['first'], end_output_frame=state['end'],
+        role=state['role'], required_output_interval=interval, branches=branches, rows=rows,
+        original_hypothesis_ambiguity_retained=len(branches)>1, part_names_are_not_cast_counts=True,
+        lifecycle_policy='separate_original_focal_hypotheses_latched_part_names' if state['role'] in FOCAL
+            else 'existing_native_inventory_policy_not_original_part_lifecycle',
+        original_native_part_lifecycle_frozen=state['role'] in FOCAL,
+        candidate_admitted=False, quality_approved=False)
+
+
+def _program(units, plan_identity, eligible):
+    value = dict(contract=CONTRACT, original_plan_identity=plan_identity,
+        eligible_request_indices=list(eligible), units=units,
+        frozen_before_donor_discovery=True, donor_observations_define_duties=False,
+        original_known_part_loss_is_not_a_waiver=True, raw_observations_referenced_not_duplicated=True,
+        coherent_original_programme_selected=False,
+        coherent_cross_camera_actor_correspondence_certified=False,
+        mixed_role_global_programme_implemented=False, hard_original_phase_reserve_implemented=False,
+        quality_approved=False)
+    value['program_sha256'] = family.digest(value)
+    # Canonical transport types at the producer, not equality weakened after
+    # worker/JSON replay. Tuple/list conversion cannot fabricate a new failure.
+    return json.loads(json.dumps(family.plain(value),sort_keys=True,allow_nan=False))
+
+
+def freeze_original_duty_program(sensors, baseline_groups, *, original_plan_identity):
+    """Read ORIGINAL native units only; do not inspect selected/unselected donors."""
+    eligible = sensors.session.domain.eligible_indices
+    units = []
+    if any(not group for group in baseline_groups):
+        # Preflight the entire window before any extra original dense sensing.
+        # This is unresolved scope, not an empty/waived duty or negative donor.
+        raise ValueError('original duties need explicit original hypotheses before donor search')
+    for group in baseline_groups:
+        branches = []
+        for state in group:
+            hypothesis = sensors.hypothesis(state)
+            original_rows = {}
+            def raw_at(tick):
+                raw = sensors.raw(state,tick,hypothesis['analysis_roll'])
+                original_rows[raw.sha256] = raw
+                return raw
+            def head_link(a,b):
+                return sensors._head_links(original_rows[family.digest(a)],original_rows[family.digest(b)])
+            branches.append(_branch(state=state.to_dict(), hypothesis=deepcopy(hypothesis),
+                raw_at=raw_at, head_link=head_link))
+        units.append(_unit(branches, eligible))
+    program = _program(units, original_plan_identity, eligible)
+    sensors.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(
+        program,sort_keys=True,allow_nan=False).encode()))
+    return program
+
+
+def validate_original_duty_program(program, *, raw_inventory):
+    """Re-derive every lifecycle from received raw references and head-link paths.
+
+    This is reference closure, not controller-owned whole-history authority.
+    Independent parent/final original-pixel remeasurement is still mandatory.
+    """
+    if not isinstance(program,dict) or program.get('contract') != CONTRACT:
+        raise ValueError('scene original duty programme is missing')
+    payload = dict(program); sha = payload.pop('program_sha256',None)
+    if sha != family.digest(payload):
+        raise ValueError('original duty programme hash changed')
+    try:
+        eligible = program['eligible_request_indices']
+        if (not isinstance(eligible,list) or not eligible or len(set(eligible)) != len(eligible)
+                or any(type(i) is not int or i<0 for i in eligible)):
+            raise ValueError('original duty programme source domain invalid')
+        units = []
+        for unit in program['units']:
+            branches = []
+            for received in unit['branches']:
+                state = received['original_state']; h = received['original_hypothesis']
+                if (family.digest(h) != received['original_subject_hypothesis_id']
+                        or state['key_preimage'].get('editorial_contract_sha256') != family.digest(h)
+                        or state['state_key'] != family.digest(state['key_preimage'])):
+                    raise ValueError('original duty subject differs from its original state/hypothesis')
+                rows = received['rows']
+                first,end = h['shot_intent']['required_output_interval']
+                if [r['output_tick'] for r in rows] != list(range(first,end)):
+                    raise ValueError('original duty programme omitted a scheduled original tick')
+                refs = {r['output_tick']:r['native_observation_sha256'] for r in rows}
+                def raw_at(tick):
+                    raw = raw_inventory[refs[tick]]
+                    if (family.digest(raw) != refs[tick] or
+                            raw['request_source_index'] != eligible[state['key_preimage']['source']]):
+                        raise ValueError('original duty raw reference changed original source')
+                    return raw
+                links = {tuple(link['raw_pair']):link for link in received['head_pixel_links']}
+                if len(links) != len(received['head_pixel_links']):
+                    # Repeated native aliases may repeat the same measured pair.
+                    if any(link != links[tuple(link['raw_pair'])] for link in received['head_pixel_links']):
+                        raise ValueError('original duty repeated native link changed')
+                def head_link(a,b):
+                    return links[family.digest(a),family.digest(b)]
+                branches.append(_branch(state=state,hypothesis=h,raw_at=raw_at,head_link=head_link))
+            units.append(_unit(branches,eligible))
+        expected = _program(units, program['original_plan_identity'],eligible)
+        if family.digest(expected) != family.digest(program):
+            raise ValueError('original required duty lifecycle changed after original observations')
+        bounds = [(u['first_output_frame'],u['end_output_frame']) for u in units]
+        if len(set(bounds)) != len(bounds) or any(a[1] != b[0] for a,b in zip(bounds,bounds[1:])):
+            raise ValueError('original duty programme units are duplicated/discontinuous')
+    except (KeyError,TypeError,IndexError) as exc:
+        raise ValueError('original duty programme lost native/hypothesis reference closure') from exc
+    return program
+
+
+def duty_at(program, state, tick):
+    if program is None:
+        return None
+    first,end,role = (state.first_output_frame,state.end_output_frame,state.role.value) if hasattr(state,'role') else (
+        state['first'],state['end'],state['role'])
+    units = [u for u in program['units'] if
+        (u['first_output_frame'],u['end_output_frame'],u['role']) == (first,end,role)]
+    if len(units) != 1:
+        raise ValueError('candidate frame has no externally frozen original duty unit')
+    unit = units[0]; low,high = unit['required_output_interval']
+    if type(tick) is not int or not low <= tick < high:
+        raise ValueError('candidate frame borrowed a nonincident original duty tick')
+    row = unit['rows'][tick-low]
+    return dict(program_sha256=program['program_sha256'], original_unit_id=unit['original_unit_id'],
+        output_tick=tick, row_sha256=family.digest(row), required_part_names=row['required_part_names'])
+
+
+def bind_row_obligations(program,state,tick):
+    ref = duty_at(program,state,tick)
+    # Unchanged formation/composition policy remains explicit, not claimed solved.
+    names = None if ref is None or state.role.value not in FOCAL else tuple(ref['required_part_names'])
+    return ref,names

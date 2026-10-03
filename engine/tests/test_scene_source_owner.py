@@ -283,6 +283,31 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         self.assertEqual({r['request_source_index'] for r in rows},set(range(8)))
         self.assertTrue(any(not b['focal_assignment_unique'] for b in receipt['search']['baseline_components'].values()))
 
+    def test_normal_owner_freezes_original_program_before_any_donor_native_query(self):
+        from crosscut.group_joint_source_camera import joint_state_from_render_plan
+        from crosscut.group_joint_state_factory import fixed_neighbor_state_from_render_plan
+        from crosscut.group_scene_original_duties import duty_at
+        original_raw=sensors_module.SceneSensors.raw
+        donors=[]
+        def observe(sensor,state,tick,roll):
+            h=sensor.hypotheses.get(state.editorial_contract_sha256)
+            scope='whole' if h is None else h['endpoint_scope']
+            builder=joint_state_from_render_plan if scope=='whole' else fixed_neighbor_state_from_render_plan
+            incumbent=builder(plan=self.context.incumbent.render_plan,domain=self.context.domain,
+                slot=state.slot,first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,
+                role=state.role)
+            if replace(state,editorial_contract_sha256=None).key!=incumbent.key:
+                program=getattr(sensor,'original_duty_program',None)
+                self.assertIsNotNone(program,'donor native work preceded original duty freeze')
+                ref=duty_at(program,state,tick)
+                donors.append(ref['program_sha256'])
+            return original_raw(sensor,state,tick,roll)
+        with optional_native_scope(monotonic()+120),scene_chart_sensors(), \
+                patch.object(sensors_module.SceneSensors,'raw',new=observe):
+            result=scene.propose_scene_changes(self.context)
+        self.assertNotIsInstance(result,family.PerformerFamilyRejection,getattr(result,'error',None))
+        self.assertTrue(donors,'normal source-changing graph did not execute any donor work')
+
     def test_binding_rejects_ipc_source_clock_static_and_flag_tampering(self):
         self.assertNotIsInstance(self.result,family.PerformerFamilyRejection)
         for field in ('source','clock','static','quality','native_pixels'):
