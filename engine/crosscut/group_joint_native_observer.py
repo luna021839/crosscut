@@ -230,19 +230,25 @@ def observe_native_group(session, *, request_source_index, native_frame_index,
             return snapshot('invalid_source_native_body_roi',heads=heads)
         candidates=tuple(head for head in heads if box[0]<=head.box_xywh[0]+head.box_xywh[2]/2<=box[0]+box[2]
             and box[1]<=head.box_xywh[1]+head.box_xywh[3]/2<=box[1]+box[3])
-        arguments={'bbox_xywh':list(box)}
+        face_box=None
         if len(candidates)==1 and all(v>=0 for v in candidates[0].box_xywh[:2]) \
                 and candidates[0].box_xywh[0]+candidates[0].box_xywh[2]<=1 \
                 and candidates[0].box_xywh[1]+candidates[0].box_xywh[3]<=1:
-            arguments['face_bbox_xywh']=list(candidates[0].box_xywh)
-        body = session.observe_native(source, native, model='rtmpose_body7', arguments=arguments)
+            face_box=candidates[0].box_xywh
+        # One native body tensor is shared across head analysis variants.
+        # Keep the face-only consistency view separate; dropping it from a
+        # complete result cache would incorrectly share True/False outcomes.
+        body = session.observe_native(source, native, model='rtmpose_body7',
+            arguments={'bbox_xywh':list(box)})
+        from .body_pose_2d import pose_face_anchor_consistency
+        face_consistent=pose_face_anchor_consistency(body,face_box)
         points = body.upper_body_xyc if body is not None and body.reason == 'observed' else ()
         people.append(OwnedPersonObservation(index,box,points,confidence,
             pose_crop_xywh=None if body is None else body.pose_crop_xywh,
             source_pixel_to_pose_input_affine=() if body is None else body.source_pixel_to_pose_input_affine,
             raw_pose_xyc=() if body is None else body.raw_keypoints_xyc,
             pose_reason='pose_model_unavailable' if body is None else body.reason,
-            face_anchor_consistent=None if body is None else body.face_anchor_consistent))
+            face_anchor_consistent=face_consistent))
     people,owners=bind_person_ownership(tuple(people),heads,(width,height))
     heads=tuple(replace(head,candidate_body_observation_ids=tuple(owners[head.observation_id])) for head in heads)
     return snapshot('head_model_unavailable_or_detection_overflow' if head_missing else

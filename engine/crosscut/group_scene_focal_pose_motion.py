@@ -29,6 +29,11 @@ POLICY=dict(contract='registered_pose_and_separate_image_contradiction_sensor_v1
     maximum_working_forward_backward_error=1.25,
     maximum_pose_image_residual_shoulder_fraction=.18,
     minimum_pose_image_residual_working_pixels=2.,
+    part_roi_maximum_features=16,part_roi_feature_bins=4,
+    part_roi_feature_sampling='bounded_equal_longitudinal_bins_v1',
+    part_roi_minimum_observed_features=3,
+    part_roi_minimum_longitudinal_coverage=.35,
+    part_roi_shoulder_span_radius_fraction=.08,part_roi_minimum_radius=6.,part_roi_maximum_radius=15.,
     mandatory_lk_corners_per_joint=False,missing_lk_is_not_zero_or_pixel_verification=True,
     calibrated_anatomy_or_professional_quality=False)
 
@@ -110,7 +115,157 @@ def _working(pixels):
     return cv2.cvtColor(pixels,cv2.COLOR_BGR2GRAY)
 
 
-def image_pose_contradiction(previous_pixels,current_pixels,previous_person,current_person,required_joints):
+def _required_bones(required_joints):
+    return tuple((name,(a,b)) for name,joints in ARM_JOINTS.items() if set(joints)<=set(required_joints)
+        for a,b in zip(joints,joints[1:]))
+
+
+def _bone_geometry(previous,current,joints,size):
+    before=np.asarray([previous.raw_pose_xyc[n][:2] for n in joints],float)*size
+    after=np.asarray([current.raw_pose_xyc[n][:2] for n in joints],float)*size
+    span=float(np.linalg.norm((np.asarray(previous.raw_pose_xyc[6][:2])-
+        previous.raw_pose_xyc[5][:2])*size))
+    radius=min(POLICY['part_roi_maximum_radius'],max(POLICY['part_roi_minimum_radius'],
+        span*POLICY['part_roi_shoulder_span_radius_fraction']))
+    return before,after,radius
+
+
+def _bone_projection(points,bone):
+    vector=bone[1]-bone[0];length=float(np.linalg.norm(vector))
+    if length<1.:
+        return None,None,None
+    unit=vector/length;normal=np.asarray((-unit[1],unit[0]))
+    offsets=np.asarray(points,float)-bone[0]
+    return (offsets*unit).sum(axis=-1)/length,(offsets*normal).sum(axis=-1),normal
+
+
+def _bone_constraint_summary(value,previous,current,size,limit):
+    """Rederive conditional regional-flow algebra, not a physical arm mask."""
+    name=value['part_name'];joints=tuple(value['raw_joint_indices'])
+    before,after,radius=_bone_geometry(previous,current,joints,size)
+    attempts=value['attempts']
+    if (not isinstance(attempts,list) or len(attempts)>POLICY['part_roi_maximum_features']
+            or value['corridor_half_width_working_pixels']!=radius):
+        raise ValueError('required part image constraint changed its bounded native ROI')
+    usable=[];residuals=[]
+    for attempt in attempts:
+        if (not isinstance(attempt,dict) or not isinstance(attempt.get('source_feature_xy'),list)
+                or len(attempt['source_feature_xy'])!=2
+                or any(type(v) not in (int,float) for v in attempt['source_feature_xy'])):
+            raise ValueError('part image feature requires exact finite numeric coordinates')
+        point=np.asarray(attempt['source_feature_xy'],float)
+        if point.shape!=(2,) or not np.isfinite(point).all() or np.any(point<0) or np.any(point>=size):
+            raise ValueError('required part feature must be on its actual native working raster')
+        alpha,beta,_=_bone_projection((point,),before)
+        if alpha is None:
+            raise ValueError('degenerate model bone cannot own an image motion constraint')
+        nearest=before[0]+np.clip(alpha[0],0,1)*(before[1]-before[0])
+        if float(np.linalg.norm(point-nearest))>radius+1e-8:
+            raise ValueError('required part feature escaped the actual model-bone image corridor')
+        target=attempt['tracked_target_xy'];back=attempt['backward_feature_xy']
+        statuses=(attempt['forward_lk_succeeded'],attempt['backward_lk_succeeded'])
+        if any(type(flag) is not bool for flag in statuses):
+            raise ValueError('part image flow must keep its actual forward/backward status')
+        vectors=[]
+        for vector in (target,back):
+            if vector is None:vectors.append(None)
+            else:
+                if (not isinstance(vector,list) or len(vector)!=2
+                        or any(type(v) not in (int,float) for v in vector)):
+                    raise ValueError('part image flow requires exact numeric coordinates')
+                vector=np.asarray(vector,float)
+                if vector.shape!=(2,) or not np.isfinite(vector).all():
+                    raise ValueError('part image flow coordinates are malformed')
+                vectors.append(vector)
+        target,back=vectors
+        observed=all(statuses) and target is not None and back is not None
+        fb=float(np.linalg.norm(back-point)) if observed else None
+        observed=bool(observed and fb<=POLICY['maximum_working_forward_backward_error']
+            and np.all(target>=0) and np.all(target<size))
+        _,_,normal=_bone_projection((after[0],),after)
+        if observed and normal is not None:
+            predicted=after[0]+alpha[0]*(after[1]-after[0])+beta[0]*normal
+            residual=float(np.linalg.norm(target-predicted))
+            usable.append(float(alpha[0]));residuals.append(residual)
+    coverage=max(usable)-min(usable) if usable else 0.
+    enough=(len(usable)>=POLICY['part_roi_minimum_observed_features']
+        and coverage>=POLICY['part_roi_minimum_longitudinal_coverage'])
+    median=float(np.median(residuals)) if enough else None
+    contradiction=bool(enough and median>limit)
+    return dict(part_name=name,raw_joint_indices=list(joints),corridor_half_width_working_pixels=radius,
+        observed_feature_count=len(usable),longitudinal_coverage=coverage,
+        median_model_image_residual_working_pixels=median,
+        status=('observed_contradiction' if contradiction else 'observed_compatible' if enough else 'unknown'),
+        contradiction=contradiction)
+
+
+def _spatial_bone_features(image,mask,before,*,budget):
+    """Observe the bone's length, not just its strongest texture cluster.
+
+    The total feature cap and flow/admission limits are unchanged. Per-bin
+    relative corner detection keeps weak but real local structure observable;
+    empty bins stay empty. Sampling is fixed before any tracking outcome.
+    """
+    ys,xs=np.nonzero(mask)
+    if not len(xs):return None
+    alpha,_,_=_bone_projection(np.column_stack((xs,ys)),before)
+    if alpha is None:return None
+    count=POLICY['part_roi_feature_bins']
+    bins=np.minimum(count-1,np.maximum(0,np.floor(alpha*count).astype(int)))
+    points=[]
+    for index in range(count):
+        selected=bins==index
+        if not np.any(selected):continue
+        region=np.zeros_like(mask);region[ys[selected],xs[selected]]=255
+        if budget is not None:budget.spend('pose_comparisons')
+        value=cv2.goodFeaturesToTrack(image,maxCorners=POLICY['part_roi_maximum_features']//count,
+            qualityLevel=.01,minDistance=3.,mask=region,blockSize=5)
+        if value is not None:points.extend(value)
+    return np.asarray(points,np.float32).reshape(-1,1,2) if points else None
+
+
+def _part_image_constraints(a,b,previous,current,required_joints,opts,limit,budget):
+    """Local bone corridors, not a whole-body rigid affine or mandatory joint corners.
+
+    Several actual two-dimensional image features must span each required
+    bone. Remote texture cannot fill an unobserved arm. This remains a
+    model-conditioned consistency sensor, never an anatomical support mask.
+    """
+    h,w=a.shape;size=np.asarray((w,h),float);result=[]
+    for name,joints in _required_bones(required_joints):
+        before,after,radius=_bone_geometry(previous,current,joints,size)
+        mask=np.zeros_like(a)
+        low=np.maximum(0,np.floor(before.min(0)-radius).astype(int))
+        high=np.minimum((w,h),np.ceil(before.max(0)+radius+1).astype(int))
+        if np.all(high>low) and np.linalg.norm(before[1]-before[0])>=1.:
+            xx,yy=np.meshgrid(np.arange(low[0],high[0]),np.arange(low[1],high[1]))
+            points=np.column_stack((xx.ravel(),yy.ravel()))
+            alpha,_,_=_bone_projection(points,before)
+            nearest=before[0]+np.clip(alpha,0,1)[:,None]*(before[1]-before[0])
+            selected=np.linalg.norm(points-nearest,axis=1)<=radius
+            mask[low[1]:high[1],low[0]:high[0]]=selected.reshape(xx.shape).astype(np.uint8)*255
+        points=_spatial_bone_features(a,mask,before,budget=budget)
+        attempts=[]
+        if points is not None:
+            if budget is not None:budget.spend('pose_comparisons',len(points))
+            forward,fs,_=cv2.calcOpticalFlowPyrLK(a,b,points,None,**opts)
+            backward,bs,_=(cv2.calcOpticalFlowPyrLK(b,a,forward,None,**opts)
+                if forward is not None else (None,None,None))
+            for i,point in enumerate(points[:,0]):
+                finite=lambda data:data is not None and np.isfinite(data[i,0]).all()
+                attempts.append(dict(source_feature_xy=list(map(float,point)),
+                    tracked_target_xy=list(map(float,forward[i,0])) if finite(forward) else None,
+                    backward_feature_xy=list(map(float,backward[i,0])) if finite(backward) else None,
+                    forward_lk_succeeded=bool(fs is not None and fs[i,0] and finite(forward)),
+                    backward_lk_succeeded=bool(bs is not None and bs[i,0] and finite(backward))))
+        value=dict(part_name=name,raw_joint_indices=list(joints),
+            corridor_half_width_working_pixels=radius,attempts=attempts)
+        value.update(_bone_constraint_summary(value,previous,current,size,limit))
+        result.append(value)
+    return result
+
+
+def image_pose_contradiction(previous_pixels,current_pixels,previous_person,current_person,required_joints,*,budget=None):
     """Observe disagreement, not an anatomical part mask or mandatory corners.
 
     These are uncalibrated sensor-consistency diagnostics. An observable point
@@ -154,9 +309,12 @@ def image_pose_contradiction(previous_pixels,current_pixels,previous_person,curr
         attempts.append(dict(raw_joint_index=joint,lk_point_status='observed' if observed else 'unknown',
             forward_backward_error_working_pixels=fb,model_image_residual_working_pixels=residual,
             contradiction=bool(observed and residual>limit)))
+    parts=_part_image_constraints(a,b,previous_person,current_person,required_joints,opts,limit,budget)
     return dict(contract=POLICY['contract'],working_size=[w,h],roi_contrast_std=contrasts,
         image_supported=image_supported,model_image_residual_limit_working_pixels=limit,
-        attempts=attempts,contradiction=any(p['contradiction'] for p in attempts),
+        attempts=attempts,required_part_image_constraints=parts,
+        required_part_motion_constrained=bool(parts and all(p['status']=='observed_compatible' for p in parts)),
+        contradiction=any(p['contradiction'] for p in (*attempts,*parts)),
         anatomical_part_support_certified=False,arm_pixel_path_verified=False)
 
 
@@ -187,7 +345,7 @@ class SourceNativeFocalPoseSequenceV1:
             raise ValueError('focal model sequence omitted a native source step')
 
     @property
-    def reason(self):
+    def coordinate_reason(self):
         anchors=self.window.anchors
         for anchor,head in zip(anchors,self.head_ids,strict=True):
             owner=next((p for p in anchor.observation.people if p.observation_id==anchor.person_observation_id),None)
@@ -200,14 +358,23 @@ class SourceNativeFocalPoseSequenceV1:
             if any(anchor.joint_states[n]!=PoseJointObservationState.VISIBLE_SUPPORTED
                     or anchor.torso_local_xy[n] is None for n in self.window.duties.required_joint_indices):
                 return 'REQUIRED_MODEL_JOINT_UNKNOWN'
+        return None
+
+    @property
+    def reason(self):
+        if self.coordinate_reason is not None:return self.coordinate_reason
         checks=json.loads(self.image_checks_json)
         if not checks or any(c['image_supported'] is not True for c in checks):return 'NATIVE_ROI_IMAGE_UNSUPPORTED'
         if any(c['contradiction'] for c in checks):return 'MODEL_POSE_IMAGE_DISAGREEMENT'
+        if any(c['required_part_motion_constrained'] is not True for c in checks):
+            return 'REQUIRED_PART_IMAGE_MOTION_UNCONSTRAINED'
         return None
 
     def to_dict(self):
         return dict(contract=CONTRACT,policy_sha256=self.policy_sha256,
             measurement_available=self.reason is None,reason=self.reason,
+            model_coordinate_measurement_available=self.coordinate_reason is None,
+            required_motion_available=self.reason is None,
             native_pose_window=self.window.to_dict(),head_observation_ids=list(self.head_ids),
             native_frame_indices=[a.observation.native_frame_index for a in self.window.anchors],
             raw_observation_sha256=[a.observation.sha256 for a in self.window.anchors],
@@ -268,7 +435,7 @@ def measure_native_focal_sequence(*,sensors,rows,selected_head_ids,required_part
             before=next(p for p in a.people if p.observation_id==owners[i])
             after=next(p for p in b.people if p.observation_id==owners[i+1])
             sensors.session.budget.spend('pose_comparisons',len(required))
-            checks.append(dict(image_pose_contradiction(aa,bb,before,after,required),
+            checks.append(dict(image_pose_contradiction(aa,bb,before,after,required,budget=sensors.session.budget),
                 raw_pair=[a.sha256,b.sha256]))
             del aa,bb
     frozen=lambda value:json.dumps(value,sort_keys=True,allow_nan=False)
@@ -320,7 +487,10 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
         parts=required_part_names))
     cache=getattr(sensors,'focal_pose_native_cache',None)
     if cache is None:cache=sensors.focal_pose_native_cache={}
-    cache_key=(tuple(row.sha256 for row in rows),selected_head_ids,required_part_names,reference,policy_sha256())
+    # IDs are frame-local. The same pair of numbers in the same borrowed
+    # three-row window can select different people when its primary rows move.
+    primary_anchors=((first,selected_head_ids[0]),(last,selected_head_ids[1]))
+    cache_key=(tuple(row.sha256 for row in rows),primary_anchors,required_part_names,reference,policy_sha256())
     if cache_key not in cache:
         measured=measure_native_focal_sequence(sensors=sensors,rows=rows,
             selected_head_ids=((first-start,selected_head_ids[0]),(last-start,selected_head_ids[1])),
@@ -328,8 +498,16 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
         cache[cache_key]=measured
         sensors.session.budget.spend('pose_evidence_bytes',len(json.dumps(measured.to_dict(),sort_keys=True).encode()))
     measured=cache[cache_key];body_ids=[a.person_observation_id for a in measured.window.anchors]
+    for index,selected in ((first-start,selected_head_ids[0]),(last-start,selected_head_ids[1])):
+        anchor=measured.window.anchors[index]
+        owner=next((p for p in rows[index].people if p.observation_id==anchor.person_observation_id),None)
+        if (anchor.observation.sha256!=rows[index].sha256
+                or measured.head_ids[index] not in (selected,None)
+                or measured.reason is None and (owner is None
+                    or owner.unique_head_observation_id!=selected or measured.head_ids[index]!=selected)):
+            raise ValueError('cached registered pose primary owner differs from requested native anchor')
     output=[]
-    if measured.reason is None:
+    if measured.coordinate_reason is None:
         for tick in range(output_ticks[0],output_ticks[1]+1):
             native=state.native_frame_indices[tick-state.first_output_frame];index=native-start
             if not 0<=index<len(rows):
@@ -357,6 +535,8 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
         required_body_observation_ids=[[body_ids[first-start]],[body_ids[last-start]]],
         native_source_measurement=measured.to_dict(),actual_output_samples=output,
         measurement_available=measured.reason is None,reason=measured.reason,
+        model_coordinate_measurement_available=measured.coordinate_reason is None,
+        required_motion_available=measured.reason is None,
         source_native_velocity_basis='actual_raw17_native_seconds_not_output_phase',
         output_camera_velocity_basis='actual_projected_samples_at_renderer_output_seconds',
         repeated_native_samples_are_not_independent_observations=True,
@@ -369,7 +549,8 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
 def required_motion_available(value):
     """Explicit dispatch; never set old pixel-flow flags on new model evidence."""
     if not isinstance(value,dict):return False
-    if value.get('contract')==VIEW_CONTRACT:return value.get('measurement_available') is True
+    if value.get('contract')==VIEW_CONTRACT:
+        return value.get('measurement_available') is True and value.get('required_motion_available') is True
     from .group_scene_observations import JOINT_LINK_CONTRACT
     return value.get('contract')==JOINT_LINK_CONTRACT and value.get('complete_required_joint_paths') is True
 
@@ -387,6 +568,8 @@ def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domai
     from .render_frame_schedule import VerifiedRenderFrameClock
     if (not isinstance(value,dict) or value.get('contract')!=VIEW_CONTRACT
             or value.get('measurement_available') is not True or value.get('reason') is not None
+            or value.get('required_motion_available') is not True
+            or value.get('model_coordinate_measurement_available') is not True
             or value.get('state_key')!=state_key or value.get('required_body_scope')!='selected_focal_owner'
             or hypothesis['role'] not in ('focal_head','focal_head_and_observed_arms')
             or any(value.get(k) is not False for k in ('same_source_arm_pixel_path_verified',
@@ -483,6 +666,21 @@ def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domai
                 raise ValueError('unknown image support cannot become a zero/known motion cost')
             if attempt.get('contradiction') is not False:
                 raise ValueError('registered pose image contradiction was promoted to measured support')
+        part_constraints=check.get('required_part_image_constraints')
+        expected_bones=[(name,list(joints)) for name,joints in _required_bones(duties.required_joint_indices)]
+        if (not isinstance(part_constraints,list) or not part_constraints
+                or [(p.get('part_name'),p.get('raw_joint_indices')) for p in part_constraints]!=expected_bones
+                or check.get('required_part_motion_constrained') is not True):
+            raise ValueError('required part image motion is unconstrained or its original duty changed')
+        after_person=next((p for p in b.people if p.observation_id==owners[index+1]),None)
+        if after_person is None:raise ValueError('required part image motion lost its actual current owner')
+        for part in part_constraints:
+            summary=_bone_constraint_summary(part,person,after_person,
+                np.asarray((working_width,working_height),float),limit)
+            if (set(part)!=set(summary)|{'attempts'}
+                    or any(part.get(key)!=expected for key,expected in summary.items())
+                    or summary['status']!='observed_compatible'):
+                raise ValueError('required part image motion differs from its actual regional constraints')
         if check.get('contradiction') is not False:
             raise ValueError('registered pose image contradiction changed')
     graph=native_pose_association_graph(domain=domain,rows=rows)

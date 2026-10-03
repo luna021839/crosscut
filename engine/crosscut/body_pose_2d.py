@@ -14,7 +14,7 @@ Apache-2.0; the externally acquired model must retain its accompanying license.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 from pathlib import Path
@@ -132,6 +132,28 @@ class BodyPose2DEvidence:
                                          detection_confidence, values)
 
 
+def pose_face_anchor_consistency(evidence, face_bbox_xywh):
+    """Pure constraint view over a raw pose; never a second network forward.
+
+    Face analysis variants do not alter the top-down body tensor. They must
+    not lend one another their constraint result or modify cached raw joints.
+    This is a nose/face ROI check, not named or cross-camera identity.
+    """
+    if face_bbox_xywh is None:
+        return None
+    if not _valid_box(face_bbox_xywh):
+        raise ValueError('pose face constraint must fit normalized image bounds')
+    if evidence is None or evidence.reason != 'observed':
+        return None
+    raw=evidence.raw_keypoints_xyc
+    if (len(raw)!=17 or any(len(point)!=3 or any(not math.isfinite(v) for v in point) for point in raw)):
+        raise ValueError('pose face constraint requires the original finite raw17 model output')
+    x,y,confidence=raw[0]
+    fx,fy,fw,fh=face_bbox_xywh
+    distance=math.hypot((x-(fx+fw/2))/fw,(y-(fy+fh/2))/fh)
+    return bool(confidence>=.3 and distance<=.8)
+
+
 class BodyPose2DAnalyzer:
     """Lazy, locked inference on a caller-selected body; never an identity tracker."""
 
@@ -196,15 +218,9 @@ class BodyPose2DAnalyzer:
                 points, scores = _decode_outputs(outputs, center, scale)
             except (cv2.error, ValueError, FloatingPointError):
                 return BodyPose2DEvidence("pose_inference_failed", **base)
-        face_consistent = None
-        if face_bbox_xywh is not None:
-            fx, fy, fw, fh = face_bbox_xywh
-            center = np.asarray(((fx + fw / 2) * width, (fy + fh / 2) * height))
-            distance = float(np.linalg.norm((points[0] - center) / np.asarray((fw * width, fh * height))))
-            face_consistent = bool(scores[0] >= .3 and distance <= .8)
         values = tuple((float(points[i, 0] / width), float(points[i, 1] / height),
                         float(np.clip(scores[i], 0, 1))) for i in _BODY_JOINTS)
-        return BodyPose2DEvidence("observed", upper_body_xyc=values,
-            face_anchor_consistent=face_consistent,
+        raw = BodyPose2DEvidence("observed", upper_body_xyc=values,
             raw_keypoints_xyc=tuple((float(x/width),float(y/height),float(confidence))
                 for (x,y),confidence in zip(points,scores,strict=True)),**base)
+        return replace(raw,face_anchor_consistent=pose_face_anchor_consistency(raw,face_bbox_xywh))
