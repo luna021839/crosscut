@@ -16,7 +16,7 @@ from .group_joint_source_camera import joint_state_from_render_plan
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 
-CONTRACT='frozen_scene_source_camera_program_v4'
+CONTRACT='frozen_scene_source_camera_program_v5'
 
 
 def _path(plan,domain,rows):
@@ -99,6 +99,9 @@ def validate_program(program,dense):
         if original_duties['original_plan_identity']!=family.digest(family.plan_payload(original)):
             raise ValueError('selected scene original duties changed their original plan identity')
         numeric=render_plan_from_json(payload['numeric_plan'])
+        from .group_scene_edit_operations import validate_scene_edit_operations
+        validate_scene_edit_operations(payload.get('edit_operations'),original=original,proposed=numeric,
+            source_domain=dense['source_domain'],mutable_intervals=tuple(tuple(span) for span in dense['window_bounds'][1:-1]))
         support=payload['dependency_support']
         edges=tuple(support['retained_applied_look_edges'])
         validate_support(support,original,numeric,retained_applied_look_edges=edges)
@@ -230,8 +233,10 @@ def replay_selected_scene(context,candidate):
         work=session.budget.to_dict()
         observed_sources=sorted({row.request_source_index for row in sensors.raw_rows.values()})
     family._fresh(context)
-    return dict(contract='independent_selected_scene_program_replay_v2',
+    return dict(contract='independent_selected_scene_program_replay_v3',
         selected_program_sha256=program['program_sha256'],fresh_complete_family_equal=True,
+        source_and_camera_edit_operations_independently_rederived=True,
+        selected_edit_operations_sha256=program['edit_operations']['operations_sha256'],
         selected_and_original_hypotheses_reobserved=True,unselected_donor_search_repeated=False,
         unselected_discovery_archive_preserved_not_reobserved=True,
         referenced_discovery_archive_preserved=True,

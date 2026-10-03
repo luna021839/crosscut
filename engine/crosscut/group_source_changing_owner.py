@@ -1,4 +1,4 @@
-"""Normal-app whole-shot SOURCE alternatives with fresh retained families.
+"""Normal-app whole-shot SOURCE/CAMERA edits with fresh retained families.
 
 This is a bounded, inspectable focal-camera producer, NOT a named-performer,
 choreographic-phase, physical-head-mask or professional-edit authority.  The
@@ -519,11 +519,21 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         from .group_scene_source_owner import validate_bound_derivative_path
         validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
     old=context.incumbent
+    scene = getattr(sensors,'scene_family',False)
     # Numeric assembly and scope size are knowable BEFORE expensive projected
     # descriptors, look fitting or native family refresh. The materializer
     # independently derives the same scope below; no oversized path gets work.
     from .group_scene_dependency_support import derive_support
     numeric,planned_changed=_assembler(path)(plan=old.render_plan,domain=context.domain,path=path)
+    planned_operations=None
+    if scene:
+        from .group_scene_edit_operations import derive_scene_edit_operations
+        planned_operations=derive_scene_edit_operations(original=old.render_plan,proposed=numeric,
+            domain=context.domain,mutable_intervals=tuple((s.first_output_frame,s.end_output_frame) for s in path[1:-1]))
+        if not planned_operations['has_numeric_edit']:
+            raise ValueError('scene completion requires an actual source/camera edit before descriptor work')
+    elif not any(numeric.segments[i].source_index!=old.render_plan.segments[i].source_index for i in planned_changed):
+        raise ValueError('legacy source-changing owner requires an actual source change')
     retained_look_edges=tuple(sorted(d.boundary_index for d in old.boundary_look_match.decisions if d.applied))
     planned_support=derive_support(old.render_plan,numeric,retained_applied_look_edges=retained_look_edges)
     if len(planned_support['descriptor_refresh_cells'])>MAX_REFRESHED_CELLS:
@@ -536,8 +546,8 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     proposed,changed=observations.plan,observations.changed_segment_indices
     if (proposed!=numeric or changed!=planned_changed or observations.dependency_support!=planned_support):
         raise ValueError('source family descriptor work changed its preflight numeric/dependency scope')
-    if not changed or not any(proposed.segments[i].source_index!=old.render_plan.segments[i].source_index for i in changed):
-        raise ValueError('source-changing owner requires an actual source change')
+    if not changed:
+        raise ValueError('source/camera completion has no numeric changed cells')
     refreshed=observations.refreshed_segment_indices
     if len(refreshed)>MAX_REFRESHED_CELLS: raise ValueError('source-family refresh cell budget exceeded')
     edges=tuple(sorted({e for i in changed for e in (i-1,i) if 0<=e<len(proposed.transitions)}))
@@ -546,7 +556,6 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     plan,look,look_evidence=family.refresh_look(old,proposed,edges,session,context.domain)
     if geometry_payload(plan)!=geometry_payload(proposed):
         raise ValueError('look refresh changed an admitted source clock/camera')
-    scene = getattr(sensors,'scene_family',False)
     final_states=tuple((fixed_neighbor_state_from_render_plan if scene and i in (0,len(path)-1)
         else joint_state_from_render_plan)(plan=plan,domain=context.domain,slot=s.slot,
         first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
@@ -574,7 +583,8 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     selected_program=None
     if scene:
         selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json(),
-            original_numeric_plan=old.render_plan.to_json(),dependency_support=planned_support)
+            original_numeric_plan=old.render_plan.to_json(),dependency_support=planned_support,
+            edit_operations=planned_operations)
         if family.digest(selected_program['selected_states']) != family.digest([s.to_dict() for s in path]):
             raise ValueError('scene completion changed the frozen selected program')
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
@@ -951,6 +961,9 @@ def final_live_replay(plan_json,receipt,deadline):
             from .group_scene_original_duties import freeze_original_duty_program
             program=receipt['selected_scene_program']
             original_plan=render_plan_from_json(program['original_numeric_plan'])
+            from .group_scene_edit_operations import validate_scene_edit_operations
+            validate_scene_edit_operations(program['edit_operations'],original=original_plan,proposed=plan,
+                source_domain=raw,mutable_intervals=tuple(tuple(span) for span in dense['window_bounds'][1:-1]))
             baseline=_path(original_plan,domain,program['baseline_states'])
             original_groups=[]
             for index,state in enumerate(baseline):

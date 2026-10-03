@@ -43,7 +43,7 @@ from crosscut.ive import AspectRatio
 from crosscut.optional_native_worker import isolated_optional, optional_native_scope
 from crosscut.pipeline import _review_first_group_bundle, _validate_review_first_group_bundle
 from crosscut.render import (RenderSegment, RenderTransition, PanCropTrack, PanCropKeyframe,
-    NormalizedCrop, render, segment_frame_counts)
+    NormalizedCrop, EditorialTransformTrack, EditorialTransformKeyframe, render, segment_frame_counts)
 from crosscut.render_frame_schedule import probe_render_frame_clock
 from crosscut.review_first_runtime import ReviewFirstRuntime
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
@@ -269,6 +269,18 @@ def scene_chart_selected_replay(context,candidate):
     with scene_chart_sensors():return replay_selected_scene.__wrapped__(context,candidate)
 
 
+@isolated_optional()
+def camera_chart_selected_replay(context,candidate):
+    from crosscut.group_scene_selected_replay import replay_selected_scene
+    with source_chart_sensors():return replay_selected_scene.__wrapped__(context,candidate)
+
+
+def camera_only_chart_window(prepared,limit):
+    """Explicit legal larger/smaller/larger chart scope, not production policy."""
+    return tuple((i,item) for i,item in enumerate(prepared)
+        if len(item[0])==3 and item[0][1].eligible_source_index==2)
+
+
 class ScenePureContractTests(unittest.TestCase):
     def test_unknown_and_same_family_are_not_independent(self):
         result=scene_derivative_fixture(3)
@@ -355,6 +367,123 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         rows=dense['scene_discovery']['native_rows']
         self.assertEqual({r['request_source_index'] for r in rows},set(range(8)))
         self.assertTrue(any(not b['focal_assignment_unique'] for b in receipt['search']['baseline_components'].values()))
+
+    def test_same_source_camera_reaches_normal_completion_parent_and_final(self):
+        # Restrict numeric proposals to the original source, not the measured
+        # geometry/gain/dense/descriptor/look gates. The actual normal owner
+        # must find a real camera edit; chart model outputs are explicit fixtures.
+        original_hypothesis=source._hypothesis
+        def same_source(context,incumbent,index,track=None):
+            if index!=incumbent.eligible_source_index:
+                raise ValueError('EXPLICIT_TEST_CAMERA_ONLY_NUMERIC_SOURCE_DOMAIN')
+            return original_hypothesis(context,incumbent,index,track)
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),source_chart_sensors(), \
+                patch.object(scene,'time_stratified_window_frontier',side_effect=camera_only_chart_window), \
+                patch.object(source,'_hypothesis',side_effect=same_source):
+            candidate=scene.propose_scene_changes(context)
+            if isinstance(candidate,family.PerformerFamilyRejection):
+                evidence=family.plain(candidate.evidence)
+                summary=dict(error=candidate.error,complete_alternative_errors=sorted({
+                    row.get('error','') for row in evidence.get('candidate_alternatives',())}),
+                    graph_counts=[(row['window'],row.get('path_count')) for row in evidence.get('attempts',())
+                        if row.get('stage')=='scene_graph'],
+                    edge_prefix=[dict(baseline={str(key):value.get('metrics') for key,value
+                            in graph.get('baseline_components',{}).items()},
+                        edges=[{key:edge.get(key) for key in ('available','metrics','reason','source_relation')}
+                            for edge in graph.get('edge_observations',())[:8]])
+                        for graph in evidence.get('attempts',()) if graph.get('stage')=='scene_graph'][:1])
+                self.fail(json.dumps(summary))
+            receipt=family.plain(candidate.performer_family_review)
+            self.assertEqual([s.source_index for s in candidate.render_plan.segments],
+                [s.source_index for s in context.incumbent.render_plan.segments])
+            operations=receipt['selected_scene_program']['edit_operations']
+            self.assertTrue(operations['camera_only_program'])
+            self.assertTrue(operations['distinct_camera_transition_count_not_inferred'])
+            self.assertFalse(operations['request_budget_restarted'])
+            self.assertTrue(any(row['operation']=='CAMERA' for row in operations['actual_shot_operations']))
+            family.validate_bundle_binding(candidate)
+            from crosscut.group_scene_selected_replay import replay_selected_scene
+            with patch.object(__import__('crosscut.group_scene_selected_replay',fromlist=['replay_selected_scene']),
+                    'replay_selected_scene',camera_chart_selected_replay):
+                proof=source.validate_parent(candidate,context)
+            self.assertTrue(proof['fresh_complete_family_equal'])
+            self.assertTrue(proof['source_and_camera_edit_operations_independently_rederived'])
+            self.assertFalse(proof['quality_approved'])
+            metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90.)
+            self.assertTrue(family.qa_metrics_valid(metrics))
+            self.assertFalse(metrics['quality_approved'])
+
+    def test_same_source_keep_does_not_reach_dense_or_restart_work(self):
+        original_hypothesis=source._hypothesis
+        def keep(context,incumbent,index,track=None):
+            if index!=incumbent.eligible_source_index:
+                raise ValueError('EXPLICIT_TEST_KEEP_NUMERIC_SOURCE_DOMAIN')
+            return original_hypothesis(context,incumbent,index,None)
+        context=replace(self.context,deadline=monotonic()+90.)
+        with optional_native_scope(context.deadline),source_chart_sensors(), \
+                patch.object(scene,'time_stratified_window_frontier',side_effect=camera_only_chart_window), \
+                patch.object(source,'_hypothesis',side_effect=keep):
+            result=scene.propose_scene_changes(context)
+        self.assertIsInstance(result,family.PerformerFamilyRejection)
+        evidence=family.plain(result.evidence)
+        self.assertEqual(evidence['candidate_alternatives'],[])
+        self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
+
+    def test_old_source_only_eligibility_starves_the_valid_camera_control(self):
+        # Exact old eligibility criterion, explicitly a local counterfactual.
+        # Use the SAME numeric/sensor/geometry scope as the positive case above.
+        original_hypothesis=source._hypothesis
+        def same_source(context,incumbent,index,track=None):
+            if index!=incumbent.eligible_source_index:
+                raise ValueError('EXPLICIT_TEST_CAMERA_ONLY_NUMERIC_SOURCE_DOMAIN')
+            return original_hypothesis(context,incumbent,index,track)
+        def old_criterion(original,proposed):
+            return any(a.eligible_source_index!=b.eligible_source_index
+                for a,b in zip(original,proposed,strict=True))
+        context=replace(self.context,deadline=monotonic()+90.)
+        with optional_native_scope(context.deadline),source_chart_sensors(), \
+                patch.object(scene,'time_stratified_window_frontier',side_effect=camera_only_chart_window), \
+                patch.object(source,'_hypothesis',side_effect=same_source), \
+                patch.object(scene,'path_has_numeric_edit',side_effect=old_criterion):
+            result=scene.propose_scene_changes(context)
+        self.assertIsInstance(result,family.PerformerFamilyRejection)
+        evidence=family.plain(result.evidence)
+        self.assertEqual(evidence['candidate_alternatives'],[])
+        self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
+
+    def test_camera_only_endpoint_match_cannot_hide_clipped_interior(self):
+        original_hypothesis=source._hypothesis
+        def clipped(context,incumbent,index,track=None):
+            if index!=incumbent.eligible_source_index:
+                raise ValueError('EXPLICIT_TEST_CAMERA_ONLY_NUMERIC_SOURCE_DOMAIN')
+            if track is not None:
+                # Keep all four cut-anchor frames unchanged. The actual
+                # renderer camera has a bad interior, not a patched dense gate.
+                times=(0.,.1,.3,.9,1.4,56/30,59/30)
+                keys=[]
+                for time in times:
+                    old=track.evaluate(time)
+                    keys.append(EditorialTransformKeyframe(time,2.,.26,.5) if time==.9 else
+                        EditorialTransformKeyframe(time,old.zoom,old.center_x,old.center_y,old.roll_degrees))
+                track=EditorialTransformTrack(tuple(keys))
+            return original_hypothesis(context,incumbent,index,track)
+        context=replace(self.context,deadline=monotonic()+90.)
+        with optional_native_scope(context.deadline),source_chart_sensors(), \
+                patch.object(scene,'time_stratified_window_frontier',side_effect=camera_only_chart_window), \
+                patch.object(source,'_hypothesis',side_effect=clipped):
+            result=scene.propose_scene_changes(context)
+        self.assertIsInstance(result,family.PerformerFamilyRejection)
+        evidence=family.plain(result.evidence)
+        self.assertGreater(evidence['native_work']['counts']['dense_paths'],0,
+            'negative control never reached interior checking: '+json.dumps({
+                'alternatives':[row.get('error') for row in evidence['candidate_alternatives']],
+                'graph_counts':[(row['window'],row.get('path_count')) for row in evidence['attempts']
+                    if row.get('stage')=='scene_graph']}))
+        self.assertTrue(any('clip' in row.get('error','') or 'crop' in row.get('error','')
+            for row in evidence['candidate_alternatives']))
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
 
     def test_normal_owner_freezes_original_program_before_any_donor_native_query(self):
         from crosscut.group_joint_source_camera import joint_state_from_render_plan

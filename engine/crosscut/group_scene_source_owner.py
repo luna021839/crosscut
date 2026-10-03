@@ -15,6 +15,7 @@ from . import group_source_changing_owner as source
 from .group_scene_observations import (SceneSensors, compare_scene_edge,
     coherent_baseline, preserves_known, has_editorial_gain, DENSE_CONTRACT)
 from .group_scene_observations import VARIANTS, scene_anchor_ticks, MAX_HYPOTHESES_PER_SPAN
+from .group_scene_edit_operations import path_has_numeric_edit
 from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget,JointGroupBudgetExhausted
 from .group_joint_observations import GroupJointObservationSession
 from .face_match import FaceMatchConfig
@@ -625,10 +626,10 @@ def propose_scene_changes(context):
                     known[index]=coherent_baseline(values,focal_assignment_unique=unique)
             paths=[]
             for path in product(lefts,*groups,rights):
-                # An unchanged-source path cannot become this owner's result;
-                # do not let it consume scarce edge/dense/family refresh work.
-                if not any(old.eligible_source_index!=new.eligible_source_index
-                        for old,new in zip(baseline[1:-1],path[1:-1],strict=True)):
+                # CAMERA and SOURCE share original duties and this native
+                # session. A face/hypothesis-only rebind or KEEP gets no new
+                # edge/dense work. Camera edits do NOT mint distinct sources.
+                if not path_has_numeric_edit(baseline[1:-1],path[1:-1]):
                     continue
                 measured=[];decision=None
                 try:
@@ -656,7 +657,7 @@ def propose_scene_changes(context):
                 alternative=dict(states=[s.to_dict() for s in path],status='dense_pending');alternatives.append(alternative)
                 try:
                     assembled,changed=source._assembler(path)(plan=plan,domain=context.domain,path=path)
-                    if not any(assembled.segments[i].source_index!=plan.segments[i].source_index for i in changed):continue
+                    if not changed:continue
                     # Transitional consumer: the existing local sensor path is
                     # still 3/4 states. Its numeric proposal must ALSO close on
                     # explicit global units before dense/completion. The new

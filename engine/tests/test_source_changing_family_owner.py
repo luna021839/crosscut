@@ -161,7 +161,9 @@ class SourceChangingFamilyTests(unittest.TestCase):
         self.assertEqual(len(calls),2)
         self.assertEqual(cas.call_count,1)
         self.assertEqual(controller.transaction_token().revision,token.revision+1)
-        archive=json.loads((self.root/'source-transaction.json').read_text())
+        # Durable archives retain the lossless native wire view. Compare the
+        # complete expanded schema, not the storage packet to a public bundle.
+        archive=family.plain(json.loads((self.root/'source-transaction.json').read_text()))
         self.assertEqual(archive['original_bundle'],self.bundle.to_dict())
         self.assertEqual(archive['candidate_bundle'],candidate.to_dict())
         receipt=candidate.to_dict()['performer_family_review']
