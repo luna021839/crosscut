@@ -103,6 +103,10 @@ def validate_archive(program, dense):
         primitive_inventory=RegionPrimitiveInventory(archive['primitive_measurements'])
         for attempt in archive['primitive_measurements']['attempts']:
             binding=primitive_inputs(attempt);refs=binding.get('raw_pair')
+            from .group_scene_head_pixel_flow import LABELS as HEAD_LABELS,validate_head_primitive_inputs
+            if attempt['label'] in HEAD_LABELS:
+                validate_head_primitive_inputs(binding,attempt['label'],raw)
+                continue
             if (attempt['label'] not in ('opencv_region_gftt','opencv_region_lk_forward','opencv_region_lk_backward')
                     or not isinstance(refs,list) or len(refs)!=2 or any(ref not in raw for ref in refs)):
                 raise ValueError('primitive prefix borrowed absent source-native observation inputs')
@@ -116,8 +120,17 @@ def validate_archive(program, dense):
         if not isinstance(refs, list) or any(ref is not None and ref not in raw for ref in refs):
             raise ValueError('scene archive is missing a referenced original raw observation')
         return [None if ref is None else raw[ref] for ref in refs]
+    validated_head_views=set()
     def walk(value):
         if isinstance(value, dict):
+            from .group_scene_head_pixel_flow import CONTRACT as HEAD_CONTRACT,validate_head_pixel_link
+            if value.get('contract')==HEAD_CONTRACT:
+                if primitive_inventory is None:
+                    raise ValueError('head pixel view lost its committed primitive inventory')
+                identity=family.digest(value)
+                if identity not in validated_head_views:
+                    validate_head_pixel_link(value,primitive_inventory,raw)
+                    validated_head_views.add(identity)
             if value.get('contract')==REGION_CONTRACT and 'region_track_storage' in value:
                 if primitive_inventory is None:
                     raise ValueError('stored ROI view lost its committed primitive inventory')

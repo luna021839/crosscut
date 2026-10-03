@@ -28,7 +28,6 @@ from .group_joint_native_joint_flow import native_joint_pixel_flow_stream, nativ
 from .group_joint_person_ownership import trackable_person_ownership
 from .group_native_head_orientation import SUPPORTED_ANALYSIS_ROLLS
 from .boundary_subject_alignment import BoundarySubjectAlignmentConfig, _action_envelope, _close_face_head_envelope
-from .group_focal_attention import focal_landmarks_track
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
 
 SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
@@ -263,13 +262,10 @@ class SceneSensors(source.NativeFamilySensors):
                 raise ValueError('repeated native scene has conflicting raw observations')
             pairs = [(h.observation_id, h.observation_id) for h in a.heads]
         else:
-            aa = self.session.native_pixels(a.request_source_index, a.native_frame_index)
-            bb = self.session.native_pixels(b.request_source_index, b.native_frame_index)
-            pairs = []
-            for x, y in product(a.heads, b.heads):
-                self.session.budget.spend('pose_comparisons')
-                if focal_landmarks_track(aa, bb, x.landmarks_xy, y.landmarks_xy):
-                    pairs.append((x.observation_id, y.observation_id))
+            from .group_scene_head_pixel_flow import measure_head_pixel_links
+            value=measure_head_pixel_links(self,a,b)
+            self.link_cache[key]=value
+            return value
         # Keep ALL possible measured links. Resolve only one-to-one edges;
         # ambiguous edges are still archived and never get a fabricated cost.
         unique = tuple((x, y) for x, y in pairs
