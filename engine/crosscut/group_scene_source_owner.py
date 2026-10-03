@@ -147,12 +147,7 @@ def relation(binding, a, b):
     return matches[0]['status'] if len(matches)==1 else DERIVATIVE_UNCERTAIN
 
 
-def validate_bound_derivative_path(binding, source_indices):
-    """Enforce the same frozen distinct-pair contract in scene AND legacy fallback.
-
-    This checks the normal app's supplied evidence, not a fresh derivative
-    classification. An incomplete audit/UNKNOWN cannot buy a source switch.
-    """
+def _validated_derivative_source_count(binding):
     if not isinstance(binding,dict) or not isinstance(binding.get('audit'),dict):
         raise ValueError('source-changing derivative preimage is missing')
     audit=binding['audit'];payload=dict(audit);identity=payload.pop('audit_sha256',None)
@@ -161,11 +156,29 @@ def validate_bound_derivative_path(binding, source_indices):
     if (audit.get('production_ready') is not True or audit.get('clock_contract_complete') is not True
             or audit.get('family_consistency_conflict_count')!=0):
         raise ValueError('source-changing derivative clock/family audit is not ready')
-    count=len(audit['family_ids'])
-    if not 3<=len(source_indices)<=4 or any(type(i) is not int or not 0<=i<count for i in source_indices):
-        raise ValueError('source-changing derivative path uses another eligible index domain')
-    if any(relation(binding,a,b)!=DERIVATIVE_DISTINCT for a,b in zip(source_indices,source_indices[1:])):
+    return len(audit['family_ids'])
+
+
+def validate_bound_derivative_pairs(binding, source_pairs):
+    """Validate explicitly owned incident edges; gaps are never extra cuts.
+
+    This checks the normal app's supplied evidence, not a fresh classifier.
+    An incomplete audit/UNKNOWN cannot buy a source switch.
+    """
+    count=_validated_derivative_source_count(binding)
+    if (not isinstance(source_pairs,(list,tuple)) or not 1<=len(source_pairs)<=12
+            or any(not isinstance(pair,(list,tuple)) or len(pair)!=2
+                or any(type(i) is not int or not 0<=i<count for i in pair) for pair in source_pairs)):
+        raise ValueError('source-changing derivative pairs use another eligible index domain')
+    if any(relation(binding,a,b)!=DERIVATIVE_DISTINCT for a,b in source_pairs):
         raise ValueError('source-changing cut is duplicate/UNKNOWN, not a verified distinct-camera pair')
+
+
+def validate_bound_derivative_path(binding, source_indices):
+    """Legacy continuous three/four-state ownership remains unchanged."""
+    if not 3<=len(source_indices)<=4:
+        raise ValueError('source-changing derivative path uses another eligible index domain')
+    validate_bound_derivative_pairs(binding,tuple(zip(source_indices,source_indices[1:])))
 
 
 def round_robin(groups, limit):
@@ -310,7 +323,8 @@ def preserve_incumbent_required_parts(sensors, baseline, path, dense):
     if program is None:
         raise ValueError('scene source change has no presearch original duty programme')
     preserved=[]
-    for old,new,span in zip(baseline[1:-1],path[1:-1],dense,strict=True):
+    from .group_scene_execution_scope import mutable_states
+    for old,new,span in zip(mutable_states(baseline),mutable_states(path),dense,strict=True):
         for row in span['rows']:
             ref=duty_at(program,old,row['output_tick'])
             if row.get('original_duty_reference')!=ref:

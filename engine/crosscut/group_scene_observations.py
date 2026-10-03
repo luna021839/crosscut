@@ -543,8 +543,9 @@ class SceneSensors(source.NativeFamilySensors):
         return row,tuple(envelopes)
 
     def dense(self, path):
+        from .group_scene_execution_scope import mutable_states
         result = []
-        for state in path[1:-1]:
+        for state in mutable_states(path):
             hypothesis = self.hypothesis(state)
             if hypothesis.get('endpoint_scope', 'whole') != 'whole':
                 raise ValueError('mutable scene shot cannot borrow fixed-neighbor endpoint scope')
@@ -1265,6 +1266,11 @@ def validate_scene_dense(dense):
     hypotheses=dense.get('scene_hypotheses');keys=dense.get('hypothesis_keys')
     if not isinstance(hypotheses,dict) or not isinstance(keys,list) or len(keys)!=len(dense['state_keys']):
         raise ValueError('scene dense hypothesis inventory missing')
+    from .group_scene_execution_scope import dense_layout
+    mutable_indices,pair_indices=dense_layout(dense)
+    if (dense.get('global_execution_scope') is not None
+            and len(pair_indices)!=len(dense.get('incident_projected_observations',()))):
+        raise ValueError('scene dense lost its explicit incident edge inventory')
     for index, key in enumerate(keys):
         h=hypotheses.get(key)
         if not isinstance(h,dict) or family.digest(h)!=key or h.get('contract')!=SCENE_CONTRACT:
@@ -1275,7 +1281,8 @@ def validate_scene_dense(dense):
             raise ValueError('scene hypothesis role differs from its bound source span')
         scope=h.get('endpoint_scope','whole')
         validate_intent(h.get('shot_intent'),role=h['role'],first=h['span_key'][1],end=h['span_key'][2],endpoint_scope=scope)
-        allowed=('whole','exit') if index==0 else ('whole','entry') if index==len(keys)-1 else ('whole',)
+        allowed=(('whole',) if dense.get('global_execution_scope') is not None else
+            ('whole','exit') if index==0 else ('whole','entry') if index==len(keys)-1 else ('whole',))
         if scope not in allowed:
             raise ValueError('scene endpoint scope does not own this fixed/mutable position')
         expected=scene_anchor_ticks(h['span_key'][1],h['span_key'][2],scope)
@@ -1287,13 +1294,14 @@ def validate_scene_dense(dense):
             raise ValueError('scene hypotheses cannot become anatomy, identity, phase or quality proof')
     if program is not None:
         for index,edge in enumerate(dense.get('incident_projected_observations',())):
+            pair=pair_indices[index]
             rows=edge.get('rows');endpoints=edge.get('required_endpoint_evidence')
             if (index+1>=len(keys) or not isinstance(rows,list) or len(rows)!=4
                     or not isinstance(endpoints,list) or len(endpoints)!=2
                     or any(e.get('original_duty_program_sha256')!=program['program_sha256'] for e in endpoints)):
                 raise ValueError('scene incident lost the original required endpoint duty programme')
             for position,row in enumerate(rows):
-                side=position//2;h=hypotheses[keys[index+side]]
+                side=position//2;h=hypotheses[keys[pair[side]]]
                 first,end=h['span_key'][1:3]
                 expected_tick=(end-4,end-1)[position] if side==0 else (first,first+3)[position-2]
                 if row.get('output_tick')!=expected_tick or row.get('role')!=h['role']:
@@ -1309,7 +1317,7 @@ def validate_scene_dense(dense):
     for index,edge in enumerate(dense.get('incident_projected_observations',())):
         if index+1>=len(keys):raise ValueError('scene edge inventory exceeds its complete state path')
         validate_composition_edge_motion(edge,hypotheses=hypotheses,
-            hypothesis_keys=keys[index:index+2],state_keys=dense['state_keys'][index:index+2],
+            hypothesis_keys=[keys[i] for i in pair_indices[index]],state_keys=[dense['state_keys'][i] for i in pair_indices[index]],
             source_domain=dense['source_domain'])
     for index,edge in enumerate(dense.get('incident_projected_observations',())):
         endpoints=edge.get('required_endpoint_evidence')
@@ -1319,7 +1327,8 @@ def validate_scene_dense(dense):
         for offset,endpoint in enumerate(endpoints):
             view=endpoint.get('registered_pose_sequence')
             if view is None:continue
-            h=hypotheses[keys[index+offset]]
+            state_index=pair_indices[index][offset]
+            h=hypotheses[keys[state_index]]
             pair=view.get('primary_raw_observation_sha256')
             if (not isinstance(pair,list) or len(pair)!=2 or any(ref not in raw_inventory for ref in pair)
                     or endpoint.get('joint_pixel_link') is not None
@@ -1331,14 +1340,14 @@ def validate_scene_dense(dense):
                 raise ValueError('scene registered incident evidence borrowed another endpoint side')
             validate_focal_pose_view(view,raw_inventory[pair[0]],raw_inventory[pair[1]],
                 raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
-                state_key=dense['state_keys'][index+offset],original_duty_program=program)
-    for a,b in zip(keys,keys[1:]):
+                state_key=dense['state_keys'][state_index],original_duty_program=program)
+    for a,b in ((keys[i],keys[j]) for i,j in pair_indices):
         if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
             raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
     minimum=BoundarySubjectAlignmentConfig().minimum_face_visible_fraction
     def fraction(value):
         return type(value) in (int,float) and math.isfinite(value) and 0<=value<=1
-    for span,key in zip(dense['mutable_shots'],keys[1:-1],strict=True):
+    for span,key in zip(dense['mutable_shots'],[keys[i] for i in mutable_indices],strict=True):
         h=hypotheses[key]
         if (span['first_output_frame'],span['end_output_frame'],span['role'])!=(h['span_key'][1],h['span_key'][2],h['role']):
             raise ValueError('scene dense role/clock differs from frozen hypothesis')

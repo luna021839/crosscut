@@ -17,9 +17,14 @@ from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 
 CONTRACT='frozen_scene_source_camera_program_v5'
+GLOBAL_CONTRACT='frozen_global_scene_source_camera_program_v1'
 
 
-def _path(plan,domain,rows):
+def _path(plan,domain,rows,*,global_execution_scope=None,original_plan=None):
+    if global_execution_scope is not None:
+        from .group_scene_execution_scope import execution_path_from_payload
+        return execution_path_from_payload(original=original_plan,proposed=plan,domain=domain,
+            payload=global_execution_scope,rows=rows)
     if not isinstance(rows,list) or len(rows) not in (3,4):
         raise ValueError('selected scene program needs three/four complete states')
     states=[]
@@ -44,13 +49,16 @@ def validate_program(program,dense):
     if not isinstance(program,dict):
         raise ValueError('scene receipt has no frozen selected program')
     payload=dict(program);sha=payload.pop('program_sha256',None)
-    if (payload.get('contract')!=CONTRACT or payload.get('quality_approved') is not False
+    global_scope=payload.get('global_execution_scope')
+    global_execution=global_scope is not None
+    expected_contract=GLOBAL_CONTRACT if global_execution else CONTRACT
+    if (payload.get('contract')!=expected_contract or payload.get('quality_approved') is not False
             or sha!=family.digest(payload) or type(payload.get('composition_window')) is not bool
             or not isinstance(payload.get('numeric_plan'),dict)):
         raise ValueError('selected scene program hash/authority invalid')
     states=payload.get('selected_states');baseline=payload.get('baseline_states')
     groups=payload.get('baseline_hypothesis_keys');rolls=payload.get('analysis_rolls')
-    if (not isinstance(states,list) or len(states) not in (3,4)
+    if (not isinstance(states,list) or (not 1<=len(states)<=18 if global_execution else len(states) not in (3,4))
             or not isinstance(baseline,list) or len(baseline)!=len(states)
             or not isinstance(groups,list) or len(groups)!=len(states)
             or any(not isinstance(group,list) or any(not isinstance(key,str) or len(key)!=64
@@ -78,6 +86,8 @@ def validate_program(program,dense):
     original_duties=payload.get('original_duty_program')
     if original_duties is None or original_duties!=dense.get('original_duty_program'):
         raise ValueError('selected scene lost its presearch original duty programme')
+    if original_duties.get('global_execution_scope')!=global_scope:
+        raise ValueError('selected scene original duties lost their explicit original execution scope')
     validate_original_duty_program(original_duties,raw_inventory={family.digest(row):row
         for row in dense['scene_discovery']['native_rows']})
     units=original_duties['units']
@@ -99,9 +109,23 @@ def validate_program(program,dense):
         if original_duties['original_plan_identity']!=family.digest(family.plan_payload(original)):
             raise ValueError('selected scene original duties changed their original plan identity')
         numeric=render_plan_from_json(payload['numeric_plan'])
+        if global_execution:
+            from .group_scene_execution_scope import execution_path_from_payload
+            from .group_scene_edit_operations import numeric_replay_domain
+            selected=execution_path_from_payload(original=original,proposed=numeric,
+                domain=numeric_replay_domain(original,dense['source_domain']),payload=global_scope,rows=states)
+            execution_path_from_payload(original=original,proposed=original,
+                domain=numeric_replay_domain(original,dense['source_domain']),payload=global_scope,rows=baseline)
+            if (dense.get('global_execution_scope')!=global_scope
+                    or global_scope['source_domain']!=dense['source_domain']
+                    or dense.get('global_execution_original_numeric_plan')!=payload['original_numeric_plan']
+                    or dense.get('global_execution_selected_numeric_plan')!=payload['numeric_plan']):
+                raise ValueError('global scene completion changed its full original/selected numeric preimages')
+            mutable_intervals=selected.mutable_intervals
+        else:mutable_intervals=tuple(tuple(span) for span in dense['window_bounds'][1:-1])
         from .group_scene_edit_operations import validate_scene_edit_operations
         validate_scene_edit_operations(payload.get('edit_operations'),original=original,proposed=numeric,
-            source_domain=dense['source_domain'],mutable_intervals=tuple(tuple(span) for span in dense['window_bounds'][1:-1]))
+            source_domain=dense['source_domain'],mutable_intervals=mutable_intervals)
         support=payload['dependency_support']
         edges=tuple(support['retained_applied_look_edges'])
         validate_support(support,original,numeric,retained_applied_look_edges=edges)
@@ -133,8 +157,12 @@ def replay_selected_scene(context,candidate):
     from .group_scene_dependency_support import validate_support
     validate_support(program['dependency_support'],context.incumbent.render_plan,numeric,
         retained_applied_look_edges=retained_look_edges)
-    path=_path(numeric,context.domain,program['selected_states'])
-    baseline=_path(context.incumbent.render_plan,context.domain,program['baseline_states'])
+    global_scope=program.get('global_execution_scope')
+    options=dict(global_execution_scope=global_scope,original_plan=context.incumbent.render_plan)
+    path=_path(numeric,context.domain,program['selected_states'],**options)
+    baseline=_path(context.incumbent.render_plan,context.domain,program['baseline_states'],**options)
+    from .group_scene_execution_scope import (GlobalSceneExecutionPath,endpoint_scope,incident_pairs)
+    if isinstance(path,GlobalSceneExecutionPath):path.validate_external(context,context.domain)
     assembled,_=source._assembler(path)(plan=context.incumbent.render_plan,domain=context.domain,path=path)
     if assembled!=numeric:
         raise ValueError('selected scene numeric program changed an unrelated clock/camera/transition')
@@ -147,7 +175,7 @@ def replay_selected_scene(context,candidate):
         shots={(s.first_output_frame,s.end_output_frame):s
             for s in source.visible_group_shots(context.incumbent.render_plan,context.domain)}
         def scope(index):
-            return 'exit' if index==0 else 'entry' if index==len(path)-1 else 'whole'
+            return endpoint_scope(path,index)
         def derive(state,index):
             shot=shots.get((state.first_output_frame,state.end_output_frame))
             if shot is None:
@@ -169,14 +197,17 @@ def replay_selected_scene(context,candidate):
             raise ValueError('selected scene original baseline hypotheses changed')
         from .group_scene_original_duties import freeze_original_duty_program
         original_duties=freeze_original_duty_program(sensors,groups,
-            original_plan_identity=family.digest(family.plan_payload(context.incumbent.render_plan)))
+            original_plan_identity=family.digest(family.plan_payload(context.incumbent.render_plan)),
+            global_execution_scope=global_scope)
         if original_duties!=program['original_duty_program']:
             raise ValueError('selected scene fresh original required duty lifecycle changed')
         sensors.install_original_duty_program(original_duties)
-        for index,state in enumerate(path):
-            alternatives=derive(state,index)
-            if state.key not in {s.key for s in alternatives}:
-                raise ValueError('selected scene source/camera hypothesis is not freshly observed')
+        def derive_selected():
+            for index,state in enumerate(path):
+                alternatives=derive(state,index)
+                if state.key not in {s.key for s in alternatives}:
+                    raise ValueError('selected scene source/camera hypothesis is not freshly observed')
+        if not isinstance(path,GlobalSceneExecutionPath):derive_selected()
         edges={}
         def read(a,b):
             key=a.key,b.key
@@ -189,7 +220,10 @@ def replay_selected_scene(context,candidate):
                 edges[key]=value
             return edges[key]
         known={};reference=None
-        if program['composition_window']:
+        if isinstance(path,GlobalSceneExecutionPath):
+            from .group_scene_global_execution import global_original_reference,global_editorial_decision
+            reference,known=global_original_reference(sensors,baseline,groups,read)
+        elif program['composition_window']:
             reference=coherent_path_reference(groups,read)
             known={i:row if row is not None else dict(available=False,metrics=None)
                 for i,row in enumerate(reference['edges'])}
@@ -205,8 +239,10 @@ def replay_selected_scene(context,candidate):
                             source._dominant(sensors.raw(state,tick,None),state.role)
                     except ValueError:unique=False
                 known[index]=coherent_baseline(values,focal_assignment_unique=unique)
-        measured=[read(a,b) for a,b in zip(path,path[1:])]
-        decision=evaluate_composition_path(reference,measured) if program['composition_window'] else None
+        if isinstance(path,GlobalSceneExecutionPath):derive_selected()
+        measured=[read(a,b) for a,b in incident_pairs(path)]
+        decision=(global_editorial_decision(known,measured) if isinstance(path,GlobalSceneExecutionPath) else
+            evaluate_composition_path(reference,measured) if program['composition_window'] else None)
         if (decision is not None and not decision['admitted']
                 or decision is None and (not all(preserves_known(known[i],row) for i,row in enumerate(measured))
                     or not any(has_editorial_gain(known[i],row) for i,row in enumerate(measured)))):

@@ -139,7 +139,7 @@ def scene_derivative_fixture(count=8):
     return replace(value,audit_sha256=family.digest(value._payload(include_sha256=False)))
 
 
-def encode_scene_chart(path,*,variant,frames=360):
+def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False):
     """Distinct non-human raster patterns; eight files are not copied aliases."""
     base=path.with_suffix('.seed.mp4')
     encode_chart(base,variant=variant%2,frames=frames)
@@ -157,6 +157,13 @@ def encode_scene_chart(path,*,variant,frames=360):
             # not prove the real derivative classifier; its typed output is
             # explicitly substituted by scene_derivative_fixture.
             image[120:,:,:]=np.clip(40+(xx[120:]*((variant%3)+1)+yy[120:]*(variant+1))%100,0,255)[:,:,None]
+        if small_focal_marker:
+            # Actual fixture pixels, not detector/geometry/admission outputs.
+            # A distant late-shot mismatch must remain visible after tick 240.
+            cv2.rectangle(image,(110,34),(208,115),(45,45,45),-1)
+            cv2.rectangle(image,(131,52),(188,99),(52,192,52),-1)
+            for x,y in ((152,68),(168,68),(152,85),(168,85)):
+                cv2.circle(image,(x,y),2,(22,125,22),-1)
         # A per-file raster tag is not a claim of eight independent real cameras.
         image[-1,-(variant+1):,:]=(variant*20,20,40)
         images.append(image)
@@ -279,6 +286,89 @@ def camera_only_chart_window(prepared,limit):
     """Explicit legal larger/smaller/larger chart scope, not production policy."""
     return tuple((i,item) for i,item in enumerate(prepared)
         if len(item[0])==3 and item[0][1].eligible_source_index==2)
+
+
+def authored_global_chart_union(context,mutable_units=(2,6),*,clipped_interior=False):
+    """Fixture numeric input, not separate local completions or NN authority.
+
+    Endpoint cameras are fitted from decoded chart geometry. This fixture
+    authoring session is separate from the measured execution transaction;
+    neither its work nor chart detectors are claimed as production evidence.
+    """
+    from crosscut.group_scene_owned_program import (freeze_owned_scene_program,
+        own_scene_intervals,camera_unit_from_plan,assemble_owned_scene_union)
+    from crosscut.group_scene_execution_scope import execution_path_from_union
+    from crosscut.group_joint_observations import GroupJointObservationSession
+    from crosscut.group_joint_source_camera import JointGroupWorkBudget
+    program=freeze_owned_scene_program(context,context.domain)
+    allocation=own_scene_intervals(program,
+        mutable_unit_ids=tuple(program.units[i].unit_id for i in mutable_units),
+        maximum_mutable_units=6,maximum_mutable_frames=540)
+    original=context.incumbent.render_plan
+    original_cameras=tuple(camera_unit_from_plan(program=program,unit_id=unit_id,
+        plan=original,domain=context.domain) for unit_id in allocation.mutable_unit_ids)
+    baseline=execution_path_from_union(context,context.domain,assemble_owned_scene_union(
+        context=context,domain=context.domain,allocation=allocation,cameras=original_cameras))
+    segments=list(original.segments)
+    with GroupJointObservationSession(domain=context.domain,budget=JointGroupWorkBudget(
+            absolute_deadline=context.deadline,**source.WORK_LIMITS)) as session:
+        sensors=sensors_module.SceneSensors(session,source.installed_native_assets(context))
+        states=tuple(sensors.bind(s,sensors.discover(s,rolls=(None,),endpoint_scope='whole')[0])
+            for s in baseline)
+        for index in baseline.mutable_indices:
+            value=states[index];left,right=states[index-1],states[index+1]
+            original_unit_index=program.units.index(baseline.scoped_units[index])
+            if original_unit_index==2:
+                # Remove the genuinely non-neutral original boundary-2 camera.
+                # Admission must measure the gain; it is not asserted here.
+                camera=source._hypothesis(context,value,value.eligible_source_index,None)
+                first_cell=baseline.scoped_units[index].role_program['original_shot']['first_segment_index']
+                segments[first_cell:first_cell+len(camera.segments)]=camera.segments
+                continue
+            targets=(scene._target(sensors.frame(left,left.end_output_frame-1)),
+                scene._target(sensors.frame(right,right.first_output_frame)))
+            first,entry=sensors.mutable_camera_inputs(value,value.first_output_frame)
+            last,exit=sensors.mutable_camera_inputs(value,value.end_output_frame-1)
+            a,ta,_=source._at(value,value.first_output_frame)
+            b,tb,_=source._at(value,value.end_output_frame-1)
+            boxes=(source._base_box(scene._native_target(first),a,ta),
+                source._base_box(scene._native_target(last),b,tb))
+            envelopes=(tuple(source._base_box(box,a,ta) for box in entry),
+                tuple(source._base_box(box,b,tb) for box in exit))
+            proposal=source.propose_endpoint_focal_face_roi_camera(source_face_boxes=boxes,
+                fixed_neighbor_face_boxes=targets,frame_count=len(value.native_frame_indices),
+                fps=original.fps,required_endpoint_envelopes=envelopes,maximum_zoom=2.)
+            track=proposal.track
+            if clipped_interior and index==baseline.mutable_indices[-1]:
+                keys=[]
+                for time in (0.,.1,.3,.9,1.4,56/30,59/30):
+                    old=track.evaluate(time)
+                    keys.append(EditorialTransformKeyframe(time,2.,.26,.5) if time==.9 else
+                        EditorialTransformKeyframe(time,old.zoom,old.center_x,old.center_y,old.roll_degrees))
+                track=EditorialTransformTrack(tuple(keys))
+            camera=source._hypothesis(context,value,value.eligible_source_index,track)
+            first_cell=baseline.scoped_units[index].role_program['original_shot']['first_segment_index']
+            segments[first_cell:first_cell+len(camera.segments)]=camera.segments
+    selected=replace(original,segments=tuple(segments))
+    cameras=tuple(camera_unit_from_plan(program=program,unit_id=unit_id,
+        plan=selected,domain=context.domain) for unit_id in allocation.mutable_unit_ids)
+    return assemble_owned_scene_union(context=context,domain=context.domain,
+        allocation=allocation,cameras=cameras)
+
+
+def render_and_decode_chart(testcase,plan):
+    """Actual encoder/complete decode. Never a human editorial quality gate."""
+    render(plan,video_codec='libx264',video_bitrate='1M',
+        video_maxrate='2M',video_buffer_size='2M',maximum_runtime_seconds=30.)
+    cap=cv2.VideoCapture(str(plan.output));decoded=0
+    try:
+        while True:
+            ok,pixels=cap.read()
+            if not ok:break
+            testcase.assertEqual(pixels.shape[:2],(180,320))
+            decoded+=1
+    finally:cap.release()
+    testcase.assertEqual(decoded,plan.output_frame_count)
 
 
 class ScenePureContractTests(unittest.TestCase):
@@ -410,6 +500,7 @@ class SceneSourceIntegrationTests(unittest.TestCase):
             self.assertTrue(proof['fresh_complete_family_equal'])
             self.assertTrue(proof['source_and_camera_edit_operations_independently_rederived'])
             self.assertFalse(proof['quality_approved'])
+            render_and_decode_chart(self,candidate.render_plan)
             metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90.)
             self.assertTrue(family.qa_metrics_valid(metrics))
             self.assertFalse(metrics['quality_approved'])
@@ -854,6 +945,82 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(evidence['native_work']['counts']['dense_paths'],0)
         self.assertFalse(evidence['quality_approved'])
         self.assertIs(self.controller.incumbent,self.bundle)
+
+
+@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'local encode/decode tools required')
+class GlobalSceneSourceIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp=tempfile.TemporaryDirectory();cls.root=Path(cls.temp.name).resolve()
+        cls.paths=tuple(cls.root/f'global-{i}.mp4' for i in range(8))
+        for i,path in enumerate(cls.paths):
+            encode_scene_chart(path,variant=i,frames=540,small_focal_marker=i==6)
+        cls.bundle,cls.controller,cls.request,cls.model=build_scene_fixture(cls.root,cls.paths)
+        with optional_native_scope(monotonic()+600.),patch.object(family,'installed_pose_model',return_value=cls.model):
+            cls.context=family.freeze_context(controller=cls.controller,request=cls.request,
+                eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
+                scene_cut_times=((),)*8,sync_scores=(.93,.91)*4,source_derivatives=scene_derivative_fixture())
+
+    @classmethod
+    def tearDownClass(cls):cls.temp.cleanup()
+
+    def test_distant_global_camera_union_reaches_one_completion_parent_and_final(self):
+        from crosscut.group_scene_global_execution import complete_global_scene_program
+        from crosscut.group_scene_selected_replay import GLOBAL_CONTRACT
+        context=replace(self.context,deadline=monotonic()+180.)
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context)
+            candidate=complete_global_scene_program.__wrapped__(context,union)
+            if isinstance(candidate,family.PerformerFamilyRejection):
+                evidence=family.plain(candidate.evidence)
+                self.fail(json.dumps(dict(error=candidate.error,
+                    counts=evidence.get('native_work',{}).get('counts'),
+                    attempts=evidence.get('attempts',()))))
+            family.validate_bundle_binding(candidate)
+            receipt=family.plain(candidate.performer_family_review)
+            program=receipt['selected_scene_program']
+            self.assertEqual(program['contract'],GLOBAL_CONTRACT)
+            scope=program['global_execution_scope']
+            self.assertEqual(len(program['selected_states']),6)
+            self.assertEqual(scope['mutable_state_indices'],[1,4])
+            self.assertEqual(scope['incident_state_pair_indices'],[[0,1],[1,2],[3,4],[4,5]])
+            self.assertEqual(len(receipt['source_camera_refresh']['mutable_shots']),2)
+            self.assertEqual(receipt['search']['atomic_numeric_programmes_completed'],1)
+            self.assertFalse(receipt['search']['local_complete_bundles_concatenated'])
+            self.assertFalse(receipt['quality_approved'])
+            render_and_decode_chart(self,candidate.render_plan)
+            self.assertEqual([s.source_index for s in candidate.render_plan.segments],
+                [s.source_index for s in context.incumbent.render_plan.segments])
+            with patch.object(__import__('crosscut.group_scene_selected_replay',fromlist=['replay_selected_scene']),
+                    'replay_selected_scene',camera_chart_selected_replay):
+                proof=source.validate_parent(candidate,context)
+            self.assertTrue(proof['fresh_complete_family_equal'])
+            self.assertTrue(proof['source_and_camera_edit_operations_independently_rederived'])
+            self.assertFalse(proof['quality_approved'])
+            metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90.)
+            self.assertTrue(family.qa_metrics_valid(metrics))
+            self.assertFalse(metrics['quality_approved'])
+            destination=os.environ.get('SCENE_TEST_ARTIFACT_DIR')
+            if destination:
+                target=Path(destination);target.mkdir(parents=True,exist_ok=True)
+                (target/'global-chart-execution-proof.json').write_text(json.dumps(dict(
+                    fixture='EXPLICIT_NON_HUMAN_CHART_NOT_MODEL_OR_EDITING_QUALITY_PROOF',
+                    completion=receipt,parent=proof,final_native=metrics,
+                    actual_full_render_decoded_frames=candidate.render_plan.output_frame_count,
+                    actual_output_size=[candidate.render_plan.width,candidate.render_plan.height],
+                    human_media_rendered=False,quality_approved=False),indent=2))
+
+    def test_distant_global_camera_union_cannot_hide_clipped_interior(self):
+        from crosscut.group_scene_global_execution import complete_global_scene_program
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context,clipped_interior=True)
+            candidate=complete_global_scene_program.__wrapped__(context,union)
+        self.assertIsInstance(candidate,family.PerformerFamilyRejection)
+        evidence=family.plain(candidate.evidence)
+        self.assertGreater(evidence['native_work']['counts']['dense_paths'],0)
+        self.assertTrue('clip' in candidate.error or 'crop' in candidate.error,candidate.error)
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
 
 
 class SceneFormationPixelTests(unittest.TestCase):

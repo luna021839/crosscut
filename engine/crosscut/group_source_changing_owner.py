@@ -371,6 +371,8 @@ def _hypothesis(context,incumbent,source,track=None):
 
 
 def _assembler(path):
+    from .group_scene_execution_scope import GlobalSceneExecutionPath
+    if isinstance(path,GlobalSceneExecutionPath):return path.assemble
     return assemble_single_group_source_camera_state if len(path)==3 else assemble_joint_group_states
 
 
@@ -515,9 +517,16 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     from .pipeline import _deterministic_exact_shot_clock_from_timeline,_validate_review_first_group_bundle
     from .timeline_review import review_timeline
     from .group_transition import GroupTransitionPlan
+    from .group_scene_execution_scope import (GlobalSceneExecutionPath,mutable_states,incident_pairs,
+        MAX_REFRESHED_CELLS as GLOBAL_MAX_REFRESHED_CELLS)
+    global_execution=isinstance(path,GlobalSceneExecutionPath)
+    if global_execution:path.validate_external(context,context.domain)
     if context.source_derivative_binding is not None:
-        from .group_scene_source_owner import validate_bound_derivative_path
-        validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
+        from .group_scene_source_owner import validate_bound_derivative_path,validate_bound_derivative_pairs
+        if global_execution:
+            validate_bound_derivative_pairs(context.source_derivative_binding,
+                tuple((a.eligible_source_index,b.eligible_source_index) for a,b in incident_pairs(path)))
+        else:validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
     old=context.incumbent
     scene = getattr(sensors,'scene_family',False)
     # Numeric assembly and scope size are knowable BEFORE expensive projected
@@ -529,19 +538,20 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if scene:
         from .group_scene_edit_operations import derive_scene_edit_operations
         planned_operations=derive_scene_edit_operations(original=old.render_plan,proposed=numeric,
-            domain=context.domain,mutable_intervals=tuple((s.first_output_frame,s.end_output_frame) for s in path[1:-1]))
+            domain=context.domain,mutable_intervals=tuple((s.first_output_frame,s.end_output_frame) for s in mutable_states(path)))
         if not planned_operations['has_numeric_edit']:
             raise ValueError('scene completion requires an actual source/camera edit before descriptor work')
     elif not any(numeric.segments[i].source_index!=old.render_plan.segments[i].source_index for i in planned_changed):
         raise ValueError('legacy source-changing owner requires an actual source change')
     retained_look_edges=tuple(sorted(d.boundary_index for d in old.boundary_look_match.decisions if d.applied))
     planned_support=derive_support(old.render_plan,numeric,retained_applied_look_edges=retained_look_edges)
-    if len(planned_support['descriptor_refresh_cells'])>MAX_REFRESHED_CELLS:
+    refresh_cap=GLOBAL_MAX_REFRESHED_CELLS if global_execution else MAX_REFRESHED_CELLS
+    if len(planned_support['descriptor_refresh_cells'])>refresh_cap:
         raise ValueError('source-family refresh cell budget exceeded before descriptor work')
     observations=refresh_joint_group_render_observations.__wrapped__(plan=old.render_plan,
         timeline=old.visual_timeline,domain=context.domain,path=path,sync_scores=context.sync_scores,
         feature_cache_directory=None,feature_derived_cache_directory=None,
-        require_persistent_feature_cache=False,maximum_refreshed_cells=MAX_REFRESHED_CELLS,
+        require_persistent_feature_cache=False,maximum_refreshed_cells=refresh_cap,
         retained_applied_look_edges=retained_look_edges)
     proposed,changed=observations.plan,observations.changed_segment_indices
     if (proposed!=numeric or changed!=planned_changed or observations.dependency_support!=planned_support):
@@ -549,20 +559,20 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if not changed:
         raise ValueError('source/camera completion has no numeric changed cells')
     refreshed=observations.refreshed_segment_indices
-    if len(refreshed)>MAX_REFRESHED_CELLS: raise ValueError('source-family refresh cell budget exceeded')
+    if len(refreshed)>refresh_cap: raise ValueError('source-family refresh cell budget exceeded')
     edges=tuple(sorted({e for i in changed for e in (i-1,i) if 0<=e<len(proposed.transitions)}))
     before_observed=family.observe_scope(old.render_plan,context.domain,refreshed,edges,context.model_path,session)
     observed=family.observe_scope(proposed,context.domain,refreshed,edges,context.model_path,session)
     plan,look,look_evidence=family.refresh_look(old,proposed,edges,session,context.domain)
     if geometry_payload(plan)!=geometry_payload(proposed):
         raise ValueError('look refresh changed an admitted source clock/camera')
-    final_states=tuple((fixed_neighbor_state_from_render_plan if scene and i in (0,len(path)-1)
+    final_states=(path.with_plan(plan,context.domain) if global_execution else tuple((fixed_neighbor_state_from_render_plan if scene and i in (0,len(path)-1)
         else joint_state_from_render_plan)(plan=plan,domain=context.domain,slot=s.slot,
         first_output_frame=s.first_output_frame,end_output_frame=s.end_output_frame,role=s.role,
-        editorial_contract_sha256=s.editorial_contract_sha256) for i,s in enumerate(path))
+        editorial_contract_sha256=s.editorial_contract_sha256) for i,s in enumerate(path)))
     if scene:
         from .group_scene_observations import compare_scene_edge
-        fresh_edges = [compare_scene_edge(sensors,a,b) for a,b in zip(final_states,final_states[1:])]
+        fresh_edges = [compare_scene_edge(sensors,a,b) for a,b in incident_pairs(final_states)]
         if any(not fresh.get('available') or family.digest(fresh.get('metrics'))!=family.digest(before.get('metrics'))
                 for before,fresh in zip(edge_rows,fresh_edges,strict=True)):
             raise ValueError('scene selected incident metrics changed during complete family refresh')
@@ -577,6 +587,10 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         every_mutable_output_tick_observed=True,face_roi_is_not_physical_head_extent=True,
         semantic_raw_v2_admission=False,cross_camera_identity_certified=False,body_phase_certified=False,
         decoded_output_quality_certified=False,quality_approved=False)
+    if global_execution:
+        dense.update(global_execution_scope=path.to_dict(),
+            global_execution_original_numeric_plan=old.render_plan.to_json(),
+            global_execution_selected_numeric_plan=proposed.to_json())
     if context.source_derivative_binding is not None:
         dense.update(source_derivative_binding=context.source_derivative_binding,
             derivative_window_source_indices=[s.eligible_source_index for s in final_states])
@@ -585,6 +599,7 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json(),
             original_numeric_plan=old.render_plan.to_json(),dependency_support=planned_support,
             edit_operations=planned_operations)
+        if global_execution:selected_program['global_execution_scope']=path.to_dict()
         if family.digest(selected_program['selected_states']) != family.digest([s.to_dict() for s in path]):
             raise ValueError('scene completion changed the frozen selected program')
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
@@ -831,17 +846,39 @@ def propose_source_changes(context):
 
 
 def validate_dense_uncertainty(dense):
+    from .group_scene_execution_scope import MAX_MUTABLE_UNITS,dense_layout
+    global_scope=isinstance(dense,dict) and dense.get('global_execution_scope') is not None
+    mutable_cap=MAX_MUTABLE_UNITS if global_scope else 2
     if (not isinstance(dense,dict) or dense.get('contract') not in DENSE_CONTRACTS
             or dense.get('every_mutable_output_tick_observed') is not True
             or dense.get('face_roi_is_not_physical_head_extent') is not True
             or any(dense.get(k) is not False for k in ('semantic_raw_v2_admission',
                 'cross_camera_identity_certified','body_phase_certified',
                 'decoded_output_quality_certified','quality_approved'))
-            or not isinstance(dense.get('mutable_shots'),list) or not 1<=len(dense['mutable_shots'])<=2):
+            or not isinstance(dense.get('mutable_shots'),list) or not 1<=len(dense['mutable_shots'])<=mutable_cap):
         raise ValueError('fresh native family cannot acquire semantic or quality authority')
+    if global_scope:
+        if dense.get('contract')!=SCENE_DENSE_CONTRACT:
+            raise ValueError('global execution requires the native scene duty consumer')
+        mutable,pairs=dense_layout(dense)
+        if len(dense['mutable_shots'])!=len(mutable) or len(dense['incident_projected_observations'])!=len(pairs):
+            raise ValueError('global dense lost an explicitly owned mutable shot or actual incident edge')
+    else:
+        # This is the COMPLETE receipt boundary. Standalone registered-motion
+        # unit consumers may have no incident edge slice; a full production
+        # family cannot omit any edge from its unchanged legacy scope.
+        keys=dense.get('state_keys')
+        if (not isinstance(keys,list) or len(keys) not in (3,4)
+                or len(dense.get('incident_projected_observations',()))!=len(keys)-1):
+            raise ValueError('complete native family lost its actual incident edge inventory')
     if dense.get('source_derivative_binding') is not None:
-        from .group_scene_source_owner import validate_bound_derivative_path
-        validate_bound_derivative_path(dense['source_derivative_binding'],dense.get('derivative_window_source_indices',[]))
+        from .group_scene_source_owner import validate_bound_derivative_path,validate_bound_derivative_pairs
+        indices=dense.get('derivative_window_source_indices',[])
+        if global_scope:
+            if len(indices)!=len(dense['state_keys']):raise ValueError('global derivative source inventory differs')
+            validate_bound_derivative_pairs(dense['source_derivative_binding'],
+                tuple((indices[a],indices[b]) for a,b in pairs))
+        else:validate_bound_derivative_path(dense['source_derivative_binding'],indices)
     for span in dense['mutable_shots']:
         rows=span.get('rows')
         if not isinstance(rows,list) or not 1<=len(rows)<=MAX_MUTABLE_FRAMES:
@@ -961,13 +998,17 @@ def final_live_replay(plan_json,receipt,deadline):
             from .group_scene_original_duties import freeze_original_duty_program
             program=receipt['selected_scene_program']
             original_plan=render_plan_from_json(program['original_numeric_plan'])
+            from .group_scene_execution_scope import (GlobalSceneExecutionPath,endpoint_scope,incident_pairs)
+            global_scope=program.get('global_execution_scope')
+            baseline=_path(original_plan,domain,program['baseline_states'],
+                global_execution_scope=global_scope,original_plan=original_plan)
             from .group_scene_edit_operations import validate_scene_edit_operations
             validate_scene_edit_operations(program['edit_operations'],original=original_plan,proposed=plan,
-                source_domain=raw,mutable_intervals=tuple(tuple(span) for span in dense['window_bounds'][1:-1]))
-            baseline=_path(original_plan,domain,program['baseline_states'])
+                source_domain=raw,mutable_intervals=(baseline.mutable_intervals if isinstance(baseline,GlobalSceneExecutionPath)
+                    else tuple(tuple(span) for span in dense['window_bounds'][1:-1])))
             original_groups=[]
             for index,state in enumerate(baseline):
-                scope='exit' if index==0 else 'entry' if index==len(baseline)-1 else 'whole'
+                scope=endpoint_scope(baseline,index)
                 unit=program['original_duty_program']['units'][index]
                 intent=unit['branches'][0]['original_hypothesis']['shot_intent']
                 sensors.shot_intents[state.first_output_frame,state.end_output_frame,scope]=intent
@@ -976,7 +1017,8 @@ def final_live_replay(plan_json,receipt,deadline):
             if [[s.editorial_contract_sha256 for s in group] for group in original_groups]!=program['baseline_hypothesis_keys']:
                 raise ValueError('scene final original hypothesis inventory changed')
             original_duties=freeze_original_duty_program(sensors,original_groups,
-                original_plan_identity=family.digest(family.plan_payload(original_plan)))
+                original_plan_identity=family.digest(family.plan_payload(original_plan)),
+                global_execution_scope=global_scope)
             if original_duties!=program['original_duty_program']:
                 raise ValueError('scene final fresh original required duty lifecycle changed')
             sensors.install_original_duty_program(original_duties)
@@ -985,7 +1027,11 @@ def final_live_replay(plan_json,receipt,deadline):
         else:
             sensors=NativeFamilySensors(session,assets,frozen_declarations=dense['pre_camera_native_declarations'])
             keys=[None]*len(dense['window_bounds'])
-        path=tuple((fixed_neighbor_state_from_render_plan if dense['contract']==SCENE_DENSE_CONTRACT
+        if dense.get('global_execution_scope') is not None:
+            selected_numeric=render_plan_from_json(program['numeric_plan'])
+            path=_path(selected_numeric,domain,program['selected_states'],global_execution_scope=global_scope,
+                original_plan=original_plan).with_plan(plan,domain)
+        else:path=tuple((fixed_neighbor_state_from_render_plan if dense['contract']==SCENE_DENSE_CONTRACT
             and i in (0,len(dense['window_bounds'])-1) else joint_state_from_render_plan)(
             plan=plan,domain=domain,slot=i,first_output_frame=b[0],
             end_output_frame=b[1],role=GroupOutputRole(dense['roles'][i]),
@@ -1005,13 +1051,16 @@ def final_live_replay(plan_json,receipt,deadline):
                         b=sensors.raw(state,h['anchor_output_ticks'][j],h['analysis_roll'])
                         if h['anchor_head_ids'][i:i+2] not in sensors._head_links(a,b)['unique_links']:
                             raise ValueError('scene final fixed/mutable head pixel hypothesis changed')
-                for outgoing in ((True,) if state is path[0] else (False,) if state is path[-1] else (False,True)):
+                sides=(tuple(sorted({True for a,b in incident_pairs(path) if a is state}
+                    | {False for a,b in incident_pairs(path) if b is state})) if isinstance(path,GlobalSceneExecutionPath) else
+                    (True,) if state is path[0] else (False,) if state is path[-1] else (False,True))
+                for outgoing in sides:
                     sensors.endpoint(state,outgoing=outgoing)
         if [s.key for s in path]!=dense['state_keys'] or family.digest(sensors.dense(path))!=family.digest(dense['mutable_shots']):
             raise ValueError('source-changing final all-tick native/camera replay disagrees')
         if dense['contract']==SCENE_DENSE_CONTRACT:
             from .group_scene_observations import compare_scene_edge
-            fresh_edges=[compare_scene_edge(sensors,a,b) for a,b in zip(path,path[1:])]
+            fresh_edges=[compare_scene_edge(sensors,a,b) for a,b in incident_pairs(path)]
             if family.digest(fresh_edges)!=family.digest(dense['incident_projected_observations']):
                 raise ValueError('scene final selected incident articulation/geometry replay disagrees')
     finally: session.close()

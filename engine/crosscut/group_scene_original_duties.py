@@ -17,6 +17,7 @@ from .group_scene_intent import validate_intent
 from .group_scene_role_obligations import ARM_PARTS
 
 CONTRACT = 'original_native_focal_duty_lifecycle_v1'
+GLOBAL_CONTRACT = 'explicit_global_original_native_focal_duty_lifecycle_v1'
 FOCAL = (GroupOutputRole.FOCAL_HEAD.value, GroupOutputRole.FOCAL_HEAD_ARMS.value)
 MAX_ORIGINAL_NATIVE_SAMPLE_TICKS = 16
 MAX_ORIGINAL_HEAD_LINK_NATIVE_GAP = 12
@@ -188,8 +189,57 @@ def _unit(branches, eligible_request_indices):
         candidate_admitted=False, quality_approved=False)
 
 
-def _program(units, plan_identity, eligible):
-    value = dict(contract=CONTRACT, original_plan_identity=plan_identity,
+def _global_scope_inventory(scope):
+    """Received scope closure only; parent still verifies the external original.
+
+    Gaps are legal only when the explicit original allocation and its actual
+    neighbour inventory own them. The legacy continuous-window contract does
+    not gain an option to delete inconvenient original duty units.
+    """
+    from .group_scene_execution_scope import (CONTRACT as SCOPE_CONTRACT,
+        MAX_MUTABLE_UNITS,MAX_MUTABLE_FRAMES,MAX_REFRESHED_CELLS,_unit_indices)
+    from .group_scene_owned_program import OwnedSceneProgram,OwnedSceneUnit,own_scene_intervals
+    raw=scope['original_owned_program']
+    dump=lambda value:json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False)
+    program=OwnedSceneProgram(raw['original_plan_identity'],dump(raw['original_plan_header']),
+        raw['source_domain_sha256'],tuple(raw['global_cell_frame_counts']),
+        tuple(OwnedSceneUnit(u['unit_id'],u['first_output_frame'],u['end_output_frame'],
+            dump(u['original_role_program'])) for u in raw['units']))
+    allocation=own_scene_intervals(program,mutable_unit_ids=tuple(scope['allocation']['mutable_unit_ids']),
+        maximum_mutable_units=scope['allocation']['maximum_mutable_units'],
+        maximum_mutable_frames=scope['allocation']['maximum_mutable_frames'])
+    bounds=[(u.first_output_frame,u.end_output_frame) for u in program.units]
+    if (program.to_dict()!=raw or allocation.to_dict()!=scope['allocation']
+            or family.digest(scope['source_domain'])!=program.source_domain_sha256
+            or allocation.maximum_mutable_units>MAX_MUTABLE_UNITS
+            or allocation.maximum_mutable_frames>MAX_MUTABLE_FRAMES
+            or len({u.unit_id for u in program.units})!=len(program.units)
+            or not bounds or bounds[0][0]!=0
+            or any(type(v) is not int for pair in bounds for v in pair)
+            or any(first>=end for first,end in bounds)
+            or any(a[1]!=b[0] for a,b in zip(bounds,bounds[1:]))
+            or bounds[-1][1]!=sum(program.global_cell_frame_counts)):
+        raise ValueError('global original duties lost their explicit complete original allocation')
+    units=tuple(program.units[i] for i in _unit_indices(program,allocation))
+    mutable=tuple(i for i,u in enumerate(units) if u.unit_id in allocation.mutable_unit_ids)
+    pairs=tuple((i,i+1) for i,(a,b) in enumerate(zip(units,units[1:]))
+        if a.end_output_frame==b.first_output_frame and (i in mutable or i+1 in mutable))
+    expected=dict(contract=SCOPE_CONTRACT,original_owned_program=raw,source_domain=scope['source_domain'],
+        allocation=allocation.to_dict(),scoped_unit_ids=[u.unit_id for u in units],
+        unit_intervals=[[u.first_output_frame,u.end_output_frame] for u in units],
+        mutable_state_indices=list(mutable),incident_state_pair_indices=[list(p) for p in pairs],
+        endpoint_scopes=['whole']*len(units),maximum_refreshed_cells=MAX_REFRESHED_CELLS,
+        positional_fixed_endpoints_assumed=False,whole_camera_restarts_at_role_epochs=False,
+        original_native_duties_frozen_by_this_numeric_scope=False,
+        whole_request_phase_reserves_implemented=False,quality_approved=False)
+    if dump(scope)!=dump(expected):
+        raise ValueError('global original duties changed explicit intervals/neighbours/authority')
+    return units
+
+
+def _program(units, plan_identity, eligible, global_execution_scope=None):
+    value = dict(contract=CONTRACT if global_execution_scope is None else GLOBAL_CONTRACT,
+        original_plan_identity=plan_identity,
         eligible_request_indices=list(eligible), units=units,
         frozen_before_donor_discovery=True, donor_observations_define_duties=False,
         original_known_part_loss_is_not_a_waiver=True, raw_observations_referenced_not_duplicated=True,
@@ -197,13 +247,30 @@ def _program(units, plan_identity, eligible):
         coherent_cross_camera_actor_correspondence_certified=False,
         mixed_role_global_programme_implemented=False, hard_original_phase_reserve_implemented=False,
         quality_approved=False)
+    if global_execution_scope is not None:
+        owned=_global_scope_inventory(global_execution_scope)
+        # Family duty identity intentionally excludes output relocation;
+        # numeric ownership identity includes the original complete plan.
+        # Both are independently rederived by the selected parent/final path.
+        if (eligible!=tuple(global_execution_scope['source_domain']['eligible_request_indices'])
+                or len(owned)!=len(units)):
+            raise ValueError('global original duties changed their whole external programme/source domain')
+        for original,unit in zip(owned,units,strict=True):
+            bounds=[original.first_output_frame,original.end_output_frame]
+            roles={epoch['role'] for epoch in original.role_program['epochs']}
+            if (unit['required_output_interval']!=bounds
+                    or [unit['first_output_frame'],unit['end_output_frame']]!=bounds
+                    or roles!={unit['role']}):
+                raise ValueError('global original duties changed their original whole-unit role/interval')
+        value['global_execution_scope']=global_execution_scope
+        value['original_owned_programme_plan_sha256']=global_execution_scope['original_owned_program']['original_plan_identity']
     value['program_sha256'] = family.digest(value)
     # Canonical transport types at the producer, not equality weakened after
     # worker/JSON replay. Tuple/list conversion cannot fabricate a new failure.
     return json.loads(json.dumps(family.plain(value),sort_keys=True,allow_nan=False))
 
 
-def freeze_original_duty_program(sensors, baseline_groups, *, original_plan_identity):
+def freeze_original_duty_program(sensors, baseline_groups, *, original_plan_identity,global_execution_scope=None):
     """Read ORIGINAL native units only; do not inspect selected/unselected donors."""
     eligible = sensors.session.domain.eligible_indices
     units = []
@@ -225,7 +292,7 @@ def freeze_original_duty_program(sensors, baseline_groups, *, original_plan_iden
             branches.append(_branch(state=state.to_dict(), hypothesis=deepcopy(hypothesis),
                 raw_at=raw_at, head_link=head_link))
         units.append(_unit(branches, eligible))
-    program = _program(units, original_plan_identity, eligible)
+    program = _program(units, original_plan_identity, eligible,global_execution_scope)
     sensors.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(
         program,sort_keys=True,allow_nan=False).encode()))
     return program
@@ -237,7 +304,7 @@ def validate_original_duty_program(program, *, raw_inventory):
     This is reference closure, not controller-owned whole-history authority.
     Independent parent/final original-pixel remeasurement is still mandatory.
     """
-    if not isinstance(program,dict) or program.get('contract') != CONTRACT:
+    if not isinstance(program,dict) or program.get('contract') not in (CONTRACT,GLOBAL_CONTRACT):
         raise ValueError('scene original duty programme is missing')
     payload = dict(program); sha = payload.pop('program_sha256',None)
     if sha != family.digest(payload):
@@ -276,11 +343,15 @@ def validate_original_duty_program(program, *, raw_inventory):
                     return links[family.digest(a),family.digest(b)]
                 branches.append(_branch(state=state,hypothesis=h,raw_at=raw_at,head_link=head_link))
             units.append(_unit(branches,eligible))
-        expected = _program(units, program['original_plan_identity'],eligible)
+        scope=program.get('global_execution_scope')
+        if (program['contract']==GLOBAL_CONTRACT)!=(scope is not None):
+            raise ValueError('original duty programme cannot relabel its original ownership contract')
+        expected = _program(units, program['original_plan_identity'],tuple(eligible),scope)
         if family.digest(expected) != family.digest(program):
             raise ValueError('original required duty lifecycle changed after original observations')
         bounds = [(u['first_output_frame'],u['end_output_frame']) for u in units]
-        if len(set(bounds)) != len(bounds) or any(a[1] != b[0] for a,b in zip(bounds,bounds[1:])):
+        if len(set(bounds)) != len(bounds) or any(a[1]>b[0] if scope is not None else a[1]!=b[0]
+                for a,b in zip(bounds,bounds[1:])):
             raise ValueError('original duty programme units are duplicated/discontinuous')
     except (KeyError,TypeError,IndexError) as exc:
         raise ValueError('original duty programme lost native/hypothesis reference closure') from exc

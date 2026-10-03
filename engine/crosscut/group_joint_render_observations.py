@@ -66,10 +66,17 @@ def refresh_joint_group_render_observations(*, plan, timeline, domain, path,
                     (choice.canonical_master_end,plan.master_audio_start+segment.master_start+segment.duration),
                     (choice.source_local_start,segment.source_start),(choice.source_local_end,segment.source_end)))):
             raise ValueError('joint rendered observations have a stale incumbent source/clock timeline')
-    if not isinstance(path, tuple) or len(path) not in (3, 4):
-        raise ValueError('joint rendered observations require three or four actual whole-shot states')
-    assembler = (assemble_single_group_source_camera_state if len(path) == 3
-        else assemble_joint_group_states)
+    from .group_scene_execution_scope import GlobalSceneExecutionPath
+    if isinstance(path,GlobalSceneExecutionPath):
+        # Explicit global ownership and atomic union, not len(path) relaxation.
+        # The ordinary complete owner externally rederives original intent
+        # before this numeric/descriptor materializer receives the program.
+        assembler=path.assemble
+    else:
+        if not isinstance(path, tuple) or len(path) not in (3, 4):
+            raise ValueError('joint rendered observations require three or four actual whole-shot states')
+        assembler = (assemble_single_group_source_camera_state if len(path) == 3
+            else assemble_joint_group_states)
     proposed,changed=assembler(plan=plan,domain=domain,path=path)
     if shot_video_clocks:
         from .shot_video_clock import FrozenShotVideoClockContext, attach_authorized_shot_video_clocks
