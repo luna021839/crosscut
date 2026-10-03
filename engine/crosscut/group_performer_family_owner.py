@@ -645,8 +645,8 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
             # Partial graphs can own frame-cache read-through mappings, unlike
             # the expanded public bundle JSON. Retain their exact wire views
             # at this separate durable seam; never stringify/drop raw evidence.
-            from .group_scene_native_storage import pack_native_evidence
-            payload=pack_native_evidence(archive)
+            from .group_scene_native_blob_storage import pack_owned_native_evidence
+            payload=pack_owned_native_evidence(archive)
             if len(json.dumps(payload,sort_keys=True,allow_nan=False).encode()) > MAX_ARCHIVE_BYTES:
                 raise ValueError('performer complete archive exceeds explicit byte budget')
             _write_analysis_manifest_atomically(Path(archive_path),payload)

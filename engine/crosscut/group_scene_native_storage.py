@@ -106,6 +106,12 @@ def pack_native_evidence(value):
 
 def expand_native_evidence(value):
     if isinstance(value,Mapping):
+        from .group_scene_native_blob_storage import (STORE_KEY, REFERENCE_CONTRACT,
+            expand_shared_native_evidence)
+        if STORE_KEY in value:
+            return expand_shared_native_evidence(value)
+        if value.get('contract')==REFERENCE_CONTRACT:
+            raise ValueError('standalone native reference has no owned blob table')
         plain={k:expand_native_evidence(v) for k,v in value.items()}
         return expand_native_observation(plain) if plain.get('contract')==CONTRACT else plain
     if isinstance(value,(list,tuple)):return [expand_native_evidence(v) for v in value]

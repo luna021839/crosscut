@@ -508,12 +508,11 @@ class SceneSensors(source.NativeFamilySensors):
             scene_geometry=_scene_geometry(heads, people), role=state.role.value,
             whole_head_extent_certified=False, cross_camera_identity_certified=False,
             body_phase_certified=False, anatomical_occlusion_inferred=False, quality_approved=False)
-        from .group_scene_native_storage import pack_native_evidence,NativeObservationView
-        stored=pack_native_evidence(result)
-        self.session.budget.spend('pose_evidence_bytes',len(__import__('json').dumps(
-            stored,sort_keys=True,separators=(',',':'),allow_nan=False).encode()))
+        from .group_scene_native_blob_storage import frame_wire_storage
+        stored,wire_bytes,native_view=frame_wire_storage(result,self.session.budget.normalized_native_views)
+        self.session.budget.spend('pose_evidence_bytes',wire_bytes)
         result=dict(stored)
-        result['native_observation']=NativeObservationView(stored['native_observation'])
+        result['native_observation']=native_view
         self.frame_cache[cache_key] = result
         if violations:
             raise SceneFrameRejection(result)

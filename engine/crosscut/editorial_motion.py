@@ -223,9 +223,9 @@ class EditorialMotionPlan:
     def __post_init__(self):
         if self.source_camera_refresh is not None:
             from .visual_boundary_repair import _freeze_audit_value
-            from .group_scene_native_storage import pack_native_evidence
+            from .group_scene_native_blob_storage import pack_owned_native_evidence
             object.__setattr__(self, 'source_camera_refresh', _freeze_audit_value(
-                pack_native_evidence(self.source_camera_refresh)))
+                pack_owned_native_evidence(self.source_camera_refresh)))
         mapping = self.eligible_request_indices
         if mapping is not None:
             if (not isinstance(mapping, tuple) or not mapping
