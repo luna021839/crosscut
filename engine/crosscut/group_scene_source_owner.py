@@ -24,6 +24,8 @@ from .source_derivative_diversity import (SourceDerivativeDiversityResult,
 CONTRACT = 'normal_scene_source_whole_camera_producer_v1'
 # Search allocation, not a confidence/visibility/quality threshold.
 MAX_WINDOWS = 3
+# Initial allocation batch, NOT a proof that unprobed windows are unavailable.
+# Continuations still share this request's original native/time/graph budgets.
 MAX_FIXED_WINDOW_PROBES = 12
 FIXED_HYPOTHESES = 2
 COMPLETE_REFRESH_RESERVE_SECONDS = 8.
@@ -190,6 +192,28 @@ def fixed_window_probe_order(prepared,limit):
     return (*primary,*remaining)[:limit]
 
 
+def fixed_window_probe_batches(prepared,*,batch_size):
+    """Retain the initial order and continue UNKNOWN windows on the same work.
+
+    New reachable windows can displace a formerly measured numeric window
+    from the first batch. Failed fixed/original hypotheses consume no source
+    graph, so that prefix is not an end-of-search condition. This allocator
+    grants neither extra model/decode/time counters nor admission authority.
+    The owning loop checks the unchanged graph/native/deadline limits before
+    EVERY window and preserves observations in its existing sensor session.
+    """
+    if type(batch_size) is not int or batch_size<1:
+        raise ValueError('scene fixed probe batch size must be a positive integer')
+    prepared=tuple(prepared)
+    if not prepared:return ()
+    initial=fixed_window_probe_order(prepared,min(batch_size,len(prepared)))
+    used={index for index,_ in initial}
+    pending=sorted(((index,item) for index,item in enumerate(prepared) if index not in used),
+        key=lambda row:(-row[1][2].get('observed_wide_repair_priority',0.),row[0]))
+    ordered=(*initial,*pending)
+    return tuple(tuple(ordered[first:first+batch_size]) for first in range(0,len(ordered),batch_size))
+
+
 def _target(row):
     if row['role'] not in (GroupOutputRole.FORMATION.value, GroupOutputRole.COMPOSITION.value):
         return tuple(row['projected_face_roi_xywh'])
@@ -314,7 +338,8 @@ def propose_scene_changes(context):
                 record['errors'].append(dict(stage='retained_epoch_topology',error=str(exc)))
         # Upright observations for time-distributed windows precede rotated
         # retries. A failed intro must not consume every selected work slot.
-        frontier=fixed_window_probe_order(prepared,MAX_FIXED_WINDOW_PROBES)
+        probe_batches=fixed_window_probe_batches(prepared,batch_size=MAX_FIXED_WINDOW_PROBES)
+        frontier=tuple(item for batch in probe_batches for item in batch)
         scheduled=tuple((wi,item,rolls) for rolls in ((None,),VARIANTS)
             for wi,item in frontier)
         graph_windows=0
@@ -553,7 +578,9 @@ def propose_scene_changes(context):
                         window_frontier_policy='observed_wide_repair_then_time_stratified_upright_v2',
                         selected_frontier_window_indices=[i for i,_ in frontier],
                         fixed_endpoints_before_donor_observations=True,
-                        fixed_window_probe_limit=MAX_FIXED_WINDOW_PROBES,
+                        fixed_window_probe_limit=len(frontier),fixed_probe_batch_size=MAX_FIXED_WINDOW_PROBES,
+                        fixed_probe_batches_share_native_session=True,
+                        fixed_probe_batch_count=len(probe_batches),
                         evaluated_graph_windows=graph_windows,
                         bounded_edge_frontier_attempts=[a for a in attempts if a.get('stage')=='bounded_edge_frontier'],
                         state_edge_frontiers_explicit=True,

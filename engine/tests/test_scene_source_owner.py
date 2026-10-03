@@ -448,6 +448,34 @@ class SceneSourceIntegrationTests(unittest.TestCase):
         family.validate_bundle_binding(candidate)
         self.assertFalse(family.plain(candidate.performer_family_review)['quality_approved'])
 
+    def test_initial_fixed_probe_batch_cannot_hide_later_complete_window_with_budget_left(self):
+        # Explicit missing fixed hypothesis, not an actual human-source failure.
+        # Decode/refresh/assembly stay real; all attempts share ONE native budget.
+        original=sensors_module.SceneSensors.discover
+        blocked=[];later=[];budgets=set()
+        def discover(sensor,state,**kwargs):
+            budgets.add(id(sensor.session.budget))
+            if kwargs.get('endpoint_scope','whole')=='exit':
+                bounds=(state.first_output_frame,state.end_output_frame)
+                if not blocked:blocked.append(bounds)
+                if bounds==blocked[0]:return ()
+                later.append(bounds)
+            return original(sensor,state,**kwargs)
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),scene_chart_sensors(), \
+                patch.object(scene,'MAX_FIXED_WINDOW_PROBES',1), \
+                patch.object(sensors_module.SceneSensors,'discover',discover):
+            candidate=scene.propose_scene_changes(context)
+        self.assertTrue(blocked and later)
+        self.assertEqual(len(budgets),1)
+        self.assertNotIsInstance(candidate,family.PerformerFamilyRejection,getattr(candidate,'error',None))
+        family.validate_bundle_binding(candidate)
+        receipt=family.plain(candidate.performer_family_review)
+        self.assertEqual(receipt['search']['fixed_probe_batch_size'],1)
+        self.assertTrue(receipt['search']['fixed_probe_batches_share_native_session'])
+        self.assertLessEqual(receipt['native_work']['counts']['model_calls'],source.WORK_LIMITS['maximum_model_calls'])
+        self.assertFalse(receipt['quality_approved'])
+
     def test_spent_first_graph_does_not_hide_later_source_camera_window(self):
         # NONHUMAN edge-unavailability control. Unlike the missing-hypothesis
         # test above, the first graph actually spends its full state frontier.
