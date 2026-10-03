@@ -556,11 +556,14 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         selected_program=dict(search_record['scene_replay_program'],numeric_plan=proposed.to_json())
         if family.digest(selected_program['selected_states']) != family.digest([s.to_dict() for s in path]):
             raise ValueError('scene completion changed the frozen selected program')
-        selected_program['program_sha256']=family.digest(selected_program)
         dense.update(scene_hypotheses={s.editorial_contract_sha256:sensors.hypothesis(s) for s in path},
             hypothesis_keys=[s.editorial_contract_sha256 for s in path],
             scene_discovery=sensors.archive() if frozen_scene_discovery is None else frozen_scene_discovery,
             source_derivative_binding=context.source_derivative_binding)
+        from .group_scene_archive import archive_binding, validate_archive
+        selected_program['discovery_archive_binding']=archive_binding(dense['scene_discovery'])
+        selected_program['program_sha256']=family.digest(selected_program)
+        validate_archive(selected_program, dense)
     motion=_fresh_motion(context,plan,observations.timeline,changed,edges,dense)
     face=_fresh_face(context,plan,observations.timeline,observed,dense,changed,refreshed)
     repairs,affine,preserved=preserve_boundary_evidence(old_plan=old.render_plan,new_plan=plan,

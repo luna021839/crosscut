@@ -37,6 +37,25 @@ MAX_JOINT_NATIVE_GAP = 12
 MAX_HYPOTHESES_PER_SPAN = 32
 # Bounded exploration, NOT detection/confidence/visibility thresholds.
 VARIANTS = (None, *SUPPORTED_ANALYSIS_ROLLS)
+DISCOVERY_QUERY_CONTRACT = 'ordered_native_scene_analysis_roll_query_v1'
+
+
+def _discovery_rolls(rolls):
+    """Query ownership is narrower than the shared raw/model observation cache.
+
+    Keep order explicit, reject ambiguous inputs before any sensor work, and
+    normalize equivalent numeric rolls. A warm broader query must not add
+    hypotheses to a later narrow query or erase the earlier discovery archive.
+    """
+    if (not isinstance(rolls, tuple) or not rolls or len(rolls) > len(VARIANTS)
+            or any(roll is not None and (type(roll) not in (int, float)
+                or not math.isfinite(roll) or roll not in SUPPORTED_ANALYSIS_ROLLS)
+                for roll in rolls)):
+        raise ValueError('scene discovery needs an explicit ordered supported roll tuple')
+    normalized = tuple(None if roll is None else float(roll) for roll in rolls)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError('scene discovery roll tuple must have distinct alternatives')
+    return normalized
 
 
 def scene_anchor_ticks(first, end, endpoint_scope='whole'):
@@ -209,11 +228,12 @@ class SceneSensors(source.NativeFamilySensors):
         return value
 
     def discover(self, state, *, rolls=VARIANTS, endpoint_scope='whole'):
+        rolls = _discovery_rolls(rolls)
         span_key = self.span_key(state)
         if state.role == GroupOutputRole.COMPOSITION:
             rolls = (None,)
-        key = (*span_key, endpoint_scope)
-        if key in self.discoveries and all(roll in [v['analysis_roll'] for v in self.discoveries[key]['variants']] for roll in rolls):
+        key = (*span_key, endpoint_scope, rolls)
+        if key in self.discoveries:
             return tuple(self.hypotheses[h] for h in self.discoveries[key]['hypothesis_ids'])
         try:
             ticks = scene_anchor_ticks(state.first_output_frame, state.end_output_frame, endpoint_scope)
@@ -221,9 +241,11 @@ class SceneSensors(source.NativeFamilySensors):
             if endpoint_scope not in ('whole', 'entry', 'exit'):
                 raise
             self.discoveries[key] = dict(span_key=list(span_key), endpoint_scope=endpoint_scope,
+                query_contract=DISCOVERY_QUERY_CONTRACT, analysis_roll_query=list(rolls),
                 variants=[], hypothesis_ids=[], reason='scene_span_needs_endpoint_window')
             return ()
         record = dict(span_key=list(span_key), endpoint_scope=endpoint_scope,
+            query_contract=DISCOVERY_QUERY_CONTRACT, analysis_roll_query=list(rolls),
             anchor_output_ticks=list(ticks), variants=[],
             hypothesis_ids=[], unresolved_subject_node_retained=True,
             variant_is_not_an_actor=True, quality_approved=False)

@@ -521,7 +521,8 @@ def propose_scene_changes(context):
                         state_edge_prefix_starvation_removed=True,native_caps_not_multiplied=True,
                         request_wide_work_accounting=False,window_fairness_guaranteed=False,
                         reserve_check_basis="before_window_only_not_hard_phase_partition")
-                    search['scene_replay_program']=dict(contract='frozen_scene_source_camera_program_v1',
+                    from .group_scene_selected_replay import CONTRACT as PROGRAM_CONTRACT
+                    search['scene_replay_program']=dict(contract=PROGRAM_CONTRACT,
                         selected_states=[s.to_dict() for s in path],baseline_states=[s.to_dict() for s in baseline],
                         baseline_hypothesis_keys=[[s.editorial_contract_sha256 for s in group]
                             for group in baseline_hypotheses],analysis_rolls=list(rolls),

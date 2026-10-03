@@ -16,7 +16,7 @@ from .group_joint_source_camera import joint_state_from_render_plan
 from . import group_performer_family_owner as family
 from . import group_source_changing_owner as source
 
-CONTRACT='frozen_scene_source_camera_program_v1'
+CONTRACT='frozen_scene_source_camera_program_v2'
 
 
 def _path(plan,domain,rows):
@@ -71,6 +71,8 @@ def validate_program(program,dense):
             raise ValueError('selected scene program changed bounds, role or hypothesis ownership')
     except (KeyError,TypeError) as exc:
         raise ValueError('selected scene state/role inventory missing') from exc
+    from .group_scene_archive import validate_archive
+    validate_archive(program, dense)
 
 
 @isolated_optional()
@@ -177,9 +179,13 @@ def replay_selected_scene(context,candidate):
         work=session.budget.to_dict()
         observed_sources=sorted({row.request_source_index for row in sensors.raw_rows.values()})
     family._fresh(context)
-    return dict(contract='independent_selected_scene_program_replay_v1',
+    return dict(contract='independent_selected_scene_program_replay_v2',
         selected_program_sha256=program['program_sha256'],fresh_complete_family_equal=True,
         selected_and_original_hypotheses_reobserved=True,unselected_donor_search_repeated=False,
         unselected_discovery_archive_preserved_not_reobserved=True,
+        referenced_discovery_archive_preserved=True,
+        received_scene_discovery_sha256=program['discovery_archive_binding']['archive_sha256'],
+        archive_history_authority='received_candidate_reference_closure_only',
+        pre_receipt_history_completeness_certified=False,
         raw_scene_observed_request_source_indices=observed_sources,
         native_work=work,elapsed_seconds=monotonic()-started,quality_approved=False)
