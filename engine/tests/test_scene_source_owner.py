@@ -175,7 +175,7 @@ def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False):
     if result.returncode:raise RuntimeError(result.stderr.decode())
 
 
-def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None):
+def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None,boundary_look_enabled=True):
     from crosscut.source_look_match import SourceLookAdjustment
     duration=16.;n=8
     mapping=tuple(range(len(sources)));offsets=(1.,)*len(sources);warps=(None,)*len(sources)
@@ -228,25 +228,27 @@ def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None):
     # is not positive unless an old applied correction really exists.
     from crosscut.boundary_look_match import _tracks_from_decisions
     from crosscut.source_look_match import SourceLookAdjustment
-    look=analyze_boundary_look_match(plan,group_16x9_safe=True)
-    original=look
-    # Author a small non-neutral recipe, and require REAL matched encode
-    # admission. Bounded fixture authoring only; no gate/result is mocked.
-    for strength in (.125,.25,.0625,.375):
-        decisions=tuple(replace(d,
-            applied=d.applied and d.boundary_index==6,
-            reason='fixture_authored_brightness_recipe_actual_encode_required',
-            outgoing_adjustment=SourceLookAdjustment(brightness=d.outgoing_adjustment.brightness*strength)
-                if d.boundary_index==6 else SourceLookAdjustment(),
-            incoming_adjustment=SourceLookAdjustment(brightness=d.incoming_adjustment.brightness*strength)
-                if d.boundary_index==6 else SourceLookAdjustment()) for d in original.decisions)
-        look=replace(original,decisions=decisions,
-            segment_tracks=_tracks_from_decisions(plan,decisions,original.analysis_config))
-        look=verify_boundary_look_match_render_domain(plan,look,
-            config=BoundaryLookRenderAdmissionConfig(proxy_width=320,proxy_height=180),
-            maximum_verified_boundaries=4,clipping_backoff_enabled=True)
-        if look.applied_count: break
-    plan=look.apply(plan)
+    look=None
+    if boundary_look_enabled:
+        look=analyze_boundary_look_match(plan,group_16x9_safe=True)
+        original=look
+        # Author a small non-neutral recipe, and require REAL matched encode
+        # admission. Bounded fixture authoring only; no gate/result is mocked.
+        for strength in (.125,.25,.0625,.375):
+            decisions=tuple(replace(d,
+                applied=d.applied and d.boundary_index==6,
+                reason='fixture_authored_brightness_recipe_actual_encode_required',
+                outgoing_adjustment=SourceLookAdjustment(brightness=d.outgoing_adjustment.brightness*strength)
+                    if d.boundary_index==6 else SourceLookAdjustment(),
+                incoming_adjustment=SourceLookAdjustment(brightness=d.incoming_adjustment.brightness*strength)
+                    if d.boundary_index==6 else SourceLookAdjustment()) for d in original.decisions)
+            look=replace(original,decisions=decisions,
+                segment_tracks=_tracks_from_decisions(plan,decisions,original.analysis_config))
+            look=verify_boundary_look_match_render_domain(plan,look,
+                config=BoundaryLookRenderAdmissionConfig(proxy_width=320,proxy_height=180),
+                maximum_verified_boundaries=4,clipping_backoff_enabled=True)
+            if look.applied_count: break
+        plan=look.apply(plan)
     bundle=replace(bundle,render_plan=plan,face_match_plan=face,editorial_motion_plan=motion,
         boundary_look_match=look,group_transition_plan=replace(bundle.group_transition_plan,transitions=transitions))
     _validate_review_first_group_bundle(bundle,eligible_indices=mapping,offsets=offsets,
@@ -676,6 +678,7 @@ class SceneSourceIntegrationTests(unittest.TestCase):
             self.assertNotIsInstance(candidate,family.PerformerFamilyRejection,
                 getattr(candidate,'error',None))
             family.validate_bundle_binding(candidate)
+            family.validate_serialized_metadata(candidate.to_dict())
             receipt=family.plain(candidate.performer_family_review)
             self.assertEqual(receipt['source_camera_refresh']['window_bounds'][0],[30,60])
             self.assertEqual(len(candidate.render_plan.segments),len(self.bundle.render_plan.segments))
@@ -981,6 +984,64 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):cls.temp.cleanup()
+
+    def test_original_no_boundary_look_reaches_completion_parent_and_final_without_fabricating_look(self):
+        from crosscut.group_scene_global_execution import complete_global_scene_program
+        storage=tempfile.TemporaryDirectory();self.addCleanup(storage.cleanup);root=Path(storage.name)
+        bundle,controller,request,model=build_scene_fixture(root,self.paths,
+            authored_camera_unit=2,boundary_look_enabled=False)
+        self.assertIsNone(bundle.boundary_look_match)
+        self.assertTrue(all(s.boundary_look_track is None for s in bundle.render_plan.segments))
+        self.assertTrue(all(s.look_adjustment is not None for s in bundle.render_plan.segments))
+        with optional_native_scope(monotonic()+180.),patch.object(family,'installed_pose_model',return_value=model):
+            context=family.freeze_context(controller=controller,request=request,
+                eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
+                scene_cut_times=((),)*8,sync_scores=(.93,.91)*4,source_derivatives=scene_derivative_fixture())
+        with optional_native_scope(context.deadline),source_chart_sensors(), \
+                patch('crosscut.boundary_look_match.analyze_boundary_look_match',
+                    side_effect=AssertionError('An originally absent family must not be fabricated')) as fit, \
+                patch('crosscut.boundary_look_match.verify_boundary_look_match_render_domain',
+                    side_effect=AssertionError('No matched-look proof exists in the absent family')) as look_encode:
+            union=authored_global_chart_union(context)
+            candidate=complete_global_scene_program.__wrapped__(context,union)
+            self.assertFalse(isinstance(candidate,family.PerformerFamilyRejection),getattr(candidate,'error',None))
+            self.assertIsNone(candidate.boundary_look_match)
+            self.assertEqual([s.look_adjustment for s in candidate.render_plan.segments],
+                [s.look_adjustment for s in bundle.render_plan.segments])
+            self.assertTrue(all(s.boundary_look_track is None for s in candidate.render_plan.segments))
+            family.validate_bundle_binding(candidate)
+            receipt=family.plain(candidate.performer_family_review)
+            audit=receipt['look_refresh']
+            self.assertEqual(audit['retained_family']['original']['mode'],'ORIGINAL_ABSENT')
+            self.assertEqual(audit['retained_family']['final']['mode'],'ORIGINAL_ABSENT')
+            self.assertEqual(audit['refreshed_edges'],[])
+            self.assertFalse(audit['matched_production_renderer_used'])
+            self.assertFalse(audit['quality_approved'])
+            with patch.object(__import__('crosscut.group_scene_selected_replay',fromlist=['replay_selected_scene']),
+                    'replay_selected_scene',camera_chart_selected_replay):
+                proof=source.validate_parent(candidate,context)
+            self.assertTrue(proof['fresh_complete_family_equal'])
+            metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90.)
+            self.assertTrue(family.qa_metrics_valid(metrics))
+            self.assertFalse(metrics['quality_approved'])
+            fit.assert_not_called();look_encode.assert_not_called()
+        probes=(150,390)
+        original_pixels=render_and_decode_chart(self,replace(bundle.render_plan,
+            output=root/'no-look-original.mp4'),capture_ticks=probes)
+        selected_pixels=render_and_decode_chart(self,candidate.render_plan,capture_ticks=probes)
+        for tick in probes:
+            self.assertGreater(float(np.mean(np.abs(original_pixels[tick].astype(np.int16)
+                -selected_pixels[tick].astype(np.int16)))),.25)
+        destination=os.environ.get('SCENE_TEST_ARTIFACT_DIR')
+        if destination:
+            target=Path(destination);target.mkdir(parents=True,exist_ok=True)
+            (target/'global-original-no-look-proof.json').write_text(json.dumps(dict(
+                fixture='EXPLICIT_NON_HUMAN_CHART_NOT_MODEL_OR_EDITING_QUALITY_PROOF',
+                original_bundle=bundle.to_dict(),completion=receipt,parent=proof,final_native=metrics,
+                actual_original_control_render_decoded_frames=bundle.render_plan.output_frame_count,
+                actual_full_render_decoded_frames=candidate.render_plan.output_frame_count,
+                old_static_source_recipes_preserved=True,no_boundary_look_fit_or_encode_performed=True,
+                human_media_rendered=False,quality_approved=False),indent=2))
 
     def test_distant_global_camera_union_reaches_one_completion_parent_and_final(self):
         from crosscut.group_scene_global_execution import complete_global_scene_program

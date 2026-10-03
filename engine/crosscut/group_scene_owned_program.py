@@ -386,7 +386,7 @@ def assemble_owned_scene_union(*, context, domain, allocation, cameras):
         if camera_unit_from_plan(program=program, unit_id=camera.unit_id,
                 plan=proposed, domain=domain) != camera:
             raise ValueError('global union camera/native phase differs from the observed whole candidate')
-    look_edges = tuple(sorted(decision.boundary_index for decision in
-        context.incumbent.boundary_look_match.decisions if decision.applied))
+    from .group_performer_family_owner import retained_applied_look_edges
+    look_edges = retained_applied_look_edges(context.incumbent)
     support = derive_support(original, proposed, retained_applied_look_edges=look_edges)
     return NumericOwnedSceneUnion(proposed, allocation, cameras, changed, _dump(support))

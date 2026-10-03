@@ -29,8 +29,7 @@ def preflight_global_numeric_union(context,union,path):
     numeric,changed=path.assemble(plan=context.incumbent.render_plan,domain=context.domain,path=path)
     operations=derive_scene_edit_operations(original=context.incumbent.render_plan,
         proposed=numeric,domain=context.domain,mutable_intervals=path.mutable_intervals)
-    look_edges=tuple(sorted(d.boundary_index for d in
-        context.incumbent.boundary_look_match.decisions if d.applied))
+    look_edges=family.retained_applied_look_edges(context.incumbent)
     support=derive_support(context.incumbent.render_plan,numeric,retained_applied_look_edges=look_edges)
     if union.changed_segment_indices!=changed or union.dependency_support!=support:
         raise ValueError('global numeric union differs from independently derived operations/dependency support')

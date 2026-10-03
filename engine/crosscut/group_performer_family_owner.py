@@ -37,6 +37,7 @@ MAX_OUTPUT_FRAMES = 36000
 MAX_REFRESHED_CELLS = 4
 MAX_NATIVE_READS = 160
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+LOOK_FAMILY_BINDING = 'retained_original_boundary_look_family_v1'
 UNRELATED_TRAINING_ENTRYPOINTS = frozenset({
     'stage_edit_dynamic_crop_capacity_probe.py',
     'stage_edit_release_fold_launcher.py',
@@ -63,6 +64,79 @@ def metadata_payload(bundle):
     value = bundle.to_dict()
     value.pop('performer_family_review', None)
     return value
+
+
+def boundary_look_inventory(look, plan):
+    """Bind actual metadata AND renderer tracks; absence is not a disabled fit.
+
+    Static source looks remain independent and are also bound, not cleared.
+    An absent metadata object with a live residual track is corruption, never
+    permission to silently erase the renderer's existing color recipe.
+    """
+    rows=plan_payload(plan)['segments']
+    tracks=[row.get('boundary_look_track') for row in rows]
+    metadata=None if look is None else plain(look.to_dict() if hasattr(look,'to_dict') else look)
+    if metadata is None:
+        if any(track is not None for track in tracks):
+            raise ValueError('original boundary look metadata absent but renderer tracks remain')
+        mode='ORIGINAL_ABSENT'
+    else:
+        if (not isinstance(metadata,dict) or metadata.get('enabled') is not True
+                or digest(metadata.get('segment_tracks'))!=digest(tracks)):
+            raise ValueError('retained look family is disabled or not the actual renderer track inventory')
+        mode='ENABLED'
+    return dict(mode=mode,segment_count=len(rows),metadata_sha256=digest(metadata),
+        renderer_tracks_sha256=digest(tracks),
+        static_source_looks_sha256=digest([row.get('look_adjustment') for row in rows]))
+
+
+def retained_applied_look_edges(bundle):
+    # Numeric-only callers can still carry a declared decision inventory. The
+    # native owner independently validates its complete family at freeze and
+    # completion; None must already agree with every actual renderer track.
+    if bundle.boundary_look_match is None:
+        boundary_look_inventory(None,bundle.render_plan)
+        return ()
+    return tuple(sorted(d.boundary_index for d in bundle.boundary_look_match.decisions if d.applied))
+
+
+def _bind_look_refresh(old,plan,look,evidence):
+    return dict(evidence,retained_family=dict(contract=LOOK_FAMILY_BINDING,
+        original=boundary_look_inventory(old.boundary_look_match,old.render_plan),
+        final=boundary_look_inventory(look,plan),
+        original_plan_sha256=digest(plan_payload(old.render_plan)),
+        original_metadata_sha256=digest(metadata_payload(old)),
+        final_plan_sha256=digest(plan_payload(plan)),quality_approved=False))
+
+
+def validate_look_refresh(plan,look,receipt,*,original_bundle=None):
+    """Consumer checks complete color-family mode, not a caller's absent flag."""
+    audit=plain(receipt.get('look_refresh'));binding=audit.get('retained_family') if isinstance(audit,dict) else None
+    final=boundary_look_inventory(look,plan)
+    original=binding.get('original') if isinstance(binding,dict) else None
+    if (not isinstance(original,dict) or binding.get('contract')!=LOOK_FAMILY_BINDING
+            or binding.get('quality_approved') is not False or binding.get('final')!=final
+            or original.get('mode')!=final['mode'] or original.get('segment_count')!=final['segment_count']
+            or binding.get('original_plan_sha256')!=receipt.get('original_plan_sha256')
+            or binding.get('original_metadata_sha256')!=receipt.get('original_metadata_sha256')
+            or binding.get('final_plan_sha256')!=digest(plan_payload(plan))):
+        raise ValueError('retained original boundary look family binding changed')
+    if final['mode']=='ORIGINAL_ABSENT':
+        if (original.get('metadata_sha256')!=digest(None)
+                or original.get('renderer_tracks_sha256')!=digest([None]*len(plan.segments))
+                or audit.get('refreshed_edges')!=[] or audit.get('projected_samples')!=[]
+                or audit.get('matched_production_renderer_used') is not False
+                or audit.get('quality_approved') is not False
+                or audit.get('incident_edges_without_boundary_look')!=receipt.get('incident_edges')
+                or 'proposed' in audit or 'verified' in audit):
+            raise ValueError('originally absent boundary look acquired a fabricated fit/render proof')
+    elif audit.get('matched_production_renderer_used') is not True:
+        raise ValueError('enabled boundary look lost its actual matched-render refresh')
+    if original_bundle is not None and (original!=boundary_look_inventory(
+            original_bundle.boundary_look_match,original_bundle.render_plan)
+            or binding['original_metadata_sha256']!=digest(metadata_payload(original_bundle))
+            or binding['original_plan_sha256']!=digest(plan_payload(original_bundle.render_plan))):
+        raise ValueError('retained boundary look differs from external original authority')
 
 
 def _stable(value):
@@ -150,14 +224,9 @@ def _supported(bundle):
         unsupported.append('existing_complete_subject_alignment_required')
     if bundle.face_match_plan is None:
         unsupported.append('existing_source_face_recipe_required')
-    if bundle.boundary_look_match is None:
-        unsupported.append('existing_complete_look_family_required')
     if unsupported:
         raise ValueError('performer family owner unsupported retained authority: ' + ', '.join(unsupported))
-    look = bundle.boundary_look_match
-    if (not look.enabled or len(look.segment_tracks) != len(bundle.render_plan.segments)
-            or tuple(s.boundary_look_track for s in bundle.render_plan.segments) != look.segment_tracks):
-        raise ValueError('retained look family is disabled or not the actual renderer track inventory')
+    boundary_look_inventory(bundle.boundary_look_match,bundle.render_plan)
     if bundle.render_plan.aspect_ratio.value != '16:9':
         raise ValueError('performer owner supports only landscape GROUP')
     if bundle.render_plan.output_frame_count > MAX_OUTPUT_FRAMES:
@@ -372,6 +441,14 @@ def _look_value(track, time):
 
 
 def refresh_look(old_bundle, camera_plan, edges, session, domain):
+    original=boundary_look_inventory(old_bundle.boundary_look_match,old_bundle.render_plan)
+    if original['mode']=='ORIGINAL_ABSENT':
+        # Do not fit, encode, clear static source looks, or fabricate a look
+        # result just to admit an original programme which never had one.
+        boundary_look_inventory(None,camera_plan)
+        return camera_plan,None,_bind_look_refresh(old_bundle,camera_plan,None,dict(
+            refreshed_edges=[],incident_edges_without_boundary_look=list(edges),projected_samples=[],
+            original_absence_preserved=True,matched_production_renderer_used=False,quality_approved=False))
     from .boundary_look_match import (analyze_boundary_look_match,
         verify_boundary_look_match_render_domain, _tracks_from_decisions,
         _boundary_pair_render_plan, BoundaryLookRenderAdmissionConfig)
@@ -422,12 +499,13 @@ def refresh_look(old_bundle, camera_plan, edges, session, domain):
     if (previous.render_admission_encode_settings_sha256 is not None
             and fresh.render_admission_encode_settings_sha256 != previous.render_admission_encode_settings_sha256):
         raise ValueError('retained/fresh look use incompatible encode settings')
-    return result.apply(clean), result, dict(refreshed_edges=list(edges),
+    refreshed_plan=result.apply(clean)
+    return refreshed_plan, result, _bind_look_refresh(old_bundle,refreshed_plan,result,dict(refreshed_edges=list(edges),
         projected_samples=cache.evidence,
         proposed=proposed.to_dict(), verified=fresh.to_dict(),
         old_family_retained_in_predecessor=True,
         disjoint_decisions_preserved=True,
-        matched_production_renderer_used=True)
+        matched_production_renderer_used=True))
 
 
 def _refresh_face(old, candidate_plan, observations, refreshed):
@@ -610,6 +688,7 @@ def validate_bundle_binding(bundle):
             or receipt.get('plan_sha256') != digest(plan_payload(bundle.render_plan))
             or receipt.get('metadata_sha256') != digest(metadata_payload(bundle))):
         raise ValueError('performer complete renderer/family/uncertainty binding changed')
+    validate_look_refresh(bundle.render_plan,bundle.boundary_look_match,receipt)
 
 
 def validate_parent(candidate, context):
@@ -620,6 +699,8 @@ def validate_parent(candidate, context):
     validate_bundle_binding(candidate)
     changed_scope(context.incumbent.render_plan,candidate.render_plan,context.domain)
     receipt = plain(candidate.performer_family_review)
+    validate_look_refresh(candidate.render_plan,candidate.boundary_look_match,receipt,
+        original_bundle=context.incumbent)
     if (receipt['source_domain'] != context.domain.to_dict()
             or receipt['source_identities'] != [list(v) for v in context.source_identities]
             or receipt['dependencies'] != dict(context.code_dependencies)
@@ -700,6 +781,30 @@ def validate_serialized_metadata(complete):
     if receipt.get('contract') == SOURCE_CONTRACT:
         from .group_source_changing_owner import validate_dense_uncertainty
         validate_dense_uncertainty(plain(receipt.get('source_camera_refresh')))
+    # Complete metadata intentionally contains final_render_segments, not a
+    # RenderPlan. Compare its non-lossy residual/color inventory here; the
+    # final consumer checks the actual complete RenderPlan separately below.
+    audit=plain(receipt.get('look_refresh'))
+    binding=audit.get('retained_family') if isinstance(audit,dict) else None
+    final=binding.get('final') if isinstance(binding,dict) else None
+    rows=complete.get('final_render_segments')
+    if not isinstance(rows,list) or not isinstance(final,dict):
+        raise ValueError('performer selected metadata lost its actual boundary look inventory')
+    tracks=[]
+    for row in rows:
+        track=row.get('boundary_look_track') if isinstance(row,Mapping) else None
+        if track is not None:
+            track=dict(track);track.pop('post_global_residual',None)
+        tracks.append(track)
+    look=complete.get('boundary_look_match')
+    mode='ORIGINAL_ABSENT' if look is None else 'ENABLED'
+    if (final.get('mode')!=mode or final.get('segment_count')!=len(rows)
+            or final.get('metadata_sha256')!=digest(look)
+            or final.get('renderer_tracks_sha256')!=digest(tracks)
+            or look is None and any(t is not None for t in tracks)
+            or look is not None and (not isinstance(look,Mapping) or look.get('enabled') is not True
+                or digest(look.get('segment_tracks'))!=digest(tracks))):
+        raise ValueError('performer selected metadata boundary look differs from the actual track inventory')
     return receipt
 
 
@@ -773,6 +878,8 @@ def consume_performer_family_qa(analysis,plan_json,selection):
     if len(complete)!=1 or validate_serialized_metadata(complete[0])!=receipt:
         raise ValueError('performer final selection/render receipt copies are missing or differ')
     selected=complete[0]
+    from .render_plan_serialization import render_plan_from_json
+    validate_look_refresh(render_plan_from_json(plan_json),selected.get('boundary_look_match'),receipt)
     for key in ('face_match','editorial_motion','boundary_look_match','group_transitions','final_render_segments'):
         if render.get(key)!=selected.get(key):
             raise ValueError('performer actual render has stale '+key+' family')

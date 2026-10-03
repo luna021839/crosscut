@@ -117,6 +117,66 @@ def test_numeric_scope_does_not_silently_admit_mixed_original_role_epochs():
         path.validate_external(context,domain)
 
 
+def no_look_fixture():
+    from crosscut import group_performer_family_owner as family
+    context,domain=fixture()
+    old=context.incumbent;old.boundary_look_match=None
+    old.to_dict=lambda:dict(boundary_look_match=None,explicit_nonmedia_fixture=True)
+    plan,look,audit=family.refresh_look(old,old.render_plan,(0,1),None,domain)
+    receipt=dict(look_refresh=audit,incident_edges=[0,1],
+        plan_sha256=family.digest(family.plan_payload(plan)),
+        original_plan_sha256=family.digest(family.plan_payload(old.render_plan)),
+        original_metadata_sha256=family.digest(family.metadata_payload(old)))
+    return old,plan,receipt
+
+
+def test_original_boundary_look_absence_preserves_plan_without_any_native_or_color_work():
+    from crosscut import group_performer_family_owner as family
+    old,plan,receipt=no_look_fixture()
+    assert plan is old.render_plan
+    assert family.retained_applied_look_edges(old)==()
+    family.validate_look_refresh(plan,None,receipt,original_bundle=old)
+    assert receipt['look_refresh']['matched_production_renderer_used'] is False
+    assert receipt['look_refresh']['retained_family']['quality_approved'] is False
+
+
+@pytest.mark.parametrize('change',['renderer_track','disabled_metadata','enabled_metadata',
+    'final_mode','original_mode','claimed_encoder','fabricated_verified','dropped_binding','incident_scope'])
+def test_original_absence_cannot_be_rehashed_into_disabled_stripped_or_fabricated_look(change):
+    from crosscut import group_performer_family_owner as family
+    from crosscut.render import BoundaryLookTrack,BoundaryLookKeyframe
+    old,plan,receipt=no_look_fixture();receipt=deepcopy(receipt);look=None
+    audit=receipt['look_refresh'];binding=audit['retained_family']
+    if change=='renderer_track':
+        track=BoundaryLookTrack((BoundaryLookKeyframe(0.,brightness=.02),))
+        plan=replace(plan,segments=(replace(plan.segments[0],boundary_look_track=track),*plan.segments[1:]))
+    elif change=='disabled_metadata':look=dict(enabled=False,segment_tracks=[None]*len(plan.segments))
+    elif change=='enabled_metadata':look=dict(enabled=True,segment_tracks=[None]*len(plan.segments))
+    elif change=='final_mode':binding['final']['mode']='ENABLED'
+    elif change=='original_mode':binding['original']['mode']='ENABLED'
+    elif change=='claimed_encoder':audit['matched_production_renderer_used']=True
+    elif change=='fabricated_verified':audit['verified']=dict(passed=True)
+    elif change=='dropped_binding':audit.pop('retained_family')
+    else:audit['incident_edges_without_boundary_look']=[0]
+    # A matching new plan digest cannot replace external original ownership.
+    receipt['plan_sha256']=family.digest(family.plan_payload(plan))
+    if 'retained_family' in audit:binding['final_plan_sha256']=receipt['plan_sha256']
+    with pytest.raises(ValueError):family.validate_look_refresh(plan,look,receipt,original_bundle=old)
+
+
+def test_absent_metadata_with_live_track_is_rejected_before_numeric_dependency_assembly():
+    from crosscut import group_performer_family_owner as family
+    from crosscut.render import BoundaryLookTrack,BoundaryLookKeyframe
+    context,domain,union,path=world()
+    context.incumbent.boundary_look_match=None
+    original=context.incumbent.render_plan
+    track=BoundaryLookTrack((BoundaryLookKeyframe(0.,brightness=.02),))
+    context.incumbent.render_plan=replace(original,segments=(
+        replace(original.segments[0],boundary_look_track=track),*original.segments[1:]))
+    with pytest.raises(ValueError,match='metadata absent but renderer tracks remain'):
+        family.retained_applied_look_edges(context.incumbent)
+
+
 def test_descriptor_consumer_assembles_union_first_and_refreshes_only_disjoint_closure():
     from crosscut.group_joint_render_observations import refresh_joint_group_render_observations
     from crosscut.visual_score import VisualTimelinePlan,VisualTimelineChoice

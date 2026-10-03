@@ -152,8 +152,9 @@ def replay_selected_scene(context,candidate):
     numeric=render_plan_from_json(program['numeric_plan'])
     if render_plan_from_json(program['original_numeric_plan'])!=context.incumbent.render_plan:
         raise ValueError('scene dependency original plan differs from the external incumbent')
-    retained_look_edges=tuple(sorted(d.boundary_index for d in context.incumbent.boundary_look_match.decisions
-        if d.applied))
+    family.validate_look_refresh(candidate.render_plan,candidate.boundary_look_match,receipt,
+        original_bundle=context.incumbent)
+    retained_look_edges=family.retained_applied_look_edges(context.incumbent)
     from .group_scene_dependency_support import validate_support
     validate_support(program['dependency_support'],context.incumbent.render_plan,numeric,
         retained_applied_look_edges=retained_look_edges)

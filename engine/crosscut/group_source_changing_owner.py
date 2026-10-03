@@ -8,7 +8,7 @@ all incident comparisons use the SAME complete mutable camera state.
 
 Supported slice: one/two whole cell-aligned shots, external source clocks,
 face-pan + measured head/arm motion + all-tick native focal ROI/part checks +
-projected descriptors + enabled boundary look. Incident legacy learned/affine/
+projected descriptors + retained enabled OR originally absent boundary look. Incident legacy learned/affine/
 formation/shot-context authorities are declined, not silently carried over.
 """
 from __future__ import annotations
@@ -543,7 +543,7 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
             raise ValueError('scene completion requires an actual source/camera edit before descriptor work')
     elif not any(numeric.segments[i].source_index!=old.render_plan.segments[i].source_index for i in planned_changed):
         raise ValueError('legacy source-changing owner requires an actual source change')
-    retained_look_edges=tuple(sorted(d.boundary_index for d in old.boundary_look_match.decisions if d.applied))
+    retained_look_edges=family.retained_applied_look_edges(old)
     planned_support=derive_support(old.render_plan,numeric,retained_applied_look_edges=retained_look_edges)
     refresh_cap=GLOBAL_MAX_REFRESHED_CELLS if global_execution else MAX_REFRESHED_CELLS
     if len(planned_support['descriptor_refresh_cells'])>refresh_cap:
@@ -903,6 +903,7 @@ def validate_binding(bundle):
             or dense.get('contract') not in DENSE_CONTRACTS
             or dense.get('geometry_sha256')!=family.digest(geometry_payload(bundle.render_plan))):
         raise ValueError('source-changing complete camera/family/uncertainty binding changed')
+    family.validate_look_refresh(bundle.render_plan,bundle.boundary_look_match,receipt)
     validate_dense_uncertainty(dense)
     if dense['contract']==SCENE_DENSE_CONTRACT:
         from .group_scene_observations import validate_scene_dense
@@ -933,6 +934,8 @@ def validate_binding(bundle):
 def validate_parent(candidate,context):
     family._fresh(context);validate_binding(candidate)
     receipt=family.plain(candidate.performer_family_review)
+    family.validate_look_refresh(candidate.render_plan,candidate.boundary_look_match,receipt,
+        original_bundle=context.incumbent)
     if (receipt['source_domain']!=context.domain.to_dict()
             or receipt['source_identities']!=[list(v) for v in context.source_identities]
             or receipt['dependencies']!=dict(context.code_dependencies)
