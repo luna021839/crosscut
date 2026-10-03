@@ -71,7 +71,8 @@ def test_unknown_or_competing_regions_do_not_gain_supported_motion(change):
 @pytest.mark.parametrize('change',['source','clock','hash','source_feature','flow','live','assignment','policy','authority'])
 def test_received_region_distribution_must_replay_exact_bound_algebra(change):
     from crosscut.group_scene_region_flow import measure_region_distribution,validate_region_distribution
-    sensors,rows,_=world();value=deepcopy(measure_region_distribution(sensors,rows[0],rows[3]))
+    from crosscut.group_scene_region_storage import expand_region_tracks
+    sensors,rows,_=world();value=deepcopy(expand_region_tracks(measure_region_distribution(sensors,rows[0],rows[3])))
     assert value['observed_support_paths']
     if change=='source':value['request_source_index']=1
     elif change=='clock':value['native_frame_indices'][0]+=1

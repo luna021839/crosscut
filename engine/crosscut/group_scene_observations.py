@@ -589,6 +589,7 @@ class SceneSensors(source.NativeFamilySensors):
             parallel_articulation_rows=[None if r is None else r.to_dict()
                 for r in self.articulation_raw_rows.values()],
             endpoint_pixel_links=list(self.link_cache.values()),
+            primitive_measurements=self.session.budget.primitive_journal.to_dict(),
             quality_approved=False, association_hypotheses_are_not_named_actors=True)
 
 

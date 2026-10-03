@@ -69,12 +69,34 @@ def validate_archive(program, dense):
         ids(row, 'heads'); ids(row, 'people')
         validate_serialized_detector_result(row)
         raw[family.digest(row)] = row
+    primitive_inventory=None
+    if archive.get('primitive_measurements') is not None:
+        from .group_joint_primitive_journal import validate_journal,primitive_inputs
+        validate_journal(archive['primitive_measurements'])
+        from .group_scene_region_storage import RegionPrimitiveInventory
+        primitive_inventory=RegionPrimitiveInventory(archive['primitive_measurements'])
+        for attempt in archive['primitive_measurements']['attempts']:
+            binding=primitive_inputs(attempt);refs=binding.get('raw_pair')
+            if (attempt['label'] not in ('opencv_region_gftt','opencv_region_lk_forward','opencv_region_lk_backward')
+                    or not isinstance(refs,list) or len(refs)!=2 or any(ref not in raw for ref in refs)):
+                raise ValueError('primitive prefix borrowed absent source-native observation inputs')
+            first,last=(raw[ref] for ref in refs)
+            if (first['request_source_index']!=last['request_source_index']
+                    or first['source_clock_identity']!=last['source_clock_identity']
+                    or not first['native_frame_index']<=binding.get('native',-1)<=last['native_frame_index']
+                    or binding.get('roi_observation_id') not in ids(first,'people')):
+                raise ValueError('primitive prefix escaped its bound source/native/ROI domain')
     def references(refs):
         if not isinstance(refs, list) or any(ref is not None and ref not in raw for ref in refs):
             raise ValueError('scene archive is missing a referenced original raw observation')
         return [None if ref is None else raw[ref] for ref in refs]
     def walk(value):
         if isinstance(value, dict):
+            if value.get('contract')==REGION_CONTRACT and 'region_track_storage' in value:
+                if primitive_inventory is None:
+                    raise ValueError('stored ROI view lost its committed primitive inventory')
+                from .group_scene_region_storage import validate_region_primitive_views
+                validate_region_primitive_views(value,primitive_inventory)
             for name in ('raw_pair', 'raw_observation_sha256'):
                 if name in value:
                     references(value[name])

@@ -168,10 +168,17 @@ def measure_region_distribution(sensors,previous,current):
         unmatched_body_observation_ids=value['required_body_observation_ids'])
     def finish(reason):
         value['reason']=reason
-        sensors.session.budget.spend('pose_evidence_bytes',len(json.dumps(value,sort_keys=True,allow_nan=False).encode()))
-        sensors.link_cache[key]=value
-        return value
+        from .group_scene_region_storage import pack_region_tracks
+        stored=pack_region_tracks(value)
+        sensors.session.budget.spend('pose_evidence_bytes',len(json.dumps(stored,
+            sort_keys=True,separators=(',',':'),allow_nan=False).encode()))
+        sensors.link_cache[key]=stored
+        return stored
     if min(len(previous.people),len(current.people))<2:return finish('fewer_than_two_original_detector_regions')
+    # Minimum first-primitive return/terminal capacity before any additional
+    # raster read. This is NOT a hard reserve for the whole measurement/phase.
+    from .group_joint_primitive_journal import primitive_reservation_bytes
+    sensors.session.budget.require_primitive_capacity({'pose_comparisons':1},primitive_reservation_bytes(4096))
     source=previous.request_source_index;pixels=sensors.session.native_pixels(source,previous.native_frame_index)
     if pixels is None:return finish('native_region_pixels_unavailable')
     value['native_pixel_sha256'].append(sha256(memoryview(pixels)).hexdigest())
@@ -183,12 +190,17 @@ def measure_region_distribution(sensors,previous,current):
         x,y,w,h=person.box_xywh;mask=np.zeros_like(gray)
         mask[max(0,math.floor(y*size[1])):min(gray.shape[0],math.ceil((y+h)*size[1])),
             max(0,math.floor(x*size[0])):min(gray.shape[1],math.ceil((x+w)*size[0]))]=255
-        sensors.session.budget.spend('pose_comparisons')
-        points=cv2.goodFeaturesToTrack(gray,maxCorners=POLICY['maximum_features_per_region'],
-            qualityLevel=POLICY['quality_level'],minDistance=POLICY['minimum_feature_distance'],mask=mask,blockSize=5)
+        points=sensors.session.budget.measure_primitive(label='opencv_region_gftt',
+            input_binding=dict(raw_pair=[previous.sha256,current.sha256],native=previous.native_frame_index,
+                native_pixel_sha256=value['native_pixel_sha256'][0],roi_observation_id=person.observation_id,
+                roi_xywh=list(person.box_xywh),policy_sha256=value['policy_sha256']),
+            work={'pose_comparisons':1},maximum_result_bytes=4096,
+            producer=lambda:cv2.goodFeaturesToTrack(gray,maxCorners=POLICY['maximum_features_per_region'],
+                qualityLevel=POLICY['quality_level'],minDistance=POLICY['minimum_feature_distance'],mask=mask,blockSize=5))
         seeds=[] if points is None else points[:,0].tolist()
         tracks.append(dict(previous_body_observation_id=person.observation_id,
-            original_box_xywh=list(person.box_xywh),seed_points_xy=seeds,steps=[]))
+            original_box_xywh=list(person.box_xywh),seed_points_xy=seeds,steps=[],
+            seed_primitive_ref=sensors.session.budget.primitive_journal.attempts[-1]['measurement_ref_sha256']))
         live.append({i:np.asarray(p) for i,p in enumerate(seeds)} if len(seeds)>=12 else {})
     opts=dict(winSize=tuple(POLICY['lk_window']),maxLevel=POLICY['lk_maximum_level'],
         criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,.01))
@@ -201,12 +213,24 @@ def measure_region_distribution(sensors,previous,current):
         for i,track in enumerate(tracks):
             if len(live[i])<10:continue
             ids=list(live[i]);points=np.asarray(list(live[i].values()),np.float32).reshape(-1,1,2)
-            # Feature updates are pixel primitives, not pose/ROI comparisons.
-            # Both actual LK directions are charged BEFORE either is invoked.
-            sensors.session.budget.spend('region_flow_feature_updates',2*len(ids))
-            forward,fs,_=cv2.calcOpticalFlowPyrLK(gray,target_gray,points,None,**opts)
-            backward,bs,_=(cv2.calcOpticalFlowPyrLK(target_gray,gray,forward,None,**opts)
+            # Commit the complete forward coordinate/status/ERROR arrays
+            # before admitting backward work; do not throw its prefix away.
+            binding=dict(raw_pair=[previous.sha256,current.sha256],native_step_offset=offset,
+                native= native,roi_observation_id=track['previous_body_observation_id'],
+                feature_ids=ids,source_points_sha256=sha256(memoryview(points)).hexdigest(),
+                source_pixel_sha256=value['native_pixel_sha256'][-2],
+                target_pixel_sha256=value['native_pixel_sha256'][-1],policy_sha256=value['policy_sha256'])
+            forward,fs,_=sensors.session.budget.measure_primitive(label='opencv_region_lk_forward',
+                input_binding=binding,work={'region_flow_feature_updates':len(ids)},maximum_result_bytes=4096,
+                producer=lambda:cv2.calcOpticalFlowPyrLK(gray,target_gray,points,None,**opts))
+            forward_ref=sensors.session.budget.primitive_journal.attempts[-1]['measurement_ref_sha256']
+            backward,bs,_=(sensors.session.budget.measure_primitive(label='opencv_region_lk_backward',
+                input_binding=dict(binding,source_points_sha256=sha256(memoryview(forward)).hexdigest()),
+                work={'region_flow_feature_updates':len(ids)},maximum_result_bytes=4096,
+                producer=lambda:cv2.calcOpticalFlowPyrLK(target_gray,gray,forward,None,**opts))
                 if forward is not None and np.isfinite(forward).all() else (None,None,None))
+            backward_ref=(sensors.session.budget.primitive_journal.attempts[-1]['measurement_ref_sha256']
+                if forward is not None and np.isfinite(forward).all() else None)
             attempts=[]
             for j,fid in enumerate(ids):
                 finite=lambda data:data is not None and np.isfinite(data[j,0]).all()
@@ -215,7 +239,8 @@ def measure_region_distribution(sensors,previous,current):
                     backward_feature_xy=backward[j,0].tolist() if finite(backward) else None,
                     forward_lk_succeeded=bool(fs is not None and fs[j,0] and finite(forward)),
                     backward_lk_succeeded=bool(bs is not None and bs[j,0] and finite(backward))))
-            step=dict(native_step_offset=offset,attempts=attempts)
+            step=dict(native_step_offset=offset,attempts=attempts,
+                forward_primitive_ref=forward_ref,backward_primitive_ref=backward_ref)
             current_points=_step_summary(step,previous_points=live[i],size=size)
             step['usable_feature_ids']=list(current_points);track['steps'].append(step);live[i]=current_points
         gray=target_gray
@@ -231,6 +256,8 @@ def measure_region_distribution(sensors,previous,current):
 
 def validate_region_distribution(value,previous,current):
     """Recompute received algebra; it cannot authenticate pixel/model history."""
+    from .group_scene_region_storage import expand_region_tracks
+    value=expand_region_tracks(value)
     previous,current=(json.loads(json.dumps(row,allow_nan=False)) for row in (previous,current))
     binding=_binding(previous,current);digest(value)
     if (any(value.get(k)!=v for k,v in binding.items()) or value.get('observed_support_paths') is not True
@@ -265,7 +292,10 @@ def project_region_distribution(value,previous,current,*,state,output_ticks,nati
     """
     from .group_source_changing_owner import project_point
     from .render_frame_schedule import VerifiedRenderFrameClock
+    from .group_scene_region_storage import expand_region_tracks
+    wire_sha256=digest(value)
     validate_region_distribution(value,previous,current)
+    value=expand_region_tracks(value)
     first,last=output_ticks
     if (type(first) is not int or type(last) is not int or first>=last
             or not state.first_output_frame<=first<last<state.end_output_frame
@@ -311,7 +341,7 @@ def project_region_distribution(value,previous,current,*,state,output_ticks,nati
     if len(regions)<POLICY['minimum_observed_roi_pairs']:
         raise ValueError('unknown regional image movement cannot become detector-centre motion')
     return dict(basis='conditional_native_roi_feature_distribution_projected_by_complete_camera',
-        flow_sha256=digest(value),state_key=state.key,output_ticks=list(output_ticks),
+        flow_sha256=wire_sha256,state_key=state.key,output_ticks=list(output_ticks),
         native_frame_indices=value['native_frame_indices'],regions=regions,
         velocity_quantiles=np.mean([r['velocity_quantiles'] for r in regions],axis=0).tolist(),
         output_duration_seconds=dt,source_native_times=native_times,

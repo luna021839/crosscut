@@ -132,7 +132,8 @@ def test_projection_uses_the_real_continuous_camera_instead_of_subtracting_nativ
 def test_native_flow_cannot_be_projected_through_a_different_source_occurrence(change):
     from crosscut.group_scene_region_flow import measure_region_distribution, project_region_distribution
     sensors, rows, _ = world()
-    value = deepcopy(measure_region_distribution(sensors, rows[0], rows[3]))
+    from crosscut.group_scene_region_storage import expand_region_tracks
+    value = deepcopy(expand_region_tracks(measure_region_distribution(sensors, rows[0], rows[3])))
     chosen = state(); ticks = (0,3)
     if change == 'clock': chosen = replace(chosen, source_clock_identity='d'*64)
     elif change == 'source': chosen = replace(chosen, segments=(replace(chosen.segments[0], source_index=1),))

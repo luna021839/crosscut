@@ -233,6 +233,9 @@ class JointGroupWorkBudget:
         self.counts={k:0 for k in values};self.model_calls={}
         self.projected_cache_bytes=maximum_projected_cache_bytes
         self.maximum_frontiers=maximum_frontiers;self.frontiers=[];self.active_frontier=None
+        self.reserved={k:0 for k in values};self._primitive_reservations={}
+        from .group_joint_primitive_journal import LocalPrimitiveJournal
+        self.primitive_journal=LocalPrimitiveJournal(self)
 
     def check(self):
         if self.clock()>=self.deadline:raise JointGroupBudgetExhausted('joint GROUP absolute work deadline reached')
@@ -248,11 +251,60 @@ class JointGroupWorkBudget:
                 raise ValueError('multi-frontier state/edge work requires an explicit active frontier')
             if self.active_frontier is not None and count>self.frontier_remaining(kind):
                 raise JointGroupBudgetExhausted('joint GROUP frontier '+kind+' work budget reached')
-        if self.counts[kind]+count>self.limits[kind]:
+        if self.counts[kind]+self.reserved[kind]+count>self.limits[kind]:
             raise JointGroupBudgetExhausted('joint GROUP '+kind+' work budget reached')
         self.counts[kind]+=count
         if kind=='model_calls':
             self.model_calls[model]=self.model_calls.get(model,0)+count
+
+    def require_primitive_capacity(self,work,maximum_evidence_bytes):
+        self.check()
+        if (not isinstance(work,dict) or not work or 'pose_evidence_bytes' in work
+                or type(maximum_evidence_bytes) is not int or maximum_evidence_bytes<1
+                or any(k not in self.limits or k in ('states','edges','model_calls')
+                    or type(n) is not int or n<0 for k,n in work.items())):
+            raise ValueError('local numeric primitive needs explicit bounded work/evidence dimensions')
+        amounts=dict(work,pose_evidence_bytes=maximum_evidence_bytes)
+        for kind,count in amounts.items():
+            if self.counts[kind]+self.reserved[kind]+count>self.limits[kind]:
+                raise JointGroupBudgetExhausted('joint GROUP primitive '+kind+' reservation unavailable')
+        return amounts
+
+    def reserve_primitive(self,work,maximum_evidence_bytes):
+        amounts=self.require_primitive_capacity(work,maximum_evidence_bytes)
+        ticket=object()
+        for kind,count in amounts.items():self.reserved[kind]+=count
+        self._primitive_reservations[ticket]=dict(amounts=amounts,started=False)
+        return ticket
+
+    def _owned_primitive_ticket(self,ticket):
+        try:owned=self._primitive_reservations.get(ticket)
+        except TypeError:owned=None
+        if owned is None:
+            raise ValueError('primitive reservation is not owned by this live budget')
+        return owned
+
+    def start_primitive(self,ticket):
+        owned=self._owned_primitive_ticket(ticket);self.check()
+        if owned['started']:raise ValueError('primitive reservation was already started')
+        owned['started']=True
+        for kind,count in owned['amounts'].items():
+            if kind=='pose_evidence_bytes':continue
+            self.reserved[kind]-=count;self.counts[kind]+=count
+
+    def settle_primitive(self,ticket,evidence_bytes):
+        owned=self._owned_primitive_ticket(ticket)
+        if type(evidence_bytes) is not int or not 0<=evidence_bytes<=owned['amounts']['pose_evidence_bytes']:
+            raise ValueError('primitive returned more evidence than its owned reservation')
+        # Completed raw/terminal storage is reserved already. It must not be
+        # discarded because its computation used the last available tick.
+        for kind,count in owned['amounts'].items():
+            if kind=='pose_evidence_bytes' or not owned['started']:self.reserved[kind]-=count
+        self.counts['pose_evidence_bytes']+=evidence_bytes
+        del self._primitive_reservations[ticket]
+
+    def measure_primitive(self,**kwargs):
+        return self.primitive_journal.measure(**kwargs)
 
     def begin_frontier(self,*,label,maximum_states,maximum_edges):
         """Declare the next finite graph; keep ALL request work/time counters.
@@ -287,7 +339,7 @@ class JointGroupWorkBudget:
         frontiers=[dict(label=row['label'],limits=dict(row['limits']),start=dict(row['start']),
             spent=dict(row.get('spent',{k:self.counts[k]-row['start'][k] for k in ('states','edges')})))
             for row in self.frontiers]
-        return dict(limits=dict(self.limits),counts=dict(self.counts),model_calls=dict(self.model_calls),
+        return dict(limits=dict(self.limits),counts=dict(self.counts),reserved=dict(self.reserved),model_calls=dict(self.model_calls),
             absolute_deadline=self.deadline,maximum_projected_cache_bytes=self.projected_cache_bytes,
             maximum_frontiers=self.maximum_frontiers,state_edge_frontiers=frontiers,
             native_and_time_caps_not_multiplied=True)
