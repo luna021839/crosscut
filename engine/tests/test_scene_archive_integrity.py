@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from crosscut import group_performer_family_owner as family
 from crosscut import group_source_changing_owner as source
+from crosscut import group_scene_observations as scene
 from crosscut.optional_native_worker import optional_native_scope
 from engine.tests import test_scene_source_owner as charts
 
@@ -85,3 +86,19 @@ class SceneArchiveIntegrityTests(unittest.TestCase):
         self.assertTrue(proof.get('referenced_discovery_archive_preserved'))
         self.assertFalse(proof.get('pre_receipt_history_completeness_certified', True))
         self.assertFalse(proof['quality_approved'])
+
+    def test_known_rejected_geometry_cannot_be_made_admissible_by_edge_flags(self):
+        original=family.plain(self.result.performer_family_review)['source_camera_refresh']
+        for scope in ('mutable','incident_row','incident_edge'):
+            with self.subTest(scope=scope):
+                dense=deepcopy(original)
+                if scope=='mutable':row=dense['mutable_shots'][0]['rows'][0]
+                elif scope=='incident_row':row=dense['incident_projected_observations'][0]['rows'][0]
+                else:row=dense['incident_projected_observations'][0]
+                row['frame_admission_violations']=['EXPLICIT_NEGATIVE_REQUIRED_FRAME_NOT_HUMAN']
+                row['role_geometry_constraints_satisfied']=False
+                if scope!='mutable':
+                    dense['incident_projected_observations'][0].update(available=True,
+                        required_semantics_available=True)
+                with self.assertRaisesRegex(ValueError,'role/visibility rejection'):
+                    scene.validate_scene_dense(dense)

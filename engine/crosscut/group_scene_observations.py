@@ -124,6 +124,17 @@ def _known_parts(person):
         if person is not None and dict(getattr(person, 'part_states', ())).get(name) == 'observed')
 
 
+class SceneFrameRejection(ValueError):
+    """A measured projection failed admission; its known pixels are not erased.
+
+    The row cannot be used by endpoint/dense admission. Only the conditional
+    editorial comparison may retain its separately measured geometry.
+    """
+    def __init__(self, row):
+        self.row = row
+        super().__init__(row['frame_admission_violations'][0])
+
+
 class SceneSensors(source.NativeFamilySensors):
     """One raw cache shared by alternatives; no dominant-face prerequisite."""
     scene_family = True
@@ -337,40 +348,55 @@ class SceneSensors(source.NativeFamilySensors):
             head_id = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
         cache_key = state.key, tick, head_id
         if cache_key in self.frame_cache:
-            return self.frame_cache[cache_key]
+            row = self.frame_cache[cache_key]
+            if row.get('frame_admission_violations'):
+                raise SceneFrameRejection(row)
+            return row
         raw = self.raw(state, tick, hypothesis['analysis_roll'])
         if abs(raw.frame_size_wh[0]/raw.frame_size_wh[1]-16/9) > .04:
             raise ValueError('scene native aspect/padding projection unsupported')
         if raw.native_pixel_sha256 is None:
             raise ValueError('scene original raster unavailable')
+        violations = []
+        def reject(reason):
+            if reason not in violations:
+                violations.append(reason)
         primary = next((h for h in raw.heads if h.observation_id == head_id), None)
         if state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION) and primary is None:
-            raise ValueError('scene focal hypothesis missing, not replaced by background actor')
-        obligations = scene_role_obligations(raw, state.role, head_id)
-        required_parts = set(obligations.required_parts)
+            reject('scene focal hypothesis missing, not replaced by background actor')
+        try:
+            obligations = scene_role_obligations(raw, state.role, head_id)
+            obligations_error = None
+        except ValueError as exc:
+            # A missing/ambiguous duty is UNKNOWN, never a zero-part duty.
+            # Raw context can still have measured, supported output geometry.
+            obligations = None
+            obligations_error = str(exc)
+            reject(obligations_error)
+        required_parts = None if obligations is None else set(obligations.required_parts)
         heads = []
         minimum = BoundarySubjectAlignmentConfig().minimum_face_visible_fraction
         for head in raw.heads:
             visible = _visible_native_box(head.box_xywh)
             if visible is None:
-                raise ValueError('scene native head has no visible raster support')
-            box, fraction = source.project_box(visible, state, tick)
-            required = head.observation_id in obligations.required_head_ids
+                reject('scene native head has no visible raster support')
+            box, fraction = source.project_box(head.box_xywh if visible is None else visible, state, tick)
+            required = None if obligations is None else head.observation_id in obligations.required_head_ids
             if required and fraction < minimum:
-                raise ValueError('scene camera crops a role-required native head/cohort member')
+                reject('scene camera crops a role-required native head/cohort member')
             headroom = _close_face_head_envelope(head.box_xywh)
             if head is primary:
                 # Existing focal gate, not a lowered threshold or inferred hair.
                 x,y,w,h=head.box_xywh
                 if x<0 or y<0 or x+w>1 or y+h>1:
-                    raise ValueError('required focal face is native-cropped; whole face unknown')
+                    reject('required focal face is native-cropped; whole face unknown')
                 _, fraction_room = source.project_box(headroom, state, tick)
                 if fraction_room < minimum:
-                    raise ValueError('scene focal face-derived headroom clipped')
+                    reject('scene focal face-derived headroom clipped')
             else:
                 fraction_room = None
             heads.append(dict(observation_id=head.observation_id,
-                raw_box_xywh=list(head.box_xywh), native_visible_support_xywh=list(visible),
+                raw_box_xywh=list(head.box_xywh), native_visible_support_xywh=None if visible is None else list(visible),
                 native_cropped=(head.box_xywh[0]<0 or head.box_xywh[1]<0 or head.box_xywh[0]+head.box_xywh[2]>1 or head.box_xywh[1]+head.box_xywh[3]>1), projected_box_xywh=list(box),
                 visible_fraction=fraction, headroom_visible_fraction=fraction_room,
                 required_by_role=required,
@@ -382,31 +408,31 @@ class SceneSensors(source.NativeFamilySensors):
             parts = dict(getattr(person, 'part_states', ()))
             if state.role == GroupOutputRole.COMPOSITION and (
                     fraction < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction):
-                raise ValueError('composition camera clips required measured native body support')
+                reject('composition camera clips required measured native body support')
             if state.role == GroupOutputRole.FORMATION:
                 if (not trackable_person_ownership(person)
                         or fraction < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction
                         or set(_known_parts(person)) != {'left_arm', 'right_arm'}):
-                    raise ValueError('formation body/required arm evidence unknown or camera-clipped')
+                    reject('formation body/required arm evidence unknown or camera-clipped')
             arms = []
             anchor = next((h.box_xywh for h in raw.heads
                 if h.observation_id == getattr(person, 'unique_head_observation_id', None)), None)
             for name, indices in (('left_arm', (0, 2, 4)), ('right_arm', (1, 3, 5))):
                 if name not in _known_parts(person):
                     continue
-                required = (person.observation_id, name) in required_parts
+                required = None if required_parts is None else (person.observation_id, name) in required_parts
                 joints_visible = all(0 <= points[n][0] <= 1 and 0 <= points[n][1] <= 1 for n in indices)
                 if required and not joints_visible:
-                    raise ValueError('scene camera crops a role-required observed arm')
+                    reject('scene camera crops a role-required observed arm')
                 # No face/body association => cannot invent a face-derived hand
                 # envelope. Keep the unknown explicitly, never a neutral box.
                 if required and anchor is None:
-                    raise ValueError('scene observed arm has no bound face-envelope anchor')
+                    reject('scene observed arm has no bound face-envelope anchor')
                 envelope = None if anchor is None else _action_envelope(
                     anchor, tuple(person.upper_body_xyc[n][:2] for n in indices))
                 visibility = None if envelope is None else source.project_box(envelope, state, tick)[1]
-                if required and visibility < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction:
-                    raise ValueError('scene camera clips a required measured arm envelope')
+                if required and visibility is not None and visibility < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction:
+                    reject('scene camera clips a required measured arm envelope')
                 item = dict(part=name, person_observation_id=person.observation_id,
                     projected_joint_xy=[list(points[n][:2]) for n in indices],
                     native_action_envelope_xywh=None if envelope is None else list(envelope),
@@ -419,13 +445,13 @@ class SceneSensors(source.NativeFamilySensors):
                 projected_upper_body_xyc=[list(p) for p in points], confidence=person.confidence,
                 unique_head_observation_id=getattr(person, 'unique_head_observation_id', None),
                 part_states=parts, observed_arms=arms,
-                required_by_role=person.observation_id in obligations.required_person_ids))
+                required_by_role=None if obligations is None else person.observation_id in obligations.required_person_ids))
         owners = [p for p in raw.people if getattr(p, 'unique_head_observation_id', None) == head_id]
         if state.role == GroupOutputRole.FOCAL_HEAD_ARMS and (len(owners) != 1
                 or set(_known_parts(owners[0])) != {'left_arm', 'right_arm'}):
-            raise ValueError('scene focal required arms lack unique original-pixel ownership')
+            reject('scene focal required arms lack unique original-pixel ownership')
         if state.role == GroupOutputRole.FORMATION and len(people) < 2:
-            raise ValueError('formation cannot be certified by one face ROI')
+            reject('formation cannot be certified by one face ROI')
         selected = next((h for h in heads if h['observation_id'] == head_id), None)
         result = dict(output_tick=tick, request_source_index=raw.request_source_index,
             native_frame_index=raw.native_frame_index, native_observation=raw.to_dict(),
@@ -437,12 +463,17 @@ class SceneSensors(source.NativeFamilySensors):
             projected_face_roi_xywh=None if selected is None else selected['projected_box_xywh'],
             face_roi_visible_fraction=None if selected is None else selected['visible_fraction'],
             projected_observed_arms=observed_arms, scene_heads=heads, scene_people=people,
-            role_obligations=obligations.to_dict(),
+            role_obligations=None if obligations is None else obligations.to_dict(),
+            role_obligations_unknown_reason=obligations_error,
+            frame_admission_violations=violations,
+            role_geometry_constraints_satisfied=not violations,
             scene_geometry=_scene_geometry(heads, people), role=state.role.value,
             whole_head_extent_certified=False, cross_camera_identity_certified=False,
-            body_phase_certified=False, anatomical_occlusion_inferred=False)
+            body_phase_certified=False, anatomical_occlusion_inferred=False, quality_approved=False)
         self.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(result, sort_keys=True).encode()))
         self.frame_cache[cache_key] = result
+        if violations:
+            raise SceneFrameRejection(result)
         return result
 
     def dense(self, path):
@@ -941,8 +972,15 @@ def compare_scene_edge(sensors, left, right):
     """Both sides use the SAME complete state/hypothesis, never per-edge actors."""
     ticks = (left.end_output_frame-4, left.end_output_frame-1,
         right.first_output_frame, right.first_output_frame+3)
+    rows = []; frame_rejections = []
     try:
-        rows = [sensors.frame(s, t) for s, t in zip((left, left, right, right), ticks)]
+        for s, t in zip((left, left, right, right), ticks):
+            try:
+                rows.append(sensors.frame(s, t))
+            except SceneFrameRejection as exc:
+                rows.append(exc.row)
+                frame_rejections.append(dict(state_key=s.key,output_tick=t,
+                    reasons=exc.row['frame_admission_violations']))
     except ValueError as exc:
         return dict(available=False, required_semantics_available=False, reason=str(exc), metrics=None,
             cross_camera_identity_certified=False, body_phase_certified=False)
@@ -953,16 +991,19 @@ def compare_scene_edge(sensors, left, right):
         attention=float(np.linalg.norm(np.asarray(a['attention_xy'])-b['attention_xy'])),
         scale=float(np.mean(np.abs(np.log(np.asarray(a['subject_height_quantiles'])/b['subject_height_quantiles'])))),
         span=abs(math.log(max(a['horizontal_span'], 1e-9)/max(b['horizontal_span'], 1e-9))))
-    va = (np.asarray(rows[1]['scene_geometry']['attention_xy'])-rows[0]['scene_geometry']['attention_xy'])*(left.output_fps/3)
-    vb = (np.asarray(rows[3]['scene_geometry']['attention_xy'])-rows[2]['scene_geometry']['attention_xy'])*(right.output_fps/3)
+    def velocity(pair, fps):
+        if any(r['scene_geometry'] is None for r in pair):return None
+        return (np.asarray(pair[1]['scene_geometry']['attention_xy'])-
+            pair[0]['scene_geometry']['attention_xy'])*(fps/3)
+    va = velocity(rows[:2],left.output_fps); vb = velocity(rows[2:],right.output_fps)
     composition_cut=GroupOutputRole.COMPOSITION in (left.role,right.role)
-    metrics['screen_motion'] = None if composition_cut else float(np.linalg.norm(va-vb))
+    metrics['screen_motion'] = None if composition_cut or va is None or vb is None else float(np.linalg.norm(va-vb))
     formation = left.role == GroupOutputRole.FORMATION or right.role == GroupOutputRole.FORMATION
     evidence = dict(left_state=left.key, right_state=right.key, rows=rows,
         metrics=metrics, available=False, required_semantics_available=False,
         required_endpoint_evidence=None, first_incoming_output_frame=right.first_output_frame,
-        screen_velocity_outgoing=None if composition_cut else va.tolist(),
-        screen_velocity_incoming=None if composition_cut else vb.tolist(),
+        screen_velocity_outgoing=None if composition_cut or va is None else va.tolist(),
+        screen_velocity_incoming=None if composition_cut or vb is None else vb.tolist(),
         camera_direction_basis='measured_screen_attention_motion_not_inferred_3d_camera',
         cross_camera_identity_certified=False, body_phase_certified=False)
     # Projected geometry is independently known even when required native
@@ -970,12 +1011,19 @@ def compare_scene_edge(sensors, left, right):
     if not formation and GroupOutputRole.COMPOSITION not in (left.role, right.role):
         boxes = [r['projected_face_roi_xywh'] for r in rows]
         if any(v is None for v in boxes):
-            return dict(evidence, reason='focal hypothesis unobserved')
-        centers = [np.asarray((v[0]+v[2]/2, v[1]+v[3]/2)) for v in boxes]
-        metrics['focal_position'] = float(np.linalg.norm(centers[1]-centers[2]))
-        metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
-        velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
-        metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
+            if not frame_rejections:
+                return dict(evidence, reason='focal hypothesis unobserved')
+        else:
+            centers = [np.asarray((v[0]+v[2]/2, v[1]+v[3]/2)) for v in boxes]
+            metrics['focal_position'] = float(np.linalg.norm(centers[1]-centers[2]))
+            metrics['focal_scale'] = abs(math.log(boxes[1][3]/boxes[2][3]))
+            velocities = [(centers[1]-centers[0])*left.output_fps/3, (centers[3]-centers[2])*right.output_fps/3]
+            metrics['focal_motion'] = float(np.linalg.norm(velocities[0]-velocities[1]))
+    if frame_rejections:
+        return dict(evidence, reason=frame_rejections[0]['reasons'][0],
+            frame_admission_violations=frame_rejections,
+            known_geometry_retained_on_frame_rejection=True,
+            required_motion_unknown_not_zero=True)
     try:
         endpoints = [sensors.endpoint(left, outgoing=True), sensors.endpoint(right, outgoing=False)]
     except ValueError as exc:
@@ -1100,6 +1148,11 @@ def validate_scene_dense(dense):
     from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available,validate_focal_pose_view
     raw_inventory={family.digest(row):row for row in (dense.get('scene_discovery') or {}).get('native_rows',())}
     for edge in dense.get('incident_projected_observations', ()):
+        if (edge.get('frame_admission_violations') or any(
+                row.get('frame_admission_violations')
+                or row.get('role_geometry_constraints_satisfied',True) is not True
+                for row in edge.get('rows',()))):
+            raise ValueError('scene incident cannot admit a measured frame with role/visibility rejection')
         if edge.get('comparison_mode') == 'predeclared_composition_cut':
             validate_articulation_evidence(edge.get('articulated_cross_camera_motion'),
                 edge.get('metrics'), dense.get('native_assets'))
@@ -1168,6 +1221,9 @@ def validate_scene_dense(dense):
             raise ValueError('scene dense omitted/duplicated a mutable output tick')
         previous_row=None
         for row in span['rows']:
+            if (row.get('frame_admission_violations')
+                    or row.get('role_geometry_constraints_satisfied',True) is not True):
+                raise ValueError('scene dense cannot admit a measured frame with role/visibility rejection')
             if (row.get('scene_hypothesis_sha256')!=key or row.get('anatomical_occlusion_inferred') is not False
                     or row.get('role')!=h['role']):
                 raise ValueError('scene dense row borrowed another hypothesis/anatomy claim')
