@@ -31,6 +31,74 @@ def _cell_offsets(plan):
     return offsets
 
 
+def _role_epochs(cells,first,end):
+    epochs=[]
+    for cell in cells:
+        try:role=role_from_cells([cell]).value;reason=None
+        except ValueError as exc:role=None;reason=str(exc)
+        low=max(cell['first_output_frame'],first);high=min(cell['end_output_frame'],end)
+        if epochs and (epochs[-1]['role'],epochs[-1]['unresolved_reason'])==(role,reason):
+            epochs[-1]['end_output_frame']=high
+            epochs[-1]['original_segment_indices'].append(cell['segment_index'])
+        else:
+            epochs.append(dict(first_output_frame=low,end_output_frame=high,role=role,
+                unresolved_reason=reason,original_segment_indices=[cell['segment_index']]))
+    return epochs
+
+
+def _original_role_program(identity,shot,cells):
+    return dict(contract=CONTRACT,original_plan_identity=identity,original_shot=shot,
+        original_output_cells=cells,epochs=_role_epochs(cells,shot['first_output_frame'],shot['end_output_frame']),
+        original_output_cell_roles_frozen=True,original_native_part_lifecycle_frozen=False,
+        role_is_not_physical_cast_or_identity=True,frozen_before_source_camera_search=True,
+        epoch_boundaries_are_not_edit_cuts=True,candidate_admitted=False,quality_approved=False)
+
+
+def validate_original_role_epochs(program,*,original_plan=None):
+    """Received role-policy closure, not fresh observation of original pixels.
+
+    Original declared labels remain input evidence, not detected cast/duties.
+    A selected parent must separately rederive the exact sidecar from its
+    external incumbent. Unresolved roles cannot be promoted or discarded.
+    """
+    try:
+        identity=program['original_plan_identity'];shot=program['original_shot'];cells=program['original_output_cells']
+        if (not isinstance(identity,str) or len(identity)!=64 or any(c not in '0123456789abcdef' for c in identity)
+                or not isinstance(shot,dict) or set(shot)!={'first_output_frame','end_output_frame','frame_count',
+                    'source_index','first_segment_index','last_segment_index'}
+                or any(type(value) is not int for value in shot.values())
+                or not 0<=shot['first_output_frame']<shot['end_output_frame']
+                or shot['frame_count']!=shot['end_output_frame']-shot['first_output_frame']
+                or shot['source_index']<0 or not 0<=shot['first_segment_index']<=shot['last_segment_index']
+                or not isinstance(cells,list) or not cells
+                or any(not isinstance(cell,dict) or set(cell)!={'segment_index','first_output_frame','end_output_frame',
+                    'shot_type','alignment_subject','face_applied'} for cell in cells)
+                or [cell['segment_index'] for cell in cells]!=list(range(shot['first_segment_index'],shot['last_segment_index']+1))
+                or any(type(cell[key]) is not int for cell in cells for key in
+                    ('segment_index','first_output_frame','end_output_frame'))
+                or any(not 0<=cell['first_output_frame']<cell['end_output_frame'] for cell in cells)
+                or any(a['end_output_frame']!=b['first_output_frame'] for a,b in zip(cells,cells[1:]))
+                or cells[0]['first_output_frame']>shot['first_output_frame']
+                or cells[-1]['end_output_frame']<shot['end_output_frame']
+                or any(cell['first_output_frame']>=shot['end_output_frame'] or
+                    cell['end_output_frame']<=shot['first_output_frame'] for cell in cells)):
+            raise ValueError('original role programme lost its external output-cell scope')
+        if _freeze(program)!=_freeze(_original_role_program(identity,shot,cells)):
+            raise ValueError('original role programme changed role epochs or promoted authority')
+        if original_plan is not None:
+            if not isinstance(original_plan,RenderPlan) or identity!=_plan_identity(original_plan):
+                raise ValueError('original role programme changed its original renderer identity')
+            offsets=_cell_offsets(original_plan)
+            if shot['last_segment_index']>=len(original_plan.segments):
+                raise ValueError('original role programme borrowed an absent output cell')
+            if any((cell['first_output_frame'],cell['end_output_frame'])!=tuple(offsets[cell['segment_index']:cell['segment_index']+2])
+                    or original_plan.segments[cell['segment_index']].source_index!=shot['source_index'] for cell in cells):
+                raise ValueError('original role programme changed its original source/cell clock')
+    except (KeyError,TypeError,IndexError) as exc:
+        raise ValueError('original role programme lost its received schema') from exc
+    return program
+
+
 def freeze_original_role_epochs(context,shot):
     """Read external original declarations before any donor observations.
 
@@ -50,28 +118,14 @@ def freeze_original_role_epochs(context,shot):
     if (not indices or (indices[0],indices[-1])!=(shot.first_segment_index,shot.last_segment_index)
             or any(plan.segments[i].source_index!=shot.source_index for i in indices)):
         raise ValueError('original role epoch shot differs from its external output cells')
-    cells=[];epochs=[]
+    cells=[]
     for index in indices:
         choice=bundle.visual_timeline.choices[index];face=bundle.face_match_plan.segments[index]
         cell=dict(segment_index=index,first_output_frame=offsets[index],end_output_frame=offsets[index+1],
             shot_type=getattr(choice.shot_type,'value',choice.shot_type),
             alignment_subject=face.alignment_subject,face_applied=face.applied)
         cells.append(cell)
-        try:role=role_from_cells([cell]).value;reason=None
-        except ValueError as exc:role=None;reason=str(exc)
-        first=max(offsets[index],shot.first_output_frame)
-        end=min(offsets[index+1],shot.end_output_frame)
-        if epochs and (epochs[-1]['role'],epochs[-1]['unresolved_reason'])==(role,reason):
-            epochs[-1]['end_output_frame']=end
-            epochs[-1]['original_segment_indices'].append(index)
-        else:
-            epochs.append(dict(first_output_frame=first,end_output_frame=end,role=role,
-                unresolved_reason=reason,original_segment_indices=[index]))
-    return dict(contract=CONTRACT,original_plan_identity=_plan_identity(plan),original_shot=shot.to_dict(),
-        original_output_cells=cells,epochs=epochs,original_output_cell_roles_frozen=True,
-        original_native_part_lifecycle_frozen=False,role_is_not_physical_cast_or_identity=True,
-        frozen_before_source_camera_search=True,epoch_boundaries_are_not_edit_cuts=True,
-        candidate_admitted=False,quality_approved=False)
+    return _original_role_program(_plan_identity(plan),shot.to_dict(),cells)
 
 
 def _pixel_parameters(segment,time):

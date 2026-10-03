@@ -70,9 +70,11 @@ class GroupSourceCameraState:
             counts=(self.end_output_frame-self.first_output_frame,)
             object.__setattr__(self,'segment_output_frame_counts',counts)
         if (not isinstance(counts,tuple) or len(counts)!=len(self.segments)
-                or any(type(n) is not int or n<2 for n in counts)
+                or any(type(n) is not int or n<self._minimum_cell_frame_count() for n in counts)
                 or sum(counts)!=self.end_output_frame-self.first_output_frame):
             raise ValueError('joint whole camera needs exact per-cell output frame counts')
+
+    def _minimum_cell_frame_count(self):return 2
 
     def key_preimage(self):
         # Whole trajectories and native clocks participate, not merely source
@@ -107,6 +109,31 @@ class GroupSourceCameraState:
                 for t in domain.scene_cut_times[self.eligible_source_index]):
             raise ValueError('joint state crosses an observed actual native camera cut')
         return self
+
+
+@dataclass(frozen=True,slots=True)
+class FixedGroupNeighborObservationState(GroupSourceCameraState):
+    """Read-only slices, never newly selected one-frame render cells.
+
+    The complete externally owned renderer rederives this state in assembly
+    and parent/final replay. Its internal fragment counts do not grant mutable
+    source/camera/cut topology authority.
+    """
+    def __post_init__(self):
+        GroupSourceCameraState.__post_init__(self)
+        if self.slot not in (0,2,3):
+            raise ValueError('read-only partial-cell view cannot own a mutable slot')
+
+    def _minimum_cell_frame_count(self):return 1
+
+    def key_preimage(self):
+        return dict(GroupSourceCameraState.key_preimage(self),
+            observation_only_fixed_subcell_fragments=True)
+
+    def to_dict(self):
+        return dict(GroupSourceCameraState.to_dict(self),
+            contract='fixed_neighbor_readonly_fragment_state_v1',
+            render_topology_materialized=False,mutable_source_camera_authority=False)
 
 
 def joint_state_from_render_plan(*,plan,domain,slot,first_output_frame,end_output_frame,

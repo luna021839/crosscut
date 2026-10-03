@@ -768,7 +768,7 @@ def restore_view_state(value,domain,hypothesis,state_key):
     This does not replace the parent's fresh model/pixel/render-plan replay.
     It makes output-space motion algebra depend on the exact bound camera.
     """
-    from .group_joint_source_camera import GroupSourceCameraState,GroupOutputRole
+    from .group_joint_source_camera import (GroupSourceCameraState,FixedGroupNeighborObservationState,GroupOutputRole)
     from .render_plan_serialization import render_segment_from_json
     from .group_scene_intent import validate_intent
     from .group_source_changing_owner import NativeFamilySensors
@@ -776,7 +776,9 @@ def restore_view_state(value,domain,hypothesis,state_key):
         raise ValueError('registered focal pose lost its complete camera preimage')
     p=value['key_preimage']
     try:
-        state=GroupSourceCameraState(p['slot'],p['first'],p['end'],p['source'],
+        state_type=(FixedGroupNeighborObservationState if value.get('contract')=='fixed_neighbor_readonly_fragment_state_v1'
+            else GroupSourceCameraState)
+        state=state_type(p['slot'],p['first'],p['end'],p['source'],
             tuple(render_segment_from_json(s) for s in p['segments']),tuple(p['native']),
             GroupOutputRole(p['role']),p['clock'],p['fps'],tuple(p['output_size']),
             tuple(p['cell_frame_counts']),value.get('raw_shot_family'),p.get('editorial_contract_sha256'))

@@ -149,6 +149,12 @@ def replay_selected_scene(context,candidate):
             shot=shots.get((state.first_output_frame,state.end_output_frame))
             if shot is None:
                 raise ValueError('selected scene state is not an original output-owned shot')
+            from .group_scene_epoch_program import freeze_original_role_epochs
+            role_program=freeze_original_role_epochs(context,shot)
+            identity=sensors.record_original_role_program(role_program)
+            roles=dense['scene_discovery']['original_programme_records']['original_role_programmes']
+            if roles.get(identity)!=role_program:
+                raise ValueError('selected scene changed its external original role epochs')
             intent=declared_shot_intent(context,shot,endpoint_scope=scope(index))
             if intent['role']!=state.role.value:
                 raise ValueError('selected scene state weakened its original declared duty')

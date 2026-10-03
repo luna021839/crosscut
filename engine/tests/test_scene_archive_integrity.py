@@ -127,3 +127,20 @@ class SceneArchiveIntegrityTests(unittest.TestCase):
             elif scope=='incident_parts':dense['incident_projected_observations'][0]['rows'][0]['role_obligations']['required_parts']=[(99,'left_arm')]
             else:dense['incident_projected_observations'][0]['required_endpoint_evidence'][0]['original_duty_program_sha256']=None
             with self.subTest(scope=scope),self.assertRaises(ValueError):scene.validate_scene_dense(dense)
+
+    def test_resigned_selected_role_or_native_programme_versions_cannot_disappear(self):
+        from crosscut.group_scene_archive import archive_binding,validate_archive
+        receipt=family.plain(self.result.performer_family_review)
+        for change in ('selected_role_ref','role_version','native_version','active_version','history_authority'):
+            with self.subTest(change=change):
+                dense=deepcopy(receipt['source_camera_refresh'])
+                program=deepcopy(receipt['selected_scene_program'])
+                archive=dense['scene_discovery'];records=archive['original_programme_records']
+                if change=='selected_role_ref':program['original_role_programme_sha256'].pop()
+                elif change=='role_version':records['original_role_programmes'].pop(program['original_role_programme_sha256'][0])
+                elif change=='native_version':records['native_duty_programmes'].pop(program['original_duty_program']['program_sha256'])
+                elif change=='active_version':records['active_native_duty_programme_sha256']='e'*64
+                else:records['pre_receipt_history_completeness_certified']=True
+                program['discovery_archive_binding']=archive_binding(archive)
+                program.pop('program_sha256');program['program_sha256']=family.digest(program)
+                with self.assertRaises(ValueError):validate_archive(program,dense)

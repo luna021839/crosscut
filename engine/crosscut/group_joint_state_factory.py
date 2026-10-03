@@ -10,11 +10,13 @@ import hashlib
 import json
 
 from .group_actual_shots import assert_native_cut_events_preserved,visible_group_cut_inventory
-from .group_joint_source_camera import GroupSourceCameraState,joint_state_from_render_plan
+from .group_joint_source_camera import (GroupSourceCameraState,FixedGroupNeighborObservationState,
+    joint_state_from_render_plan)
 from .group_source_domain import GroupSourceDomain
 from .group_cut_camera_proposal import UNREVIEWED_GROUP_SOURCE_TRANSITION_REASON
 from .render import (RenderPlan,RenderTransition,aligned_render_segment,segment_frame_counts,
-    _combined_identity_segment,_segments_share_source_clock)
+    _combined_identity_segment,_segments_share_source_clock,_can_share_source_clock)
+from .render_boundary_clock import native_frame_clocks_for_output
 from .render_frame_schedule import sampler_frame_schedule
 from .shot_context_camera import slice_shot_camera_track
 
@@ -32,30 +34,58 @@ def fixed_neighbor_state_from_render_plan(*,plan,domain,slot,first_output_frame,
     """Read an unchanged actual neighbor without publishing a split timeline.
 
     A broadcaster cut can end the neighbor inside a canonical cell while the
-    mutable middle shot is already aligned. The numeric split scaffold proves
-    every original native sample, crop, camera/canvas and look value unchanged;
-    only a read-only fixed state is returned. The assembler still reconstructs
-    it from the original plan, and mutable states retain strict cell ownership.
+    mutable middle shot is already aligned. Read-only fragment views keep
+    every original native sample, crop, camera/canvas and look phase unchanged
+    without splitting the selected RenderPlan. Even a one-tick tail is merely
+    an observation fragment, not a newly rendered cell. The assembler still
+    reconstructs it from the original plan; mutable states retain cell ownership.
     This is not a complete mutable-epoch metadata/receipt owner.
     """
-    if type(slot) is not int or slot not in (0,2,3):
+    if (not isinstance(plan,RenderPlan) or not isinstance(domain,GroupSourceDomain)
+            or plan.sources!=domain.request_sources or any(t.kind.uses_overlap for t in plan.transitions)
+            or type(slot) is not int or slot not in (0,2,3)):
         raise ValueError('partial-cell neighbor view is only for a fixed outer state')
     counts=segment_frame_counts(plan);ticks=[0]
     for count in counts:ticks.append(ticks[-1]+count)
     if (type(first_output_frame) is not int or type(end_output_frame) is not int
             or not 0<=first_output_frame<end_output_frame<=ticks[-1]):
         raise ValueError('fixed neighbor interval is outside the original renderer')
-    source_plan=plan
-    if first_output_frame not in ticks or end_output_frame not in ticks:
-        from .group_interval_materialization import split_group_render_intervals
-        split=tuple(t for t in (first_output_frame,end_output_frame) if t not in ticks)
-        scaffold=split_group_render_intervals(plan=plan,domain=domain,
-            split_output_frames=split,maximum_additional_cells=2)
-        source_plan=scaffold.plan
-    return joint_state_from_render_plan(plan=source_plan,domain=domain,slot=slot,
-        first_output_frame=first_output_frame,end_output_frame=end_output_frame,
-        role=role,raw_shot_family=raw_shot_family,
-        editorial_contract_sha256=editorial_contract_sha256)
+    if first_output_frame in ticks and end_output_frame in ticks:
+        return joint_state_from_render_plan(plan=plan,domain=domain,slot=slot,
+            first_output_frame=first_output_frame,end_output_frame=end_output_frame,
+            role=role,raw_shot_family=raw_shot_family,
+            editorial_contract_sha256=editorial_contract_sha256)
+    if plan.authorized_shot_video_clocks or any(s.outgoing_overlap_transform is not None for s in plan.segments):
+        raise ValueError('read-only fragments need supported original hard-cut clock/camera authority')
+    from .group_interval_materialization import _slice_camera,_slice_look
+    from .group_cut_camera_proposal import retime_base_pan
+    indices=tuple(i for i in range(len(counts)) if ticks[i]<end_output_frame and ticks[i+1]>first_output_frame)
+    if not _can_share_source_clock(plan,first_index=indices[0],candidate_last_index=indices[-1]):
+        raise ValueError('fixed fragment view is not one actual source clock')
+    fragments=[];fragment_counts=[]
+    for index in indices:
+        segment=plan.segments[index];a=max(first_output_frame,ticks[index]);b=min(end_output_frame,ticks[index+1])
+        local=a-ticks[index];offset=local/plan.fps
+        stop=segment.duration if b==ticks[index+1] else (b-ticks[index])/plan.fps
+        duration=stop-offset
+        fragments.append(segment if a==ticks[index] and b==ticks[index+1] else replace(segment,
+            source_start=segment.source_start+offset*segment.source_playback_rate,
+            master_start=segment.master_start+offset,duration=duration,
+            source_duration=duration*segment.source_playback_rate if segment.source_duration is not None else None,
+            pan_crop=retime_base_pan(segment.pan_crop,relative_shift=offset,duration=duration),
+            editorial_transform=_slice_camera(segment.editorial_transform,offset_seconds=offset,duration=duration),
+            boundary_look_track=_slice_look(segment.boundary_look_track,offset_seconds=offset,duration=duration)))
+        fragment_counts.append(b-a)
+    samples=native_frame_clocks_for_output(plan,domain.clocks_by_request,range(first_output_frame,end_output_frame))
+    source=fragments[0].source_index;eligible=domain.eligible_index(source)
+    if any(row.source_index!=source or row.terminal_clone for row in samples.values()):
+        raise ValueError('fixed fragment view cannot borrow other-source or terminal-cloned pixels')
+    identity=hashlib.sha256(json.dumps(domain.render_frame_clocks[eligible].to_dict(),
+        sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    return FixedGroupNeighborObservationState(slot,first_output_frame,end_output_frame,eligible,
+        tuple(fragments),tuple(row.native_frame_index for row in samples.values()),role,identity,
+        plan.fps,(plan.width,plan.height),tuple(fragment_counts),raw_shot_family,
+        editorial_contract_sha256).bind_source(domain)
 
 
 def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_index,camera_track=None):
@@ -69,6 +99,7 @@ def candidate_joint_group_state(*,plan,domain,incumbent_state,eligible_source_in
     """
     if (not isinstance(plan,RenderPlan) or not isinstance(domain,GroupSourceDomain)
             or not isinstance(incumbent_state,GroupSourceCameraState)
+            or isinstance(incumbent_state,FixedGroupNeighborObservationState)
             or incumbent_state.slot not in (1,2) or plan.sources!=domain.request_sources):
         raise ValueError('joint state factory needs complete owned plan/domain and a mutable shot')
     first,end,counts=_cell_interval(plan,incumbent_state.first_output_frame,incumbent_state.end_output_frame)
@@ -150,6 +181,8 @@ def _assemble_group_state_path(*,plan,domain,path,state_count,replace_incident_c
                 editorial_contract_sha256=state.editorial_contract_sha256)
             if original.key!=state.key:raise ValueError('joint replacement changed a fixed outer neighbor')
         else:
+            if isinstance(state,FixedGroupNeighborObservationState):
+                raise ValueError('read-only fixed fragments cannot become mutable renderer cells')
             first,end,counts=_cell_interval(plan,state.first_output_frame,state.end_output_frame)
             if state.segment_output_frame_counts!=tuple(counts[first:end]) or len(state.segments)!=end-first:
                 raise ValueError('joint state changed canonical cell/frame authority')

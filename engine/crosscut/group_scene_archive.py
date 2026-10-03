@@ -11,7 +11,7 @@ from .group_joint_source_camera import GroupOutputRole
 
 CONTRACT = 'received_scene_discovery_reference_binding_v1'
 SECTIONS = ('discoveries', 'hypotheses', 'native_rows',
-    'parallel_articulation_rows', 'endpoint_pixel_links')
+    'parallel_articulation_rows', 'endpoint_pixel_links','original_programme_records')
 
 
 def archive_binding(archive):
@@ -36,8 +36,10 @@ def validate_archive(program, dense):
     if (not isinstance(archive, dict) or archive.get('contract') != SCENE_CONTRACT
             or archive.get('quality_approved') is not False
             or archive.get('association_hypotheses_are_not_named_actors') is not True
-            or any(not isinstance(archive.get(name), list) for name in SECTIONS if name != 'hypotheses')
+            or any(not isinstance(archive.get(name), list) for name in SECTIONS if name not in
+                ('hypotheses','original_programme_records'))
             or not isinstance(archive.get('hypotheses'), dict)
+            or not isinstance(archive.get('original_programme_records'),dict)
             or not archive['discoveries'] or not archive['native_rows'] or not archive['hypotheses']):
         raise ValueError('scene discovery archive inventory or uncertainty authority missing')
     if program.get('discovery_archive_binding') != archive_binding(archive):
@@ -73,6 +75,26 @@ def validate_archive(program, dense):
     if archive.get('normalized_native_view_records') is not None:
         from .group_scene_native_storage import validate_normalized_view_records
         validate_normalized_view_records(archive['normalized_native_view_records'],raw)
+    from .group_scene_programme_archive import validate_programme_records
+    from .render_plan_serialization import render_plan_from_json
+    original_plan=render_plan_from_json(program['original_numeric_plan']) if 'original_numeric_plan' in program else None
+    validate_programme_records(archive['original_programme_records'],raw_inventory=raw,
+        required_programme=program.get('original_duty_program'),original_plan=original_plan,
+        reference_roots=(archive,dense.get('mutable_shots'),dense.get('incident_projected_observations')))
+    role_refs=program.get('original_role_programme_sha256')
+    baseline=program.get('baseline_states');original_duties=program.get('original_duty_program')
+    role_inventory=archive['original_programme_records']['original_role_programmes']
+    if (not isinstance(role_refs,list) or not isinstance(baseline,list) or len(role_refs)!=len(baseline)
+            or not isinstance(original_duties,dict) or len(original_duties['units'])!=len(role_refs)):
+        raise ValueError('selected scene lost its external original role programme references')
+    for ref,state,unit in zip(role_refs,baseline,original_duties['units'],strict=True):
+        role_program=role_inventory.get(ref);preimage=state['key_preimage']
+        if (role_program is None or (role_program['original_shot']['first_output_frame'],
+                role_program['original_shot']['end_output_frame'],role_program['original_shot']['source_index'])!=
+                (preimage['first'],preimage['end'],eligible[preimage['source']])
+                or any(branch['original_hypothesis']['shot_intent']['retained_output_cells']!=
+                    role_program['original_output_cells'] for branch in unit['branches'])):
+            raise ValueError('selected original role programme changed its original source/cells or disappeared')
     primitive_inventory=None
     if archive.get('primitive_measurements') is not None:
         from .group_joint_primitive_journal import validate_journal,primitive_inputs

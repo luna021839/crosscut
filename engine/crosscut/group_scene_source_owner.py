@@ -266,6 +266,13 @@ def propose_scene_changes(context):
             absolute_deadline=context.deadline,**request_limits),maximum_raw_cache_bytes=32*1024*1024)
         sensors=SceneSensors(session,assets)
         plan=context.incumbent.render_plan;shots=source.visible_group_shots(plan,context.domain)
+        # Preserve ORIGINAL external role epochs before a uniform-role numeric
+        # path can reject a mixed shot, and before any donor/model observation.
+        # Sidecars alone do not grant the old positional assembler mixed-role
+        # authority; the still-unsupported global owner remains explicit.
+        from .group_scene_epoch_program import freeze_original_role_epochs
+        role_programme_refs={(shot.first_output_frame,shot.end_output_frame):
+            sensors.record_original_role_program(freeze_original_role_epochs(context,shot)) for shot in shots}
         # Interleave paired and solo numeric domains. The current state frontier
         # has separate bounded state/edge frontiers. Native/model/time work is
         # still shared, so later windows may remain unobserved; do not claim
@@ -279,6 +286,8 @@ def propose_scene_changes(context):
         for window in windows:
             if any(s.frame_count>source.MAX_MUTABLE_FRAMES for s in window[1:-1]): continue
             record=dict(bounds=[[s.first_output_frame,s.end_output_frame] for s in window],states=[],errors=[],
+                original_role_programme_sha256=[role_programme_refs[s.first_output_frame,s.end_output_frame] for s in window],
+                global_mixed_role_camera_owner_implemented=False,
                 observed_wide_repair_priority=observed_wide_repair_priority(
                     context.incumbent.visual_timeline,window[1:-1]))
             numeric_inventory.append(record)
@@ -559,6 +568,7 @@ def propose_scene_changes(context):
                         baseline_hypothesis_keys=[[s.editorial_contract_sha256 for s in group]
                             for group in baseline_hypotheses],analysis_rolls=list(rolls),
                         original_duty_program=original_program,
+                        original_role_programme_sha256=numeric['original_role_programme_sha256'],
                         composition_window=composition_window,quality_approved=False)
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)
                     alternative['status']='complete_unapproved'

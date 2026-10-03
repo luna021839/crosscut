@@ -12,6 +12,7 @@ from dataclasses import asdict, replace
 from collections import Counter
 from itertools import product
 import math
+import json
 from statistics import median
 from types import SimpleNamespace
 
@@ -151,12 +152,29 @@ class SceneSensors(source.NativeFamilySensors):
         self.articulation_raw_rows = {}
         self.articulation_endpoint_cache = {}
         self.original_duty_program = None
+        self.original_native_duty_programmes = {}
+        self.original_role_programmes = {}
 
     def install_original_duty_program(self, program):
         from .group_scene_original_duties import validate_original_duty_program
         validate_original_duty_program(program, raw_inventory={r.sha256:r.to_dict()
             for r in self.raw_rows.values()})
-        self.original_duty_program = program
+        # The caller's mutable object is not this local programme version.
+        # Keep earlier versions when switching windows; retained frame/pose
+        # references may still name them. This is not controller history.
+        owned=family.plain(program)
+        if not hasattr(self,'original_native_duty_programmes'):self.original_native_duty_programmes={}
+        self.original_duty_program=self.original_native_duty_programmes.setdefault(owned['program_sha256'],owned)
+
+    def record_original_role_program(self,program):
+        from .group_scene_epoch_program import validate_original_role_epochs
+        validate_original_role_epochs(program)
+        owned=family.plain(program);identity=family.digest(owned)
+        if not hasattr(self,'original_role_programmes'):self.original_role_programmes={}
+        if identity not in self.original_role_programmes:
+            self.session.budget.spend('pose_evidence_bytes',len(json.dumps(owned,sort_keys=True,allow_nan=False).encode()))
+            self.original_role_programmes[identity]=owned
+        return identity
 
     def duty_binding(self, state, tick):
         from .group_scene_original_duties import bind_row_obligations
@@ -595,6 +613,7 @@ class SceneSensors(source.NativeFamilySensors):
 
     def archive(self):
         from .group_scene_native_storage import pack_native_observation
+        from .group_scene_programme_archive import programme_records
         views=self.session.budget.normalized_native_views
         native=[pack_native_observation(r.to_dict()) for r in self.raw_rows.values()]
         parallel=[None if r is None else pack_native_observation(r.to_dict())
@@ -607,6 +626,9 @@ class SceneSensors(source.NativeFamilySensors):
             endpoint_pixel_links=list(self.link_cache.values()),
             primitive_measurements=self.session.budget.primitive_journal.to_dict(),
             normalized_native_view_records=views.to_dict(),
+            original_programme_records=programme_records(roles=getattr(self,'original_role_programmes',{}),
+                native=getattr(self,'original_native_duty_programmes',{}),
+                active=None if getattr(self,'original_duty_program',None) is None else self.original_duty_program['program_sha256']),
             quality_approved=False, association_hypotheses_are_not_named_actors=True)
 
 
