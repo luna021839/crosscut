@@ -642,9 +642,14 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
         archive = dict(contract=CONTRACT,status='preparing',quality_approved=False,
             original_bundle=old.to_dict(),original_plan=old.render_plan.to_json())
         def publish():
-            if len(json.dumps(archive,sort_keys=True,allow_nan=False).encode()) > MAX_ARCHIVE_BYTES:
+            # Partial graphs can own frame-cache read-through mappings, unlike
+            # the expanded public bundle JSON. Retain their exact wire views
+            # at this separate durable seam; never stringify/drop raw evidence.
+            from .group_scene_native_storage import pack_native_evidence
+            payload=pack_native_evidence(archive)
+            if len(json.dumps(payload,sort_keys=True,allow_nan=False).encode()) > MAX_ARCHIVE_BYTES:
                 raise ValueError('performer complete archive exceeds explicit byte budget')
-            _write_analysis_manifest_atomically(Path(archive_path),archive)
+            _write_analysis_manifest_atomically(Path(archive_path),payload)
         publish()  # Even a missing sensor asset leaves the complete predecessor.
         try:
             context = freeze_context(controller=controller,request=request,eligible_indices=eligible_indices,
