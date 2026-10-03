@@ -36,7 +36,13 @@ def test_failed_required_motion_retains_independently_measured_geometry(role):
     assert not value['available']
     assert value['required_semantics_available'] is False
     assert value['metrics']['occupancy']==pytest.approx(.1)
-    assert value['metrics']['screen_motion']==0.
+    if role==GroupOutputRole.COMPOSITION:
+        # A fixed detector centre is known geometry, not a zero pixel speed.
+        assert value['metrics']['screen_motion'] is None
+        assert value['screen_velocity_outgoing'] is None
+        assert value['screen_velocity_incoming'] is None
+    else:
+        assert value['metrics']['screen_motion']==0.
     assert value['reason']=='EXPLICIT_REQUIRED_ARM_MEASUREMENT_UNKNOWN'
     assert 'arm_predicted_0' not in value['metrics']
     known=scene.coherent_baseline([value])

@@ -172,6 +172,7 @@ class SceneSensors(source.NativeFamilySensors):
             raise ValueError('repeated native endpoint is not measured motion')
         evidence = dict(output_ticks=list(ticks), required_semantics_available=True,
             head_pixel_link=None, joint_pixel_link=None, composition_support_link=None,
+            verified_source_clock=self.session.domain.render_frame_clocks[state.eligible_source_index].to_dict(),
             quality_approved=False)
         if state.role == GroupOutputRole.COMPOSITION:
             link = body_support_links(self, *raw)
@@ -793,6 +794,149 @@ def selected_focal_motion(rows, states):
         focal_basis='bound_scene_hypothesis_not_legacy_global_focal',quality_approved=False)
 
 
+def composition_endpoint_screen_motion(state,rows,endpoint):
+    """Already measured own-side pixels viewed through ONE complete camera.
+
+    Modalities remain explicit. Native ROI particles, legacy measured ROI LK
+    and registered focal landmarks do not become anatomical/cast authority.
+    A missing pixel producer must never borrow detector attention as motion.
+    """
+    from .group_scene_region_flow import CONTRACT as REGION_CONTRACT,project_region_distribution
+    from .group_scene_composition import LINK_CONTRACT,validate_support_link
+    ticks=tuple(row['output_tick'] for row in rows)
+    raw=tuple(row['native_observation'] for row in rows)
+    if (endpoint.get('output_ticks')!=list(ticks) or len(ticks)!=2
+            or any(type(t) is not int for t in ticks)
+            or not state.first_output_frame<=ticks[0]<ticks[1]<state.end_output_frame
+            or any(row['request_source_index']!=state.segments[0].source_index
+                or row['source_clock_identity']!=state.source_clock_identity for row in raw)
+            or [state.native_frame_indices[t-state.first_output_frame] for t in ticks]
+                !=[row['native_frame_index'] for row in raw]):
+        raise ValueError('composition screen motion borrowed another source/native/output occurrence')
+    if state.role==GroupOutputRole.COMPOSITION:
+        link=endpoint.get('composition_support_link') or {}
+        if link.get('contract')==REGION_CONTRACT:
+            from fractions import Fraction
+            from .render_frame_schedule import VerifiedRenderFrameClock
+            clock=endpoint.get('verified_source_clock')
+            if not isinstance(clock,dict):
+                raise ValueError('native region motion lacks its bound source clock, not an output-fps substitute')
+            try:
+                native_clock=VerifiedRenderFrameClock(Fraction(clock['frame_rate']),clock['frame_count'],
+                    clock['packet_grid_sha256'],clock['grid_basis'])
+            except (KeyError,TypeError,ValueError,ZeroDivisionError) as exc:
+                raise ValueError('native region motion source clock malformed') from exc
+            if family.digest(clock)!=family.digest(native_clock.to_dict()):
+                raise ValueError('native region motion changed its actual source clock preimage')
+            measured=project_region_distribution(link,*raw,state=state,output_ticks=ticks,native_clock=native_clock)
+        elif link.get('contract')==LINK_CONTRACT:
+            # Legacy contracts use their actual LK prediction, NOT a fresh
+            # destination detector box whose jitter could fake motion.
+            validate_support_link(link,*raw);velocity=[]
+            lookup={p['observation_id']:i for i,p in enumerate(raw[0]['people'])}
+            for old_id,new_id in link['assignments']:
+                index=lookup[old_id];before=raw[0]['people'][index]['box_xywh']
+                after=link['predicted_boxes'][index]
+                a=(before[0]+before[2]/2,before[1]+before[3]/2)
+                b=(after[0]+after[2]/2,after[1]+after[3]/2)
+                velocity.append((np.asarray(source.project_point(b,state,ticks[1]))-
+                    source.project_point(a,state,ticks[0]))/((ticks[1]-ticks[0])/state.output_fps))
+            measured=dict(basis='legacy_native_pixel_lk_roi_centres_not_detector_attention',
+                flow_sha256=family.digest(link),
+                velocity_quantiles=np.quantile(velocity,(.1,.5,.9),axis=0).tolist())
+        else:raise ValueError('composition has no explicit supported pixel motion modality')
+    elif state.role==GroupOutputRole.FORMATION:
+        link=endpoint.get('joint_pixel_link') or {}
+        validate_required_body_native_sequence(link,*raw)
+        velocity=[]
+        for index,destination in link['assignments']:
+            flow=link['joint_pixel_flow'][index]
+            if (flow is None or flow.get('observation_id')!=raw[0]['people'][index]['observation_id']
+                    or not {0,1,2,3,4,5}<={j[0] for j in flow['joints']}):
+                raise ValueError('composition formation side lost its actual required joint image movement')
+            for item in flow['joints']:
+                joint,x,y,tx,ty,error,features=item
+                if joint not in (0,1,2,3,4,5):continue
+                if ([x,y]!=raw[0]['people'][index]['upper_body_xyc'][joint][:2]
+                        or error>1.25 or features<3):
+                    raise ValueError('composition formation motion borrowed another native joint feature')
+                velocity.append((np.asarray(source.project_point((tx,ty),state,ticks[1]))-
+                    source.project_point((x,y),state,ticks[0]))/((ticks[1]-ticks[0])/state.output_fps))
+        measured=dict(basis='required_native_joint_local_pixel_flow_projected_by_complete_camera',
+            flow_sha256=family.digest(link),
+            velocity_quantiles=np.quantile(velocity,(.1,.5,.9),axis=0).tolist())
+    else:
+        link=endpoint.get('head_pixel_link') or {};heads=[r['selected_frame_local_head_id'] for r in rows]
+        if (heads not in link.get('unique_links',())
+                or link.get('raw_pair')!=[family.digest(row) for row in raw]):
+            raise ValueError('composition cut lacks its other side registered focal pixel path')
+        selected=[next((h for h in row['heads'] if h['observation_id']==head),None)
+            for row,head in zip(raw,heads,strict=True)]
+        if any(h is None or len(h.get('landmarks_xy',()))!=5 for h in selected):
+            raise ValueError('composition focal motion has no complete registered native landmarks')
+        velocity=[(np.asarray(source.project_point(b,state,ticks[1]))-
+            source.project_point(a,state,ticks[0]))/((ticks[1]-ticks[0])/state.output_fps)
+            for a,b in zip(selected[0]['landmarks_xy'],selected[1]['landmarks_xy'],strict=True)]
+        measured=dict(basis='registered_focal_landmarks_with_unique_original_pixel_path',
+            flow_sha256=family.digest(link),
+            velocity_quantiles=np.quantile(velocity,(.1,.5,.9),axis=0).tolist())
+    result=dict(measured)
+    result.update(contract='complete_camera_supported_screen_motion_distribution_v1',
+        complete_state_preimage=state.to_dict(),output_ticks=list(ticks),
+        raw_observation_sha256=[family.digest(row) for row in raw],
+        cross_camera_identity_certified=False,body_phase_certified=False,quality_approved=False)
+    return result
+
+
+def validate_composition_edge_motion(edge,*,hypotheses,hypothesis_keys,state_keys,source_domain):
+    """Rederive projection and utility from bound point paths and cameras.
+
+    This received-algebra check does not authenticate the physical history of
+    its LK values. Normal fresh selected parent/final pixel replay is mandatory.
+    """
+    from fractions import Fraction
+    from pathlib import Path
+    from .group_source_domain import GroupSourceDomain
+    from .render_frame_schedule import VerifiedRenderFrameClock
+    from .group_scene_focal_pose_motion import restore_view_state
+    from .group_scene_region_flow import CONTRACT as REGION_CONTRACT
+    endpoints=edge.get('required_endpoint_evidence')
+    has_native=bool(endpoints and any((e.get('composition_support_link') or {}).get('contract')
+        ==REGION_CONTRACT for e in endpoints))
+    basis='conditional_supported_pixel_distribution_not_detector_attention_or_3d_camera'
+    if edge.get('camera_direction_basis')!=basis:
+        if has_native:raise ValueError('native region cut cannot use detector attention as its motion utility')
+        return  # Explicit legacy receipts do not gain this new native modality.
+    views=edge.get('composition_pixel_motion')
+    if views is None and edge.get('available') is False:
+        if (edge.get('metrics') or {}).get('screen_motion') is not None:
+            raise ValueError('unknown composition pixel motion was imputed as a known detector cost')
+        return
+    if (not isinstance(views,list) or len(views)!=2 or not isinstance(endpoints,list)
+            or len(endpoints)!=2 or len(edge.get('rows',()))!=4):
+        raise ValueError('composition cut omitted its measured pixel motion views')
+    eligible=source_domain['eligible_request_indices'];clocks=source_domain['render_frame_clocks']
+    files=[Path('EXPLICIT_EXCLUDED_SOURCE_NOT_OPENED') for _ in range(max(eligible)+1)]
+    for i,path in zip(eligible,source_domain['eligible_sources'],strict=True):files[i]=Path(path)
+    domain=GroupSourceDomain(tuple(files),tuple(eligible),(0.,)*len(eligible),(None,)*len(eligible),
+        tuple(tuple(c) for c in source_domain['scene_cut_times']),tuple(
+            VerifiedRenderFrameClock(Fraction(c['frame_rate']),c['frame_count'],
+                c['packet_grid_sha256'],c['grid_basis']) for c in clocks))
+    expected=[]
+    for index,(view,endpoint) in enumerate(zip(views,endpoints,strict=True)):
+        h=hypotheses[hypothesis_keys[index]]
+        chosen=restore_view_state(view.get('complete_state_preimage'),domain,h,state_keys[index])
+        rebuilt=composition_endpoint_screen_motion(chosen,edge['rows'][2*index:2*index+2],endpoint)
+        if family.digest(view)!=family.digest(rebuilt):
+            raise ValueError('composition output velocity differs from its actual native paths/complete camera')
+        expected.append(np.asarray(rebuilt['velocity_quantiles']))
+    motion=float(np.mean(np.linalg.norm(expected[0]-expected[1],axis=1)))
+    if (edge['metrics'].get('screen_motion')!=motion
+            or edge.get('screen_velocity_outgoing')!=expected[0][1].tolist()
+            or edge.get('screen_velocity_incoming')!=expected[1][1].tolist()):
+        raise ValueError('composition screen utility changed its actual projected pixel distribution')
+
+
 def compare_scene_edge(sensors, left, right):
     """Both sides use the SAME complete state/hypothesis, never per-edge actors."""
     ticks = (left.end_output_frame-4, left.end_output_frame-1,
@@ -811,12 +955,14 @@ def compare_scene_edge(sensors, left, right):
         span=abs(math.log(max(a['horizontal_span'], 1e-9)/max(b['horizontal_span'], 1e-9))))
     va = (np.asarray(rows[1]['scene_geometry']['attention_xy'])-rows[0]['scene_geometry']['attention_xy'])*(left.output_fps/3)
     vb = (np.asarray(rows[3]['scene_geometry']['attention_xy'])-rows[2]['scene_geometry']['attention_xy'])*(right.output_fps/3)
-    metrics['screen_motion'] = float(np.linalg.norm(va-vb))
+    composition_cut=GroupOutputRole.COMPOSITION in (left.role,right.role)
+    metrics['screen_motion'] = None if composition_cut else float(np.linalg.norm(va-vb))
     formation = left.role == GroupOutputRole.FORMATION or right.role == GroupOutputRole.FORMATION
     evidence = dict(left_state=left.key, right_state=right.key, rows=rows,
         metrics=metrics, available=False, required_semantics_available=False,
         required_endpoint_evidence=None, first_incoming_output_frame=right.first_output_frame,
-        screen_velocity_outgoing=va.tolist(), screen_velocity_incoming=vb.tolist(),
+        screen_velocity_outgoing=None if composition_cut else va.tolist(),
+        screen_velocity_incoming=None if composition_cut else vb.tolist(),
         camera_direction_basis='measured_screen_attention_motion_not_inferred_3d_camera',
         cross_camera_identity_certified=False, body_phase_certified=False)
     # Projected geometry is independently known even when required native
@@ -836,9 +982,22 @@ def compare_scene_edge(sensors, left, right):
         return dict(evidence, reason=str(exc), known_geometry_retained_on_missing_motion=True,
             required_motion_unknown_not_zero=True)
     evidence.update(available=True, required_semantics_available=True, required_endpoint_evidence=endpoints)
-    if GroupOutputRole.COMPOSITION in (left.role, right.role):
+    if composition_cut:
         from .group_scene_editorial_policy import composition_cost
         from .group_scene_articulation import compare_composition_articulation
+        evidence.update(detector_attention_velocity_outgoing=va.tolist(),
+            detector_attention_velocity_incoming=vb.tolist(),composition_pixel_motion=None,
+            camera_direction_basis='conditional_supported_pixel_distribution_not_detector_attention_or_3d_camera')
+        try:
+            motion=[composition_endpoint_screen_motion(s,pair,endpoint)
+                for s,pair,endpoint in zip((left,right),(rows[:2],rows[2:]),endpoints,strict=True)]
+        except ValueError as exc:
+            return dict(evidence,available=False,reason=str(exc),
+                known_geometry_retained_on_missing_motion=True,required_motion_unknown_not_zero=True)
+        outgoing,incoming=[np.asarray(m['velocity_quantiles']) for m in motion]
+        metrics['screen_motion']=float(np.mean(np.linalg.norm(outgoing-incoming,axis=1)))
+        evidence.update(composition_pixel_motion=motion,
+            screen_velocity_outgoing=outgoing[1].tolist(),screen_velocity_incoming=incoming[1].tolist())
         articulation = compare_composition_articulation(sensors, left, right)
         if articulation['available']:
             metrics.update(articulation['metrics'])
@@ -967,6 +1126,11 @@ def validate_scene_dense(dense):
         if any(h.get(k) is not False for k in ('temporal_identity_certified','cross_camera_identity_certified',
                 'whole_head_extent_certified','body_phase_certified','quality_approved')):
             raise ValueError('scene hypotheses cannot become anatomy, identity, phase or quality proof')
+    for index,edge in enumerate(dense.get('incident_projected_observations',())):
+        if index+1>=len(keys):raise ValueError('scene edge inventory exceeds its complete state path')
+        validate_composition_edge_motion(edge,hypotheses=hypotheses,
+            hypothesis_keys=keys[index:index+2],state_keys=dense['state_keys'][index:index+2],
+            source_domain=dense['source_domain'])
     for index,edge in enumerate(dense.get('incident_projected_observations',())):
         endpoints=edge.get('required_endpoint_evidence')
         if endpoints is None:continue

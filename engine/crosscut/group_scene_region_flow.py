@@ -252,3 +252,75 @@ def validate_region_distribution(value,previous,current):
     expected=_associations(tracks,previous,current,size)
     if any(value.get(k)!=v for k,v in expected.items()):
         raise ValueError('region distribution altered its unique supported ROI assignment')
+
+
+def project_region_distribution(value,previous,current,*,state,output_ticks,native_clock=None):
+    """Project actual continuing image points, not the detector centres.
+
+    Equal weight per supported ROI avoids rewarding whichever rectangle has
+    more corners. Within-ROI quantiles retain opposite/nonrigid movement that
+    a single median would cancel. Unmatched/unknown rectangles stay explicit;
+    this conditional texture statistic is neither a cast nor an arm duty.
+    No additional raster, network inference or LK call is performed here.
+    """
+    from .group_source_changing_owner import project_point
+    from .render_frame_schedule import VerifiedRenderFrameClock
+    validate_region_distribution(value,previous,current)
+    first,last=output_ticks
+    if (type(first) is not int or type(last) is not int or first>=last
+            or not state.first_output_frame<=first<last<state.end_output_frame
+            or [state.native_frame_indices[t-state.first_output_frame] for t in output_ticks]
+                !=value['native_frame_indices']
+            or state.source_clock_identity!=previous['source_clock_identity']
+            or any(s.source_index!=previous['request_source_index'] for s in state.segments)):
+        raise ValueError('region motion view changed its actual source/native occurrence or complete camera')
+    size=np.asarray(previous['frame_size_wh'],float)
+    dt=(last-first)/state.output_fps
+    native_times=None;native_dt=None
+    if native_clock is not None:
+        if (not isinstance(native_clock,VerifiedRenderFrameClock)
+                or digest(native_clock.to_dict())!=previous['source_clock_identity']
+                or current['native_frame_index']>=native_clock.frame_count):
+            raise ValueError('region velocity borrowed a different verified native timebase')
+        if native_clock.grid_basis=='exact_cfr_presentation_grid':
+            native_times=[str(n/native_clock.frame_rate) for n in value['native_frame_indices']]
+            native_dt=float((current['native_frame_index']-previous['native_frame_index'])/native_clock.frame_rate)
+    time_basis=('verified_exact_cfr_native_presentation_time' if native_times is not None else
+        'native_pts_not_available_from_index_only_grid')
+    matched={a for a,b in value['assignments']};regions=[]
+    for track in value['region_tracks']:
+        if track['previous_body_observation_id'] not in matched:continue
+        terminal={a['feature_id']:a['tracked_target_xy'] for a in track['steps'][-1]['attempts']}
+        velocities=[];image_contributions=[];camera_contributions=[];native_velocities=[]
+        for fid in track['terminal_feature_ids']:
+            seed=np.asarray(track['seed_points_xy'][fid])/size
+            target=np.asarray(terminal[fid])/size
+            before=np.asarray(project_point(seed,state,first))
+            after=np.asarray(project_point(target,state,last))
+            same_output_transform=np.asarray(project_point(seed,state,last))
+            velocities.append((np.asarray(after)-before)/dt)
+            image_contributions.append((after-same_output_transform)/dt)
+            camera_contributions.append((same_output_transform-before)/dt)
+            if native_dt is not None:native_velocities.append((target-seed)/native_dt)
+        regions.append(dict(previous_body_observation_id=track['previous_body_observation_id'],
+            continuing_feature_count=len(velocities),
+            velocity_quantiles=np.quantile(velocities,(.1,.5,.9),axis=0).tolist(),
+            image_displacement_at_same_output_transform_quantiles=np.quantile(image_contributions,(.1,.5,.9),axis=0).tolist(),
+            editing_camera_contribution_quantiles=np.quantile(camera_contributions,(.1,.5,.9),axis=0).tolist(),
+            native_velocity_quantiles=None if native_dt is None else np.quantile(native_velocities,(.1,.5,.9),axis=0).tolist()))
+    if len(regions)<POLICY['minimum_observed_roi_pairs']:
+        raise ValueError('unknown regional image movement cannot become detector-centre motion')
+    return dict(basis='conditional_native_roi_feature_distribution_projected_by_complete_camera',
+        flow_sha256=digest(value),state_key=state.key,output_ticks=list(output_ticks),
+        native_frame_indices=value['native_frame_indices'],regions=regions,
+        velocity_quantiles=np.mean([r['velocity_quantiles'] for r in regions],axis=0).tolist(),
+        output_duration_seconds=dt,source_native_times=native_times,
+        source_native_duration_seconds=native_dt,source_native_time_basis=time_basis,
+        verified_native_clock=None if native_clock is None else native_clock.to_dict(),
+        native_velocity_quantiles=None if native_dt is None else np.mean([r['native_velocity_quantiles'] for r in regions],axis=0).tolist(),
+        image_displacement_at_same_output_transform_quantiles=np.mean([r['image_displacement_at_same_output_transform_quantiles'] for r in regions],axis=0).tolist(),
+        editing_camera_contribution_quantiles=np.mean([r['editing_camera_contribution_quantiles'] for r in regions],axis=0).tolist(),
+        component_basis='exact_per_particle_output_difference_before_quantiles_not_physical_3d_camera',
+        region_weighting='equal_supported_roi_not_corner_count',
+        unmatched_body_observation_ids=value['unmatched_body_observation_ids'],
+        named_identity_certified=False,articulated_motion_certified=False,quality_approved=False)
