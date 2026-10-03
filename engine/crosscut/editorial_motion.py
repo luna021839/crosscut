@@ -223,7 +223,9 @@ class EditorialMotionPlan:
     def __post_init__(self):
         if self.source_camera_refresh is not None:
             from .visual_boundary_repair import _freeze_audit_value
-            object.__setattr__(self, 'source_camera_refresh', _freeze_audit_value(self.source_camera_refresh))
+            from .group_scene_native_storage import pack_native_evidence
+            object.__setattr__(self, 'source_camera_refresh', _freeze_audit_value(
+                pack_native_evidence(self.source_camera_refresh)))
         mapping = self.eligible_request_indices
         if mapping is not None:
             if (not isinstance(mapping, tuple) or not mapping
@@ -277,6 +279,7 @@ class EditorialMotionPlan:
 
     def to_dict(self) -> dict[str, Any]:
         from .visual_boundary_repair import _thaw_audit_value
+        from .group_scene_native_storage import expand_native_evidence
         confirmed_member_policy = self.analysis_basis.startswith(
             "confirmed_member_anchor_"
         )
@@ -391,7 +394,7 @@ class EditorialMotionPlan:
                 else None
             ),
             "segments": [item.to_dict() for item in self.segments],
-            **({'source_camera_refresh': _thaw_audit_value(self.source_camera_refresh)}
+            **({'source_camera_refresh': expand_native_evidence(_thaw_audit_value(self.source_camera_refresh))}
                 if self.source_camera_refresh is not None else {}),
             **({"required_boundary_failures": [
                 {"boundary_index": index, "reasons": list(reasons), "context": context}

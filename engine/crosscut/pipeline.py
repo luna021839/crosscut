@@ -20445,6 +20445,9 @@ class _GroupRenderCandidateBundle:
         for name in ('stage_edit_exact_shot_clock', 'dynamic_crop_application', 'cut_local_sync', 'normal_interval_review', 'performer_family_review'):
             value = getattr(self, name)
             if value is not None:
+                if name=='performer_family_review':
+                    from .group_scene_native_storage import pack_native_evidence
+                    value=pack_native_evidence(value)
                 object.__setattr__(self, name, _freeze_audit_value(value))
         if self.phrase_times is not None:
             values=tuple(self.phrase_times)
@@ -20455,9 +20458,10 @@ class _GroupRenderCandidateBundle:
 
     def to_dict(self) -> dict[str, Any]:
         from .visual_boundary_repair import _thaw_audit_value
+        from .group_scene_native_storage import expand_native_evidence
         return {
             "performer_family_review": (
-                _thaw_audit_value(self.performer_family_review)
+                expand_native_evidence(_thaw_audit_value(self.performer_family_review))
                 if self.performer_family_review is not None else None),
             "normal_interval_review": (
                 _thaw_audit_value(self.normal_interval_review)

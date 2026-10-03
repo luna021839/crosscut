@@ -176,10 +176,11 @@ class SceneSensors(source.NativeFamilySensors):
         native = state.native_frame_indices[tick-state.first_output_frame]
         key = ('body_composition', request, native)
         if key not in self.raw_rows:
-            row = observe_native_composition(self.session, request_source_index=request,
-                native_frame_index=native)
-            self.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(
-                row.to_dict(), sort_keys=True, allow_nan=False).encode()))
+            row = self.session.budget.normalized_native_views.measure(label='native_composition_observation_view',
+                input_binding=dict(request_source_index=request,native_frame_index=native,
+                    source_clock_identity=state.source_clock_identity),
+                producer=lambda:observe_native_composition(self.session, request_source_index=request,
+                    native_frame_index=native))
             self.raw_rows[key] = row
         return self.raw_rows[key]
 
@@ -489,7 +490,12 @@ class SceneSensors(source.NativeFamilySensors):
             scene_geometry=_scene_geometry(heads, people), role=state.role.value,
             whole_head_extent_certified=False, cross_camera_identity_certified=False,
             body_phase_certified=False, anatomical_occlusion_inferred=False, quality_approved=False)
-        self.session.budget.spend('pose_evidence_bytes', len(__import__('json').dumps(result, sort_keys=True).encode()))
+        from .group_scene_native_storage import pack_native_evidence,NativeObservationView
+        stored=pack_native_evidence(result)
+        self.session.budget.spend('pose_evidence_bytes',len(__import__('json').dumps(
+            stored,sort_keys=True,separators=(',',':'),allow_nan=False).encode()))
+        result=dict(stored)
+        result['native_observation']=NativeObservationView(stored['native_observation'])
         self.frame_cache[cache_key] = result
         if violations:
             raise SceneFrameRejection(result)
@@ -569,6 +575,10 @@ class SceneSensors(source.NativeFamilySensors):
                                 raise ValueError('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
                             raise ValueError('scene dense required body/arm joint pixel lifecycle unknown')
                 row = dict(self.frame(state, tick, head_id=current_head))
+                # Dense/public JSON remains the original observation schema.
+                # The read-through frame cache keeps only its wire packet;
+                # frozen owners repack this temporary consumer view at transfer.
+                row['native_observation']=family.plain(row['native_observation'])
                 row['required_body_temporal_link']=body_link
                 row['composition_support_link']=support_link
                 projected = self.session.projected_pixels(state, tick)
@@ -584,12 +594,18 @@ class SceneSensors(source.NativeFamilySensors):
         return result
 
     def archive(self):
+        from .group_scene_native_storage import pack_native_observation
+        views=self.session.budget.normalized_native_views
+        native=[pack_native_observation(r.to_dict()) for r in self.raw_rows.values()]
+        listed={r['observation_sha256'] for r in native}
+        native.extend(packet for ref,packet in views.views.items() if ref not in listed)
         return dict(contract=SCENE_CONTRACT, discoveries=list(self.discoveries.values()),
-            hypotheses=self.hypotheses, native_rows=[r.to_dict() for r in self.raw_rows.values()],
-            parallel_articulation_rows=[None if r is None else r.to_dict()
+            hypotheses=self.hypotheses, native_rows=native,
+            parallel_articulation_rows=[None if r is None else pack_native_observation(r.to_dict())
                 for r in self.articulation_raw_rows.values()],
             endpoint_pixel_links=list(self.link_cache.values()),
             primitive_measurements=self.session.budget.primitive_journal.to_dict(),
+            normalized_native_view_records=views.to_dict(),
             quality_approved=False, association_hypotheses_are_not_named_actors=True)
 
 
@@ -885,7 +901,7 @@ def composition_endpoint_screen_motion(state,rows,endpoint):
     from .group_scene_region_flow import CONTRACT as REGION_CONTRACT,project_region_distribution
     from .group_scene_composition import LINK_CONTRACT,validate_support_link
     ticks=tuple(row['output_tick'] for row in rows)
-    raw=tuple(row['native_observation'] for row in rows)
+    raw=tuple(family.plain(row['native_observation']) for row in rows)
     if (endpoint.get('output_ticks')!=list(ticks) or len(ticks)!=2
             or any(type(t) is not int for t in ticks)
             or not state.first_output_frame<=ticks[0]<ticks[1]<state.end_output_frame
@@ -1201,6 +1217,7 @@ def has_editorial_gain(before, after):
 
 def validate_scene_dense(dense):
     """Consumer-side structure and per-tick evidence; fresh replay still required."""
+    dense=family.plain(dense)
     from .group_scene_source_owner import relation
     from .source_derivative_diversity import DERIVATIVE_DISTINCT
     if dense.get('contract')!=DENSE_CONTRACT:

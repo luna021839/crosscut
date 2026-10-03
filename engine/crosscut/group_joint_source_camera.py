@@ -236,6 +236,8 @@ class JointGroupWorkBudget:
         self.reserved={k:0 for k in values};self._primitive_reservations={}
         from .group_joint_primitive_journal import LocalPrimitiveJournal
         self.primitive_journal=LocalPrimitiveJournal(self)
+        from .group_scene_native_storage import LocalNormalizedNativeViews
+        self.normalized_native_views=LocalNormalizedNativeViews(self)
 
     def check(self):
         if self.clock()>=self.deadline:raise JointGroupBudgetExhausted('joint GROUP absolute work deadline reached')

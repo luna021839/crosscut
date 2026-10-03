@@ -25,6 +25,7 @@ def archive_binding(archive):
 
 
 def validate_archive(program, dense):
+    program=family.plain(program);dense=family.plain(dense)
     from .group_scene_observations import (SCENE_CONTRACT, DISCOVERY_QUERY_CONTRACT,
         _discovery_rolls, scene_anchor_ticks)
     from .group_scene_intent import validate_intent
@@ -69,6 +70,9 @@ def validate_archive(program, dense):
         ids(row, 'heads'); ids(row, 'people')
         validate_serialized_detector_result(row)
         raw[family.digest(row)] = row
+    if archive.get('normalized_native_view_records') is not None:
+        from .group_scene_native_storage import validate_normalized_view_records
+        validate_normalized_view_records(archive['normalized_native_view_records'],raw)
     primitive_inventory=None
     if archive.get('primitive_measurements') is not None:
         from .group_joint_primitive_journal import validate_journal,primitive_inputs

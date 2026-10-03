@@ -44,7 +44,8 @@ UNRELATED_TRAINING_ENTRYPOINTS = frozenset({
 
 
 def plain(value):
-    return _thaw_audit_value(value)
+    from .group_scene_native_storage import expand_native_evidence
+    return expand_native_evidence(_thaw_audit_value(value))
 
 
 def digest(value):

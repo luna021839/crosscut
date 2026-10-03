@@ -189,10 +189,12 @@ class NativeFamilySensors:
             raise ValueError('native observation escaped the complete source-camera state')
         key = source,native,roll
         if key not in self.raw_rows:
-            row = observe_native_group(self.session,request_source_index=source,
-                native_frame_index=native,head_analysis_roll=roll)
-            self.session.budget.spend('pose_evidence_bytes',len(__import__('json').dumps(row.to_dict(),
-                sort_keys=True,separators=(',',':'),allow_nan=False).encode()))
+            row = self.session.budget.normalized_native_views.measure(label='native_focal_observation_view',
+                input_binding=dict(request_source_index=source,native_frame_index=native,
+                    source_clock_identity=getattr(state,'source_clock_identity',None),
+                    head_analysis_roll=roll),
+                producer=lambda:observe_native_group(self.session,request_source_index=source,
+                    native_frame_index=native,head_analysis_roll=roll))
             self.raw_rows[key]=row
         return self.raw_rows[key]
 
@@ -917,6 +919,7 @@ def validate_parent(candidate,context):
 @isolated_optional()
 def final_live_replay(plan_json,receipt,deadline):
     """Final LIVE original-native replay; not a decoded-output quality pass."""
+    receipt=family.plain(receipt)
     from fractions import Fraction
     from .render_plan_serialization import render_plan_from_json
     from .render_frame_schedule import VerifiedRenderFrameClock

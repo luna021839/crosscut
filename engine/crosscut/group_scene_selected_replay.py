@@ -39,6 +39,7 @@ def _path(plan,domain,rows):
 
 
 def validate_program(program,dense):
+    program=family.plain(program);dense=family.plain(dense)
     from .group_native_head_orientation import SUPPORTED_ANALYSIS_ROLLS
     if not isinstance(program,dict):
         raise ValueError('scene receipt has no frozen selected program')
