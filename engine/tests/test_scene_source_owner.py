@@ -175,7 +175,7 @@ def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False):
     if result.returncode:raise RuntimeError(result.stderr.decode())
 
 
-def build_scene_fixture(root,sources,*,boundary=0):
+def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None):
     from crosscut.source_look_match import SourceLookAdjustment
     duration=16.;n=8
     mapping=tuple(range(len(sources)));offsets=(1.,)*len(sources);warps=(None,)*len(sources)
@@ -206,6 +206,20 @@ def build_scene_fixture(root,sources,*,boundary=0):
     motion=build_editorial_motion_plan(visual_timeline=timeline,transitions=transitions,
         fps=30.,boundary_subject_alignment_plan=alignment,face_match_plan=face)
     motion=replace(motion,eligible_request_indices=mapping)
+    if authored_camera_unit is not None:
+        # A deliberately bad authored chart camera, NOT a successful NN fit.
+        # Boundary index 2 above owns incoming shot 3, not shot 2. Removing
+        # None on shot 2 used to leave KEEP while the test claimed two edits.
+        assert type(authored_camera_unit) is int and 0<=authored_camera_unit<n
+        authored=EditorialTransformTrack((
+            EditorialTransformKeyframe(0.,1.18,.57,.5),
+            EditorialTransformKeyframe(2.,1.18,.57,.5)),
+            reason='EXPLICIT_NONHUMAN_AUTHORED_BAD_CAMERA_NOT_NN_EVIDENCE')
+        motion=replace(motion,segments=tuple(replace(item,track=authored,
+            reasons=(*item.reasons,'explicit_authored_nonhuman_camera'))
+            if item.segment_index==authored_camera_unit else item for item in motion.segments))
+        # Constant framing is not an animated zoom/pan target event. Existing
+        # frame-visible motion counters retain their original exact semantics.
     plan=replace(bundle.render_plan,fps=30.,transitions=transitions,segments=tuple(
         RenderSegment(i,2.*i+1,2.,2.*i,pan_crop=pan,
             look_adjustment=SourceLookAdjustment(brightness=.002+i*.0001),
@@ -356,19 +370,22 @@ def authored_global_chart_union(context,mutable_units=(2,6),*,clipped_interior=F
         allocation=allocation,cameras=cameras)
 
 
-def render_and_decode_chart(testcase,plan):
+def render_and_decode_chart(testcase,plan,*,capture_ticks=()):
     """Actual encoder/complete decode. Never a human editorial quality gate."""
     render(plan,video_codec='libx264',video_bitrate='1M',
         video_maxrate='2M',video_buffer_size='2M',maximum_runtime_seconds=30.)
-    cap=cv2.VideoCapture(str(plan.output));decoded=0
+    cap=cv2.VideoCapture(str(plan.output));decoded=0;captured={}
     try:
         while True:
             ok,pixels=cap.read()
             if not ok:break
             testcase.assertEqual(pixels.shape[:2],(180,320))
+            if decoded in capture_ticks:captured[decoded]=pixels.copy()
             decoded+=1
     finally:cap.release()
     testcase.assertEqual(decoded,plan.output_frame_count)
+    testcase.assertEqual(tuple(sorted(captured)),tuple(sorted(capture_ticks)))
+    return captured
 
 
 class ScenePureContractTests(unittest.TestCase):
@@ -955,7 +972,8 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
         cls.paths=tuple(cls.root/f'global-{i}.mp4' for i in range(8))
         for i,path in enumerate(cls.paths):
             encode_scene_chart(path,variant=i,frames=540,small_focal_marker=i==6)
-        cls.bundle,cls.controller,cls.request,cls.model=build_scene_fixture(cls.root,cls.paths)
+        cls.bundle,cls.controller,cls.request,cls.model=build_scene_fixture(cls.root,cls.paths,
+            authored_camera_unit=2)
         with optional_native_scope(monotonic()+600.),patch.object(family,'installed_pose_model',return_value=cls.model):
             cls.context=family.freeze_context(controller=cls.controller,request=cls.request,
                 eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
@@ -967,9 +985,17 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
     def test_distant_global_camera_union_reaches_one_completion_parent_and_final(self):
         from crosscut.group_scene_global_execution import complete_global_scene_program
         from crosscut.group_scene_selected_replay import GLOBAL_CONTRACT
+        from crosscut.group_scene_edit_operations import derive_scene_edit_operations
         context=replace(self.context,deadline=monotonic()+180.)
         with optional_native_scope(context.deadline),source_chart_sensors():
             union=authored_global_chart_union(context)
+            operations=derive_scene_edit_operations(original=context.incumbent.render_plan,
+                proposed=union.plan,domain=context.domain,
+                mutable_intervals=union.allocation.mutable_output_intervals)
+            expected_operations=[(120,180,'CAMERA'),(360,420,'CAMERA')]
+            self.assertEqual([(row['first_output_frame'],row['end_output_frame'],row['operation'])
+                for row in operations['actual_shot_operations'] if row['mutable']],expected_operations,
+                'Two scoped mutables are not proof of two actual camera edits')
             candidate=complete_global_scene_program.__wrapped__(context,union)
             if isinstance(candidate,family.PerformerFamilyRejection):
                 evidence=family.plain(candidate.evidence)
@@ -980,6 +1006,9 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
             receipt=family.plain(candidate.performer_family_review)
             program=receipt['selected_scene_program']
             self.assertEqual(program['contract'],GLOBAL_CONTRACT)
+            self.assertEqual([(row['first_output_frame'],row['end_output_frame'],row['operation'])
+                for row in program['edit_operations']['actual_shot_operations'] if row['mutable']],
+                expected_operations)
             scope=program['global_execution_scope']
             self.assertEqual(len(program['selected_states']),6)
             self.assertEqual(scope['mutable_state_indices'],[1,4])
@@ -988,7 +1017,17 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
             self.assertEqual(receipt['search']['atomic_numeric_programmes_completed'],1)
             self.assertFalse(receipt['search']['local_complete_bundles_concatenated'])
             self.assertFalse(receipt['quality_approved'])
-            render_and_decode_chart(self,candidate.render_plan)
+            probes=(150,390)
+            original_pixels=render_and_decode_chart(self,replace(context.incumbent.render_plan,
+                output=self.root/'global-original-control.mp4'),capture_ticks=probes)
+            selected_pixels=render_and_decode_chart(self,candidate.render_plan,capture_ticks=probes)
+            pixel_changes=[]
+            for tick in probes:
+                difference=float(np.mean(np.abs(original_pixels[tick].astype(np.int16)
+                    -selected_pixels[tick].astype(np.int16))))
+                self.assertGreater(difference,.25,'Actual encoded pixels must change in BOTH mutable intervals')
+                pixel_changes.append(dict(output_tick=tick,mean_absolute_decoded_pixel_difference=difference,
+                    visible_geometric_change_certified=False,professional_quality_certified=False))
             self.assertEqual([s.source_index for s in candidate.render_plan.segments],
                 [s.source_index for s in context.incumbent.render_plan.segments])
             with patch.object(__import__('crosscut.group_scene_selected_replay',fromlist=['replay_selected_scene']),
@@ -1007,6 +1046,8 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
                     fixture='EXPLICIT_NON_HUMAN_CHART_NOT_MODEL_OR_EDITING_QUALITY_PROOF',
                     completion=receipt,parent=proof,final_native=metrics,
                     actual_full_render_decoded_frames=candidate.render_plan.output_frame_count,
+                    actual_original_control_render_decoded_frames=context.incumbent.render_plan.output_frame_count,
+                    actual_encoded_mutable_pixel_changes=pixel_changes,
                     actual_output_size=[candidate.render_plan.width,candidate.render_plan.height],
                     human_media_rendered=False,quality_approved=False),indent=2))
 
