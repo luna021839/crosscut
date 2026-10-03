@@ -179,8 +179,14 @@ class NativeFamilySensors:
             state.native_frame_indices[0],state.native_frame_indices[-1],state.role.value)
 
     def raw(self,state,tick,roll):
-        source = self.session.domain.request_index(state.eligible_source_index)
         native = state.native_frame_indices[tick-state.first_output_frame]
+        return self.raw_native(state,native,roll)
+
+    def raw_native(self,state,native,roll):
+        """Shared exact raw sensing, including actually inferred middle rasters."""
+        source = self.session.domain.request_index(state.eligible_source_index)
+        if (type(native) is not int or not state.native_frame_indices[0]<=native<=state.native_frame_indices[-1]):
+            raise ValueError('native observation escaped the complete source-camera state')
         key = source,native,roll
         if key not in self.raw_rows:
             row = observe_native_group(self.session,request_source_index=source,

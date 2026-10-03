@@ -190,10 +190,16 @@ class SceneSensors(source.NativeFamilySensors):
                 ids = None if state.role == GroupOutputRole.FORMATION else tuple(
                     r['selected_frame_local_head_id'] for r in rows)
                 required = None if ids is None else tuple(sorted({name for _, name in parts}))
-                link = native_body_links(self, *raw, selected_head_ids=ids, selected_part_names=required)
-                if not link['complete_required_joint_paths']:
+                link = (native_body_links(self, *raw) if ids is None else
+                    focal_required_motion(self,state,*raw,output_ticks=ticks,
+                        selected_head_ids=ids,selected_part_names=required))
+                from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
+                if not required_motion_available(link):
+                    if link.get('contract')==VIEW_CONTRACT:
+                        raise ValueError('required endpoint registered pose unavailable: '+str(link.get('reason')))
                     raise ValueError('required endpoint joint pixel paths unknown')
-                evidence['joint_pixel_link'] = link
+                if link.get('contract')==JOINT_LINK_CONTRACT:evidence['joint_pixel_link'] = link
+                else:evidence['registered_pose_sequence'] = link
         self.endpoint_cache[key] = evidence
         return evidence
 
@@ -475,11 +481,13 @@ class SceneSensors(source.NativeFamilySensors):
                     if previous.native_frame_index == raw.native_frame_index:
                         if previous.sha256 != raw.sha256: raise ValueError('repeated scene body raster differs')
                     else:
-                        body_link=native_body_links(self,previous,raw,
-                            selected_head_ids=(previous_head,current_head)
-                                if state.role!=GroupOutputRole.FORMATION else None,
-                            selected_part_names=required_names if state.role!=GroupOutputRole.FORMATION else None)
-                        if not body_link['complete_required_joint_paths']:
+                        body_link=(native_body_links(self,previous,raw) if state.role==GroupOutputRole.FORMATION
+                            else focal_required_motion(self,state,previous,raw,output_ticks=(tick-1,tick),
+                                selected_head_ids=(previous_head,current_head),selected_part_names=required_names))
+                        from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
+                        if not required_motion_available(body_link):
+                            if body_link.get('contract')==VIEW_CONTRACT:
+                                raise ValueError('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
                             raise ValueError('scene dense required body/arm joint pixel lifecycle unknown')
                 row = dict(self.frame(state, tick, head_id=current_head))
                 row['required_body_temporal_link']=body_link
@@ -656,12 +664,35 @@ def endpoint_focal_part_paths(sensors,state,first,last):
     raw=tuple(sensors.raw(state,row['output_tick'],h['analysis_roll']) for row in (first,last))
     if raw[0].native_frame_index==raw[1].native_frame_index:
         raise ValueError('scene repeated native endpoint is not observed arm motion')
-    evidence=native_body_links(sensors,*raw,
+    evidence=focal_required_motion(sensors,state,*raw,
+        output_ticks=(first['output_tick'],last['output_tick']),
         selected_head_ids=(first['selected_frame_local_head_id'],last['selected_frame_local_head_id']),
         selected_part_names=before)
-    if not evidence['complete_required_joint_paths']:
+    from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
+    if not required_motion_available(evidence):
+        if evidence.get('contract')==VIEW_CONTRACT:
+            raise ValueError('scene endpoint registered focal pose unavailable: '+str(evidence.get('reason')))
         raise ValueError('scene endpoint required arm native pixel path unknown')
     return evidence
+
+
+def focal_required_motion(sensors,state,previous,current,*,output_ticks,selected_head_ids,selected_part_names):
+    """Registered model2D temporal type or unchanged legacy pixel producer.
+
+    Backend choice is based on the raw binding contract, not which result wins
+    or has a convenient cost. Unknown new-model duties never fall back to a
+    more convenient old certificate. Formation has a different explicit path.
+    """
+    from .group_scene_focal_pose_motion import (registered_raw17_basis,focal_pose_view)
+    if all(registered_raw17_basis(row) for row in (previous,current)):
+        key=('registered_focal_pose_view',state.key,previous.sha256,current.sha256,
+            output_ticks,selected_head_ids,selected_part_names)
+        if key not in sensors.link_cache:
+            sensors.link_cache[key]=focal_pose_view(sensors,state,previous,current,output_ticks=output_ticks,
+                selected_head_ids=selected_head_ids,required_part_names=selected_part_names)
+        return sensors.link_cache[key]
+    return native_body_links(sensors,previous,current,selected_head_ids=selected_head_ids,
+        selected_part_names=selected_part_names)
 
 
 def temporal_formation(sensors, state, outgoing):
@@ -907,6 +938,8 @@ def validate_scene_dense(dense):
     from .group_scene_composition import validate_raw_composition,validate_support_link
     from .group_scene_articulation import validate_articulation_evidence
     from .group_native_detector_result import validate_serialized_detector_result
+    from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available,validate_focal_pose_view
+    raw_inventory={family.digest(row):row for row in (dense.get('scene_discovery') or {}).get('native_rows',())}
     for edge in dense.get('incident_projected_observations', ()):
         if edge.get('comparison_mode') == 'predeclared_composition_cut':
             validate_articulation_evidence(edge.get('articulated_cross_camera_motion'),
@@ -934,6 +967,27 @@ def validate_scene_dense(dense):
         if any(h.get(k) is not False for k in ('temporal_identity_certified','cross_camera_identity_certified',
                 'whole_head_extent_certified','body_phase_certified','quality_approved')):
             raise ValueError('scene hypotheses cannot become anatomy, identity, phase or quality proof')
+    for index,edge in enumerate(dense.get('incident_projected_observations',())):
+        endpoints=edge.get('required_endpoint_evidence')
+        if endpoints is None:continue
+        if not isinstance(endpoints,list) or len(endpoints)!=2 or index+1>=len(keys):
+            raise ValueError('scene incident endpoint evidence has another path scope')
+        for offset,endpoint in enumerate(endpoints):
+            view=endpoint.get('registered_pose_sequence')
+            if view is None:continue
+            h=hypotheses[keys[index+offset]]
+            pair=view.get('primary_raw_observation_sha256')
+            if (not isinstance(pair,list) or len(pair)!=2 or any(ref not in raw_inventory for ref in pair)
+                    or endpoint.get('joint_pixel_link') is not None
+                    or view.get('output_ticks')!=endpoint.get('output_ticks')):
+                raise ValueError('scene registered incident evidence lost original native samples/type/clock')
+            expected_ticks=([h['span_key'][2]-4,h['span_key'][2]-1] if offset==0
+                else [h['span_key'][1],h['span_key'][1]+3])
+            if endpoint['output_ticks']!=expected_ticks:
+                raise ValueError('scene registered incident evidence borrowed another endpoint side')
+            validate_focal_pose_view(view,raw_inventory[pair[0]],raw_inventory[pair[1]],
+                raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
+                state_key=dense['state_keys'][index+offset])
     for a,b in zip(keys,keys[1:]):
         if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
             raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
@@ -1022,9 +1076,15 @@ def validate_scene_dense(dense):
             if row['role']==GroupOutputRole.FORMATION.value or previous_parts or current_parts:
                 if row['output_tick']>span['first_output_frame'] and not row['native_repeated_alias']:
                     link=row.get('required_body_temporal_link')
-                    if not isinstance(link,dict) or link.get('complete_required_joint_paths') is not True:
+                    if not required_motion_available(link):
                         raise ValueError('scene dense required arm temporal pixel producer missing')
-                    validate_required_body_native_sequence(link,previous_row['native_observation'],native)
+                    if link.get('contract')==VIEW_CONTRACT:
+                        raw_inventory.update({family.digest(previous_row['native_observation']):previous_row['native_observation'],
+                            family.digest(native):native})
+                        validate_focal_pose_view(link,previous_row['native_observation'],native,
+                            raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
+                            state_key=dense['state_keys'][dense['hypothesis_keys'].index(key)])
+                    else:validate_required_body_native_sequence(link,previous_row['native_observation'],native)
                     expected_scope=('all_formation_people' if row['role']==GroupOutputRole.FORMATION.value
                         else 'selected_focal_owner')
                     if link.get('required_body_scope')!=expected_scope:

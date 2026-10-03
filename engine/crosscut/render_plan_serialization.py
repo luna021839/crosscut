@@ -9,6 +9,37 @@ from .render import (BoundaryLookKeyframe, BoundaryLookTrack, EditorialTransform
     RenderPlan, RenderSegment, RenderTransition, SourceLookAdjustment)
 
 
+def render_segment_from_json(raw: Mapping[str, Any]) -> RenderSegment:
+    """Exact camera/clock preimage shared by plan and received sensor replay."""
+    if not isinstance(raw, dict):
+        raise ValueError('RenderSegment must be an object')
+    try:
+        args = {f.name:raw[f.name] for f in fields(RenderSegment) if f.name in raw}
+        if raw.get('crop') is not None:
+            args['crop'] = NormalizedCrop(**raw['crop'])
+        if raw.get('pan_crop') is not None:
+            args['pan_crop'] = PanCropTrack(tuple(PanCropKeyframe(
+                time_seconds=item['time_seconds'], crop=NormalizedCrop(**item['crop']))
+                for item in raw['pan_crop']['keyframes']))
+        for name,cls,keyframe in (
+                ('editorial_transform',EditorialTransformTrack,EditorialTransformKeyframe),
+                ('outgoing_overlap_transform',EditorialTransformTrack,EditorialTransformKeyframe),
+                ('boundary_look_track',BoundaryLookTrack,BoundaryLookKeyframe)):
+            item=raw.get(name)
+            if item is not None:
+                values={f.name:item[f.name] for f in fields(cls) if f.name in item}
+                values['keyframes']=tuple(keyframe(**point) for point in item['keyframes'])
+                args[name]=cls(**values)
+        if raw.get('look_adjustment') is not None:
+            args['look_adjustment']=SourceLookAdjustment(**raw['look_adjustment'])
+        # RenderPlan.to_json omits selected null fields, while a complete state
+        # uses asdict. Each caller rechecks its OWN complete canonical preimage;
+        # forcing one segment encoding onto the other rejects legitimate plans.
+        return RenderSegment(**args)
+    except (KeyError,TypeError,OverflowError) as exc:
+        raise ValueError('render segment is incomplete or malformed') from exc
+
+
 def render_plan_from_json(payload: Mapping[str, Any]) -> RenderPlan:
     """Recompute all redundant clocks and reject any lossy reconstruction.
 
@@ -33,23 +64,7 @@ def render_plan_from_json(payload: Mapping[str, Any]) -> RenderPlan:
             from .shot_video_clock import shot_video_clock_from_dict
             args['authorized_shot_video_clocks'] = tuple(shot_video_clock_from_dict(row)
                 for row in payload['authorized_shot_video_clocks'])
-        segments = []
-        for raw in payload['segments']:
-            segment = values(RenderSegment, raw)
-            if raw.get('crop') is not None:
-                segment['crop'] = NormalizedCrop(**raw['crop'])
-            if raw.get('pan_crop') is not None:
-                segment['pan_crop'] = PanCropTrack(tuple(PanCropKeyframe(
-                    time_seconds=item['time_seconds'], crop=NormalizedCrop(**item['crop']))
-                    for item in raw['pan_crop']['keyframes']))
-            for name in ('editorial_transform', 'outgoing_overlap_transform'):
-                segment[name] = track(EditorialTransformTrack, EditorialTransformKeyframe, raw.get(name))
-            segment['boundary_look_track'] = track(BoundaryLookTrack, BoundaryLookKeyframe,
-                                                   raw.get('boundary_look_track'))
-            if raw.get('look_adjustment') is not None:
-                segment['look_adjustment'] = SourceLookAdjustment(**raw['look_adjustment'])
-            segments.append(RenderSegment(**segment))
-        args['segments'] = tuple(segments)
+        args['segments'] = tuple(render_segment_from_json(raw) for raw in payload['segments'])
         args['transitions'] = tuple(RenderTransition(**values(RenderTransition, raw))
                                     for raw in payload['transitions'])
         plan = RenderPlan(**args)
