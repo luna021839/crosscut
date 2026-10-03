@@ -138,6 +138,12 @@ def complete_global_scene_program(context,union):
                     frontier.begin();frontier.finish('CACHED_OBSERVED_PAIR_REJECT')
                     attempts.append(dict(state_keys=[s.key for s in values],
                         status='CACHED_OBSERVED_PAIR_REJECT',infeasible_pair=blocked));continue
+                blocked_state=sensors.cached_state_dense_rejection(path.with_states(values))
+                if blocked_state is not None:
+                    frontier.begin();frontier.finish('CACHED_OBSERVED_STATE_DENSE_REJECT')
+                    attempts.append(dict(state_keys=[s.key for s in values],
+                        status='CACHED_OBSERVED_STATE_DENSE_REJECT',
+                        state_local_dense_rejection=blocked_state));continue
                 # Spend BEFORE advancing: budget at B preserves B as pending,
                 # never records it as a negative observation or restarts work.
                 stage='conditional_state'

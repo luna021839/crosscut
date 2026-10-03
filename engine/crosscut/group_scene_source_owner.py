@@ -16,6 +16,7 @@ from .group_scene_observations import (SceneSensors, compare_scene_edge,
     coherent_baseline, preserves_known, has_editorial_gain, DENSE_CONTRACT)
 from .group_scene_observations import VARIANTS, scene_anchor_ticks, MAX_HYPOTHESES_PER_SPAN
 from .group_scene_edit_operations import path_has_numeric_edit
+from .group_scene_hypothesis_outcomes import SceneHypothesisRejection
 from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget,JointGroupBudgetExhausted
 from .group_joint_observations import GroupJointObservationSession
 from .face_match import FaceMatchConfig
@@ -84,7 +85,7 @@ def measure_fixed_endpoint_inventory(values, *, sensors, outgoing, record):
             record['outcome']='BUDGET_PARTIAL'
             record['interrupted_current_state_key']=value.key
             raise
-        except ValueError as exc:
+        except SceneHypothesisRejection as exc:
             attempt.update(status='OBSERVED_UNAVAILABLE',error=str(exc))
         except BaseException as exc:
             attempt.update(status='PRODUCER_FAILED',error_type=type(exc).__name__)

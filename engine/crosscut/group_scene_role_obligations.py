@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 from .group_joint_source_camera import GroupOutputRole
+from .group_scene_hypothesis_outcomes import SceneRoleObservationRejection
 
 
 CONTRACT = 'declared_scene_role_obligations_v2'
@@ -54,20 +55,26 @@ def scene_role_obligations(raw, role, selected_head_id, *, required_part_names=N
             or len(set(head_ids)) != len(head_ids) or len(set(person_ids)) != len(person_ids)):
         raise ValueError('scene role raw observation IDs are invalid or duplicated')
     if role == GroupOutputRole.COMPOSITION:
-        if selected_head_id is not None or heads or len(people) < 2:
-            raise ValueError('composition duty needs body support, never a fake focal head')
+        if selected_head_id is not None:
+            raise ValueError('composition duty cannot carry a selected focal hypothesis')
+        if heads or len(people) < 2:
+            raise SceneRoleObservationRejection('composition duty needs body support, never a fake focal head')
         # This v1 conservative inventory is NOT a semantic cast/cohort solver.
         # Unknown poses remain unknown and cannot create an arm obligation.
         return SceneRoleObligations(role.value, None, (), person_ids, (), None,
             'not_requested_body_support_only', (), ())
     if role == GroupOutputRole.FORMATION:
-        if selected_head_id is not None or len(people) < 2:
-            raise ValueError('formation duty cannot be replaced by a selected focal head')
+        if selected_head_id is not None:
+            raise ValueError('formation duty cannot carry a selected focal hypothesis')
+        if len(people) < 2:
+            raise SceneRoleObservationRejection('formation duty needs measured native body support')
         return SceneRoleObligations(role.value, None, head_ids, person_ids,
             tuple((i, part) for i in person_ids for part in ARM_PARTS), None,
             'not_focal', (), ())
-    if type(selected_head_id) is not int or selected_head_id not in head_ids:
-        raise ValueError('declared focal hypothesis is missing from original observations')
+    if type(selected_head_id) is not int:
+        raise ValueError('declared focal hypothesis needs an integer frame-local head ID')
+    if selected_head_id not in head_ids:
+        raise SceneRoleObservationRejection('declared focal hypothesis is missing from original observations')
     owners = tuple(p for p in people if _get(p, 'unique_head_observation_id') == selected_head_id)
     owner = owners[0] if len(owners) == 1 else None
     owner_id = None if owner is None else _get(owner, 'observation_id')
@@ -75,10 +82,10 @@ def scene_role_obligations(raw, role, selected_head_id, *, required_part_names=N
     parts = {} if owner is None else dict(_get(owner, 'part_states', ()))
     if role == GroupOutputRole.FOCAL_HEAD_ARMS and (owner is None
             or any(parts.get(part) != 'observed' for part in ARM_PARTS)):
-        raise ValueError('scene focal required arms lack unique original-pixel ownership')
+        raise SceneRoleObservationRejection('scene focal required arms lack unique original-pixel ownership')
     if required_part_names and (owner is None or any(parts.get(part) != 'observed'
             for part in required_part_names)):
-        raise ValueError('scene original required arm lacks selected native owner/observation')
+        raise SceneRoleObservationRejection('scene original required arm lacks selected native owner/observation')
     # A known arm of the selected owner remains a duty even on a head role.
     # An unbound OTHER body is neither assigned to this head nor erased.
     required_parts = tuple((owner_id, part) for part in ARM_PARTS

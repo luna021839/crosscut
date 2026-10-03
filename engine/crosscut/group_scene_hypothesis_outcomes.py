@@ -9,3 +9,12 @@ class SceneHypothesisRejection(ValueError):
     Generic ValueError, source/model identity changes, archive corruption and
     JointGroupBudgetExhausted must remain terminal in that execution.
     """
+
+
+class SceneRoleObservationRejection(SceneHypothesisRejection):
+    """A valid duty cannot be resolved in a particular native observation.
+
+    Invalid duty/ID/reference formats are NOT this outcome. A frame consumer
+    may retain separately measured geometry for this observational failure;
+    a dense consumer must still reject the candidate without waiving duties.
+    """

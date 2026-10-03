@@ -29,7 +29,7 @@ from .group_joint_person_ownership import trackable_person_ownership
 from .group_native_head_orientation import SUPPORTED_ANALYSIS_ROLLS
 from .boundary_subject_alignment import BoundarySubjectAlignmentConfig, _action_envelope, _close_face_head_envelope
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
-from .group_scene_hypothesis_outcomes import SceneHypothesisRejection
+from .group_scene_hypothesis_outcomes import SceneHypothesisRejection,SceneRoleObservationRejection
 
 SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
 DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v6'
@@ -154,6 +154,7 @@ class SceneSensors(source.NativeFamilySensors):
         self.original_duty_program = None
         self.original_native_duty_programmes = {}
         self.original_role_programmes = {}
+        self.state_dense_rejections = {}
 
     def install_original_duty_program(self, program):
         from .group_scene_original_duties import validate_original_duty_program
@@ -215,7 +216,7 @@ class SceneSensors(source.NativeFamilySensors):
         rows = [self.frame(state, t) for t in ticks]
         raw = [self.raw(state, t, h['analysis_roll']) for t in ticks]
         if raw[0].native_frame_index == raw[1].native_frame_index:
-            raise ValueError('repeated native endpoint is not measured motion')
+            raise SceneHypothesisRejection('repeated native endpoint is not measured motion')
         evidence = dict(output_ticks=list(ticks), required_semantics_available=True,
             head_pixel_link=None, joint_pixel_link=None, composition_support_link=None,
             verified_source_clock=self.session.domain.render_frame_clocks[state.eligible_source_index].to_dict(),
@@ -224,14 +225,14 @@ class SceneSensors(source.NativeFamilySensors):
         if state.role == GroupOutputRole.COMPOSITION:
             link = body_support_links(self, *raw)
             if not link['observed_support_paths']:
-                raise ValueError('composition endpoint native support path unknown')
+                raise SceneHypothesisRejection('composition endpoint native support path unknown')
             evidence['composition_support_link'] = link
         else:
             if state.role != GroupOutputRole.FORMATION:
                 ids = [r['selected_frame_local_head_id'] for r in rows]
                 link = self._head_links(*raw)
                 if ids not in link['unique_links']:
-                    raise ValueError('required focal endpoint head pixel path unknown')
+                    raise SceneHypothesisRejection('required focal endpoint head pixel path unknown')
                 evidence['head_pixel_link'] = link
             parts = set(p for row in rows for p in map(tuple,row['role_obligations']['required_parts']))
             if state.role == GroupOutputRole.FORMATION or parts:
@@ -244,8 +245,8 @@ class SceneSensors(source.NativeFamilySensors):
                 from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
                 if not required_motion_available(link):
                     if link.get('contract')==VIEW_CONTRACT:
-                        raise ValueError('required endpoint registered pose unavailable: '+str(link.get('reason')))
-                    raise ValueError('required endpoint joint pixel paths unknown')
+                        raise SceneHypothesisRejection('required endpoint registered pose unavailable: '+str(link.get('reason')))
+                    raise SceneHypothesisRejection('required endpoint joint pixel paths unknown')
                 if link.get('contract')==JOINT_LINK_CONTRACT:evidence['joint_pixel_link'] = link
                 else:evidence['registered_pose_sequence'] = link
         self.endpoint_cache[key] = evidence
@@ -369,7 +370,8 @@ class SceneSensors(source.NativeFamilySensors):
 
     def hypothesis(self, state):
         value = self.hypotheses.get(state.editorial_contract_sha256)
-        if value is None or list(self.span_key(state)) != value['span_key']:
+        if (not isinstance(value,dict) or family.digest(value)!=state.editorial_contract_sha256
+                or list(self.span_key(state)) != value.get('span_key')):
             raise ValueError('scene state lacks its frozen pre-camera cohort hypothesis')
         return value
 
@@ -388,7 +390,7 @@ class SceneSensors(source.NativeFamilySensors):
             return row
         raw = self.raw(state, tick, hypothesis['analysis_roll'])
         if abs(raw.frame_size_wh[0]/raw.frame_size_wh[1]-16/9) > .04:
-            raise ValueError('scene native aspect/padding projection unsupported')
+            raise SceneHypothesisRejection('scene native aspect/padding projection unsupported')
         if raw.native_pixel_sha256 is None:
             raise ValueError('scene original raster unavailable')
         violations = []
@@ -401,7 +403,7 @@ class SceneSensors(source.NativeFamilySensors):
         try:
             obligations = scene_role_obligations(raw, state.role, head_id,required_part_names=required_names)
             obligations_error = None
-        except ValueError as exc:
+        except SceneRoleObservationRejection as exc:
             # A missing/ambiguous duty is UNKNOWN, never a zero-part duty.
             # Raw context can still have measured, supported output geometry.
             obligations = None
@@ -543,70 +545,133 @@ class SceneSensors(source.NativeFamilySensors):
         # caller converts these through the preserved source base crop.
         return row,tuple(envelopes)
 
+    def _state_dense_binding(self,state):
+        """Live, state-local dependencies, NOT a transferable native receipt."""
+        if self.session.closed:
+            raise ValueError('a state dense rejection cannot resume a closed native session')
+        hypothesis=self.hypothesis(state)
+        program=self.original_duty_program
+        unit=None
+        if program is not None:
+            units=[u for u in program['units'] if (u['first_output_frame'],u['end_output_frame'],u['role'])
+                ==(state.first_output_frame,state.end_output_frame,state.role.value)]
+            if len(units)!=1:raise ValueError('dense rejection lost its original duty unit')
+            unit=units[0]
+        request=self.session.domain.request_index(state.eligible_source_index)
+        return dict(state_key=state.key,hypothesis_sha256=family.digest(hypothesis),
+            original_duty_program_sha256=None if program is None else program['program_sha256'],
+            original_duty_unit_sha256=None if unit is None else family.digest(unit),
+            source_domain_sha256=family.digest(self.session.domain.to_dict()),
+            source_file_identity=list(source._file_identity(self.session.domain.request_sources[request])),
+            native_asset_identities={name:list(source._file_identity(path)) for name,path in self.assets.items()},
+            registered_model_sha256={name:row[2] for name,row in self.session.models.items()},
+            registered_model_adapter_sha256=dict(self.session.model_adapters))
+
+    def _remember_state_dense_rejection(self,state,dependencies,error):
+        # Only _dense_state calls this, and only for typed measured rejection.
+        # Pair editorial utility and preserve-incumbent PATH failures never
+        # enter this cache. Reserve evidence before retaining the record.
+        if not dependencies:return
+        packet=dict(contract='same_session_state_local_dense_observation_rejection_v1',
+            dependency_binding=self._state_dense_binding(state),
+            native_observation_dependencies=[dict(cache_key=list(key),observation_sha256=sha)
+                for key,sha in dict(dependencies).items()],
+            reason=str(error),error_type=type(error).__name__,
+            scope='one_complete_mutable_state_not_incident_pair_or_path',
+            same_native_session_only=True,numeric_cursor_grants_native_reuse=False,
+            new_native_budget_granted=False,quality_approved=False)
+        self.session.budget.spend('pose_evidence_bytes',len(json.dumps(packet,sort_keys=True).encode()))
+        self.state_dense_rejections[state.key]=(self.session,self.session.budget,packet)
+
+    def cached_state_dense_rejection(self,path):
+        """Prune only a measured local negative whose actual inputs still match."""
+        from .group_scene_execution_scope import mutable_states
+        for state in mutable_states(path):
+            entry=self.state_dense_rejections.get(state.key)
+            if entry is None:continue
+            owner,budget,record=entry
+            if owner is not self.session or budget is not self.session.budget:
+                raise ValueError('state dense rejection cannot borrow another native session or budget')
+            self.session.budget.check()
+            if record['dependency_binding']!=self._state_dense_binding(state):continue
+            if any((raw:=self.raw_rows.get(tuple(dep['cache_key']))) is None
+                    or raw.sha256!=dep['observation_sha256']
+                    for dep in record['native_observation_dependencies']):continue
+            return family.plain(record)
+        return None
+
     def dense(self, path):
         from .group_scene_execution_scope import mutable_states
-        result = []
+        result=[]
         for state in mutable_states(path):
-            hypothesis = self.hypothesis(state)
-            if hypothesis.get('endpoint_scope', 'whole') != 'whole':
-                raise ValueError('mutable scene shot cannot borrow fixed-neighbor endpoint scope')
-            rows = []; previous = None; current_head = hypothesis['anchor_head_ids'][0]
-            for tick in range(state.first_output_frame, state.end_output_frame):
-                raw = self.raw(state, tick, hypothesis['analysis_roll'])
-                previous_head = current_head
-                if previous is not None and state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION):
-                    links = self._head_links(previous, raw)
-                    choices = [b for a, b in links['unique_links'] if a == current_head]
-                    if len(choices) != 1:
-                        raise SceneHypothesisRejection('scene dense focal path unknown/competing; no actor substitution')
-                    current_head = choices[0]
-                if tick in hypothesis['anchor_output_ticks']:
-                    expected = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
-                    if current_head != expected:
-                        raise SceneHypothesisRejection('scene left/right endpoint hypotheses lack one whole temporal path')
-                body_link=None; support_link=None
-                if previous is not None and state.role == GroupOutputRole.COMPOSITION:
-                    if previous.native_frame_index == raw.native_frame_index:
-                        if previous.sha256 != raw.sha256: raise ValueError('repeated composition raw raster differs')
-                    else:
-                        from .group_scene_composition import body_support_links
-                        support_link = body_support_links(self, previous, raw)
-                        if not support_link['observed_support_paths']:
-                            raise SceneHypothesisRejection('composition dense body support lifecycle unknown')
-                current_parts = self.obligations(raw,state,tick,current_head).required_parts
-                previous_parts = () if previous is None else self.obligations(
-                    previous,state,tick-1,previous_head).required_parts
-                required_names = tuple(sorted({name for _,name in (*previous_parts,*current_parts)}))
-                if previous is not None and (state.role == GroupOutputRole.FORMATION or required_names):
-                    if previous.native_frame_index == raw.native_frame_index:
-                        if previous.sha256 != raw.sha256: raise ValueError('repeated scene body raster differs')
-                    else:
-                        body_link=(native_body_links(self,previous,raw) if state.role==GroupOutputRole.FORMATION
-                            else focal_required_motion(self,state,previous,raw,output_ticks=(tick-1,tick),
-                                selected_head_ids=(previous_head,current_head),selected_part_names=required_names))
-                        from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
-                        if not required_motion_available(body_link):
-                            if body_link.get('contract')==VIEW_CONTRACT:
-                                raise SceneHypothesisRejection('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
-                            raise SceneHypothesisRejection('scene dense required body/arm joint pixel lifecycle unknown')
-                row = dict(self.frame(state, tick, head_id=current_head))
-                # Dense/public JSON remains the original observation schema.
-                # The read-through frame cache keeps only its wire packet;
-                # frozen owners repack this temporary consumer view at transfer.
-                row['native_observation']=family.plain(row['native_observation'])
-                row['required_body_temporal_link']=body_link
-                row['composition_support_link']=support_link
-                projected = self.session.projected_pixels(state, tick)
-                if projected is None:
-                    raise ValueError('scene dense projected pixels unavailable')
-                row['projected_pixels_sha256'] = source.sha256(memoryview(projected)).hexdigest()
-                row['same_source_previous_pixel_link_observed'] = (support_link is not None if state.role == GroupOutputRole.COMPOSITION
-                    else previous is not None and state.role != GroupOutputRole.FORMATION)
-                row['native_repeated_alias'] = previous is not None and previous.native_frame_index == raw.native_frame_index
-                rows.append(row); previous = raw
-            result.append(dict(first_output_frame=state.first_output_frame, end_output_frame=state.end_output_frame,
-                role=state.role.value, rows=rows))
+            dependencies=[]
+            try:row=self._dense_state(state,dependencies)
+            except SceneHypothesisRejection as exc:
+                self._remember_state_dense_rejection(state,dependencies,exc)
+                raise
+            result.append(row)
         return result
+
+    def _dense_state(self,state,dependencies):
+        hypothesis = self.hypothesis(state)
+        if hypothesis.get('endpoint_scope', 'whole') != 'whole':
+            raise ValueError('mutable scene shot cannot borrow fixed-neighbor endpoint scope')
+        rows = []; previous = None; current_head = hypothesis['anchor_head_ids'][0]
+        for tick in range(state.first_output_frame, state.end_output_frame):
+            raw = self.raw(state, tick, hypothesis['analysis_roll'])
+            request=self.session.domain.request_index(state.eligible_source_index)
+            key=(('body_composition',request,raw.native_frame_index) if state.role==GroupOutputRole.COMPOSITION
+                else (request,raw.native_frame_index,hypothesis['analysis_roll']))
+            dependencies.append((key,raw.sha256))
+            previous_head = current_head
+            if previous is not None and state.role not in (GroupOutputRole.FORMATION, GroupOutputRole.COMPOSITION):
+                links = self._head_links(previous, raw)
+                choices = [b for a, b in links['unique_links'] if a == current_head]
+                if len(choices) != 1:
+                    raise SceneHypothesisRejection('scene dense focal path unknown/competing; no actor substitution')
+                current_head = choices[0]
+            if tick in hypothesis['anchor_output_ticks']:
+                expected = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
+                if current_head != expected:
+                    raise SceneHypothesisRejection('scene left/right endpoint hypotheses lack one whole temporal path')
+            body_link=None; support_link=None
+            if previous is not None and state.role == GroupOutputRole.COMPOSITION:
+                if previous.native_frame_index == raw.native_frame_index:
+                    if previous.sha256 != raw.sha256: raise ValueError('repeated composition raw raster differs')
+                else:
+                    from .group_scene_composition import body_support_links
+                    support_link = body_support_links(self, previous, raw)
+                    if not support_link['observed_support_paths']:
+                        raise SceneHypothesisRejection('composition dense body support lifecycle unknown')
+            current_parts = self.obligations(raw,state,tick,current_head).required_parts
+            previous_parts = () if previous is None else self.obligations(
+                previous,state,tick-1,previous_head).required_parts
+            required_names = tuple(sorted({name for _,name in (*previous_parts,*current_parts)}))
+            if previous is not None and (state.role == GroupOutputRole.FORMATION or required_names):
+                if previous.native_frame_index == raw.native_frame_index:
+                    if previous.sha256 != raw.sha256: raise ValueError('repeated scene body raster differs')
+                else:
+                    body_link=(native_body_links(self,previous,raw) if state.role==GroupOutputRole.FORMATION
+                        else focal_required_motion(self,state,previous,raw,output_ticks=(tick-1,tick),
+                            selected_head_ids=(previous_head,current_head),selected_part_names=required_names))
+                    from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
+                    if not required_motion_available(body_link):
+                        if body_link.get('contract')==VIEW_CONTRACT:
+                            raise SceneHypothesisRejection('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
+                        raise SceneHypothesisRejection('scene dense required body/arm joint pixel lifecycle unknown')
+            row = dict(self.frame(state, tick, head_id=current_head))
+            row['native_observation']=family.plain(row['native_observation'])
+            row['required_body_temporal_link']=body_link
+            row['composition_support_link']=support_link
+            projected = self.session.projected_pixels(state, tick)
+            if projected is None:raise ValueError('scene dense projected pixels unavailable')
+            row['projected_pixels_sha256'] = source.sha256(memoryview(projected)).hexdigest()
+            row['same_source_previous_pixel_link_observed'] = (support_link is not None if state.role == GroupOutputRole.COMPOSITION
+                else previous is not None and state.role != GroupOutputRole.FORMATION)
+            row['native_repeated_alias'] = previous is not None and previous.native_frame_index == raw.native_frame_index
+            rows.append(row); previous = raw
+        return dict(first_output_frame=state.first_output_frame,end_output_frame=state.end_output_frame,
+            role=state.role.value,rows=rows)
 
     def archive(self):
         from .group_scene_native_storage import pack_native_observation
@@ -775,11 +840,11 @@ def endpoint_focal_part_paths(sensors,state,first,last):
     after=tuple(sorted({name for _,name in last['role_obligations']['required_parts']}))
     if not before and not after:return None
     if before!=after and (getattr(sensors,'original_duty_program',None) is None or not set(before)<=set(after)):
-        raise ValueError('scene endpoint selected-arm observation lifecycle unknown')
+        raise SceneHypothesisRejection('scene endpoint selected-arm observation lifecycle unknown')
     h=sensors.hypothesis(state)
     raw=tuple(sensors.raw(state,row['output_tick'],h['analysis_roll']) for row in (first,last))
     if raw[0].native_frame_index==raw[1].native_frame_index:
-        raise ValueError('scene repeated native endpoint is not observed arm motion')
+        raise SceneHypothesisRejection('scene repeated native endpoint is not observed arm motion')
     evidence=focal_required_motion(sensors,state,*raw,
         output_ticks=(first['output_tick'],last['output_tick']),
         selected_head_ids=(first['selected_frame_local_head_id'],last['selected_frame_local_head_id']),
@@ -787,8 +852,8 @@ def endpoint_focal_part_paths(sensors,state,first,last):
     from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
     if not required_motion_available(evidence):
         if evidence.get('contract')==VIEW_CONTRACT:
-            raise ValueError('scene endpoint registered focal pose unavailable: '+str(evidence.get('reason')))
-        raise ValueError('scene endpoint required arm native pixel path unknown')
+            raise SceneHypothesisRejection('scene endpoint registered focal pose unavailable: '+str(evidence.get('reason')))
+        raise SceneHypothesisRejection('scene endpoint required arm native pixel path unknown')
     return evidence
 
 
@@ -1073,7 +1138,7 @@ def compare_scene_edge(sensors, left, right):
             outcome='BUDGET_PARTIAL' if rows else 'BUDGET_NOT_STARTED',
             unexecuted_measurements_are_unknown=True)
         raise
-    except ValueError as exc:
+    except SceneHypothesisRejection as exc:
         return dict(available=False, required_semantics_available=False, reason=str(exc), metrics=None,
             cross_camera_identity_certified=False, body_phase_certified=False)
     a, b = rows[1]['scene_geometry'], rows[2]['scene_geometry']
@@ -1123,7 +1188,7 @@ def compare_scene_edge(sensors, left, right):
             unexecuted_measurements_are_unknown=True,
             known_geometry_retained_on_missing_motion=True,required_motion_unknown_not_zero=True)
         raise
-    except ValueError as exc:
+    except SceneHypothesisRejection as exc:
         return dict(evidence, reason=str(exc), known_geometry_retained_on_missing_motion=True,
             required_motion_unknown_not_zero=True)
     evidence.update(available=True, required_semantics_available=True, required_endpoint_evidence=endpoints)
@@ -1140,7 +1205,7 @@ def compare_scene_edge(sensors, left, right):
             exc.partial_evidence=dict(evidence,available=False,outcome='BUDGET_PARTIAL',
                 unexecuted_measurements_are_unknown=True)
             raise
-        except ValueError as exc:
+        except SceneHypothesisRejection as exc:
             return dict(evidence,available=False,reason=str(exc),
                 known_geometry_retained_on_missing_motion=True,required_motion_unknown_not_zero=True)
         outgoing,incoming=[np.asarray(m['velocity_quantiles']) for m in motion]

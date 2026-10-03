@@ -31,7 +31,7 @@ from crosscut.group_joint_native_observer import NativeGroupHead
 from crosscut.source_derivative_diversity import (SourceDerivativeDiversityResult,
     SourceDerivativePairEvidence,SourceDerivativeConfig,DERIVATIVE_DISTINCT)
 from engine.tests.test_source_changing_family_owner import source_chart_sensors,chart_native
-from engine.tests.test_performer_family_owner import encode_chart,build_fixture,chart_sensors
+from engine.tests.test_performer_family_owner import encode_chart,build_fixture,chart_sensors,box_from_chart
 
 from crosscut.boundary_subject_alignment import build_boundary_subject_alignment_plan
 from crosscut.boundary_look_match import (analyze_boundary_look_match,
@@ -68,7 +68,7 @@ class FixedEndpointInventoryTests(unittest.TestCase):
             if value.index==interrupted:
                 raise scene.JointGroupBudgetExhausted('EXPLICIT_FIXED_PROBE_BUDGET_INTERRUPTION')
             if value.index in failed:
-                raise ValueError('EXPLICIT_OBSERVED_ENDPOINT_UNAVAILABLE')
+                raise sensors_module.SceneHypothesisRejection('EXPLICIT_OBSERVED_ENDPOINT_UNAVAILABLE')
             return ()
         return states,SimpleNamespace(hypothesis=hypothesis,endpoint=endpoint),calls
 
@@ -129,6 +129,18 @@ class FixedEndpointInventoryTests(unittest.TestCase):
         self.assertEqual(record['attempts'],[])
         self.assertEqual(record['completed_measurement_count'],0)
 
+    def test_contract_failure_does_not_consume_the_next_fixed_endpoint(self):
+        values,sensors,calls,record=self.run_inventory()
+        def bad_contract(value,**kwargs):
+            calls.append(value.index)
+            raise ValueError('EXPLICIT_BAD_FIXED_ENDPOINT_REFERENCE')
+        sensors.endpoint=bad_contract
+        with self.assertRaises(ValueError):
+            scene.measure_fixed_endpoint_inventory(values,sensors=sensors,outgoing=True,record=record)
+        self.assertEqual(calls,[0])
+        self.assertEqual(record['outcome'],'PRODUCER_FAILED')
+        self.assertEqual(record['completed_measurement_count'],0)
+
 
 def scene_derivative_fixture(count=8):
     pairs=tuple(SourceDerivativePairEvidence(a,b,DERIVATIVE_DISTINCT,
@@ -139,7 +151,7 @@ def scene_derivative_fixture(count=8):
     return replace(value,audit_sha256=family.digest(value._payload(include_sha256=False)))
 
 
-def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False):
+def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False,joint_textures=False):
     """Distinct non-human raster patterns; eight files are not copied aliases."""
     base=path.with_suffix('.seed.mp4')
     encode_chart(base,variant=variant%2,frames=frames)
@@ -164,6 +176,13 @@ def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False):
             cv2.rectangle(image,(131,52),(188,99),(52,192,52),-1)
             for x,y in ((152,68),(168,68),(152,85),(168,85)):
                 cv2.circle(image,(x,y),2,(22,125,22),-1)
+        if joint_textures and (marker:=box_from_chart(image)) is not None:
+            x,y,w,h=marker;cx=int(round((x+w/2)*320));cy=int(round((y+h/2)*180))
+            for px,py in ((cx-8,cy-8),(cx+8,cy-8),(cx-8,cy+9),(cx+8,cy+9)):
+                for dx in (-4,-1,2):
+                    for dy in (-4,-1,2):
+                        color=(15,90,15) if (dx+dy)%2 else (45,115,45)
+                        image[py+dy:py+dy+2,px+dx:px+dx+2]=color
         # A per-file raster tag is not a claim of eight independent real cameras.
         image[-1,-(variant+1):,:]=(variant*20,20,40)
         images.append(image)
@@ -391,6 +410,49 @@ def render_and_decode_chart(testcase,plan,*,capture_ticks=()):
 
 
 class ScenePureContractTests(unittest.TestCase):
+    def test_obligation_observation_failure_and_malformed_contract_remain_distinct(self):
+        from crosscut.group_scene_hypothesis_outcomes import SceneRoleObservationRejection,SceneHypothesisRejection
+        role=sensors_module.GroupOutputRole.FOCAL_HEAD
+        raw=dict(heads=[dict(observation_id=0)],people=[])
+        with self.assertRaises(SceneRoleObservationRejection):
+            sensors_module.scene_role_obligations(raw,role,0,required_part_names=('left_arm',))
+        for invalid,names,head in ((dict(heads=[dict(observation_id=0),dict(observation_id=0)],people=[]),('left_arm',),0),
+                (raw,('missing_arm',),0),(raw,('left_arm',),False)):
+            with self.subTest(raw=invalid,names=names,head=head):
+                try:sensors_module.scene_role_obligations(invalid,role,head,required_part_names=names)
+                except ValueError as exc:self.assertNotIsInstance(exc,SceneHypothesisRejection)
+                else:self.fail('malformed original duty/raw ID must remain a contract failure')
+
+    def test_edge_contract_failures_propagate_from_frame_endpoint_and_actual_composition_projection(self):
+        role=sensors_module.GroupOutputRole
+        left=SimpleNamespace(key='a'*64,role=role.COMPOSITION,first_output_frame=0,end_output_frame=8,
+            output_fps=30.,segments=(SimpleNamespace(source_index=0),),source_clock_identity='b'*64,
+            native_frame_indices=tuple(range(8)))
+        right=SimpleNamespace(key='c'*64,role=role.FOCAL_HEAD,first_output_frame=8,end_output_frame=16,
+            output_fps=30.)
+        def row(state,tick):
+            return dict(output_tick=tick,scene_geometry=dict(occupancy=.2,attention_xy=[.5,.5],
+                subject_height_quantiles=[.2,.3,.4],horizontal_span=.4),
+                # Explicit corrupt raw source, detected by the ACTUAL motion function.
+                native_observation=dict(request_source_index=9,source_clock_identity='b'*64,
+                    native_frame_index=tick))
+        for stage in ('frame','endpoint','composition'):
+            def frame(state,tick):
+                if stage=='frame':raise ValueError('EXPLICIT_BAD_FROZEN_FRAME_CONTRACT')
+                return row(state,tick)
+            def endpoint(state,*,outgoing):
+                if stage=='endpoint':raise ValueError('EXPLICIT_BAD_ENDPOINT_CONTRACT')
+                return dict(output_ticks=[state.end_output_frame-4,state.end_output_frame-1]
+                    if outgoing else [state.first_output_frame,state.first_output_frame+3])
+            with self.subTest(stage=stage),self.assertRaises(ValueError) as caught:
+                sensors_module.compare_scene_edge(SimpleNamespace(frame=frame,endpoint=endpoint),left,right)
+            self.assertNotIsInstance(caught.exception,sensors_module.SceneHypothesisRejection)
+        from crosscut.group_scene_hypothesis_outcomes import SceneHypothesisRejection
+        sensor=SimpleNamespace(frame=lambda *a:(_ for _ in ()).throw(SceneHypothesisRejection('measured support missing')))
+        measured=sensors_module.compare_scene_edge(sensor,left,right)
+        self.assertFalse(measured['available'])
+        self.assertEqual(measured['reason'],'measured support missing')
+
     def test_unknown_and_same_family_are_not_independent(self):
         result=scene_derivative_fixture(3)
         binding={'audit':result.to_dict()}
@@ -424,6 +486,54 @@ class ScenePureContractTests(unittest.TestCase):
         audit=scene_derivative_fixture(4).to_dict();audit['pairs'][0]['status']='uncertain'
         payload=dict(audit);payload.pop('audit_sha256');audit['audit_sha256']=family.digest(payload)
         with self.assertRaises(ValueError):scene.validate_bound_derivative_path({'audit':audit},[0,1,2,3])
+
+
+class SceneLocalDenseRejectionIdentityTests(unittest.TestCase):
+    """NONMEDIA dependency identity tests, not manufactured native admission."""
+    def fixture(self):
+        from fractions import Fraction
+        from crosscut.group_source_domain import GroupSourceDomain
+        from crosscut.render_frame_schedule import VerifiedRenderFrameClock
+        from crosscut.group_joint_source_camera import GroupSourceCameraState,JointGroupWorkBudget,GroupOutputRole
+        storage=tempfile.TemporaryDirectory();self.addCleanup(storage.cleanup)
+        path=Path(storage.name)/'NONMEDIA-scope-input.bin';path.write_bytes(b'explicit nonmedia identity control')
+        domain=GroupSourceDomain((path,),(0,),(0.,),(None,),((),),
+            (VerifiedRenderFrameClock(Fraction(30),8,'a'*64,'synthetic_nonmedia'),))
+        state=GroupSourceCameraState(1,0,8,0,(RenderSegment(0,0.,8/30,0.),),tuple(range(8)),
+            GroupOutputRole.FOCAL_HEAD,'a'*64,output_size=(320,180))
+        h=dict(span_key=list(source.NativeFamilySensors.span_key(state)),analysis_roll=None,
+            endpoint_scope='whole',anchor_output_ticks=[0,3,4,7],anchor_head_ids=[0]*4)
+        state=replace(state,editorial_contract_sha256=family.digest(h))
+        sensor=sensors_module.SceneSensors.__new__(sensors_module.SceneSensors)
+        sensor.session=SimpleNamespace(domain=domain,closed=False,models={},model_adapters={},
+            budget=JointGroupWorkBudget(absolute_deadline=monotonic()+30.))
+        sensor.assets={};sensor.hypotheses={state.editorial_contract_sha256:h}
+        sensor.original_duty_program=dict(program_sha256='d'*64,units=[dict(
+            first_output_frame=0,end_output_frame=8,role=state.role.value,required_parts=['left_arm'])])
+        sensor.raw_rows={(0,0,None):SimpleNamespace(sha256='c'*64)};sensor.state_dense_rejections={}
+        sensor._remember_state_dense_rejection(state,[((0,0,None),'c'*64)],
+            sensors_module.SceneHypothesisRejection('EXPLICIT_NONMEDIA_CACHE_DEPENDENCY_CONTROL'))
+        return sensor,state
+
+    def test_local_failure_is_reused_only_with_unchanged_camera_duty_and_native_observation(self):
+        for change in ('none','camera','duty','native','hypothesis','closed','budget_owner'):
+            sensor,state=self.fixture()
+            if change=='camera':state=replace(state,segments=(replace(state.segments[0],
+                editorial_transform=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),))),))
+            elif change=='duty':sensor.original_duty_program['units'][0]['required_parts'].append('right_arm')
+            elif change=='native':sensor.raw_rows[0,0,None]=SimpleNamespace(sha256='e'*64)
+            elif change=='hypothesis':sensor.hypotheses[state.editorial_contract_sha256]['anchor_head_ids'][0]=1
+            elif change=='closed':sensor.session.closed=True
+            elif change=='budget_owner':sensor.session.budget=SimpleNamespace()
+            # The legacy mutable selector is path[1:-1]; no observations run.
+            path=(None,state,None)
+            with self.subTest(change=change):
+                if change in ('hypothesis','closed','budget_owner'):
+                    with self.assertRaises(ValueError):sensor.cached_state_dense_rejection(path)
+                else:
+                    result=sensor.cached_state_dense_rejection(path)
+                    self.assertEqual(result is not None,change=='none')
+                    if result is not None:self.assertFalse(result['new_native_budget_granted'])
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'local encode/decode tools required')
@@ -984,6 +1094,130 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):cls.temp.cleanup()
+
+    def run_real_obligation_control(self, *, six_binary=False, corrupt_reference=False):
+        """Real dense/obligation producers; only NON-HUMAN detectors are replaced.
+
+        A's declared analysis variant loses its arm owner at one internal,
+        non-anchor native frame. B retains the SAME original required arm.
+        No dense, obligation, utility, completion or admission function is
+        patched to create failure/success. This is not human model evidence.
+        """
+        from crosscut import group_scene_global_execution as execution
+        from crosscut.group_joint_person_ownership import OwnedPersonObservation
+        cls=type(self)
+        if not hasattr(cls,'arm_context'):
+            root=cls.root/'arm-obligations';root.mkdir()
+            paths=tuple(root/f'arm-{i}.mp4' for i in range(8))
+            for i,path in enumerate(paths):
+                encode_scene_chart(path,variant=i,frames=540,small_focal_marker=i==6,joint_textures=True)
+            bundle,controller,request,model=build_scene_fixture(root,paths,
+                authored_camera_unit=2,boundary_look_enabled=False)
+            with optional_native_scope(monotonic()+180.),patch.object(family,'installed_pose_model',return_value=model):
+                cls.arm_context=family.freeze_context(controller=controller,request=request,
+                    eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
+                    scene_cut_times=((),)*8,sync_scores=(.93,.91)*4,source_derivatives=scene_derivative_fixture())
+        real_discover=sensors_module.SceneSensors.discover
+        real_frame=sensors_module.SceneSensors.frame
+        raw_calls=[];dense_calls=[]
+        def native(session, *, request_source_index, native_frame_index, head_analysis_roll=None):
+            row=chart_native(session,request_source_index=request_source_index,
+                native_frame_index=native_frame_index,head_analysis_roll=head_analysis_roll)
+            if row.heads:
+                head=row.heads[0];points=head.landmarks_xy
+                # Geometric-marker joints on actual decoded textured pixels.
+                # Ownership/pose are explicit synthetic detector substitutes.
+                joints=tuple((*points[i],.99) for i in (0,1,3,4,4,3,3,4))
+                missing=request_source_index==2 and head_analysis_roll==30. and native_frame_index==157
+                owner=OwnedPersonObservation(0,head.box_xywh,joints,.99,
+                    candidate_head_observation_ids=() if missing else (0,),
+                    unique_head_observation_id=None if missing else 0,
+                    body_ownership_state='unknown' if missing else 'observed',
+                    part_states=(('left_arm','unknown' if missing else 'observed'),
+                        ('right_arm','unknown')))
+                row=replace(row,people=(owner,),reason='EXPLICIT_SYNTHETIC_ARM_OWNER_'+str(head_analysis_roll))
+                if missing:raw_calls.append(dict(sensor_session=id(session),native=native_frame_index))
+            return row
+        def discover(sensor,state,**kwargs):
+            selected=sensor.original_duty_program is not None
+            if selected and state.first_output_frame==120:
+                values=real_discover(sensor,state,rolls=(30.,None),endpoint_scope='whole')
+            else:values=real_discover(sensor,state,**kwargs)
+            if six_binary and selected and values and state.first_output_frame!=120:
+                duplicate=dict(values[0],explicit_nonhuman_second_inventory_option=True)
+                key=family.digest(duplicate);sensor.hypotheses[key]=duplicate
+                record=next(r for r in sensor.discoveries.values() if values[0] is sensor.hypotheses[r['hypothesis_ids'][0]])
+                if key not in record['hypothesis_ids']:record['hypothesis_ids'].append(key)
+                return (values[0],duplicate)
+            return values
+        def frame(sensor,state,tick,**kwargs):
+            if corrupt_reference and sensor.original_duty_program is not None and state.first_output_frame==120 \
+                    and state.segments[0].editorial_transform is None:
+                sensor.hypotheses.pop(state.editorial_contract_sha256,None)
+            return real_frame(sensor,state,tick,**kwargs)
+        # Trace calls without replacing dense's implementation/exception.
+        real_dense=sensors_module.SceneSensors.dense
+        def traced_dense(sensor,path):
+            dense_calls.append(dict(sensor=id(sensor),budget=id(sensor.session.budget),
+                duty=sensor.original_duty_program['program_sha256']))
+            return real_dense(sensor,path)
+        context=replace(cls.arm_context,deadline=monotonic()+180.)
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context)
+            with patch.object(source,'observe_native_group',side_effect=native), \
+                    patch.object(sensors_module.SceneSensors,'discover',discover), \
+                    patch.object(sensors_module.SceneSensors,'frame',frame), \
+                    patch.object(sensors_module.SceneSensors,'dense',traced_dense), \
+                    patch.object(source,'complete_source_candidate',wraps=source.complete_source_candidate) as completion:
+                candidate=execution.complete_global_scene_program.__wrapped__(context,union)
+        return candidate,dense_calls,raw_calls,completion.call_count
+
+    def obligation_control_failure(self,candidate):
+        if not isinstance(candidate,family.PerformerFamilyRejection):return None
+        evidence=family.plain(candidate.evidence)
+        return json.dumps(dict(error=candidate.error,outcome=evidence.get('outcome'),
+            attempts=[dict(status=a.get('status'),error=a.get('error'),
+                edge_reasons=[r.get('reason') for r in a.get('observed_incident_rows',())],
+                decision=a.get('editorial_decision')) for a in evidence.get('attempts',())]))
+
+    def test_real_required_owner_failure_advances_without_erasing_original_arm_duty(self):
+        candidate,calls,raw_calls,completed=self.run_real_obligation_control()
+        self.assertFalse(isinstance(candidate,family.PerformerFamilyRejection),self.obligation_control_failure(candidate))
+        self.assertEqual(completed,1)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[0],calls[1])
+        self.assertEqual(len(raw_calls),1)
+        receipt=family.plain(candidate.performer_family_review)
+        self.assertEqual(receipt['native_work']['counts']['dense_paths'],2)
+        duty=receipt['search']['original_duty_program']
+        unit=next(u for u in duty['units'] if u['first_output_frame']==120)
+        self.assertTrue(all('left_arm' in r['required_part_names'] for r in unit['rows']))
+        self.assertFalse(receipt['quality_approved'])
+        family.validate_bundle_binding(candidate)
+
+    def test_real_frozen_hypothesis_contract_failure_is_terminal_without_pair_cache_or_completion(self):
+        candidate,calls,_,completed=self.run_real_obligation_control(corrupt_reference=True)
+        self.assertIsInstance(candidate,family.PerformerFamilyRejection)
+        evidence=family.plain(candidate.evidence)
+        self.assertEqual(evidence['outcome'],'TERMINAL_FAILURE')
+        self.assertEqual(calls,[])
+        self.assertEqual(completed,0)
+        self.assertEqual(evidence['conditional_frontier']['infeasible_pairs'],[])
+        self.assertEqual(evidence['conditional_frontier']['completed_combination_count'],0)
+
+    def test_real_state_local_owner_failure_does_not_starve_binary_frontier_with_four_dense_slots(self):
+        candidate,calls,raw_calls,completed=self.run_real_obligation_control(six_binary=True)
+        self.assertFalse(isinstance(candidate,family.PerformerFamilyRejection),self.obligation_control_failure(candidate))
+        self.assertEqual(completed,1)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[0],calls[1])
+        self.assertEqual(len(raw_calls),1)
+        receipt=family.plain(candidate.performer_family_review)
+        self.assertEqual(receipt['native_work']['limits']['dense_paths'],4)
+        self.assertEqual(receipt['native_work']['counts']['dense_paths'],2)
+        self.assertTrue(any(a['status']=='CACHED_OBSERVED_STATE_DENSE_REJECT'
+            for a in receipt['search']['prior_complete_rejections']))
+        self.assertFalse(receipt['quality_approved'])
 
     def test_original_no_boundary_look_reaches_completion_parent_and_final_without_fabricating_look(self):
         from crosscut.group_scene_global_execution import complete_global_scene_program
