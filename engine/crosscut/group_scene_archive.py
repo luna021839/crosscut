@@ -29,6 +29,7 @@ def validate_archive(program, dense):
         _discovery_rolls, scene_anchor_ticks)
     from .group_scene_intent import validate_intent
     from .group_scene_composition import LINK_CONTRACT, validate_support_link
+    from .group_native_detector_result import validate_serialized_detector_result
     archive = dense.get('scene_discovery')
     if (not isinstance(archive, dict) or archive.get('contract') != SCENE_CONTRACT
             or archive.get('quality_approved') is not False
@@ -65,6 +66,7 @@ def validate_archive(program, dense):
                     'named_member_identity_certified', 'motion_certified', 'visibility_certified', 'quality_approved'))):
             raise ValueError('scene archive raw source/clock/uncertainty changed')
         ids(row, 'heads'); ids(row, 'people')
+        validate_serialized_detector_result(row)
         raw[family.digest(row)] = row
     def references(refs):
         if not isinstance(refs, list) or any(ref is not None and ref not in raw for ref in refs):

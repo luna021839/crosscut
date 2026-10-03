@@ -67,7 +67,7 @@ def observe_composition_pose(session, body_support):
         (*body_support.model_content_sha256, (name, session.models[name][2])), people, (),
         'parallel_pose_observed_no_focal_identity' if people else body_support.reason,
         (*body_support.model_adapter_fingerprints, (name, session.model_adapters[name])),
-        ownership_policy_fingerprint())
+        ownership_policy_fingerprint(), raw_person_detector_json=body_support.raw_person_detector_json)
 
 
 def _raw(sensors, state, tick):
@@ -215,6 +215,7 @@ def compare_composition_articulation(sensors, left, right):
 def validate_articulation_evidence(value, edge_metrics, native_assets):
     """Structure/authority binding only; final original-pixel replay is mandatory."""
     from .group_performer_family_owner import digest
+    from .group_native_detector_result import validate_serialized_detector_result
     if (not isinstance(value, dict) or value.get('contract') != CONTRACT
             or type(value.get('available')) is not bool or not isinstance(edge_metrics, dict)
             or any(value.get(k) is not False for k in ('named_identity_certified',
@@ -255,6 +256,7 @@ def validate_articulation_evidence(value, edge_metrics, native_assets):
                 or hashes[0] != a['native_pixel_sha256'] or hashes[-1] != b['native_pixel_sha256']):
             raise ValueError('observed articulation native raster hashes differ')
         for row in raw:
+            validate_serialized_detector_result(row)
             models, adapters = dict(row['model_content_sha256']), dict(row['model_adapter_fingerprints'])
             if not {'nanodet_people','rtmpose_body7'} <= set(models) or set(models) != set(adapters):
                 raise ValueError('articulation did not retain every actual model/adapter identity')

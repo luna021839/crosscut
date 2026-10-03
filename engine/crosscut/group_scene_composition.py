@@ -53,20 +53,32 @@ def observe_native_composition(session, *, request_source_index, native_frame_in
     clock = session.domain.render_frame_clocks[session.domain.eligible_index(request_source_index)]
     clock_hash = hashlib.sha256(json.dumps(clock.to_dict(), sort_keys=True,
         separators=(',', ':')).encode()).hexdigest()
+    identity = _file_identity(session.domain.request_sources[request_source_index])
+    raw_detector_json = None
     def result(reason, people=()):
         return NativeCompositionObservation(request_source_index, native_frame_index,
             (pixels.shape[1], pixels.shape[0]) if pixels is not None else (0, 0),
-            clock_hash, _file_identity(session.domain.request_sources[request_source_index]),
+            clock_hash, identity,
             None if pixels is None else hashlib.sha256(memoryview(pixels)).hexdigest(),
             ((name, session.models[name][2]),), tuple(people), (), reason,
-            ((name, session.model_adapters[name]),))
+            ((name, session.model_adapters[name]),), raw_person_detector_json=raw_detector_json)
     if pixels is None:
         return result('exact_native_decode_unavailable')
     rows = session.observe_native(request_source_index, native_frame_index, model=name)
+    from .group_native_detector_result import capture_detector_result, bounded_detector_rows
+    record = capture_detector_result(rows, binding=dict(request_source_index=request_source_index,
+        native_frame_index=native_frame_index, source_clock_identity=clock_hash,
+        source_file_identity=list(identity), native_pixel_sha256=hashlib.sha256(memoryview(pixels)).hexdigest()),
+        model_content_sha256=session.models[name][2], model_adapter_sha256=session.model_adapters[name])
+    raw_detector_json = json.dumps(record, sort_keys=True, separators=(',', ':'), allow_nan=False)
     if rows is None:
         return result('person_detector_unavailable')
-    if len(rows) > 12:
+    if record['row_count'] is not None and record['row_count'] > 12:
         return result('person_detection_overflow_not_truncated')
+    try:
+        rows = bounded_detector_rows(record)
+    except ValueError:
+        return result('invalid_or_unretained_native_body_detector_result')
     height, width = pixels.shape[:2]
     people = []
     for index, row in enumerate(rows):

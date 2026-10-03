@@ -55,6 +55,7 @@ class NativeGroupObservation:
     reason: str
     model_adapter_fingerprints: tuple[tuple[str,str],...] = ()
     person_ownership_policy_sha256: str | None = None
+    raw_person_detector_json: str | None = None
 
     def __post_init__(self):
         sha=lambda value:isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
@@ -86,9 +87,16 @@ class NativeGroupObservation:
                 raise ValueError('native model and adapter identities must be immutable named SHA-256 values')
         if self.model_adapter_fingerprints and tuple(n for n,_ in self.model_adapter_fingerprints)!=tuple(n for n,_ in self.model_content_sha256):
             raise ValueError('every native model must bind the same named adapter set')
+        if self.raw_person_detector_json is not None:
+            from .group_native_detector_result import validate_detector_result, MAX_RAW_RESULT_BYTES
+            if (not isinstance(self.raw_person_detector_json, str)
+                    or len(self.raw_person_detector_json) > MAX_RAW_RESULT_BYTES*3+4096):
+                raise ValueError('native raw detector receipt must be frozen JSON text')
+            validate_detector_result(json.loads(self.raw_person_detector_json), asdict(self))
 
     def to_dict(self):
         payload = asdict(self)
+        raw_detector = payload.pop('raw_person_detector_json')
         contract = 'actual_source_native_owned_person_body_face_observation_rows_v3'
         if self.person_ownership_policy_sha256 is None:
             # Legacy raw preimages stay byte-semantically reproducible, without
@@ -97,6 +105,12 @@ class NativeGroupObservation:
             payload.pop('person_ownership_policy_sha256')
             for person in payload['people']:
                 person.pop('upper_body_ownership_state', None)
+        if raw_detector is not None:
+            from .group_native_detector_result import detector_semantics_complete
+            contract = 'actual_source_native_owned_person_body_face_observation_rows_v4'
+            result = json.loads(raw_detector)
+            payload['raw_person_detector_result'] = result
+            payload['person_detector_semantics_complete'] = detector_semantics_complete(result, payload)
         return dict(contract=contract, **payload,
             detection_ids_are_frame_local=True, persistent_subject_correspondence_verified=False,
             named_member_identity_certified=False, motion_certified=False,
@@ -168,11 +182,12 @@ def observe_native_group(session, *, request_source_index, native_frame_index,
     identity = _file_identity(session.domain.request_sources[source])
     models = tuple((name, session.models[name][2]) for name in required_models)
     adapters=tuple((name,session.model_adapters[name]) for name,_ in models)
+    raw_detector_json = None
     def snapshot(reason, people=(), heads=()):
         return NativeGroupObservation(source, native,
             (pixels.shape[1], pixels.shape[0]) if pixels is not None else (0, 0), clock_identity, identity,
             hashlib.sha256(memoryview(pixels)).hexdigest() if pixels is not None else None,
-            models, tuple(people), tuple(heads), reason,adapters,ownership_policy_fingerprint())
+            models, tuple(people), tuple(heads), reason,adapters,ownership_policy_fingerprint(), raw_detector_json)
     if pixels is None:
         return snapshot('exact_native_decode_unavailable')
     heads=session.observe_native(source,native,model=head_model)
@@ -189,18 +204,30 @@ def observe_native_group(session, *, request_source_index, native_frame_index,
         heads = tuple(replace(value.head, observation_id=id_base + value.head.observation_id)
             for value in heads)
     rows = session.observe_native(source, native, model='nanodet_people')
+    from .group_native_detector_result import capture_detector_result, bounded_detector_rows
+    result = capture_detector_result(rows, binding=dict(request_source_index=source, native_frame_index=native,
+        source_clock_identity=clock_identity, source_file_identity=list(identity),
+        native_pixel_sha256=hashlib.sha256(memoryview(pixels)).hexdigest()),
+        model_content_sha256=session.models['nanodet_people'][2],
+        model_adapter_sha256=session.model_adapters['nanodet_people'])
+    raw_detector_json = json.dumps(result, sort_keys=True, separators=(',', ':'), allow_nan=False)
     if rows is None:
         return snapshot('person_model_unavailable',heads=heads)
-    if len(rows) > 12:
+    if result['row_count'] is not None and result['row_count'] > 12:
         return snapshot('person_detection_overflow_not_truncated',heads=heads)
+    try:
+        rows = bounded_detector_rows(result)
+    except ValueError:
+        return snapshot('invalid_or_unretained_native_body_detector_result',heads=heads)
     height, width = pixels.shape[:2]
     people = []
     for index, row in enumerate(rows):
         left, top, right, bottom, confidence = map(float, row)
         box = (left/width, top/height, (right-left)/width, (bottom-top)/height)
-        if (box[2] <= 0 or box[3] <= 0 or box[0] < 0 or box[1] < 0
+        if (any(not math.isfinite(v) for v in (*box, confidence)) or not 0 <= confidence <= 1
+                or box[2] <= 0 or box[3] <= 0 or box[0] < 0 or box[1] < 0
                 or box[0]+box[2] > 1.000001 or box[1]+box[3] > 1.000001):
-            return snapshot('invalid_source_native_body_roi')
+            return snapshot('invalid_source_native_body_roi',heads=heads)
         candidates=tuple(head for head in heads if box[0]<=head.box_xywh[0]+head.box_xywh[2]/2<=box[0]+box[2]
             and box[1]<=head.box_xywh[1]+head.box_xywh[3]/2<=box[1]+box[3])
         arguments={'bbox_xywh':list(box)}

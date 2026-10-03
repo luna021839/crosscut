@@ -883,6 +883,7 @@ def validate_scene_dense(dense):
     from .group_scene_intent import validate_intent
     from .group_scene_composition import validate_raw_composition,validate_support_link
     from .group_scene_articulation import validate_articulation_evidence
+    from .group_native_detector_result import validate_serialized_detector_result
     for edge in dense.get('incident_projected_observations', ()):
         if edge.get('comparison_mode') == 'predeclared_composition_cut':
             validate_articulation_evidence(edge.get('articulated_cross_camera_motion'),
@@ -930,6 +931,7 @@ def validate_scene_dense(dense):
                     or row.get('role')!=h['role']):
                 raise ValueError('scene dense row borrowed another hypothesis/anatomy claim')
             native=row.get('native_observation') or {}
+            validate_serialized_detector_result(native)
             obligations=scene_role_obligations(native,row['role'],row['selected_frame_local_head_id'])
             if family.plain(row.get('role_obligations'))!=family.plain(obligations.to_dict()):
                 raise ValueError('scene dense required/context scope changed after native observation')
