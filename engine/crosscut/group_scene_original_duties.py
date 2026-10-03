@@ -19,6 +19,7 @@ from .group_scene_role_obligations import ARM_PARTS
 CONTRACT = 'original_native_focal_duty_lifecycle_v1'
 FOCAL = (GroupOutputRole.FOCAL_HEAD.value, GroupOutputRole.FOCAL_HEAD_ARMS.value)
 MAX_ORIGINAL_NATIVE_SAMPLE_TICKS = 16
+MAX_ORIGINAL_HEAD_LINK_NATIVE_GAP = 12
 
 
 def original_sample_ticks(first,end,anchors):
@@ -28,12 +29,20 @@ def original_sample_ticks(first,end,anchors):
     previously known required part remains required across them. This is not
     an all-original-frames NN/identity certificate or a hard phase lease.
     """
+    if (type(first) is not int or type(end) is not int or first>=end
+            or len(set(anchors))>MAX_ORIGINAL_NATIVE_SAMPLE_TICKS
+            or any(type(t) is not int or not first<=t<end for t in anchors)):
+        raise ValueError('original sample plan has invalid interval/anchors')
     if end-first<=MAX_ORIGINAL_NATIVE_SAMPLE_TICKS:return tuple(range(first,end))
-    selected=set(anchors)|set(range(first,min(end,first+4)))|set(range(max(first,end-4),end))
-    for tick in (first+round((end-first-1)*i/(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS-1))
-            for i in range(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS)):
-        if len(selected)>=MAX_ORIGINAL_NATIVE_SAMPLE_TICKS:break
-        selected.add(tick)
+    # Plan the complete temporal grid before honoring exact endpoint anchors.
+    # Replacing the nearest nonanchor preserves the later half of the grid;
+    # filling from its front until a cap did not.
+    selected={first+round((end-first-1)*i/(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS-1))
+        for i in range(MAX_ORIGINAL_NATIVE_SAMPLE_TICKS)}
+    anchored=set(anchors)
+    for tick in sorted(anchored-selected):
+        displaced=min(selected-anchored,key=lambda n:(abs(n-tick),n))
+        selected.remove(displaced);selected.add(tick)
     return tuple(sorted(selected))
 
 
@@ -71,7 +80,9 @@ def _branch(*, state, hypothesis, raw_at, head_link):
                 native_observation_sha256=None,selected_frame_local_head_id=None,
                 original_person_observation_id=None,head_obligation='required' if role in FOCAL else 'not_requested',
                 head_observation='not_requested',parts=parts,raw_context_retained=True))
-            previous=None;selected=None
+            # No inferred row is created. Keep only the last ACTUAL sampled
+            # raw/conditional owner so the next sample must earn a measured
+            # native head link. Unknown links never reacquire a largest face.
             continue
         raw = _raw_dict(raw_at(tick))
         sha = family.digest(raw)
@@ -79,6 +90,8 @@ def _branch(*, state, hypothesis, raw_at, head_link):
         if (raw['native_frame_index'] != native or raw['source_clock_identity'] != preimage['clock']
                 or raw['native_pixel_sha256'] is None):
             raise ValueError('original duty raw source/native clock/raster changed')
+        if previous is not None and native-previous['native_frame_index']>MAX_ORIGINAL_HEAD_LINK_NATIVE_GAP:
+            previous=None;selected=None
         if tick in hypothesis['anchor_output_ticks']:
             anchor = hypothesis['anchor_output_ticks'].index(tick)
             if sha != hypothesis['raw_observation_sha256'][anchor]:

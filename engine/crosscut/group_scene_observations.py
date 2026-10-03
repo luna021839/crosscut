@@ -20,7 +20,7 @@ from scipy.optimize import linear_sum_assignment
 
 from . import group_source_changing_owner as source
 from . import group_performer_family_owner as family
-from .group_joint_source_camera import GroupOutputRole
+from .group_joint_source_camera import GroupOutputRole,JointGroupBudgetExhausted
 from .group_joint_formation import (ObservedFormationPerson, DeclaredFormationView,
     ObservedFormationTemporalMotion, compare_projected_formation, _bones)
 from .group_joint_native_joint_flow import native_joint_pixel_flow_stream, native_joint_assignment_cost
@@ -495,6 +495,34 @@ class SceneSensors(source.NativeFamilySensors):
             raise SceneFrameRejection(result)
         return result
 
+    def mutable_camera_inputs(self,state,tick):
+        """Conditional raw duties BEFORE admission of a replaceable camera.
+
+        Camera violations remain in the exact measured row. Missing source
+        observations, cropped native faces and unresolved required owners do
+        not become repairable geometry; fixed neighbors still use frame().
+        """
+        if state.role not in (GroupOutputRole.FOCAL_HEAD,GroupOutputRole.FOCAL_HEAD_ARMS):
+            return self.frame(state,tick),()
+        try:row=self.frame(state,tick)
+        except SceneFrameRejection as exc:row=exc.row
+        selected=next((h for h in row['scene_heads']
+            if h['observation_id']==row['selected_frame_local_head_id']),None)
+        if (row['role_obligations'] is None or selected is None
+                or selected['native_cropped'] or row['raw_face_roi_xywh'] is None):
+            if row['frame_admission_violations']:raise SceneFrameRejection(row)
+            raise ValueError('mutable fitting requires observed original-duty owner and whole native face')
+        head=tuple(row['raw_face_roi_xywh'])
+        envelopes=[_close_face_head_envelope(head)]
+        for arm in row['projected_observed_arms']:
+            if not arm['required_by_role']:continue
+            if arm['native_action_envelope_xywh'] is None:
+                raise SceneFrameRejection(row)
+            envelopes.append(tuple(arm['native_action_envelope_xywh']))
+        # Exact raw head/arm records, not an accepted old projection. The
+        # caller converts these through the preserved source base crop.
+        return row,tuple(envelopes)
+
     def dense(self, path):
         result = []
         for state in path[1:-1]:
@@ -709,7 +737,7 @@ def endpoint_focal_part_paths(sensors,state,first,last):
     before=tuple(sorted({name for _,name in first['role_obligations']['required_parts']}))
     after=tuple(sorted({name for _,name in last['role_obligations']['required_parts']}))
     if not before and not after:return None
-    if before!=after:
+    if before!=after and (getattr(sensors,'original_duty_program',None) is None or not set(before)<=set(after)):
         raise ValueError('scene endpoint selected-arm observation lifecycle unknown')
     h=sensors.hypothesis(state)
     raw=tuple(sensors.raw(state,row['output_tick'],h['analysis_roll']) for row in (first,last))
@@ -718,7 +746,7 @@ def endpoint_focal_part_paths(sensors,state,first,last):
     evidence=focal_required_motion(sensors,state,*raw,
         output_ticks=(first['output_tick'],last['output_tick']),
         selected_head_ids=(first['selected_frame_local_head_id'],last['selected_frame_local_head_id']),
-        selected_part_names=before)
+        selected_part_names=tuple(sorted(set(before)|set(after))))
     from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
     if not required_motion_available(evidence):
         if evidence.get('contract')==VIEW_CONTRACT:
@@ -736,8 +764,10 @@ def focal_required_motion(sensors,state,previous,current,*,output_ticks,selected
     """
     from .group_scene_focal_pose_motion import (registered_raw17_basis,focal_pose_view)
     if all(registered_raw17_basis(row) for row in (previous,current)):
+        program=getattr(sensors,'original_duty_program',None)
         key=('registered_focal_pose_view',state.key,previous.sha256,current.sha256,
-            output_ticks,selected_head_ids,selected_part_names)
+            output_ticks,selected_head_ids,selected_part_names,
+            None if program is None else program['program_sha256'])
         if key not in sensors.link_cache:
             sensors.link_cache[key]=focal_pose_view(sensors,state,previous,current,output_ticks=output_ticks,
                 selected_head_ids=selected_head_ids,required_part_names=selected_part_names)
@@ -1000,6 +1030,12 @@ def compare_scene_edge(sensors, left, right):
                 rows.append(exc.row)
                 frame_rejections.append(dict(state_key=s.key,output_tick=t,
                     reasons=exc.row['frame_admission_violations']))
+    except JointGroupBudgetExhausted as exc:
+        exc.partial_evidence=dict(left_state=left.key,right_state=right.key,rows=rows,
+            metrics=None,available=False,required_semantics_available=False,
+            outcome='BUDGET_PARTIAL' if rows else 'BUDGET_NOT_STARTED',
+            unexecuted_measurements_are_unknown=True)
+        raise
     except ValueError as exc:
         return dict(available=False, required_semantics_available=False, reason=str(exc), metrics=None,
             cross_camera_identity_certified=False, body_phase_certified=False)
@@ -1045,6 +1081,11 @@ def compare_scene_edge(sensors, left, right):
             required_motion_unknown_not_zero=True)
     try:
         endpoints = [sensors.endpoint(left, outgoing=True), sensors.endpoint(right, outgoing=False)]
+    except JointGroupBudgetExhausted as exc:
+        exc.partial_evidence=dict(evidence,outcome='BUDGET_PARTIAL',
+            unexecuted_measurements_are_unknown=True,
+            known_geometry_retained_on_missing_motion=True,required_motion_unknown_not_zero=True)
+        raise
     except ValueError as exc:
         return dict(evidence, reason=str(exc), known_geometry_retained_on_missing_motion=True,
             required_motion_unknown_not_zero=True)
@@ -1058,6 +1099,10 @@ def compare_scene_edge(sensors, left, right):
         try:
             motion=[composition_endpoint_screen_motion(s,pair,endpoint)
                 for s,pair,endpoint in zip((left,right),(rows[:2],rows[2:]),endpoints,strict=True)]
+        except JointGroupBudgetExhausted as exc:
+            exc.partial_evidence=dict(evidence,available=False,outcome='BUDGET_PARTIAL',
+                unexecuted_measurements_are_unknown=True)
+            raise
         except ValueError as exc:
             return dict(evidence,available=False,reason=str(exc),
                 known_geometry_retained_on_missing_motion=True,required_motion_unknown_not_zero=True)
@@ -1250,7 +1295,7 @@ def validate_scene_dense(dense):
                 raise ValueError('scene registered incident evidence borrowed another endpoint side')
             validate_focal_pose_view(view,raw_inventory[pair[0]],raw_inventory[pair[1]],
                 raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
-                state_key=dense['state_keys'][index+offset])
+                state_key=dense['state_keys'][index+offset],original_duty_program=program)
     for a,b in zip(keys,keys[1:]):
         if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
             raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
@@ -1358,7 +1403,8 @@ def validate_scene_dense(dense):
                             family.digest(native):native})
                         validate_focal_pose_view(link,previous_row['native_observation'],native,
                             raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
-                            state_key=dense['state_keys'][dense['hypothesis_keys'].index(key)])
+                            state_key=dense['state_keys'][dense['hypothesis_keys'].index(key)],
+                            original_duty_program=program)
                     else:validate_required_body_native_sequence(link,previous_row['native_observation'],native)
                     expected_scope=('all_formation_people' if row['role']==GroupOutputRole.FORMATION.value
                         else 'selected_focal_owner')

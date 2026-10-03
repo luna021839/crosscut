@@ -467,6 +467,16 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
     if (not state.first_output_frame<=scope[0]<scope[1]<=state.end_output_frame
             or any(not scope[0]<=t<scope[1] for t in output_ticks)):
         raise ValueError('registered focal pose output occurrence escaped its frozen required scope')
+    program=getattr(sensors,'original_duty_program',None)
+    # A temporal sensor can need a part before its editorial activation in
+    # order to measure its velocity. Its observation mask is the UNION over
+    # this output interval, not a retroactive duty for each earlier frame.
+    if program is not None:
+        from .group_scene_original_duties import duty_at
+        expected=tuple(sorted({name for tick in range(output_ticks[0],output_ticks[1]+1)
+            for name in duty_at(program,state,tick)['required_part_names']}))
+        if required_part_names!=expected:
+            raise ValueError('registered pose measurement mask differs from original tick duties')
     first,last=previous.native_frame_index,current.native_frame_index
     if not 0<last-first<=12:
         raise ValueError('registered focal pose needs distinct bounded native endpoint samples')
@@ -506,7 +516,7 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
                 or measured.reason is None and (owner is None
                     or owner.unique_head_observation_id!=selected or measured.head_ids[index]!=selected)):
             raise ValueError('cached registered pose primary owner differs from requested native anchor')
-    output=[]
+    output=[];output_required=set()
     if measured.coordinate_reason is None:
         for tick in range(output_ticks[0],output_ticks[1]+1):
             native=state.native_frame_indices[tick-state.first_output_frame];index=native-start
@@ -516,18 +526,22 @@ def focal_pose_view(sensors,state,previous,current,*,output_ticks,selected_head_
             # Preserve all existing headroom and arm/hand-envelope clipping
             # checks. More generous model sensing cannot waive camera duties.
             sensors.frame(state,tick,head_id=head)
-            from .group_scene_role_obligations import scene_role_obligations
             expected=tuple(sorted({name for _,name in
-                scene_role_obligations(rows[index],state.role,head).required_parts}))
-            if expected!=required_part_names:
+                sensors.obligations(rows[index],state,tick,head).required_parts}))
+            if not set(expected)<=set(required_part_names) or program is None and expected!=required_part_names:
                 raise ValueError('registered focal pose required arm lifecycle differs from original raw scope')
+            output_required.update(expected)
             person=next(p for p in rows[index].people if p.observation_id==body_ids[index])
             output.append(dict(output_tick=tick,output_seconds=tick/state.output_fps,
                 native_frame_index=native,raw_observation_sha256=rows[index].sha256,
                 head_observation_id=head,person_observation_id=body_ids[index],
+                original_duty_reference=sensors.duty_binding(state,tick)[0],
                 projected_required_joint_xy=[[joint,*project_point(person.raw_pose_xyc[joint][:2],state,tick)]
                     for joint in measured.window.duties.required_joint_indices]))
+        if tuple(sorted(output_required))!=required_part_names:
+            raise ValueError('registered pose required mask was not owned by its actual output interval')
     result=dict(contract=VIEW_CONTRACT,state_key=state.key,complete_state_preimage=state.to_dict(),
+        original_duty_program_sha256=None if program is None else program['program_sha256'],
         output_ticks=list(output_ticks),output_fps=state.output_fps,
         primary_native_frames=[first,last],primary_raw_observation_sha256=[previous.sha256,current.sha256],
         selected_head_ids=list(selected_head_ids),required_body_scope='selected_focal_owner',
@@ -555,7 +569,8 @@ def required_motion_available(value):
     return value.get('contract')==JOINT_LINK_CONTRACT and value.get('complete_required_joint_paths') is True
 
 
-def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domain,hypothesis,state_key):
+def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domain,hypothesis,state_key,
+        original_duty_program=None):
     """Received measurement replay, NOT fresh image/model or phase authority.
 
     The consumer rederives raw ownership, joints, native seconds, all alternatives
@@ -566,6 +581,14 @@ def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domai
     from fractions import Fraction
     from .group_source_domain import GroupSourceDomain
     from .render_frame_schedule import VerifiedRenderFrameClock
+    if original_duty_program is not None:
+        from .group_scene_original_duties import validate_original_duty_program,duty_at
+        validate_original_duty_program(original_duty_program,raw_inventory=raw_inventory)
+        if (original_duty_program['eligible_request_indices']!=source_domain['eligible_request_indices']
+                or value.get('original_duty_program_sha256')!=original_duty_program['program_sha256']):
+            raise ValueError('registered pose view lost its external original duty programme')
+    elif value.get('original_duty_program_sha256') is not None:
+        raise ValueError('registered pose consumer cannot borrow duties from its received view')
     if (not isinstance(value,dict) or value.get('contract')!=VIEW_CONTRACT
             or value.get('measurement_available') is not True or value.get('reason') is not None
             or value.get('required_motion_available') is not True
@@ -704,6 +727,7 @@ def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domai
         raise ValueError('registered focal pose output clock/required scope differs from its complete state')
     from .group_source_changing_owner import project_point
     from .group_scene_role_obligations import scene_role_obligations
+    original_required=set()
     for sample in samples:
         n=sample.get('native_frame_index')
         if type(n) is not int or n not in natives:
@@ -716,15 +740,23 @@ def validate_focal_pose_view(value,previous,current,*,raw_inventory,source_domai
                 or any(len(p)!=3 or any(type(v) not in (int,float) or not math.isfinite(v)
                     or not 0<=v<=1 for v in p[1:]) for p in points)):
             raise ValueError('registered focal pose output lost required measured joints/clock')
+        ref=None if original_duty_program is None else duty_at(original_duty_program,state,sample['output_tick'])
+        if sample.get('original_duty_reference')!=ref:
+            raise ValueError('registered pose output changed its externally owned original tick duty')
+        names=None if ref is None else tuple(ref['required_part_names'])
+        expected_parts={name for _,name in scene_role_obligations(rows[index],state.role,heads[index],
+            required_part_names=names).required_parts}
+        original_required.update(expected_parts)
         if (state.native_frame_indices[sample['output_tick']-state.first_output_frame]!=n
-                or sorted({name for _,name in
-                    scene_role_obligations(rows[index],state.role,heads[index]).required_parts})!=parts):
+                or not expected_parts<=set(parts) or ref is None and sorted(expected_parts)!=parts):
             raise ValueError('registered focal pose native join/arm lifecycle differs from its frozen state')
         person=next(p for p in rows[index].people if p.observation_id==owners[index])
         expected=[[joint,*project_point(person.raw_pose_xyc[joint][:2],state,sample['output_tick'])]
             for joint in duties.required_joint_indices]
         if points!=expected:
             raise ValueError('registered focal pose received output points differ from actual complete camera projection')
+    if sorted(original_required)!=parts:
+        raise ValueError('registered pose measurement mask expanded/removed original interval duties')
     if ([samples[0]['native_frame_index'],samples[-1]['native_frame_index']]!=[first,last]
             or any(a['native_frame_index']>b['native_frame_index'] for a,b in zip(samples,samples[1:]))):
         raise ValueError('registered focal pose chronological output/native join changed')

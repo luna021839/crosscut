@@ -15,7 +15,7 @@ from . import group_source_changing_owner as source
 from .group_scene_observations import (SceneSensors, compare_scene_edge,
     coherent_baseline, preserves_known, has_editorial_gain, DENSE_CONTRACT)
 from .group_scene_observations import VARIANTS, scene_anchor_ticks
-from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget
+from .group_joint_source_camera import GroupOutputRole, JointGroupWorkBudget,JointGroupBudgetExhausted
 from .group_joint_observations import GroupJointObservationSession
 from .face_match import FaceMatchConfig
 from .source_derivative_diversity import (SourceDerivativeDiversityResult,
@@ -235,9 +235,15 @@ def preserve_incumbent_required_parts(sensors, baseline, path, dense):
 
 def propose_scene_changes(context):
     attempts=[];numeric_inventory=[];alternatives=[];session=None;sensors=None
-    def rejected(error, *, error_type='ValueError'):
+    active_window=None;active_graph=None
+    def rejected(error, *, error_type='ValueError',outcome='MEASUREMENT_UNAVAILABLE',partial=None):
         return family.PerformerFamilyRejection(error,dict(contract=CONTRACT,
             error=error,error_type=error_type,
+            outcome=outcome,unexecuted_measurements_are_unknown=True,
+            fallback_work_restart_allowed=False,
+            # Whole raw prefix retention is the separate F22 journal contract.
+            raw_prefix_completeness_certified=False,
+            interrupted_measurement=partial,
             attempts=attempts,numeric_source_inventory=numeric_inventory,candidate_alternatives=alternatives,
             scene_observations=None if sensors is None else sensors.archive(),
             native_work=None if session is None else session.budget.to_dict(),
@@ -305,6 +311,7 @@ def propose_scene_changes(context):
         graph_windows=0
         evaluated_hypothesis_frontiers=set()
         for wi,(baseline,raw_slots,numeric),rolls in scheduled:
+            active_window=wi;active_graph=None
             if monotonic()+COMPLETE_REFRESH_RESERVE_SECONDS >= context.deadline:
                 attempts.append(dict(stage='reserve',reason='complete_refresh_reserve_preserved'));break
             if session.budget.counts['states']>=session.budget.limits['states']:
@@ -346,6 +353,8 @@ def propose_scene_changes(context):
                 original_program=freeze_original_duty_program(sensors,baseline_hypotheses,
                     original_plan_identity=family.digest(family.plan_payload(plan)))
                 sensors.install_original_duty_program(original_program)
+            except JointGroupBudgetExhausted:
+                raise
             except ValueError as exc:
                 attempts.append(dict(stage='original_duty_freeze',window=wi,error=str(exc),
                     donor_native_observations_skipped=True,original_ambiguity_is_not_a_waiver=True))
@@ -358,6 +367,8 @@ def propose_scene_changes(context):
                     try:
                         sensors.endpoint(value,outgoing=outgoing)
                         valid.append(value)
+                    except JointGroupBudgetExhausted:
+                        raise
                     except ValueError as exc:
                         attempts.append(dict(stage='fixed_required_measurement',window=wi,
                             state_key=value.key,error=str(exc),donor_native_observations_skipped=True))
@@ -396,15 +407,21 @@ def propose_scene_changes(context):
                                 l=_target(sensors.frame(left,left.end_output_frame-1));r=_target(sensors.frame(right,right.first_output_frame))
                                 interior=tuple((a+b)/2 for a,b in zip(l,r))
                                 targets=(l,r) if len(baseline)==3 else ((l,interior) if slot==1 else (interior,r))
-                                first=sensors.frame(value,value.first_output_frame);last=sensors.frame(value,value.end_output_frame-1)
+                                first,entry_envelopes=sensors.mutable_camera_inputs(value,value.first_output_frame)
+                                last,exit_envelopes=sensors.mutable_camera_inputs(value,value.end_output_frame-1)
                                 a,ta,_=source._at(value,value.first_output_frame);b,tb,_=source._at(value,value.end_output_frame-1)
                                 boxes=(source._base_box(_native_target(first),a,ta),source._base_box(_native_target(last),b,tb))
+                                envelopes=(tuple(source._base_box(box,a,ta) for box in entry_envelopes),
+                                    tuple(source._base_box(box,b,tb) for box in exit_envelopes))
                                 proposal=source.propose_endpoint_focal_face_roi_camera(source_face_boxes=boxes,
                                     fixed_neighbor_face_boxes=targets,frame_count=len(value.native_frame_indices),fps=plan.fps,
+                                    required_endpoint_envelopes=envelopes if entry_envelopes or exit_envelopes else None,
                                     maximum_zoom=(FaceMatchConfig().maximum_silhouette_zoom
                                         if value.role==GroupOutputRole.FORMATION else 2.))
                                 camera=source._hypothesis(context,baseline[slot],value.eligible_source_index,proposal.track)
                                 cameras.append(sensors.bind(camera,sensors.hypothesis(value)))
+                            except JointGroupBudgetExhausted:
+                                raise
                             except ValueError as exc:
                                 if len(camera_errors)<source.MAX_RECORDED_FAILURES:camera_errors.append(str(exc))
                     # Native then camera, round-robin over SOURCE, not the first
@@ -427,6 +444,8 @@ def propose_scene_changes(context):
             all_states=tuple(dict((v.key,v) for v in (*lefts,*(s for g in groups for s in g),*rights)).values())
             for state in all_states:session.budget.spend('states')
             edges={};known={}
+            active_graph=dict(window=wi,window_native_start_counts=start_counts,
+                edge_observations=[],baseline_components=known,camera_errors=camera_errors)
             def read(a,b):
                 key=a.key,b.key
                 if key not in edges:
@@ -439,6 +458,7 @@ def propose_scene_changes(context):
                     # as a verified distinct-camera cut in the selected graph.
                     if evidence['source_relation'] != DERIVATIVE_DISTINCT:evidence['available']=False
                     edges[key]=evidence
+                    active_graph['edge_observations'].append(evidence)
                 return edges[key]
             composition_window=any(v.role==GroupOutputRole.COMPOSITION for v in baseline)
             composition_reference=None
@@ -466,6 +486,7 @@ def propose_scene_changes(context):
                             for tick in scene_anchor_ticks(old_state.first_output_frame,
                                     old_state.end_output_frame,scope_for(old_index)):
                                 source._dominant(sensors.raw(old_state,tick,None),old_state.role)
+                        except JointGroupBudgetExhausted:raise
                         except ValueError:unique=False
                     known[index]=coherent_baseline(values,focal_assignment_unique=unique)
             paths=[]
@@ -542,6 +563,10 @@ def propose_scene_changes(context):
                     result=source.complete_source_candidate(context,path,sensors,session,assets,dense,measured,search)
                     alternative['status']='complete_unapproved'
                     return result
+                except JointGroupBudgetExhausted as exc:
+                    alternative.update(status='budget_unverified',error=str(exc),
+                        unexecuted_measurements_are_unknown=True)
+                    raise
                 except (ValueError,RuntimeError,OSError) as exc:
                     alternative.update(status='rejected',error=str(exc))
             attempts.append(dict(stage='scene_graph',window=wi,state_keys=[s.key for s in all_states],
@@ -549,6 +574,17 @@ def propose_scene_changes(context):
                 window_native_start_counts=start_counts,
                 window_native_end_counts=dict(session.budget.counts),camera_errors=camera_errors))
         return rejected('no complete bounded scene/source/whole-camera family candidate')
+    except JointGroupBudgetExhausted as exc:
+        counts={} if session is None else session.budget.counts
+        measured=any(counts.get(k,0) for k in ('new_decodes','model_calls','pose_comparisons',
+            'region_flow_feature_updates','association_nodes','association_edges'))
+        attempts.append(dict(stage='budget_interrupted',window=active_window,
+            outcome='BUDGET_PARTIAL' if measured else 'BUDGET_NOT_STARTED',
+            retained_graph=active_graph,native_work_at_interrupt=dict(counts),
+            unexecuted_measurements_are_unknown=True,new_budget_retry_started=False))
+        return rejected(type(exc).__name__+': '+str(exc),error_type=type(exc).__name__,
+            outcome='BUDGET_PARTIAL' if measured else 'BUDGET_NOT_STARTED',
+            partial=getattr(exc,'partial_evidence',None))
     except (ValueError,RuntimeError,OSError) as exc:
         # The legacy sibling/fixed-camera fallback may also fail. Preserve this
         # exact native/lease/asset cause inside its evidence, not only in the

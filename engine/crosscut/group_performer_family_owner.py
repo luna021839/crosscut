@@ -544,6 +544,17 @@ def propose_performer_family(context):
     scene_candidate = propose_scene_changes(context)
     if not isinstance(scene_candidate, PerformerFamilyRejection):
         return scene_candidate
+    if context.source_derivative_binding is not None:
+        # The normal source/scene path now owns frozen original duties. The
+        # legacy siblings cannot yet consume that contract or the same request
+        # ledger; they are UNSUPPORTED, not an automatic new-budget retry.
+        # Keep the exact rejection/partial history for the normal controller.
+        return PerformerFamilyRejection(scene_candidate.error,dict(
+            contract='normal_scene_fallback_contract_unavailable_v1',
+            fallback_status='UNSUPPORTED_ORIGINAL_DUTY_REQUEST_LEDGER',
+            legacy_proposal_called=False,new_budget_retry_started=False,
+            original_duties_waived=False,scene_search=scene_candidate.evidence,
+            quality_approved=False))
     source_candidate = propose_source_changes(context)
     if not isinstance(source_candidate, PerformerFamilyRejection):
         receipt = plain(source_candidate.performer_family_review)

@@ -39,6 +39,7 @@ class FocalFaceROICameraProposal:
     observed_geometry_sample_count: int
     preserved_entry_camera_frame_count: int = 0
     unobserved_geometry_frame_indices: tuple[int, ...] = ()
+    endpoint_required_envelopes: tuple[tuple[tuple[float, float, float, float], ...], ...] = ()
 
     def to_dict(self):
         return dict(contract=('authored_partial_native_face_roi_camera_proposal_v1'
@@ -53,6 +54,8 @@ class FocalFaceROICameraProposal:
             unobserved_geometry_frame_indices=self.unobserved_geometry_frame_indices,
             interpolated_camera_parameters_are_not_subject_observations=bool(self.unobserved_geometry_frame_indices),
             minimum_observed_face_roi_visible_fraction=self.minimum_observed_face_roi_visible_fraction,
+            endpoint_required_envelopes=self.endpoint_required_envelopes,
+            required_envelopes_are_fitting_constraints_not_dense_evidence=True,
             face_inputs_are_geometry_only=True, native_subject_correspondence_certified=False,
             whole_head_extent_certified=False, required_arm_visibility_certified=False,
             gesture_or_phase_continuity_certified=False, source_clock_certified=False,
@@ -190,7 +193,8 @@ def propose_partial_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_bo
 
 
 def propose_endpoint_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_face_boxes,
-        frame_count, fps, incumbent_track=None, maximum_zoom=2., maximum_center_shift=.25):
+        frame_count, fps, incumbent_track=None, maximum_zoom=2., maximum_center_shift=.25,
+        required_endpoint_envelopes=None):
     """Authored camera interpolation from TWO measurements, not dense proof.
 
     This deliberately separate proposal permits an actual render/inspection
@@ -208,17 +212,28 @@ def propose_endpoint_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_
             or not 0 < maximum_center_shift <= .25
             or incumbent_track is not None and not isinstance(incumbent_track, EditorialTransformTrack)):
         raise ValueError('endpoint camera proposal needs two measurements and a bounded output interval')
+    envelopes=() if required_endpoint_envelopes is None else tuple(tuple(group)
+        for group in required_endpoint_envelopes)
+    if envelopes and (len(envelopes)!=2 or any(not _valid_box(box)
+            for group in envelopes for box in group)):
+        # Coordinates are AFTER the immutable source crop. Expanding an
+        # editorial camera cannot restore its already discarded pixels.
+        raise ValueError('required endpoint envelope is unobserved or outside the retained base raster')
     states = []
-    for source, target in zip(boxes, targets):
+    for index,(source, target) in enumerate(zip(boxes, targets)):
         # The renderer already admits this physical quarter-frame envelope.
         # Do not inherit a narrower planner style cap and call its residual
         # unavoidable. Real-pixel corners and endpoint ROI support still apply.
         zoom = min(maximum_zoom, max(1., target[3]/source[3]))
-        state, _ = _target_state(box=source, target_box=target, zoom=zoom,
-            roll_degrees=0., maximum_center_shift=maximum_center_shift,
-            settings=BoundarySubjectAlignmentConfig())
-        if state is None:
-            raise ValueError('endpoint camera has no real-pixel-safe crop')
+        if envelopes:
+            state=_required_envelope_camera(source,target,(source,*envelopes[index]),
+                desired_zoom=zoom,maximum_center_shift=maximum_center_shift)
+        else:
+            state, _ = _target_state(box=source, target_box=target, zoom=zoom,
+                roll_degrees=0., maximum_center_shift=maximum_center_shift,
+                settings=BoundarySubjectAlignmentConfig())
+            if state is None:
+                raise ValueError('endpoint camera has no real-pixel-safe crop')
         states.append(state)
     duration = (frame_count-1)/fps
     track = _track_for_segment(last_frame_time=duration, ramp_frames=14, fps=fps,
@@ -235,7 +250,57 @@ def propose_endpoint_focal_face_roi_camera(*, source_face_boxes, fixed_neighbor_
         old = incumbent_track.evaluate(time) if incumbent_track is not None else _TransformState()
         before.append(_residual(box, target, _TransformState(old.zoom, old.center_x, old.center_y, old.roll_degrees)))
     return FocalFaceROICameraProposal(track, tuple(before), tuple(after), frame_count,
-        min(row['observed_face_roi_visible_fraction'] for row in after), 2)
+        min(row['observed_face_roi_visible_fraction'] for row in after), 2,
+        endpoint_required_envelopes=envelopes)
+
+
+def _required_envelope_camera(face,target,envelopes,*,desired_zoom,maximum_center_shift):
+    """Continuous feasible endpoint fit, no gate/cap reduction or pixel synthesis.
+
+    Preserve all supplied measured boxes; minimize face-target displacement
+    inside the intersecting canvas/support/pan domain at the closest possible
+    zoom to the face-scale target. Middle-frame admission stays the owner's job.
+    """
+    lo=tuple(min(box[axis] for box in envelopes) for axis in (0,1))
+    hi=tuple(max(box[axis]+box[axis+2] for box in envelopes) for axis in (0,1))
+    zoom=min(desired_zoom,*(1/(hi[j]-lo[j]) for j in (0,1)))
+    if zoom<1.-1e-9:
+        raise ValueError('required endpoint envelopes have no retained-raster camera domain')
+    def domain(at_zoom):
+        half=.5/at_zoom
+        bounds=tuple((max(half,hi[j]-half),min(1.-half,lo[j]+half)) for j in (0,1))
+        if any(low>high for low,high in bounds):return None
+        nearest=tuple(min(high,max(low,.5)) for low,high in bounds)
+        return bounds if math.dist(nearest,(.5,.5))<=maximum_center_shift else None
+    zoom=max(1.,zoom);bounds=domain(zoom)
+    if bounds is None:
+        # Lower zoom expands every canvas/support center interval. Search its
+        # monotonic feasible domain rather than reject a repairable framing
+        # or raise the radial pan limit. This is only bounded geometry work.
+        low,high=1.,zoom
+        if domain(low) is None:
+            raise ValueError('required endpoint camera has no retained-raster/pan domain')
+        for _ in range(40):
+            middle=(low+high)/2
+            if domain(middle) is None:high=middle
+            else:low=middle
+        zoom=low;bounds=domain(zoom)
+    clamp=lambda point:tuple(min(high,max(low,point[j])) for j,(low,high) in enumerate(bounds))
+    origin=clamp((.5,.5))
+    desired=tuple(_center(face)[j]-(_center(target)[j]-.5)/zoom for j in (0,1))
+    center=clamp(desired)
+    if math.dist(center,(.5,.5))>maximum_center_shift:
+        delta=tuple(center[j]-origin[j] for j in (0,1))
+        offset=tuple(origin[j]-.5 for j in (0,1))
+        aa=sum(x*x for x in delta);bb=2*sum(x*y for x,y in zip(delta,offset))
+        cc=sum(x*x for x in offset)-maximum_center_shift**2
+        amount=min(1.,max(0.,(-bb+math.sqrt(max(0.,bb*bb-4*aa*cc)))/(2*aa)))
+        center=tuple(origin[j]+amount*delta[j] for j in (0,1))
+    state=_TransformState(zoom,*center,0.)
+    state.keyframe(0.)  # Actual renderer's structural/real-pixel bounds.
+    if any(_project_box(box,state)[1]<.999999 for box in envelopes):
+        raise ValueError('required envelope fit failed containment; no visibility waiver')
+    return state
 
 
 def retain_entry_camera_proposal(proposal, *, incumbent_track, fps, preserved_frames=4):
