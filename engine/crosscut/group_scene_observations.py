@@ -597,12 +597,13 @@ class SceneSensors(source.NativeFamilySensors):
         from .group_scene_native_storage import pack_native_observation
         views=self.session.budget.normalized_native_views
         native=[pack_native_observation(r.to_dict()) for r in self.raw_rows.values()]
-        listed={r['observation_sha256'] for r in native}
+        parallel=[None if r is None else pack_native_observation(r.to_dict())
+            for r in self.articulation_raw_rows.values()]
+        listed={r['observation_sha256'] for r in (*native,*parallel) if r is not None}
         native.extend(packet for ref,packet in views.views.items() if ref not in listed)
         return dict(contract=SCENE_CONTRACT, discoveries=list(self.discoveries.values()),
             hypotheses=self.hypotheses, native_rows=native,
-            parallel_articulation_rows=[None if r is None else pack_native_observation(r.to_dict())
-                for r in self.articulation_raw_rows.values()],
+            parallel_articulation_rows=parallel,
             endpoint_pixel_links=list(self.link_cache.values()),
             primitive_measurements=self.session.budget.primitive_journal.to_dict(),
             normalized_native_view_records=views.to_dict(),

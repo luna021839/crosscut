@@ -76,9 +76,15 @@ def _raw(sensors, state, tick):
     base = sensors.raw(state, tick, None)
     key = base.sha256
     if key not in sensors.articulation_raw_rows:
-        row = observe_composition_pose(sensors.session, base)
-        if row is not None:
-            sensors.session.budget.spend('pose_evidence_bytes', len(json.dumps(row.to_dict(), sort_keys=True).encode()))
+        row = None
+        if ('rtmpose_body7' in sensors.session.models
+                and 'rtmpose_body7' in sensors.session.model_adapters):
+            row = sensors.session.budget.normalized_native_views.measure(
+                label='native_composition_parallel_pose_view',
+                input_binding=dict(request_source_index=base.request_source_index,
+                    native_frame_index=base.native_frame_index,source_clock_identity=base.source_clock_identity,
+                    body_support_sha256=base.sha256),
+                producer=lambda:observe_composition_pose(sensors.session,base))
         sensors.articulation_raw_rows[key] = row
     return sensors.articulation_raw_rows[key]
 

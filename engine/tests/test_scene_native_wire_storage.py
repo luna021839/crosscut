@@ -1,5 +1,6 @@
 """Lossless normalized observation wire, not NN raw-return or human quality proof."""
 from copy import deepcopy
+from dataclasses import asdict,fields
 import json
 from time import monotonic
 from types import SimpleNamespace
@@ -65,6 +66,117 @@ def test_frozen_motion_stores_wire_but_public_json_keeps_original_observation_sc
     public=motion.to_dict()['source_camera_refresh']['native_rows'][0]
     assert encoded(public)==encoded(original)
     assert json.loads(encoded(motion.to_dict()))['source_camera_refresh']['native_rows'][0]==public
+
+
+def body_support_fixture():
+    from crosscut.group_joint_native_observer import NativeGroupObservation
+    from crosscut.group_scene_composition import NativeCompositionObservation
+    _,rows,_=world();base=rows[0]
+    values={field.name:getattr(base,field.name) for field in fields(NativeGroupObservation)}
+    values.update(heads=(),
+        model_content_sha256=(('nanodet_people','a'*64),),
+        model_adapter_fingerprints=(('nanodet_people','c'*64),),
+        reason='EXPLICIT_NONHUMAN_BODY_SUPPORT_SCHEMA_FIXTURE')
+    return NativeCompositionObservation(**values)
+
+
+def parallel_fixture():
+    from crosscut.group_joint_native_observer import NativeGroupObservation
+    from crosscut.group_scene_articulation import NativeCompositionPoseObservation
+    from crosscut.group_joint_person_ownership import OwnedPersonObservation
+    base=body_support_fixture()
+    values={field.name:getattr(base,field.name) for field in fields(NativeGroupObservation)}
+    values.update(people=tuple(OwnedPersonObservation(p.observation_id,p.box_xywh,(),p.confidence,
+            pose_reason='EXPLICIT_NONHUMAN_UNOBSERVED_POSE') for p in base.people),
+        model_content_sha256=(('nanodet_people','a'*64),('rtmpose_body7','b'*64)),
+        model_adapter_fingerprints=(('nanodet_people','c'*64),('rtmpose_body7','d'*64)),
+        reason='EXPLICIT_NONHUMAN_PARALLEL_SCHEMA_FIXTURE')
+    return NativeCompositionPoseObservation(**values)
+
+
+def test_actual_parallel_articulation_schema_roundtrips_and_survives_archive():
+    raw=parallel_fixture();packet=pack_native_observation(raw.to_dict())
+    assert encoded(expand_native_observation(packet))==encoded(raw.to_dict())
+    sensors=object.__new__(SceneSensors);budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.)
+    sensors.session=SimpleNamespace(budget=budget);sensors.raw_rows={};sensors.hypotheses={}
+    sensors.discoveries={};sensors.articulation_raw_rows={'parallel':raw};sensors.link_cache={}
+    archive=family.plain(sensors.archive())
+    assert encoded(archive['parallel_articulation_rows'][0])==encoded(raw.to_dict())
+    assert archive['parallel_articulation_rows'][0]['heads_state']=='not_requested'
+    assert archive['parallel_articulation_rows'][0]['semantic_cast_membership_certified'] is False
+
+
+@pytest.mark.parametrize('change',['head','cast_authority','model_names'])
+def test_parallel_wire_cannot_invent_focal_or_cast_authority(change):
+    raw=parallel_fixture().to_dict()
+    if change=='head':
+        from crosscut.group_joint_native_observer import NativeGroupHead
+        raw['heads']=[asdict(NativeGroupHead(0,(.1,.1,.1,.1),((.1,.1),)*5,.9))]
+    elif change=='cast_authority':raw['semantic_cast_membership_certified']=True
+    else:raw['model_content_sha256']=[('yunet_head_faces','a'*64)]
+    with pytest.raises(ValueError):pack_native_observation(raw)
+
+
+def test_parallel_producer_reserves_view_before_expensive_pose_work():
+    from crosscut import group_scene_articulation as articulation
+    from crosscut.group_joint_source_camera import GroupOutputRole
+    raw=parallel_fixture();calls=[]
+    budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.,maximum_pose_evidence_bytes=128)
+    sensors=SimpleNamespace(session=SimpleNamespace(budget=budget,models={'rtmpose_body7':object()},
+            model_adapters={'rtmpose_body7':'d'*64}),
+        raw=lambda *args:body_support_fixture(),articulation_raw_rows={})
+    state=SimpleNamespace(role=GroupOutputRole.COMPOSITION)
+    def observe(*args):calls.append(1);return raw
+    with patch.object(articulation,'observe_composition_pose',side_effect=observe),pytest.raises(JointGroupBudgetExhausted):
+        articulation._raw(sensors,state,0)
+    assert not calls and not sensors.articulation_raw_rows
+    assert not any(budget.reserved.values())
+
+
+def test_parallel_return_has_its_own_normalized_view_record_not_focal_identity():
+    from crosscut import group_scene_articulation as articulation
+    from crosscut.group_joint_source_camera import GroupOutputRole
+    raw=parallel_fixture();calls=[];budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.)
+    base=body_support_fixture()
+    sensors=SimpleNamespace(session=SimpleNamespace(budget=budget,models={'rtmpose_body7':object()},
+            model_adapters={'rtmpose_body7':'d'*64}),
+        raw=lambda *args:base,articulation_raw_rows={})
+    state=SimpleNamespace(role=GroupOutputRole.COMPOSITION)
+    def observe(*args):calls.append(1);return raw
+    with patch.object(articulation,'observe_composition_pose',side_effect=observe):
+        assert articulation._raw(sensors,state,0) is raw
+        assert articulation._raw(sensors,state,0) is raw
+    record=budget.normalized_native_views.to_dict()
+    assert calls==[1] and len(record['attempts'])==1
+    assert record['attempts'][0]['label']=='native_composition_parallel_pose_view'
+    validate_normalized_view_records(record,{raw.sha256:raw.to_dict(),base.sha256:base.to_dict()})
+    assert record['intermediate_nn_raw_returns_retained'] is False
+
+
+@pytest.mark.parametrize('change',['omitted','focal_body','native','clock'])
+def test_parallel_record_cannot_borrow_unbound_body_support(change):
+    base=body_support_fixture();raw=parallel_fixture()
+    budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.)
+    budget.normalized_native_views.measure(label='native_composition_parallel_pose_view',
+        input_binding=dict(request_source_index=base.request_source_index,native_frame_index=base.native_frame_index,
+            source_clock_identity=base.source_clock_identity,body_support_sha256=base.sha256),producer=lambda:raw)
+    inventory={raw.sha256:raw.to_dict(),base.sha256:base.to_dict()}
+    if change=='omitted':inventory.pop(base.sha256)
+    elif change=='focal_body':inventory[base.sha256]['contract']='actual_source_native_owned_person_body_face_observation_rows_v2'
+    elif change=='native':inventory[base.sha256]['native_frame_index']+=1
+    else:inventory[base.sha256]['source_clock_identity']='f'*64
+    with pytest.raises(ValueError):validate_normalized_view_records(budget.normalized_native_views.to_dict(),inventory)
+
+
+def test_unregistered_parallel_adapter_remains_not_requested_not_a_failed_view():
+    from crosscut import group_scene_articulation as articulation
+    from crosscut.group_joint_source_camera import GroupOutputRole
+    budget=JointGroupWorkBudget(absolute_deadline=monotonic()+10.,maximum_pose_evidence_bytes=128)
+    sensors=SimpleNamespace(session=SimpleNamespace(budget=budget,models={'rtmpose_body7':object()},model_adapters={}),
+        raw=lambda *args:body_support_fixture(),articulation_raw_rows={})
+    with patch.object(articulation,'observe_composition_pose',side_effect=AssertionError('adapter unavailable')):
+        assert articulation._raw(sensors,SimpleNamespace(role=GroupOutputRole.COMPOSITION),0) is None
+    assert not budget.normalized_native_views.attempts and not any(budget.reserved.values())
 
 
 @pytest.mark.parametrize('change',['payload','hash','size','authority','unknown_schema'])

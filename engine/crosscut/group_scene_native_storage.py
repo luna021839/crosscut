@@ -15,10 +15,13 @@ from .group_joint_primitive_journal import encoded,packed,unpacked,MAX_RECORD_BY
 CONTRACT='lossless_normalized_scene_native_wire_v1'
 RECORD_CONTRACT='local_pre_reserved_normalized_native_view_records_v1'
 MAX_NATIVE_JSON_BYTES=512*1024
+PARALLEL_CONTRACT='native_composition_parallel_articulated_observations_v1'
+LABELS=frozenset(('native_focal_observation_view','native_composition_observation_view',
+    'native_composition_parallel_pose_view'))
 RAW_CONTRACTS=frozenset(('actual_source_native_owned_person_body_face_observation_rows_v2',
     'actual_source_native_owned_person_body_face_observation_rows_v3',
     'actual_source_native_owned_person_body_face_observation_rows_v4',
-    'native_detector_body_support_only_v1'))
+    'native_detector_body_support_only_v1',PARALLEL_CONTRACT))
 
 
 def _native_payload(value):
@@ -32,6 +35,14 @@ def _native_payload(value):
                 'named_member_identity_certified','persistent_subject_correspondence_verified',
                 'motion_certified','visibility_certified'))):
         raise ValueError('normalized native wire requires the bounded observation/uncertainty schema')
+    if value['contract']==PARALLEL_CONTRACT:
+        models=value.get('model_content_sha256')
+        if (value['heads'] or value.get('heads_state')!='not_requested'
+                or value.get('semantic_cast_membership_certified') is not False
+                or not isinstance(models,(tuple,list)) or len(models)!=2
+                or any(not isinstance(row,(tuple,list)) or len(row)!=2 for row in models)
+                or tuple(row[0] for row in models)!=('nanodet_people','rtmpose_body7')):
+            raise ValueError('parallel native pose wire cannot borrow focal or cast authority')
     data=encoded(value)
     if len(data)>MAX_NATIVE_JSON_BYTES:raise ValueError('normalized native observation exceeded its declared wire bound')
     return data
@@ -106,7 +117,7 @@ class LocalNormalizedNativeViews:
         self.budget=budget;self.attempts=[];self.views={};self.view_bytes=0;self.record_bytes=0
 
     def measure(self,*,label,input_binding,producer):
-        if (label not in ('native_focal_observation_view','native_composition_observation_view')
+        if (label not in LABELS
                 or not isinstance(input_binding,dict) or not callable(producer)):
             raise ValueError('normalized native view requires an explicit bounded producer/input')
         inputs=encoded(input_binding)
@@ -169,12 +180,19 @@ def validate_normalized_view_records(value,raw_inventory):
     referenced=set();records=0
     for index,row in enumerate(value['attempts']):
         if (not isinstance(row,dict) or row.get('sequence')!=index
-                or row.get('label') not in ('native_focal_observation_view','native_composition_observation_view')
+                or row.get('label') not in LABELS
                 or row.get('status') not in ('returned','producer_failed','view_contract_violated')
                 or row.get('intermediate_nn_raw_returns_retained') is not False
                 or len(encoded(row))>MAX_RECORD_BYTES):
             raise ValueError('normalized native view lost its ordered local BEGIN/terminal')
         binding=json.loads(unpacked(row['input_binding'],limit=2048));ref=row.get('observation_sha256')
+        body=None
+        if row['label']=='native_composition_parallel_pose_view':
+            body=raw_inventory.get(binding.get('body_support_sha256'))
+            if (body is None or body.get('contract')!='native_detector_body_support_only_v1'
+                    or any(binding.get(key)!=body.get(key) for key in
+                        ('request_source_index','native_frame_index','source_clock_identity'))):
+                raise ValueError('parallel normalized view lost its original body-support input')
         if row['status']=='returned':
             native=raw_inventory.get(ref)
             if (native is None or row.get('normalized_view_retained') is not True
@@ -182,6 +200,10 @@ def validate_normalized_view_records(value,raw_inventory):
                     or binding.get('native_frame_index')!=native['native_frame_index']
                     or binding.get('source_clock_identity') not in (None,native['source_clock_identity'])):
                 raise ValueError('normalized view record lost its committed native/source occurrence')
+            if body is not None and (native.get('contract')!=PARALLEL_CONTRACT or any(
+                    native.get(key)!=body.get(key) for key in ('request_source_index','native_frame_index',
+                        'source_clock_identity','source_file_identity','native_pixel_sha256'))):
+                raise ValueError('parallel normalized return borrowed another body-source raster')
             referenced.add(ref)
         elif ref is not None or row.get('normalized_view_retained') is not False:
             raise ValueError('failed normalized view invented a complete returned observation')
