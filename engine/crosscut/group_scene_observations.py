@@ -29,6 +29,7 @@ from .group_joint_person_ownership import trackable_person_ownership
 from .group_native_head_orientation import SUPPORTED_ANALYSIS_ROLLS
 from .boundary_subject_alignment import BoundarySubjectAlignmentConfig, _action_envelope, _close_face_head_envelope
 from .group_scene_role_obligations import scene_role_obligations, CONTRACT as ROLE_CONTRACT
+from .group_scene_hypothesis_outcomes import SceneHypothesisRejection
 
 SCENE_CONTRACT = 'native_scene_role_cohort_hypotheses_v3'
 DENSE_CONTRACT = 'source_native_scene_role_whole_camera_refresh_v6'
@@ -124,7 +125,7 @@ def _known_parts(person):
         if person is not None and dict(getattr(person, 'part_states', ())).get(name) == 'observed')
 
 
-class SceneFrameRejection(ValueError):
+class SceneFrameRejection(SceneHypothesisRejection):
     """A measured projection failed admission; its known pixels are not erased.
 
     The row cannot be used by endpoint/dense admission. Only the conditional
@@ -557,12 +558,12 @@ class SceneSensors(source.NativeFamilySensors):
                     links = self._head_links(previous, raw)
                     choices = [b for a, b in links['unique_links'] if a == current_head]
                     if len(choices) != 1:
-                        raise ValueError('scene dense focal path unknown/competing; no actor substitution')
+                        raise SceneHypothesisRejection('scene dense focal path unknown/competing; no actor substitution')
                     current_head = choices[0]
                 if tick in hypothesis['anchor_output_ticks']:
                     expected = hypothesis['anchor_head_ids'][hypothesis['anchor_output_ticks'].index(tick)]
                     if current_head != expected:
-                        raise ValueError('scene left/right endpoint hypotheses lack one whole temporal path')
+                        raise SceneHypothesisRejection('scene left/right endpoint hypotheses lack one whole temporal path')
                 body_link=None; support_link=None
                 if previous is not None and state.role == GroupOutputRole.COMPOSITION:
                     if previous.native_frame_index == raw.native_frame_index:
@@ -571,7 +572,7 @@ class SceneSensors(source.NativeFamilySensors):
                         from .group_scene_composition import body_support_links
                         support_link = body_support_links(self, previous, raw)
                         if not support_link['observed_support_paths']:
-                            raise ValueError('composition dense body support lifecycle unknown')
+                            raise SceneHypothesisRejection('composition dense body support lifecycle unknown')
                 current_parts = self.obligations(raw,state,tick,current_head).required_parts
                 previous_parts = () if previous is None else self.obligations(
                     previous,state,tick-1,previous_head).required_parts
@@ -586,8 +587,8 @@ class SceneSensors(source.NativeFamilySensors):
                         from .group_scene_focal_pose_motion import VIEW_CONTRACT,required_motion_available
                         if not required_motion_available(body_link):
                             if body_link.get('contract')==VIEW_CONTRACT:
-                                raise ValueError('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
-                            raise ValueError('scene dense required body/arm joint pixel lifecycle unknown')
+                                raise SceneHypothesisRejection('scene dense registered focal pose unavailable: '+str(body_link.get('reason')))
+                            raise SceneHypothesisRejection('scene dense required body/arm joint pixel lifecycle unknown')
                 row = dict(self.frame(state, tick, head_id=current_head))
                 # Dense/public JSON remains the original observation schema.
                 # The read-through frame cache keeps only its wire packet;

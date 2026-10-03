@@ -1063,6 +1063,124 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
         self.assertTrue('clip' in candidate.error or 'crop' in candidate.error,candidate.error)
         self.assertFalse(evidence['fallback_work_restart_allowed'])
 
+    def run_two_conditional_chart_control(self,*,terminal=None):
+        """Explicit A-fails/B-valid control; real B native completion stays on.
+
+        A is a labelled NON-HUMAN sensor alternative with identical endpoint
+        observations; only its dense failure is injected. It is not evidence
+        of two real human hypotheses or a trained model's editing ability.
+        """
+        from crosscut import group_scene_global_execution as execution
+        from crosscut.group_scene_hypothesis_outcomes import SceneHypothesisRejection
+        real_discover=sensors_module.SceneSensors.discover
+        real_dense=sensors_module.SceneSensors.dense
+        calls=[]
+        def discover(sensor,state,**kwargs):
+            values=real_discover(sensor,state,**kwargs)
+            if (values and state.first_output_frame==120
+                    and state.segments[0].editorial_transform is None):
+                bad=dict(values[0],explicit_nonhuman_dense_failure_control=True)
+                identity=family.digest(bad)
+                sensor.hypotheses[identity]=bad
+                record=next(r for r in sensor.discoveries.values()
+                    if values[0] is sensor.hypotheses[r['hypothesis_ids'][0]])
+                if identity not in record['hypothesis_ids']:record['hypothesis_ids'].insert(0,identity)
+                return (bad,values[0])
+            return values
+        def dense(sensor,path):
+            calls.append(dict(sensor=id(sensor),budget=id(sensor.session.budget),
+                duty=sensor.original_duty_program['program_sha256']))
+            if any(sensor.hypothesis(s).get('explicit_nonhuman_dense_failure_control') for s in path):
+                if terminal=='contract':raise ValueError('EXPLICIT_TERMINAL_ARCHIVE_CONTRACT_CONTROL')
+                if terminal=='budget':sensor.session.budget.limits['states']=1
+                raise SceneHypothesisRejection('EXPLICIT_A_ENDPOINTS_PASS_DENSE_REJECT')
+            return real_dense(sensor,path)
+        context=replace(self.context,deadline=monotonic()+180.)
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context)
+            with patch.object(sensors_module.SceneSensors,'discover',discover), \
+                    patch.object(sensors_module.SceneSensors,'dense',dense), \
+                    patch.object(execution,'MAX_CONDITIONAL_PATHS',
+                        1 if terminal=='truncated' else execution.MAX_CONDITIONAL_PATHS), \
+                    patch.object(source,'complete_source_candidate',wraps=source.complete_source_candidate) as completion:
+                candidate=execution.complete_global_scene_program.__wrapped__(context,union)
+        return candidate,calls,completion.call_count
+
+    def test_global_dense_reject_advances_same_session_to_second_conditional_then_completes_once(self):
+        candidate,calls,completed=self.run_two_conditional_chart_control()
+        self.assertFalse(isinstance(candidate,family.PerformerFamilyRejection),getattr(candidate,'error',None))
+        self.assertEqual(completed,1)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[0],calls[1])
+        family.validate_bundle_binding(candidate)
+        receipt=family.plain(candidate.performer_family_review)
+        self.assertEqual(receipt['native_work']['counts']['dense_paths'],2)
+        self.assertEqual(receipt['search']['atomic_numeric_programmes_completed'],1)
+        self.assertFalse(receipt['quality_approved'])
+
+    def test_global_budget_before_second_conditional_retains_unknown_pending_cursor_without_restart(self):
+        candidate,calls,completed=self.run_two_conditional_chart_control(terminal='budget')
+        self.assertIsInstance(candidate,family.PerformerFamilyRejection)
+        evidence=family.plain(candidate.evidence)
+        self.assertEqual(evidence['outcome'],'BUDGET_PARTIAL')
+        self.assertEqual(completed,0)
+        self.assertEqual(len(calls),1)
+        cursor=evidence['conditional_frontier']
+        self.assertEqual(cursor['completed_combination_count'],1)
+        self.assertEqual(cursor['pending_combination_count'],1)
+        self.assertEqual(cursor['next_rank_vector'],[0,1,0,0,0,0])
+        self.assertFalse(cursor['inventory_exhausted'])
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
+        self.assertFalse(evidence['quality_approved'])
+
+    def test_global_contract_error_is_terminal_not_an_observed_hypothesis_rejection(self):
+        candidate,calls,completed=self.run_two_conditional_chart_control(terminal='contract')
+        self.assertIsInstance(candidate,family.PerformerFamilyRejection)
+        evidence=family.plain(candidate.evidence)
+        self.assertEqual(evidence['outcome'],'TERMINAL_FAILURE')
+        self.assertEqual(completed,0)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(evidence['conditional_frontier']['completed_combination_count'],0)
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
+
+    def test_global_search_cap_is_not_exhaustive_no_gain_and_keeps_second_conditional_pending(self):
+        candidate,calls,completed=self.run_two_conditional_chart_control(terminal='truncated')
+        self.assertIsInstance(candidate,family.PerformerFamilyRejection)
+        evidence=family.plain(candidate.evidence)
+        self.assertEqual(evidence['outcome'],'SEARCH_TRUNCATED')
+        self.assertEqual(completed,0)
+        self.assertEqual(len(calls),1)
+        cursor=evidence['conditional_frontier']
+        self.assertEqual(cursor['completed_combination_count'],1)
+        self.assertEqual(cursor['pending_combination_count'],1)
+        self.assertEqual(cursor['next_rank_vector'],[0,1,0,0,0,0])
+        self.assertFalse(cursor['inventory_exhausted'])
+        self.assertFalse(evidence['fallback_work_restart_allowed'])
+        self.assertFalse(evidence['quality_approved'])
+
+    def test_real_chart_mixed_endpoint_hypothesis_emits_typed_local_temporal_rejection(self):
+        from crosscut.group_joint_observations import GroupJointObservationSession
+        from crosscut.group_joint_source_camera import JointGroupWorkBudget
+        from crosscut.group_scene_execution_scope import execution_path_from_union
+        from crosscut.group_scene_hypothesis_outcomes import SceneHypothesisRejection
+        context=replace(self.context,deadline=monotonic()+120.)
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context)
+        path=execution_path_from_union(context,context.domain,union)
+        with optional_native_scope(context.deadline),scene_chart_sensors(), \
+                GroupJointObservationSession(domain=context.domain,budget=JointGroupWorkBudget(
+                    absolute_deadline=context.deadline,**source.WORK_LIMITS)) as session:
+            sensors=sensors_module.SceneSensors(session,source.installed_native_assets(context))
+            values=[]
+            for index,state in enumerate(path):
+                hypotheses=sensors.discover(state,rolls=(None,),endpoint_scope='whole')
+                if index==path.mutable_indices[0]:
+                    hypothesis=next(h for h in hypotheses if h['anchor_head_ids']==[0,0,1,1])
+                else:hypothesis=next(h for h in hypotheses if h['anchor_head_ids']==[0,0,0,0])
+                values.append(sensors.bind(state,hypothesis))
+            with self.assertRaisesRegex(SceneHypothesisRejection,'one whole temporal path'):
+                sensors.dense(path.with_states(values))
+
 
 class SceneFormationPixelTests(unittest.TestCase):
     def fixture(self,flat=False):

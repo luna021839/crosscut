@@ -138,3 +138,145 @@ def test_descriptor_consumer_assembles_union_first_and_refreshes_only_disjoint_c
     assert result.dependency_support==union.dependency_support
     assert calls==[(0,1),(3,5),(10,11)]
     assert result.refreshed_segment_indices==(0,1,3,4,5,10,11)
+
+
+@pytest.mark.parametrize('case',['keep','nineteen_descriptor_cells','forged_support'])
+def test_global_numerically_rejected_union_never_resolves_assets_or_starts_native_session(case):
+    from crosscut import group_scene_global_execution as execution
+    from crosscut import group_performer_family_owner as family
+    if case=='nineteen_descriptor_cells':
+        context,domain,union,path=world(indices=(1,4,7,10,13,16),length=22)
+        assert len(union.dependency_support['descriptor_refresh_cells'])==19
+    else:
+        context,domain,union,path=world()
+        if case=='keep':
+            cameras=tuple(camera_unit_from_plan(program=union.allocation.program,
+                unit_id=unit_id,plan=context.incumbent.render_plan,domain=domain)
+                for unit_id in union.allocation.mutable_unit_ids)
+            union=assemble_owned_scene_union(context=context,domain=domain,
+                allocation=union.allocation,cameras=cameras)
+            assert not union.changed_segment_indices
+        else:
+            support=deepcopy(union.dependency_support)
+            support['descriptor_refresh_cells']=[]
+            union=replace(union,dependency_support_json=json.dumps(support))
+    context.domain=domain
+    with patch.object(family,'_fresh'), \
+            patch.object(execution.source,'installed_native_assets',side_effect=AssertionError('native assets reached')) as assets, \
+            patch.object(execution,'GroupJointObservationSession',side_effect=AssertionError('native session reached')) as session, \
+            patch.object(execution,'SceneSensors',side_effect=AssertionError('native sensors reached')) as sensors:
+        result=execution.complete_global_scene_program.__wrapped__(context,union)
+    assert isinstance(result,family.PerformerFamilyRejection)
+    evidence=family.plain(result.evidence)
+    assert evidence['outcome']=='NUMERIC_PREFLIGHT_REJECTED'
+    assert evidence['normal_global_execution_performed'] is False
+    assert evidence['native_work'] is None
+    assert evidence['scene_observations'] is None
+    assert evidence['fallback_work_restart_allowed'] is False
+    assert not evidence['quality_approved']
+    assets.assert_not_called();session.assert_not_called();sensors.assert_not_called()
+
+
+def conditional_fixture(*,binary_units=6,maximum_paths=32):
+    from crosscut.group_scene_conditional_frontier import ConditionalSceneFrontier
+    groups=tuple(tuple(NS(key=f'EXPLICIT_NONMEDIA_UNIT_{i}_OPTION_{j}') for j in range(2))
+        for i in range(binary_units))
+    pairs=tuple((i,i+1) for i in range(binary_units-1))
+    return groups,pairs,ConditionalSceneFrontier(groups,pairs,maximum_paths=maximum_paths)
+
+
+def test_six_binary_conditional_units_reach_first_units_second_option_without_lexicographic_starvation():
+    groups,pairs,frontier=conditional_fixture()
+    seen=[]
+    while frontier.peek() is not None:
+        values=frontier.begin();seen.append(tuple(s.key for s in values))
+        frontier.finish('NO_EDITORIAL_GAIN' if values[0] is groups[0][0] else 'DENSE_VALID_SELECTED')
+        if values[0] is groups[0][1]:break
+    assert len(seen)==7  # Lexicographic prefix would need combination 33.
+    assert seen[-1][0]==groups[0][1].key
+    assert all(any(row[i]==groups[i][1].key for row in seen) for i in range(6))
+    assert frontier.to_dict()['pending_combination_count']==57
+
+
+def test_conditional_path_cap_retains_exact_numeric_cursor_and_unexecuted_inventory():
+    from crosscut.group_scene_conditional_frontier import ConditionalSceneFrontier
+    groups,pairs,frontier=conditional_fixture()
+    while frontier.peek() is not None:
+        frontier.begin();frontier.finish('NO_EDITORIAL_GAIN')
+    cursor=json.loads(json.dumps(frontier.to_dict()))
+    assert frontier.outcome=='SEARCH_TRUNCATED'
+    assert cursor['total_combinations']==64
+    assert cursor['completed_combination_count']==32
+    assert cursor['pending_combination_count']==32
+    assert cursor['next_rank_vector'] is not None
+    assert not cursor['inventory_exhausted']
+    assert not cursor['new_native_budget_granted']
+    restored=ConditionalSceneFrontier.from_dict(groups,pairs,cursor)
+    assert restored.to_dict()==cursor
+    assert restored.peek() is None  # Numeric restore cannot enlarge the request cap.
+
+
+def test_exhaustive_small_conditional_rejection_is_not_a_truncated_inventory():
+    groups,pairs,frontier=conditional_fixture(binary_units=1)
+    while frontier.peek() is not None:
+        frontier.begin();frontier.finish('NO_EDITORIAL_GAIN')
+    assert frontier.outcome=='COMPLETE_NO_GAIN'
+    assert frontier.to_dict()['pending_combination_count']==0
+    assert frontier.to_dict()['inventory_exhausted']
+
+
+def test_conditional_budget_interruption_preserves_active_and_pending_numeric_choices():
+    from crosscut.group_scene_conditional_frontier import ConditionalSceneFrontier
+    groups,pairs,frontier=conditional_fixture()
+    frontier.begin();frontier.finish('OBSERVED_HYPOTHESIS_REJECTED')
+    values=frontier.begin()
+    cursor=frontier.to_dict()
+    assert cursor['completed_combination_count']==1
+    assert cursor['pending_combination_count']==63
+    assert cursor['active_rank_vector']==cursor['next_rank_vector']
+    restored=ConditionalSceneFrontier.from_dict(groups,pairs,json.loads(json.dumps(cursor)))
+    assert tuple(s.key for s in restored.peek())==tuple(s.key for s in values)
+    assert restored.to_dict()==cursor
+
+
+def test_empty_conditional_discovery_is_unknown_not_exhaustive_no_gain():
+    from crosscut.group_scene_conditional_frontier import ConditionalSceneFrontier
+    groups,pairs,unused=conditional_fixture()
+    frontier=ConditionalSceneFrontier(((),*groups[1:]),pairs)
+    assert frontier.peek() is None
+    assert frontier.outcome=='HYPOTHESES_UNAVAILABLE'
+    assert not frontier.to_dict()['inventory_exhausted']
+    assert not frontier.to_dict()['quality_approved']
+
+
+def test_original_reference_cannot_swallow_budget_exhaustion_as_focal_ambiguity():
+    from crosscut.group_scene_global_execution import global_original_reference
+    from crosscut.group_joint_source_camera import JointGroupBudgetExhausted
+    context,domain,union,path=world()
+    def raw(*args):raise JointGroupBudgetExhausted('EXPLICIT_ORIGINAL_REFERENCE_BUDGET_CONTROL')
+    with pytest.raises(JointGroupBudgetExhausted,match='ORIGINAL_REFERENCE_BUDGET'):
+        global_original_reference(NS(raw=raw),path,tuple((s,) for s in path),lambda a,b:{})
+
+
+def test_conditional_pair_pruning_reuses_only_observed_identical_real_incident_pair():
+    groups,pairs,frontier=conditional_fixture()
+    values=frontier.begin()
+    frontier.remember_infeasible_pair((0,1),values[0],values[1],'EXPLICIT_OBSERVED_UNAVAILABLE_PAIR')
+    frontier.finish('OBSERVED_PAIR_REJECTED')
+    second=frontier.begin()
+    assert frontier.blocked_pair(second)['previous_observed_pair_reused']
+    with pytest.raises(ValueError,match='frozen unit inventory'):
+        frontier.remember_infeasible_pair((0,5),values[0],values[5],'NOT_AN_ACTUAL_INCIDENT_EDGE')
+
+
+@pytest.mark.parametrize('change',['inventory_order','pending_count','skip_current','fake_quality'])
+def test_conditional_cursor_cannot_rehash_a_different_inventory_or_unexecuted_progress(change):
+    from crosscut.group_scene_conditional_frontier import ConditionalSceneFrontier
+    groups,pairs,frontier=conditional_fixture()
+    frontier.begin();frontier.finish('NO_EDITORIAL_GAIN');cursor=deepcopy(frontier.to_dict())
+    if change=='inventory_order':cursor['inventory']['ordered_state_keys'][0].reverse()
+    elif change=='pending_count':cursor['pending_combination_count']-=1
+    elif change=='skip_current':cursor['next_rank_vector']=[1]*6
+    else:cursor['quality_approved']=0
+    with pytest.raises(ValueError,match='canonical progress'):
+        ConditionalSceneFrontier.from_dict(groups,pairs,cursor)

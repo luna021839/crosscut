@@ -319,6 +319,7 @@ def _native_target(row):
 def preserve_incumbent_required_parts(sensors, baseline, path, dense):
     """Check the PRESEARCH original programme, never reselect a dominant actor."""
     from .group_scene_original_duties import duty_at,FOCAL
+    from .group_scene_hypothesis_outcomes import SceneHypothesisRejection
     program=getattr(sensors,'original_duty_program',None)
     if program is None:
         raise ValueError('scene source change has no presearch original duty programme')
@@ -335,7 +336,7 @@ def preserve_incumbent_required_parts(sensors, baseline, path, dense):
                 actual={(a['person_observation_id'],a['part']) for a in row['projected_observed_arms']
                     if a['required_by_role']}
                 if expected!=actual or expected and owner is None:
-                    raise ValueError('scene source change loses a selected-owner original required arm')
+                    raise SceneHypothesisRejection('scene source change loses a selected-owner original required arm')
             preserved.append(dict(output_tick=row['output_tick'],original_duty_reference=ref,
                 part_count_is_not_cross_camera_actor_correspondence=True,
                 missing_original_measurement_is_not_a_duty_waiver=True,
