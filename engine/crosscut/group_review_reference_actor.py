@@ -1,0 +1,117 @@
+"""One independently anchored actor hypothesis per original native shot.
+
+The original's output geometry picks one seed before donor/pose costs. Native
+appearance/position then follows that seed in both directions. Detector IDs
+are frame-local. A missing/ambiguous association is never max-face recovery,
+named identity, production tracking, or a complete motion certificate.
+"""
+from dataclasses import replace
+import math
+
+from .group_performer_family_owner import digest
+from .group_review_actor_path import _link
+
+
+def _native_association_view(view,unit):
+    raw=view['row']['native_observation'];d=view['descriptor']
+    head=next((h for h in raw['heads'] if h['observation_id']==d.frame_local_head_id),None)
+    if head is None:raise ValueError('original actor view lost its actual native occurrence')
+    x,y,w,h=head['box_xywh']
+    # Association uses actual native head coordinates, not arbitrary original
+    # editorial crop jumps. The real row/camera returned to consumers is intact.
+    descriptor=replace(d,head_center=(x+w/2,y+h/2),face_width=w,face_height=h,pose_shape=None)
+    return dict(view,descriptor=descriptor,row=dict(view['row'],projection=dict(
+        view['row']['projection'],camera_sha256='native-association-only:'+digest(unit))))
+
+
+def freeze_original_review_actor_inventory(frames,*,native_units,original_program_identity,
+        maximum_frames=2048,maximum_native_gap=12,minimum_cosine=.25,ambiguity_margin=.025,
+        original_attention_scopes=None):
+    """Freeze output-tick bindings without inspecting donor/action-match costs.
+
+    Each physical original shot uses the observed frame nearest its inventory
+    midpoint, then its most central sufficiently visible output face as seed.
+    Face area breaks spatial ties; body completeness never selects that seed.
+    A retained direct anchor may bridge a missing slot only within the SAME
+    fixed native gap. Recursive gap expansion / re-seeding after loss is absent.
+    """
+    if (not isinstance(frames,dict) or not 1<=len(frames)<=maximum_frames
+            or set(frames)!=set(native_units) or not isinstance(original_program_identity,str)
+            or not original_program_identity or not 1<=maximum_native_gap<=12
+            or not 0<=minimum_cosine<=1 or not 0<=ambiguity_margin<=1):
+        raise ValueError('original actor inventory needs one finite independent physical request set')
+    scopes={t:'single-independent-request' for t in frames} if original_attention_scopes is None else (
+        original_attention_scopes)
+    if (not isinstance(scopes,dict) or set(scopes)!=set(frames)
+            or any(not isinstance(v,str) or not v for v in scopes.values())):
+        raise ValueError('original attention scopes must be independently frozen exact output requests')
+    groups={}
+    for tick,views in sorted(frames.items()):
+        if type(tick) is not int or tick<0 or not isinstance(views,(list,tuple)) or len(views)>24:
+            raise ValueError('original actor frame/head inventory is unbounded')
+        unit=tuple(native_units[tick])
+        if len(unit)!=4:raise ValueError('original actor requires source/clock/file/native-camera unit')
+        for view in views:
+            raw=view['row']['native_observation']
+            if (view['row']['output_tick']!=tick or raw['request_source_index']!=unit[0]
+                    or raw['source_clock_identity']!=unit[1]
+                    or digest(raw['source_file_identity'])!=unit[2]):
+                raise ValueError('original actor inventory borrowed another raster or native unit')
+        # Repeated visits to one native camera, separated by other original
+        # shots, are NOT one continuous actor request. Output attention scopes
+        # come from the ORIGINAL interval inventory, never failed donor/body
+        # costs. They do not pretend to be new physical native camera cuts.
+        groups.setdefault((unit,scopes[tick]),[]).append(tick)
+    selected={t:None for t in frames};groups_receipts=[]
+    for (unit,attention_scope),ticks in groups.items():
+        observed=[t for t in ticks if frames[t]]
+        if not observed:
+            groups_receipts.append(dict(unit=list(unit),original_attention_scope=attention_scope,
+                seed_tick=None,requests=ticks));continue
+        midpoint=(ticks[0]+ticks[-1])/2
+        seed_tick=min(observed,key=lambda t:(abs(t-midpoint),t))
+        def attention(view):
+            d=view['descriptor'];x,y=d.head_center
+            return (math.hypot(x-.5,(y-.4)*9/16),-d.face_height*d.face_width,
+                digest((view['vector'],d.head_center,d.face_height,d.face_width)))
+        seed=min(frames[seed_tick],key=attention)
+        selected[seed_tick]=dict(seed,original_actor_inventory_seed=True)
+        seed_position=ticks.index(seed_tick);association_links=[]
+        for positions in (range(seed_position+1,len(ticks)),range(seed_position-1,-1,-1)):
+            anchor=seed;anchor_tick=seed_tick
+            for position in positions:
+                tick=ticks[position];ranked=[]
+                for value in frames[tick]:
+                    left,right=(anchor,value) if anchor_tick<tick else (value,anchor)
+                    link=_link(_native_association_view(left,unit),_native_association_view(right,unit),
+                        maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine)
+                    if link is not None and link['linked']:
+                        ranked.append((link['cost'],attention(value),value,link))
+                ranked.sort(key=lambda p:(p[0],p[1]))
+                if not ranked:continue
+                best=ranked[0];margin=None if len(ranked)==1 else ranked[1][0]-best[0]
+                value=dict(best[2],reacquisition_ambiguous=bool(
+                    best[2].get('reacquisition_ambiguous',False) or anchor.get('reacquisition_ambiguous',False)
+                    or margin is not None and margin<ambiguity_margin))
+                selected[tick]=value;association_links.append(dict(anchor_tick=anchor_tick,target_tick=tick,
+                    margin=margin,link=best[3],ambiguous=value['reacquisition_ambiguous']))
+                anchor=value;anchor_tick=tick
+        groups_receipts.append(dict(unit=list(unit),requests=ticks,seed_tick=seed_tick,
+            original_attention_scope=attention_scope,
+            seed_head_id=seed['descriptor'].frame_local_head_id,links=association_links,
+            seed_basis='independent_original_output_attention_not_donor_pose_error'))
+    bindings=[]
+    for tick,view in sorted(selected.items()):
+        raw=None if view is None else view['row']['native_observation']
+        bindings.append(dict(output_tick=tick,head_id=None if view is None else view['descriptor'].frame_local_head_id,
+            raw_parent=None if raw is None else digest(raw),
+            ambiguous=False if view is None else view.get('reacquisition_ambiguous',False),
+            state='UNMATCHED' if view is None else 'OBSERVED_ANCHORED_ORIGINAL_ACTOR_HYPOTHESIS'))
+    receipt=dict(contract='original_native_shot_anchored_actor_inventory_v1',
+        original_program_identity=original_program_identity,groups=groups_receipts,bindings=bindings,
+        maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
+        ambiguity_margin=ambiguity_margin,donor_costs_used=False,production_ownership_rewritten=False,
+        attention_scopes_are_physical_camera_cuts=False,
+        named_actor_certified=False,quality_approved=False)
+    receipt['inventory_identity']=digest(receipt)
+    return selected,receipt

@@ -19,7 +19,8 @@ class FrozenReviewMatchPolicy:
 
     def __post_init__(self):
         value=json.loads(self.token_json)
-        expected=_policy_payload(value.get('controls'),target_interval=value.get('target_interval',()))
+        expected=_policy_payload(value.get('controls'),target_interval=value.get('target_interval',()),
+            action_schema=value.get('action_schema'))
         if value!=expected:
             raise ValueError('match policy changed its independently calibrated controls or thresholds')
 
@@ -30,13 +31,15 @@ class FrozenReviewMatchPolicy:
     def identity(self):return digest(self.payload)
 
 
-def _policy_payload(controls,*,target_interval):
+def _policy_payload(controls,*,target_interval,action_schema='upper_body_six_v1'):
     """Separate actual positive / wrong-person / wrong-phase controls once.
 
     The caller is the evidence producer, not the target score optimizer.
     All controls, including a failed separation, remain in the policy seal.
     """
-    if (not isinstance(controls,(tuple,list)) or not 3<=len(controls)<=32
+    from .group_review_declared_action import ACTION_SCHEMAS
+    if (action_schema not in ACTION_SCHEMAS
+            or not isinstance(controls,(tuple,list)) or not 3<=len(controls)<=32
             or len(target_interval)!=2 or not 0<=target_interval[0]<target_interval[1]):
         raise ValueError('match policy needs finite independent controls and exact target interval')
     for c in controls:
@@ -45,6 +48,7 @@ def _policy_payload(controls,*,target_interval):
         cost_unmeasured=(c.get('motion_cost') is None and
             (c.get('label')=='WRONG_ACTOR' or coverage_adversary))
         if (c.get('label') not in ('POSITIVE_MOVING_MATCH','WRONG_ACTOR','WRONG_PHASE')
+                or c.get('action_schema','upper_body_six_v1')!=action_schema
                 or not isinstance(c.get('evidence_identity'),str) or len(c['evidence_identity'])!=64
                 or any(v not in '0123456789abcdef' for v in c['evidence_identity'])
                 or not isinstance(c.get('output_ticks'),list) or not c['output_ticks']
@@ -79,6 +83,8 @@ def _policy_payload(controls,*,target_interval):
     token=dict(contract='independent_control_calibrated_review_match_policy_v1',
         state='CONTROL_SEPARATED' if separable else 'CONTROLS_NOT_SEPARATED' if failed else 'CONTROLS_PARTIAL',controls=list(controls),
         target_interval=list(target_interval),basis='frozen_requested_body_common_time_and_actual_output_coverage',
+        action_schema=action_schema,requested_joint_indices=list(ACTION_SCHEMAS[action_schema]),
+        action_kind='BODY' if action_schema=='upper_body_six_v1' else 'PARTIAL_ACTION',
         identity_control_state='CONTROL_SEPARATED' if identity_separated else 'CONTROLS_NOT_SEPARATED',
         body_coverage_adversary_state=coverage_state,
         numeric_phase_control_state=('UNMEASURED' if best_wrong_phase_motion is None else
@@ -90,8 +96,8 @@ def _policy_payload(controls,*,target_interval):
     return token
 
 
-def freeze_control_calibrated_review_match_policy(controls,*,target_interval):
-    value=_policy_payload(controls,target_interval=target_interval)
+def freeze_control_calibrated_review_match_policy(controls,*,target_interval,action_schema='upper_body_six_v1'):
+    value=_policy_payload(controls,target_interval=target_interval,action_schema=action_schema)
     return FrozenReviewMatchPolicy(json.dumps(value,sort_keys=True,allow_nan=False))
 
 
@@ -109,9 +115,13 @@ def evaluate_review_match_suitability(*,policy,appearance_cosine,mutual_appearan
     if p['state']!='CONTROL_SEPARATED':return dict(result,reason='independent_controls_not_separated',
         identity_control_state=p['identity_control_state'],numeric_phase_control_state=p['numeric_phase_control_state'],
         body_coverage_adversary_state=p['body_coverage_adversary_state'])
-    if (not _finite(appearance_cosine) or motion.get('intent_kind')!='BODY'
+    if (not _finite(appearance_cosine) or motion.get('intent_kind')!=p['action_kind']
             or motion.get('same_time_action_supported') is not True
             or not _finite(motion.get('exploration_cost'))
+            or motion.get('nonstationary_native_action_observed') is not True
+            or motion.get('complete_on_declared_basis') is not True
+            or p['action_kind']=='BODY' and motion.get('full_BODY_contract_complete') is not True
+            or p['action_kind']=='PARTIAL_ACTION' and motion.get('declared_action_schema')!=p['action_schema']
             or actual_required_support_state!='PASS'):
         return dict(result,reason='required_actor_body_or_output_evidence_unmeasured')
     failures=[]
@@ -124,7 +134,8 @@ def evaluate_review_match_suitability(*,policy,appearance_cosine,mutual_appearan
 
 def evaluate_review_diagnostic_encode_permission(*,policy,appearance_cosine,mutual_appearance,motion,
         actual_required_support_state,complete_keyed_incident_state,protected_reference_state,
-        candidate_full_output_replay_state,actual_native_alias=False):
+        candidate_full_output_replay_state,actual_native_alias=False,
+        partial_action_declaration=None,original_known_duty_state='UNKNOWN',actor_relation_state='UNKNOWN'):
     """One diagnostic is not adoption or a substitute numeric phase threshold."""
     if not isinstance(policy,FrozenReviewMatchPolicy):raise ValueError('diagnostic requires independent sealed controls')
     p=policy.payload
@@ -138,10 +149,28 @@ def evaluate_review_diagnostic_encode_permission(*,policy,appearance_cosine,mutu
             or actual_native_alias or not mutual_appearance or not _finite(appearance_cosine)
             or appearance_cosine<p['minimum_appearance_cosine']):
         return dict(result,state='NOT_PERMITTED',reason='independent_identity_or_known_adversary_failed')
-    if (motion.get('intent_kind')!='BODY' or motion.get('same_time_action_supported') is not True
+    kind=motion.get('intent_kind')
+    partial=False
+    if kind=='PARTIAL_ACTION':
+        from .group_review_declared_action import FrozenReviewActionDeclaration
+        partial=(isinstance(partial_action_declaration,FrozenReviewActionDeclaration)
+            and partial_action_declaration.payload['action_kind']=='PARTIAL_ACTION'
+            and p['action_schema']==partial_action_declaration.payload['schema']
+            and motion.get('declaration_identity')==partial_action_declaration.identity
+            and motion.get('declared_action_schema')==partial_action_declaration.payload['schema']
+            and motion.get('complete_on_declared_basis') is True
+            and motion.get('full_BODY_contract_complete') is False
+            and motion.get('all_declared_comparison_velocity_windows_measured') is True
+            and original_known_duty_state=='PASS' and actor_relation_state=='PASS')
+    if (kind=='BODY' and p['action_kind']!='BODY' or kind!='BODY' and not partial
+            or motion.get('same_time_action_supported') is not True
             or not _finite(motion.get('exploration_cost'))
             or any(s!='PASS' for s in (actual_required_support_state,complete_keyed_incident_state,
                 protected_reference_state,candidate_full_output_replay_state))):
         return dict(result,state='NOT_PERMITTED',reason='complete_actual_body_output_incident_evidence_required')
+    if (motion.get('nonstationary_native_action_observed') is not True
+            or kind=='BODY' and motion.get('full_BODY_contract_complete') is not True):
+        return dict(result,state='NOT_PERMITTED',reason='stationary_or_incomplete_scope_is_not_moving_action')
     return dict(result,state='DIAGNOSTIC_ONLY',diagnostic_encode_permitted=True,
+        declared_action_kind=kind,full_BODY_contract_complete=not partial,
         numeric_phase_control_state=p['numeric_phase_control_state'],comparative_improvement_claimed=False)

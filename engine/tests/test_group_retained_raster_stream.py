@@ -67,3 +67,51 @@ def test_unbounded_or_incomplete_encoder_policy_is_rejected_before_start(tmp_pat
     with pytest.raises(ValueError,match='exceeds the output cap'):
         construct_retained_stream_movie(**values,maximum_video_bitrate=32000000,
             video_buffer_bits=48000000,audio_payload_bound=123)
+
+
+def provider_options(tmp_path):
+    import json
+    from crosscut.group_retained_raster_stream import FrozenRetainedRasterProvider
+    a=tmp_path/'original.mp4';fixture_movie(a,0)
+    token=dict(contract='selected_raw_raster_provider_v1',frame_count=5,frame_size_wh=[40,24],
+        changed_intervals=[[1,2]],selected_program_identity='a'*64,native_evidence_root='b'*64,
+        renderer_identity='c'*64,post_selection_camera_refit=False)
+    calls=[]
+    def frame(t):calls.append(t);return np.full((24,40,3),137,np.uint8)
+    provider=FrozenRetainedRasterProvider(json.dumps(token,sort_keys=True),frame)
+    return dict(reference_movie=a,output=tmp_path/'raw-delivery.mp4',frame_count=5,fps=10.,
+        width=40,height=24,changed_intervals=((1,2),),protected_intervals=((3,5),),
+        expected_reference_sha256=content_sha(a),selected_raw_provider=provider,
+        expected_provider_identity=provider.identity,minimum_free_bytes=1,
+        maximum_output_bytes=1024*1024,maximum_seconds=30.),calls
+
+
+def test_raw_provider_encodes_once_without_a_proposed_movie_and_replays_exact_recipe(tmp_path):
+    values,calls=provider_options(tmp_path)
+    report=construct_retained_stream_movie(**values)
+    assert calls==[1] and report['proposed_movie'] is None
+    assert not report['proposed_movie_encode_required']
+    verified=verify_retained_stream_recipe(report,selected_raw_provider=values['selected_raw_provider'])
+    assert calls==[1,1] and all(verified['checks'].values())
+    assert not verified['compatible_movie_decode_verified']
+
+
+def test_raw_provider_cannot_refit_its_camera_or_borrow_another_binding(tmp_path):
+    import json
+    from crosscut.group_retained_raster_stream import FrozenRetainedRasterProvider
+    values,_=provider_options(tmp_path);provider=values['selected_raw_provider']
+    p=provider.payload;p['post_selection_camera_refit']=True
+    with pytest.raises(ValueError,match='immutable exact'):
+        FrozenRetainedRasterProvider(json.dumps(p),provider.frame_for_tick)
+    values['expected_provider_identity']='e'*64
+    with pytest.raises(ValueError,match='identity'):construct_retained_stream_movie(**values)
+
+
+def test_independent_raw_recipe_replay_needs_the_same_provider_and_detects_changed_pixels(tmp_path):
+    values,_=provider_options(tmp_path);provider=values['selected_raw_provider']
+    report=construct_retained_stream_movie(**values)
+    with pytest.raises(ValueError,match='frozen selected raw provider'):verify_retained_stream_recipe(report)
+    from crosscut.group_retained_raster_stream import FrozenRetainedRasterProvider
+    bad=FrozenRetainedRasterProvider(provider.token_json,lambda t:np.full((24,40,3),138,np.uint8))
+    with pytest.raises(ValueError,match='recipe verification failed'):
+        verify_retained_stream_recipe(report,selected_raw_provider=bad)

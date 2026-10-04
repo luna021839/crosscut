@@ -205,3 +205,30 @@ def test_supported_mode_retains_protected_output_known_support_and_paired_regres
 def test_comparative_mode_does_not_inherit_noncomparative_permission():
     m,rows,c=fixture();c['verdict']='INCONCLUSIVE'
     assert decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c)['state']=='HOLD'
+
+
+@pytest.mark.parametrize('field,value',(('frozen_nonregression_tolerance',1.),
+    ('motion_cost_units','pixels_per_second'),('motion_cost_basis','partial_upper_arm_v1'),
+    ('requested_joint_indices',[0,1,2,3])))
+@pytest.mark.parametrize('supported',(False,True))
+def test_receipt_cannot_override_sealed_tolerance_units_or_joint_basis(field,value,supported):
+    if supported:m,rows,c,p=supported_fixture(known=True)
+    else:m,rows,c=fixture();p=None
+    r=next(r for r in rows if r.get('kind')=='REPLACED_CUT')
+    r['candidate_motion_cost']=.8;r[field]=value
+    with pytest.raises(ValueError,match='sealed tolerance'):
+        decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c,protected_reference_verification=p)
+
+
+def test_missing_receipt_tolerance_does_not_remove_the_sealed_nonregression_check():
+    m,rows,c=fixture();r=next(r for r in rows if r.get('kind')=='REPLACED_CUT')
+    r.pop('frozen_nonregression_tolerance');r['candidate_motion_cost']=.8
+    assert decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c)['state']=='REJECT'
+
+
+def test_partial_candidate_cost_cannot_compare_with_known_full_body_cost():
+    m,rows,c,p=supported_fixture(known=True);r=next(r for r in rows if r.get('kind')=='REPLACED_CUT')
+    basis=deepcopy(m.payload['sealed_original_motion_inventory']['rows'][0]['comparison_basis'])
+    basis['requested_joint_indices']=[0,1,2,3];r['candidate_comparison_basis']=basis
+    with pytest.raises(ValueError,match='different sealed anatomical basis'):
+        decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c,protected_reference_verification=p)

@@ -140,6 +140,37 @@ def _primary_native_points(view):
     return observed
 
 
+def apply_review_primary_joint_observation(view,*,project_point):
+    """Keep directly measured selected-owner joints without whole-arm gating.
+
+    This does not infer a missing wrist or promote UNKNOWN ownership/support.
+    No auxiliary receipt must first succeed merely to retain a primary elbow.
+    """
+    if view is None:return None
+    primary=_primary_native_points(view)
+    if primary is None or not {0,1}<=primary.keys():return view
+    projected={i:(*project_point(p[:2]),p[2]) for i,p in primary.items()}
+    if any(not all(0<=v<=1 for v in projected[i][:2]) for i in (0,1)):return view
+    center=np.mean(np.asarray([projected[i][:2] for i in (0,1)]),axis=0)
+    scale=float(np.linalg.norm((np.asarray(projected[0][:2])-projected[1][:2])*(1.,9/16)))
+    if scale<=1e-6:return view
+    shape=tuple((i,(p[0]-center[0])/scale,(p[1]-center[1])*9/16/scale)
+        for i,p in sorted(projected.items()) if all(0<=v<=1 for v in p[:2]))
+    known={} if view['descriptor'].pose_shape is None else {p[0]:np.asarray(p[1:]) for p in view['descriptor'].pose_shape}
+    actual={p[0]:np.asarray(p[1:]) for p in shape}
+    if any(i not in actual or np.linalg.norm(point-actual[i])>1e-6 for i,point in known.items()):return view
+    raw=view['row']['native_observation'];head=next(h for h in raw['heads']
+        if h['observation_id']==view['descriptor'].frame_local_head_id)
+    provenance={i:dict(basis='PRIMARY_NATIVE_MODEL',raw_parent_sha256=digest(raw),
+        model_confidence=p[2],xy_native=list(p[:2])) for i,p in primary.items()}
+    identity=digest(dict(contract='selected_owner_individual_primary_joint_review_v1',
+        binding=native_binding(raw),head=head_fingerprint(head),provenance=provenance,
+        production_ownership_unchanged=True))
+    return dict(view,descriptor=replace(view['descriptor'],pose_shape=shape),
+        review_primary_joint_evidence_identity=identity,review_joint_evidence_identity=identity,
+        review_joint_provenance=provenance,primary_whole_arm_ownership_unchanged=True)
+
+
 def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
     """Bind auxiliary evidence to this exact actor/raster/camera projection.
 

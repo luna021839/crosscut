@@ -14,7 +14,8 @@ def policy():return freeze_control_calibrated_review_match_policy(controls(),tar
 
 def evaluate(cos=.7,cost=.2,**kwargs):
     return evaluate_review_match_suitability(policy=policy(),appearance_cosine=cos,mutual_appearance=True,
-        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=cost),
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=cost,
+            nonstationary_native_action_observed=True,complete_on_declared_basis=True,full_BODY_contract_complete=True),
         actual_required_support_state=kwargs.pop('actual_required_support_state','PASS'),**kwargs)
 
 
@@ -108,7 +109,8 @@ def test_coverage_negative_has_no_silent_finite_cost_imputation():
 def test_one_technical_diagnostic_is_separate_from_uncalibrated_suitability():
     from crosscut.group_review_match_suitability import evaluate_review_diagnostic_encode_permission
     kwargs=dict(policy=partial_policy(),appearance_cosine=.7,mutual_appearance=True,
-        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2),
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2,
+            nonstationary_native_action_observed=True,full_BODY_contract_complete=True),
         actual_required_support_state='PASS',complete_keyed_incident_state='PASS',
         protected_reference_state='PASS',candidate_full_output_replay_state='PASS')
     r=evaluate_review_diagnostic_encode_permission(**kwargs)
@@ -118,3 +120,46 @@ def test_one_technical_diagnostic_is_separate_from_uncalibrated_suitability():
             'protected_reference_state','candidate_full_output_replay_state'):
         assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,**{field:'UNKNOWN'}))['diagnostic_encode_permitted']
     assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,policy=partial_policy('PASS')))['diagnostic_encode_permitted']
+
+
+def test_typed_partial_diagnostic_keeps_full_body_false_and_needs_every_original_actor_duty():
+    from crosscut.group_review_match_suitability import evaluate_review_diagnostic_encode_permission
+    from crosscut.group_review_declared_action import freeze_review_action_declaration
+    from crosscut.group_review_motion_contract import freeze_selected_review_motion_intent
+    old=freeze_selected_review_motion_intent([None]*5,requested_ticks=(8,9,10,11,12),original_actor_identity='original')
+    declaration=freeze_review_action_declaration(schema='bilateral_upper_arm_v1',ticks=(8,9,10,11,12),
+        original_motion_intent=old,original_preservation_duty_identity='a'*64,declared_scope_identity='b'*64)
+    motion=dict(intent_kind='PARTIAL_ACTION',declaration_identity=declaration.identity,
+        declared_action_schema='bilateral_upper_arm_v1',complete_on_declared_basis=True,
+        full_BODY_contract_complete=False,all_declared_comparison_velocity_windows_measured=True,
+        nonstationary_native_action_observed=True,same_time_action_supported=True,exploration_cost=.2)
+    data=controls()
+    for c in data:c['action_schema']='bilateral_upper_arm_v1'
+    data[2].update(motion_cost=None,control_role='BODY_COVERAGE_ADVERSARY',
+        expected_body_coverage_state='FAIL',actual_body_coverage_state='FAIL')
+    scoped_policy=freeze_control_calibrated_review_match_policy(data,target_interval=(100,160),
+        action_schema='bilateral_upper_arm_v1')
+    kwargs=dict(policy=scoped_policy,appearance_cosine=.7,mutual_appearance=True,motion=motion,
+        actual_required_support_state='PASS',complete_keyed_incident_state='PASS',protected_reference_state='PASS',
+        candidate_full_output_replay_state='PASS',partial_action_declaration=declaration,
+        original_known_duty_state='PASS',actor_relation_state='PASS')
+    result=evaluate_review_diagnostic_encode_permission(**kwargs)
+    assert result['diagnostic_encode_permitted'] and not result['full_BODY_contract_complete']
+    assert not result['adoption_permitted'] and not result['match_suitable']
+    for field in ('original_known_duty_state','actor_relation_state'):
+        assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,**{field:'UNKNOWN'}))['diagnostic_encode_permitted']
+    for field in ('nonstationary_native_action_observed','all_declared_comparison_velocity_windows_measured'):
+        assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,motion=dict(motion,**{field:False})))['diagnostic_encode_permitted']
+    assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,partial_action_declaration=None))['diagnostic_encode_permitted']
+    assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,policy=partial_policy()))['diagnostic_encode_permitted']
+
+
+def test_partial_control_policy_cannot_reuse_full_body_costs_or_stationary_suitability():
+    with pytest.raises(ValueError,match='control measurements'):
+        freeze_control_calibrated_review_match_policy(controls(),target_interval=(100,160),
+            action_schema='bilateral_upper_arm_v1')
+    result=evaluate_review_match_suitability(policy=policy(),appearance_cosine=.7,mutual_appearance=True,
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=0.,
+            complete_on_declared_basis=True,full_BODY_contract_complete=True,
+            nonstationary_native_action_observed=False),actual_required_support_state='PASS')
+    assert not result['match_suitable']

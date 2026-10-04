@@ -3,7 +3,8 @@ from dataclasses import replace
 import pytest
 
 from crosscut.group_review_body_recovery import (freeze_review_body_window,
-    apply_review_body_receipt,head_fingerprint,native_binding,consume_head_conditioned_review_support)
+    apply_review_body_receipt,apply_review_primary_joint_observation,
+    head_fingerprint,native_binding,consume_head_conditioned_review_support)
 from crosscut.body_pose_2d import RTMPOSE_BODY7_MODEL_SHA256
 from crosscut.group_performer_family_owner import digest
 from crosscut.group_review_camera_repair import FramingDescriptor
@@ -106,6 +107,34 @@ def test_primary_shoulders_normalize_all_added_joints_once_and_keep_native_confl
     conflicted=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
     assert conflicted['descriptor']==view['descriptor']
     assert conflicted['review_body_recovery_state']=='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY'
+
+
+def test_primary_joints_do_not_require_a_successful_auxiliary_model_to_survive():
+    _,view,_=complementary_fixture();saved=deepcopy(view)
+    primary=view['row']['native_observation']['people'][0]['upper_body_xyc']
+    primary[2][2]=.7
+    value=apply_review_primary_joint_observation(view,project_point=lambda p:p)
+    assert {p[0] for p in value['descriptor'].pose_shape}=={0,1,2,4}
+    assert value['review_joint_provenance'][2]['basis']=='PRIMARY_NATIVE_MODEL'
+    assert 3 not in value['review_joint_provenance'] and 5 not in value['review_joint_provenance']
+    assert value['primary_whole_arm_ownership_unchanged'] and value['row']==view['row']
+    assert 'review_body_receipt_sha256' not in value
+    assert view['descriptor']==saved['descriptor']
+
+
+@pytest.mark.parametrize('adverse',['ambiguous','fail'])
+def test_primary_only_resolver_does_not_hide_adverse_part_ownership(adverse):
+    _,view,_=complementary_fixture()
+    view['row']['native_observation']['people'][0]['part_states']=[
+        ['shoulder_anchor','observed'],['left_arm',adverse],['right_arm','unknown']]
+    assert apply_review_primary_joint_observation(view,project_point=lambda p:p)==view
+
+
+def test_primary_only_missing_owner_or_cropped_shoulder_cannot_manufacture_body():
+    _,view,_=complementary_fixture()
+    assert apply_review_primary_joint_observation(view,project_point=lambda p:(p[0]+2,p[1]))==view
+    view['row']['projection']['people']=[]
+    assert apply_review_primary_joint_observation(view,project_point=lambda p:p)==view
 
 
 def test_known_normalized_primary_without_actual_native_binding_is_not_inverted_to_make_a_union():

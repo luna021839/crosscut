@@ -15,6 +15,15 @@ from .group_review_motion_seam import (
     review_window_connected,compare_aligned_review_head_windows)
 
 
+def frozen_motion_request_inventory(ticks,requests):
+    """The original/declaration, never a donor intersection, owns requests."""
+    positions=[dict(tick=t,joints=j) for t,j in zip(ticks,requests)]
+    velocities=[dict(first_tick=a,last_tick=b,
+        joints=None if ja is None or jb is None else sorted(set(ja)&set(jb)))
+        for a,b,ja,jb in zip(ticks,ticks[1:],requests,requests[1:])]
+    return dict(position_requests=positions,velocity_requests=velocities)
+
+
 @dataclass(frozen=True,slots=True)
 class FrozenReviewMotionIntent:
     """Original actor and time-specific part requests, independent of donors."""
@@ -24,7 +33,7 @@ class FrozenReviewMotionIntent:
         value=json.loads(self.token_json)
         ticks=value.get('ticks',[]);requests=value.get('joint_requests',[])
         if (value.get('contract')!='frozen_selected_original_motion_intent_v2'
-                or value.get('kind') not in ('BODY','HEAD_ONLY','UNKNOWN')
+                or value.get('kind') not in ('BODY','PARTIAL_ACTION','HEAD_ONLY','UNKNOWN')
                 or not 2<=len(ticks)<=16 or len(requests)!=len(ticks)
                 or any(type(t) is not int or t<0 for t in ticks)
                 or any(a>=b for a,b in zip(ticks,ticks[1:]))
@@ -33,6 +42,9 @@ class FrozenReviewMotionIntent:
                     or j!=sorted(set(j)) or any(type(k) is not int or not 0<=k<6 for k in j))
                     for j in requests)):
             raise ValueError('motion intent needs exact selected original actor/time/part requests')
+        expected=frozen_motion_request_inventory(ticks,requests)
+        if any(value.get(k)!=v for k,v in expected.items()):
+            raise ValueError('motion intent changed or omitted its frozen position/velocity requests')
 
     @property
     def payload(self):return json.loads(self.token_json)
@@ -65,8 +77,13 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
         if indices is not None:known.update(indices)
         if view is None:missing.append(tick)
     body=len(known)>=4
-    kind='BODY' if body else 'HEAD_ONLY' if head_only_declared and not missing else 'UNKNOWN'
-    if body:
+    partial={0,1}<=known and bool(known&{2,3,4,5})
+    # A known elbow/wrist cannot disappear into HEAD_ONLY simply because
+    # fewer than four joints were measured. Partial action has its own basis;
+    # it is neither complete BODY nor automatic match/adoption authority.
+    kind=('BODY' if body else 'PARTIAL_ACTION' if partial else
+        'HEAD_ONLY' if head_only_declared and not missing and not (known&{2,3,4,5}) else 'UNKNOWN')
+    if body or partial:
         # Preserve the explicit unknown slot. It cannot certify a head-only
         # match, nor falsely assert a wrist was visible for a whole epoch.
         by_unit={u:set() for u in units}
@@ -81,6 +98,9 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
         known_joint_union=sorted(known),original_unmatched_ticks=missing,
         original_native_unit_keys=[list(u) for u in units],
         inferred_whole_arm_visibility_asserted=False,quality_approved=False)
+    token['partial_action_is_complete_body']=False
+    token['automatic_partial_action_adoption_permitted']=False
+    token.update(frozen_motion_request_inventory(ticks,requests))
     return FrozenReviewMotionIntent(json.dumps(token,sort_keys=True,allow_nan=False))
 
 
@@ -224,23 +244,42 @@ def compare_frozen_review_motion_route(left,right, *, fps,intent,route):
             side_shapes[i]=points
         shapes.append(side_shapes)
     if missing:return dict(result,missing_frozen_joint_requests=missing,evidence_loss_prevents_head_fallback=True)
-    positions=[];velocities=[];directions=[]
+    positions=[];velocities=[];directions=[];action_speeds=[];unresolved_velocity=[]
     for i in indices:
         positions.extend(float(np.linalg.norm(shapes[0][i][k]-shapes[1][i][k]))
             for k in token['joint_requests'][i])
     for a,b in zip(indices,indices[1:]):
         joints=tuple(sorted(set(token['joint_requests'][a])&set(token['joint_requests'][b])))
-        if len(joints)<4:continue
+        minimum_joints=3 if token['kind']=='PARTIAL_ACTION' else 4
+        if len(joints)<minimum_joints or not (set(joints)&{2,3,4,5}):
+            unresolved_velocity.append(dict(first_tick=ticks[a],last_tick=ticks[b],
+                requested_joints=list(joints),reason='declared_action_window_underobserved'))
+            continue
         dt=(ticks[b]-ticks[a])/fps
         av,bv=[np.asarray([(s[b][k]-s[a][k])/dt for k in joints]) for s in shapes]
         an,bn=float(np.linalg.norm(av)),float(np.linalg.norm(bv))
+        action_speeds.append((an,bn))
         velocities.append(float(np.linalg.norm(av-bv)/(1.+max(an,bn))))
         if an>1e-8 and bn>1e-8:directions.append(float((1.-np.clip(np.sum(av*bv)/(an*bn),-1.,1.))/2))
-    if not positions or not velocities:return dict(result,body_velocity_requests_unresolved=True)
+    if unresolved_velocity or not positions or len(velocities)!=len(indices)-1:
+        return dict(result,body_velocity_requests_unresolved=True,
+            unresolved_velocity_requests=unresolved_velocity,
+            requested_velocity_windows=len(indices)-1,
+            measured_velocity_windows=len(velocities),complete_on_declared_basis=False)
     trajectory=float(np.mean(positions));velocity=float(np.mean(velocities))
     direction=None if not directions else float(np.mean(directions))
-    return dict(result,state='OBSERVED_NATIVE_COMMON_BODY_ACTION_HYPOTHESIS',
+    partial=token['kind']=='PARTIAL_ACTION'
+    full_body=not partial and all(token['joint_requests'][i]==list(range(6)) for i in range(len(ticks)))
+    moving=any(max(a,b)>1e-8 for a,b in action_speeds)
+    return dict(result,state='OBSERVED_NATIVE_COMMON_PARTIAL_ACTION_HYPOTHESIS' if partial else
+        'OBSERVED_NATIVE_COMMON_BODY_ACTION_HYPOTHESIS',
         trajectory_error=trajectory,velocity_error=velocity,direction_error=direction,
         exploration_cost=2.*trajectory+velocity+(0. if direction is None else direction),
         same_time_action_supported=True,adjacent_body_velocity_observations=len(velocities),
-        requested_joint_positions=len(positions),choreography_motion_observed=True)
+        requested_joint_positions=len(positions),choreography_motion_observed=moving,
+        nonstationary_native_action_observed=moving,
+        native_action_speed_pairs=[list(p) for p in action_speeds],
+        all_declared_comparison_velocity_windows_measured=True,
+        requested_velocity_windows=len(indices)-1,measured_velocity_windows=len(velocities),
+        complete_on_declared_basis=True,full_BODY_contract_complete=full_body,
+        complete_body_observation=full_body,automatic_partial_action_adoption_permitted=False)

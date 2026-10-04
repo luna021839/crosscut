@@ -159,3 +159,68 @@ def test_same_native_continuation_survives_missing_body_but_not_wrong_sampler_or
     assert not same_native_review_continuation(a[:2],a[2:],expected_native_addresses=wrong)['continuity_supported']
     a[3]['reacquisition_ambiguous']=True
     assert not same_native_review_continuation(a[:2],a[2:],expected_native_addresses=expected)['continuity_supported']
+
+
+def test_known_three_joint_action_cannot_be_downgraded_to_head_only():
+    a=[view(t,t*.1) for t in TICKS]
+    for v in a:v['descriptor']=replace(v['descriptor'],pose_shape=v['descriptor'].pose_shape[:3])
+    frozen=intent(a,True)
+    assert frozen.payload['kind']=='PARTIAL_ACTION'
+    result=compare_frozen_review_motion_route(a,deepcopy(a),fps=30.,intent=frozen,route=route())
+    assert result['same_time_action_supported'] and result['exploration_cost']==pytest.approx(0.)
+    assert not result['complete_body_observation']
+    assert not result['automatic_partial_action_adoption_permitted']
+
+
+def test_partial_action_retains_missing_known_elbow_without_donor_intersection():
+    a=[view(t,t*.1) for t in TICKS]
+    for v in a:v['descriptor']=replace(v['descriptor'],pose_shape=v['descriptor'].pose_shape[:3])
+    b=deepcopy(a);b[2]['descriptor']=replace(b[2]['descriptor'],pose_shape=b[2]['descriptor'].pose_shape[:2])
+    result=compare_frozen_review_motion_route(a,b,fps=30.,intent=intent(a,True),route=route())
+    assert not result['same_time_action_supported'] and result['evidence_loss_prevents_head_fallback']
+
+
+def test_single_known_action_joint_without_shoulders_is_not_a_head_match():
+    a=[view(t,t*.1) for t in TICKS]
+    for v in a:v['descriptor']=replace(v['descriptor'],pose_shape=(v['descriptor'].pose_shape[2],))
+    assert intent(a,True).payload['kind']=='UNKNOWN'
+
+
+def test_every_requested_velocity_window_is_required_not_just_one():
+    a=[view(t,t*.1) for t in TICKS]
+    for v in a[2:]:v['descriptor']=replace(v['descriptor'],pose_shape=v['descriptor'].pose_shape[:3])
+    frozen=intent(a)
+    assert len(frozen.payload['velocity_requests'])==4
+    result=compare_frozen_review_motion_route(a,deepcopy(a),fps=30.,intent=frozen,route=route())
+    assert not result['same_time_action_supported']
+    assert result['requested_velocity_windows']==4 and result['measured_velocity_windows']==1
+    assert len(result['unresolved_velocity_requests'])==3
+
+
+def test_opposite_partial_elbow_motion_is_not_a_perfect_head_match():
+    a=[view(t,t*.1) for t in TICKS];b=deepcopy(a)
+    for left,right in zip(a,b):
+        left['descriptor']=replace(left['descriptor'],pose_shape=left['descriptor'].pose_shape[:3])
+        points=left['descriptor'].pose_shape
+        right['descriptor']=replace(right['descriptor'],pose_shape=tuple(
+            (k,x,-y if k==2 else y) for k,x,y in points))
+    result=compare_frozen_review_motion_route(a,b,fps=30.,intent=intent(a,True),route=route())
+    assert result['intent_kind']=='PARTIAL_ACTION' and result['exploration_cost']>0.
+    assert result['velocity_error']>0.
+
+
+def test_stationary_pose_is_not_moving_choreography_evidence():
+    a=[view(t,0.) for t in TICKS]
+    result=compare(a,deepcopy(a))
+    assert result['exploration_cost']==pytest.approx(0.)
+    assert not result['choreography_motion_observed']
+    assert not result['nonstationary_native_action_observed']
+    assert result['complete_on_declared_basis'] and not result['full_BODY_contract_complete']
+
+
+def test_velocity_inventory_cannot_be_shortened_in_the_sealed_intent():
+    import json
+    from crosscut.group_review_motion_contract import FrozenReviewMotionIntent
+    p=intent([view(t,t*.1) for t in TICKS]).payload
+    p['velocity_requests']=p['velocity_requests'][:1]
+    with pytest.raises(ValueError,match='velocity'):FrozenReviewMotionIntent(json.dumps(p))

@@ -19,6 +19,29 @@ COMPARATIVE='COMPARATIVE_MEASURED_GAIN'
 SUPPORTED='SUPPORTED_WITHOUT_IMPROVEMENT_CLAIM'
 
 
+def _motion_basis(*,tolerance=0.,units='normalized_position_relative_velocity_direction_v1',
+        joint_indices=(0,1,2,3,4,5),basis='frozen_upper_body_six_common_time_v1'):
+    if (type(tolerance) not in (int,float) or not math.isfinite(tolerance) or tolerance<0
+            or not isinstance(units,str) or not units or not isinstance(basis,str) or not basis
+            or not isinstance(joint_indices,(list,tuple)) or not joint_indices
+            or list(joint_indices)!=sorted(set(joint_indices))
+            or any(type(j) is not int or not 0<=j<6 for j in joint_indices)):
+        raise ValueError('motion comparison needs finite sealed tolerance, units and joint basis')
+    return dict(frozen_nonregression_tolerance=tolerance,motion_cost_units=units,
+        motion_cost_basis=basis,requested_joint_indices=list(joint_indices))
+
+
+def _validate_basis(value):
+    try:
+        expected=_motion_basis(tolerance=value['frozen_nonregression_tolerance'],
+            units=value['motion_cost_units'],basis=value['motion_cost_basis'],
+            joint_indices=value['requested_joint_indices'])
+    except (KeyError,TypeError) as error:
+        raise ValueError('motion comparison basis is missing from the sealed root') from error
+    if value!=expected:raise ValueError('motion comparison changed its sealed basis')
+    return expected
+
+
 @dataclass(frozen=True,slots=True)
 class FrozenOriginalMotionInventory:
     """Actual old measurements, sealed BEFORE candidate costs are available."""
@@ -31,6 +54,7 @@ class FrozenOriginalMotionInventory:
                 or not isinstance(rows,list) or not rows or len({r.get('tick') for r in rows})!=len(rows)):
             raise ValueError('noncomparative mode needs genuine independently sealed original measurements')
         for row in rows:
+            _validate_basis(row.get('comparison_basis'))
             state,cost=row.get('state'),row.get('motion_cost')
             if (type(row.get('tick')) is not int or row['tick']<1
                     or not _sha(row.get('original_binding')) or not _sha(row.get('measurement_evidence_identity'))
@@ -47,11 +71,16 @@ class FrozenOriginalMotionInventory:
     def identity(self):return digest(self.payload)
 
 
-def freeze_original_motion_inventory(*,original_plan_identity,original_event_identity,measurements):
+def freeze_original_motion_inventory(*,original_plan_identity,original_event_identity,measurements,
+        nonregression_tolerance=0.,motion_cost_units='normalized_position_relative_velocity_direction_v1',
+        requested_joint_indices=(0,1,2,3,4,5),motion_cost_basis='frozen_upper_body_six_common_time_v1'):
+    basis=_motion_basis(tolerance=nonregression_tolerance,units=motion_cost_units,
+        joint_indices=requested_joint_indices,basis=motion_cost_basis)
     return FrozenOriginalMotionInventory(json.dumps(dict(
         contract='original_motion_measurements_before_candidate_scoring_v1',
         original_plan_identity=original_plan_identity,original_event_identity=original_event_identity,
-        rows=list(measurements)),sort_keys=True,allow_nan=False))
+        rows=[dict(row,comparison_basis=row.get('comparison_basis',basis)) for row in measurements]),
+        sort_keys=True,allow_nan=False))
 
 
 @dataclass(frozen=True,slots=True)
@@ -69,6 +98,7 @@ class FrozenReviewAdoptionManifest:
                 or len({r.get('request_id') for r in rows})!=len(rows)
                 or any(not _sha(r.get('request_id')) or r.get('domain') not in ('SUPPORT','MOTION') for r in rows)):
             raise ValueError('adoption needs a bounded complete frozen keyed request manifest')
+        _validate_basis(value.get('comparison_basis'))
         if value.get('adoption_mode')==SUPPORTED:
             inventory=FrozenOriginalMotionInventory(json.dumps(value.get('sealed_original_motion_inventory')))
             if (inventory.identity!=value.get('original_motion_inventory_identity')
@@ -89,7 +119,9 @@ class FrozenReviewAdoptionManifest:
 
 def freeze_review_adoption_manifest(evidence,*,original_plan_identity,candidate_plan_identity,
         original_cut_ticks,candidate_cut_ticks,incident_bindings,motion_policy_identity,support_part_inventory,
-        adoption_mode=COMPARATIVE,original_motion_inventory=None,protected_reference_identity=None):
+        adoption_mode=COMPARATIVE,original_motion_inventory=None,protected_reference_identity=None,
+        nonregression_tolerance=0.,motion_cost_units='normalized_position_relative_velocity_direction_v1',
+        requested_joint_indices=(0,1,2,3,4,5),motion_cost_basis='frozen_upper_body_six_common_time_v1'):
     """Incident bindings seal each actual sampler/camera/actor window separately.
 
     A binding is a producer-derived content fingerprint, not a selected view
@@ -138,7 +170,9 @@ def freeze_review_adoption_manifest(evidence,*,original_plan_identity,candidate_
         evidence_plan_identity=evidence.identity,original_plan_identity=original_plan_identity,
         candidate_plan_identity=candidate_plan_identity,motion_policy_identity=motion_policy_identity,
         original_duty_root=evidence.original_duty_root,editorial_intent_root=evidence.editorial_intent_root,
-        interval=[evidence.first,evidence.end],quality_approved=False)
+        interval=[evidence.first,evidence.end],comparison_basis=_motion_basis(
+            tolerance=nonregression_tolerance,units=motion_cost_units,
+            joint_indices=requested_joint_indices,basis=motion_cost_basis),quality_approved=False)
     if inventory is not None:root.update(sealed_original_motion_inventory=inventory,
         original_motion_inventory_identity=original_motion_inventory.identity,
         protected_reference_identity=protected_reference_identity)
@@ -172,6 +206,17 @@ def validate_keyed_adoption_receipts(manifest,receipts):
                     or receipt.get('original_motion_measurement_evidence_identity')!=old['measurement_evidence_identity']
                     or receipt.get('original_motion_cost')!=old['motion_cost']):
                 raise ValueError('motion receipt erased or rewrote a sealed original measurement')
+        if request['domain']=='MOTION':
+            basis=(next(r for r in value['sealed_original_motion_inventory']['rows']
+                if r['tick']==request['tick'])['comparison_basis']
+                if value.get('adoption_mode')==SUPPORTED else value['comparison_basis'])
+            # Optional mirror fields never supply authority. In particular,
+            # a larger receipt tolerance cannot change the fixed manifest.
+            if any(k in receipt and receipt[k]!=v for k,v in basis.items()):
+                raise ValueError('motion receipt changed sealed tolerance, units or joint basis')
+            candidate_basis=receipt.get('candidate_comparison_basis')
+            if candidate_basis is not None and candidate_basis!=basis:
+                raise ValueError('candidate motion cost is on a different sealed anatomical basis')
         if request['domain']=='SUPPORT' and receipt.get('part')!=request['part']:
             raise ValueError('support receipt borrowed another required anatomical part')
     return expected
@@ -218,9 +263,10 @@ def decide_keyed_review_adoption(*,manifest,receipts,comparison,protected_refere
                 unresolved.append((request['tick'],'new_cut_suitability_not_supported'))
         elif kind=='REPLACED_CUT':
             before,after=receipt.get('original_motion_cost'),receipt.get('candidate_motion_cost')
-            tolerance=receipt.get('frozen_nonregression_tolerance')
             original=(next(r for r in value['sealed_original_motion_inventory']['rows']
                 if r['tick']==request['tick']) if supported else None)
+            tolerance=(original['comparison_basis'] if supported else
+                value['comparison_basis'])['frozen_nonregression_tolerance']
             if supported and (receipt.get('independent_suitability_passed') is not True
                     or receipt.get('candidate_motion_intent_kind')!='BODY'
                     or receipt.get('candidate_complete_body_observation') is not True
