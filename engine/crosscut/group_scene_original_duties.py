@@ -16,8 +16,8 @@ from .group_joint_source_camera import GroupOutputRole
 from .group_scene_intent import validate_intent
 from .group_scene_role_obligations import ARM_PARTS
 
-CONTRACT = 'original_native_focal_duty_lifecycle_v1'
-GLOBAL_CONTRACT = 'explicit_global_original_native_focal_duty_lifecycle_v1'
+CONTRACT = 'original_output_visible_focal_duty_lifecycle_v2'
+GLOBAL_CONTRACT = 'explicit_global_original_output_visible_focal_duty_lifecycle_v2'
 FOCAL = (GroupOutputRole.FOCAL_HEAD.value, GroupOutputRole.FOCAL_HEAD_ARMS.value)
 MAX_ORIGINAL_NATIVE_SAMPLE_TICKS = 16
 MAX_ORIGINAL_HEAD_LINK_NATIVE_GAP = 12
@@ -56,6 +56,9 @@ def _raw_dict(raw):
 
 
 def _branch(*, state, hypothesis, raw_at, head_link):
+    from .group_original_visible_support import (ARM_INDICES, measured_visible_arm_support,
+        native_base_crop, restore_original_camera)
+    from .group_source_changing_owner import project_point
     preimage = state['key_preimage']
     role = preimage['role']
     intent = hypothesis['shot_intent']
@@ -67,6 +70,7 @@ def _branch(*, state, hypothesis, raw_at, head_link):
     previous = None
     rows, links, latched = [], [], {}
     explicit = role == GroupOutputRole.FOCAL_HEAD_ARMS.value
+    camera = restore_original_camera(state)
     for tick in range(first, end):
         if tick not in sampled:
             # No decode/NN/LK call, no negative detection, no interpolated
@@ -76,7 +80,9 @@ def _branch(*, state, hypothesis, raw_at, head_link):
                 became_required_at_output_tick=first if explicit else latched.get(name,{}).get('output_tick'),
                 original_required_reason='explicit_original_output_role' if explicit else
                     'observed_selected_original_hypothesis_latched' if name in latched else 'original_measurement_unknown',
-                original_first_observed_reference=latched.get(name)) for name in ARM_PARTS}
+                original_first_observed_reference=latched.get(name),
+                original_output_visibility='unknown',
+                required_support=None if explicit else latched.get(name,{}).get('required_support')) for name in ARM_PARTS}
             rows.append(dict(output_tick=tick,native_frame_index=preimage['native'][tick-preimage['first']],
                 native_observation_sha256=None,selected_frame_local_head_id=None,
                 original_person_observation_id=None,head_obligation='required' if role in FOCAL else 'not_requested',
@@ -130,16 +136,29 @@ def _branch(*, state, hypothesis, raw_at, head_link):
             else:
                 status = dict(owner.get('part_states', ())).get(name)
                 observation = 'observed' if status == 'observed' else 'unresolved' if status == 'ambiguous' else 'missing'
-            if observation == 'observed' and name not in latched:
+            support = None
+            if observation == 'observed':
+                support = measured_visible_arm_support(
+                    native_points=[owner['upper_body_xyc'][i][:2] for i in ARM_INDICES[name]],
+                    project_point=lambda p: project_point(p,camera,tick),
+                    base_crop=native_base_crop(camera,tick))
+            # Source-known alone is not an ORIGINAL-output obligation. Keep
+            # outside evidence without pretending an unknown pose is outside.
+            if support is not None and support['visibility'] != 'outside' and name not in latched:
                 latched[name] = dict(output_tick=tick, native_observation_sha256=sha,
-                    original_person_observation_id=owner['observation_id'])
+                    original_person_observation_id=owner['observation_id'], required_support=support)
             required = role in FOCAL and (explicit or name in latched)
             parts[name] = dict(obligation='required' if required else 'unknown',
                 observation=observation,
                 became_required_at_output_tick=first if explicit else latched.get(name, {}).get('output_tick'),
                 original_required_reason='explicit_original_output_role' if explicit else
                     'observed_selected_original_hypothesis_latched' if name in latched else 'original_measurement_unknown',
-                original_first_observed_reference=latched.get(name))
+                original_first_observed_reference=latched.get(name),
+                original_output_visibility='unknown' if support is None else support['visibility'],
+                source_known_support=support,
+                required_support=None if explicit else (
+                    support if support is not None and support['visibility'] != 'outside'
+                    else latched.get(name,{}).get('required_support')))
         rows.append(dict(output_tick=tick, native_frame_index=native,
             native_observation_sha256=sha, selected_frame_local_head_id=selected,
             original_person_observation_id=None if owner is None else owner['observation_id'],
@@ -177,13 +196,18 @@ def _unit(branches, eligible_request_indices):
         required = sorted({name for branch in branches for name,part in branch['rows'][offset]['parts'].items()
             if part['obligation'] == 'required'})
         rows.append(dict(output_tick=tick, required_part_names=required,
+            required_support_by_part={name:[dict(
+                original_subject_hypothesis_id=branch['original_subject_hypothesis_id'],
+                support=branch['rows'][offset]['parts'][name]['required_support'])
+                for branch in branches if branch['rows'][offset]['parts'][name]['obligation']=='required']
+                for name in required},
             branch_row_sha256=[family.digest(branch['rows'][offset]) for branch in branches]))
     identity = family.digest(dict(original_source=state['source'], clock=state['clock'],
         bounds=[state['first'],state['end']], role=state['role'], intent=first['original_hypothesis']['shot_intent']))
     return dict(original_unit_id=identity, first_output_frame=state['first'], end_output_frame=state['end'],
         role=state['role'], required_output_interval=interval, branches=branches, rows=rows,
         original_hypothesis_ambiguity_retained=len(branches)>1, part_names_are_not_cast_counts=True,
-        lifecycle_policy='separate_original_focal_hypotheses_latched_part_names' if state['role'] in FOCAL
+        lifecycle_policy='separate_original_focal_hypotheses_original_visible_support_v2' if state['role'] in FOCAL
             else 'existing_native_inventory_policy_not_original_part_lifecycle',
         original_native_part_lifecycle_frozen=state['role'] in FOCAL,
         candidate_admitted=False, quality_approved=False)
@@ -457,7 +481,8 @@ def duty_at(program, state, tick,*,resolver=None):
     return dict(program_sha256=program['program_sha256'],external_original_id=program['original_plan_identity'],
         original_unit_id=unit['original_unit_id'],original_hypothesis_branches=[
             b['original_subject_hypothesis_id'] for b in unit['branches']],
-        output_tick=tick, row_sha256=family.digest(row), required_part_names=row['required_part_names'])
+        output_tick=tick, row_sha256=family.digest(row), required_part_names=row['required_part_names'],
+        required_support_by_part=row['required_support_by_part'])
 
 
 def bind_row_obligations(program,state,tick,*,resolver=None):

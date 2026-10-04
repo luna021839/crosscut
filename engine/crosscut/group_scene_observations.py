@@ -384,6 +384,7 @@ class SceneSensors(source.NativeFamilySensors):
         return value
 
     def frame(self, state, tick, *, head_id='anchor'):
+        from .group_original_visible_support import native_base_crop
         hypothesis = self.hypothesis(state)
         if head_id == 'anchor':
             if tick not in hypothesis['anchor_output_ticks']:
@@ -466,7 +467,16 @@ class SceneSensors(source.NativeFamilySensors):
                     continue
                 required = None if required_parts is None else (person.observation_id, name) in required_parts
                 joints_visible = all(0 <= points[n][0] <= 1 and 0 <= points[n][1] <= 1 for n in indices)
-                if required and not joints_visible:
+                frozen_support = None if duty_reference is None else duty_reference.get('required_support_by_part',{}).get(name)
+                partial_contract = bool(frozen_support) and all(s['support'] is not None for s in frozen_support)
+                required_support_visible = joints_visible
+                if required and partial_contract:
+                    from .group_original_visible_support import support_preserved,native_base_crop
+                    required_support_visible = all(support_preserved(s['support'],
+                        native_points=[person.upper_body_xyc[n][:2] for n in indices],
+                        project_point=lambda p: source.project_point(p,state,tick),
+                        base_crop=native_base_crop(state,tick)) for s in frozen_support)
+                if required and not required_support_visible:
                     reject('scene camera crops a role-required observed arm')
                 # No face/body association => cannot invent a face-derived hand
                 # envelope. Keep the unknown explicitly, never a neutral box.
@@ -475,13 +485,16 @@ class SceneSensors(source.NativeFamilySensors):
                 envelope = None if anchor is None else _action_envelope(
                     anchor, tuple(person.upper_body_xyc[n][:2] for n in indices))
                 visibility = None if envelope is None else source.project_box(envelope, state, tick)[1]
-                if required and visibility is not None and visibility < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction:
+                if required and not partial_contract and visibility is not None and visibility < BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction:
                     reject('scene camera clips a required measured arm envelope')
                 item = dict(part=name, person_observation_id=person.observation_id,
                     projected_joint_xy=[list(points[n][:2]) for n in indices],
                     native_action_envelope_xywh=None if envelope is None else list(envelope),
                     visible_fraction=visibility, required_by_role=required,
                     measured_joints_visible=joints_visible,
+                    original_visible_support_token=frozen_support if required else None,
+                    required_support_visible=required_support_visible if required else None,
+                    native_base_crop_xyxy=list(native_base_crop(state,tick)),
                     envelope_state='unknown_unassociated_head' if anchor is None else 'face_derived_framing_not_anatomy')
                 arms.append(item); observed_arms.append(item)
             people.append(dict(observation_id=person.observation_id,
@@ -546,6 +559,18 @@ class SceneSensors(source.NativeFamilySensors):
         envelopes=[_close_face_head_envelope(head)]
         for arm in row['projected_observed_arms']:
             if not arm['required_by_role']:continue
+            tokens=arm.get('original_visible_support_token')
+            if tokens and all(s['support'] is not None for s in tokens):
+                from .group_original_visible_support import ARM_INDICES,support_positions
+                person=next(p for p in row['native_observation']['people']
+                    if p['observation_id']==arm['person_observation_id'])
+                points=[person['upper_body_xyc'][i][:2] for i in ARM_INDICES[arm['part']]]
+                support=[p for s in tokens for p in support_positions(s['support'],points)]
+                if not support:raise ValueError('a required visible support cannot be empty')
+                xs,ys=zip(*support)
+                envelopes.append((min(xs)-.002,min(ys)-.002,
+                    max(.004,max(xs)-min(xs)+.004),max(.004,max(ys)-min(ys)+.004)))
+                continue
             if arm['native_action_envelope_xywh'] is None:
                 raise SceneFrameRejection(row)
             envelopes.append(tuple(arm['native_action_envelope_xywh']))
@@ -1485,14 +1510,27 @@ def validate_scene_dense(dense):
                 raise ValueError('scene dense omitted, duplicated or promoted original observed parts')
             for arm in row['projected_observed_arms']:
                 required=(arm['person_observation_id'],arm['part']) in required_parts
+                tokens=None if program is None else ref['required_support_by_part'].get(arm['part'])
+                partial_contract=bool(tokens) and all(s['support'] is not None for s in tokens)
+                if arm.get('original_visible_support_token') != (tokens if required else None):
+                    raise ValueError('scene dense arm borrowed a different original visible support token')
+                if required and partial_contract:
+                    from .group_original_visible_support import ARM_INDICES,support_preserved_coordinates
+                    person=next(p for p in native['people'] if p['observation_id']==arm['person_observation_id'])
+                    visible=all(support_preserved_coordinates(s['support'],
+                        native_points=[person['upper_body_xyc'][i][:2] for i in ARM_INDICES[arm['part']]],
+                        projected_points=arm['projected_joint_xy'],
+                        base_crop=arm.get('native_base_crop_xyxy')) for s in tokens)
+                    if arm.get('required_support_visible') is not True or not visible:
+                        raise ValueError('scene dense lost a known original visible arm support')
                 if arm['visible_fraction'] is not None and not fraction(arm['visible_fraction']):
                     raise ValueError('scene dense arm visibility is not a finite fraction')
-                if arm.get('required_by_role')!=required or required and (
+                if arm.get('required_by_role')!=required or required and not partial_contract and (
                         arm.get('measured_joints_visible') is not True or arm['visible_fraction'] is None
                         or arm['visible_fraction']<BoundarySubjectAlignmentConfig().minimum_performer_visible_fraction
                         or arm['native_action_envelope_xywh'] is None):
                     raise ValueError('scene dense lost required arm visibility or borrowed context')
-                if required and (len(arm['projected_joint_xy'])!=3 or any(
+                if required and not partial_contract and (len(arm['projected_joint_xy'])!=3 or any(
                         len(point)!=2 or any(not fraction(v) for v in point)
                         for point in arm['projected_joint_xy'])):
                     raise ValueError('scene dense required arm joints are not measured visible coordinates')
