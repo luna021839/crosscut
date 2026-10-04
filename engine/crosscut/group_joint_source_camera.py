@@ -257,6 +257,10 @@ class JointGroupWorkBudget:
                 or maximum_association_nodes>1536 or maximum_association_edges>18000):
             raise ValueError('joint GROUP requires explicit bounded state/edge/dense/decode/model/time budgets')
         self.clock=clock;self.deadline=absolute_deadline;self.limits=values
+        from .request_work_lease import current_request_work_phase
+        self.request_work_phase=current_request_work_phase()
+        if self.request_work_phase is not None:
+            self.deadline=min(self.deadline,self.request_work_phase.deadline)
         self.counts={k:0 for k in values};self.model_calls={}
         self.projected_cache_bytes=maximum_projected_cache_bytes
         self.maximum_frontiers=maximum_frontiers;self.frontiers=[];self.active_frontier=None
@@ -282,6 +286,10 @@ class JointGroupWorkBudget:
                 raise JointGroupBudgetExhausted('joint GROUP frontier '+kind+' work budget reached')
         if self.counts[kind]+self.reserved[kind]+count>self.limits[kind]:
             raise JointGroupBudgetExhausted('joint GROUP '+kind+' work budget reached')
+        if self.request_work_phase is not None:
+            # This is a live parent ACK in an isolated worker, not a copied
+            # count. A new session/frontier cannot reset the phase allocation.
+            self.request_work_phase.charge(kind,count,model=model)
         self.counts[kind]+=count
         if kind=='model_calls':
             self.model_calls[model]=self.model_calls.get(model,0)+count
@@ -301,9 +309,11 @@ class JointGroupWorkBudget:
 
     def reserve_primitive(self,work,maximum_evidence_bytes):
         amounts=self.require_primitive_capacity(work,maximum_evidence_bytes)
+        request_ticket=(None if self.request_work_phase is None
+            else self.request_work_phase.reserve(amounts))
         ticket=object()
         for kind,count in amounts.items():self.reserved[kind]+=count
-        self._primitive_reservations[ticket]=dict(amounts=amounts,started=False)
+        self._primitive_reservations[ticket]=dict(amounts=amounts,started=False,request_ticket=request_ticket)
         return ticket
 
     def _owned_primitive_ticket(self,ticket):
@@ -316,6 +326,8 @@ class JointGroupWorkBudget:
     def start_primitive(self,ticket):
         owned=self._owned_primitive_ticket(ticket);self.check()
         if owned['started']:raise ValueError('primitive reservation was already started')
+        if self.request_work_phase is not None:
+            self.request_work_phase.start(owned['request_ticket'])
         owned['started']=True
         for kind,count in owned['amounts'].items():
             if kind=='pose_evidence_bytes':continue
@@ -325,6 +337,8 @@ class JointGroupWorkBudget:
         owned=self._owned_primitive_ticket(ticket)
         if type(evidence_bytes) is not int or not 0<=evidence_bytes<=owned['amounts']['pose_evidence_bytes']:
             raise ValueError('primitive returned more evidence than its owned reservation')
+        if self.request_work_phase is not None:
+            self.request_work_phase.settle(owned['request_ticket'],evidence_bytes)
         # Completed raw/terminal storage is reserved already. It must not be
         # discarded because its computation used the last available tick.
         for kind,count in owned['amounts'].items():

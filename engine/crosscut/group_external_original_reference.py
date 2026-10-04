@@ -120,14 +120,25 @@ class GroupExternalOriginalReference:
         self.validate_original()
         if not isinstance(plan, RenderPlan) or getattr(bundle, 'render_plan', None) != plan:
             raise ValueError('external-reference candidate lost its complete owned GROUP plan')
-        if (_header(plan) != _header(self.original_bundle.render_plan)
-                or plan.authorized_shot_video_clocks
-                or any(t.kind.uses_overlap for t in plan.transitions)):
-            raise ValueError('external reference common output/source clock authority changed')
+        self.validate_numeric_plan(plan)
         old = json.loads(self._frozen_preimage)['original_boundary_look']
         current = boundary_look_inventory(bundle.boundary_look_match, plan)
         if current['mode'] != old['mode']:
             raise ValueError('external original boundary-look policy forbids implicit creation/removal')
+
+    def validate_numeric_plan(self,plan):
+        """Exclude protected writes before selected feature/completion work.
+
+        This does not admit look metadata, native duties, source freshness or
+        completed learned authority. Those remain mandatory later consumers.
+        """
+        self.validate_original()
+        if not isinstance(plan,RenderPlan):
+            raise TypeError('external numeric preservation needs a complete RenderPlan')
+        if (_header(plan) != _header(self.original_bundle.render_plan)
+                or plan.authorized_shot_video_clocks
+                or any(t.kind.uses_overlap for t in plan.transitions)):
+            raise ValueError('external reference common output/source clock authority changed')
         if self.protected_output_intervals:
             comparison = compare_group_reference_interval(reference=self.original_bundle.render_plan,
                 candidate=plan, reference_source_clocks=self.source_domain.clocks_by_request,

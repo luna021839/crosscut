@@ -3,7 +3,7 @@
 Only our own parent/child messages use pickle. No downloaded input is unpickled
 and no raw descriptor, face vector, or model result is persisted for IPC.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from collections import deque
 from functools import wraps
@@ -18,7 +18,7 @@ import pickle
 import signal
 import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
 from time import monotonic
 from types import MappingProxyType
 
@@ -75,7 +75,18 @@ def _reduce_readonly_mapping(value):
     return _restore_readonly_mapping, (dict(value),)
 
 
-def _encode_message(value):
+class _BoundedMessageStream(io.BytesIO):
+    def __init__(self, maximum_bytes):
+        super().__init__()
+        self.maximum_bytes = maximum_bytes
+
+    def write(self, data):
+        if self.maximum_bytes is not None and self.tell() + len(data) > self.maximum_bytes:
+            raise ValueError("optional IPC message exceeded its pre-reserved byte bound")
+        return super().write(data)
+
+
+def _encode_message(value, *, maximum_bytes=None):
     """Private IPC only: preserve immutable maps and shared object identity.
 
     Visual candidates and repair evidence deliberately contain mappingproxy
@@ -83,7 +94,7 @@ def _encode_message(value):
     a process-global pickle reducer. In particular, authority seals and custom
     provider callbacks receive no special serialization/bypass here.
     """
-    stream = io.BytesIO()
+    stream = _BoundedMessageStream(maximum_bytes)
     writer = pickle.Pickler(stream, protocol=pickle.HIGHEST_PROTOCOL)
     writer.dispatch_table = copyreg.dispatch_table.copy()
     writer.dispatch_table[MappingProxyType] = _reduce_readonly_mapping
@@ -137,26 +148,128 @@ def run_isolated_python_call(module: str, name: str, kwargs: dict, *, deadline: 
         raise ValueError("optional worker deadline must be finite")
     if deadline <= monotonic():
         raise ReviewFirstSearchCutoff("optional native work has no admission budget")
-    request = _encode_message((module, name, kwargs))
-    # The worker/guardian enforce the absolute cutoff themselves. Defer our
-    # competing Python alarm until the process and IPC handles are reaped.
-    with defer_deadline_during_owned_native_wait():
-        return _communicate_isolated(request, deadline)
+    from .request_work_lease import current_request_work_phase, RequestWorkExhausted
+    phase = current_request_work_phase()
+    if phase is None:
+        request = _encode_message((module, name, kwargs))
+        # The worker/guardian enforce the absolute cutoff themselves. Defer our
+        # competing Python alarm until the process and IPC handles are reaped.
+        with defer_deadline_during_owned_native_wait():
+            return _communicate_isolated(request, deadline)
+    from .request_work_transport import ParentWorkTransport
+    if not hasattr(phase, "begin_worker"):
+        raise ValueError("a child cannot create another isolated phase owner")
+    deadline = min(deadline, phase.deadline)
+    key = phase.begin_worker(module, name)  # Durable parent admission BEFORE pickle/model work.
+    transport = None
+    stats = dict(sent_bytes=0, received_bytes=0)
+    status = "failed"
+    error = None
+    result = None
+    try:
+        transport = ParentWorkTransport(phase, key)
+        request = _encode_message((module, name, kwargs, transport.descriptor()),
+                                  maximum_bytes=phase.maximum_worker_message_bytes)
+        with defer_deadline_during_owned_native_wait():
+            result = _communicate_isolated(request, deadline, transport=transport,
+                maximum_result_bytes=phase.maximum_worker_message_bytes, wire_stats=stats)
+        status = "returned"
+    except BaseException as exc:
+        error = exc
+        status = "cutoff" if isinstance(exc, ReviewFirstSearchCutoff) else "failed"
+    finally:
+        if transport is not None:
+            transport.close()  # The native group and its inherited pipe holders are reaped already.
+            if transport.error is not None:
+                error = transport.error
+                status = "cutoff" if isinstance(error, RequestWorkExhausted) else "failed"
+        phase.finish_worker(key, status=status, **stats)
+    if error is not None:
+        raise error
+    return result
 
 
-def _communicate_isolated(request: bytes, deadline: float):
+def _bounded_communicate(worker, request, deadline, maximum_result_bytes, wire_stats):
+    """Bound parent output allocation even if a child violates its serializer."""
+    from .review_first_runtime import ReviewFirstSearchCutoff
+    done = Event()
+    chunks, errors = [], []
+
+    def send():
+        try:
+            # Record the measured accepted prefix, including a pipe closing
+            # mid-message. Do not turn partial input into a fictitious zero.
+            remaining=memoryview(request)
+            while remaining:
+                written=worker.stdin.write(remaining[:65536])
+                if type(written) is not int or not 0<written<=min(len(remaining),65536):
+                    raise OSError("owned worker input did not accept its complete prefix")
+                wire_stats["sent_bytes"]+=written
+                remaining=remaining[written:]
+            worker.stdin.flush()
+        except BrokenPipeError:
+            pass
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            try:
+                worker.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    def receive():
+        try:
+            while data := worker.stdout.read(min(65536, maximum_result_bytes - wire_stats["received_bytes"] + 1)):
+                wire_stats["received_bytes"] += len(data)
+                if wire_stats["received_bytes"] > maximum_result_bytes:
+                    raise ValueError("optional worker returned more IPC bytes than reserved")
+                chunks.append(data)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    sender = Thread(target=send, daemon=True)
+    receiver = Thread(target=receive, daemon=True)
+    sender.start()
+    receiver.start()
+    while worker.poll() is None or not done.is_set():
+        if errors:
+            raise errors[0]
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ReviewFirstSearchCutoff("optional native worker deadline")
+        done.wait(min(.025, remaining))
+    if errors:
+        raise errors[0]
+    sender.join(timeout=.25)
+    receiver.join(timeout=.25)
+    if sender.is_alive() or receiver.is_alive():
+        raise RuntimeError("owned bounded IPC threads did not finish")
+    return b"".join(chunks), None
+
+
+def _communicate_isolated(request: bytes, deadline: float, *, transport=None,
+                          maximum_result_bytes=None, wire_stats=None):
     from .review_first_runtime import ReviewFirstSearchCutoff
     from .workflow_supervisor import terminate_owned_process_group
     command = [sys.executable, "-m", _WORKER_MODULE, "guard", repr(deadline), str(os.getpid())]
+    inherited = () if transport is None else transport.pass_fds
+    command.extend(str(fd) for fd in inherited)
     diagnostics = _WorkerStderrTail()
     worker = None
     try:
         worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=diagnostics.write_fd, start_new_session=True,
-                                  env=_worker_environment())
+                                  env=_worker_environment(), pass_fds=inherited)
+        if transport is not None:
+            transport.child_spawned()
         diagnostics.close_writer()
         try:
-            result, _ = worker.communicate(input=request, timeout=max(.001, deadline-monotonic()))
+            if transport is None:
+                result, _ = worker.communicate(input=request, timeout=max(.001, deadline-monotonic()))
+            else:
+                result, _ = _bounded_communicate(worker, request, deadline, maximum_result_bytes, wire_stats)
         except subprocess.TimeoutExpired as exc:
             raise ReviewFirstSearchCutoff("optional native worker deadline") from exc
         if worker.returncode != 0 or not result:
@@ -189,23 +302,42 @@ def _communicate_isolated(request: bytes, deadline: float):
 
 
 def _execute():
+    from .request_work_lease import RequestWorkExhausted
     # Keep IPC on an owned fd; both Python prints and native stdout now go to
     # stderr, so model diagnostics cannot corrupt the binary return channel.
     output = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    remote = None
+    maximum_bytes = None
     try:
-        module, name, kwargs = pickle.load(sys.stdin.buffer)
-        value = getattr(importlib.import_module(module), name)(**kwargs)
-        encoded = _encode_message((True, value))
-    except Exception as exc:
+        request = pickle.load(sys.stdin.buffer)
+        if len(request) == 4:
+            from .request_work_transport import RemoteWorkPhase
+            from .request_work_lease import bind_request_work_phase
+            module, name, kwargs, descriptor = request
+            remote = RemoteWorkPhase(descriptor)
+            maximum_bytes = remote.maximum_worker_message_bytes
+            scope = bind_request_work_phase(remote)
+        else:
+            module, name, kwargs = request
+            scope = nullcontext()
+        with scope:
+            if remote is not None:
+                remote.worker_entered()  # Parent ACK precedes the target function.
+            value = getattr(importlib.import_module(module), name)(**kwargs)
+            encoded = _encode_message((True, value), maximum_bytes=maximum_bytes)
+    except (Exception, RequestWorkExhausted) as exc:
         # Encoding itself can fail. Report that concrete failure without
         # writing a partial success payload to the anonymous IPC channel.
-        encoded = _encode_message((False, f"{type(exc).__name__}: {exc}"))
+        encoded = _encode_message((False, f"{type(exc).__name__}: {exc}"), maximum_bytes=maximum_bytes)
+    finally:
+        if remote is not None:
+            remote.close()
     with output:
         output.write(encoded)
 
 
-def _guard(deadline: float, owner: int):
+def _guard(deadline: float, owner: int, inherited_fds=()):
     # The guardian stays outside the work group so it can kill ALL inherited
     # pipe holders even after the execute leader returned successfully.
     if os.getpid() != os.getpgrp():
@@ -220,7 +352,7 @@ def _guard(deadline: float, owner: int):
         previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
             process = subprocess.Popen([sys.executable, "-m", _WORKER_MODULE, "execute"],
-                                       start_new_session=True)
+                                       start_new_session=True, pass_fds=inherited_fds)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         while True:
@@ -248,6 +380,6 @@ if __name__ == "__main__":
     if mode == "execute":
         _execute()
     elif mode == "guard":
-        raise SystemExit(_guard(float(arguments[0]), int(arguments[1])))
+        raise SystemExit(_guard(float(arguments[0]), int(arguments[1]), tuple(map(int, arguments[2:]))))
     else:
         raise SystemExit("invalid private worker mode")

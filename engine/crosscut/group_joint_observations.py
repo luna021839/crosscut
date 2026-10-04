@@ -47,25 +47,34 @@ class GroupJointObservationSession:
         self.raw_peak_bytes=0;self.raw_evictions=0;self.native_frame_bytes={}
         self.peak_owned_raw_decode_bytes=0;self.native_pixel_copies=0
 
+    def _identity(self,path):
+        if self.budget.request_work_phase is not None:
+            self.budget.request_work_phase.charge('identity_reads')
+        return _file_identity(path)
+
     def _assert_source_identity(self,source):
         self.budget.check()
         if self.closed:raise ValueError('joint observation session is closed')
         local=self.domain.eligible_index(source)
         path=self.domain.request_sources[source]
-        identity=_file_identity(path)
+        identity=self._identity(path)
         if source not in self.identities:
             self.identities[source]=identity
             capture=None
             try:
+                if self.budget.request_work_phase is not None:
+                    self.budget.request_work_phase.charge('source_probes')
                 clock=probe_render_frame_clock(path,
                     timeout_seconds=max(.01,min(10.,self.budget.deadline-self.budget.clock())))
                 self.budget.check()
-                if clock!=self.domain.render_frame_clocks[local] or _file_identity(path)!=identity:
+                if clock!=self.domain.render_frame_clocks[local] or self._identity(path)!=identity:
                     raise ValueError('joint observation native clock/file changed before decoder opening')
+                if self.budget.request_work_phase is not None:
+                    self.budget.request_work_phase.charge('decoder_opens')
                 capture=cv2.VideoCapture(str(path))
                 if not capture.isOpened():raise ValueError('joint eligible source decoder unavailable')
                 reader=ExactNativeFrameReader(capture,clock)
-                if _file_identity(path)!=identity:raise ValueError('joint source changed during decoder opening')
+                if self._identity(path)!=identity:raise ValueError('joint source changed during decoder opening')
                 self.captures[source]=capture;self.readers[source]=reader
             except BaseException:
                 if capture is not None:capture.release()
@@ -187,12 +196,14 @@ class GroupJointObservationSession:
                 or len(expected_asset_sha256)!=64
                 or any(c not in '0123456789abcdef' for c in expected_asset_sha256)):
             raise ValueError('joint model loaded-asset identity must be a SHA256 digest')
-        identity=_file_identity(asset_path)
+        identity=self._identity(asset_path)
         if expected_file_identity is not None and identity!=expected_file_identity:
             raise ValueError('joint model asset identity differs from the loaded observer')
+        if self.budget.request_work_phase is not None:
+            self.budget.request_work_phase.charge('model_hash_bytes',identity[2])
         with asset_path.open('rb') as stream:
             digest=hashlib.file_digest(stream,'sha256').hexdigest()
-        if _file_identity(asset_path)!=identity:raise ValueError('joint model changed while binding its content identity')
+        if self._identity(asset_path)!=identity:raise ValueError('joint model changed while binding its content identity')
         if expected_asset_sha256 is not None and digest!=expected_asset_sha256:
             raise ValueError('joint model asset differs from the bytes loaded by its observer')
         dependencies=tuple(asset_dependencies)
@@ -202,19 +213,21 @@ class GroupJointObservationSession:
         bound=[]
         for dependency in dependencies:
             self.budget.check()
-            before=_file_identity(dependency)
+            before=self._identity(dependency)
+            if self.budget.request_work_phase is not None:
+                self.budget.request_work_phase.charge('model_hash_bytes',before[2])
             with dependency.open('rb') as stream:
                 dependency_sha=hashlib.file_digest(stream,'sha256').hexdigest()
-            if _file_identity(dependency)!=before:
+            if self._identity(dependency)!=before:
                 raise ValueError('joint model external asset changed while binding')
             bound.append((dependency,before,dependency_sha))
         if bound:
             adapter_fingerprint={'adapter':adapter_fingerprint,'external_asset_dependencies':[
                 {'filename':path.name,'sha256':sha} for path,_,sha in bound]}
         encoded=json.dumps(adapter_fingerprint,sort_keys=True,separators=(',',':'),allow_nan=False)
-        if _file_identity(asset_path)!=identity:
+        if self._identity(asset_path)!=identity:
             raise ValueError('joint model changed while binding external assets')
-        if any(_file_identity(path)!=before for path,before,_ in bound):
+        if any(self._identity(path)!=before for path,before,_ in bound):
             raise ValueError('joint model external asset changed while binding')
         self.models[name]=(asset_path,identity,digest,observer)
         self.model_asset_dependencies[name]=tuple(bound)
@@ -223,8 +236,8 @@ class GroupJointObservationSession:
 
     def _assert_model_assets(self,name):
         path,identity,_,_=self.models[name]
-        if _file_identity(path)!=identity:raise ValueError('joint observation model identity changed')
-        if any(_file_identity(path)!=identity for path,identity,_ in self.model_asset_dependencies.get(name,())):
+        if self._identity(path)!=identity:raise ValueError('joint observation model identity changed')
+        if any(self._identity(path)!=identity for path,identity,_ in self.model_asset_dependencies.get(name,())):
             raise ValueError('joint observation model external asset identity changed')
 
     def observe(self,state,output_tick,*,model,arguments=None):

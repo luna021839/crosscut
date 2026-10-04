@@ -84,7 +84,13 @@ def visible_group_cut_inventory(plan, source_domain):
             kind='source_switch'
         elif tick in seam_indices:
             index=seam_indices[tick]
-            if not _can_share_source_clock(plan,first_index=index-1,candidate_last_index=index):
+            # Decoder coalescing needs one nearly linear clock. Physical
+            # continuity does not: a continuous piecewise rate map may need
+            # separate decoder runs while still crossing a real native cut.
+            # A shared run uses the renderer's linear sampler and has no seek;
+            # otherwise test the authored source endpoint, not the rate change.
+            if (not _can_share_source_clock(plan,first_index=index-1,candidate_last_index=index)
+                    and abs(plan.segments[index-1].source_end-plan.segments[index].source_start)>1e-9):
                 kind='same_source_clock_jump'
         if kind is not None:
             events.append(VisibleGroupCut(tick,kind,left.source_index,right.source_index,

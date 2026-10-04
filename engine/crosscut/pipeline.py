@@ -34173,12 +34173,29 @@ def analyze(
                     and stage_edit_generation_result is not None
                 ):
                     reporter.status(
-                        "StageEdit가 제안한 전체 선택 구간 중 첫 검토 가능 경로를 "
-                        "실프레임 하드 게이트로 확인하는 중…"
+                        "StageEdit 전체 편집 경로를 수치 비교한 뒤 선택된 한 경로만 "
+                        "실프레임·렌더 계약으로 완성하는 중…"
                     )
-                    for retained_candidate in (
-                        stage_edit_generation_result.retained_candidates[:8]
-                    ):
+                    from .stage_edit_single_completion import select_complete_learned_path
+                    def select_learned_complete_path():
+                        def numeric_admission(plan):
+                            group_first.validate_plan(plan)
+                            if group_external_original_reference is not None:
+                                group_external_original_reference.validate_numeric_plan(plan)
+                        return select_complete_learned_path(stage_edit_generation_result,
+                            sources=request.sources,source_offsets=offsets,timewarps=eligible_timewarps,
+                            source_durations=local_durations,numeric_admission=numeric_admission)
+                    selected_complete_path = group_first.run_optional(
+                        "stage_edit_complete_path_numeric_selection",select_learned_complete_path)
+                    if selected_complete_path is not None:
+                        review_first_visual_selection_payload['complete_path_numeric_selection'] = selected_complete_path.to_dict()
+                    else:
+                        review_first_rejections.append(deepcopy(group_first.attempts[-1]))
+                    # A singleton is deliberate: a selected completion failure
+                    # ends this family. It never completes rank 2, 3, ... using
+                    # renewed optional deadlines until an arbitrary one passes.
+                    for retained_candidate in (() if selected_complete_path is None
+                            else (selected_complete_path.candidate,)):
                         review_first_runtime.require_first_render_budget("optional_learned_candidate")
                         def propose_learned_candidate():
                             materialized_review_candidate = (
@@ -34213,6 +34230,8 @@ def analyze(
                                 reporter=reporter, warnings=warnings)
                             promoted_bundle = _apply_stage_edit_candidate_render_contract(promoted_bundle,
                                 materialized_review_candidate, motion_authority_v3=registered_stage_edit_motion_authority_v3)
+                            promoted_bundle = replace(promoted_bundle,candidate_lineage=(
+                                *promoted_bundle.candidate_lineage,selected_complete_path.to_dict()))
                             group_first.validate_plan(promoted_bundle.render_plan)
                             _validate_review_first_group_bundle(promoted_bundle, eligible_indices=eligible_indices,
                                 offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
@@ -34270,6 +34289,7 @@ def analyze(
                                 retained_candidate.rank
                             ),
                             "source_path_authority_used": True,
+                            "complete_path_numeric_selection": selected_complete_path.to_dict(),
                             "dynamic_crop_version": (
                                 materialized_review_candidate.dynamic_crop_version
                             ),
@@ -34285,8 +34305,9 @@ def analyze(
                         break
                     if review_first_stage_edit_materialized is None:
                         warnings.append(
-                            "StageEdit 경로가 시각 하드 게이트를 통과하지 "
-                            "못해 기록을 남기고 결정론적 전체 구간 선택기로 전환했습니다."
+                            "StageEdit 전체 경로의 수치 선택 또는 선택된 단일 완성이 "
+                            "통과하지 못했습니다. 다른 순위의 반복 완성은 실행하지 않고 "
+                            "기존 전체 편집 경로와 실패 기록을 유지합니다."
                         )
                 elif (
                     bool(getattr(request, "review_first_enabled", False))

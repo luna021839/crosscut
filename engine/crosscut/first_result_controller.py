@@ -83,6 +83,8 @@ class FirstResultController:
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self.omitted_attempt_count = 0
         self._journal_warnings = []
+        self._request_work_lease = None
+        self._request_work_lease_attempted = False
         self._external_original_reference = external_original_reference
         if external_original_reference is not None:
             from .group_external_original_reference import GroupExternalOriginalReference
@@ -102,6 +104,51 @@ class FirstResultController:
             return True
         self.external_original_reference.validate_original()
         return False
+
+    @property
+    def request_work_lease(self):
+        return self._request_work_lease
+
+    def reserve_request_work(self, *, total_limits, allocations, journal_path):
+        """Own all editing phases once, before any optional producer.
+
+        Allocation values are explicit declared work, not measured WCET or an
+        automatically guessed media SLA. Missing admission never launches work.
+        """
+        from .request_work_lease import RequestWorkLease
+        if self._request_work_lease_attempted or self.attempts or self.baseline is None:
+            raise ValueError("whole-request work must be admitted once after baseline and before optional producers")
+        self._request_work_lease_attempted = True
+        self._request_work_lease = RequestWorkLease(runtime=self.runtime,
+            controller_identity=self.transaction_token().content_sha256,
+            total_limits=total_limits, allocations=allocations, journal_path=journal_path)
+        self._persist()
+        return self._request_work_lease
+
+    def run_work_phase(self, name, operation):
+        from .optional_native_worker import optional_native_scope
+        from .request_work_lease import RequestWorkExhausted
+        if self._request_work_lease is None or not callable(operation):
+            raise ValueError("declared request work phase needs its live controller lease and operation")
+        self.runtime.require_total_budget("request_phase_" + str(name))
+        try:
+            with self._request_work_lease.phase(name) as port:
+                with optional_native_scope(port.deadline), enforce_review_first_deadline(port.deadline,
+                        stage="request_phase_" + name):
+                    try:
+                        value = operation()
+                        port._check()
+                        if port.admission_cutoff is not None:
+                            raise port.admission_cutoff
+                    except (ReviewFirstDeadlineExceeded, ReviewFirstSearchCutoff) as exc:
+                        self.runtime.require_total_budget("request_phase_" + name)
+                        if isinstance(exc,RequestWorkExhausted):raise
+                        # Convert inside the phase context so its durable
+                        # terminal records the same typed scheduling outcome.
+                        raise RequestWorkExhausted(name,"phase_wall",partial=port.partial_work) from exc
+                return value
+        finally:
+            self._persist()
 
     def _validate_external_candidate(self, value, plan, *, baseline=False):
         reference = self.external_original_reference
@@ -232,6 +279,19 @@ class FirstResultController:
         if self.baseline is None:
             raise RuntimeError("optional work cannot precede the complete baseline")
         self.runtime.require_total_budget(stage)
+        from .request_work_lease import current_request_work_phase, RequestWorkExhausted
+        if self._request_work_lease_attempted and (self._request_work_lease is None
+                or current_request_work_phase() is not self._request_work_lease.active
+                or self._request_work_lease.active is None):
+            self.skipped_count += 1
+            if len(self.attempts) < 64:
+                self.attempts.append(dict(stage=stage, status="budget_not_started",
+                    dimension="declared_live_request_phase_required", elapsed_seconds=0.,
+                    observed_geometry_rejected=False))
+            else:
+                self.omitted_attempt_count += 1
+            self._persist()
+            return None
         if not self.runtime.optional_refinement_allowed or len(self.attempts) >= 64:
             self.skipped_count += 1
             if len(self.attempts) < 64:
@@ -248,6 +308,8 @@ class FirstResultController:
         cutoff = min(self.runtime.deadline_monotonic_seconds,
             self.runtime.deadline_monotonic_seconds - self.runtime.total_budget_seconds
             + min(self.runtime.first_render_budget_seconds, self.runtime.refinement_stop_seconds))
+        if self._request_work_lease is not None:
+            cutoff = min(cutoff,self._request_work_lease.active.deadline)
         try:
             from .optional_native_worker import optional_native_scope
             with optional_native_scope(cutoff), enforce_review_first_deadline(cutoff, stage=stage):
@@ -257,6 +319,8 @@ class FirstResultController:
                     validate(value)
             row["status"] = "validated_proposal" if value is not None else "unavailable"
             return value
+        except RequestWorkExhausted as exc:
+            row.update(exc.to_dict())
         except ReviewFirstDeadlineExceeded:
             committed = self._incumbent_revision != started_revision
             row["status"] = "committed_deadline_pending" if committed else "deadline_exceeded"
@@ -341,6 +405,8 @@ class FirstResultController:
             external_original_reference=None if self.external_original_reference is None
                 else self.external_original_reference.to_dict(),
             journal_warnings=deepcopy(self._journal_warnings),
+            request_work_lease_attempted=self._request_work_lease_attempted,
+            request_work_lease=None if self._request_work_lease is None else self._request_work_lease.to_dict(),
             quality_approved=False, decoded_qa_required=True)
 
 

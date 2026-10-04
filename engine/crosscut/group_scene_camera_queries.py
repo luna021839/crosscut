@@ -40,6 +40,8 @@ class GroupWholeCameraObservation:
     full_renderer_identity: str
     output_fps: float
     output_size: tuple[int, int]
+    _registry: object = field(default=None,init=False,repr=False,compare=False)
+    _key: str = field(init=False,repr=False,compare=False)
 
     @classmethod
     def from_plan(cls, *, plan, domain, physical_shot):
@@ -75,10 +77,11 @@ class GroupWholeCameraObservation:
                 or any(not isinstance(s,str) or len(s) != 64 or any(c not in '0123456789abcdef' for c in s)
                     for s in (self.source_clock_identity,self.full_renderer_identity))):
             raise ValueError('whole camera query lost complete clock/canvas identity')
+        object.__setattr__(self,'_key',_digest(self.to_dict()))
 
     @property
     def key(self):
-        return _digest(self.to_dict())
+        return self._key
 
     def to_dict(self):
         return dict(contract='physical_camera_full_renderer_observation_v1',
@@ -92,17 +95,13 @@ class GroupWholeCameraObservation:
             mutable_edit_authority=False,quality_approved=False)
 
     def bind_source(self, domain):
-        if not isinstance(domain,GroupSourceDomain) or _json(domain.to_dict()) != self.source_domain_json:
-            raise ValueError('whole camera query changed its complete external source/clock domain')
-        source = domain.request_index(self.eligible_source_index)
-        clock = domain.render_frame_clocks[self.eligible_source_index]
-        if (any(s.source_index != source for s in self.segments)
-                or self.source_clock_identity != _digest(clock.to_dict())
-                or self.native_frame_indices[-1] >= clock.frame_count):
-            raise ValueError('whole camera query changed its actual source/native clock')
+        if not isinstance(self._registry,PreparedGroupCameraQueries):
+            raise ValueError('whole camera query is not a registered full-renderer camera handle')
+        self._registry.require_camera(self,domain)
         return self
 
     def sample_at(self, tick):
+        self.bind_source(None if self._registry is None else self._registry.domain)
         if type(tick) is not int or not self.first_output_frame <= tick < self.end_output_frame:
             raise ValueError('camera projection borrowed a tick outside its actual physical span')
         index = bisect_right(self.canonical_segment_first_output_frames,tick)-1
@@ -121,6 +120,10 @@ class PreparedGroupCameraQueries:
     samples: tuple = field(init=False)
     plan_identity: str = field(init=False)
     domain_json: str = field(init=False)
+    clock_identities: tuple = field(init=False)
+    _cameras: dict = field(init=False,repr=False,compare=False)
+    _bound_domains: dict = field(init=False,repr=False,compare=False)
+    _shots_by_span: dict = field(init=False,repr=False,compare=False)
 
     def __post_init__(self):
         if (not isinstance(self.plan,RenderPlan) or not isinstance(self.domain,GroupSourceDomain)
@@ -138,22 +141,43 @@ class PreparedGroupCameraQueries:
         object.__setattr__(self,'samples',tuple(samples.values()))
         object.__setattr__(self,'plan_identity',_plan_identity(self.plan))
         object.__setattr__(self,'domain_json',_json(self.domain.to_dict()))
+        object.__setattr__(self,'clock_identities',tuple(_digest(c.to_dict()) for c in self.domain.render_frame_clocks))
+        object.__setattr__(self,'_cameras',{})
+        object.__setattr__(self,'_bound_domains',{id(self.domain):self.domain})
+        object.__setattr__(self,'_shots_by_span',{(s.first_output_frame,s.end_output_frame):s for s in self.shots})
+
+    def require_camera(self,camera,domain):
+        # Only the exact record derived here owns this immutable renderer's
+        # schedule and geometry. A dataclass reconstruction/self hash is not
+        # registration, even if it repeats the original renderer ID.
+        if (self._cameras.get((camera.first_output_frame,camera.end_output_frame)) is not camera
+                or camera.full_renderer_identity!=self.plan_identity):
+            raise ValueError('whole camera query changed its registered external renderer record')
+        if self._bound_domains.get(id(domain)) is not domain:
+            if not isinstance(domain,GroupSourceDomain) or _json(domain.to_dict())!=self.domain_json:
+                raise ValueError('whole camera query changed its complete external source/clock domain')
+            self._bound_domains[id(domain)]=domain
 
     def camera_for(self,shot):
-        if (_plan_identity(self.plan)!=self.plan_identity or _json(self.domain.to_dict())!=self.domain_json):
-            raise ValueError('prepared camera queries changed their complete renderer/domain preimage')
-        if shot not in self.shots:
+        if self._shots_by_span.get((shot.first_output_frame,shot.end_output_frame))!=shot:
             raise ValueError('camera query span is not one actual selected physical camera')
         first,end=shot.first_output_frame,shot.end_output_frame
-        indices=tuple(i for i in range(len(self.counts)) if self.starts[i]<end and self.starts[i+1]>first)
+        key=(first,end)
+        if key in self._cameras:return self._cameras[key]
+        # The inventory already resolved the incident canonical cells. Avoid
+        # scanning the complete plan for every physical camera.
+        indices=range(shot.first_segment_index,shot.last_segment_index+1)
         samples=self.samples[first:end];source=samples[0].source_index
         if any(s.source_index!=source or s.terminal_clone for s in samples):
             raise ValueError('camera query cannot borrow a different source or terminal clone')
         local=self.domain.eligible_index(source)
-        return GroupWholeCameraObservation(first,end,local,tuple(self.plan.segments[i] for i in indices),
+        camera=GroupWholeCameraObservation(first,end,local,tuple(self.plan.segments[i] for i in indices),
             tuple(self.starts[i] for i in indices),tuple(self.counts[i] for i in indices),
-            tuple(s.native_frame_index for s in samples),_digest(self.domain.render_frame_clocks[local].to_dict()),
-            self.domain_json,self.plan_identity,self.plan.fps,(self.plan.width,self.plan.height)).bind_source(self.domain)
+            tuple(s.native_frame_index for s in samples),self.clock_identities[local],
+            self.domain_json,self.plan_identity,self.plan.fps,(self.plan.width,self.plan.height))
+        self._cameras[key]=camera
+        object.__setattr__(camera,'_registry',self)
+        return camera.bind_source(self.domain)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +192,8 @@ class GroupSceneRoleQuery:
     editorial_contract_sha256: str | None = None
     raw_shot_family: str | None = None
     slot: int = 1
+    _key: str = field(init=False,repr=False,compare=False)
+    _unit_id: str = field(init=False,repr=False,compare=False)
 
     def __post_init__(self):
         if not isinstance(self.camera,GroupWholeCameraObservation):
@@ -190,14 +216,16 @@ class GroupSceneRoleQuery:
                 or len(self.editorial_contract_sha256) != 64
                 or any(c not in '0123456789abcdef' for c in self.editorial_contract_sha256)):
             raise ValueError('role query subject hypothesis hash is invalid')
+        object.__setattr__(self,'_unit_id',_digest(dict(
+            original_plan_identity=program['original_plan_identity'],original_role_program=program)))
+        object.__setattr__(self,'_key',_digest(self.key_preimage()))
 
     @property
     def original_role_program(self): return json.loads(self.original_role_program_json)
 
     @property
     def original_unit_id(self):
-        program=self.original_role_program
-        return _digest(dict(original_plan_identity=program['original_plan_identity'],original_role_program=program))
+        return self._unit_id
 
     def require_resolved_role(self):
         if self.role is None:
@@ -237,7 +265,7 @@ class GroupSceneRoleQuery:
             original_epoch_index=self.epoch_index,editorial_contract_sha256=self.editorial_contract_sha256)
 
     @property
-    def key(self): return _digest(self.key_preimage())
+    def key(self): return self._key
 
     def to_dict(self):
         return dict(contract='original_role_readonly_camera_query_v1',state_key=self.key,

@@ -152,12 +152,13 @@ class SceneSensors(source.NativeFamilySensors):
         self.articulation_raw_rows = {}
         self.articulation_endpoint_cache = {}
         self.original_duty_program = None
+        self.original_duty_resolver = None
         self.original_native_duty_programmes = {}
         self.original_role_programmes = {}
         self.state_dense_rejections = {}
 
     def install_original_duty_program(self, program):
-        from .group_scene_original_duties import validate_original_duty_program
+        from .group_scene_original_duties import validate_original_duty_program,NativeOriginalDutyResolver
         validate_original_duty_program(program, raw_inventory={r.sha256:r.to_dict()
             for r in self.raw_rows.values()})
         # The caller's mutable object is not this local programme version.
@@ -166,6 +167,7 @@ class SceneSensors(source.NativeFamilySensors):
         owned=family.plain(program)
         if not hasattr(self,'original_native_duty_programmes'):self.original_native_duty_programmes={}
         self.original_duty_program=self.original_native_duty_programmes.setdefault(owned['program_sha256'],owned)
+        self.original_duty_resolver=NativeOriginalDutyResolver(self.original_duty_program)
 
     def record_original_role_program(self,program):
         from .group_scene_epoch_program import validate_original_role_epochs
@@ -179,7 +181,8 @@ class SceneSensors(source.NativeFamilySensors):
 
     def duty_binding(self, state, tick):
         from .group_scene_original_duties import bind_row_obligations
-        return bind_row_obligations(getattr(self,'original_duty_program',None),state,tick)
+        return bind_row_obligations(getattr(self,'original_duty_program',None),state,tick,
+            resolver=getattr(self,'original_duty_resolver',None))
 
     def obligations(self, raw, state, tick, head_id):
         _,names = self.duty_binding(state,tick)
@@ -189,6 +192,7 @@ class SceneSensors(source.NativeFamilySensors):
         from .group_scene_camera_queries import GroupSceneRoleQuery
         if isinstance(state,GroupSceneRoleQuery):
             state.require_resolved_role()
+            self.duty_binding(state,tick)
             state.sample_at(tick)
         if state.role != GroupOutputRole.COMPOSITION:
             return super().raw(state, tick, roll)

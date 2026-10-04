@@ -30,6 +30,66 @@ def freeze(sensors,state,h):
         original_plan_identity='a'*64)
 
 
+def test_registered_query_must_belong_to_the_frozen_native_original_before_raw_sensing():
+    """Two legitimate factories are not interchangeable original authorities.
+
+    This uses explicit nonhuman native rows. A donor camera carrying ORIGINAL A
+    is legal; a query carrying ORIGINAL B is not, even at identical ticks/roles.
+    """
+    from unittest.mock import patch
+    from crosscut.group_scene_owned_program import (freeze_owned_scene_program,
+        own_scene_intervals,camera_unit_from_plan,assemble_owned_scene_union)
+    from crosscut.group_scene_execution_scope import execution_path_from_union
+    from crosscut.group_scene_epoch_program import compile_common_clock_camera_queries
+    from crosscut.render import RenderPlan,EditorialTransformTrack,EditorialTransformKeyframe
+    sensors,state,h,_,calls=scene_world()
+    domain=sensors.session.domain
+    plan=RenderPlan(sources=domain.request_sources,segments=state.segments,
+        reference_source=0,aspect_ratio='16:9',output=__import__('pathlib').Path('NONHUMAN-NOT-RENDERED.mp4'),
+        fps=state.output_fps)
+    def context(p):
+        return NS(incumbent=NS(render_plan=p,
+            visual_timeline=NS(choices=(NS(shot_type='medium'),)),
+            face_match_plan=NS(segments=(NS(alignment_subject=None,applied=False),)),
+            boundary_look_match=None))
+    ctx=context(plan);owned=freeze_owned_scene_program(ctx,domain)
+    allocation=own_scene_intervals(owned,mutable_unit_ids=(owned.units[0].unit_id,),
+        maximum_mutable_units=1,maximum_mutable_frames=8)
+    camera=camera_unit_from_plan(program=owned,unit_id=owned.units[0].unit_id,plan=plan,domain=domain)
+    union=assemble_owned_scene_union(context=ctx,domain=domain,allocation=allocation,cameras=(camera,))
+    scope=execution_path_from_union(ctx,domain,union)
+    program=original.freeze_original_duty_program(sensors,((state,),),
+        original_plan_identity='a'*64,global_execution_scope=scope.to_dict())
+    sensors.install_original_duty_program(program)
+    query_a=compile_common_clock_camera_queries(context=ctx,domain=domain,original_program=owned,
+        candidate_plan=plan,output_intervals=((0,8),)).queries[0]
+    changed=replace(plan,segments=(replace(plan.segments[0],editorial_transform=
+        EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),))),))
+    ctx_b=context(changed);owned_b=freeze_owned_scene_program(ctx_b,domain)
+    query_b=compile_common_clock_camera_queries(context=ctx_b,domain=domain,original_program=owned_b,
+        candidate_plan=changed,output_intervals=((0,8),)).queries[0]
+    donor_a=compile_common_clock_camera_queries(context=ctx,domain=domain,original_program=owned,
+        candidate_plan=changed,output_intervals=((0,8),)).queries[0]
+    assert query_a.original_unit_id!=query_b.original_unit_id
+    assert donor_a.original_unit_id==query_a.original_unit_id
+    assert donor_a.camera.key!=query_a.camera.key
+    assert original.duty_at(program,query_a,3)==original.duty_at(program,donor_a,3)
+    assert original.duty_at(program,query_a.to_dict()['key_preimage'],3)==original.duty_at(program,query_a,3)
+    assert original.duty_at(program,query_a.to_dict(),3)==original.duty_at(program,query_a,3)
+    assert original.original_units_for_query(program,query_a.to_dict())==program['units']
+    for bad in (query_b,query_b.to_dict()['key_preimage'],query_b.to_dict()):
+        with pytest.raises(ValueError,match='external native duty original'):
+            original.duty_at(program,bad,3)
+    calls.clear()
+    # Call the actual method rather than the fixture's substitute raw lambda.
+    with patch.object(sensors,'raw_native') as native,pytest.raises(ValueError,match='external native duty original'):
+        scene.SceneSensors.raw(sensors,query_b,3,None)
+    native.assert_not_called()
+    with patch.object(sensors,'raw_native',return_value='EXPLICIT-NONHUMAN-RAW') as native:
+        assert scene.SceneSensors.raw(sensors,donor_a,3,None)=='EXPLICIT-NONHUMAN-RAW'
+        native.assert_called_once()
+
+
 def test_known_arm_is_latched_across_original_owner_ambiguity_and_missing_pose():
     sensors,state,h,rows,_=scene_world()
     for tick in (2,3):

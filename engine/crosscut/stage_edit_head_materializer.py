@@ -86,6 +86,11 @@ class StageEditHeadMaterializerInputError(StageEditHeadMaterializerError, ValueE
 
 
 def _sha256_file(path: Path) -> str:
+    from .request_work_lease import current_request_work_phase
+    phase=current_request_work_phase()
+    if phase is not None:
+        phase.charge('identity_reads')
+        phase.charge('model_hash_bytes',path.stat().st_size)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -1162,6 +1167,9 @@ def materialize_stage_edit_head_frames_v2(
     )
     history_contract = stage_edit_recent_history_mask_contract(schema)
     try:
+        from .request_work_lease import current_request_work_phase
+        phase=current_request_work_phase()
+        if phase is not None:phase.charge('model_loads',model='stage_edit_dynamic_crop_v2')
         model, loaded_metadata = load_stage_edit_dynamic_crop_checkpoint_v2(
             checkpoint,
             expected_schema=schema,
@@ -1174,6 +1182,7 @@ def materialize_stage_edit_head_frames_v2(
         batch = tensorize_stage_edit_batch(
             (model_sequence,), schema, metadata.base_model_config
         )
+        if phase is not None:phase.charge('model_calls',model='stage_edit_dynamic_crop_v2')
         output = model(batch)
         import mlx.core as mx
 
@@ -1368,6 +1377,9 @@ def materialize_stage_edit_head_frames_v3(
                     f"contextual runtime token {token_index} source/family identity changed"
                 )
     try:
+        from .request_work_lease import current_request_work_phase
+        phase=current_request_work_phase()
+        if phase is not None:phase.charge('model_loads',model='stage_edit_dynamic_crop_v3')
         model, loaded_metadata = load_stage_edit_dynamic_crop_checkpoint_v3(
             checkpoint,
             expected_schema=schema,
@@ -1380,6 +1392,7 @@ def materialize_stage_edit_head_frames_v3(
         batch = tensorize_stage_edit_batch(
             (model_sequence,), schema, metadata.base_model_config
         )
+        if phase is not None:phase.charge('model_calls',model='stage_edit_dynamic_crop_v3')
         output = model(batch)
         import mlx.core as mx
 

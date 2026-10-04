@@ -44,7 +44,8 @@ class Reporter:
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'local tools required')
 class SceneSourceNormalAnalyzeTests(unittest.TestCase):
-    def run_normal(self,*,corrupt_parent=False,external_original=False,absent_look=False):
+    def run_normal(self,*,corrupt_parent=False,external_original=False,absent_look=False,
+            learned_completion_reject=False):
         with ExitStack() as stack:
             # macOS exposes /var as /private/var. AnalysisRequest canonicalizes
             # source paths, so the baseline fixture must use that SAME domain;
@@ -91,11 +92,25 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
                     close_values=[.20]*20,nonwide_values=[.60]*20)
             policy_path=root/'EXPLICIT_SYNTHETIC_MONTAGE_PROFILE.json'
             _write(policy_path,profile);policy=load_professional_montage_policy(policy_path)
+            model_context=None
+            if learned_completion_reject:
+                from engine.tests.test_stage_edit_single_completion import synthetic_complete_generation
+                generated,_=synthetic_complete_generation(root,sources=paths,section_plan=bundle.section_plan,
+                    duration=16,source_offsets=(1.,)*8,width=320,height=180,fps=30.,prefer_long_spans=True)
+                generated.write_json(root/'NONHUMAN-generation-audit.json')
+                model_context=dict(bundle=None,motion=None,generation=generated,snapshot=None,
+                    causal_audit={'explicit_synthetic_heads':True},policy=policy,motion_profile=None,
+                    profile_payload=None,montage_config=pipeline._rendered_montage_config_from_policy(
+                        policy,require_complete_role_duration_policy=True),
+                    audit_path=root/'NONHUMAN-generation-audit.json')
+                self.learned_materialization=stack.enter_context(patch(
+                    'crosscut.pipeline.materialize_stage_edit_visual_candidate',
+                    side_effect=ValueError('EXPLICIT_SYNTHETIC_SELECTED_COMPLETION_REJECTED')))
             fixtures=dict(_load_stage_edit_montage_policy=policy,_align_sequentially=(alignment,None),
                 _common_master_range=(0.,16.),analyze_rhythm=rhythm,build_section_plan=bundle.section_plan,
                 build_group_draft=draft,build_visual_timeline=bundle.visual_timeline,
                 repair_visual_timeline_boundaries=VisualBoundaryRepairPlan(bundle.visual_timeline,(bundle.visual_timeline,),(),1,()),
-                _review_first_registered_group_generation=None,analyze_source_derivative_diversity=scene_derivative_fixture(),
+                _review_first_registered_group_generation=model_context,analyze_source_derivative_diversity=scene_derivative_fixture(),
                 detect_scene_changes_in_video_cached=((),{'detection_policy':'explicit_chart_fixture'}),
                 analyze_source_look_match=None,build_boundary_affine_plan=None,build_boundary_subject_alignment_plan=None,
                 build_editorial_motion_plan=None,build_group_transition_plan=None)
@@ -175,6 +190,21 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
                         width=p.width,height=p.height) for p in rendered],logs=reporter.rows),indent=2))
             self.assertIsNotNone(selected[1],(failure,reporter.rows[-20:]))
             return bundle,selected[1],qa,rendered,calls,failure
+
+    def test_normal_learned_failure_completes_one_selected_rank_not_eight_then_keeps_original_qa(self):
+        _,manifest,reports,rendered,_,failure=self.run_normal(learned_completion_reject=True)
+        self.assertEqual(self.learned_materialization.call_count,1,failure)
+        selected=self.learned_materialization.call_args.args[0]
+        receipt=manifest['review_first_visual_selection']['complete_path_numeric_selection']
+        self.assertEqual(receipt['selected_rank'],selected.rank)
+        self.assertEqual(len(receipt['compared_complete_paths']),8)
+        self.assertEqual(receipt['maximum_selected_completions'],1)
+        self.assertFalse(receipt['native_scene_selection_performed'])
+        self.assertFalse(receipt['quality_approved'])
+        self.assertGreaterEqual(len(rendered),2,failure)
+        self.assertTrue(reports,failure)
+        self.assertFalse(reports[-1][1]['passed'])
+        self.assertFalse(manifest['app_result_exposure']['delivery_completion_message_allowed'])
 
     def test_external_original_absence_is_retained_before_normal_authoring_through_final_replay(self):
         baseline,manifest,reports,rendered,calls,failure=self.run_normal(external_original=True,absent_look=True)

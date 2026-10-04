@@ -34,6 +34,65 @@ def fail():
     raise ValueError("injected model failure")
 
 
+def phase_budget_calls(*, calls, event_file, exit_after=False):
+    """Counter-reset control; the callback is NOT an actual neural model."""
+    import os
+    from pathlib import Path
+    from time import monotonic
+    from crosscut.group_joint_source_camera import JointGroupWorkBudget
+    for index in range(calls):
+        budget = JointGroupWorkBudget(absolute_deadline=monotonic()+30.)
+        budget.spend("model_calls", model="synthetic-phase-observer")
+        with Path(event_file).open("a") as stream:
+            stream.write(str(index)+"\n")
+    if exit_after:
+        os._exit(7)
+    return dict(callback_count=calls, actual_neural_model=False)
+
+
+def phase_numeric_primitive():
+    from time import monotonic
+    from crosscut.group_joint_source_camera import JointGroupWorkBudget
+    budget = JointGroupWorkBudget(absolute_deadline=monotonic()+30.)
+    value = budget.measure_primitive(label="synthetic-numeric-return", input_binding={"source":0},
+        work={"pose_comparisons":2}, maximum_result_bytes=128, producer=lambda:(1,2.))
+    return dict(value=value, local_journal=budget.primitive_journal.to_dict())
+
+
+def phase_blocked_primitive(*,pid_file):
+    from time import monotonic
+    from crosscut.group_joint_source_camera import JointGroupWorkBudget
+    budget=JointGroupWorkBudget(absolute_deadline=monotonic()+30.)
+    return budget.measure_primitive(label='explicit-nonhuman-blocked-native',input_binding={'source':0},
+        work={'pose_comparisons':2},maximum_result_bytes=128,producer=lambda:native_block(pid_file=pid_file))
+
+
+def phase_oversized_result():
+    return b"x"*80000
+
+
+def phase_chart_observations(*, domain, model_path, event_file, frames):
+    """Real native decoder/session; explicitly non-human pixel-mean observer."""
+    from pathlib import Path
+    from time import monotonic
+    from crosscut.group_joint_observations import GroupJointObservationSession
+    from crosscut.group_joint_source_camera import JointGroupWorkBudget
+    reports=[]
+    for native in frames:
+        # Deliberately reopen sessions. The local counts all restart at zero;
+        # parent-owned admission must nevertheless retain prior work.
+        budget=JointGroupWorkBudget(absolute_deadline=monotonic()+30.)
+        with GroupJointObservationSession(domain=domain,budget=budget) as session:
+            def observer(pixels):
+                with Path(event_file).open("a") as stream:
+                    stream.write(str(native)+"\n")
+                return float(pixels.mean())
+            session.register_model("nonhuman-chart-mean",model_path,observer)
+            value=session.observe_native(0,native,model="nonhuman-chart-mean")
+            reports.append(dict(value=value,diagnostics=session.diagnostics()))
+    return dict(reports=reports,actual_neural_model=False,human_quality=False)
+
+
 def native_exit_with_stderr():
     import os
     os.write(2, b'x' * 200_000)
@@ -163,7 +222,7 @@ def native_descendant(*, pid_file):
     time.sleep(30)
 
 
-def synthetic_mlx_head():
+def synthetic_mlx_head(version=3):
     """Real tiny CPU forward with explicitly synthetic readiness evidence."""
     from pathlib import Path
     import tempfile
@@ -171,19 +230,23 @@ def synthetic_mlx_head():
     import mlx.core as mx
     from tests.test_stage_edit_head_materializer import StageEditHeadMaterializerTests
     from crosscut.stage_edit_dynamic_crop_head_v3 import StageEditTransformerDynamicCropV3, save_stage_edit_dynamic_crop_checkpoint_v3
-    from crosscut.stage_edit_head_materializer import materialize_stage_edit_head_frames_v3
+    from crosscut.stage_edit_dynamic_crop_head_v2 import StageEditTransformerDynamicCropV2, save_stage_edit_dynamic_crop_checkpoint_v2
+    from crosscut.stage_edit_head_materializer import materialize_stage_edit_head_frames_v3,materialize_stage_edit_head_frames_v2
     from crosscut.stage_edit_transformer import StageEditReadinessReport, mlx_runtime_version
     fixture = StageEditHeadMaterializerTests()
     fixture.setUp()
     with tempfile.TemporaryDirectory() as directory, mx.stream(mx.cpu):
         path = Path(directory)
-        saved = save_stage_edit_dynamic_crop_checkpoint_v3(path,
-            StageEditTransformerDynamicCropV3(fixture.config), fixture.metadata_v3)
+        if version not in (2,3):raise ValueError('explicit tiny v2/v3 fixture only')
+        saved = (save_stage_edit_dynamic_crop_checkpoint_v3(path,
+            StageEditTransformerDynamicCropV3(fixture.config), fixture.metadata_v3) if version==3 else
+            save_stage_edit_dynamic_crop_checkpoint_v2(path,StageEditTransformerDynamicCropV2(fixture.config),fixture.metadata))
         readiness = StageEditReadinessReport(architecture_available=True, learned_inference_ready=True,
             status="production_checkpoint_ready", reason="synthetic worker serialization test only",
             mlx_version=mlx_runtime_version(), checkpoint_path=str(path.resolve()), training_steps=saved.training_steps,
-            checkpoint_format="dynamic_crop_v3", dynamic_crop_version=3,
-            checkpoint_metadata_filename="dynamic-crop-v3-metadata.json")
+            checkpoint_format=f"dynamic_crop_v{version}", dynamic_crop_version=version,
+            checkpoint_metadata_filename=f"dynamic-crop-v{version}-metadata.json")
         with patch('crosscut.stage_edit_head_materializer.stage_edit_readiness_report', return_value=readiness):
-            return materialize_stage_edit_head_frames_v3(checkpoint_directory=path, sequence=fixture.sequence,
+            if version==3:return materialize_stage_edit_head_frames_v3(checkpoint_directory=path, sequence=fixture.sequence,
                 canonical_source_ids=('A','B'), derivative_family_id_by_source={'A':0,'B':1})
+            return materialize_stage_edit_head_frames_v2(checkpoint_directory=path,sequence=fixture.sequence,canonical_source_ids=('A','B'))

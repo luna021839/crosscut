@@ -264,6 +264,13 @@ def _program(units, plan_identity, eligible, global_execution_scope=None):
                 raise ValueError('global original duties changed their original whole-unit role/interval')
         value['global_execution_scope']=global_execution_scope
         value['original_owned_programme_plan_sha256']=global_execution_scope['original_owned_program']['original_plan_identity']
+        value['original_unit_bindings']=[dict(numeric_original_unit_id=original.unit_id,
+            native_original_unit_id=unit['original_unit_id'],
+            original_plan_identity=original.role_program['original_plan_identity'],
+            original_role_program=original.role_program,
+            first_output_frame=original.first_output_frame,end_output_frame=original.end_output_frame,
+            original_hypothesis_branches=[b['original_subject_hypothesis_id'] for b in unit['branches']])
+            for original,unit in zip(owned,units,strict=True)]
     value['program_sha256'] = family.digest(value)
     # Canonical transport types at the producer, not equality weakened after
     # worker/JSON replay. Tuple/list conversion cannot fabricate a new failure.
@@ -358,15 +365,67 @@ def validate_original_duty_program(program, *, raw_inventory):
     return program
 
 
-def original_units_for_query(program,state):
+class NativeOriginalDutyResolver:
+    """One validated numeric-unit/native-duty mapping, not a donor role claim.
+
+    Native lifecycle production still supports uniform whole units only. This
+    resolver does not manufacture mixed temporal evidence or actor identity.
+    Its owner validates and freezes the entire native programme before use.
+    """
+    def __init__(self,program):
+        self.program=program
+        self.bindings={b['numeric_original_unit_id']:b for b in program.get('original_unit_bindings',())}
+        if len(self.bindings)!=len(program.get('original_unit_bindings',())):
+            raise ValueError('original numeric/native duty unit mapping is duplicated')
+
+    def require_query_origin(self,state):
+        from .group_scene_camera_queries import GroupSceneRoleQuery
+        if isinstance(state,GroupSceneRoleQuery):
+            identity,epoch,first,end,role=(state.original_unit_id,state.epoch_index,state.first_output_frame,
+                state.end_output_frame,None if state.role is None else state.role.value)
+            claimed=state.original_role_program
+        elif isinstance(state,dict):
+            p=state.get('key_preimage',state)
+            if 'original_unit_id' not in p and 'whole_camera_sha256' not in p:return
+            identity,epoch,first,end,role=(p.get('original_unit_id'),p.get('original_epoch_index'),
+                p.get('first'),p.get('end'),p.get('role'))
+            claimed=state.get('original_role_program')
+        else:return
+        binding=self.bindings.get(identity) if isinstance(identity,str) else None
+        if (binding is None or self.program.get('contract')!=GLOBAL_CONTRACT
+                or binding['original_plan_identity']!=self.program['original_owned_programme_plan_sha256']
+                or claimed is not None and family.digest(claimed)!=family.digest(binding['original_role_program'])
+                or type(epoch) is not int or not 0<=epoch<len(binding['original_role_program']['epochs'])):
+            raise ValueError('query original role programme is not bound to this external native duty original')
+        row=binding['original_role_program']['epochs'][epoch]
+        if (type(first) is not int or type(end) is not int
+                or not row['first_output_frame']<=first<end<=row['end_output_frame'] or role!=row['role']):
+            raise ValueError('query original epoch address changed its external native duty scope')
+
+
+def _require_query_origin(program,state,resolver):
+    if resolver is None:resolver=NativeOriginalDutyResolver(program)
+    if resolver.program is not program:
+        raise ValueError('original duty resolver belongs to a different native programme')
+    resolver.require_query_origin(state)
+
+
+def _query_address(state):
+    if hasattr(state,'role'):
+        return state.first_output_frame,state.end_output_frame,state.role.value
+    p=state.get('key_preimage',state)
+    return p['first'],p['end'],p['role']
+
+
+def original_units_for_query(program,state,*,resolver=None):
     """Dependency closure on ORIGINAL units, never candidate-owned lifecycles.
 
     A camera/query may be a strict subspan or cross several original units of
     the same role. This does not create/reset a branch or waive a different
     original role. Full programme/raw closure is validated by its owner first.
     """
-    first,end,role = (state.first_output_frame,state.end_output_frame,state.role.value) if hasattr(state,'role') else (
-        state['first'],state['end'],state['role'])
+    _require_query_origin(program,state,resolver)
+    first,end,role = _query_address(state)
     if type(first) is not int or type(end) is not int or not 0<=first<end:
         raise ValueError('original duty query has invalid candidate bounds')
     units=[u for u in program['units'] if u['first_output_frame']<end and u['end_output_frame']>first]
@@ -378,11 +437,11 @@ def original_units_for_query(program,state):
     return units
 
 
-def duty_at(program, state, tick):
+def duty_at(program, state, tick,*,resolver=None):
     if program is None:
         return None
-    first,end,role = (state.first_output_frame,state.end_output_frame,state.role.value) if hasattr(state,'role') else (
-        state['first'],state['end'],state['role'])
+    _require_query_origin(program,state,resolver)
+    first,end,role = _query_address(state)
     if (type(first) is not int or type(end) is not int or type(tick) is not int
             or not 0<=first<=tick<end):
         raise ValueError('candidate frame borrowed a nonincident original duty tick')
@@ -401,8 +460,8 @@ def duty_at(program, state, tick):
         output_tick=tick, row_sha256=family.digest(row), required_part_names=row['required_part_names'])
 
 
-def bind_row_obligations(program,state,tick):
-    ref = duty_at(program,state,tick)
+def bind_row_obligations(program,state,tick,*,resolver=None):
+    ref = duty_at(program,state,tick,resolver=resolver)
     # Unchanged formation/composition policy remains explicit, not claimed solved.
     names = None if ref is None or state.role.value not in FOCAL else tuple(ref['required_part_names'])
     return ref,names
