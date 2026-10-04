@@ -58,7 +58,7 @@ def select_closeup_review_path(*, cells, edge_at, fps, style, maximum_changed_fr
         if (any(type(cell[k]) is not int for k in ('first', 'end', 'original_source'))
                 or not 0 <= cell['first'] < cell['end']
                 or i and cells[i-1]['end'] != cell['first']
-                or not 1 <= len(cell['alternatives']) <= 4
+                or not 1 <= len(cell['alternatives']) <= 8
                 or sum(bool(a['keep']) for a in cell['alternatives']) != 1):
             raise ValueError('every closeup cell needs exact contiguous scope and one real KEEP')
         if cell.get('protected') and (len(cell['alternatives']) != 1 or not cell['alternatives'][0]['keep']):

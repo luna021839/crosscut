@@ -70,9 +70,16 @@ def pair_risk(a,b,ma=None,mb=None):
         +.65*(1. if appearance is None else max(0.,.5-appearance))
         +.35*(.5 if motion is None else motion)+.1*unknown)
     near = min(0. if a is None else a['near'],0. if b is None else b['near'])
+    choreography_motion = (ma is not None and mb is not None
+        and ma['basis'] == mb['basis'] == 'owned_upper_body_shape_velocity')
+    # Mouth/eye landmark deformation may be useful face-pose evidence, but it
+    # is not measured arm/choreography continuity. Do not buy an authored
+    # moving-dance-cut bonus with that fallback when the body is unobserved.
     matched = (near*kinetic*max(0.,min(1.,(appearance-.25)/.35))*math.exp(-2.*shape-motion)
-        if mutual and appearance is not None and shape is not None and motion is not None else 0.)
+        if choreography_motion and mutual and appearance is not None
+        and shape is not None and motion is not None else 0.)
     return dict(risk=float(risk),moving_match=float(matched),face_geometry_risk=geometry,
         pose_or_face_shape_risk=shape,appearance_cosine=appearance,mutual_appearance_hypothesis=mutual,
-        motion_direction_phase_risk=motion,kinetic_strength=kinetic,same_actor_certified=False,
+        motion_direction_phase_risk=motion,kinetic_strength=kinetic,
+        choreography_motion_observed=choreography_motion,same_actor_certified=False,
         unknown_metric_count=unknown)

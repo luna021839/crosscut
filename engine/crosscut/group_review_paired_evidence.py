@@ -28,6 +28,7 @@ class PairedEvidencePlan:
     context_frames: int = 3
     appearance_stride: int = 6
     extra_appearance_ticks: tuple[int, ...] = ()
+    incident_ticks: tuple[int, ...] = ()
 
     def __post_init__(self):
         if (any(type(v) is not int for v in (self.output_frame_count, self.first, self.end,
@@ -44,6 +45,11 @@ class PairedEvidencePlan:
                     < min(self.output_frame_count, self.end+self.context_frames)
                     for t in self.extra_appearance_ticks)):
             raise ValueError('paired extra appearance requests need a frozen common incident scope')
+        if (not isinstance(self.incident_ticks,tuple) or len(self.incident_ticks)>512
+                or tuple(sorted(set(self.incident_ticks)))!=self.incident_ticks
+                or any(type(t) is not int or not self.first<=t<=self.end
+                    or not 0<t<self.output_frame_count for t in self.incident_ticks)):
+            raise ValueError('paired incidents need a frozen common entry/interior/exit cut union')
 
     @property
     def interior_ticks(self): return tuple(range(self.first, self.end))
@@ -64,6 +70,7 @@ class PairedEvidencePlan:
 
     def to_dict(self):
         return dict(contract=CONTRACT, output_frame_count=self.output_frame_count, fps=self.fps,
+            **({'incident_ticks':list(self.incident_ticks)} if self.incident_ticks else {}),
             first=self.first, end=self.end, original_duty_root=self.original_duty_root,
             editorial_intent_root=self.editorial_intent_root, context_frames=self.context_frames,
             appearance_stride=self.appearance_stride, interior_ticks=list(self.interior_ticks),
@@ -153,7 +160,8 @@ def compare_paired_metric_series(*, plan, original, candidate, weights, minimum_
             raise ValueError('paired weights must be finite nonnegative risks')
         before, after = original['metrics'][name], candidate['metrics'][name]
         if (not isinstance(before, (tuple, list)) or not before or len(before) != len(after)
-                or len(before) not in (len(plan.interior_ticks), 2)):
+                or len(before) not in (len(plan.interior_ticks),
+                    len(plan.incident_ticks) if plan.incident_ticks else 2)):
             raise ValueError('paired metric changed its output/incident sample domain')
         differences = []
         for i, (a, b) in enumerate(zip(before, after, strict=True)):

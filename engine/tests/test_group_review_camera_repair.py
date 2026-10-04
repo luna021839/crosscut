@@ -4,6 +4,7 @@ from crosscut.group_review_camera_repair import (FramingDescriptor, framing_desc
     geometry_cost, compare_two_sided_geometry, fit_whole_camera_track,
     measured_native_support_preserved,effective_face_detail_pixels,transformed_descriptor)
 from crosscut.group_review_camera_repair import relax_measured_camera_track
+from crosscut.group_review_camera_repair import ReviewActorSelection
 from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack
 import pytest
 
@@ -15,6 +16,14 @@ def face(h=.1, x=.45, y=.3):
 
 def descriptor(h=.1, x=.5):
     return FramingDescriptor((x,.4),h,h/2,None,0,False)
+
+
+def test_unmatched_actor_choice_cannot_become_largest_face_salience():
+    row=face()
+    assert framing_descriptor(row,actor_selection=ReviewActorSelection('DEFAULT_SALIENCE')) is not None
+    assert framing_descriptor(row,actor_selection=ReviewActorSelection.occurrence(None)) is None
+    assert framing_descriptor(row,actor_selection=ReviewActorSelection.occurrence(0)).frame_local_head_id==0
+    assert framing_descriptor(row,actor_selection=ReviewActorSelection.occurrence(99)) is None
 
 def test_unknown_is_not_zero_or_geometry_gain():
     assert geometry_cost(None,descriptor()) is None
@@ -139,3 +148,40 @@ def test_dense_correction_rejects_sample_index_or_unbounded_search():
     with pytest.raises(ValueError,match='bounded ordered'):
         relax_measured_camera_track(track,[face()],sample_times=(0.,),maximum_trials=100000,
             required_support_check=measured_native_support_preserved)
+
+
+def test_context_face_does_not_override_explicit_original_focal_support_consumer():
+    rows=[face(.1,.45) for _ in range(3)]
+    for row in rows:
+        row['native_observation']['heads'].append(dict(observation_id=9,box_xywh=[.002,.25,.03,.06]))
+    conservative=fit_whole_camera_track(rows,descriptor(.15),descriptor(.15),duration=1.)
+    calls=[]
+    def focal_support(row,key):
+        calls.append(key.zoom)
+        focal=deepcopy(row)
+        focal['native_observation']['heads']=focal['native_observation']['heads'][:1]
+        return measured_native_support_preserved(focal,key)
+    explicit=fit_whole_camera_track(rows,descriptor(.15),descriptor(.15),duration=1.,
+        head_ids=(0,0,0),required_support_check=focal_support)
+    assert conservative.evaluate(.5).zoom==1.
+    assert explicit.evaluate(.5).zoom>1.4 and calls
+
+
+def test_explicit_required_support_failure_cannot_be_ignored_in_primary_camera_fit():
+    assert fit_whole_camera_track([face() for _ in range(3)],descriptor(.15),descriptor(.15),
+        duration=1.,required_support_check=lambda row,key:False) is None
+    with pytest.raises(ValueError,match='explicit boolean'):
+        fit_whole_camera_track([face() for _ in range(3)],descriptor(.15),descriptor(.15),
+            duration=1.,required_support_check=lambda row,key:'UNKNOWN')
+
+
+def test_offscreen_projected_wrist_cannot_be_observed_pose_support():
+    row=face();joints=[[.4,.4,.9],[.6,.4,.9],[.4,.6,.9],[.6,.6,.9],
+        [.4,1.1,.9],[.6,.8,.9],[.4,.7,.9],[.6,.7,.9]]
+    row['projection']['people']=[dict(observation_id=0,unique_head_observation_id=0,
+        projected_box_xywh=[.3,.2,.4,.8],visible_fraction=1.,projected_upper_body_xyc=joints,
+        part_states=dict(shoulder_anchor='observed',left_arm='observed',right_arm='observed'))]
+    row['native_observation']['people']=[dict(observation_id=0,confidence=.9)]
+    shape=framing_descriptor(row).pose_shape
+    assert 4 not in {p[0] for p in shape}
+    assert {0,1,2,3,5}<={p[0] for p in shape}

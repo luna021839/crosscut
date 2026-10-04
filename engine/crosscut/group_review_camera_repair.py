@@ -16,6 +16,23 @@ CONTRACT = 'measured_two_sided_group_camera_review_repair_v2'
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewActorSelection:
+    """A typed frame-local choice. UNMATCHED never means largest face."""
+    state: str
+    head_id: int | None = None
+
+    def __post_init__(self):
+        if (self.state not in ('UNMATCHED', 'HEAD_OCCURRENCE', 'DEFAULT_SALIENCE')
+                or (self.state == 'HEAD_OCCURRENCE') != (type(self.head_id) is int)
+                or self.head_id is not None and self.head_id < 0):
+            raise ValueError('review actor selection needs an explicit occurrence or unmatched state')
+
+    @classmethod
+    def occurrence(cls, head_id):
+        return cls('UNMATCHED') if head_id is None else cls('HEAD_OCCURRENCE', head_id)
+
+
+@dataclass(frozen=True, slots=True)
 class FramingDescriptor:
     head_center: tuple[float, float] | None
     face_height: float | None
@@ -36,13 +53,22 @@ class FramingDescriptor:
             body_box_is_required_cast=False,persistent_identity_certified=False, motion_observed=False)
 
 
-def framing_descriptor(measurement,*,head_id=None):
+def framing_descriptor(measurement,*,head_id=None,actor_selection=None):
     """One actual face/owned-body hypothesis, never a semantic actor ID.
 
     The optional frame-local ID is for a separately measured appearance path.
     It cannot fall back to a different face if that hypothesis is unavailable.
     A face descriptor must not borrow the largest unrelated body's geometry.
     """
+    if actor_selection is not None:
+        if not isinstance(actor_selection, ReviewActorSelection):
+            raise ValueError('framing actor choice must be typed')
+        if actor_selection.state == 'UNMATCHED':
+            return None
+        if actor_selection.state == 'HEAD_OCCURRENCE':
+            head_id = actor_selection.head_id
+        elif head_id is not None:
+            raise ValueError('default salience cannot also select a head occurrence')
     row = measurement['projection']
     heads = [h for h in row['heads'] if h['visible_fraction'] >= .995
         and all(math.isfinite(v) for v in h['projected_box_xywh'])
@@ -63,7 +89,8 @@ def framing_descriptor(measurement,*,head_id=None):
     if len(owners) == 1:
         p = owners[0]; joints = p['projected_upper_body_xyc']
         if (len(joints) == 8 and p['part_states'].get('shoulder_anchor') == 'observed'
-                and min(joints[0][2], joints[1][2]) >= .42):
+                and min(joints[0][2], joints[1][2]) >= .42
+                and _inside(joints[0][:2]) and _inside(joints[1][:2])):
             center = tuple((joints[0][i]+joints[1][i])/2 for i in range(2))
             shoulder = math.hypot(joints[0][0]-joints[1][0], (joints[0][1]-joints[1][1])*9/16)
             if shoulder > 1e-6:
@@ -72,7 +99,8 @@ def framing_descriptor(measurement,*,head_id=None):
                     if p['part_states'].get(name) == 'observed': allowed.update(indices)
                 shape = tuple((index, (point[0]-center[0])/shoulder,
                     (point[1]-center[1])*9/16/shoulder)
-                    for index,point in enumerate(joints[:6]) if index in allowed and point[2] >= .42)
+                    for index,point in enumerate(joints[:6]) if index in allowed and point[2] >= .42
+                    and _inside(point[:2]))
     head_native=None if head is None else next(p for p in native['heads'] if p['observation_id']==head['observation_id'])
     pixels=None if head_native is None else head_native['box_xywh'][3]*native['frame_size_wh'][1]
     size=measurement.get('query',{}).get('camera',{}).get('output_size')
@@ -209,8 +237,19 @@ def relax_measured_camera_track(track, measurements, *, sample_times, required_s
         unknown_correspondence_certified=False,quality_approved=False)
 
 
-def fit_endpoint_camera(measurement,target,*,time_seconds,maximum_zoom=1.75,head_id=None):
+def _review_support_allowed(measurement,key,required_support_check):
+    value=(measured_native_support_preserved(measurement,key) if required_support_check is None
+        else required_support_check(measurement,key))
+    if type(value) is not bool:
+        raise ValueError('review required-support consumer must return an explicit boolean')
+    return value
+
+
+def fit_endpoint_camera(measurement,target,*,time_seconds,maximum_zoom=1.75,head_id=None,
+        required_support_check=None):
     if not 1. <= maximum_zoom <= 2.:raise ValueError('review camera zoom cap must be declared within renderer range')
+    if required_support_check is not None and not callable(required_support_check):
+        raise ValueError('review camera requires a bound original-support consumer')
     descriptor=framing_descriptor(measurement,head_id=head_id)
     if descriptor is None:return None
     if target is not None and descriptor.face_height is not None and target.face_height is not None:
@@ -232,7 +271,7 @@ def fit_endpoint_camera(measurement,target,*,time_seconds,maximum_zoom=1.75,head
         for cx,cy in centers:
             try:key=EditorialTransformKeyframe(time_seconds,zoom,cx,cy)
             except ValueError:continue
-            if not measured_native_support_preserved(measurement,key):continue
+            if not _review_support_allowed(measurement,key,required_support_check):continue
             value=transformed_descriptor(descriptor,key)
             cost=geometry_cost(target,value)
             if cost is None:
@@ -244,8 +283,14 @@ def fit_endpoint_camera(measurement,target,*,time_seconds,maximum_zoom=1.75,head
 
 
 def fit_whole_camera_track(measurements,left,right,*,duration,maximum_zoom=1.75,
-        sample_times=None,head_ids=None):
-    """Fit a single continuous camera, then verify all prefix measurements."""
+        sample_times=None,head_ids=None,required_support_check=None):
+    """Fit one camera against explicit original duties when a bound consumer exists.
+
+    The conservative default preserves all measured native support. A review
+    owner may instead bind the immutable original required-part programme;
+    context faces/body boxes must not silently become a required whole cast.
+    This callback does not grant normal admission or declare UNKNOWN passed.
+    """
     if len(measurements)<3 or duration<=0:raise ValueError('whole camera needs a measured prefix and positive duration')
     if sample_times is None:
         camera=measurements[0].get('query',{}).get('camera',{})
@@ -259,8 +304,10 @@ def fit_whole_camera_track(measurements,left,right,*,duration,maximum_zoom=1.75,
         raise ValueError('review camera fit needs actual ordered output sample phases')
     if head_ids is None:head_ids=(None,)*len(measurements)
     if len(head_ids)!=len(measurements):raise ValueError('review camera actor samples differ')
-    first=fit_endpoint_camera(measurements[0],left,time_seconds=0.,maximum_zoom=maximum_zoom,head_id=head_ids[0])
-    last=fit_endpoint_camera(measurements[-1],right,time_seconds=duration,maximum_zoom=maximum_zoom,head_id=head_ids[-1])
+    first=fit_endpoint_camera(measurements[0],left,time_seconds=0.,maximum_zoom=maximum_zoom,
+        head_id=head_ids[0],required_support_check=required_support_check)
+    last=fit_endpoint_camera(measurements[-1],right,time_seconds=duration,maximum_zoom=maximum_zoom,
+        head_id=head_ids[-1],required_support_check=required_support_check)
     if first is None or last is None:return None
     # Neutral/intermediate framing is blended, not another physical edit.
     midpoint=EditorialTransformKeyframe(duration/2,(first.zoom+last.zoom)/2,
@@ -276,7 +323,7 @@ def fit_whole_camera_track(measurements,left,right,*,duration,maximum_zoom=1.75,
             .5+(k.center_x-.5)*alpha,.5+(k.center_y-.5)*alpha) for k in track.keyframes)
         try:trial=EditorialTransformTrack(keys,reason=track.reason)
         except ValueError:continue
-        if not all(measured_native_support_preserved(row,trial.evaluate(t))
+        if not all(_review_support_allowed(row,trial.evaluate(t),required_support_check)
                 for t,row in zip(sample_times,measurements,strict=True)):continue
         endpoints=(transformed_descriptor(framing_descriptor(measurements[0],head_id=head_ids[0]),trial.evaluate(0.)),
             transformed_descriptor(framing_descriptor(measurements[-1],head_id=head_ids[-1]),trial.evaluate(duration)))

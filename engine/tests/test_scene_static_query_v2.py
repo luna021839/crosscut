@@ -90,3 +90,14 @@ def test_recorded_numeric_reprojection_requires_registered_camera():
     forged=replace(query,camera=replace(query.camera,native_frame_indices=tuple(n+1 for n in query.camera.native_frame_indices)))
     with pytest.raises(ValueError,match='registered'):
         reproject_recorded_static_query(forged,59,raw,domain=domain)
+
+
+def test_compact_review_reprojection_keeps_actual_coordinates_and_native_parent():
+    domain,query,raw=recorded_fixture()
+    full=reproject_recorded_static_query(query,59,raw,domain=domain)
+    compact=reproject_recorded_static_query(query,59,raw,domain=domain,compact=True)
+    assert compact['projection']==full['projection']
+    assert compact['native_observation']==full['native_observation']
+    assert compact['query']['registered_query_sha256']==query.key
+    assert compact['query']['camera']['output_size']==list(query.camera.output_size)
+    assert not compact['fresh_inference_performed'] and not compact['quality_approved']

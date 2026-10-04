@@ -102,3 +102,31 @@ def test_actual_capture_cannot_relabel_output_tick_or_native_clock():
     p,capture=capture_fixture();capture['rows']['20']['projection']['native_frame_index']=999
     with pytest.raises(ValueError,match='native clock'):
         validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64)
+
+
+def test_incident_union_includes_exit_even_when_internal_metrics_are_identical():
+    p=PairedEvidencePlan(100,30.,20,30,'a'*64,'b'*64,
+        incident_ticks=(20,23,26,30),extra_appearance_ticks=(18,19,20,21,22,23,24,25,26,27,28,29,30,31,32))
+    requests=dict(interior_ticks=p.interior_ticks,left_ticks=p.left_ticks,
+        right_ticks=p.right_ticks,appearance_ticks=p.appearance_ticks)
+    a=dict(evidence_plan_sha256=p.identity,requests=requests,metrics=dict(detail=[.2]*10,seam=[.2]*4))
+    b=deepcopy(a);b['metrics']['seam'][-1]=1.2
+    result=compare_paired_metric_series(plan=p,original=a,candidate=b,weights=dict(detail=1.,seam=1.))
+    assert result['verdict']=='WORSE'
+    assert result['components']['seam']['total_items']==4
+    assert p.to_dict()['incident_ticks'][-1]==30
+    assert {30,31,32}<=set(p.appearance_ticks)
+
+
+def test_incident_cut_union_cannot_be_omitted_from_one_series():
+    p=PairedEvidencePlan(100,30.,20,30,'a'*64,'b'*64,incident_ticks=(20,23,26,30))
+    requests=dict(interior_ticks=p.interior_ticks,left_ticks=p.left_ticks,
+        right_ticks=p.right_ticks,appearance_ticks=p.appearance_ticks)
+    a=dict(evidence_plan_sha256=p.identity,requests=requests,metrics=dict(seam=[.2]*4))
+    b=deepcopy(a);b['metrics']['seam']=[.2]*3
+    with pytest.raises(ValueError,match='incident sample domain'):
+        compare_paired_metric_series(plan=p,original=a,candidate=b,weights=dict(seam=1.))
+
+
+def test_legacy_pair_contract_has_no_unrequested_incident_domain():
+    assert 'incident_ticks' not in world()[0].to_dict()

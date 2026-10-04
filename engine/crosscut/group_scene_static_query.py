@@ -75,7 +75,7 @@ def observe_static_role_query(session,query,tick,*,cache=None):
     return StaticRoleMeasurement(freeze(query.to_dict()),tick,freeze(raw.to_dict()),freeze(projected))
 
 
-def reproject_recorded_static_query(query,tick,raw,*,domain):
+def reproject_recorded_static_query(query,tick,raw,*,domain,compact=False):
     """Numeric review reuse only; NEVER a fresh/live native observation.
 
     A persisted detector result may rank another camera over the exact same
@@ -107,8 +107,11 @@ def reproject_recorded_static_query(query,tick,raw,*,domain):
         canonical_segment_phase_seconds=phase,heads=heads,people=people,
         unknown_owner_ids=[p['observation_id'] for p in raw['people'] if p['unique_head_observation_id'] is None],
         physical_limb_masks_observed=False)
+    if type(compact) is not bool:raise ValueError('recorded projection compact mode must be explicit')
+    query_data=(dict(camera=dict(output_fps=query.camera.output_fps,output_size=list(query.camera.output_size)),
+        registered_query_sha256=query.key) if compact else query.to_dict())
     return dict(contract='recorded_source_native_static_query_reprojection_for_review_v1',
-        query=query.to_dict(),output_tick=tick,native_observation=raw,projection=projection,
+        query=query_data,output_tick=tick,native_observation=raw,projection=projection,
         one_frame_static_observation=False,recorded_observation_reprojected=True,
         fresh_inference_performed=False,live_native_authority=False,motion_observed=False,
         actor_identity_certified=False,candidate_admitted=False,quality_approved=False)
