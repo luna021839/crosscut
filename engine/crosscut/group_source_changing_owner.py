@@ -641,6 +641,9 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         plan_sha256=family.digest(family.plan_payload(plan)),metadata_sha256=family.digest(family.metadata_payload(candidate)),
         original_plan_sha256=family.digest(family.plan_payload(old.render_plan)),
         original_metadata_sha256=family.digest(family.metadata_payload(old)),
+        external_original_reference=family.external_reference_binding(context,candidate),
+        external_original_selected_boundary_look_metadata=None if candidate.boundary_look_match is None
+            else family.plain(candidate.boundary_look_match.to_dict()),
         source_domain=context.domain.to_dict(),synchronization_scores=list(context.sync_scores),
         source_identities=[list(v) for v in context.source_identities],dependencies=dict(context.code_dependencies),
         model_path=str(context.model_path),model_identity=list(context.model_identity),model_sha256=context.model_sha256,
@@ -904,6 +907,7 @@ def validate_binding(bundle):
             or dense.get('geometry_sha256')!=family.digest(geometry_payload(bundle.render_plan))):
         raise ValueError('source-changing complete camera/family/uncertainty binding changed')
     family.validate_look_refresh(bundle.render_plan,bundle.boundary_look_match,receipt)
+    family.validate_external_reference_binding(bundle,receipt)
     validate_dense_uncertainty(dense)
     if dense['contract']==SCENE_DENSE_CONTRACT:
         from .group_scene_observations import validate_scene_dense
@@ -936,6 +940,7 @@ def validate_parent(candidate,context):
     receipt=family.plain(candidate.performer_family_review)
     family.validate_look_refresh(candidate.render_plan,candidate.boundary_look_match,receipt,
         original_bundle=context.incumbent)
+    family.validate_external_reference_binding(candidate,receipt,context=context)
     if (receipt['source_domain']!=context.domain.to_dict()
             or receipt['source_identities']!=[list(v) for v in context.source_identities]
             or receipt['dependencies']!=dict(context.code_dependencies)

@@ -207,6 +207,7 @@ class PerformerFamilyContext:
     cache_directory: Path | None = None
     derived_cache_directory: Path | None = None
     source_derivative_binding: Any = None
+    external_original_reference: Any = None
 
 
 def _supported(bundle):
@@ -255,12 +256,16 @@ def freeze_context(*, controller, request, eligible_indices, offsets, timewarps,
         raise ValueError('performer source changed during native clock preparation')
     domain = GroupSourceDomain(tuple(sources), tuple(eligible_indices), tuple(offsets),
         tuple(timewarps), tuple(tuple(v) for v in scene_cut_times), clocks)
+    external = getattr(controller, 'external_original_reference', None)
+    if external is not None:
+        external.validate_source_domain(domain)
+        external.validate_candidate(incumbent, incumbent.render_plan)
     from .group_scene_source_owner import freeze_derivatives
     derivative_binding = freeze_derivatives(source_derivatives, domain, identities)
     return PerformerFamilyContext(incumbent, domain, identities, tuple(sorted(dependencies(model).items())),
         model, _file_identity(model), _file_hash(model), controller.transaction_token(), deadline, tuple(sync_scores),
         getattr(request, 'source_cache_directory', None),
-        getattr(request, 'visual_feature_derived_cache_directory', None), derivative_binding)
+        getattr(request, 'visual_feature_derived_cache_directory', None), derivative_binding, external)
 
 
 def _fresh(context):
@@ -271,6 +276,33 @@ def _fresh(context):
             or context.model_identity != _file_identity(context.model_path)
             or context.model_sha256 != _file_hash(context.model_path)):
         raise ValueError('performer family live source/model/code preimage changed')
+    external = getattr(context, 'external_original_reference', None)
+    if external is not None:
+        external.validate_source_domain(context.domain)
+        external.validate_candidate(context.incumbent, context.incumbent.render_plan)
+
+
+def external_reference_binding(context, candidate):
+    external = getattr(context, 'external_original_reference', None)
+    if external is None:
+        return None
+    external.validate_source_domain(context.domain)
+    external.validate_candidate(candidate, candidate.render_plan)
+    return external.to_dict()
+
+
+def validate_external_reference_binding(candidate, receipt, *, context=None):
+    from .group_external_original_reference import validate_external_original_reference_payload
+    policy = plain(receipt.get('external_original_reference'))
+    if context is not None and policy != external_reference_binding(context, candidate):
+        raise ValueError('child changed the external original policy before fresh parent admission')
+    if policy is not None and receipt.get('external_original_selected_boundary_look_metadata') != (
+            None if candidate.boundary_look_match is None else plain(candidate.boundary_look_match.to_dict())):
+        raise ValueError('external policy selected look differs from the actual complete candidate')
+    validate_external_original_reference_payload(policy, plan=candidate.render_plan,
+        look=candidate.boundary_look_match, source_domain_payload=receipt['source_domain'],
+        source_identities=receipt['source_identities'],
+        live_clocks=None if context is None else context.domain.clocks_by_request)
 
 
 def _schedule(plan, domain):
@@ -588,6 +620,9 @@ def complete_candidate(context, camera_bundle):
             plan_sha256=digest(plan_payload(plan)), metadata_sha256=digest(metadata_payload(candidate)),
             original_plan_sha256=digest(plan_payload(old.render_plan)),
             original_metadata_sha256=digest(metadata_payload(old)),
+            external_original_reference=external_reference_binding(context, candidate),
+            external_original_selected_boundary_look_metadata=None if candidate.boundary_look_match is None
+                else plain(candidate.boundary_look_match.to_dict()),
             source_domain=context.domain.to_dict(), synchronization_scores=list(context.sync_scores), source_identities=[list(v) for v in context.source_identities],
             dependencies=dict(context.code_dependencies), model_path=str(context.model_path),
             model_identity=list(context.model_identity), model_sha256=context.model_sha256,
@@ -689,6 +724,7 @@ def validate_bundle_binding(bundle):
             or receipt.get('metadata_sha256') != digest(metadata_payload(bundle))):
         raise ValueError('performer complete renderer/family/uncertainty binding changed')
     validate_look_refresh(bundle.render_plan,bundle.boundary_look_match,receipt)
+    validate_external_reference_binding(bundle, receipt)
 
 
 def validate_parent(candidate, context):
@@ -701,6 +737,7 @@ def validate_parent(candidate, context):
     receipt = plain(candidate.performer_family_review)
     validate_look_refresh(candidate.render_plan,candidate.boundary_look_match,receipt,
         original_bundle=context.incumbent)
+    validate_external_reference_binding(candidate, receipt, context=context)
     if (receipt['source_domain'] != context.domain.to_dict()
             or receipt['source_identities'] != [list(v) for v in context.source_identities]
             or receipt['dependencies'] != dict(context.code_dependencies)
@@ -805,6 +842,11 @@ def validate_serialized_metadata(complete):
             or look is not None and (not isinstance(look,Mapping) or look.get('enabled') is not True
                 or digest(look.get('segment_tracks'))!=digest(tracks))):
         raise ValueError('performer selected metadata boundary look differs from the actual track inventory')
+    if receipt.get('external_original_reference') is not None and (
+            receipt.get('external_original_selected_boundary_look_metadata') != look
+            or receipt['external_original_reference'].get('mode') != (
+                'ABSENT_PRESERVED' if look is None else 'ACTIVE_EXISTING')):
+        raise ValueError('selected metadata lost its external original boundary-look policy')
     return receipt
 
 
@@ -838,6 +880,11 @@ def _final_live_replay(plan_json, receipt, deadline):
             or _file_hash(receipt['model_path']) != receipt['model_sha256']
             or _schedule_digest(_schedule(plan,domain)) != receipt['global_native_schedule_sha256']):
         raise ValueError('performer final live source/model/native inventory changed')
+    from .group_external_original_reference import validate_external_original_reference_payload
+    validate_external_original_reference_payload(plain(receipt.get('external_original_reference')),
+        plan=plan, look=plain(receipt.get('external_original_selected_boundary_look_metadata')),
+        source_domain_payload=raw, source_identities=receipt['source_identities'],
+        live_clocks=domain.clocks_by_request)
     session=GroupJointObservationSession(domain=domain,budget=JointGroupWorkBudget(
         absolute_deadline=deadline,maximum_new_decodes=MAX_NATIVE_READS))
     try:

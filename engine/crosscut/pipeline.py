@@ -27846,11 +27846,20 @@ def analyze(
         VerifiedMemberAcquisitionIdentityAuthority | None
     ) = None,
     group_broadcast_slot_hints: tuple[str | None, ...] = (),
+    group_external_original_reference=None,
 ) -> AnalysisArtifact:
     if not isinstance(allow_failed_comparison_render, bool):
         raise TypeError("allow_failed_comparison_render must be a boolean")
     if not isinstance(review_rendered_proxies, bool):
         raise TypeError("review_rendered_proxies must be a boolean")
+    if group_external_original_reference is not None:
+        from .group_external_original_reference import GroupExternalOriginalReference
+        if (not isinstance(group_external_original_reference, GroupExternalOriginalReference)
+                or request.edit_mode is not EditMode.GROUP
+                or not bool(getattr(request, 'review_first_enabled', False))
+                or request.sources != group_external_original_reference.source_domain.request_sources):
+            raise ValueError('external original is valid only for its explicit review-first GROUP request')
+        group_external_original_reference.validate_original()
     if group_broadcast_slot_hints and (
         request.source_mode is not SourceMode.AUTOMATIC
         or request.edit_mode is not EditMode.GROUP
@@ -34099,8 +34108,9 @@ def analyze(
                         review_first_runtime.require_total_budget("required_visual_baseline")
                         reporter.progress(0.96 + 0.018 * completed / max(1, total),
                             f"첫 전체 편집 경로 확인 중… {completed}/{total}")
-                    visual_timeline = build_visual_timeline(**{
-                        **visual_builder_arguments, "progress_callback": baseline_progress, "maximum_results": 1})
+                    visual_timeline = (group_external_original_reference.original_bundle.visual_timeline
+                        if group_external_original_reference is not None else build_visual_timeline(**{
+                            **visual_builder_arguments, "progress_callback": baseline_progress, "maximum_results": 1}))
                     review_first_visual_selection_payload = {
                         "contract": "review_first_visual_selection_v1",
                         "authority": "deterministic_full_song_visual_selector",
@@ -34108,19 +34118,27 @@ def analyze(
                         "passed": True,
                     }
                     from .first_result_controller import FirstResultController
-                    baseline_bundle = _review_first_group_bundle(timeline=visual_timeline, request=request,
-                        eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
-                        common_start=common_start, section_plan=section_plan, phrase_times=phrase_times,
-                        output=request.output_directory / f"{base_filename}-group-crosscut.mp4",
-                        reporter=reporter, warnings=warnings)
+                    baseline_output = request.output_directory / f"{base_filename}-group-crosscut.mp4"
+                    baseline_bundle = (group_external_original_reference.baseline_for_output(baseline_output)
+                        if group_external_original_reference is not None else _review_first_group_bundle(
+                            timeline=visual_timeline, request=request, eligible_indices=eligible_indices,
+                            offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
+                            section_plan=section_plan, phrase_times=phrase_times, output=baseline_output,
+                            reporter=reporter, warnings=warnings))
                     group_first = FirstResultController(review_first_runtime, sources=request.sources,
                         source_durations=tuple(float(info.video_streams[0].duration_seconds or
                             info.duration_seconds or 0.) for info in media),
                         master_start=common_start, duration=baseline_bundle.render_plan.duration,
                         journal_path=request.output_directory / f"{base_filename}-group-first-result-journal.json",
-                        allowed_source_indices=eligible_indices)
+                        allowed_source_indices=eligible_indices,
+                        external_original_reference=group_external_original_reference)
                     group_first.install_baseline(baseline_bundle, plan=baseline_bundle.render_plan,
-                        authority="deterministic_full_song_visual_selector")
+                        authority=('external_original_group_reference'
+                            if group_external_original_reference is not None
+                            else 'deterministic_full_song_visual_selector'))
+                    if group_external_original_reference is not None:
+                        review_first_verified_candidate_bundle = baseline_bundle
+                        review_first_visual_selection_payload['authority'] = 'external_original_group_reference'
                     if request.source_mode is SourceMode.AUTOMATIC:
                         source_look_match_result = group_first.run_optional("source_look_match", lambda:
                             analyze_source_look_match(tuple(request.sources[index] for index in eligible_indices),
@@ -35626,7 +35644,8 @@ def analyze(
                 # Look matching used to exist only in the legacy multi-candidate
                 # path. Apply it once to the actual retained final geometry;
                 # failure/cutoff must not discard that incumbent or rerun cuts.
-                if group_first.incumbent.boundary_look_match is None:
+                if (group_first.incumbent.boundary_look_match is None
+                        and group_first.boundary_look_creation_allowed):
                     look_bundle = group_first.run_optional(
                         "boundary_look_match_render_admission",
                         lambda: _review_first_group_boundary_look_bundle(

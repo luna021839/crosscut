@@ -1095,6 +1095,105 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):cls.temp.cleanup()
 
+    def external_reference(self, *, absent=True):
+        from crosscut.group_external_original_reference import GroupExternalOriginalReference
+        bundle=replace(self.bundle)
+        if absent:
+            bundle=replace(bundle,boundary_look_match=None,render_plan=replace(bundle.render_plan,
+                segments=tuple(replace(s,boundary_look_track=None) for s in bundle.render_plan.segments)))
+        return GroupExternalOriginalReference(bundle,self.context.domain,((420,480),))
+
+    def test_external_absent_policy_stays_original_after_an_unprotected_camera_promotion(self):
+        from crosscut.first_result_controller import FirstResultController
+        from crosscut.review_first_runtime import ReviewFirstRuntime
+        reference=self.external_reference();baseline=reference.original_bundle;plan=baseline.render_plan
+        controller=FirstResultController(ReviewFirstRuntime(enabled=True),sources=plan.sources,
+            source_durations=(18.,)*8,master_start=plan.master_audio_start,duration=plan.duration,
+            external_original_reference=reference)
+        controller.install_baseline(baseline,plan=plan,authority='EXPLICIT_NONHUMAN_REFERENCE')
+        track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),))
+        rows=list(plan.segments);rows[0]=replace(rows[0],editorial_transform=track)
+        candidate=replace(baseline,render_plan=replace(plan,segments=tuple(rows)))
+        controller.promote(candidate,plan=candidate.render_plan,authority='NUMERIC_POLICY_ONLY_NOT_NATIVE_ADMISSION')
+        self.assertFalse(controller.boundary_look_creation_allowed)
+        self.assertEqual(controller.external_original_reference.to_dict(),reference.to_dict())
+        rows[-1]=replace(rows[-1],editorial_transform=track)
+        protected=replace(candidate,render_plan=replace(plan,segments=tuple(rows)))
+        with self.assertRaisesRegex(ValueError,'protected'):
+            controller.promote(protected,plan=protected.render_plan,authority='PROTECTED_NEGATIVE_CONTROL')
+        with self.assertRaisesRegex(ValueError,'boundary-look policy'):
+            controller.promote(self.bundle,plan=self.bundle.render_plan,authority='IMPLICIT_NEW_LOOK_NEGATIVE')
+        shifted=replace(candidate,render_plan=replace(candidate.render_plan,master_audio_start=.1))
+        with self.assertRaisesRegex(ValueError,'clock authority'):
+            reference.validate_candidate(shifted,shifted.render_plan)
+        altered_flag=replace(candidate,render_plan=replace(candidate.render_plan,
+            member_pose_dissolve_requested=True,member_pose_dissolve_effective=False,
+            member_pose_dissolve_count=0))
+        with self.assertRaisesRegex(ValueError,'clock authority'):
+            reference.validate_candidate(altered_flag,altered_flag.render_plan)
+        with self.assertRaisesRegex(ValueError,'verified source/interval/frame domain'):
+            controller.promote(shifted,plan=shifted.render_plan,authority='CHANGED_MASTER_CLOCK_NEGATIVE')
+        self.assertIs(controller.incumbent,candidate)
+
+    def test_external_original_rejects_absent_metadata_with_active_tracks_and_changed_original(self):
+        from crosscut.group_external_original_reference import GroupExternalOriginalReference
+        from crosscut.render import BoundaryLookKeyframe,BoundaryLookTrack
+        # This is a contract-corruption control, not look-fit quality evidence.
+        # A real fit is allowed to retain no applied tracks. Manufacture the
+        # contradictory actual renderer recipe explicitly instead of assuming
+        # that every chart fit must author a correction in every environment.
+        rows=list(self.bundle.render_plan.segments)
+        rows[0]=replace(rows[0],boundary_look_track=BoundaryLookTrack((
+            BoundaryLookKeyframe(0.,brightness=.003),)))
+        corrupted=replace(self.bundle,boundary_look_match=None,
+            render_plan=replace(self.bundle.render_plan,segments=tuple(rows)))
+        with self.assertRaisesRegex(ValueError,'renderer tracks remain'):
+            GroupExternalOriginalReference(corrupted,self.context.domain,((420,480),))
+        reference=self.external_reference()
+        # Explicit corruption of one copied original, not the class fixture.
+        object.__setattr__(reference.original_bundle,'diagnostics',('EXPLICIT_MUTATED_ROOT',))
+        with self.assertRaisesRegex(ValueError,'reference changed'):
+            reference.to_dict()
+
+    def test_serialized_external_policy_rederives_original_root_tracks_and_protected_camera(self):
+        from crosscut.group_external_original_reference import validate_external_original_reference_payload
+        reference=self.external_reference();record=reference.to_dict();original=reference.original_bundle
+        def validate(value,plan):
+            validate_external_original_reference_payload(value,plan=plan,look=None,
+                source_domain_payload=self.context.domain.to_dict(),
+                source_identities=[list(v) for v in self.context.source_identities],
+                live_clocks=self.context.domain.clocks_by_request)
+        validate(record,original.render_plan)
+        for field in ('mode','original_numeric_plan','original_metadata','encoded_pixel_identity_verified',
+                'source_clock_authority','protected_output_intervals'):
+            value=json.loads(json.dumps(record))
+            if field=='mode':value[field]='ACTIVE_EXISTING'
+            elif field=='original_numeric_plan':value[field]['segments'][0]['source_start']+=.1
+            elif field=='original_metadata':value[field]['diagnostics'].append('EXPLICIT_MUTATED_SERIALIZED_ROOT')
+            elif field=='encoded_pixel_identity_verified':value[field]=True
+            elif field=='source_clock_authority':value[field]='SELF_CLAIMED_NATIVE_AUTHORITY'
+            else:
+                value[field]=[[420,480],[450,480]]
+                preimage={key:value[key] for key in ('original_plan_sha256','original_metadata_sha256',
+                    'source_domain_sha256','source_identities','original_boundary_look','protected_output_intervals')}
+                value['policy_sha256']=family.digest(preimage)
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                validate(value,original.render_plan)
+        rows=list(original.render_plan.segments)
+        rows[-1]=replace(rows[-1],editorial_transform=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),)))
+        with self.assertRaisesRegex(ValueError,'protected'):
+            validate(record,replace(original.render_plan,segments=tuple(rows)))
+
+    def test_external_reference_requires_the_actual_original_source_clock_domain(self):
+        reference=self.external_reference(absent=False)
+        reference.validate_source_domain(self.context.domain)
+        with self.assertRaisesRegex(ValueError,'source/clock domain'):
+            reference.validate_source_domain(replace(self.context.domain,audio_offsets=(1.2,)*8))
+        with self.assertRaisesRegex(ValueError,'source/clock domain'):
+            reference.validate_source_domain(replace(self.context.domain,
+                render_frame_clocks=(replace(self.context.domain.render_frame_clocks[0],
+                    packet_grid_sha256='0'*64),*self.context.domain.render_frame_clocks[1:])))
+
     def run_real_obligation_control(self, *, six_binary=False, corrupt_reference=False):
         """Real dense/obligation producers; only NON-HUMAN detectors are replaced.
 
@@ -1231,6 +1330,9 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
             context=family.freeze_context(controller=controller,request=request,
                 eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
                 scene_cut_times=((),)*8,sync_scores=(.93,.91)*4,source_derivatives=scene_derivative_fixture())
+        from crosscut.group_external_original_reference import GroupExternalOriginalReference
+        reference=GroupExternalOriginalReference(bundle,context.domain,((420,480),))
+        context=replace(context,external_original_reference=reference)
         with optional_native_scope(context.deadline),source_chart_sensors(), \
                 patch('crosscut.boundary_look_match.analyze_boundary_look_match',
                     side_effect=AssertionError('An originally absent family must not be fabricated')) as fit, \
@@ -1245,6 +1347,7 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
             self.assertTrue(all(s.boundary_look_track is None for s in candidate.render_plan.segments))
             family.validate_bundle_binding(candidate)
             receipt=family.plain(candidate.performer_family_review)
+            self.assertEqual(receipt['external_original_reference'],reference.to_dict())
             audit=receipt['look_refresh']
             self.assertEqual(audit['retained_family']['original']['mode'],'ORIGINAL_ABSENT')
             self.assertEqual(audit['retained_family']['final']['mode'],'ORIGINAL_ABSENT')

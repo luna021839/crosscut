@@ -44,7 +44,7 @@ class Reporter:
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'local tools required')
 class SceneSourceNormalAnalyzeTests(unittest.TestCase):
-    def run_normal(self,*,corrupt_parent=False):
+    def run_normal(self,*,corrupt_parent=False,external_original=False,absent_look=False):
         with ExitStack() as stack:
             # macOS exposes /var as /private/var. AnalysisRequest canonicalizes
             # source paths, so the baseline fixture must use that SAME domain;
@@ -53,12 +53,20 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
             paths=tuple(root/f'source-{i}.mp4' for i in range(8))
             for i,path in enumerate(paths):
                 encode_scene_chart(path,variant=i,frames=540)
-            bundle,_,_,model=build_scene_fixture(root,paths)
+            bundle,_,_,model=build_scene_fixture(root,paths,boundary_look_enabled=not absent_look)
             request=pipeline.AnalysisRequest.from_dict(dict(song='XOXZ',edit_mode='group',
                 aspect_ratio='16:9',source_mode='automatic',review_first_enabled=True,
                 sources=[str(p) for p in paths],output_directory=str(root/'out'),
                 source_cache_directory=str(root/'cache'),experimental_pixel_camera_review=False))
             self.assertEqual(request.sources,paths)
+            reference=None
+            if external_original:
+                from crosscut.group_external_original_reference import GroupExternalOriginalReference
+                from crosscut.group_source_domain import GroupSourceDomain
+                from crosscut.render_frame_schedule import probe_render_frame_clock
+                reference=GroupExternalOriginalReference(bundle,GroupSourceDomain(paths,tuple(range(8)),
+                    (1.,)*8,(None,)*8,((),)*8,tuple(probe_render_frame_clock(p) for p in paths)),((420,480),))
+            self.original_reference_record=None if reference is None else reference.to_dict()
             alignment=AlignmentResult(reference=str(paths[0]),sample_rate=4000,
                 alignments=tuple(SourceAlignment(source=str(p),is_reference=i==0,
                     offset_samples=4000,offset_seconds=1.,score=(.93,.91)[i%2],overlap_samples=44000,
@@ -97,6 +105,8 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
             stack.enter_context(patch('crosscut.pipeline.build_face_match_plan',side_effect=ValueError('chart baseline supplies explicit existing face family')))
             stack.enter_context(patch('crosscut.pipeline._review_first_group_bundle',side_effect=lambda **kw:
                 replace(bundle,render_plan=replace(bundle.render_plan,output=kw['output']))))
+            self.look_authoring=stack.enter_context(patch('crosscut.pipeline._review_first_group_boundary_look_bundle',
+                wraps=pipeline._review_first_group_boundary_look_bundle))
             stack.enter_context(patch.object(family,'installed_pose_model',return_value=model))
             calls=[]
             def proposer(context):
@@ -134,7 +144,8 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
             self.assertIs(pipeline._enforce_automatic_stage_edit_post_render_qa,_REAL_FINAL_QA)
             failure=None;reporter=Reporter()
             with scene_chart_sensors():
-                try:pipeline.analyze(request,reporter,review_rendered_proxies=True)
+                try:pipeline.analyze(request,reporter,review_rendered_proxies=True,
+                    group_external_original_reference=reference)
                 except RuntimeError as exc:failure=str(exc)
             manifests=[];qa=[]
             for path in request.output_directory.rglob('*.json'):
@@ -164,6 +175,36 @@ class SceneSourceNormalAnalyzeTests(unittest.TestCase):
                         width=p.width,height=p.height) for p in rendered],logs=reporter.rows),indent=2))
             self.assertIsNotNone(selected[1],(failure,reporter.rows[-20:]))
             return bundle,selected[1],qa,rendered,calls,failure
+
+    def test_external_original_absence_is_retained_before_normal_authoring_through_final_replay(self):
+        baseline,manifest,reports,rendered,calls,failure=self.run_normal(external_original=True,absent_look=True)
+        self.assertEqual(self.look_authoring.call_count,0)
+        self.assertEqual(len(calls),1,failure)
+        self.assertGreaterEqual(len(rendered),2,failure)
+        chosen=manifest['rendered_candidate_selection']['complete_candidates'][0]
+        self.assertEqual(chosen['candidate_origin'],source.CONTRACT,json.dumps(dict(runtime_error=failure,
+            proposal_errors=[c.error if isinstance(c,family.PerformerFamilyRejection) else None for c in calls],
+            attempts=manifest.get('review_first_visual_selection',{}).get('first_result_controller',{}).get('attempts'))))
+        self.assertIsNone(chosen['boundary_look_match'])
+        self.assertTrue(all(s.boundary_look_track is None for p in rendered for s in p.segments))
+        receipt=chosen['performer_family_review']
+        self.assertEqual(receipt['external_original_reference'],self.original_reference_record)
+        self.assertEqual(receipt['external_original_reference']['mode'],'ABSENT_PRESERVED')
+        self.assertEqual(receipt['look_refresh']['refreshed_edges'],[])
+        self.assertFalse(receipt['look_refresh']['matched_production_renderer_used'])
+        controller=manifest['review_first_visual_selection']['first_result_controller']
+        self.assertEqual(controller['external_original_reference'],self.original_reference_record)
+        self.assertTrue(reports,failure)
+        metrics=reports[-1][1]['metrics'].get('performer_family_review')
+        self.assertTrue(family.qa_metrics_valid(metrics),metrics)
+        self.assertFalse(reports[-1][1]['passed'])
+        self.assertFalse(manifest['app_result_exposure']['delivery_completion_message_allowed'])
+        self.assertTrue(all(s.look_adjustment is not None for s in baseline.render_plan.segments))
+
+    def test_fresh_normal_absent_baseline_still_allows_explicit_look_authoring(self):
+        _,_,_,rendered,_,failure=self.run_normal(absent_look=True)
+        self.assertEqual(self.look_authoring.call_count,1,failure)
+        self.assertGreaterEqual(len(rendered),2,failure)
 
     def test_source_change_reaches_real_normal_renderer_and_original_failing_qa(self):
         baseline,manifest,reports,rendered,calls,failure=self.run_normal()

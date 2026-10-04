@@ -57,7 +57,8 @@ def _defer_owner_publication_signals():
 
 class FirstResultController:
     def __init__(self, runtime: ReviewFirstRuntime, *, sources, source_durations,
-                 master_start: float, duration: float, allowed_source_indices=None, journal_path=None):
+                 master_start: float, duration: float, allowed_source_indices=None, journal_path=None,
+                 external_original_reference=None):
         self.runtime = runtime
         self.sources = tuple(sources)
         self.source_durations = tuple(source_durations)
@@ -82,6 +83,35 @@ class FirstResultController:
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self.omitted_attempt_count = 0
         self._journal_warnings = []
+        self._external_original_reference = external_original_reference
+        if external_original_reference is not None:
+            from .group_external_original_reference import GroupExternalOriginalReference
+            if not isinstance(external_original_reference, GroupExternalOriginalReference):
+                raise TypeError('controller external original must be a frozen typed GROUP reference')
+            external_original_reference.validate_original()
+
+    @property
+    def external_original_reference(self):
+        return self._external_original_reference
+
+    @property
+    def boundary_look_creation_allowed(self):
+        # A fresh normal project may author a new look. An explicit external
+        # reference keeps its original absent/active policy across promotions.
+        if self.external_original_reference is None:
+            return True
+        self.external_original_reference.validate_original()
+        return False
+
+    def _validate_external_candidate(self, value, plan, *, baseline=False):
+        reference = self.external_original_reference
+        if reference is not None:
+            self.runtime.require_total_budget('external_original_policy_validation')
+            if baseline:
+                reference.validate_baseline(value, plan)
+            else:
+                reference.validate_candidate(value, plan)
+            self.runtime.require_total_budget('external_original_policy_validation')
 
     def _cleanup_journal(self, temporary, *, phase):
         if temporary is None:
@@ -187,6 +217,7 @@ class FirstResultController:
         if self.baseline is not None:
             raise RuntimeError("baseline may only be installed once")
         self.validate_plan(plan)
+        self._validate_external_candidate(value, plan, baseline=True)
         stage = FirstResultStage.BASELINE_PLAN_READY
         history = [*self._history, stage.value]
         revision = self._incumbent_revision+1
@@ -247,6 +278,7 @@ class FirstResultController:
 
     def promote(self, value, *, plan: RenderPlan, authority: str, _token=None):
         self.validate_plan(plan)
+        self._validate_external_candidate(value, plan)
         revision = self._incumbent_revision+1
         snapshot = dict(self.to_dict(), incumbent_revision=revision, selected_authority=authority)
         self._publish_owner(dict(incumbent=value, _incumbent_plan=plan, _incumbent_revision=revision,
@@ -265,7 +297,9 @@ class FirstResultController:
             payload=self.incumbent
         else:
             raise TypeError('candidate transaction needs a serializable complete typed owner')
-        preimage=dict(owner=payload,render_plan=self._incumbent_plan.to_json())
+        preimage=dict(owner=payload,render_plan=self._incumbent_plan.to_json(),
+            external_original_reference=None if self.external_original_reference is None
+                else self.external_original_reference.to_dict())
         identity=hashlib.sha256(json.dumps(preimage,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
         return IncumbentTransactionToken(self._incumbent_revision,identity)
 
@@ -304,6 +338,8 @@ class FirstResultController:
             skipped_count=self.skipped_count, attempts=deepcopy(self.attempts),
             omitted_attempt_count=self.omitted_attempt_count,
             journal_path=str(self.journal_path) if self.journal_path is not None else None,
+            external_original_reference=None if self.external_original_reference is None
+                else self.external_original_reference.to_dict(),
             journal_warnings=deepcopy(self._journal_warnings),
             quality_approved=False, decoded_qa_required=True)
 
