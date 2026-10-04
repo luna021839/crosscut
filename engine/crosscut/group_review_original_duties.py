@@ -43,7 +43,12 @@ def freeze_review_original_duties(original, measured):
                     target = [projected['projected_upper_body_xyc'][j][:2] for j in indices]
                     support = measured_visible_arm_support(native_points=points,
                         project_point=lambda point:target[points.index(list(point))])
-                    if support['visibility'] != 'outside': parts.setdefault(name,support)
+                    # A new positive original observation owns this tick's
+                    # actual visible support. Missing/outside observations
+                    # retain prior known support; explicit whole-arm duties
+                    # remain whole and cannot be replaced by a partial mask.
+                    if support['visibility'] != 'outside' and not (name in parts and parts[name] is None):
+                        parts[name]=support
         tokens[str(tick)] = dict(head_required=focal,parts=dict(parts) if focal else {},
             original_role=role,original_unit_id=u.unit_id,original_epoch_index=index,
             original_observation_sha256=None if row is None else digest(row['native_observation']),

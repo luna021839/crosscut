@@ -2,7 +2,7 @@
 from copy import deepcopy
 import pytest
 from crosscut.group_review_paired_evidence import (PairedEvidencePlan,
-    compare_paired_metric_series, time_normalized_center_acceleration)
+    compare_paired_metric_series, time_normalized_center_acceleration,validate_paired_native_request_inventory)
 
 
 def world():
@@ -72,3 +72,33 @@ def test_union_of_original_and_candidate_cut_appearance_positions_is_identical()
     assert p.identity != world()[0].identity
     with pytest.raises(ValueError,match='frozen common'):
         PairedEvidencePlan(100,30.,20,30,'a'*64,'b'*64,extra_appearance_ticks=(5,))
+
+
+def capture_fixture():
+    plan=world()[0];ticks=sorted({*plan.interior_ticks,*plan.left_ticks,*plan.right_ticks})
+    capture=dict(full_plan_identity='c'*64,requested_output_ticks=ticks,
+        requested_appearance_ticks=list(plan.appearance_ticks),patches={str(t):{} for t in ticks},
+        appearance={str(t):[] for t in plan.appearance_ticks},rows={str(t):dict(output_tick=t,
+            native_observation=dict(request_source_index=0,native_frame_index=t//2,source_clock_identity='d'*64),
+            projection=dict(source_request_index=0,native_frame_index=t//2,source_clock_identity='d'*64)) for t in ticks})
+    return plan,capture
+
+
+def test_actual_capture_keeps_native_alias_output_rows_and_empty_appearance_results():
+    p,capture=capture_fixture()
+    result=validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64)
+    assert result['requested_output_ticks']==16 and result['actual_capture_keys_verified']
+    assert not result['fresh_native_authority_certified']
+
+
+@pytest.mark.parametrize('domain',['rows','patches','appearance'])
+def test_actual_capture_cannot_copy_request_lists_while_omitting_results(domain):
+    p,capture=capture_fixture();capture[domain].pop(next(iter(capture[domain])))
+    with pytest.raises(ValueError,match='actual capture'):
+        validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64)
+
+
+def test_actual_capture_cannot_relabel_output_tick_or_native_clock():
+    p,capture=capture_fixture();capture['rows']['20']['projection']['native_frame_index']=999
+    with pytest.raises(ValueError,match='native clock'):
+        validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64)

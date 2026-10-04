@@ -3,7 +3,9 @@ from copy import deepcopy
 from crosscut.group_review_camera_repair import (FramingDescriptor, framing_descriptor,
     geometry_cost, compare_two_sided_geometry, fit_whole_camera_track,
     measured_native_support_preserved,effective_face_detail_pixels,transformed_descriptor)
-from crosscut.render import EditorialTransformKeyframe
+from crosscut.group_review_camera_repair import relax_measured_camera_track
+from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack
+import pytest
 
 def face(h=.1, x=.45, y=.3):
     box=[x,y,h/2,h]
@@ -110,3 +112,30 @@ def test_native_resolution_cannot_hide_small_output_face_or_invent_zoom_detail()
 
 def test_unmeasured_output_inventory_is_not_guessed_for_legibility():
     assert effective_face_detail_pixels(framing_descriptor(face())) is None
+
+
+def test_dense_correction_retains_largest_legal_whole_camera_not_tickwise_zoom():
+    rows=[face(.1,.25),face(.1,.001),face(.1,.55)]
+    track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.4),EditorialTransformKeyframe(1.,1.4)))
+    fixed,report=relax_measured_camera_track(track,rows,sample_times=(0.,.5,1.),
+        required_support_check=measured_native_support_preserved)
+    assert fixed is not None and fixed.evaluate(.5).zoom==1.
+    assert report['measured_ticks']==3 and not report['fresh_inference_performed']
+    assert all(measured_native_support_preserved(row,fixed.evaluate(t)) for row,t in zip(rows,(0.,.5,1.)))
+
+
+def test_impossible_native_duty_is_not_hidden_by_camera_relaxation():
+    track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),EditorialTransformKeyframe(1.,1.2)))
+    fixed,report=relax_measured_camera_track(track,[face()],sample_times=(0.,),
+        required_support_check=lambda row,key:False)
+    assert fixed is None and report['retained_intervention_fraction'] is None
+
+
+def test_dense_correction_rejects_sample_index_or_unbounded_search():
+    track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),EditorialTransformKeyframe(1.,1.2)))
+    with pytest.raises(ValueError,match='bounded ordered'):
+        relax_measured_camera_track(track,[face(),face()],sample_times=(.5,.4),
+            required_support_check=measured_native_support_preserved)
+    with pytest.raises(ValueError,match='bounded ordered'):
+        relax_measured_camera_track(track,[face()],sample_times=(0.,),maximum_trials=100000,
+            required_support_check=measured_native_support_preserved)

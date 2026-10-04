@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 from crosscut.group_review_camera_repair import FramingDescriptor,fit_whole_camera_track
 from crosscut.group_review_program_evaluator import (ReviewObjective,evaluate_review_program,
-    consume_frozen_part_duties,freeze_empty_part_duties)
+    consume_frozen_part_duties,freeze_empty_part_duties,bind_review_part_duties)
 from crosscut.group_review_native_window import one_to_one_appearance_hypotheses,cosine
 from crosscut.render import EditorialTransformKeyframe
 
@@ -107,3 +107,27 @@ def test_same_objective_and_full_interior_fail_survives_parent_final():
 def test_objective_rejects_nan_and_unbounded_shortlist():
     with pytest.raises(ValueError):ReviewObjective(readability_weight=float('nan'))
     with pytest.raises(ValueError):ReviewObjective(maximum_shortlist_sources=3)
+
+
+def test_bound_duty_snapshot_matches_raw_verdict_without_rehashing_all_rows(monkeypatch):
+    raw=token();bound=bind_review_part_duties(raw);row=face();row['output_tick']=1
+    expected=consume_frozen_part_duties(raw,row,candidate_head_ids=(0,),key=EditorialTransformKeyframe(0.,1.))
+    def no_rehash(value):raise AssertionError('full duty hash repeated per tick')
+    monkeypatch.setattr('crosscut.group_review_program_evaluator.digest',no_rehash)
+    for _ in range(20):
+        actual=consume_frozen_part_duties(bound,row,candidate_head_ids=(0,),key=EditorialTransformKeyframe(0.,1.))
+        assert actual==expected
+
+
+def test_bound_duties_cannot_be_weakened_by_mutating_original_or_returned_row():
+    raw=token({'left_arm':None});bound=bind_review_part_duties(raw)
+    raw['rows']['1']['parts'].clear();bound.row(1)['parts'].clear()
+    assert bound.row(1)['parts']=={'left_arm':None}
+    assert bound.row(0) is None and bound.row(2) is None
+
+
+def test_bound_duty_snapshot_rejects_output_gaps_and_wrong_contract():
+    raw=token();raw['rows']['3']=deepcopy(raw['rows']['1'])
+    with pytest.raises(ValueError,match='contiguous'):bind_review_part_duties(raw)
+    raw=token();raw['contract']='borrowed'
+    with pytest.raises(ValueError,match='frozen contract'):bind_review_part_duties(raw)

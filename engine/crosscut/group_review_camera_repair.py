@@ -176,6 +176,39 @@ def transformed_descriptor(descriptor,key):
         descriptor.native_face_pixels,None if descriptor.output_face_pixels is None else descriptor.output_face_pixels*key.zoom)
 
 
+def relax_measured_camera_track(track, measurements, *, sample_times, required_support_check,
+        maximum_trials=21):
+    """One bounded whole-track correction from already measured native rows.
+
+    The caller supplies immutable original-part duties, not an all-context
+    body-box gate. UNKNOWN correspondence is not certified PASS. This numeric
+    correction performs no new inference and cannot certify editing quality.
+    Measurements must be projected through the source-native identity camera;
+    the callback applies the proposed key to that same geometry.
+    """
+    if (not isinstance(track, EditorialTransformTrack) or not measurements
+            or len(measurements) != len(sample_times) or not callable(required_support_check)
+            or type(maximum_trials) is not int or not 2 <= maximum_trials <= 65
+            or any(not math.isfinite(t) or t < 0. or t > track.keyframes[-1].time_seconds+1e-8
+                for t in sample_times)
+            or any(a >= b for a,b in zip(sample_times,sample_times[1:]))
+            or any(k.roll_degrees != 0. for k in track.keyframes)):
+        raise ValueError('measured camera correction needs bounded ordered native samples and frozen duties')
+    for trial_index in range(maximum_trials):
+        alpha = 1.-trial_index/(maximum_trials-1)
+        keys = tuple(EditorialTransformKeyframe(k.time_seconds,1.+(k.zoom-1.)*alpha,
+            .5+(k.center_x-.5)*alpha,.5+(k.center_y-.5)*alpha) for k in track.keyframes)
+        candidate = EditorialTransformTrack(keys,reason='dense_measured_original_part_camera_correction')
+        if all(required_support_check(row,candidate.evaluate(t))
+                for row,t in zip(measurements,sample_times,strict=True)):
+            return candidate, dict(trials=trial_index+1,retained_intervention_fraction=alpha,
+                measured_ticks=len(measurements),fresh_inference_performed=False,
+                unknown_correspondence_certified=False,quality_approved=False)
+    return None, dict(trials=maximum_trials,retained_intervention_fraction=None,
+        measured_ticks=len(measurements),fresh_inference_performed=False,
+        unknown_correspondence_certified=False,quality_approved=False)
+
+
 def fit_endpoint_camera(measurement,target,*,time_seconds,maximum_zoom=1.75,head_id=None):
     if not 1. <= maximum_zoom <= 2.:raise ValueError('review camera zoom cap must be declared within renderer range')
     descriptor=framing_descriptor(measurement,head_id=head_id)

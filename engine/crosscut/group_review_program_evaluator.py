@@ -4,7 +4,8 @@ Geometry is style, not candidate eligibility. Required original polyline
 support is a separate three-state contract. Native pixel features, anonymous
 source-local tracks and two incident contexts remain separate evidence.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+import json
 import math
 
 from .group_original_visible_support import ARM_INDICES, support_preserved_coordinates
@@ -13,6 +14,40 @@ from .group_review_camera_repair import (effective_face_detail_pixels,
     geometry_cost, shape_cost)
 
 CONTRACT='shared_frozen_measured_group_review_objective_v3'
+
+
+@dataclass(frozen=True,slots=True)
+class BoundReviewPartDuties:
+    """Immutable snapshot with one root hash, not a hash of the film per tick."""
+    token_json:str
+    identity:str=field(init=False)
+    first_tick:int=field(init=False)
+    row_json:tuple[str,...]=field(init=False,repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.token_json,str) or len(self.token_json)>32*1024*1024:
+            raise ValueError('bound review duties need a bounded serialized snapshot')
+        token=json.loads(self.token_json)
+        if token.get('contract')!='frozen_original_review_part_duties_v1' or not isinstance(token.get('rows'),dict):
+            raise ValueError('bound review original duties need the explicit frozen contract')
+        ticks=sorted(int(t) for t in token['rows'])
+        if (not ticks or len(ticks)>16384 or ticks[0]<0
+                or ticks!=list(range(ticks[0],ticks[-1]+1))
+                or set(token['rows'])!={str(t) for t in ticks}):
+            raise ValueError('bound review duty snapshot needs exact contiguous output ticks')
+        rows=tuple(json.dumps(token['rows'][str(t)],sort_keys=True,separators=(',',':'),allow_nan=False) for t in ticks)
+        object.__setattr__(self,'identity',digest(token))
+        object.__setattr__(self,'first_tick',ticks[0])
+        object.__setattr__(self,'row_json',rows)
+
+    def row(self,tick):
+        index=tick-self.first_tick
+        return None if type(tick) is not int or not 0<=index<len(self.row_json) else json.loads(self.row_json[index])
+
+
+def bind_review_part_duties(token):
+    return token if isinstance(token,BoundReviewPartDuties) else BoundReviewPartDuties(
+        json.dumps(token,sort_keys=True,separators=(',',':'),allow_nan=False))
 
 
 @dataclass(frozen=True,slots=True)
@@ -57,10 +92,11 @@ def consume_frozen_part_duties(token,measurement,*,candidate_head_ids,key):
     Empty measurements never prove a known duty. Source motion UNKNOWN alone
     is not a reason to reject a review. This consumer is not a cast solver.
     """
-    if token.get('contract')!='frozen_original_review_part_duties_v1':
+    bound=isinstance(token,BoundReviewPartDuties)
+    if not bound and token.get('contract')!='frozen_original_review_part_duties_v1':
         raise ValueError('review original duties need the explicit frozen contract')
     raw=measurement['native_observation'];tick=measurement['output_tick']
-    required=token['rows'].get(str(tick))
+    required=token.row(tick) if bound else token['rows'].get(str(tick))
     if required is None:raise ValueError('original duty token does not own this output tick')
     projected={p['observation_id']:p for p in measurement['projection']['people']}
     transform=lambda p:(.5+(p[0]-key.center_x)*key.zoom,.5+(p[1]-key.center_y)*key.zoom)
@@ -91,7 +127,7 @@ def consume_frozen_part_duties(token,measurement,*,candidate_head_ids,key):
                 failures.append('original_visible_'+name+'_support_loss')
     if required['parts'] and not candidate_head_ids:unknown.append('required_arm_correspondence_unknown')
     state='FAIL' if failures else 'UNKNOWN' if unknown else 'PASS'
-    return dict(state=state,failures=failures,unknown=unknown,token_sha256=digest(token),
+    return dict(state=state,failures=failures,unknown=unknown,token_sha256=token.identity if bound else digest(token),
         output_tick=tick,remaining_candidate_branches=list(candidate_head_ids),
         silhouette_or_occlusion_certified=False,quality_approved=False)
 

@@ -50,3 +50,23 @@ def test_candidate_relabel_or_omitted_requested_tick_cannot_weaken_original():
     with pytest.raises(ValueError,match='external unit'):freeze_review_original_duties(original,data)
     original,data=world();del data['rows']['2']
     with pytest.raises(ValueError,match='requested tick'):freeze_review_original_duties(original,data)
+
+
+def test_new_positive_original_support_updates_while_missing_keeps_it():
+    original,data=world();name=next(iter(ARM_INDICES))
+    data['rows']['0']['native_observation']['people'][0]['part_states']=[(name,'observed')]
+    new=deepcopy(data['rows']['0'])
+    points=new['native_observation']['people'][0]['upper_body_xyc']
+    for i in ARM_INDICES[name]:points[i][1]+=.1
+    new['projection']['people'][0]['projected_upper_body_xyc']=deepcopy(points)
+    data['rows']['1']=new;data['requested_output_ticks']=[0,1,2];data['original_linked_heads']['1']=7
+    duties=freeze_review_original_duties(original,data)
+    assert duties['rows']['0']['parts'][name]!=duties['rows']['1']['parts'][name]
+    assert duties['rows']['1']['parts'][name]==duties['rows']['2']['parts'][name]
+
+
+def test_explicit_whole_arm_duty_is_not_weakened_to_new_partial_support():
+    original,data=world('focal_head_and_observed_arms');name=next(iter(ARM_INDICES))
+    data['rows']['0']['native_observation']['people'][0]['part_states']=[(name,'observed')]
+    duties=freeze_review_original_duties(original,data)
+    assert duties['rows']['0']['parts'][name] is None

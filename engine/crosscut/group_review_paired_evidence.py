@@ -99,6 +99,37 @@ def time_normalized_center_acceleration(ticks, centers, fps):
     return tuple(result)
 
 
+def validate_paired_native_request_inventory(plans, capture, *, expected_render_plan_identity):
+    """Check captured rows/appearance keys, not requests copied into a score.
+
+    Inference aliases may share a native frame; every requested OUTPUT tick
+    still has its own measured row. An empty appearance detection list is an
+    actual result, whereas an absent result key is an omitted request.
+    """
+    if not plans or any(not isinstance(p,PairedEvidencePlan) for p in plans):
+        raise ValueError('paired capture needs its frozen evidence plans')
+    ticks = sorted({t for p in plans for t in (*p.interior_ticks,*p.left_ticks,*p.right_ticks)})
+    appearance = sorted({t for p in plans for t in p.appearance_ticks})
+    if (capture.get('full_plan_identity') != expected_render_plan_identity
+            or capture.get('requested_output_ticks') != ticks
+            or capture.get('requested_appearance_ticks') != appearance
+            or set(capture.get('rows',{})) != {str(t) for t in ticks}
+            or set(capture.get('patches',{})) != {str(t) for t in ticks}
+            or set(capture.get('appearance',{})) != {str(t) for t in appearance}):
+        raise ValueError('paired actual capture omitted or changed output/context/appearance requests')
+    for tick in ticks:
+        row = capture['rows'][str(tick)]
+        raw = row['native_observation']; projection = row['projection']
+        if (row.get('output_tick') != tick
+                or raw['native_frame_index'] != projection['native_frame_index']
+                or raw['request_source_index'] != projection['source_request_index']
+                or raw['source_clock_identity'] != projection['source_clock_identity']):
+            raise ValueError('paired actual row borrowed another output/source/native clock')
+    return dict(requested_output_ticks=len(ticks),requested_appearance_ticks=len(appearance),
+        actual_capture_keys_verified=True,native_aliases_deleted_output_ticks=False,
+        fresh_native_authority_certified=False,quality_approved=False)
+
+
 def compare_paired_metric_series(*, plan, original, candidate, weights, minimum_gain=.05):
     """Compare aligned measured risks; lost known evidence cannot buy BETTER.
 
