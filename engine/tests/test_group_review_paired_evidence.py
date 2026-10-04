@@ -104,6 +104,20 @@ def test_actual_capture_cannot_relabel_output_tick_or_native_clock():
         validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64)
 
 
+def test_self_consistent_wrong_capture_native_address_is_rejected_by_actual_sampler():
+    p,capture=capture_fixture()
+    addresses={int(t):(r['native_observation']['request_source_index'],
+        r['native_observation']['native_frame_index'],r['native_observation']['source_clock_identity'])
+        for t,r in capture['rows'].items()}
+    validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64,
+        expected_native_addresses=addresses)
+    capture['rows']['20']['native_observation']['native_frame_index']=999
+    capture['rows']['20']['projection']['native_frame_index']=999
+    with pytest.raises(ValueError,match='compiled renderer native address'):
+        validate_paired_native_request_inventory([p],capture,expected_render_plan_identity='c'*64,
+            expected_native_addresses=addresses)
+
+
 def test_incident_union_includes_exit_even_when_internal_metrics_are_identical():
     p=PairedEvidencePlan(100,30.,20,30,'a'*64,'b'*64,
         incident_ticks=(20,23,26,30),extra_appearance_ticks=(18,19,20,21,22,23,24,25,26,27,28,29,30,31,32))

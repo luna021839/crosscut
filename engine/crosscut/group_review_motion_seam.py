@@ -24,7 +24,10 @@ def _window_links(sequence):
     Missing observations remain unresolved. A changed clock/native address is
     a contract error; a camera/gap/appearance bridge is unmeasured evidence.
     """
-    if any(v is None or v.get('descriptor') is None for v in sequence):
+    if any(v is None or v.get('descriptor') is None
+            or v.get('reacquisition_ambiguous',False)
+            or v.get('selected_actor_association_state') in ('AMBIGUOUS','UNMATCHED','UNKNOWN')
+            for v in sequence):
         return False
     for left,right in zip(sequence,sequence[1:]):
         a,b=left['row'],right['row']
@@ -46,6 +49,17 @@ def _window_links(sequence):
         if appearance is None or appearance<.25:
             return False
     return True
+
+
+def review_window_connected(sequence, *, require_native_motion=False):
+    """Explicit anonymous association check, not an aesthetic or identity badge.
+
+    Native aliases can preserve an occurrence but cannot create a second
+    temporal observation. Background inventory truncation alone is not a
+    selected-actor ambiguity signal.
+    """
+    return bool(_window_links(sequence) and (not require_native_motion or len({
+        v['row']['native_observation']['native_frame_index'] for v in sequence})>=2))
 
 
 def _velocity(shapes,ticks,common,fps,*,outgoing):

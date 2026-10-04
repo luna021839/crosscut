@@ -11,7 +11,7 @@ import math
 from .group_original_visible_support import ARM_INDICES, support_preserved_coordinates
 from .group_performer_family_owner import digest
 from .group_review_camera_repair import (effective_face_detail_pixels,
-    geometry_cost, shape_cost)
+    geometry_cost, shape_cost, project_review_editorial_point)
 
 CONTRACT='shared_frozen_measured_group_review_objective_v3'
 
@@ -99,35 +99,47 @@ def consume_frozen_part_duties(token,measurement,*,candidate_head_ids,key):
     required=token.row(tick) if bound else token['rows'].get(str(tick))
     if required is None:raise ValueError('original duty token does not own this output tick')
     projected={p['observation_id']:p for p in measurement['projection']['people']}
-    transform=lambda p:(.5+(p[0]-key.center_x)*key.zoom,.5+(p[1]-key.center_y)*key.zoom)
+    transform=lambda p:project_review_editorial_point(p,key)
     inside=lambda p:all(-1e-9<=v<=1+1e-9 for v in p)
     failures=[];unknown=[]
-    if required['head_required'] and not candidate_head_ids:unknown.append('required_head_missing_or_unmatched')
+    part_states={p:'PASS' for p in required['parts']}
+    if required['head_required']:part_states['head']='PASS'
+    def mark(part,state):
+        rank={'PASS':0,'UNKNOWN':1,'FAIL':2}
+        if rank[state]>rank[part_states.get(part,'PASS')]:part_states[part]=state
+    if required['head_required'] and not candidate_head_ids:
+        unknown.append('required_head_missing_or_unmatched');mark('head','UNKNOWN')
     for identity in candidate_head_ids:
         heads=[h for h in measurement['projection']['heads'] if h['observation_id']==identity]
         if required['head_required'] and not heads:
-            unknown.append('required_head_unobserved');continue
+            unknown.append('required_head_unobserved');mark('head','UNKNOWN')
+            for name in required['parts']:mark(name,'UNKNOWN')
+            continue
         if required['head_required']:
             x,y,w,h=heads[0]['projected_box_xywh']
-            if heads[0]['visible_fraction']<.995 or not all(inside(transform(p)) for p in ((x,y),(x+w,y+h))):
-                failures.append('required_face_roi_crop')
+            if heads[0]['visible_fraction']<.995 or not all(inside(transform(p))
+                    for p in ((x,y),(x+w,y),(x,y+h),(x+w,y+h))):
+                failures.append('required_face_roi_crop');mark('head','FAIL')
         owners=[p for p in raw['people'] if p.get('unique_head_observation_id')==identity]
         for name,support in required['parts'].items():
             if len(owners)!=1 or dict(owners[0]['part_states']).get(name)!='observed':
-                unknown.append('required_'+name+'_observation_or_ownership_unknown');continue
+                unknown.append('required_'+name+'_observation_or_ownership_unknown');mark(name,'UNKNOWN');continue
             p=owners[0];indices=ARM_INDICES[name]
             points=[p['upper_body_xyc'][i][:2] for i in indices]
             projected_points=[transform(projected[p['observation_id']]['projected_upper_body_xyc'][i][:2]) for i in indices]
             if support is None:
                 # Explicit whole arm is not purchased with inferred joints.
                 if any(not all(-1e-9<=v<=1+1e-9 for v in q) for q in (*points,*projected_points)):
-                    failures.append('explicit_required_'+name+'_outside')
+                    failures.append('explicit_required_'+name+'_outside');mark(name,'FAIL')
             elif not support_preserved_coordinates(support,native_points=points,
                     projected_points=projected_points):
-                failures.append('original_visible_'+name+'_support_loss')
-    if required['parts'] and not candidate_head_ids:unknown.append('required_arm_correspondence_unknown')
+                failures.append('original_visible_'+name+'_support_loss');mark(name,'FAIL')
+    if required['parts'] and not candidate_head_ids:
+        unknown.append('required_arm_correspondence_unknown')
+        for name in required['parts']:mark(name,'UNKNOWN')
     state='FAIL' if failures else 'UNKNOWN' if unknown else 'PASS'
     return dict(state=state,failures=failures,unknown=unknown,token_sha256=token.identity if bound else digest(token),
+        part_states=part_states,
         output_tick=tick,remaining_candidate_branches=list(candidate_head_ids),
         silhouette_or_occlusion_certified=False,quality_approved=False)
 

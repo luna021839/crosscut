@@ -64,10 +64,17 @@ def test_more_closeup_cannot_purchase_known_motion_regression_or_missing_exit(mo
             motion_verdicts=['NONREGRESSING',motion])
 
 
-def test_unknown_original_support_is_not_falsely_labeled_pass():
-    gate=require_paired_motion_adoption(comparison=dict(verdict='BETTER'),
-        support_states=['UNKNOWN'],motion_verdicts=['NONREGRESSING'])
-    assert gate['unresolved_original_support']==1 and not gate['quality_approved']
+def test_unknown_support_string_has_no_original_provenance_and_cannot_approve():
+    with pytest.raises(ValueError,match='frozen manifest'):
+        require_paired_motion_adoption(comparison=dict(verdict='BETTER'),
+            support_states=['UNKNOWN'],motion_verdicts=['NONREGRESSING'])
+
+
+@pytest.mark.parametrize('support,motion',[([],['NONREGRESSING']),(['PASS'],[]),([],[])])
+def test_no_observations_cannot_vacuously_permit_encode(support,motion):
+    with pytest.raises(ValueError,match='explicit measured'):
+        require_paired_motion_adoption(comparison=dict(verdict='BETTER'),
+            support_states=support,motion_verdicts=motion)
 
 
 def test_false_neighbor_receipt_and_unbounded_work_cannot_enter_the_beam():

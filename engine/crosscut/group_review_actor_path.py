@@ -47,7 +47,19 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
         return None  # The real unmatched alternative remains in the graph.
     shape = shape_cost(left['descriptor'],right['descriptor'])
     reacquired=a[4]!=b[4]
-    return dict(cost=2.*max(0.,1.-sim)+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.),
+    # Identity embeddings alone can prefer another performer doing the same
+    # dance. A camera-local hypothesis also owns its measured head trajectory.
+    # A real observed camera cut is a separate reacquisition, not a spatial
+    # jump penalized as a continuous local track.
+    spatial=0.
+    if not reacquired:
+        da,db=left['descriptor'],right['descriptor']
+        distance=math.hypot(db.head_center[0]-da.head_center[0],
+            (db.head_center[1]-da.head_center[1])*9/16)
+        spatial=.4*distance/(.12+(da.face_height+db.face_height)/2)
+        spatial+=.2*abs(math.log(db.face_height/da.face_height))
+    return dict(cost=2.*max(0.,1.-sim)+spatial+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.),
+        measured_camera_local_spatial_cost=spatial,
         state='appearance_reacquisition_at_observed_native_cut' if reacquired else 'appearance_link_hypothesis',
         cosine=sim,linked=True,continuous_camera_local_track_hypothesis=not reacquired,
         observed_native_camera_cut=observed_native_camera_cut)
@@ -55,7 +67,7 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
 
 def anonymous_review_actor_paths(frames, *, maximum_paths=2, maximum_heads=4,
         maximum_native_gap=12, minimum_cosine=.25, ambiguity_margin=.025,
-        maximum_beam=32, work_port=None,known_native_camera_cut_edges=()):
+        maximum_beam=32, work_port=None,known_native_camera_cut_edges=(),distinct_anchor_hypotheses=False):
     """Return a small set of complete sequences, retaining unmatched states.
 
     Each ordered frame supplies explicit, actually observed head views. A head
@@ -67,13 +79,22 @@ def anonymous_review_actor_paths(frames, *, maximum_paths=2, maximum_heads=4,
             or any(type(v) is not int or not 1 <= v <= cap for v,cap in
                 ((maximum_paths,4),(maximum_heads,8),(maximum_beam,64),(maximum_native_gap,12)))
             or not math.isfinite(minimum_cosine) or not 0 <= minimum_cosine <= 1
-            or not math.isfinite(ambiguity_margin) or not 0 <= ambiguity_margin <= 1):
+            or not math.isfinite(ambiguity_margin) or not 0 <= ambiguity_margin <= 1
+            or type(distinct_anchor_hypotheses) is not bool):
         raise ValueError('anonymous actor paths require explicit finite bounds')
     if (not isinstance(known_native_camera_cut_edges,tuple)
             or tuple(sorted(set(known_native_camera_cut_edges)))!=known_native_camera_cut_edges
             or any(type(i) is not int or not 1<=i<len(frames) for i in known_native_camera_cut_edges)):
         raise ValueError('camera reacquisition needs explicit sampled edges with observed native cuts')
     rows=[]
+    # A hypothesis key includes its embedding. Hash each immutable measured
+    # view once per call, not once for every beam parent/child/rival.
+    content_keys={}
+    def key_for(view):
+        if view is None:return 'unmatched'
+        key=id(view)
+        if key not in content_keys:content_keys[key]=_content_key(view)
+        return content_keys[key]
     heads_truncated=False
     beam_truncated=False
     previous=None
@@ -91,53 +112,75 @@ def anonymous_review_actor_paths(frames, *, maximum_paths=2, maximum_heads=4,
                 raise ValueError('actor frames changed source, clock or output order')
             if keys and address != _address(frame[0]):
                 raise ValueError('same actor frame contains different observation addresses')
-            key=_content_key(view)
+            key=key_for(view)
             if key in keys:
                 raise ValueError('duplicate indistinguishable actor hypotheses')
             keys.add(key)
         if frame:
             previous=_address(frame[0])
         ordered=sorted(frame,key=lambda v:(-(v['descriptor'].face_height or 0.)
-            *(v['descriptor'].face_width or 0.),_content_key(v)))
+            *(v['descriptor'].face_width or 0.),key_for(v)))
         heads_truncated |= len(ordered)>maximum_heads
         rows.append(tuple(ordered[:maximum_heads])+(None,))
     beam=[dict(cost=0.,views=(),links=(),tie=())]
     visited=0
     for frame_index,choices in enumerate(rows):
         cache={}
-        parents={_content_key(p['views'][-1]):p['views'][-1] for p in beam if p['views']}
+        parents={key_for(p['views'][-1]):p['views'][-1] for p in beam if p['views']}
         if work_port is not None:
             work_port.charge('association_nodes',len(choices))
             work_port.charge('association_edges',len(parents)*len(choices))
         for key,left in parents.items():
             for right in choices:
-                cache[key,_content_key(right)]=_link(left,right,
+                cache[key,key_for(right)]=_link(left,right,
                     maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
                     observed_native_camera_cut=frame_index in known_native_camera_cut_edges)
         next_beam=[]
         for parent in beam:
             for view in choices:
-                link=None if not parent['views'] else cache[_content_key(parent['views'][-1]),_content_key(view)]
+                link=None if not parent['views'] else cache[key_for(parent['views'][-1]),key_for(view)]
                 if parent['views'] and link is None:
                     continue
                 cost=(1.5 if view is None else 0.)+(0. if link is None else link['cost'])
                 next_beam.append(dict(cost=parent['cost']+cost,views=parent['views']+(view,),
                     links=parent['links']+(() if link is None else (link,)),
-                    tie=parent['tie']+(_content_key(view),)))
+                    tie=parent['tie']+(key_for(view),)))
                 visited+=1
         next_beam.sort(key=lambda p:(p['cost'],p['tie']))
-        beam_truncated |= len(next_beam)>maximum_beam
-        beam=next_beam[:maximum_beam]
-    chosen=beam[:maximum_paths]
+        if distinct_anchor_hypotheses:
+            # Preserve histories for each pre-score first-frame actor. Two
+            # nearly identical histories of one actor must not crowd every
+            # other focal hypothesis out of the small candidate inventory.
+            groups={}
+            for p in next_beam:groups.setdefault(p['tie'][0],[]).append(p)
+            beam_truncated |= any(len(g)>maximum_beam for g in groups.values())
+            beam=sorted((p for g in groups.values() for p in g[:maximum_beam]),key=lambda p:(p['cost'],p['tie']))
+        else:
+            beam_truncated |= len(next_beam)>maximum_beam
+            beam=next_beam[:maximum_beam]
+    if distinct_anchor_hypotheses:
+        anchor_order=tuple(key_for(v) for v in rows[0] if v is not None)
+        chosen=[min((p for p in beam if p['tie'][0]==anchor),key=lambda p:(p['cost'],p['tie']))
+            for anchor in anchor_order if any(p['tie'][0]==anchor for p in beam)][:maximum_paths]
+    else:chosen=beam[:maximum_paths]
     results=[]
     for path in chosen:
-        gap=None if len(beam)<2 else beam[1]['cost']-beam[0]['cost']
+        # A different clearly connected performer is an editorial alternative,
+        # not uncertainty in this actor's temporal association. Competing
+        # histories that share an observed endpoint can change the middle
+        # identity and must remain ambiguous downstream.
+        rivals=[p for p in beam if p['tie']!=path['tie'] and any(
+            path['views'][i] is not None and p['views'][i] is not None
+            and key_for(path['views'][i])==key_for(p['views'][i])
+            for i in (0,len(path['views'])-1))]
+        gap=None if not rivals else min(p['cost']-path['cost'] for p in rivals)
         complete=all(v is not None for v in path['views']) and all(l['linked'] for l in path['links'])
         results.append(dict(observations=path['views'],cost=path['cost'],
             frame_local_head_ids=tuple(None if v is None else v['descriptor'].frame_local_head_id for v in path['views']),
             source_local_link_hypotheses=path['links'],
             all_sampled_frames_connected=complete,
-            competing_path_margin=gap,ambiguous=gap is None or gap < ambiguity_margin,
+            competing_path_margin=gap,ambiguous=bool(gap is not None and gap < ambiguity_margin),
+            ambiguity_scope='selected_path_endpoint_conditioned_history',
             missing_frames=sum(v is None for v in path['views']),
             hypothesis_sha256=digest(path['tie']),visited_states=visited,
             head_inventory_truncated=heads_truncated,association_beam_truncated=beam_truncated,

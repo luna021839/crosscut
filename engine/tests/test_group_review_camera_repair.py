@@ -5,8 +5,10 @@ from crosscut.group_review_camera_repair import (FramingDescriptor, framing_desc
     measured_native_support_preserved,effective_face_detail_pixels,transformed_descriptor)
 from crosscut.group_review_camera_repair import relax_measured_camera_track
 from crosscut.group_review_camera_repair import ReviewActorSelection
+from crosscut.group_review_camera_repair import project_review_editorial_point,fit_endpoint_camera
 from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack
 import pytest
+import math
 
 def face(h=.1, x=.45, y=.3):
     box=[x,y,h/2,h]
@@ -185,3 +187,63 @@ def test_offscreen_projected_wrist_cannot_be_observed_pose_support():
     shape=framing_descriptor(row).pose_shape
     assert 4 not in {p[0] for p in shape}
     assert {0,1,2,3,5}<={p[0] for p in shape}
+
+
+def test_review_roll_uses_actual_renderer_rotate_then_crop_convention():
+    from crosscut.boundary_subject_alignment import _TransformState,_project_point
+    key=EditorialTransformKeyframe(0.,1.4,.53,.48,1.2)
+    actual=_TransformState(key.zoom,key.center_x,key.center_y,key.roll_degrees)
+    for point in ((0.,0.),(1.,0.),(0.,1.),(.31,.27),(.63,.88)):
+        assert project_review_editorial_point(point,key)==pytest.approx(_project_point(point,actual))
+
+
+def test_roll_rotates_body_shape_and_all_bounding_box_corners():
+    from dataclasses import replace
+    d=replace(descriptor(.2),pose_shape=((0,-.5,0.),(1,.5,0.),(4,-.6,-.8)),
+        body_box=(.35,.25,.3,.65),head_roll_radians=.1)
+    key=EditorialTransformKeyframe(0.,1.4,.5,.5,1.2)
+    result=transformed_descriptor(d,key)
+    angle=math.radians(1.2)
+    assert result.pose_shape[0][1:]==pytest.approx((-.5*math.cos(angle),-.5*math.sin(angle)))
+    assert result.head_roll_radians==pytest.approx(.1+angle)
+    projected=[project_review_editorial_point(p,key) for p in ((.35,.25),(.65,.25),(.35,.9),(.65,.9))]
+    x,y,w,h=result.body_box
+    assert x==pytest.approx(min(p[0] for p in projected))
+    assert y==pytest.approx(min(p[1] for p in projected))
+    assert x+w==pytest.approx(max(p[0] for p in projected))
+    assert y+h==pytest.approx(max(p[1] for p in projected))
+
+
+def test_fitted_endpoint_matches_anchor_not_a_midpoint_or_unrotated_box():
+    row=face(.15,.43,.3)
+    row['projection']['heads'][0]['projected_landmarks_xy']=[[.44,.34],[.49,.34]]
+    original=framing_descriptor(row)
+    actual_key=EditorialTransformKeyframe(0.,1.5,.53,.48,1.)
+    target=transformed_descriptor(original,actual_key)
+    fitted=fit_endpoint_camera(row,target,time_seconds=0.,required_support_check=lambda row,key:True)
+    assert fitted.zoom==pytest.approx(actual_key.zoom)
+    assert fitted.center_x==pytest.approx(actual_key.center_x)
+    assert fitted.center_y==pytest.approx(actual_key.center_y)
+    assert fitted.roll_degrees==pytest.approx(actual_key.roll_degrees)
+    assert geometry_cost(target,transformed_descriptor(original,fitted))<1e-10
+
+
+def test_roll_correction_stays_bounded_and_can_relax_to_identity():
+    track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.4,.5,.5,1.6),
+        EditorialTransformKeyframe(1.,1.4,.5,.5,1.6)))
+    result,report=relax_measured_camera_track(track,[face(),face()],sample_times=(0.,1.),
+        required_support_check=lambda row,key:key.zoom==1.)
+    assert result.evaluate(.5).zoom==1. and result.evaluate(.5).roll_degrees==0.
+    assert report['retained_intervention_fraction']==0.
+
+
+def test_camera_descriptor_override_keeps_actual_head_and_native_ownership():
+    from dataclasses import replace
+    row=face();d=framing_descriptor(row)
+    auxiliary=replace(d,pose_shape=((0,-.5,0.),(1,.5,0.),(2,-.6,.6),(3,.6,.6)))
+    camera=fit_endpoint_camera(row,descriptor(.15),time_seconds=0.,head_id=0,
+        descriptor_override=auxiliary,required_support_check=lambda r,k:True)
+    assert camera is not None and not auxiliary.owner_known
+    for wrong in (replace(auxiliary,frame_local_head_id=99),replace(auxiliary,owner_known=True)):
+        with pytest.raises(ValueError,match='head/ownership'):
+            fit_endpoint_camera(row,descriptor(.15),time_seconds=0.,head_id=0,descriptor_override=wrong)

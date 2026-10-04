@@ -3,7 +3,7 @@
 This module neither infers people nor changes a camera after selection.
 Original ownership, actual native evidence and final quality remain separate.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 import json
 import math
 
@@ -17,6 +17,7 @@ class RealizedReviewVariant:
     payload_json: str
     utility: float
     changed_frames: int
+    _identity: str=field(init=False,repr=False)
 
     def __post_init__(self):
         if (type(self.first) is not int or type(self.end) is not int
@@ -30,17 +31,69 @@ class RealizedReviewVariant:
                 or not all(k in value for k in
                     ('camera_identity','sampler_identity','actor_path_identity','source_identity'))):
             raise ValueError('realized variant must bind its actual camera, sampler and actor path')
+        object.__setattr__(self,'_identity',digest(dict(first=self.first,end=self.end,payload=value)))
 
     @property
     def payload(self):return json.loads(self.payload_json)
 
     @property
     def identity(self):
-        return digest(dict(first=self.first,end=self.end,payload=self.payload))
+        return self._identity
+
+    @property
+    def evaluation_identity(self):
+        return digest(dict(physical_variant=self.identity,utility=self.utility,
+            changed_frames=self.changed_frames,policy='near4.5_blur0.45_path0.5_duration_v1'))
 
     def assert_unchanged(self,payload):
         if digest(payload)!=digest(self.payload):
             raise ValueError('selected realized camera/sampler/actor payload changed after selection')
+
+
+def validate_restored_review_variant(variant,metadata,selected,*,camera_identity,sampler_identity,
+        expected_source_identity,output_frame_count):
+    """Recompute what the consumer uses, not only the duplicated JSON hash."""
+    payload=variant.payload
+    if (metadata.get('bindings')!=payload.get('bindings')
+            or metadata.get('source')!=payload.get('source')
+            or metadata.get('phase')!=payload.get('phase_frames')
+            or metadata.get('keep')!=payload.get('keep')
+            or tuple(metadata.get('phase_scope',()))!=(max(0,variant.first-6),
+                min(output_frame_count,variant.end+6))):
+        raise ValueError('cached model metadata disagrees with sealed actor/source/phase/scope')
+    bindings=payload['bindings'];ticks=tuple(b['output_tick'] for b in bindings)
+    if tuple(sorted(set(ticks)))!=ticks or tuple(selected)!=ticks:
+        raise ValueError('restored actor binding inventory changed')
+    for binding in bindings:
+        view=selected[binding['output_tick']]
+        if binding['state']=='UNMATCHED':
+            if view is not None or binding['head_id'] is not None or binding['native_frame'] is not None:
+                raise ValueError('restored unmatched actor changed to a selected occurrence')
+        elif (binding['state']!='HEAD_OCCURRENCE' or view is None
+                or view['descriptor'].frame_local_head_id!=binding['head_id']
+                or view['row']['native_observation']['native_frame_index']!=binding['native_frame']):
+            raise ValueError('restored selected actor changed its sealed occurrence/native parent')
+    actor_identity=digest([(t,None if v is None else v['descriptor'].frame_local_head_id,
+        None if v is None else digest(v['row']['native_observation'])) for t,v in selected.items()])
+    if (actor_identity!=payload['actor_path_identity'] or camera_identity!=payload['camera_identity']
+            or sampler_identity!=payload['sampler_identity'] or expected_source_identity!=payload['source_identity']):
+        raise ValueError('restored actual actor/raw/camera/sampler identity disagrees with sealed payload')
+    near=sum(0. if v is None else v['near'] for v in selected.values())/len(selected)
+    blur=sum(1. if v is None or v['detail_risk'] is None else v['detail_risk'] for v in selected.values())/len(selected)
+    path=payload['actor_path'];path_cost=0. if path is None else path['cost']/len(selected)
+    # FPS is supplied in metadata by the restoring caller; it is checked
+    # against the immutable plan, never accepted from the cached score.
+    fps=metadata.get('validated_plan_fps')
+    if type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0:
+        raise ValueError('restored evaluation requires the actual plan clock')
+    utility=(variant.end-variant.first)/fps*(4.5*near-.45*blur-.5*path_cost)
+    if (abs(near-payload['near_fraction'])>1e-9 or abs(utility-variant.utility)>1e-8
+            or variant.changed_frames!=(0 if payload['keep'] else variant.end-variant.first)
+            or metadata.get('evaluation_identity',variant.evaluation_identity)!=variant.evaluation_identity):
+        raise ValueError('cached selection utility or changed-frame accounting changed')
+    return dict(actual_restored_actor_verified=True,evaluation_identity=variant.evaluation_identity,
+        policy='near4.5_blur0.45_path0.5_duration_v1',legacy_evaluation_recomputed=
+            'evaluation_identity' not in metadata,quality_approved=False)
 
 
 def select_realized_review_path(layers,edge_at,*,output_frame_count,
@@ -126,16 +179,22 @@ def incident_tick_union(first,end,original_cut_ticks,candidate_cut_ticks,*,outpu
         if first<=t<=end and 0<t<output_frame_count}))
 
 
-def require_paired_motion_adoption(*,comparison,support_states,motion_verdicts):
-    """A consumer gate, not a quality badge. Near duration cannot pay motion."""
-    if (comparison.get('verdict') not in ('BETTER','WORSE','INCONCLUSIVE')
-            or any(s not in ('PASS','FAIL','UNKNOWN') for s in support_states)
-            or any(s not in ('NONREGRESSING','REGRESSING','UNMEASURED','UNCHANGED')
-                for s in motion_verdicts)):
-        raise ValueError('paired adoption needs explicit measured verdicts')
-    if comparison['verdict']!='BETTER' or 'FAIL' in support_states or any(
-            s in ('REGRESSING','UNMEASURED') for s in motion_verdicts):
-        raise ValueError('paired motion/support comparison does not permit encode')
-    return dict(numeric_review_encode_permitted=True,
-        unresolved_original_support=sum(s=='UNKNOWN' for s in support_states),
-        quality_approved=False,normal_complete_bundle_created=False)
+def require_paired_motion_adoption(*,comparison,expected_manifest=None,keyed_receipts=None,
+        support_states=None,motion_verdicts=None):
+    """Only a complete plan-bound keyed comparison can permit review encoding.
+
+    Legacy generic strings cannot prove inventory, original UNKNOWN provenance
+    or an unchanged sampler/camera/actor. Keep the argument names solely to
+    give old callers an explicit rejection, never a permissive compatibility
+    fallback. Numeric review encoding still does not establish expert quality.
+    """
+    from .group_review_adoption_manifest import decide_keyed_review_adoption
+    if (expected_manifest is None or keyed_receipts is None or support_states is not None
+            or motion_verdicts is not None):
+        raise ValueError('paired adoption needs explicit measured keyed receipts and a frozen manifest; '
+            'generic verdict strings cannot permit encode')
+    decision=decide_keyed_review_adoption(manifest=expected_manifest,receipts=keyed_receipts,
+        comparison=comparison)
+    if decision['state']!='REVIEW_ENCODE_ELIGIBLE':
+        raise ValueError('paired motion/support comparison does not permit encode: '+decision['state'])
+    return decision

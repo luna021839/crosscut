@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from crosscut.group_retained_raster_review import content_sha
 from crosscut.group_retained_raster_stream import construct_retained_stream_movie,verify_retained_stream_recipe
+from crosscut.group_retained_raster_stream import bounded_review_encoder_bytes
 
 
 def fixture_movie(path,offset):
@@ -49,3 +50,20 @@ def test_stream_cannot_patch_protected_frames_or_reuse_changed_content(tmp_path)
 def test_recipe_checksum_tampering_is_not_a_stream_pass(tmp_path):
     report=construct_retained_stream_movie(**options(tmp_path));report['protected_raster_sha256']='0'*64
     with pytest.raises(ValueError,match='recipe verification failed'):verify_retained_stream_recipe(report)
+
+
+def test_encoder_bound_includes_vbv_audio_container_and_exact_frame_duration():
+    assert bounded_review_encoder_bytes(frame_count=5,fps=10.,maximum_video_bitrate=32000000,
+        video_buffer_bits=48000000,audio_payload_bytes=123,container_reserve_bytes=100)==8000223
+    expected=bounded_review_encoder_bytes(frame_count=4357,fps=29.97,maximum_video_bitrate=32000000,
+        video_buffer_bits=48000000,audio_payload_bytes=10000000)
+    assert expected<640*1024**2
+
+
+def test_unbounded_or_incomplete_encoder_policy_is_rejected_before_start(tmp_path):
+    values=options(tmp_path)
+    with pytest.raises(ValueError,match='nonnegative payloads'):
+        construct_retained_stream_movie(**values,maximum_video_bitrate=32000000)
+    with pytest.raises(ValueError,match='exceeds the output cap'):
+        construct_retained_stream_movie(**values,maximum_video_bitrate=32000000,
+            video_buffer_bits=48000000,audio_payload_bound=123)

@@ -4,11 +4,33 @@ import unittest
 import cv2
 import numpy as np
 
-from crosscut.group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost, native_joint_pixel_flow_stream
+from crosscut.group_joint_native_joint_flow import native_joint_pixel_flows, native_joint_assignment_cost, native_joint_pixel_flow_stream, review_native_joint_patch_paths
 from engine.tests.test_group_joint_formation import person
 
 
 class NativeJointFlowTests(unittest.TestCase):
+    def test_pure_review_patch_measurement_does_not_need_or_create_person_ownership(self):
+        previous, current, subject, moved = self.fixture()
+        seeds = tuple((i, *subject.upper_body_xyc[i][:2]) for i in (2, 4))
+        rows = review_native_joint_patch_paths(previous, current, seeds)
+        self.assertEqual({row[0] for row in rows}, {2, 4})
+        for row in rows:
+            self.assertAlmostEqual(row[3], moved.upper_body_xyc[row[0]][0], delta=.003)
+            self.assertEqual(len(row), 7)
+        self.assertEqual(review_native_joint_patch_paths(previous, current, ()), ())
+        self.assertEqual(review_native_joint_patch_paths(previous, current, seeds,
+            intermediate_pixels=(np.zeros_like(previous),)), ())
+
+    def test_review_patch_seeds_and_four_step_limit_cannot_expand_silently(self):
+        previous, current, subject, _ = self.fixture()
+        seed = (2, *subject.upper_body_xyc[2][:2])
+        for seeds in ((seed, seed), ((2, -1., .5),), ((8, .5, .5),)):
+            with self.assertRaises(ValueError):
+                review_native_joint_patch_paths(previous, current, seeds)
+        with self.assertRaises(ValueError):
+            review_native_joint_patch_paths(previous, current, (seed,),
+                intermediate_pixels=(previous,)*4)
+
     def fixture(self):
         subject = person(4, .5)
         width, height = 1000, 800

@@ -9,7 +9,9 @@ from .group_original_visible_support import ARM_INDICES, measured_visible_arm_su
 from .group_performer_family_owner import digest
 
 
-def freeze_review_original_duties(original, measured):
+def freeze_review_original_duties(original, measured, *, role_origin='human_declared'):
+    if role_origin not in ('human_declared','automatic_observed_support_v1'):
+        raise ValueError('original duty policy needs a frozen human/automatic role origin')
     if measured['original_program_sha256'] != original.program_sha256:
         raise ValueError('review duty observations borrowed another original programme')
     count = sum(original.global_cell_frame_counts)
@@ -26,7 +28,7 @@ def freeze_review_original_duties(original, measured):
     for tick in range(count):
         u,index,e = epochs[tick]; role = e['role']; key = (u.unit_id,index)
         parts = latched.setdefault(key,{})
-        if role == GroupOutputRole.FOCAL_HEAD_ARMS.value:
+        if role == GroupOutputRole.FOCAL_HEAD_ARMS.value and role_origin=='human_declared':
             for name in ARM_INDICES: parts.setdefault(name,None)
         row = measured['rows'].get(str(tick)); head = measured['original_linked_heads'].get(str(tick))
         focal = role in focal_roles
@@ -50,6 +52,7 @@ def freeze_review_original_duties(original, measured):
                     if support['visibility'] != 'outside' and not (name in parts and parts[name] is None):
                         parts[name]=support
         tokens[str(tick)] = dict(head_required=focal,parts=dict(parts) if focal else {},
+            role_origin=role_origin,
             original_role=role,original_unit_id=u.unit_id,original_epoch_index=index,
             original_observation_sha256=None if row is None else digest(row['native_observation']),
             conditional_original_head=head,
@@ -57,6 +60,7 @@ def freeze_review_original_duties(original, measured):
             unresolved_role_or_formation=role in (None,GroupOutputRole.FORMATION.value),
             cast_correspondence_certified=False)
     return dict(contract='frozen_original_review_part_duties_v1',
+        automatic_role_policy=role_origin,
         original_program_sha256=original.program_sha256,rows=tokens,
         full_original_output_ticks_observed=len(requested) == count,
         missing_actor_does_not_erase_latched_parts=True,mixed_and_subcell_original_roles_preserved=True,

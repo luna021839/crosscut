@@ -106,7 +106,8 @@ def time_normalized_center_acceleration(ticks, centers, fps):
     return tuple(result)
 
 
-def validate_paired_native_request_inventory(plans, capture, *, expected_render_plan_identity):
+def validate_paired_native_request_inventory(plans, capture, *, expected_render_plan_identity,
+        expected_native_addresses=None):
     """Check captured rows/appearance keys, not requests copied into a score.
 
     Inference aliases may share a native frame; every requested OUTPUT tick
@@ -124,6 +125,8 @@ def validate_paired_native_request_inventory(plans, capture, *, expected_render_
             or set(capture.get('patches',{})) != {str(t) for t in ticks}
             or set(capture.get('appearance',{})) != {str(t) for t in appearance}):
         raise ValueError('paired actual capture omitted or changed output/context/appearance requests')
+    if expected_native_addresses is not None and set(expected_native_addresses)!=set(ticks):
+        raise ValueError('paired sampler address inventory omitted an exact output request')
     for tick in ticks:
         row = capture['rows'][str(tick)]
         raw = row['native_observation']; projection = row['projection']
@@ -132,6 +135,9 @@ def validate_paired_native_request_inventory(plans, capture, *, expected_render_
                 or raw['request_source_index'] != projection['source_request_index']
                 or raw['source_clock_identity'] != projection['source_clock_identity']):
             raise ValueError('paired actual row borrowed another output/source/native clock')
+        if expected_native_addresses is not None and tuple(expected_native_addresses[tick])!=(
+                raw['request_source_index'],raw['native_frame_index'],raw['source_clock_identity']):
+            raise ValueError('paired actual capture changed its compiled renderer native address')
     return dict(requested_output_ticks=len(ticks),requested_appearance_ticks=len(appearance),
         actual_capture_keys_verified=True,native_aliases_deleted_output_ticks=False,
         fresh_native_authority_certified=False,quality_approved=False)

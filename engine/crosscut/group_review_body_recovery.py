@@ -1,0 +1,212 @@
+"""Source-local, fixed-ROI auxiliary body measurements for GROUP reviews.
+
+Duplicate body detections are kept, never NMS-merged into an owner. A new
+top-down observation can supplement a selected single-face occurrence, with
+the ROI frozen from the prior inventory before pose or match costs are seen.
+It is not production person ownership, named identity, or quality approval.
+"""
+from dataclasses import dataclass, replace
+import json
+import math
+import numpy as np
+
+from .group_performer_family_owner import digest
+from .body_pose_2d import RTMPOSE_BODY7_MODEL_SHA256
+
+
+def head_fingerprint(head):
+    return digest({k:head[k] for k in ('box_xywh','landmarks_xy','confidence','extent_basis')})
+
+
+def native_binding(raw):
+    return dict(source=raw['request_source_index'],native=raw['native_frame_index'],
+        clock=raw['source_clock_identity'],file=list(raw['source_file_identity']),
+        pixel=raw['native_pixel_sha256'],size=list(raw['frame_size_wh']))
+
+
+@dataclass(frozen=True,slots=True)
+class FrozenReviewBodyWindow:
+    token_json:str
+
+    def __post_init__(self):
+        value=json.loads(self.token_json);requests=value.get('requests',())
+        if (value.get('contract')!='frozen_prior_inventory_body_review_window_v1'
+                or not 2<=len(requests)<=16 or value.get('roi_selection_inspected_new_pose') is not False
+                or any(len(v.get('roi',()))!=4 or min(v['roi'][2:])<=0
+                    or any(not math.isfinite(x) for x in v['roi']) for v in requests)
+                or any(a['binding']['native']>=b['binding']['native'] for a,b in zip(requests,requests[1:]))
+                or any(b['binding']['native']-a['binding']['native']>12 for a,b in zip(requests,requests[1:]))
+                or len({(v['binding']['source'],v['binding']['clock'],tuple(v['binding']['file']))
+                    for v in requests})!=1):
+            raise ValueError('fixed body ROI needs exact bounded source-local prior requests')
+
+    @property
+    def payload(self):return json.loads(self.token_json)
+
+    @property
+    def identity(self):return digest(self.payload)
+
+
+def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None):
+    """No candidate error, pose success, or editorial crop selects this ROI."""
+    if (not isinstance(raws,(list,tuple)) or not 2<=len(raws)<=16
+            or type(native_camera_unit) is not int or native_camera_unit<0):
+        raise ValueError('auxiliary review body scope is an actual single-face native close-up')
+    explicit=head_ids is not None
+    if not explicit and any(len(raw['heads'])!=1 for raw in raws):
+        raise ValueError('auxiliary review body scope is an actual single-face native close-up')
+    if explicit and (not isinstance(head_ids,(list,tuple)) or len(head_ids)!=len(raws)
+            or any(type(i) is not int or i<0 for i in head_ids)):
+        raise ValueError('explicit auxiliary body needs an independently selected occurrence at every request')
+    heads=[]
+    for index,raw in enumerate(raws):
+        selected=([h for h in raw['heads'] if h['observation_id']==head_ids[index]] if explicit else raw['heads'])
+        if len(selected)!=1 or selected[0]['box_xywh'][3]<(0.05 if explicit else .13):
+            raise ValueError('selected auxiliary head is absent, repeated or below its declared measurement scope')
+        heads.append(selected[0])
+    boxes=[]
+    for raw,head in zip(raws,heads,strict=True):
+        ids=set(head['candidate_body_observation_ids'])
+        boxes.extend(p['box_xywh'] for p in raw['people'] if p['observation_id'] in ids
+            and p.get('face_anchor_consistent') is True and p.get('pose_reason')=='observed')
+    if not boxes:raise ValueError('body window has no previously measured head-compatible ROI')
+    boxes=np.asarray(boxes,float)
+    center=np.median(boxes[:,:2]+boxes[:,2:]/2,axis=0);size=np.median(boxes[:,2:],axis=0)
+    low=np.maximum(0.,center-size/2);high=np.minimum(1.,center+size/2)
+    roi=tuple(map(float,np.r_[low,high-low]))
+    requests=[dict(binding=native_binding(raw),raw_parent_sha256=digest(raw),
+        head_fingerprint=head_fingerprint(head),head_id=head['observation_id'],roi=roi)
+        for raw,head in zip(raws,heads,strict=True)]
+    value=dict(contract='frozen_prior_inventory_body_review_window_v1',native_camera_unit=native_camera_unit,
+        requests=requests,prior_body_roi_alternatives=boxes.tolist(),
+        roi_derivation='coordinate_median_of_all_prior_head_compatible_boxes',
+        roi_selection_inspected_new_pose=False,raw_detector_rows_rewritten=False,
+        head_selection_scope='explicit_prior_selected_occurrences' if explicit else 'sole_native_face',
+        body_ownership_certified=False,quality_approved=False)
+    return FrozenReviewBodyWindow(json.dumps(value,sort_keys=True,allow_nan=False))
+
+
+def bind_review_body_receipts(bundle):
+    """Reject duplicate or foreign receipts; retain unsuccessful actual poses."""
+    if (bundle.get('contract')!='bounded_actual_fixed_roi_body_review_receipts_v1'
+            or not isinstance(bundle.get('windows'),list) or not isinstance(bundle.get('receipts'),list)
+            or len(bundle['receipts'])>512):
+        raise ValueError('body recovery needs the bounded independently frozen actual inventory')
+    windows={}
+    for row in bundle['windows']:
+        window=FrozenReviewBodyWindow(json.dumps(row['token'],sort_keys=True,allow_nan=False))
+        if row['identity']!=window.identity or window.identity in windows:
+            raise ValueError('body window seal changed or repeated')
+        windows[window.identity]=window
+    receipts={}
+    for receipt in bundle['receipts']:
+        window=windows.get(receipt.get('window_identity'))
+        if (window is None or receipt.get('model_content_sha256')!=RTMPOSE_BODY7_MODEL_SHA256
+                or receipt.get('contract')!='actual_fixed_roi_body_review_receipt_v1'):
+            raise ValueError('body receipt has no matching pre-inference window/model')
+        request=next((r for r in window.payload['requests'] if r['binding']==receipt.get('binding')),None)
+        if (request is None or request['head_fingerprint']!=receipt.get('head_fingerprint')
+                or request['raw_parent_sha256']!=receipt.get('raw_parent_sha256')
+                or tuple(request['roi'])!=tuple(receipt.get('pose',{}).get('bbox_xywh',()))):
+            raise ValueError('body receipt changed its prior actor/native/ROI request')
+        b=receipt['binding'];key=(b['source'],b['native'],b['clock'],tuple(b['file']),b['pixel'],receipt['head_fingerprint'])
+        if key in receipts:raise ValueError('two body receipts compete for one exact selected raster')
+        receipts[key]=(window,receipt)
+    return receipts
+
+
+def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
+    """Bind auxiliary evidence to this exact actor/raster/camera projection.
+
+    Original conflicting observations are not discarded. A low-confidence
+    wrist remains absent; no candidate-dependent intersection grants a pass.
+    """
+    if view is None:return None
+    if not isinstance(expected_window,FrozenReviewBodyWindow):
+        raise ValueError('auxiliary body consumer needs its independently frozen request')
+    raw=view['row']['native_observation'];d=view['descriptor']
+    result=dict(view)
+    selected=next((h for h in raw['heads'] if h['observation_id']==d.frame_local_head_id),None)
+    request=next((v for v in expected_window.payload['requests'] if v['binding']==native_binding(raw)),None)
+    if (receipt.get('contract')!='actual_fixed_roi_body_review_receipt_v1' or request is None
+            or receipt.get('window_identity')!=expected_window.identity
+            or receipt.get('model_content_sha256')!=RTMPOSE_BODY7_MODEL_SHA256
+            or receipt.get('binding')!=native_binding(raw) or selected is None
+            or receipt.get('raw_parent_sha256')!=digest(raw)
+            or request['head_id']!=selected['observation_id']
+            or request['head_fingerprint']!=head_fingerprint(selected)
+            or (len(raw['heads'])!=1 and expected_window.payload.get('head_selection_scope')
+                !='explicit_prior_selected_occurrences')
+            or receipt.get('head_fingerprint')!=head_fingerprint(selected)):
+        raise ValueError('auxiliary body receipt borrowed another actor/native raster')
+    result['review_body_receipt_sha256']=digest(receipt)
+    result['auxiliary_body_is_production_ownership']=False
+    pose=receipt['pose'];points=pose.get('upper_body_xyc',())
+    if tuple(pose.get('bbox_xywh',()))!=tuple(request['roi']):
+        raise ValueError('auxiliary body inference changed the predeclared ROI')
+    raw_points=pose.get('raw_keypoints_xyc',())
+    # BodyPose2DAnalyzer retains unclipped SimCC scores in raw17 but clips
+    # the public eight-joint confidence to [0,1]. Coordinates are identical;
+    # an actual model score over 1 must not be mistaken for fabricated joints.
+    if len(raw_points)==17 and len(points)==8 and any(
+            tuple(points[i])!=(raw_points[j][0],raw_points[j][1],
+                max(0.,min(1.,raw_points[j][2]))) for i,j in enumerate((5,6,7,8,9,10,11,12))):
+        raise ValueError('auxiliary upper-body evidence changed its actual RTMPose raw joint mapping')
+    if (pose.get('reason')!='observed' or pose.get('face_anchor_consistent') is not True
+            or len(points)!=8 or len(pose.get('raw_keypoints_xyc',()))!=17
+            or any(len(p)!=3 or any(not math.isfinite(v) for v in p) or not 0<=p[2]<=1 for p in points)
+            or min(points[0][2],points[1][2])<.42):
+        result['review_body_recovery_state']='UNRESOLVED_ACTUAL_POSE';return result
+    projected=[(*project_point(p[:2]),p[2]) for p in points]
+    if any(not all(0.<=v<=1. for v in projected[i][:2]) for i in (0,1)):
+        result['review_body_recovery_state']='SHOULDER_OUTSIDE_ACTUAL_CAMERA';return result
+    center=np.mean(np.asarray(projected[:2])[:,:2],axis=0)
+    scale=float(np.linalg.norm((np.asarray(projected[0][:2])-np.asarray(projected[1][:2]))*(1.,9/16)))
+    if scale<=1e-6:
+        result['review_body_recovery_state']='DEGENERATE_SHOULDER';return result
+    shape=tuple((i,(p[0]-center[0])/scale,(p[1]-center[1])*9/16/scale)
+        for i,p in enumerate(projected[:6]) if p[2]>=.42 and all(0.<=v<=1. for v in p[:2]))
+    primary={} if d.pose_shape is None else {p[0]:np.asarray(p[1:]) for p in d.pose_shape}
+    secondary={p[0]:np.asarray(p[1:]) for p in shape}
+    disagreements={k:float(np.linalg.norm(primary[k]-secondary[k])) for k in primary.keys()&secondary.keys()}
+    result['primary_auxiliary_joint_disagreement']=disagreements
+    if any(v>.35 for v in disagreements.values()) or not primary.keys()<=secondary.keys():
+        result['review_body_recovery_state']='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY';return result
+    result['descriptor']=replace(d,pose_shape=shape)
+    result['review_body_native_xyc']=tuple(tuple(p) for p in points)
+    result['review_body_projected_xyc']=tuple(tuple(p) for p in projected)
+    result['review_body_recovery_state']='OBSERVED_HEAD_CONDITIONED_BODY_REVIEW_HYPOTHESIS'
+    return result
+
+
+def consume_head_conditioned_review_support(token,view,*,key):
+    """Review-only polyline support, with unchanged raw ownership authority.
+
+    Only the verified adapter's successful selected-head measurement can fill
+    an otherwise unknown part. Primary FAIL and known conflicting evidence
+    cannot be hidden. No production unique-head ownership is manufactured.
+    """
+    from .group_review_program_evaluator import bind_review_part_duties,consume_frozen_part_duties
+    from .group_review_camera_repair import project_review_editorial_point
+    from .group_original_visible_support import ARM_INDICES,support_preserved_coordinates
+    bound=bind_review_part_duties(token)
+    if view is None:raise ValueError('head-conditioned support needs the exact output observation')
+    row=view['row'];head=view['descriptor'].frame_local_head_id
+    result=consume_frozen_part_duties(bound,row,candidate_head_ids=(head,),key=key)
+    if view.get('review_body_recovery_state')!='OBSERVED_HEAD_CONDITIONED_BODY_REVIEW_HYPOTHESIS':return result
+    if not view.get('review_body_receipt_sha256') or view.get('auxiliary_body_is_production_ownership') is not False:
+        raise ValueError('head-conditioned support lost its verified auxiliary evidence binding')
+    raw=view['review_body_native_xyc'];projected=view['review_body_projected_xyc']
+    states=dict(result['part_states']);required=bound.row(row['output_tick'])
+    for name,support in required['parts'].items():
+        if states[name]!='UNKNOWN':continue
+        indices=ARM_INDICES[name]
+        if any(raw[i][2]<.42 for i in indices):continue
+        native=[raw[i][:2] for i in indices]
+        actual=[project_review_editorial_point(projected[i][:2],key) for i in indices]
+        passed=(all(all(0<=v<=1 for v in p) for p in (*native,*actual)) if support is None else
+            support_preserved_coordinates(support,native_points=native,projected_points=actual))
+        states[name]='PASS' if passed else 'FAIL'
+    state='FAIL' if 'FAIL' in states.values() else 'UNKNOWN' if 'UNKNOWN' in states.values() else 'PASS'
+    return dict(result,state=state,part_states=states,review_head_conditioned_parts=True,
+        auxiliary_body_is_production_ownership=False,review_body_receipt_sha256=view['review_body_receipt_sha256'])

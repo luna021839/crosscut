@@ -25,8 +25,47 @@ def test_competing_people_keep_distinct_connected_sequences():
     frames=[[view(t,0,17),view(t,1,5)] for t in (0,2,4)]
     paths=anonymous_review_actor_paths(frames)
     assert len(paths)==2 and all(p['all_sampled_frames_connected'] for p in paths)
-    assert all(p['ambiguous'] for p in paths)
+    assert all(not p['ambiguous'] for p in paths)
     assert {p['frame_local_head_ids'] for p in paths}=={(17,17,17),(5,5,5)}
+
+
+def test_shared_endpoints_do_not_hide_ambiguous_middle_actor_history():
+    middle_a=view(2,0,7);middle_b=view(2,1,8)
+    middle_b['vector']=list(middle_a['vector'])
+    from dataclasses import replace
+    middle_b['descriptor']=replace(middle_b['descriptor'],head_center=middle_a['descriptor'].head_center,
+        face_width=.15001)
+    paths=anonymous_review_actor_paths([[view(0,0,7)],[middle_a,middle_b],[view(4,0,7)]])
+    assert all(p['ambiguous'] for p in paths)
+    assert all(p['competing_path_margin']==pytest.approx(0.) for p in paths)
+
+
+def test_local_spatial_hypothesis_does_not_jump_to_a_more_similar_background_face():
+    from dataclasses import replace
+    left=view(0,0,7);near=view(2,0,8);far=view(2,0,9)
+    near['vector']=[.98,.2]+[0.]*126
+    far['descriptor']=replace(far['descriptor'],head_center=(.95,.85))
+    p=anonymous_review_actor_paths([[left],[near,far]])[0]
+    assert p['frame_local_head_ids']==(7,8)
+
+
+def test_two_frozen_anchor_actors_are_not_two_histories_of_one_actor():
+    frames=[[view(t,0,7),view(t,1,9)] for t in (0,2,4)]
+    paths=anonymous_review_actor_paths(frames,distinct_anchor_hypotheses=True)
+    assert {p['frame_local_head_ids'][0] for p in paths}=={7,9}
+    assert all(not p['ambiguous'] for p in paths)
+
+
+def test_beam_does_not_rehash_embeddings_for_every_parent_and_rival(monkeypatch):
+    import crosscut.group_review_actor_path as module
+    original=module._content_key;calls=[]
+    def counted(v):
+        calls.append(id(v));return original(v)
+    monkeypatch.setattr(module,'_content_key',counted)
+    frames=[[view(t,i,i) for i in range(4)] for t in (0,2,4,6)]
+    paths=anonymous_review_actor_paths(frames,maximum_heads=4,distinct_anchor_hypotheses=True)
+    assert len(calls)==16 and len(set(calls))==16
+    assert paths and all(p['all_sampled_frames_connected'] for p in paths)
 
 
 def test_detector_head_id_permutation_does_not_change_content_or_rank():

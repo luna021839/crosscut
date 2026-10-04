@@ -70,3 +70,19 @@ def test_explicit_whole_arm_duty_is_not_weakened_to_new_partial_support():
     data['rows']['0']['native_observation']['people'][0]['part_states']=[(name,'observed')]
     duties=freeze_review_original_duties(original,data)
     assert duties['rows']['0']['parts'][name] is None
+
+
+def test_automatic_role_does_not_promote_unobserved_arms_to_human_locks():
+    original,data=world('focal_head_and_observed_arms')
+    data['rows']['0']['native_observation']['people']=[]
+    duties=freeze_review_original_duties(original,data,role_origin='automatic_observed_support_v1')
+    assert all(not r['parts'] for r in duties['rows'].values())
+    assert duties['automatic_role_policy']=='automatic_observed_support_v1'
+
+
+def test_automatic_known_arm_remains_required_when_original_detection_disappears():
+    original,data=world('focal_head_and_observed_arms');name=next(iter(ARM_INDICES))
+    data['rows']['0']['native_observation']['people'][0]['part_states']=[(name,'observed')]
+    duties=freeze_review_original_duties(original,data,role_origin='automatic_observed_support_v1')
+    assert duties['rows']['0']['parts'][name] is not None
+    assert duties['rows']['2']['parts']==duties['rows']['0']['parts']

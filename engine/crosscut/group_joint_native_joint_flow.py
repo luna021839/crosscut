@@ -57,21 +57,51 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
     Caller supplies chronological actual rasters, not interpolated frames. A
     no-feature result is UNKNOWN and does not assert that unread steps passed.
     """
+    seeds = tuple(tuple((joint, x, y) for joint, (x, y, confidence)
+        in enumerate(person.upper_body_xyc) if confidence >= .3 and 0 <= x < 1 and 0 <= y < 1)
+        if trackable_person_ownership(person) else () for person in people)
+    measured = _joint_local_pixel_rows(previous_pixels, current_pixels, seeds,
+        intermediate_pixels=intermediate_pixels, maximum_intermediate=12)
+    result = []
+    for person, joints in zip(people, measured, strict=True):
+        core = {row[0] for row in joints} & {0, 1, 6, 7}
+        result.append(NativeJointPixelFlow(person.observation_id, tuple(joints))
+            if len(joints) >= 3 and len(core) >= 2 else None)
+    return tuple(result)
+
+
+def review_native_joint_patch_paths(previous_pixels, current_pixels, seeds, *, intermediate_pixels=()):
+    """Pure short pixel measurement, with NO person/anatomy ownership upgrade.
+
+    Seeds are actual measured joint-index/x/y coordinates supplied by a bound
+    review caller. This primitive neither creates model confidence nor asserts
+    anatomical visibility at its endpoint. The caller must verify exact source
+    rasters, native units, actor binding, two independent anchors and budget.
+    At most four chronological native steps may be supplied, in either time
+    direction. A missing feature remains absent; no zero-motion substitute.
+    """
+    if (not isinstance(seeds, (tuple, list)) or len(seeds) > 8
+            or any(len(row) != 3 or type(row[0]) is not int or not 0 <= row[0] < 8
+                or any(not math.isfinite(v) or not 0 <= v < 1 for v in row[1:]) for row in seeds)
+            or len({row[0] for row in seeds}) != len(seeds)):
+        raise ValueError('review joint patch seeds need unique actual normalized coordinates')
+    return tuple(_joint_local_pixel_rows(previous_pixels, current_pixels, (tuple(seeds),),
+        intermediate_pixels=intermediate_pixels, maximum_intermediate=3)[0])
+
+
+def _joint_local_pixel_rows(previous_pixels, current_pixels, seeds_by_group, *,
+        intermediate_pixels, maximum_intermediate):
     if any(not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
             or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 3
             for frame in (previous_pixels, current_pixels)):
         raise ValueError('joint pixel flow needs actual BGR8 rasters')
     if previous_pixels.shape != current_pixels.shape:
-        return tuple(None for _ in people)
+        return tuple(() for _ in seeds_by_group)
     previous = cv2.cvtColor(previous_pixels, cv2.COLOR_BGR2GRAY)
     height, width = previous.shape
     feature_rows, groups = [], []
-    for owner, person in enumerate(people):
-        if not trackable_person_ownership(person):
-            continue
-        for joint, (x, y, confidence) in enumerate(person.upper_body_xyc):
-            if confidence < .3 or not 0 <= x < 1 or not 0 <= y < 1:
-                continue
+    for owner, seeds in enumerate(seeds_by_group):
+        for joint, x, y in seeds:
             radius = max(6, min(20, int(min(width, height)*.015)))
             xx, yy = int(round(x*width)), int(round(y*height))
             left, top = max(0, xx-radius), max(0, yy-radius)
@@ -88,7 +118,7 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
             feature_rows.extend(points)
             groups.append((owner, joint, x, y, start, len(feature_rows)))
     if not feature_rows:
-        return tuple(None for _ in people)
+        return tuple(() for _ in seeds_by_group)
     original = np.asarray(feature_rows, dtype=np.float32).reshape(-1, 1, 2)
     options = dict(winSize=(21, 21), maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
@@ -98,8 +128,8 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
     errors = np.zeros(len(original), dtype=np.float32)
     def steps():
         for index, frame in enumerate(intermediate_pixels):
-            if index >= 12:
-                raise ValueError('joint pixel flow accepts at most twelve actual intervening rasters')
+            if index >= maximum_intermediate:
+                raise ValueError('joint pixel flow exceeded its actual intervening raster bound')
             yield frame
         yield current_pixels
     for frame in steps():
@@ -107,14 +137,14 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
                 or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 3):
             raise ValueError('joint pixel flow needs actual BGR8 rasters')
         if frame.shape != previous_pixels.shape:
-            return tuple(None for _ in people)
+            return tuple(() for _ in seeds_by_group)
         current = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(previous, current, moving, None, **options)
         if forward is None or forward_status is None:
-            return tuple(None for _ in people)
+            return tuple(() for _ in seeds_by_group)
         backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, forward, None, **options)
         if backward is None or backward_status is None:
-            return tuple(None for _ in people)
+            return tuple(() for _ in seeds_by_group)
         moved = forward.reshape(-1, 2)
         step_errors = np.linalg.norm(backward.reshape(-1, 2)-moving.reshape(-1, 2), axis=1)
         valid &= (forward_status.reshape(-1).astype(bool) & backward_status.reshape(-1).astype(bool)
@@ -126,7 +156,7 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
         # Failed features remain failed across every subsequent step.
         moving = forward
         previous = current
-    rows = [[] for _ in people]
+    rows = [[] for _ in seeds_by_group]
     for owner, joint, x, y, start, end in groups:
         indices = np.flatnonzero(valid[start:end])+start
         if len(indices) < 3:
@@ -145,12 +175,7 @@ def native_joint_pixel_flow_stream(previous_pixels, current_pixels, people, *, i
             continue
         rows[owner].append((joint, float(x), float(y), x+dx, y+dy,
             float(np.max(errors[indices])), len(indices)))
-    result = []
-    for person, joints in zip(people, rows, strict=True):
-        core = {row[0] for row in joints} & {0, 1, 6, 7}
-        result.append(NativeJointPixelFlow(person.observation_id, tuple(joints))
-            if len(joints) >= 3 and len(core) >= 2 else None)
-    return tuple(result)
+    return tuple(tuple(joints) for joints in rows)
 
 
 def native_joint_assignment_cost(flow, person, frame_size_wh):
