@@ -67,6 +67,71 @@ def test_primary_adverse_body_observations_cannot_be_replaced_with_a_good_altern
     assert result['review_body_recovery_state']=='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY'
 
 
+def complementary_fixture():
+    frozen,view,receipt=fixture();raws=[raw(10),view['row']['native_observation'],raw(12)]
+    points=deepcopy(receipt['pose']['upper_body_xyc'])
+    for i in (2,3,5):points[i][2]=.1
+    raws[1]['people'][0]['upper_body_xyc']=points
+    raws[1]['people'][0]['part_states']=[['shoulder_anchor','observed'],['left_arm','unknown'],['right_arm','unknown']]
+    frozen=freeze_review_body_window(raws,native_camera_unit=0)
+    receipt['window_identity']=frozen.identity;receipt['raw_parent_sha256']=digest(raws[1])
+    receipt['pose']['bbox_xywh']=frozen.payload['requests'][1]['roi']
+    view['row']['projection']=dict(people=[dict(observation_id=0,unique_head_observation_id=7)])
+    view['descriptor']=replace(view['descriptor'],owner_known=True,
+        pose_shape=((0,-.5,0.),(1,.5,0.),(4,-1.5,-.28125)))
+    return frozen,view,receipt
+
+
+def test_complementary_actual_joints_are_unioned_in_native_coordinates_not_row_replaced():
+    frozen,view,receipt=complementary_fixture();saved=deepcopy(view['row'])
+    receipt['pose']['upper_body_xyc'][4]=[.9,.9,.1]
+    receipt['pose']['raw_keypoints_xyc'][9]=[.9,.9,.1]
+    result=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert [p[0] for p in result['descriptor'].pose_shape]==[0,1,2,3,4,5]
+    assert result['review_body_native_xyc'][4]==(.2,.4,.8)
+    assert result['review_joint_provenance'][4]['basis']=='PRIMARY_NATIVE_MODEL'
+    assert result['review_joint_provenance'][2]['basis']=='FIXED_ROI_NATIVE_MODEL'
+    assert result['row']==saved and result['descriptor'].owner_known
+    assert not result['auxiliary_body_is_production_ownership']
+
+
+def test_primary_shoulders_normalize_all_added_joints_once_and_keep_native_conflict():
+    frozen,view,receipt=complementary_fixture()
+    for i,j in enumerate((5,6)):
+        point=list(receipt['pose']['upper_body_xyc'][i]);point[0]+=.01
+        receipt['pose']['upper_body_xyc'][i]=point;receipt['pose']['raw_keypoints_xyc'][j]=point
+    result=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert dict((p[0],p[1:]) for p in result['descriptor'].pose_shape)[2]==pytest.approx((-.9999999999999999,.28125))
+    receipt['pose']['upper_body_xyc'][4]=[.9,.9,.8];receipt['pose']['raw_keypoints_xyc'][9]=[.9,.9,.8]
+    conflicted=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert conflicted['descriptor']==view['descriptor']
+    assert conflicted['review_body_recovery_state']=='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY'
+
+
+def test_known_normalized_primary_without_actual_native_binding_is_not_inverted_to_make_a_union():
+    frozen,view,receipt=complementary_fixture();view['row']['projection']['people']=[]
+    result=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert result['descriptor']==view['descriptor']
+    assert 'review_joint_provenance' not in result
+
+
+def test_individually_observed_primary_wrist_survives_unknown_whole_arm_without_fabricating_missing_elbow():
+    frozen,view,receipt=complementary_fixture()
+    native=view['row']['native_observation'];native['people'][0]['upper_body_xyc'][2][2]=.1
+    frozen=freeze_review_body_window([raw(10),native,raw(12)],native_camera_unit=0)
+    receipt['window_identity']=frozen.identity;receipt['raw_parent_sha256']=digest(native)
+    receipt['pose']['upper_body_xyc'][4]=[.9,.9,.1];receipt['pose']['raw_keypoints_xyc'][9]=[.9,.9,.1]
+    actual=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert actual['review_joint_provenance'][2]['basis']=='FIXED_ROI_NATIVE_MODEL'
+    assert actual['review_joint_provenance'][4]['basis']=='PRIMARY_NATIVE_MODEL'
+    native['people'][0]['part_states']=[['shoulder_anchor','observed'],['left_arm','ambiguous'],['right_arm','observed']]
+    frozen=freeze_review_body_window([raw(10),native,raw(12)],native_camera_unit=0)
+    receipt['window_identity']=frozen.identity;receipt['raw_parent_sha256']=digest(native)
+    blocked=apply_review_body_receipt(view,receipt,project_point=lambda p:p,expected_window=frozen)
+    assert blocked['descriptor']==view['descriptor']
+    assert blocked['review_body_recovery_state']=='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY'
+
+
 @pytest.mark.parametrize('field', ['binding','head_fingerprint','window_identity','model_content_sha256','raw_parent_sha256'])
 def test_wrong_physical_actor_window_or_model_is_rejected(field):
     frozen,view,receipt=fixture();receipt[field]='wrong'

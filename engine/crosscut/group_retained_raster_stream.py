@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .group_retained_raster_review import content_sha,_spans
+from .group_output_media_clock import ordinal_video_encoder_arguments,verify_final_output_media_clock
 
 CONTRACT='hash_bound_retained_preencode_raster_stream_v1'
 
@@ -85,7 +86,7 @@ def construct_retained_stream_movie(*,reference_movie,proposed_movie,output,
     stderr_path=output.with_name(output.stem+'-stream-encoder.log')
     command=['ffmpeg','-nostdin','-v','warning','-f','rawvideo','-pixel_format','bgr24',
         '-video_size',f'{width}x{height}','-framerate',str(fps),'-i','pipe:0','-i',str(reference),
-        '-map','0:v:0','-map','1:a:0','-vf','scale=out_color_matrix=bt709:out_range=tv',
+        '-map','0:v:0','-map','1:a:0',*ordinal_video_encoder_arguments(fps),
         '-c:v','libx264','-preset','medium','-crf','16','-pix_fmt','yuv420p','-threads','4',
         *vbv,
         '-color_primaries','bt709','-color_trc','bt709','-colorspace','bt709','-color_range','tv',
@@ -123,6 +124,8 @@ def construct_retained_stream_movie(*,reference_movie,proposed_movie,output,
     if temporary.stat().st_size>maximum_output_bytes:raise OSError('final retained stream exceeds its byte cap')
     if (content_sha(reference)!=expected_reference_sha256 or content_sha(proposed)!=expected_proposed_sha256):
         raise ValueError('retained stream input changed during encode')
+    media_clock=verify_final_output_media_clock(movie=temporary,original_audio_movie=reference,
+        frame_count=frame_count,fps=fps,timeout_seconds=max(.1,deadline-monotonic()))
     temporary.replace(output)
     return dict(contract=CONTRACT,reference_movie=str(reference),proposed_movie=str(proposed),movie=str(output),
         reference_content_sha256=expected_reference_sha256,proposed_content_sha256=expected_proposed_sha256,
@@ -136,6 +139,7 @@ def construct_retained_stream_movie(*,reference_movie,proposed_movie,output,
         original_audio_stream_copied=True,maximum_output_bytes=maximum_output_bytes,
         maximum_video_bitrate=maximum_video_bitrate,video_buffer_bits=video_buffer_bits,
         audio_payload_bound=audio_payload_bound,encoder_byte_bound=encoder_bound,
+        final_output_media_clock=dict(media_clock,movie=str(output)),
         quality_approved=False,construction_seconds=monotonic()-started)
 
 

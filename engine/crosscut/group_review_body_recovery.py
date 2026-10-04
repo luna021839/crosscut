@@ -115,6 +115,31 @@ def bind_review_body_receipts(bundle):
     return receipts
 
 
+def _primary_native_points(view):
+    """Selected raw owned body only, never invert/merge normalized shapes."""
+    d=view['descriptor'];raw=view['row']['native_observation']
+    owners=[p for p in view['row'].get('projection',{}).get('people',())
+        if p.get('unique_head_observation_id')==d.frame_local_head_id]
+    if len(owners)!=1 or not d.owner_known:return {} if d.pose_shape is None else None
+    body=next((p for p in raw['people'] if p['observation_id']==owners[0]['observation_id']),None)
+    points=() if body is None else body.get('upper_body_xyc',())
+    if len(points)!=8:return {} if d.pose_shape is None else None
+    requested=set() if d.pose_shape is None else {p[0] for p in d.pose_shape}
+    if any(not 0<=i<6 or len(points[i])!=3 or any(not math.isfinite(v) for v in points[i])
+            or points[i][2]<.42 or not all(0<=v<1 for v in points[i][:2]) for i in requested):return None
+    parts=dict(body.get('part_states',()))
+    # Whole-arm UNKNOWN often means ONE joint was missed, not that every
+    # other directly observed joint disappeared. Preserve explicit ambiguity
+    # and adverse part states; a raw model's remaining selected-owner joints
+    # can contribute individually without claiming complete arm ownership.
+    observed={i:tuple(p) for i,p in enumerate(points[:6]) if len(p)==3
+        and all(math.isfinite(v) for v in p) and p[2]>=.42 and all(0<=v<1 for v in p[:2])
+        and parts.get('shoulder_anchor' if i<2 else 'left_arm' if i in (2,4) else 'right_arm')
+            in ('observed','unknown')}
+    if not requested<=observed.keys():return None
+    return observed
+
+
 def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
     """Bind auxiliary evidence to this exact actor/raster/camera projection.
 
@@ -154,10 +179,22 @@ def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
         raise ValueError('auxiliary upper-body evidence changed its actual RTMPose raw joint mapping')
     if (pose.get('reason')!='observed' or pose.get('face_anchor_consistent') is not True
             or len(points)!=8 or len(pose.get('raw_keypoints_xyc',()))!=17
-            or any(len(p)!=3 or any(not math.isfinite(v) for v in p) or not 0<=p[2]<=1 for p in points)
-            or min(points[0][2],points[1][2])<.42):
+            or any(len(p)!=3 or any(not math.isfinite(v) for v in p) or not 0<=p[2]<=1 for p in points)):
         result['review_body_recovery_state']='UNRESOLVED_ACTUAL_POSE';return result
-    projected=[(*project_point(p[:2]),p[2]) for p in points]
+    primary=_primary_native_points(view)
+    if primary is None:
+        result['review_body_recovery_state']='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY';return result
+    combined=[tuple(p) for p in points]
+    provenance={i:dict(basis='FIXED_ROI_NATIVE_MODEL',receipt_sha256=digest(receipt),
+        model_confidence=p[2],xy_native=list(p[:2])) for i,p in enumerate(points[:6])
+        if p[2]>=.42 and all(0<=v<1 for v in p[:2])}
+    for i,p in primary.items():
+        combined[i]=p
+        provenance[i]=dict(basis='PRIMARY_NATIVE_MODEL',raw_parent_sha256=digest(raw),
+            model_confidence=p[2],xy_native=list(p[:2]))
+    if min(combined[0][2],combined[1][2])<.42:
+        result['review_body_recovery_state']='UNRESOLVED_ACTUAL_POSE';return result
+    projected=[(*project_point(p[:2]),p[2]) for p in combined]
     if any(not all(0.<=v<=1. for v in projected[i][:2]) for i in (0,1)):
         result['review_body_recovery_state']='SHOULDER_OUTSIDE_ACTUAL_CAMERA';return result
     center=np.mean(np.asarray(projected[:2])[:,:2],axis=0)
@@ -166,15 +203,31 @@ def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
         result['review_body_recovery_state']='DEGENERATE_SHOULDER';return result
     shape=tuple((i,(p[0]-center[0])/scale,(p[1]-center[1])*9/16/scale)
         for i,p in enumerate(projected[:6]) if p[2]>=.42 and all(0.<=v<=1. for v in p[:2]))
-    primary={} if d.pose_shape is None else {p[0]:np.asarray(p[1:]) for p in d.pose_shape}
-    secondary={p[0]:np.asarray(p[1:]) for p in shape}
-    disagreements={k:float(np.linalg.norm(primary[k]-secondary[k])) for k in primary.keys()&secondary.keys()}
+    expected_primary={} if d.pose_shape is None else {p[0]:np.asarray(p[1:]) for p in d.pose_shape}
+    resolved={p[0]:np.asarray(p[1:]) for p in shape}
+    # Every joint is resolved in one native coordinate system and normalized
+    # once with the retained common shoulder basis. Auxiliary absence does
+    # not erase a primary wrist; known coordinate conflicts remain failures.
+    if any(k not in resolved or np.linalg.norm(expected_primary[k]-resolved[k])>1e-6
+            for k in expected_primary):
+        result['review_body_recovery_state']='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY';return result
+    disagreements={}
+    for i,p in primary.items():
+        secondary=points[i]
+        if secondary[2]<.42 or not all(0<=v<1 for v in secondary[:2]):continue
+        a=np.asarray(project_point(p[:2]));b=np.asarray(project_point(secondary[:2]))
+        disagreements[i]=float(np.linalg.norm((a-b)*(1.,9/16))/scale)
     result['primary_auxiliary_joint_disagreement']=disagreements
-    if any(v>.35 for v in disagreements.values()) or not primary.keys()<=secondary.keys():
+    if any(v>.35 for v in disagreements.values()):
         result['review_body_recovery_state']='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY';return result
     result['descriptor']=replace(d,pose_shape=shape)
-    result['review_body_native_xyc']=tuple(tuple(p) for p in points)
+    result['review_body_native_xyc']=tuple(combined)
     result['review_body_projected_xyc']=tuple(tuple(p) for p in projected)
+    result['review_joint_provenance']=provenance
+    result['review_joint_evidence_identity']=digest(dict(contract='native_joint_model_union_review_v1',
+        binding=native_binding(raw),head=head_fingerprint(selected),
+        provenance=provenance,conflicts=disagreements,raw_parent=digest(raw),receipt=digest(receipt),
+        production_ownership_unchanged=True))
     result['review_body_recovery_state']='OBSERVED_HEAD_CONDITIONED_BODY_REVIEW_HYPOTHESIS'
     return result
 

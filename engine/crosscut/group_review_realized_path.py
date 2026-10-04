@@ -180,7 +180,7 @@ def incident_tick_union(first,end,original_cut_ticks,candidate_cut_ticks,*,outpu
 
 
 def require_paired_motion_adoption(*,comparison,expected_manifest=None,keyed_receipts=None,
-        support_states=None,motion_verdicts=None):
+        support_states=None,motion_verdicts=None,protected_reference_verification=None):
     """Only a complete plan-bound keyed comparison can permit review encoding.
 
     Legacy generic strings cannot prove inventory, original UNKNOWN provenance
@@ -194,7 +194,7 @@ def require_paired_motion_adoption(*,comparison,expected_manifest=None,keyed_rec
         raise ValueError('paired adoption needs explicit measured keyed receipts and a frozen manifest; '
             'generic verdict strings cannot permit encode')
     decision=decide_keyed_review_adoption(manifest=expected_manifest,receipts=keyed_receipts,
-        comparison=comparison)
+        comparison=comparison,protected_reference_verification=protected_reference_verification)
     if decision['state']!='REVIEW_ENCODE_ELIGIBLE':
         raise ValueError('paired motion/support comparison does not permit encode: '+decision['state'])
     return decision

@@ -69,3 +69,52 @@ def test_serialized_policy_cannot_replace_the_control_separation_threshold():
     value=policy().payload;value['maximum_motion_cost']=100.
     with pytest.raises(ValueError,match='thresholds'):
         FrozenReviewMatchPolicy(json.dumps(value))
+
+
+def partial_policy(state='FAIL'):
+    data=controls();data[2].update(motion_cost=None,control_role='BODY_COVERAGE_ADVERSARY',
+        expected_body_coverage_state='FAIL',actual_body_coverage_state=state)
+    return freeze_control_calibrated_review_match_policy(data,target_interval=(100,160))
+
+
+def test_offscreen_phase_control_does_not_erase_measured_identity_or_invent_motion_cost():
+    p=partial_policy();assert p.payload['state']=='CONTROLS_PARTIAL'
+    assert p.payload['identity_control_state']=='CONTROL_SEPARATED'
+    assert p.payload['minimum_appearance_cosine']==pytest.approx(.45)
+    assert p.payload['numeric_phase_control_state']=='UNMEASURED'
+    assert p.payload['maximum_motion_cost'] is None
+    assert p.payload['body_coverage_adversary_state']=='COVERAGE_NEGATIVE_CONFIRMED'
+    assert p.payload['controls'][2]['motion_cost'] is None
+    result=evaluate_review_match_suitability(policy=p,appearance_cosine=.7,mutual_appearance=True,
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2),
+        actual_required_support_state='PASS')
+    assert not result['match_suitable'] and result['state']=='UNMEASURED'
+    result=evaluate_review_match_suitability(policy=p,appearance_cosine=.1,mutual_appearance=True,
+        motion={},actual_required_support_state='PASS')
+    assert result['state']=='UNSUITABLE'
+
+
+def test_unknown_coverage_is_not_confirmed_negative_and_failed_coverage_stays_failed():
+    assert partial_policy('UNKNOWN').payload['body_coverage_adversary_state']=='UNMEASURED'
+    assert partial_policy('PASS').payload['state']=='CONTROLS_NOT_SEPARATED'
+
+
+def test_coverage_negative_has_no_silent_finite_cost_imputation():
+    data=controls();data[2].update(control_role='BODY_COVERAGE_ADVERSARY',
+        expected_body_coverage_state='FAIL',actual_body_coverage_state='FAIL')
+    with pytest.raises(ValueError):freeze_control_calibrated_review_match_policy(data,target_interval=(100,160))
+
+
+def test_one_technical_diagnostic_is_separate_from_uncalibrated_suitability():
+    from crosscut.group_review_match_suitability import evaluate_review_diagnostic_encode_permission
+    kwargs=dict(policy=partial_policy(),appearance_cosine=.7,mutual_appearance=True,
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2),
+        actual_required_support_state='PASS',complete_keyed_incident_state='PASS',
+        protected_reference_state='PASS',candidate_full_output_replay_state='PASS')
+    r=evaluate_review_diagnostic_encode_permission(**kwargs)
+    assert r['diagnostic_encode_permitted'] and r['maximum_encodes']==1
+    assert not r['match_suitable'] and not r['adoption_permitted']
+    for field in ('actual_required_support_state','complete_keyed_incident_state',
+            'protected_reference_state','candidate_full_output_replay_state'):
+        assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,**{field:'UNKNOWN'}))['diagnostic_encode_permitted']
+    assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,policy=partial_policy('PASS')))['diagnostic_encode_permitted']

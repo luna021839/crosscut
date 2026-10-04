@@ -40,14 +40,20 @@ def _policy_payload(controls,*,target_interval):
             or len(target_interval)!=2 or not 0<=target_interval[0]<target_interval[1]):
         raise ValueError('match policy needs finite independent controls and exact target interval')
     for c in controls:
+        coverage_adversary=(c.get('label')=='WRONG_PHASE'
+            and c.get('control_role')=='BODY_COVERAGE_ADVERSARY')
+        cost_unmeasured=(c.get('motion_cost') is None and
+            (c.get('label')=='WRONG_ACTOR' or coverage_adversary))
         if (c.get('label') not in ('POSITIVE_MOVING_MATCH','WRONG_ACTOR','WRONG_PHASE')
                 or not isinstance(c.get('evidence_identity'),str) or len(c['evidence_identity'])!=64
                 or any(v not in '0123456789abcdef' for v in c['evidence_identity'])
                 or not isinstance(c.get('output_ticks'),list) or not c['output_ticks']
                 or any(type(t) is not int or t<0 or target_interval[0]<=t<target_interval[1] for t in c['output_ticks'])
                 or not _finite(c.get('appearance_cosine')) or not -1<=c['appearance_cosine']<=1
-                or (c['label']!='WRONG_ACTOR' or c.get('motion_cost') is not None)
-                    and (not _finite(c.get('motion_cost')) or c['motion_cost']<0)):
+                or not cost_unmeasured and (not _finite(c.get('motion_cost')) or c['motion_cost']<0)
+                or coverage_adversary and (c.get('motion_cost') is not None
+                    or c.get('expected_body_coverage_state') not in ('FAIL','UNKNOWN')
+                    or c.get('actual_body_coverage_state') not in ('PASS','FAIL','UNKNOWN'))):
             raise ValueError('calibration borrowed target results or lacks exact actual control measurements')
     positive=[c for c in controls if c['label']=='POSITIVE_MOVING_MATCH']
     wrong_actor=[c for c in controls if c['label']=='WRONG_ACTOR']
@@ -57,13 +63,28 @@ def _policy_payload(controls,*,target_interval):
     weakest_identity=min(c['appearance_cosine'] for c in positive)
     strongest_wrong_actor=max(c['appearance_cosine'] for c in wrong_actor)
     worst_positive_motion=max(c['motion_cost'] for c in positive)
-    best_wrong_phase_motion=min(c['motion_cost'] for c in wrong_phase)
-    separable=(weakest_identity>strongest_wrong_actor and worst_positive_motion<best_wrong_phase_motion)
+    numeric_phase=[c for c in wrong_phase if c.get('control_role')!='BODY_COVERAGE_ADVERSARY']
+    coverage=[c for c in wrong_phase if c.get('control_role')=='BODY_COVERAGE_ADVERSARY']
+    best_wrong_phase_motion=min((c['motion_cost'] for c in numeric_phase),default=None)
+    identity_separated=weakest_identity>strongest_wrong_actor
+    phase_separated=best_wrong_phase_motion is not None and worst_positive_motion<best_wrong_phase_motion
+    coverage_state=('NOT_REQUESTED' if not coverage else
+        'CONTROL_FAILED' if any(c['actual_body_coverage_state']=='PASS' for c in coverage) else
+        'UNMEASURED' if any(c['actual_body_coverage_state']=='UNKNOWN' for c in coverage) else
+        'COVERAGE_NEGATIVE_CONFIRMED')
+    separable=(identity_separated and phase_separated
+        and coverage_state in ('NOT_REQUESTED','COVERAGE_NEGATIVE_CONFIRMED'))
+    failed=(not identity_separated or best_wrong_phase_motion is not None and not phase_separated
+        or coverage_state=='CONTROL_FAILED')
     token=dict(contract='independent_control_calibrated_review_match_policy_v1',
-        state='CONTROL_SEPARATED' if separable else 'CONTROLS_NOT_SEPARATED',controls=list(controls),
+        state='CONTROL_SEPARATED' if separable else 'CONTROLS_NOT_SEPARATED' if failed else 'CONTROLS_PARTIAL',controls=list(controls),
         target_interval=list(target_interval),basis='frozen_requested_body_common_time_and_actual_output_coverage',
-        minimum_appearance_cosine=(weakest_identity+strongest_wrong_actor)/2 if separable else None,
-        maximum_motion_cost=(worst_positive_motion+best_wrong_phase_motion)/2 if separable else None,
+        identity_control_state='CONTROL_SEPARATED' if identity_separated else 'CONTROLS_NOT_SEPARATED',
+        body_coverage_adversary_state=coverage_state,
+        numeric_phase_control_state=('UNMEASURED' if best_wrong_phase_motion is None else
+            'CONTROL_SEPARATED' if phase_separated else 'CONTROLS_NOT_SEPARATED'),
+        minimum_appearance_cosine=(weakest_identity+strongest_wrong_actor)/2 if identity_separated else None,
+        maximum_motion_cost=(worst_positive_motion+best_wrong_phase_motion)/2 if phase_separated else None,
         control_policy_frozen_before_target_scoring=True,expert_quality_certified=False,
         unseen_song_generalization_validated=False,quality_approved=False)
     return token
@@ -80,9 +101,14 @@ def evaluate_review_match_suitability(*,policy,appearance_cosine,mutual_appearan
     p=policy.payload
     result=dict(contract='independent_review_match_suitability_v1',policy_identity=policy.identity,
         state='UNMEASURED',match_suitable=False,quality_approved=False)
-    if p['state']!='CONTROL_SEPARATED':return dict(result,reason='independent_controls_not_separated')
     if actual_native_alias:return dict(result,state='UNSUITABLE',reason='native_alias_cannot_observe_action')
     if actual_required_support_state=='FAIL':return dict(result,state='UNSUITABLE',reason='required_output_support_lost')
+    if (p['identity_control_state']=='CONTROL_SEPARATED' and _finite(appearance_cosine)
+            and (not mutual_appearance or appearance_cosine<p['minimum_appearance_cosine'])):
+        return dict(result,state='UNSUITABLE',reason=['actor_control_failed'])
+    if p['state']!='CONTROL_SEPARATED':return dict(result,reason='independent_controls_not_separated',
+        identity_control_state=p['identity_control_state'],numeric_phase_control_state=p['numeric_phase_control_state'],
+        body_coverage_adversary_state=p['body_coverage_adversary_state'])
     if (not _finite(appearance_cosine) or motion.get('intent_kind')!='BODY'
             or motion.get('same_time_action_supported') is not True
             or not _finite(motion.get('exploration_cost'))
@@ -94,3 +120,28 @@ def evaluate_review_match_suitability(*,policy,appearance_cosine,mutual_appearan
     if failures:return dict(result,state='UNSUITABLE',reason=failures)
     return dict(result,state='MATCH_SUITABLE',match_suitable=True,
         named_actor_certified=False,review_encode_permitted=False)
+
+
+def evaluate_review_diagnostic_encode_permission(*,policy,appearance_cosine,mutual_appearance,motion,
+        actual_required_support_state,complete_keyed_incident_state,protected_reference_state,
+        candidate_full_output_replay_state,actual_native_alias=False):
+    """One diagnostic is not adoption or a substitute numeric phase threshold."""
+    if not isinstance(policy,FrozenReviewMatchPolicy):raise ValueError('diagnostic requires independent sealed controls')
+    p=policy.payload
+    result=dict(contract='separate_technical_body_diagnostic_encode_permission_v1',
+        policy_identity=policy.identity,diagnostic_encode_permitted=False,maximum_encodes=1,
+        match_suitable=False,adoption_permitted=False,quality_approved=False,
+        normal_speed_independent_human_judgment_still_required=True)
+    if (p['identity_control_state']!='CONTROL_SEPARATED'
+            or p['body_coverage_adversary_state']=='CONTROL_FAILED'
+            or p['numeric_phase_control_state']=='CONTROLS_NOT_SEPARATED'
+            or actual_native_alias or not mutual_appearance or not _finite(appearance_cosine)
+            or appearance_cosine<p['minimum_appearance_cosine']):
+        return dict(result,state='NOT_PERMITTED',reason='independent_identity_or_known_adversary_failed')
+    if (motion.get('intent_kind')!='BODY' or motion.get('same_time_action_supported') is not True
+            or not _finite(motion.get('exploration_cost'))
+            or any(s!='PASS' for s in (actual_required_support_state,complete_keyed_incident_state,
+                protected_reference_state,candidate_full_output_replay_state))):
+        return dict(result,state='NOT_PERMITTED',reason='complete_actual_body_output_incident_evidence_required')
+    return dict(result,state='DIAGNOSTIC_ONLY',diagnostic_encode_permitted=True,
+        numeric_phase_control_state=p['numeric_phase_control_state'],comparative_improvement_claimed=False)
