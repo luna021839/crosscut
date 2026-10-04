@@ -186,6 +186,10 @@ class SceneSensors(source.NativeFamilySensors):
         return scene_role_obligations(raw,state.role,head_id,required_part_names=names)
 
     def raw(self, state, tick, roll):
+        from .group_scene_camera_queries import GroupSceneRoleQuery
+        if isinstance(state,GroupSceneRoleQuery):
+            state.require_resolved_role()
+            state.sample_at(tick)
         if state.role != GroupOutputRole.COMPOSITION:
             return super().raw(state, tick, roll)
         from .group_scene_composition import observe_native_composition
@@ -551,16 +555,14 @@ class SceneSensors(source.NativeFamilySensors):
             raise ValueError('a state dense rejection cannot resume a closed native session')
         hypothesis=self.hypothesis(state)
         program=self.original_duty_program
-        unit=None
+        units=None
         if program is not None:
-            units=[u for u in program['units'] if (u['first_output_frame'],u['end_output_frame'],u['role'])
-                ==(state.first_output_frame,state.end_output_frame,state.role.value)]
-            if len(units)!=1:raise ValueError('dense rejection lost its original duty unit')
-            unit=units[0]
+            from .group_scene_original_duties import original_units_for_query
+            units=original_units_for_query(program,state)
         request=self.session.domain.request_index(state.eligible_source_index)
         return dict(state_key=state.key,hypothesis_sha256=family.digest(hypothesis),
             original_duty_program_sha256=None if program is None else program['program_sha256'],
-            original_duty_unit_sha256=None if unit is None else family.digest(unit),
+            original_duty_units_sha256=None if units is None else family.digest(units),
             source_domain_sha256=family.digest(self.session.domain.to_dict()),
             source_file_identity=list(source._file_identity(self.session.domain.request_sources[request])),
             native_asset_identities={name:list(source._file_identity(path)) for name,path in self.assets.items()},
@@ -1407,9 +1409,13 @@ def validate_scene_dense(dense):
             validate_focal_pose_view(view,raw_inventory[pair[0]],raw_inventory[pair[1]],
                 raw_inventory=raw_inventory,source_domain=dense['source_domain'],hypothesis=h,
                 state_key=dense['state_keys'][state_index],original_duty_program=program)
-    for a,b in ((keys[i],keys[j]) for i,j in pair_indices):
-        if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
-            raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
+    if dense.get('global_execution_scope') is not None:
+        from .group_scene_physical_boundaries import validate_dense_physical_boundaries
+        validate_dense_physical_boundaries(dense)
+    else:
+        for a,b in ((keys[i],keys[j]) for i,j in pair_indices):
+            if relation(dense.get('source_derivative_binding'),hypotheses[a]['span_key'][0],hypotheses[b]['span_key'][0])!=DERIVATIVE_DISTINCT:
+                raise ValueError('scene cut lacks a bound distinct-camera pair; duplicate/UNKNOWN cannot count as diversity')
     minimum=BoundarySubjectAlignmentConfig().minimum_face_visible_fraction
     def fraction(value):
         return type(value) in (int,float) and math.isfinite(value) and 0<=value<=1

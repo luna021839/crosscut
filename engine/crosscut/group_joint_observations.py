@@ -139,6 +139,12 @@ class GroupJointObservationSession:
                 old=self.raw.pop(key);self.raw_bytes-=0 if old is None else old.nbytes;self.raw_evictions+=1
 
     def projected_pixels(self,state,output_tick):
+        from .group_scene_camera_queries import GroupWholeCameraObservation,GroupSceneRoleQuery
+        if isinstance(state,GroupSceneRoleQuery):
+            # Role labels do not alter the pixels or their cache owner. Verify
+            # query bounds before sharing its physical-camera projection.
+            state.sample_at(output_tick)
+            state=state.camera
         state.bind_source(self.domain)
         if type(output_tick) is not int or not state.first_output_frame<=output_tick<state.end_output_frame:
             raise ValueError('joint output observation is outside its complete camera state')
@@ -149,18 +155,23 @@ class GroupJointObservationSession:
         def observe():
             frame=self.native_pixels(source,native)
             if frame is None:return None
-            relative=offset;index=0
-            for count in state.segment_output_frame_counts:
-                if relative<count:break
-                relative-=count;index+=1
+            if isinstance(state,GroupWholeCameraObservation):
+                segment,relative_seconds,_=state.sample_at(output_tick)
+                index=next(i for i,s in enumerate(state.segments) if s is segment)
+            else:
+                relative=offset;index=0
+                for count in state.segment_output_frame_counts:
+                    if relative<count:break
+                    relative-=count;index+=1
+                segment=state.segments[index]
+                relative_seconds=relative/state.output_fps
             key=(state.key,index)
             if key not in self.geometry:
-                segment=state.segments[index]
                 self.geometry[key]=PrescribedGeometrySampler(SimpleNamespace(frame_rate=float(
                     self.domain.render_frame_clocks[state.eligible_source_index].frame_rate)),segment,
                     master_start=segment.master_start)
             return _reference_view_for_span(frame,self.geometry[key].span,
-                relative_time=relative/state.output_fps,size=state.output_size)
+                relative_time=relative_seconds,size=state.output_size)
         pixels=self.projected.get_or_observe(state=state,output_tick=output_tick,
             raw_identity=(source,identity,native),observer=observe)
         self._assert_source_identity(source)

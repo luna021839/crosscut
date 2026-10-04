@@ -151,7 +151,8 @@ def scene_derivative_fixture(count=8):
     return replace(value,audit_sha256=family.digest(value._payload(include_sha256=False)))
 
 
-def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False,joint_textures=False):
+def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False,joint_textures=False,
+        native_camera_cut_frame=None):
     """Distinct non-human raster patterns; eight files are not copied aliases."""
     base=path.with_suffix('.seed.mp4')
     encode_chart(base,variant=variant%2,frames=frames)
@@ -183,6 +184,11 @@ def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False,joint_
                     for dy in (-4,-1,2):
                         color=(15,90,15) if (dx+dy)%2 else (45,115,45)
                         image[py+dy:py+dy+2,px+dx:px+dx+2]=color
+        if native_camera_cut_frame is not None and len(images)>=native_camera_cut_frame:
+            # A fixture-authored, real decoded-pixel camera event. The green
+            # target remains observable; only this chart's background changes.
+            # This is not a real-camera detector result or human inference.
+            image[120:,:,:]=np.clip(30+(xx[120:]*4+yy[120:]*7)%190,0,255)[:,:,None]
         # A per-file raster tag is not a claim of eight independent real cameras.
         image[-1,-(variant+1):,:]=(variant*20,20,40)
         images.append(image)
@@ -194,11 +200,15 @@ def encode_scene_chart(path,*,variant,frames=360,small_focal_marker=False,joint_
     if result.returncode:raise RuntimeError(result.stderr.decode())
 
 
-def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None,boundary_look_enabled=True):
+def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None,boundary_look_enabled=True,
+        source_indices=None):
     from crosscut.source_look_match import SourceLookAdjustment
     duration=16.;n=8
     mapping=tuple(range(len(sources)));offsets=(1.,)*len(sources);warps=(None,)*len(sources)
-    choices=tuple(replace(_choice(i,i,start=2.*i,end=2.*(i+1)),
+    source_indices=tuple(range(n)) if source_indices is None else tuple(source_indices)
+    if len(source_indices)!=n or any(type(s) is not int or not 0<=s<len(sources) for s in source_indices):
+        raise ValueError('explicit scene chart source mapping is invalid')
+    choices=tuple(replace(_choice(i,source_indices[i],start=2.*i,end=2.*(i+1)),
         source_local_start=2.*i+1,source_local_end=2.*(i+1)+1,
         entry_shot_scale=.4,exit_shot_scale=.4) for i in range(n))
     timeline=VisualTimelinePlan(choices,1.)
@@ -214,7 +224,7 @@ def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None,boun
     # camera, and an actual older dense motion on a DISTANT boundary.
     pan=PanCropTrack((PanCropKeyframe(0.,NormalizedCrop(.01,.01,.98,.98)),
         PanCropKeyframe(2.,NormalizedCrop(.01,.01,.98,.98))))
-    face=FaceMatchPlan(tuple(FaceMatchSegment(i,i,True,None,.33,.34,1/.98,1/.98,pan,
+    face=FaceMatchPlan(tuple(FaceMatchSegment(i,source_indices[i],True,None,.33,.34,1/.98,1/.98,pan,
         alignment_subject='face',alignment_purpose='synthetic_source_chart_fit') for i in range(n)),.34,1.18,(.5,.5))
     transitions=tuple(RenderTransition(tier='C') for _ in range(n-1))
     clocks=tuple(probe_render_frame_clock(p) for p in sources)
@@ -240,8 +250,8 @@ def build_scene_fixture(root,sources,*,boundary=0,authored_camera_unit=None,boun
         # Constant framing is not an animated zoom/pan target event. Existing
         # frame-visible motion counters retain their original exact semantics.
     plan=replace(bundle.render_plan,fps=30.,transitions=transitions,segments=tuple(
-        RenderSegment(i,2.*i+1,2.,2.*i,pan_crop=pan,
-            look_adjustment=SourceLookAdjustment(brightness=.002+i*.0001),
+        RenderSegment(source_indices[i],2.*i+1,2.,2.*i,pan_crop=pan,
+            look_adjustment=SourceLookAdjustment(brightness=.002+source_indices[i]*.0001),
             editorial_transform=motion.track_for(i)) for i in range(n)))
     # Real full old look fit AND actual renderer/decode admission. The fixture
     # is not positive unless an old applied correction really exists.
@@ -1094,6 +1104,68 @@ class GlobalSceneSourceIntegrationTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):cls.temp.cleanup()
+
+    def test_same_file_native_cut_camera_edits_reach_completion_fresh_parent_final_and_real_pixels(self):
+        from crosscut.group_scene_global_execution import complete_global_scene_program
+        from crosscut.source_derivative_diversity import DERIVATIVE_CONFIRMED
+        from crosscut.group_actual_shots import visible_group_cut_inventory
+        root=self.root/'same-file-native-cut';root.mkdir()
+        native_source=root/'explicit-chart-native-cut.mp4'
+        encode_scene_chart(native_source,variant=1,frames=540,native_camera_cut_frame=150)
+        # Independently demonstrate the supplied event in actual native pixels.
+        capture=cv2.VideoCapture(str(native_source))
+        try:
+            reader=ExactNativeFrameReader(capture,probe_render_frame_clock(native_source))
+            before=reader.frame_at(149);after=reader.frame_at(150)
+            self.assertIsNotNone(before);self.assertIsNotNone(after)
+            self.assertGreater(float(np.mean(np.abs(before[120:].astype(np.int16)-after[120:].astype(np.int16)))),20.)
+        finally:capture.release()
+        paths=tuple(native_source if i==1 else p for i,p in enumerate(self.paths))
+        bundle,controller,request,model=build_scene_fixture(root,paths,authored_camera_unit=2,
+            boundary_look_enabled=False,source_indices=(0,1,1,3,4,5,6,7))
+        with optional_native_scope(monotonic()+240.),patch.object(family,'installed_pose_model',return_value=model):
+            context=family.freeze_context(controller=controller,request=request,
+                eligible_indices=tuple(range(8)),offsets=(1.,)*8,timewarps=(None,)*8,
+                scene_cut_times=tuple((5.,) if i==1 else () for i in range(8)),
+                sync_scores=(.93,.91)*4,source_derivatives=scene_derivative_fixture())
+        events=visible_group_cut_inventory(bundle.render_plan,context.domain)
+        native=[e for e in events if e.first_incoming_output_frame==120]
+        self.assertEqual([(e.kind,e.outgoing_source_index,e.incoming_source_index,e.native_cut_frame) for e in native],
+            [('native_camera_cut',1,1,150)])
+        with optional_native_scope(context.deadline),source_chart_sensors():
+            union=authored_global_chart_union(context)
+            candidate=complete_global_scene_program.__wrapped__(context,union)
+            self.assertFalse(isinstance(candidate,family.PerformerFamilyRejection),getattr(candidate,'error',None))
+            family.validate_bundle_binding(candidate)
+            receipt=family.plain(candidate.performer_family_review)
+            policies=receipt['source_camera_refresh']['physical_boundary_policies']
+            native_policy=next(row for row in policies if row['output_tick']==120)
+            self.assertEqual(native_policy['source_relation'],DERIVATIVE_CONFIRMED)
+            self.assertTrue(native_policy['preserved_original_native_cut'])
+            self.assertFalse(native_policy['new_distinct_source_credit'])
+            self.assertFalse(native_policy['distinct_source_pair_confirmed'])
+            with patch.object(__import__('crosscut.group_scene_selected_replay',fromlist=['replay_selected_scene']),
+                    'replay_selected_scene',camera_chart_selected_replay):
+                proof=source.validate_parent(candidate,context)
+            self.assertTrue(proof['fresh_complete_family_equal'])
+            metrics=_REAL_FINAL(candidate.render_plan.to_json(),receipt,monotonic()+90.)
+            self.assertTrue(family.qa_metrics_valid(metrics))
+            self.assertFalse(metrics['quality_approved'])
+        probes=(150,390)
+        original_pixels=render_and_decode_chart(self,replace(bundle.render_plan,
+            output=root/'original-control.mp4'),capture_ticks=probes)
+        selected_pixels=render_and_decode_chart(self,candidate.render_plan,capture_ticks=probes)
+        for tick in probes:
+            self.assertGreater(float(np.mean(np.abs(original_pixels[tick].astype(np.int16)
+                -selected_pixels[tick].astype(np.int16)))),.25)
+        self.assertEqual(visible_group_cut_inventory(candidate.render_plan,context.domain),events)
+        # Receipt tampering must fail at the actual bundle consumers too.
+        broken=deepcopy(receipt)
+        for row in broken['source_camera_refresh']['physical_boundary_policies']:
+            if row['output_tick']==120:row['new_distinct_source_credit']=True
+        motion=replace(candidate.editorial_motion_plan,source_camera_refresh=broken['source_camera_refresh'])
+        damaged=replace(candidate,performer_family_review=broken,editorial_motion_plan=motion)
+        with self.assertRaises(ValueError):family.validate_bundle_binding(damaged)
 
     def external_reference(self, *, absent=True):
         from crosscut.group_external_original_reference import GroupExternalOriginalReference

@@ -59,6 +59,158 @@ def test_three_consecutive_mutables_complete_one_numeric_scope_not_middle_two():
     restored.validate_external(context,domain)
 
 
+def native_boundary_world():
+    """Explicit numeric native cut, not a detector or human-media fixture."""
+    from engine.tests.test_scene_source_owner import scene_derivative_fixture
+    from crosscut.group_scene_source_owner import freeze_derivatives
+    context,domain=fixture(native_cut=2.)
+    for row in context.incumbent.face_match_plan.segments:row.alignment_subject='face'
+    program=freeze_owned_scene_program(context,domain)
+    unit=program.units[1]
+    allocation=own_scene_intervals(program,mutable_unit_ids=(unit.unit_id,),
+        maximum_mutable_units=6,maximum_mutable_frames=540)
+    original=context.incumbent.render_plan;segments=list(original.segments)
+    # Maintain the renderer's unchanged tier-D continuity. No gate is waived.
+    segments[1]=replace(segments[1],editorial_transform=EditorialTransformTrack((
+        EditorialTransformKeyframe(0.,1.1),EditorialTransformKeyframe(29/30.,1.),
+        EditorialTransformKeyframe(1.,1.))))
+    selected=replace(original,segments=tuple(segments))
+    union=assemble_owned_scene_union(context=context,domain=domain,allocation=allocation,cameras=(
+        camera_unit_from_plan(program=program,unit_id=unit.unit_id,plan=selected,domain=domain),))
+    path=execution_path_from_union(context,domain,union)
+    binding=freeze_derivatives(scene_derivative_fixture(),domain,
+        tuple((str(p),0,0) for p in domain.eligible_sources))
+    return context,domain,path,binding
+
+
+def test_preserved_same_file_native_cut_is_admitted_without_distinct_source_credit():
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    from crosscut.source_derivative_diversity import DERIVATIVE_CONFIRMED
+    from crosscut.group_scene_source_owner import validate_bound_derivative_pairs
+    context,domain,path,binding=native_boundary_world()
+    pairs=incident_pairs(path)
+    with pytest.raises(ValueError,match='duplicate/UNKNOWN'):
+        validate_bound_derivative_pairs(binding,tuple((a.eligible_source_index,b.eligible_source_index) for a,b in pairs))
+    rows=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+        domain=domain,derivative_binding=binding).require(pairs)
+    assert rows[0]['distinct_source_pair_confirmed'] is True
+    assert rows[1]['output_tick']==60
+    assert rows[1]['source_relation']==DERIVATIVE_CONFIRMED
+    assert rows[1]['preserved_original_native_cut'] is True
+    assert rows[1]['incident_source_sampler_preserved'] is True
+    assert rows[1]['distinct_source_pair_confirmed'] is False
+    assert rows[1]['new_distinct_source_credit'] is False
+    assert rows[1]['native_motion_observed'] is False
+    assert rows[1]['quality_approved'] is False
+
+
+def test_canonical_or_role_seam_cannot_become_an_actual_same_source_camera_cut():
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    from crosscut.group_joint_source_camera import joint_state_from_render_plan,GroupOutputRole
+    context,domain=fixture()
+    plan=context.incumbent.render_plan
+    states=tuple(joint_state_from_render_plan(plan=plan,domain=domain,slot=1,
+        first_output_frame=first,end_output_frame=end,role=GroupOutputRole.FOCAL_HEAD)
+        for first,end in ((30,60),(60,90)))
+    policy=PreparedPhysicalBoundaryPolicy(original=plan,observed=plan,domain=domain,derivative_binding=None)
+    row=policy.classify(*states)
+    assert row['observed_events']==[] and row['admitted'] is False
+    with pytest.raises(ValueError,match='global physical cut'):policy.require((states,))
+    measured=dict(available=True,metrics=dict(scale=.2))
+    assert policy.attach(measured,*states)['metrics']==dict(scale=.2)
+    assert measured['available'] is False
+
+
+def test_unknown_source_switch_cannot_use_the_native_camera_boundary_exception():
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    from crosscut.group_scene_source_owner import relation
+    from crosscut.group_performer_family_owner import digest
+    from crosscut.source_derivative_diversity import DERIVATIVE_UNCERTAIN
+    context,domain,path,binding=native_boundary_world()
+    binding=deepcopy(binding);binding['audit']['pairs']=[]
+    payload=dict(binding['audit']);payload.pop('audit_sha256')
+    binding['audit']['audit_sha256']=digest(payload)
+    assert relation(binding,0,1)==DERIVATIVE_UNCERTAIN
+    policy=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+        domain=domain,derivative_binding=binding)
+    a,b=incident_pairs(path)[0]
+    assert policy.classify(a,b)['admitted'] is False
+    with pytest.raises(ValueError,match='global physical cut'):policy.require(incident_pairs(path))
+
+
+def test_equal_rounded_native_ids_cannot_hide_a_changed_source_request_clock():
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    from crosscut.group_joint_source_camera import joint_state_from_render_plan,GroupOutputRole
+    context,domain,path,binding=native_boundary_world()
+    original=path.original_plan
+    selected=replace(original,segments=tuple(replace(s,source_start=s.source_start+.001)
+        if i in (1,2) else s for i,s in enumerate(original.segments)))
+    states=tuple(joint_state_from_render_plan(plan=selected,domain=domain,slot=1,
+        first_output_frame=first,end_output_frame=end,role=GroupOutputRole.FOCAL_HEAD)
+        for first,end in ((30,60),(60,90)))
+    policy=PreparedPhysicalBoundaryPolicy(original=original,observed=selected,domain=domain,derivative_binding=binding)
+    row=policy.classify(*states)
+    assert row['observed_events']==row['original_events']
+    assert row['incident_source_sampler_preserved'] is False
+    assert row['admitted'] is False
+
+
+@pytest.mark.parametrize('field',['native_event','tick','source_relation','source_clock','distinct_credit','admitted',
+    'source_index_bool','source_index_float','drop'])
+def test_rehashed_global_dense_cannot_author_a_native_boundary_policy(field):
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy,validate_dense_physical_boundaries
+    context,domain,path,binding=native_boundary_world()
+    rows=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+        domain=domain,derivative_binding=binding).require(incident_pairs(path))
+    dense=dict(global_execution_scope=path.to_dict(),
+        global_execution_original_numeric_plan=path.original_plan.to_json(),
+        global_execution_selected_numeric_plan=path.numeric_plan.to_json(),source_domain=domain.to_dict(),
+        source_derivative_binding=binding,physical_boundary_policies=rows,
+        derivative_window_source_indices=[s.eligible_source_index for s in path],
+        incident_projected_observations=[dict(physical_boundary_policy=row,source_relation=row['source_relation']) for row in rows])
+    assert validate_dense_physical_boundaries(dense)==rows
+    dense=deepcopy(dense);row=dense['physical_boundary_policies'][1]
+    if field=='native_event':row['observed_events'][0]['native_cut_frame']+=1
+    elif field=='tick':row['output_tick']+=1
+    elif field=='source_relation':row['source_relation']='verified_distinct_camera'
+    elif field=='source_clock':row['observed_incident_sampler_sha256']='0'*64
+    elif field=='distinct_credit':row['new_distinct_source_credit']=True
+    elif field=='admitted':row['admitted']=1
+    elif field=='source_index_bool':dense['derivative_window_source_indices'][1]=True
+    elif field=='source_index_float':dense['derivative_window_source_indices'][1]=1.
+    else:dense.pop('physical_boundary_policies')
+    with pytest.raises(ValueError,match='physical boundary'):validate_dense_physical_boundaries(dense)
+
+
+@pytest.mark.parametrize('value',[True,1.])
+def test_derivative_eligible_indices_cannot_use_bool_float_aliases(value):
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    context,domain,path,binding=native_boundary_world()
+    binding=deepcopy(binding);binding['eligible_request_indices'][1]=value
+    with pytest.raises(ValueError,match='eligible source domain'):
+        PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+            domain=domain,derivative_binding=binding)
+
+
+def test_same_file_source_seek_is_not_a_preserved_native_camera_cut():
+    from crosscut.group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+    from crosscut.group_joint_source_camera import joint_state_from_render_plan,GroupOutputRole
+    from crosscut.render import RenderTransition
+    context,domain,path,binding=native_boundary_world()
+    original=path.original_plan;segments=list(original.segments);transitions=list(original.transitions)
+    segments[2]=replace(segments[2],source_start=segments[2].source_start+.1)
+    transitions[1]=RenderTransition(tier='C')
+    selected=replace(original,segments=tuple(segments),transitions=tuple(transitions))
+    states=tuple(joint_state_from_render_plan(plan=selected,domain=domain,slot=1,
+        first_output_frame=first,end_output_frame=end,role=GroupOutputRole.FOCAL_HEAD)
+        for first,end in ((30,60),(60,90)))
+    row=PreparedPhysicalBoundaryPolicy(original=original,observed=selected,domain=domain,
+        derivative_binding=binding).classify(*states)
+    assert row['observed_events'][0]['kind']=='same_source_clock_jump'
+    assert row['admitted'] is False
+    assert row['new_distinct_source_credit'] is False
+
+
 @pytest.mark.parametrize('change',['mutable_indices','pairs','ids','caps','roles','alignment','state','authority_type'])
 def test_rehashed_scope_cannot_change_external_ownership_or_alignment(change):
     context,domain,union,path=world();raw=deepcopy(path.to_dict());rows=[s.to_dict() for s in path]

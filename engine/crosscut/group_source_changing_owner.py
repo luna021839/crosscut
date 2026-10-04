@@ -96,6 +96,9 @@ def asset_payload(assets):
 
 
 def _at(state, tick):
+    from .group_scene_camera_queries import GroupSceneRoleQuery
+    if isinstance(state,GroupSceneRoleQuery):
+        return state.sample_at(tick)
     relative = tick-state.first_output_frame
     if not 0 <= relative < len(state.native_frame_indices):
         raise ValueError('source-family sample outside complete state')
@@ -521,12 +524,14 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
         MAX_REFRESHED_CELLS as GLOBAL_MAX_REFRESHED_CELLS)
     global_execution=isinstance(path,GlobalSceneExecutionPath)
     if global_execution:path.validate_external(context,context.domain)
-    if context.source_derivative_binding is not None:
-        from .group_scene_source_owner import validate_bound_derivative_path,validate_bound_derivative_pairs
-        if global_execution:
-            validate_bound_derivative_pairs(context.source_derivative_binding,
-                tuple((a.eligible_source_index,b.eligible_source_index) for a,b in incident_pairs(path)))
-        else:validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
+    if global_execution:
+        from .group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+        physical_policy=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+            domain=context.domain,derivative_binding=context.source_derivative_binding)
+        physical_policies=physical_policy.require(incident_pairs(path))
+    elif context.source_derivative_binding is not None:
+        from .group_scene_source_owner import validate_bound_derivative_path
+        validate_bound_derivative_path(context.source_derivative_binding,[s.eligible_source_index for s in path])
     old=context.incumbent
     scene = getattr(sensors,'scene_family',False)
     # Numeric assembly and scope size are knowable BEFORE expensive projected
@@ -573,6 +578,12 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if scene:
         from .group_scene_observations import compare_scene_edge
         fresh_edges = [compare_scene_edge(sensors,a,b) for a,b in incident_pairs(final_states)]
+        if global_execution:
+            final_policy=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=plan,
+                domain=context.domain,derivative_binding=context.source_derivative_binding)
+            if final_policy.require(incident_pairs(final_states))!=physical_policies:
+                raise ValueError('complete family refresh changed original physical event/sampler policy')
+            for row,(a,b) in zip(fresh_edges,incident_pairs(final_states),strict=True):final_policy.attach(row,a,b)
         if any(not fresh.get('available') or family.digest(fresh.get('metrics'))!=family.digest(before.get('metrics'))
                 for before,fresh in zip(edge_rows,fresh_edges,strict=True)):
             raise ValueError('scene selected incident metrics changed during complete family refresh')
@@ -590,7 +601,9 @@ def complete_source_candidate(context,path,sensors,session,assets,dense_rows,edg
     if global_execution:
         dense.update(global_execution_scope=path.to_dict(),
             global_execution_original_numeric_plan=old.render_plan.to_json(),
-            global_execution_selected_numeric_plan=proposed.to_json())
+            global_execution_selected_numeric_plan=proposed.to_json(),
+            physical_boundary_policies=physical_policies,
+            derivative_window_source_indices=[s.eligible_source_index for s in final_states])
     if context.source_derivative_binding is not None:
         dense.update(source_derivative_binding=context.source_derivative_binding,
             derivative_window_source_indices=[s.eligible_source_index for s in final_states])
@@ -874,14 +887,13 @@ def validate_dense_uncertainty(dense):
         if (not isinstance(keys,list) or len(keys) not in (3,4)
                 or len(dense.get('incident_projected_observations',()))!=len(keys)-1):
             raise ValueError('complete native family lost its actual incident edge inventory')
-    if dense.get('source_derivative_binding') is not None:
-        from .group_scene_source_owner import validate_bound_derivative_path,validate_bound_derivative_pairs
+    if global_scope:
+        from .group_scene_physical_boundaries import validate_dense_physical_boundaries
+        validate_dense_physical_boundaries(dense)
+    elif dense.get('source_derivative_binding') is not None:
+        from .group_scene_source_owner import validate_bound_derivative_path
         indices=dense.get('derivative_window_source_indices',[])
-        if global_scope:
-            if len(indices)!=len(dense['state_keys']):raise ValueError('global derivative source inventory differs')
-            validate_bound_derivative_pairs(dense['source_derivative_binding'],
-                tuple((indices[a],indices[b]) for a,b in pairs))
-        else:validate_bound_derivative_path(dense['source_derivative_binding'],indices)
+        validate_bound_derivative_path(dense['source_derivative_binding'],indices)
     for span in dense['mutable_shots']:
         rows=span.get('rows')
         if not isinstance(rows,list) or not 1<=len(rows)<=MAX_MUTABLE_FRAMES:
@@ -1069,6 +1081,13 @@ def final_live_replay(plan_json,receipt,deadline):
         if dense['contract']==SCENE_DENSE_CONTRACT:
             from .group_scene_observations import compare_scene_edge
             fresh_edges=[compare_scene_edge(sensors,a,b) for a,b in incident_pairs(path)]
+            if isinstance(path,GlobalSceneExecutionPath):
+                from .group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+                physical_policy=PreparedPhysicalBoundaryPolicy(original=original_plan,observed=plan,domain=domain,
+                    derivative_binding=dense.get('source_derivative_binding'))
+                if physical_policy.require(incident_pairs(path))!=dense['physical_boundary_policies']:
+                    raise ValueError('scene final original physical event/sampler policy changed')
+                for row,(a,b) in zip(fresh_edges,incident_pairs(path),strict=True):physical_policy.attach(row,a,b)
             if family.digest(fresh_edges)!=family.digest(dense['incident_projected_observations']):
                 raise ValueError('scene final selected incident articulation/geometry replay disagrees')
     finally: session.close()

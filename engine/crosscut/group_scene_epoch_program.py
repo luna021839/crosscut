@@ -1,8 +1,8 @@
 """Original role sidecars over one complete source/camera programme.
 
 Roles can change inside a continuous camera without becoming new edit cuts.
-An internal numeric scaffold serves existing cell-aligned observers; the
-selected render topology is not replaced by it. This compiler neither senses
+Readonly role queries use the full selected renderer without a cell-splitting
+scaffold or a fresh per-epoch camera origin. This compiler neither senses
 original body lifecycles nor admits donors, completes bundles or grants global
 parent/final authority. Those remain separate obligations of the owner.
 """
@@ -11,9 +11,10 @@ import json
 
 from .group_actual_shots import (VisibleGroupShot,assert_native_cut_events_preserved,
     visible_group_cut_inventory,visible_group_shots)
-from .group_interval_materialization import GroupIntervalRenderScaffold,split_group_render_intervals
 from .group_joint_native_preparation import _plan_identity
-from .group_joint_source_camera import GroupOutputRole,GroupSourceCameraState,joint_state_from_render_plan
+from .group_joint_source_camera import GroupOutputRole
+from .group_scene_camera_queries import (GroupWholeCameraObservation,GroupSceneRoleQuery,
+    PreparedGroupCameraQueries)
 from .group_scene_intent import CONTRACT as INTENT_CONTRACT,role_from_cells,validate_intent
 from .render import RenderPlan,segment_frame_counts,_base_crop_values,_boundary_look_values
 from .render_boundary_clock import native_frame_clocks_for_output
@@ -178,7 +179,7 @@ def _verify_candidate(original,candidate,domain,shot):
 
 @dataclass(frozen=True,slots=True)
 class GroupRoleEpochView:
-    state: GroupSourceCameraState
+    state: GroupSceneRoleQuery
     intent_json: str
 
     @property
@@ -191,15 +192,16 @@ class GroupRoleEpochView:
 @dataclass(frozen=True,slots=True)
 class GroupRoleEpochCompilation:
     plan: RenderPlan
-    observation_scaffold: GroupIntervalRenderScaffold
+    camera: GroupWholeCameraObservation
     views: tuple[GroupRoleEpochView,...]
     original_program_json: str
 
     def to_dict(self):
-        return dict(contract='compiled_original_role_sidecar_views_v1',
+        return dict(contract='compiled_original_role_camera_queries_v2',
             original_role_program=json.loads(self.original_program_json),
             selected_plan_identity=_plan_identity(self.plan),
-            observation_scaffold=self.observation_scaffold.to_dict(),views=[v.to_dict() for v in self.views],
+            camera=self.camera.to_dict(),views=[v.to_dict() for v in self.views],
+            render_cells_split_for_observation=False,
             epoch_boundaries_are_not_edit_cuts=True,selected_render_topology_unchanged=True,
             original_native_part_lifecycle_frozen=False,global_mutable_program_authority=False,
             candidate_admitted=False,full_bundle_created=False,quality_approved=False)
@@ -221,20 +223,12 @@ def compile_role_epoch_views(*,context,domain,shot,original_role_program,candida
     if any(e['role'] is None for e in expected['epochs']):
         raise ValueError('unresolved original role cannot become a donor-selected context duty')
     selected=_verify_candidate(original,original if candidate_plan is None else candidate_plan,domain,shot)
-    boundaries=tuple(sorted({t for e in expected['epochs'] for t in
-        (e['first_output_frame'],e['end_output_frame']) if 0<t<original.output_frame_count}))
-    scaffold=split_group_render_intervals(plan=selected,domain=domain,split_output_frames=boundaries,
-        maximum_additional_cells=64)
-    original_cells={c['segment_index']:c for c in expected['original_output_cells']}
-    retained=[]
-    for mapping in scaffold.cell_map:
-        if mapping.old_segment_index not in original_cells:continue
-        cell=dict(original_cells[mapping.old_segment_index])
-        cell.update(segment_index=mapping.new_segment_index,first_output_frame=mapping.first_output_frame,
-            end_output_frame=mapping.end_output_frame)
-        retained.append(cell)
+    actual=next(s for s in visible_group_shots(selected,domain)
+        if (s.first_output_frame,s.end_output_frame)==(shot.first_output_frame,shot.end_output_frame))
+    camera=GroupWholeCameraObservation.from_plan(plan=selected,domain=domain,physical_shot=actual)
+    retained=expected['original_output_cells']
     views=[]
-    for epoch in expected['epochs']:
+    for epoch_index,epoch in enumerate(expected['epochs']):
         first,end=epoch['first_output_frame'],epoch['end_output_frame']
         intent=dict(contract=INTENT_CONTRACT,role=epoch['role'],first_output_frame=first,end_output_frame=end,
             cells=[c for c in retained if c['first_output_frame']<end and c['end_output_frame']>first],
@@ -246,7 +240,83 @@ def compile_role_epoch_views(*,context,domain,shot,original_role_program,candida
                 original_output_cells=expected['original_output_cells'],
                 original_native_part_lifecycle_frozen=False,epoch_boundaries_are_not_edit_cuts=True))
         validate_intent(intent,role=epoch['role'],first=first,end=end)
-        state=joint_state_from_render_plan(plan=scaffold.plan,domain=domain,slot=1,
-            first_output_frame=first,end_output_frame=end,role=GroupOutputRole(epoch['role']))
+        state=GroupSceneRoleQuery(camera,_freeze(expected),first,end,epoch_index,GroupOutputRole(epoch['role']))
         views.append(GroupRoleEpochView(state,_freeze(intent)))
-    return GroupRoleEpochCompilation(selected,scaffold,tuple(views),_freeze(expected))
+    return GroupRoleEpochCompilation(selected,camera,tuple(views),_freeze(expected))
+
+
+@dataclass(frozen=True,slots=True)
+class GroupCommonClockCameraQueries:
+    """Original roles and selected physical cameras need not share topology.
+
+    Readonly common-clock queries, not an accepted edit, a mutable allocation
+    or a native motion receipt. Unknown original roles are retained verbatim.
+    """
+    plan: RenderPlan
+    cameras: tuple[GroupWholeCameraObservation,...]
+    queries: tuple[GroupSceneRoleQuery,...]
+    original_program_json: str
+    output_intervals: tuple[tuple[int,int],...]
+
+    def to_dict(self):
+        return dict(contract='common_clock_original_role_physical_camera_queries_v1',
+            original_owned_program=json.loads(self.original_program_json),
+            selected_plan_identity=_plan_identity(self.plan),
+            output_intervals=[list(span) for span in self.output_intervals],
+            cameras=[camera.to_dict() for camera in self.cameras],
+            queries=[dict(key=query.key,key_preimage=query.key_preimage()) for query in self.queries],
+            role_epochs_are_not_physical_cuts=True,render_topology_materialized=False,
+            original_native_lifecycle_frozen=False,whole_request_phase_reserves_implemented=False,
+            candidate_admitted=False,quality_approved=False)
+
+
+def compile_common_clock_camera_queries(*,context,domain,original_program,candidate_plan,output_intervals):
+    """Intersect original roles with selected cameras without manufacturing cuts.
+
+    One selected camera may cover several original units; a moved selected
+    cut may split one original role epoch. Every query still names its ORIGINAL
+    unit and epoch. Learned local source clocks are sampled by the normal full
+    renderer clock helper, not replaced by zero alignment offsets. Their full
+    learned authority and mutable/protected admission remain the owner work.
+    """
+    from .group_scene_owned_program import validate_owned_scene_program
+    validate_owned_scene_program(original_program.to_dict(),context,domain)
+    original=context.incumbent.render_plan
+    # The source-clock authorization payload can differ in a numerical learned
+    # proposal. Observing its geometry is NOT approval of that authority.
+    if (not isinstance(candidate_plan,RenderPlan)
+            or candidate_plan.output_frame_count!=original.output_frame_count
+            or any(getattr(original,f.name)!=getattr(candidate_plan,f.name) for f in fields(RenderPlan)
+                if f.name not in ('segments','transitions','output','authorized_shot_video_clocks'))):
+        raise ValueError('common-clock query changed external audio/output/canvas/source headers')
+    previous=-1
+    if not isinstance(output_intervals,tuple) or not output_intervals or len(output_intervals)>256:
+        raise ValueError('common-clock queries need an explicit bounded output scope')
+    for span in output_intervals:
+        if (not isinstance(span,tuple) or len(span)!=2 or any(type(t) is not int for t in span)
+                or not 0<=span[0]<span[1]<=original.output_frame_count or span[0]<previous):
+            raise ValueError('common-clock query scope must have ordered disjoint exact output ticks')
+        previous=span[1]
+    prepared=PreparedGroupCameraQueries(candidate_plan,domain)
+    cameras=tuple(prepared.camera_for(shot) for shot in prepared.shots if any(
+        shot.first_output_frame<end and shot.end_output_frame>first for first,end in output_intervals))
+    queries=[]
+    for first,end in output_intervals:
+        for camera in cameras:
+            for unit in original_program.units:
+                if unit.first_output_frame>=min(end,camera.end_output_frame) or unit.end_output_frame<=max(first,camera.first_output_frame):
+                    continue
+                program=unit.role_program
+                for index,epoch in enumerate(program['epochs']):
+                    low=max(first,camera.first_output_frame,epoch['first_output_frame'])
+                    high=min(end,camera.end_output_frame,epoch['end_output_frame'])
+                    if low>=high:continue
+                    queries.append(GroupSceneRoleQuery(camera,unit.original_role_program_json,low,high,index,
+                        None if epoch['role'] is None else GroupOutputRole(epoch['role'])))
+    queries=tuple(sorted(queries,key=lambda q:q.first_output_frame))
+    for first,end in output_intervals:
+        rows=[q for q in queries if first<=q.first_output_frame<q.end_output_frame<=end]
+        if (not rows or rows[0].first_output_frame!=first or rows[-1].end_output_frame!=end
+                or any(a.end_output_frame!=b.first_output_frame for a,b in zip(rows,rows[1:]))):
+            raise ValueError('common-clock queries omitted or duplicated an original output duty tick')
+    return GroupCommonClockCameraQueries(candidate_plan,cameras,queries,_freeze(original_program.to_dict()),output_intervals)

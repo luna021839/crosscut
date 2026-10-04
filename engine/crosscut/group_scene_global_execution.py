@@ -86,8 +86,8 @@ def complete_global_scene_program(context,union):
     """Execute ONE numeric union; do not concatenate local completed bundles."""
     from .group_scene_intent import declared_shot_intent
     from .group_scene_original_duties import freeze_original_duty_program
-    from .group_scene_source_owner import relation,preserve_incumbent_required_parts
-    from .source_derivative_diversity import DERIVATIVE_DISTINCT
+    from .group_scene_source_owner import preserve_incumbent_required_parts
+    from .group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
     from .group_scene_selected_replay import GLOBAL_CONTRACT
     attempts=[];session=None;sensors=None;frontier=None;stage='numeric_preflight'
     try:
@@ -95,6 +95,10 @@ def complete_global_scene_program(context,union):
         path=execution_path_from_union(context,context.domain,union)
         numeric_preflight=preflight_global_numeric_union(context,union,path)
         baseline=path.with_plan(context.incumbent.render_plan,context.domain)
+        original_policy=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.original_plan,
+            domain=context.domain,derivative_binding=context.source_derivative_binding)
+        selected_policy=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.numeric_plan,
+            domain=context.domain,derivative_binding=context.source_derivative_binding)
         stage='native_assets'
         assets=source.installed_native_assets(context)
         stage='native_observations'
@@ -115,16 +119,16 @@ def complete_global_scene_program(context,union):
                 global_execution_scope=path.to_dict())
             sensors.install_original_duty_program(original_duties)
             edges={}
-            def read(a,b):
-                key=a.key,b.key
+            def read(a,b,policy):
+                key=a.key,b.key,id(policy)
                 if key not in edges:
                     session.budget.spend('edges')
                     row=compare_scene_edge(sensors,a,b)
-                    row['source_relation']=relation(context.source_derivative_binding,a.eligible_source_index,b.eligible_source_index)
-                    if row['source_relation']!=DERIVATIVE_DISTINCT:row['available']=False
+                    policy.attach(row,a,b)
                     edges[key]=row
                 return edges[key]
-            reference,known=global_original_reference(sensors,baseline,groups,read)
+            reference,known=global_original_reference(sensors,baseline,groups,
+                lambda a,b:read(a,b,original_policy))
             # No selected/unselected donor has been sensed before original
             # duties and the coherent original boundary reference are frozen.
             selected_groups=tuple(tuple(sensors.bind(state,h) for h in sensors.discover(state,
@@ -154,7 +158,7 @@ def complete_global_scene_program(context,union):
                     stage='conditional_edges'
                     for i,j in path.incident_pair_indices:
                         a,b=candidate_path[i],candidate_path[j]
-                        row=read(a,b);measured.append(row)
+                        row=read(a,b,selected_policy);measured.append(row)
                         if not row.get('available',False):
                             frontier.remember_infeasible_pair((i,j),a,b,
                                 str(row.get('reason') or 'observed incident comparison unavailable'))

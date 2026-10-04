@@ -206,6 +206,15 @@ def dense_layout(dense):
     scope=dense.get('global_execution_scope')
     if scope is None:
         return tuple(range(1,len(dense['state_keys'])-1)),tuple((i,i+1) for i in range(len(dense['state_keys'])-1))
+    path=dense_execution_path(dense)
+    return path.mutable_indices,path.incident_pair_indices
+
+
+def dense_execution_path(dense):
+    """Reconstruct global numeric sampling; not external alignment authority."""
+    scope=dense.get('global_execution_scope')
+    if scope is None:
+        raise ValueError('global physical boundary validation requires its explicit numeric scope')
     from .render_plan_serialization import render_plan_from_json
     from .group_scene_edit_operations import numeric_replay_domain
     program=dense.get('global_execution_original_numeric_plan')
@@ -215,4 +224,4 @@ def dense_layout(dense):
         domain=numeric_replay_domain(original,dense['source_domain']),payload=scope)
     # This replays a materialized clock, not original alignment offsets. The
     # external alignment domain is independently verified by the parent.
-    return path.mutable_indices,path.incident_pair_indices
+    return path

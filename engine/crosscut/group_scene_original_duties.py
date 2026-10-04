@@ -358,20 +358,46 @@ def validate_original_duty_program(program, *, raw_inventory):
     return program
 
 
+def original_units_for_query(program,state):
+    """Dependency closure on ORIGINAL units, never candidate-owned lifecycles.
+
+    A camera/query may be a strict subspan or cross several original units of
+    the same role. This does not create/reset a branch or waive a different
+    original role. Full programme/raw closure is validated by its owner first.
+    """
+    first,end,role = (state.first_output_frame,state.end_output_frame,state.role.value) if hasattr(state,'role') else (
+        state['first'],state['end'],state['role'])
+    if type(first) is not int or type(end) is not int or not 0<=first<end:
+        raise ValueError('original duty query has invalid candidate bounds')
+    units=[u for u in program['units'] if u['first_output_frame']<end and u['end_output_frame']>first]
+    if (not units or units[0]['first_output_frame']>first or units[-1]['end_output_frame']<end
+            or any(a['end_output_frame']!=b['first_output_frame'] for a,b in zip(units,units[1:]))):
+        raise ValueError('candidate query has no complete externally frozen original duty scope')
+    if any(u['role']!=role for u in units):
+        raise ValueError('candidate query changed an externally frozen original role')
+    return units
+
+
 def duty_at(program, state, tick):
     if program is None:
         return None
     first,end,role = (state.first_output_frame,state.end_output_frame,state.role.value) if hasattr(state,'role') else (
         state['first'],state['end'],state['role'])
-    units = [u for u in program['units'] if
-        (u['first_output_frame'],u['end_output_frame'],u['role']) == (first,end,role)]
+    if (type(first) is not int or type(end) is not int or type(tick) is not int
+            or not 0<=first<=tick<end):
+        raise ValueError('candidate frame borrowed a nonincident original duty tick')
+    units = [u for u in program['units'] if u['first_output_frame']<=tick<u['end_output_frame']]
     if len(units) != 1:
         raise ValueError('candidate frame has no externally frozen original duty unit')
     unit = units[0]; low,high = unit['required_output_interval']
+    if unit['role']!=role:
+        raise ValueError('candidate frame changed its externally frozen original role')
     if type(tick) is not int or not low <= tick < high:
         raise ValueError('candidate frame borrowed a nonincident original duty tick')
     row = unit['rows'][tick-low]
-    return dict(program_sha256=program['program_sha256'], original_unit_id=unit['original_unit_id'],
+    return dict(program_sha256=program['program_sha256'],external_original_id=program['original_plan_identity'],
+        original_unit_id=unit['original_unit_id'],original_hypothesis_branches=[
+            b['original_subject_hypothesis_id'] for b in unit['branches']],
         output_tick=tick, row_sha256=family.digest(row), required_part_names=row['required_part_names'])
 
 

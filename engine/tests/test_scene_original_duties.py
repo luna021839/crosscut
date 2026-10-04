@@ -15,6 +15,7 @@ from crosscut.group_joint_source_camera import GroupOutputRole as Role
 from crosscut.group_scene_role_obligations import scene_role_obligations
 from engine.tests.test_scene_focal_pose_motion import scene_world
 from crosscut.render import RenderSegment
+from types import SimpleNamespace as NS
 
 
 def freeze(sensors,state,h):
@@ -180,6 +181,55 @@ def test_program_keeps_original_hypotheses_separate_not_actor_or_part_counts():
     assert unit['rows'][0]['required_part_names']==['left_arm','right_arm']
     assert unit['part_names_are_not_cast_counts'] is True
     assert program['coherent_original_programme_selected'] is False
+
+
+def test_candidate_subspan_queries_original_lifecycle_by_output_tick_not_new_bounds():
+    sensors,state,h,rows,_=scene_world()
+    owner=rows[3].people[0]
+    rows[3]=replace(rows[3],people=(replace(owner,
+        part_states=(('left_arm','observed'),('right_arm','unknown'))),))
+    program=freeze(sensors,state,h)
+    sensors.install_original_duty_program(program)
+    original_id=program['units'][0]['original_unit_id']
+    # A one-tick query is not a newly constructed render cell or a new
+    # lifecycle. It asks the ORIGINAL programme about this same output tick.
+    subspan=NS(first_output_frame=3,end_output_frame=4,role=state.role)
+    ref=original.duty_at(program,subspan,3)
+    assert ref==original.duty_at(program,state,3)
+    assert ref['original_unit_id']==original_id
+    assert ref['required_part_names']==['left_arm','right_arm']
+    assert program['units'][0]['branches'][0]['rows'][3]['parts']['right_arm']['observation']=='missing'
+    assert ref['external_original_id']==program['original_plan_identity']
+    assert ref['original_hypothesis_branches']==[
+        b['original_subject_hypothesis_id'] for b in program['units'][0]['branches']]
+    with pytest.raises(ValueError,match='nonincident'):
+        original.duty_at(program,subspan,4)
+    with pytest.raises(ValueError,match='role'):
+        original.duty_at(program,NS(first_output_frame=3,end_output_frame=4,role=Role.COMPOSITION),3)
+
+
+def test_subspan_dense_cache_dependency_keeps_the_complete_original_duty_unit(tmp_path):
+    sensors,state,h,rows,_=scene_world();program=freeze(sensors,state,h)
+    sensors.install_original_duty_program(program)
+    # Dependency identity only. Real NONMEDIA regular files supply identity;
+    # none is decoded or represented as a camera/model-quality observation.
+    paths=tuple(tmp_path/f'NONMEDIA-cache-source-{i}.bin' for i in range(2))
+    for path in paths:path.write_bytes(b'EXPLICIT_NONMEDIA_IDENTITY_ONLY')
+    sensors.session.domain=replace(sensors.session.domain,request_sources=paths)
+    sensors.session.closed=False;sensors.session.models={};sensors.session.model_adapters={};sensors.assets={}
+    candidate=replace(state,first_output_frame=2,end_output_frame=6,
+        native_frame_indices=(2,3,4,5),segments=(RenderSegment(0,2/30,4/30,2/30),),
+        segment_output_frame_counts=(4,))
+    selected=deepcopy(h);selected['span_key']=list(sensors.span_key(candidate))
+    selected['anchor_output_ticks']=[2,3,4,5];selected['anchor_head_ids']=[0]*4
+    selected['raw_observation_sha256']=[rows[t].sha256 for t in (2,3,4,5)]
+    sensors.hypotheses[scene.family.digest(selected)]=selected
+    candidate=sensors.bind(candidate,selected)
+    # This helper binds dependency identity, not a passing dense observation.
+    result=sensors._state_dense_binding(candidate)
+    assert result['original_duty_units_sha256']==scene.family.digest(program['units'])
+    assert result['original_duty_program_sha256']==program['program_sha256']
+    assert result['state_key']==candidate.key
 
 
 @pytest.mark.parametrize('mode',['drop_tick','clear_latch','replace_owner','wrong_raw','promote_identity'])

@@ -209,21 +209,34 @@ def replay_selected_scene(context,candidate):
                 if state.key not in {s.key for s in alternatives}:
                     raise ValueError('selected scene source/camera hypothesis is not freshly observed')
         if not isinstance(path,GlobalSceneExecutionPath):derive_selected()
+        physical_policies=None
+        if isinstance(path,GlobalSceneExecutionPath):
+            from .group_scene_physical_boundaries import PreparedPhysicalBoundaryPolicy
+            original_physical=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=path.original_plan,
+                domain=context.domain,derivative_binding=context.source_derivative_binding)
+            selected_physical=PreparedPhysicalBoundaryPolicy(original=path.original_plan,observed=numeric,
+                domain=context.domain,derivative_binding=context.source_derivative_binding)
+            physical_policies=selected_physical.require(incident_pairs(path))
+            if physical_policies!=dense['physical_boundary_policies']:
+                raise ValueError('selected scene parent physical event/sampler policy changed')
         edges={}
-        def read(a,b):
-            key=a.key,b.key
+        def read(a,b,physical=None):
+            key=a.key,b.key,id(physical)
             if key not in edges:
                 session.budget.spend('edges')
                 value=compare_scene_edge(sensors,a,b)
-                value['source_relation']=scene.relation(context.source_derivative_binding,
-                    a.eligible_source_index,b.eligible_source_index)
-                if value['source_relation']!=DERIVATIVE_DISTINCT:value['available']=False
+                if physical is not None:physical.attach(value,a,b)
+                else:
+                    value['source_relation']=scene.relation(context.source_derivative_binding,
+                        a.eligible_source_index,b.eligible_source_index)
+                    if value['source_relation']!=DERIVATIVE_DISTINCT:value['available']=False
                 edges[key]=value
             return edges[key]
         known={};reference=None
         if isinstance(path,GlobalSceneExecutionPath):
             from .group_scene_global_execution import global_original_reference,global_editorial_decision
-            reference,known=global_original_reference(sensors,baseline,groups,read)
+            reference,known=global_original_reference(sensors,baseline,groups,
+                lambda a,b:read(a,b,original_physical))
         elif program['composition_window']:
             reference=coherent_path_reference(groups,read)
             known={i:row if row is not None else dict(available=False,metrics=None)
@@ -241,7 +254,8 @@ def replay_selected_scene(context,candidate):
                     except ValueError:unique=False
                 known[index]=coherent_baseline(values,focal_assignment_unique=unique)
         if isinstance(path,GlobalSceneExecutionPath):derive_selected()
-        measured=[read(a,b) for a,b in incident_pairs(path)]
+        measured=[read(a,b,selected_physical if isinstance(path,GlobalSceneExecutionPath) else None)
+            for a,b in incident_pairs(path)]
         decision=(global_editorial_decision(known,measured) if isinstance(path,GlobalSceneExecutionPath) else
             evaluate_composition_path(reference,measured) if program['composition_window'] else None)
         if (decision is not None and not decision['admitted']
