@@ -35,6 +35,10 @@ class FrozenReviewKnownJointDuty:
                     or any(type(i) is not int or not 0<=i<6 for i in joints)
                     or r['original_state']=='OBSERVED' and not _sha(r.get('original_occurrence_identity'))):
                 raise ValueError('known joint duty cannot borrow candidate visibility or erase an original observation')
+            if (r.get('unresolved_joint_indices')!=sorted(set(range(6))-set(joints))
+                    or r.get('original_actor_state') not in ('OBSERVED','UNRESOLVED')
+                    or r['original_state']=='OBSERVED' and not joints):
+                raise ValueError('known joint duty cannot promote an empty or unresolved anatomical fact')
 
     @property
     def payload(self):return json.loads(self.token_json)
@@ -50,10 +54,12 @@ def freeze_review_known_joint_duty(original_views,*,original_actor_inventory_ide
         if v is not None and v['row']['output_tick']!=tick:
             raise ValueError('original joint duty borrowed another output instant')
         shape=None if v is None else v['descriptor'].pose_shape
-        rows.append(dict(tick=tick,original_state='UNRESOLVED' if v is None else 'OBSERVED',
+        known=sorted({p[0] for p in shape or ()})
+        rows.append(dict(tick=tick,original_state='OBSERVED' if known else 'UNRESOLVED',
+            original_actor_state='UNRESOLVED' if v is None or v.get('reacquisition_ambiguous',False) else 'OBSERVED',
             original_occurrence_identity=None if v is None else digest(dict(
                 raw=v['row']['native_observation'],head=v['descriptor'].frame_local_head_id)),
-            known_joint_indices=sorted({p[0] for p in shape or ()}),
+            known_joint_indices=known,unresolved_joint_indices=sorted(set(range(6))-set(known)),
             known_joint_evidence_identity=None if v is None else v.get('review_joint_evidence_identity')))
     return FrozenReviewKnownJointDuty(json.dumps(dict(
         contract='original_time_specific_known_joint_presence_duty_v1',requests=rows,
@@ -73,7 +79,7 @@ def consume_review_known_joint_duty(*,duty,observations,projected_joint_points):
         if v is not None and v['row']['output_tick']!=tick:
             raise ValueError('known joint consumer borrowed another selected instant')
         missing=[];cropped=[]
-        if r['original_state']=='UNRESOLVED' or v is None or v.get('reacquisition_ambiguous',False):
+        if v is None:
             state='UNKNOWN'
         else:
             shape=v['descriptor'].pose_shape
@@ -84,8 +90,11 @@ def consume_review_known_joint_duty(*,duty,observations,projected_joint_points):
                 if (not isinstance(xy,(tuple,list)) or len(xy)!=2
                         or any(type(n) not in (int,float) or not math.isfinite(n) or not 0<=n<=1 for n in xy)):
                     cropped.append(joint)
-            state='FAIL' if cropped else 'UNKNOWN' if missing else 'PASS'
+            unresolved=(r['original_state']=='UNRESOLVED' or r['original_actor_state']=='UNRESOLVED'
+                or v.get('reacquisition_ambiguous',False))
+            state='FAIL' if cropped else 'UNKNOWN' if missing or unresolved else 'PASS'
         results.append(dict(tick=tick,state=state,requested_joint_indices=r['known_joint_indices'],
+            unresolved_original_joint_indices=r['unresolved_joint_indices'],original_actor_state=r['original_actor_state'],
             missing_joint_indices=missing,cropped_joint_indices=cropped))
     states=[r['state'] for r in results]
     return dict(contract='actual_time_specific_known_joint_presence_receipt_v1',

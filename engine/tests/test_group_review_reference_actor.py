@@ -88,3 +88,31 @@ def test_attention_scope_cannot_be_omitted_only_after_actor_link_failure():
     with pytest.raises(ValueError,match='scopes'):
         freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
             original_program_identity='original',original_attention_scopes={0:'a'})
+
+
+def test_tied_independent_original_seed_does_not_become_a_certain_actor_path():
+    frames={t:[view(t,0,10+t,center=.48),view(t,1,20+t,center=.52)] for t in range(3)}
+    selected,receipt=freeze(frames)
+    assert receipt['groups'][0]['seed_attention_ambiguous']
+    assert all(v['reacquisition_ambiguous'] for v in selected.values())
+    assert len(receipt['groups'][0]['seed_attention_rivals'])==1
+    assert not receipt['groups'][0]['seed_actor_correspondence_certified']
+
+
+def test_original_seed_attention_margin_is_independently_declared_not_a_donor_cost():
+    frames={t:[view(t,0,10+t,center=.50),view(t,1,20+t,center=.515)] for t in range(3)}
+    selected,receipt=freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+        original_program_identity='original',seed_attention_margin=.02)
+    assert all(v['reacquisition_ambiguous'] for v in selected.values())
+    assert receipt['seed_attention_margin']==.02
+    selected,receipt=freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+        original_program_identity='original',seed_attention_margin=.001)
+    assert not receipt['groups'][0]['seed_attention_ambiguous']
+    assert all(not v.get('reacquisition_ambiguous',False) for v in selected.values())
+
+
+def test_existing_ambiguous_original_seed_cannot_be_overwritten_by_new_association():
+    frames={t:[dict(view(t,0,t+10),reacquisition_ambiguous=(t==1))] for t in range(3)}
+    selected,receipt=freeze(frames)
+    assert all(v['reacquisition_ambiguous'] for v in selected.values())
+    assert receipt['groups'][0]['seed_attention_ambiguous']

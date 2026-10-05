@@ -167,6 +167,8 @@ def measure_review_projected_action(left,right,*,left_queries,right_queries,fps,
             bindings.append(dict(side=side,tick=t,registered_query_identity=q.key,
                 native_parent=None if v is None else digest(v['row']['native_observation']),
                 selected_head=None if v is None else v['descriptor'].frame_local_head_id,
+                native_head_identity=None if v is None else next((digest(h) for h in v['row']['native_observation'].get('heads',())
+                    if h['observation_id']==v['descriptor'].frame_local_head_id),None),
                 anatomical_provenance_identity=None if v is None else v.get('review_joint_evidence_identity'),
                 projected_points={str(k):list(p) for k,p in xy.items()}))
         points.append(values)
@@ -186,25 +188,33 @@ def measure_review_projected_action(left,right,*,left_queries,right_queries,fps,
         requested_velocity_windows=len(indices)-1,measured_velocity_windows=len(dt))
 
 
-def fit_review_anatomical_key(source_points,target_points,*,requested_joints,time_seconds,
-        maximum_zoom=2.,maximum_roll_degrees=1.6):
+def fit_review_anatomical_keys(source_points,target_points,*,requested_joints,time_seconds,
+        maximum_zoom=2.,maximum_roll_degrees=1.6,required_visible_points=(),maximum_candidates=8):
     """Bounded screen-space similarity fit, not a warp or missing-joint fill.
 
     The caller chooses the full joint basis BEFORE fitting. Targets are actual
     original entry/exit or actual donor/donor same-time anatomy, not face-only
     centers. Legal pan and scale bounds are renderer bounds, not pose scores.
     """
+    if type(maximum_candidates) is not int or not 1<=maximum_candidates<=64:
+        raise ValueError('camera candidate budget must be predeclared within 1..64')
+    visible=np.asarray(tuple(required_visible_points),dtype=float)
+    if visible.size:
+        if visible.ndim!=2 or visible.shape[1]!=2 or not np.isfinite(visible).all():
+            raise ValueError('known preservation points must be finite observed 2D points')
+        if np.any(visible<0.) or np.any(visible>1.):
+            raise ValueError('known preservation support is outside the neutral source raster')
     joints=tuple(requested_joints)
     if (joints!=tuple(sorted(set(joints))) or len(joints)<3
             or not 1<=maximum_zoom<=2 or not 0<=maximum_roll_degrees<=1.6):
         raise ValueError('anatomical camera fit needs its predeclared bounded joint basis')
-    if any(j not in source_points or j not in target_points for j in joints):return None
+    if any(j not in source_points or j not in target_points for j in joints):return ()
     aspect=np.asarray((1.,9/16));a=np.asarray([source_points[j] for j in joints])*aspect
     b=np.asarray([target_points[j] for j in joints])*aspect
-    if not np.isfinite(a).all() or not np.isfinite(b).all():return None
+    if not np.isfinite(a).all() or not np.isfinite(b).all():return ()
     ac,bc=a.mean(axis=0),b.mean(axis=0);aa,bb=a-ac,b-bc
     energy=float(np.sum(aa*aa))
-    if energy<=1e-12:return None
+    if energy<=1e-12:return ()
     dot=float(np.sum(aa*bb));cross=float(np.sum(aa[:,0]*bb[:,1]-aa[:,1]*bb[:,0]))
     angle=max(-maximum_roll_degrees,min(maximum_roll_degrees,math.degrees(math.atan2(cross,dot))))
     center=np.asarray((.5,.5))*aspect
@@ -227,7 +237,28 @@ def fit_review_anatomical_key(source_points,target_points,*,requested_joints,tim
                 cx,cy=.5+alpha*(desired-.5)
                 try:key=EditorialTransformKeyframe(time_seconds,zoom,float(cx),float(cy),roll)
                 except ValueError:continue
+                if any(not all(0.<=v<=1. for v in project_review_editorial_point(p,key)) for p in visible):
+                    continue
                 projected=np.asarray([project_review_editorial_point(source_points[j],key) for j in joints])*aspect
                 error=float(np.sum((projected-b)**2))
                 options.append((error,key))
-    return min(options,key=lambda p:(p[0],p[1].zoom,abs(p[1].roll_degrees)))[1] if options else None
+    result=[];seen=set()
+    for _,key in sorted(options,key=lambda p:(p[0],p[1].zoom,abs(p[1].roll_degrees))):
+        signature=(key.time_seconds,key.zoom,key.center_x,key.center_y,key.roll_degrees)
+        if signature in seen:continue
+        seen.add(signature);result.append(key)
+        if len(result)==maximum_candidates:break
+    return tuple(result)
+
+
+def fit_review_anatomical_key(source_points,target_points,*,requested_joints,time_seconds,
+        maximum_zoom=2.,maximum_roll_degrees=1.6,required_visible_points=()):
+    """Compatibility wrapper; supplied actual known points constrain the fit.
+
+    No missing joint is inferred and this does not certify actor or quality.
+    The bounded producer should consume the plural feasible-camera API.
+    """
+    keys=fit_review_anatomical_keys(source_points,target_points,requested_joints=requested_joints,
+        time_seconds=time_seconds,maximum_zoom=maximum_zoom,maximum_roll_degrees=maximum_roll_degrees,
+        required_visible_points=required_visible_points,maximum_candidates=1)
+    return keys[0] if keys else None

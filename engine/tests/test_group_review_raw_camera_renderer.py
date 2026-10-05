@@ -63,3 +63,18 @@ def test_post_selection_program_or_camera_slicing_cannot_be_hidden():
     with pytest.raises(ValueError,match='post-select slice'):
         render_selected_review_rasters(plan=plan,queries={t:q for t,q in queries.items() if t<19},changed_intervals=((10,19),),
             session=session,native_row_for_query=row,expected_program_identity=digest(plan.to_json()))
+
+
+def test_distinct_canonical_rasters_keep_every_ordinal_and_replay_identically():
+    plan,queries,session,row=setup()
+    indices=[queries[t].sample_at(t)[2] for t in range(10,20)]
+    ordinal={n:i for i,n in enumerate(indices)}
+    assert len(ordinal)==10
+    session.native_pixels=lambda source,native:np.full((180,320,3),20+ordinal[native]*20,dtype=np.uint8)
+    a,ra=render_selected_review_rasters(plan=plan,queries=queries,changed_intervals=((10,20),),
+        session=session,native_row_for_query=row,expected_program_identity=digest(plan.to_json()))
+    b,rb=render_selected_review_rasters(plan=plan,queries=queries,changed_intervals=((10,20),),
+        session=session,native_row_for_query=row,expected_program_identity=digest(plan.to_json()))
+    values=[float(a.frame(t).mean()) for t in range(10,20)]
+    assert all(abs(value-(20+i*20))<=3 for i,value in enumerate(values))
+    assert a.identity==b.identity and ra['output_frames']==10 and not ra['quality_approved']

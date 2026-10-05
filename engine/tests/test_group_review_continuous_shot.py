@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from crosscut.group_review_continuous_shot import (ContinuousReviewShotScope,continuous_review_native_runs,
     measure_review_added_camera_motion,joint_review_shot_measurements,select_continuous_review_shot,
-    classify_review_continuation_incident)
+    classify_review_continuation_incident,enumerate_continuous_review_intervals,ReviewCameraRealizationBudget)
 from crosscut.render import EditorialTransformKeyframe as Key
 from crosscut.render import RenderPlan, RenderSegment, SourceLookAdjustment, EditorialTransformTrack
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
@@ -32,6 +32,36 @@ def test_native_runs_exist_without_actor_coverage_and_split_actual_physical_cuts
 def test_native_run_cannot_bridge_missing_addresses_or_reverse_frame_clock():
     rows={0:(0,'clock','file',0,10),1:None,2:(0,'clock','file',0,11),3:(0,'clock','file',0,2)}
     assert [(r['first_tick'],r['end_tick']) for r in continuous_review_native_runs(rows)]==[(0,1),(2,3),(3,4)]
+
+
+def test_physical_subinterval_is_generated_without_actor_or_body_observations():
+    rows={t:(0,'clock','file',0 if t<2715 else 1,t) for t in range(2664,2724)}
+    result=enumerate_continuous_review_intervals(runs_by_source={0:continuous_review_native_runs(rows)},
+        independent_boundaries=(2664,2724),output_frame_count=4357)
+    assert result['state']=='COMPLETE' and len(result['hypotheses'])==1
+    scope=result['hypotheses'][0]['scope']
+    assert (scope['entry_tick'],scope['return_tick'])==(2664,2715)
+    assert not result['hypotheses'][0]['actor_correspondence_certified']
+    assert not result['pose_costs_used_to_choose_boundaries']
+
+
+def test_interval_budget_defers_fairly_instead_of_losing_earlier_hypotheses():
+    runs={s:continuous_review_native_runs({t:(s,'clock','file',0,t) for t in range(50,100)}) for s in range(3)}
+    result=enumerate_continuous_review_intervals(runs_by_source=runs,independent_boundaries=(50,70,100),
+        output_frame_count=200,maximum_returned=2)
+    assert result['state']=='BUDGET_LIMITED' and [r['source'] for r in result['hypotheses']]==[0,1]
+    assert result['deferred'] and result['total_physical_hypotheses']==9
+
+
+def test_camera_recipe_budget_counts_unique_cameras_not_action_schemas():
+    budget=ReviewCameraRealizationBudget(56)
+    for i in range(56):
+        for _schema in range(3):assert budget.reserve(dict(camera=i,source=0))
+    assert not budget.reserve(dict(camera=56,source=0))
+    assert budget.reserve(dict(camera=0,source=0))
+    receipt=budget.receipt()
+    assert receipt['state']=='BUDGET_LIMITED' and len(receipt['reserved_recipe_identities'])==56
+    assert len(receipt['deferred_recipe_identities'])==1 and not receipt['pre_existing_candidates_erased']
 
 
 def test_different_constant_cameras_and_original_return_are_measured():
@@ -89,10 +119,12 @@ def test_joint_measurement_rejects_different_camera_and_missing_return():
         rows.append(dict(boundary_tick=t,program_identity='a'*64,
             native_action=dict(route_identity='route',same_time_action_supported=True,exploration_cost=.1),
             projected_action=dict(route_identity='route',state='MEASURED',projected_position_error=.1,
-                projected_velocity_error=.1,actual_projected_inputs=[dict(side='left',tick=t,registered_query_identity='camera-a')]),
+                projected_velocity_error=.1,actual_projected_inputs=[dict(side='left',tick=t,registered_query_identity='camera-a',
+                    native_parent='raw',selected_head=10,native_head_identity='head')]),
             head_connection=dict(route_identity='route',state='MEASURED',face_center_position_error=.1,
                 face_scale_log_error=.1,face_center_velocity_error=.1,
-                actual_inputs=[dict(side='left',tick=t,face=dict(registered_query_identity='camera-a'))])))
+                actual_inputs=[dict(side='left',tick=t,face=dict(registered_query_identity='camera-a',
+                    native_parent='raw',selected_head=10,native_head_identity='head'))])))
     assert joint_review_shot_measurements(scope=s,program_identity='a'*64,incidents=rows,camera_motion=c,
         known_joint_state='PASS',actor_state='PASS')['state']=='MEASURED'
     wrong=deepcopy(rows);wrong[1]['head_connection']['actual_inputs'][0]['face']['registered_query_identity']='camera-b'
@@ -100,6 +132,15 @@ def test_joint_measurement_rejects_different_camera_and_missing_return():
         joint_review_shot_measurements(scope=s,program_identity='a'*64,incidents=wrong,camera_motion=c,known_joint_state='PASS',actor_state='PASS')
     with pytest.raises(ValueError,match='both declared incidents'):
         joint_review_shot_measurements(scope=s,program_identity='a'*64,incidents=rows[:1],camera_motion=c,known_joint_state='PASS',actor_state='PASS')
+    for field,value in (('native_parent','other-raw'),('selected_head',20),('native_head_identity','other-head')):
+        wrong=deepcopy(rows);wrong[0]['head_connection']['actual_inputs'][0]['face'][field]=value
+        with pytest.raises(ValueError,match='actor/raw'):
+            joint_review_shot_measurements(scope=s,program_identity='a'*64,incidents=wrong,camera_motion=c,
+                known_joint_state='PASS',actor_state='PASS')
+    wrong=deepcopy(rows);wrong[0]['head_connection']['actual_inputs']*=2
+    with pytest.raises(ValueError,match='reused'):
+        joint_review_shot_measurements(scope=s,program_identity='a'*64,incidents=wrong,camera_motion=c,
+            known_joint_state='PASS',actor_state='PASS')
 
 
 def test_actual_original_camera_return_is_consumed_not_just_reported():

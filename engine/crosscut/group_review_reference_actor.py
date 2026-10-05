@@ -26,7 +26,7 @@ def _native_association_view(view,unit):
 
 def freeze_original_review_actor_inventory(frames,*,native_units,original_program_identity,
         maximum_frames=2048,maximum_native_gap=12,minimum_cosine=.25,ambiguity_margin=.025,
-        original_attention_scopes=None):
+        original_attention_scopes=None,seed_attention_margin=.025):
     """Freeze output-tick bindings without inspecting donor/action-match costs.
 
     Each physical original shot uses the observed frame nearest its inventory
@@ -38,7 +38,9 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
     if (not isinstance(frames,dict) or not 1<=len(frames)<=maximum_frames
             or set(frames)!=set(native_units) or not isinstance(original_program_identity,str)
             or not original_program_identity or not 1<=maximum_native_gap<=12
-            or not 0<=minimum_cosine<=1 or not 0<=ambiguity_margin<=1):
+            or not 0<=minimum_cosine<=1 or not 0<=ambiguity_margin<=1
+            or type(seed_attention_margin) not in (int,float) or not math.isfinite(seed_attention_margin)
+            or not 0<=seed_attention_margin<=1):
         raise ValueError('original actor inventory needs one finite independent physical request set')
     scopes={t:'single-independent-request' for t in frames} if original_attention_scopes is None else (
         original_attention_scopes)
@@ -67,14 +69,22 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
         observed=[t for t in ticks if frames[t]]
         if not observed:
             groups_receipts.append(dict(unit=list(unit),original_attention_scope=attention_scope,
-                seed_tick=None,requests=ticks));continue
+                seed_tick=None,requests=ticks,seed_attention_ambiguous=True,
+                seed_attention_rivals=[],seed_actor_correspondence_certified=False));continue
         midpoint=(ticks[0]+ticks[-1])/2
         seed_tick=min(observed,key=lambda t:(abs(t-midpoint),t))
         def attention(view):
             d=view['descriptor'];x,y=d.head_center
             return (math.hypot(x-.5,(y-.4)*9/16),-d.face_height*d.face_width,
                 digest((view['vector'],d.head_center,d.face_height,d.face_width)))
-        seed=min(frames[seed_tick],key=attention)
+        ranked_seeds=sorted(frames[seed_tick],key=attention)
+        seed=ranked_seeds[0];seed_distance=attention(seed)[0]
+        # Centrality is an independently chosen attention heuristic, not an
+        # identity certificate. A deterministic area/hash tie-break must not
+        # erase plausible other original actors or the seed's existing doubt.
+        seed_rivals=[v for v in ranked_seeds[1:] if attention(v)[0]-seed_distance<=seed_attention_margin]
+        seed_ambiguous=bool(seed.get('reacquisition_ambiguous',False) or seed_rivals)
+        seed=dict(seed,reacquisition_ambiguous=seed_ambiguous)
         selected[seed_tick]=dict(seed,original_actor_inventory_seed=True)
         seed_position=ticks.index(seed_tick);association_links=[]
         for positions in (range(seed_position+1,len(ticks)),range(seed_position-1,-1,-1)):
@@ -99,6 +109,11 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
         groups_receipts.append(dict(unit=list(unit),requests=ticks,seed_tick=seed_tick,
             original_attention_scope=attention_scope,
             seed_head_id=seed['descriptor'].frame_local_head_id,links=association_links,
+            seed_attention_ambiguous=seed_ambiguous,seed_actor_correspondence_certified=False,
+            seed_attention_distance=seed_distance,seed_attention_rivals=[dict(
+                head_id=v['descriptor'].frame_local_head_id,raw_parent=digest(v['row']['native_observation']),
+                attention_distance=attention(v)[0],distance_margin=attention(v)[0]-seed_distance,
+                output_face_area=v['descriptor'].face_height*v['descriptor'].face_width) for v in seed_rivals],
             seed_basis='independent_original_output_attention_not_donor_pose_error'))
     bindings=[]
     for tick,view in sorted(selected.items()):
@@ -110,7 +125,10 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
     receipt=dict(contract='original_native_shot_anchored_actor_inventory_v1',
         original_program_identity=original_program_identity,groups=groups_receipts,bindings=bindings,
         maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
-        ambiguity_margin=ambiguity_margin,donor_costs_used=False,production_ownership_rewritten=False,
+        ambiguity_margin=ambiguity_margin,seed_attention_margin=seed_attention_margin,
+        seed_attention_margin_units='aspect_corrected_normalized_output_center_distance',
+        seed_attention_margin_is_actor_identity_threshold=False,
+        donor_costs_used=False,production_ownership_rewritten=False,
         attention_scopes_are_physical_camera_cuts=False,
         named_actor_certified=False,quality_approved=False)
     receipt['inventory_identity']=digest(receipt)

@@ -53,3 +53,39 @@ def test_unknown_original_actor_remains_unknown():
     result=consume_review_known_joint_duty(duty=frozen,observations={10:view(10,[0,1,3,5])},
         projected_joint_points={10:{k:(.5,.5) for k in [0,1,3,5]}})
     assert result['state']=='UNKNOWN'
+
+
+def test_existing_head_without_pose_cannot_become_empty_joint_pass():
+    original=view(10,[]);original['descriptor'].pose_shape=None
+    frozen=freeze_review_known_joint_duty({10:original},original_actor_inventory_identity='a'*64,
+        original_preservation_duty_identity='b'*64)
+    row=frozen.payload['requests'][0]
+    assert row['original_state']=='UNRESOLVED' and row['known_joint_indices']==[]
+    assert row['unresolved_joint_indices']==list(range(6))
+    result=consume_review_known_joint_duty(duty=frozen,observations={10:view(10,[0,1,2,3,4,5])},
+        projected_joint_points={10:{k:(.5,.5) for k in range(6)}})
+    assert result['state']=='UNKNOWN'
+
+
+def test_known_wrist_is_per_tick_and_is_not_painted_into_an_unobserved_tick():
+    original={407:view(407,[0,1,2,3,5]),408:view(408,[]),409:view(409,list(range(6)))}
+    original[408]['descriptor'].pose_shape=None
+    frozen=freeze_review_known_joint_duty(original,original_actor_inventory_identity='a'*64,
+        original_preservation_duty_identity='b'*64)
+    a,b,c=frozen.payload['requests']
+    assert a['known_joint_indices']==[0,1,2,3,5] and a['unresolved_joint_indices']==[4]
+    assert b['known_joint_indices']==[] and b['original_state']=='UNRESOLVED'
+    assert c['known_joint_indices']==list(range(6)) and c['unresolved_joint_indices']==[]
+    observations={t:view(t,list(range(6))) for t in original}
+    points={t:{k:(.5,.5) for k in range(6)} for t in original};points[409][4]=(1.1,.5)
+    assert consume_review_known_joint_duty(duty=frozen,observations=observations,
+        projected_joint_points=points)['state']=='FAIL'
+
+
+def test_ambiguous_actor_cannot_erase_a_known_cropped_wrist():
+    original=view(10,[0,1,5]);original['reacquisition_ambiguous']=True
+    frozen=freeze_review_known_joint_duty({10:original},original_actor_inventory_identity='a'*64,
+        original_preservation_duty_identity='b'*64)
+    result=consume_review_known_joint_duty(duty=frozen,observations={10:view(10,[0,1,5])},
+        projected_joint_points={10:{0:(.5,.5),1:(.5,.5),5:(1.1,.5)}})
+    assert result['state']=='FAIL' and result['requests'][0]['original_actor_state']=='UNRESOLVED'

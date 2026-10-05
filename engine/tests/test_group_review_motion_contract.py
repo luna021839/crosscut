@@ -77,7 +77,8 @@ def test_original_transient_pose_loss_cannot_switch_known_body_intent_to_head():
     a[2]['descriptor']=replace(a[2]['descriptor'],pose_shape=None)
     frozen=intent(a,True)
     assert frozen.payload['kind']=='BODY'
-    assert frozen.payload['joint_requests'][2]==[0,1,2,3]
+    assert frozen.payload['joint_requests'][2] is None
+    assert TICKS[2] in frozen.payload['original_unmatched_ticks']
     b=[view(t,0.) for t in TICKS]
     for v in b:v['descriptor']=replace(v['descriptor'],pose_shape=None)
     result=compare_frozen_review_motion_route(b,b,fps=30.,intent=frozen,route=route())
@@ -147,12 +148,13 @@ def test_body_in_a_different_original_shot_does_not_invent_a_past_visible_wrist(
     for v in a[:2]:v['descriptor']=replace(v['descriptor'],pose_shape=None)
     frozen=freeze_selected_review_motion_intent(a,requested_ticks=TICKS,original_actor_identity='original',
         reference_native_units=[('head-shot',)]*2+[('body-shot',)]*3)
-    assert frozen.payload['joint_requests'][:2]==[[],[]]
+    assert frozen.payload['joint_requests'][:2]==[None,None]
     assert frozen.payload['kind']=='BODY'
     a[3]['descriptor']=replace(a[3]['descriptor'],pose_shape=None)
     frozen=freeze_selected_review_motion_intent(a,requested_ticks=TICKS,original_actor_identity='original',
         reference_native_units=[('head-shot',)]*2+[('body-shot',)]*3)
-    assert frozen.payload['joint_requests'][3]==[0,1,2,3]
+    assert frozen.payload['joint_requests'][3] is None
+    assert frozen.payload['known_joint_union']==[0,1,2,3]
 
 
 def test_same_native_continuation_survives_missing_body_but_not_wrong_sampler_or_actor():

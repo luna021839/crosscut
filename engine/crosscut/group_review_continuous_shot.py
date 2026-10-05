@@ -6,6 +6,7 @@ An explicit KEEP_ORIGINAL remains a result, never a forced technical winner.
 """
 from dataclasses import dataclass
 import math
+from itertools import combinations
 import numpy as np
 from .group_performer_family_owner import digest
 from .render import EditorialTransformKeyframe
@@ -64,6 +65,76 @@ def continuous_review_native_runs(native_signatures):
             rows.append(dict(first_tick=t,end_tick=t+1,physical_unit=list(s[:4]),first_native_frame=s[4],last_native_frame=s[4]))
         else:rows[-1].update(end_tick=t+1,last_native_frame=s[4])
     return tuple(dict(row,actor_correspondence_certified=False,known_joint_duties_waived=False,quality_approved=False) for row in rows)
+
+
+def enumerate_continuous_review_intervals(*,runs_by_source,independent_boundaries,output_frame_count,
+        minimum_hold_frames=18,maximum_returned=56,context_frames=12):
+    """Physical interval catalogue BEFORE actor, anatomy and camera costs.
+
+    Native edges are real alternative edit boundaries, not a reason to lose an
+    entire source. Every hypothesis owns BOTH new incidents. Budget exhaustion
+    returns deferred hypotheses without erasing already available hypotheses.
+    Including the original source index is intentional: KEEP is a recipe, not
+    a camera index. No interval here is an editorial/actor quality certificate.
+    """
+    boundaries=tuple(independent_boundaries)
+    if (not 2<=len(boundaries)<=32 or boundaries!=tuple(sorted(set(boundaries)))
+            or any(type(t) is not int or t<0 for t in boundaries)
+            or type(maximum_returned) is not int or not 1<=maximum_returned<=224
+            or not isinstance(runs_by_source,dict) or not 1<=len(runs_by_source)<=16):
+        raise ValueError('finite independent physical interval catalogue and budget required')
+    if (type(output_frame_count) is not int or type(minimum_hold_frames) is not int
+            or type(context_frames) is not int or not 2<=minimum_hold_frames<=300
+            or not 2<=context_frames<=60 or output_frame_count<=2*context_frames):
+        raise ValueError('physical interval catalogue needs exact hold and original contexts')
+    low,high=boundaries[0],boundaries[-1];groups={}
+    for source,runs in sorted(runs_by_source.items()):
+        if type(source) is not int or source<0 or not isinstance(runs,(list,tuple)) or len(runs)>64:
+            raise ValueError('physical interval source/run inventory changed')
+        candidates={}
+        for run in runs:
+            a,b=run['first_tick'],run['end_tick'];unit=run['physical_unit']
+            if (type(a) is not int or type(b) is not int or not 0<=a<b<=output_frame_count
+                    or len(unit)!=4 or unit[0]!=source):raise ValueError('physical run address changed')
+            root=digest(run)
+            anchors=sorted({t for t in (*boundaries,a,b)
+                if max(low,a,context_frames)<=t<=min(high,b,output_frame_count-context_frames)})
+            for first,end in combinations(anchors,2):
+                if end-first<minimum_hold_frames:continue
+                scope=ContinuousReviewShotScope(first,end,output_frame_count,
+                    context_frames=context_frames,minimum_hold_frames=minimum_hold_frames)
+                candidates[(first,end,root)]=dict(source=source,scope=scope.to_dict(),native_run_identity=root,
+                    physical_unit=unit,actor_correspondence_certified=False,known_joint_duties_waived=False,quality_approved=False)
+        groups[source]=[candidates[k] for k in sorted(candidates)]
+    ordered=[]
+    for index in range(max((len(v) for v in groups.values()),default=0)):
+        for group in groups.values():
+            if index<len(group):ordered.append(group[index])
+    return dict(contract='physical_before_actor_continuous_interval_catalogue_v1',
+        state='COMPLETE' if len(ordered)<=maximum_returned else 'BUDGET_LIMITED',
+        independent_boundaries=boundaries,hypotheses=ordered[:maximum_returned],deferred=ordered[maximum_returned:],
+        total_physical_hypotheses=len(ordered),pose_costs_used_to_choose_boundaries=False,
+        quality_approved=False)
+
+
+class ReviewCameraRealizationBudget:
+    """Reserve a unique recipe BEFORE expensive realization; schemas share it."""
+    def __init__(self,maximum_recipes):
+        if type(maximum_recipes) is not int or not 1<=maximum_recipes<=224:
+            raise ValueError('camera realization needs its independently declared finite budget')
+        self.maximum_recipes=maximum_recipes;self.reserved={};self.deferred=[]
+
+    def reserve(self,recipe):
+        identity=digest(recipe)
+        if identity in self.reserved:return True
+        if len(self.reserved)>=self.maximum_recipes:
+            self.deferred.append(identity);return False
+        self.reserved[identity]=recipe;return True
+
+    def receipt(self):
+        return dict(state='BUDGET_LIMITED' if self.deferred else 'COMPLETE',maximum_recipes=self.maximum_recipes,
+            reserved_recipe_identities=list(self.reserved),deferred_recipe_identities=list(dict.fromkeys(self.deferred)),
+            pre_existing_candidates_erased=False,quality_approved=False)
 
 
 def classify_review_continuation_incident(*,candidate,continuation,source_clocks,
@@ -167,7 +238,23 @@ def joint_review_shot_measurements(*,scope,program_identity,incidents,camera_mot
         hinputs={(r['side'],r['tick']):r.get('registered_query_identity',
             None if r['face'] is None else r['face']['registered_query_identity']) for r in h.get('actual_inputs',[])}
         if pinputs!=hinputs:raise ValueError('head and anatomical action used different actual cameras')
+        def occurrences(rows,head):
+            result={}
+            for row in rows:
+                key=(row['side'],row['tick'])
+                if key in result:raise ValueError('joint shot evidence reused an actual occurrence request')
+                value=row.get('face') if head else row
+                occurrence=None if value is None else tuple(value.get(k) for k in
+                    ('native_parent','selected_head','native_head_identity'))
+                result[key]=None if occurrence is None or all(k is None for k in occurrence) else occurrence
+            return result
+        pa=occurrences(p.get('actual_projected_inputs',[]),False)
+        ha=occurrences(h.get('actual_inputs',[]),True)
+        if set(pa)!=set(ha) or any(pa[k] is not None and ha[k] is not None and pa[k]!=ha[k] for k in pa):
+            raise ValueError('head and anatomical action used different actual actor/raw occurrences')
         measured=bool(n.get('same_time_action_supported') and p.get('state')=='MEASURED' and h.get('state')=='MEASURED')
+        if measured and (not pa or any(v is None or any(k is None for k in v) for v in (*pa.values(),*ha.values()))):
+            raise ValueError('joint shot measurement lacks actual actor/raw occurrence bindings')
         states.append('PASS' if measured else 'UNKNOWN')
         rows.append(dict(boundary_tick=x['boundary_tick'],native_action=n.get('exploration_cost'),
             projected_position=p.get('projected_position_error'),projected_velocity=p.get('projected_velocity_error'),

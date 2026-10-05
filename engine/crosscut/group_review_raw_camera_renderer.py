@@ -66,7 +66,7 @@ def render_selected_review_rasters(*,plan,queries,changed_intervals,session,nati
         command=['ffmpeg','-nostdin','-v','error','-f','rawvideo','-pixel_format','bgr24',
             '-video_size',f'{shape[1]}x{shape[0]}','-framerate',str(plan.fps),'-i','pipe:0',
             '-vf',','.join(filters),'-frames:v',str(len(ticks)),'-threads','2',
-            '-f','rawvideo','-pix_fmt','bgr24','pipe:1']
+            '-fps_mode','passthrough','-f','rawvideo','-pix_fmt','bgr24','pipe:1']
         completed=subprocess.run(command,input=b''.join(memoryview(p).cast('B') for p in native),
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout_seconds,check=False)
         if completed.returncode:raise RuntimeError('selected production camera failed: '+completed.stderr.decode()[-2000:])
@@ -81,6 +81,7 @@ def render_selected_review_rasters(*,plan,queries,changed_intervals,session,nati
     # being mistaken for replay of a previously selected provider.
     import inspect
     renderer_identity=digest(dict(contract='production_post_clock_camera_and_look_renderer_v1',
+        canonical_raster_sync='passthrough_v1',
         source=inspect.getsource(_video_post_clock_filters),selected_segments=[s for s in plan.to_json()['segments']],
         output_size=[plan.width,plan.height],fps=plan.fps))
     token=dict(contract='selected_raw_raster_provider_v1',frame_count=plan.output_frame_count,

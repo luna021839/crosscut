@@ -8,7 +8,7 @@ from crosscut.group_review_camera_repair import FramingDescriptor
 from crosscut.group_review_motion_contract import freeze_selected_review_motion_intent,freeze_review_native_motion_route
 from crosscut.group_review_declared_action import freeze_review_action_declaration
 from crosscut.group_review_projected_action import (project_observed_review_joints,measure_review_projected_action,
-    fit_review_anatomical_key,project_observed_review_face,measure_review_projected_face)
+    fit_review_anatomical_key,fit_review_anatomical_keys,project_observed_review_face,measure_review_projected_face)
 from crosscut.group_review_camera_repair import project_review_editorial_point
 from crosscut.group_performer_family_owner import digest
 from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
@@ -90,6 +90,39 @@ def test_infeasible_unconstrained_roll_does_not_discard_measured_joint_request()
     before=sum(math.dist(points[j],target[j])**2 for j in points)
     after=sum(math.dist(project_review_editorial_point(points[j],key),target[j])**2 for j in points)
     assert after<=before+1e-12
+
+
+def test_camera_fit_keeps_feasible_intermediate_zoom_and_all_known_wrist_points():
+    import math
+    points={0:(.46,.45),1:(.54,.45),2:(.45,.55),3:(.55,.55)}
+    desired=EditorialTransformKeyframe(0.,2.)
+    target={j:project_review_editorial_point(p,desired) for j,p in points.items()}
+    # These are independently observed points across ALL changed ticks, not
+    # just the four fitting joints. The optimal 2x fit crops the right wrist.
+    support=((.9,.5),(.1,.5),(.5,.9))
+    keys=fit_review_anatomical_keys(points,target,requested_joints=(0,1,2,3),
+        time_seconds=0.,required_visible_points=support,maximum_candidates=8)
+    assert keys and any(k.zoom==pytest.approx(1.16) for k in keys)
+    before=sum(math.dist(points[j],target[j])**2 for j in points)
+    assert min(sum(math.dist(project_review_editorial_point(points[j],k),target[j])**2
+        for j in points) for k in keys)<before
+    for key in keys:
+        assert all(all(0.<=v<=1. for v in project_review_editorial_point(p,key)) for p in support)
+    assert len({(k.zoom,k.center_x,k.center_y,k.roll_degrees) for k in keys})==len(keys)
+
+
+@pytest.mark.parametrize('support',(((float('nan'),.5),),((1.01,.5),),((.5,),)))
+def test_camera_fit_rejects_invalid_preservation_points_instead_of_dropping_them(support):
+    points={0:(.4,.4),1:(.6,.4),2:(.4,.6)}
+    with pytest.raises(ValueError,match='preservation'):
+        fit_review_anatomical_keys(points,points,requested_joints=(0,1,2),time_seconds=0.,required_visible_points=support)
+
+
+@pytest.mark.parametrize('maximum_candidates',(0,65,True))
+def test_camera_fit_requires_predeclared_finite_candidate_budget(maximum_candidates):
+    points={0:(.4,.4),1:(.6,.4),2:(.4,.6)}
+    with pytest.raises(ValueError,match='budget'):
+        fit_review_anatomical_keys(points,points,requested_joints=(0,1,2),time_seconds=0.,maximum_candidates=maximum_candidates)
 
 
 def faces(zoom=1.):

@@ -76,7 +76,7 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
         indices=None if shape is None else sorted({p[0] for p in shape})
         requests.append(indices)
         if indices is not None:known.update(indices)
-        if view is None:missing.append(tick)
+        if indices is None:missing.append(tick)
     body=len(known)>=4
     partial={0,1}<=known and bool(known&{2,3,4,5})
     # A known elbow/wrist cannot disappear into HEAD_ONLY simply because
@@ -84,20 +84,15 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
     # it is neither complete BODY nor automatic match/adoption authority.
     kind=('BODY' if body else 'PARTIAL_ACTION' if partial else
         'HEAD_ONLY' if head_only_declared and not missing and not (known&{2,3,4,5}) else 'UNKNOWN')
-    if body or partial:
-        # Preserve the explicit unknown slot. It cannot certify a head-only
-        # match, nor falsely assert a wrist was visible for a whole epoch.
-        by_unit={u:set() for u in units}
-        for unit,indices in zip(units,requests):
-            if indices is not None:by_unit[unit].update(indices)
-        # A body seen AFTER a different original shot cannot manufacture a
-        # visible wrist in an earlier genuine head-only shot. Detector loss
-        # WITHIN a known body shot still retains that shot's known requests.
-        requests=[sorted(by_unit[u]) if j is None else j for u,j in zip(units,requests)]
+    # Facts are time-specific. A known wrist at t+1 is not an observation of
+    # that wrist at t. The union keeps BODY/PARTIAL intent from downgrading to
+    # HEAD_ONLY, but no unknown anatomical slot is painted with that union.
     token=dict(contract='frozen_selected_original_motion_intent_v2',ticks=list(ticks),
         original_actor_identity=original_actor_identity,kind=kind,joint_requests=requests,
         known_joint_union=sorted(known),original_unmatched_ticks=missing,
         original_native_unit_keys=[list(u) for u in units],
+        original_anatomical_facts_by_tick=[dict(tick=t,observed=j or [],
+            unresolved=list(range(6)) if j is None else sorted(set(range(6))-set(j))) for t,j in zip(ticks,requests)],
         inferred_whole_arm_visibility_asserted=False,quality_approved=False)
     token['partial_action_is_complete_body']=False
     token['automatic_partial_action_adoption_permitted']=False
