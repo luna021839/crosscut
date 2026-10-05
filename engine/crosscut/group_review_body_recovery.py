@@ -100,6 +100,76 @@ def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None,minimum_na
     return FrozenReviewBodyWindow(json.dumps(value,sort_keys=True,allow_nan=False))
 
 
+def plan_partial_review_body_windows(raws, *, requested_ticks, native_signatures,
+        head_ids, minimum_native_head_pixels=32):
+    """Measure available occurrences; a missing slot must not erase its peers.
+
+    Split on the actual source/clock/file/camera run, not pose success. Unknown
+    actors are not interpolated. Every originally requested slot is retained
+    in the report, while only exact available native occurrences can be sent
+    to the auxiliary model. This does not complete a motion comparison.
+    """
+    ticks=tuple(requested_ticks);signatures=tuple(native_signatures)
+    if (not 2<=len(ticks)<=16 or len(raws)!=len(ticks) or len(head_ids)!=len(ticks)
+            or len(signatures)!=len(ticks)
+            or any(type(t) is not int or t<0 for t in ticks)
+            or any(a>=b for a,b in zip(ticks,ticks[1:]))):
+        raise ValueError('partial body scope needs its complete requested slot inventory')
+    slots=[];runs=[];current=[];previous=None
+    for tick,raw,head,signature in zip(ticks,raws,head_ids,signatures,strict=True):
+        if signature is not None:
+            if (len(signature)!=5 or type(signature[0]) is not int or signature[0]<0
+                    or type(signature[3]) is not int or signature[3]<0
+                    or type(signature[4]) is not int or signature[4]<0):
+                raise ValueError('partial body scope lost its actual native sampler address')
+            signature=tuple(signature)
+        if raw is not None:
+            expected=(raw['request_source_index'],raw['source_clock_identity'],
+                digest(raw['source_file_identity']))
+            if signature is None or signature[:3]!=expected or signature[4]!=raw['native_frame_index']:
+                raise ValueError('partial body slot borrowed another source/clock/file/native frame')
+        if head is not None and (raw is None or type(head) is not int or head<0):
+            raise ValueError('partial body slot invented an unobserved selected actor')
+        state='UNOBSERVED_NATIVE' if raw is None else 'UNRESOLVED_ACTOR' if head is None else 'AVAILABLE'
+        slots.append(dict(tick=tick,state=state,native_signature=signature,head_id=head))
+        # A known physical run may bridge a missing detector row; an unknown
+        # sampler address or an actual native cut may not be bridged.
+        connected=(signature is not None and previous is not None
+            and signature[:4]==previous[:4] and 0<=signature[4]-previous[4]<=12)
+        if not connected and current:
+            runs.append(current);current=[]
+        if signature is not None:current.append((tick,raw,head,signature))
+        previous=signature
+    if current:runs.append(current)
+    windows=[];unavailable=[]
+    for run in runs:
+        available={}
+        for tick,raw,head,signature in run:
+            if raw is None or head is None:continue
+            native=signature[4]
+            if native in available:
+                old_raw,old_head=available[native]
+                if old_head!=head or digest(old_raw)!=digest(raw):
+                    raise ValueError('partial body native aliases disagree about the actual actor or raster')
+            else:available[native]=(raw,head)
+        if len(available)<2:
+            unavailable.append(dict(ticks=[v[0] for v in run],reason='fewer_than_two_available_native_occurrences'))
+            continue
+        pairs=[available[n] for n in sorted(available)]
+        try:
+            window=freeze_review_body_window([v[0] for v in pairs],
+                native_camera_unit=run[0][3][3],head_ids=[v[1] for v in pairs],
+                minimum_native_head_pixels=minimum_native_head_pixels)
+        except ValueError as error:
+            unavailable.append(dict(ticks=[v[0] for v in run],reason=str(error)));continue
+        windows.append(window)
+    return tuple(windows),dict(requested_slots=slots,physical_run_count=len(runs),
+        available_native_window_count=len(windows),unavailable=unavailable,
+        missing_or_ambiguous_slots=[v['tick'] for v in slots if v['state']!='AVAILABLE'],
+        missing_actor_slots_interpolated=False,complete_motion_observation=False,
+        quality_approved=False)
+
+
 def bind_review_body_receipts(bundle):
     """Reject duplicate or foreign receipts; retain unsuccessful actual poses."""
     if (bundle.get('contract')!='bounded_actual_fixed_roi_body_review_receipts_v1'

@@ -4,7 +4,8 @@ import pytest
 
 from crosscut.group_review_body_recovery import (freeze_review_body_window,
     apply_review_body_receipt,apply_review_primary_joint_observation,
-    head_fingerprint,native_binding,consume_head_conditioned_review_support)
+    head_fingerprint,native_binding,consume_head_conditioned_review_support,
+    plan_partial_review_body_windows)
 from crosscut.body_pose_2d import RTMPOSE_BODY7_MODEL_SHA256
 from crosscut.group_performer_family_owner import digest
 from crosscut.group_review_camera_repair import FramingDescriptor
@@ -45,6 +46,59 @@ def test_freeze_keeps_all_prior_duplicate_boxes_and_does_not_claim_owner():
     assert len(result.payload['prior_body_roi_alternatives'])==4
     assert not result.payload['body_ownership_certified']
     assert not result.payload['roi_selection_inspected_new_pose'] and originals==saved
+
+
+def partial_scope(raws,*,units=None,heads=None,natives=None):
+    natives=list(range(10,10+len(raws))) if natives is None else natives
+    units=[0]*len(raws) if units is None else units
+    signatures=[(2,'clock',digest([1,2,3,4,5]),u,n) for u,n in zip(units,natives)]
+    return plan_partial_review_body_windows(raws,requested_ticks=tuple(range(100,100+len(raws))),
+        native_signatures=signatures,head_ids=[None if r is None else 7 for r in raws] if heads is None else heads)
+
+
+def test_three_missing_slots_do_not_discard_two_actual_body_occurrences():
+    originals=[None,None,raw(12),None,raw(14)];saved=deepcopy(originals)
+    windows,report=partial_scope(originals)
+    assert len(windows)==1
+    assert [v['binding']['native'] for v in windows[0].payload['requests']]==[12,14]
+    assert report['missing_or_ambiguous_slots']==[100,101,103]
+    assert len(report['requested_slots'])==5 and originals==saved
+    assert not report['missing_actor_slots_interpolated']
+    assert not report['complete_motion_observation'] and not report['quality_approved']
+
+
+def test_partial_body_recovery_splits_actual_camera_cuts_without_erasing_other_run():
+    windows,report=partial_scope([raw(10),raw(11),raw(12),None,raw(14)],units=[0,0,1,1,1])
+    assert [[v['binding']['native'] for v in w.payload['requests']] for w in windows]==[[10,11],[12,14]]
+    assert [w.payload['native_camera_unit'] for w in windows]==[0,1]
+    assert report['physical_run_count']==2 and report['missing_or_ambiguous_slots']==[103]
+
+
+def test_ambiguous_actor_is_not_completed_or_allowed_to_hide_other_occurrences():
+    windows,report=partial_scope([raw(10),raw(11),raw(12)],heads=[7,None,7])
+    assert [v['binding']['native'] for v in windows[0].payload['requests']]==[10,12]
+    assert report['requested_slots'][1]['state']=='UNRESOLVED_ACTOR'
+    assert report['missing_or_ambiguous_slots']==[101]
+
+
+def test_partial_body_native_alias_is_inferred_once_not_treated_as_motion():
+    a=raw(10)
+    windows,report=partial_scope([a,deepcopy(a),raw(11)],natives=[10,10,11])
+    assert len(windows[0].payload['requests'])==2
+    assert len(report['requested_slots'])==3 and not report['complete_motion_observation']
+    different=deepcopy(a);different['heads'][0]['box_xywh'][0]+=.01
+    with pytest.raises(ValueError,match='native aliases disagree'):
+        partial_scope([a,different,raw(11)],natives=[10,10,11])
+
+
+def test_partial_body_exact_sampler_and_actor_inventory_cannot_be_borrowed():
+    with pytest.raises(ValueError,match='another source/clock/file/native'):
+        partial_scope([raw(10),raw(12)])
+    with pytest.raises(ValueError,match='unobserved selected actor'):
+        partial_scope([None,raw(11)],heads=[7,7])
+    windows,report=partial_scope([raw(10),None,raw(12)],units=[0,1,2])
+    assert not windows and report['physical_run_count']==3
+    assert len(report['unavailable'])==3
 
 
 def test_actual_alternate_pose_can_restore_shape_without_rewriting_native_owner():

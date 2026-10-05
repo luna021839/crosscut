@@ -19,7 +19,9 @@ from .render import EditorialTransformKeyframe,EditorialTransformTrack
 def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joints=(0,1,2,3,4,5)):
     """Exploration evidence for visible anatomy; NOT complete action admission.
 
-    Missing joints keep explicit request IDs and a nonzero uncertainty cost.
+    Missing joints keep explicit request IDs and bounded cost intervals. Rank
+    by the fixed-inventory upper cost, not a donor's easier observed subset:
+    removing an inconvenient limb cannot improve its exploratory score.
     Velocity uses consecutive common measured samples only, never interpolation
     through occlusion. Normalizing shoulders removes framing, not body action.
     """
@@ -47,11 +49,15 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
     a,b=normalized;positions=[];velocities=[];directions=[]
     weights={j:.1 if j<2 else 1.5 if j in (4,5) else 1. for j in requested_joints}
     observed_articulation=0;known_weight=0.;error=0.
+    bounded_position=0.;bounded_velocity=0.;velocity_weight=0.
+    bounded_direction=0.;direction_weight=0.;articulated_velocity_requests=0
+    nonstationary_windows=0
     for t,pa,pb in zip(ticks,a,b):
         for j in requested_joints:
             if j not in pa or j not in pb:continue
             distance=math.dist(pa[j],pb[j]);weight=weights[j]
             error+=distance*weight;known_weight+=weight;observed_articulation+=j>=2
+            bounded_position+=weight*distance/(1.+distance)
             positions.append(dict(tick=t,joint=j,error=distance))
     for i in range(1,len(ticks)):
         dt=(ticks[i]-ticks[i-1])/fps
@@ -61,16 +67,41 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
             bv=tuple((b[i][j][k]-b[i-1][j][k])/dt for k in (0,1))
             an,bn=math.hypot(*av),math.hypot(*bv)
             velocity=math.dist(av,bv)/(1+max(an,bn));velocities.append(velocity)
-            if j>=2 and min(an,bn)>.05:
-                directions.append(1-max(-1.,min(1.,sum(x*y for x,y in zip(av,bv))/(an*bn))))
+            weight=weights[j];velocity_weight+=weight
+            bounded_velocity+=weight*math.dist(av,bv)/(1.+an+bn)
+            if j>=2:
+                articulated_velocity_requests+=1;direction_weight+=weight
+                nonstationary_windows+=max(an,bn)>.05
+                if min(an,bn)>.05:
+                    direction=(1-max(-1.,min(1.,sum(x*y for x,y in zip(av,bv))/(an*bn))))/2.
+                    directions.append(direction);bounded_direction+=weight*direction
+                # A stationary side has no defined direction. The measured
+                # speed discrepancy remains in velocity; do not invent one.
     expected=len(ticks)*sum(weights.values());coverage=known_weight/expected
-    score=None if observed_articulation<3 else error/max(known_weight,1e-9)+.25*(
-        sum(velocities)/len(velocities) if velocities else 1.)+.35*(
-        sum(directions)/len(directions) if directions else 0.)+.8*(1-coverage)
+    expected_velocity=(len(ticks)-1)*sum(weights.values())
+    expected_direction=(len(ticks)-1)*sum(w for j,w in weights.items() if j>=2)
+    def interval(loss,known,total):
+        if total<=0:return (0.,0.)
+        return (loss/total,(loss+max(0.,total-known))/total)
+    position_interval=interval(bounded_position,known_weight,expected)
+    velocity_interval=interval(bounded_velocity,velocity_weight,expected_velocity)
+    direction_interval=interval(bounded_direction,direction_weight,expected_direction)
+    score_interval=tuple(position_interval[i]+.25*velocity_interval[i]+.35*direction_interval[i]
+        for i in (0,1))
+    score=None if observed_articulation<3 or articulated_velocity_requests<2 else score_interval[1]
     return dict(contract='partial_actual_joint_trajectory_exploration_v1',
         state='UNMEASURED' if score is None else 'PARTIAL_OBSERVED_HYPOTHESIS',exploration_score=score,
         requested_ticks=list(ticks),requested_joint_indices=list(requested_joints),
         missing_joint_requests=missing,measured_position_requests=positions,coverage=coverage,
+        ranking_basis='fixed_requested_joint_time_upper_cost_not_observed_subset_mean',
+        exploratory_cost_interval=list(score_interval),
+        bounded_position_cost_interval=list(position_interval),
+        bounded_velocity_cost_interval=list(velocity_interval),
+        bounded_direction_cost_interval=list(direction_interval),
+        observed_subset_position_error=None if not known_weight else error/known_weight,
+        measured_articulated_velocity_requests=articulated_velocity_requests,
+        nonstationary_common_action_observed=bool(nonstationary_windows),
+        missing_cost_bounds_are_observations=False,
         measured_velocity_requests=len(velocities),expected_velocity_requests=(len(ticks)-1)*len(requested_joints),
         missing_imputed_as_zero=False,missing_joint_trajectory_interpolated=False,
         full_action_certified=False,actor_identity_certified=False,quality_approved=False)

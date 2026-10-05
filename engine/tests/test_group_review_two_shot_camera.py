@@ -183,6 +183,39 @@ def test_partial_trajectory_does_not_invent_motion_through_a_missing_wrist_frame
     assert not r['missing_joint_trajectory_interpolated']
 
 
+def test_erasing_badly_matching_wrists_cannot_improve_exploratory_rank():
+    left=[];right=[]
+    for i in range(5):
+        p={0:(.4,.4),1:(.6,.4),2:(.3,.6),3:(.7,.6),4:(.2+.01*i,.7),5:(.8-.01*i,.7)}
+        left.append(p);right.append(dict(p))
+        right[-1][4]=(.9-.01*i,.2);right[-1][5]=(.1+.01*i,.2)
+    measured=measure_review_partial_joint_trajectory(left,right,ticks=(10,11,12,13,14),fps=30.)
+    sparse=[{j:p for j,p in row.items() if j not in (4,5)} for row in right]
+    dropped=measure_review_partial_joint_trajectory(left,sparse,ticks=(10,11,12,13,14),fps=30.)
+    assert dropped['exploration_score']>=measured['exploration_score']
+    assert dropped['bounded_position_cost_interval'][1]>=measured['bounded_position_cost_interval'][1]
+    assert dropped['bounded_velocity_cost_interval'][1]>=measured['bounded_velocity_cost_interval'][1]
+    assert dropped['coverage']<measured['coverage'] and not dropped['missing_cost_bounds_are_observations']
+    assert dropped['ranking_basis']=='fixed_requested_joint_time_upper_cost_not_observed_subset_mean'
+
+
+def test_one_articulated_snapshot_is_not_a_measured_moving_trajectory():
+    p={0:(.4,.4),1:(.6,.4),2:(.3,.6),3:(.7,.6),4:(.2,.7),5:(.8,.7)}
+    rows=[{}, {},p,{},{}]
+    r=measure_review_partial_joint_trajectory(rows,rows,ticks=(10,11,12,13,14),fps=30.)
+    assert r['exploration_score'] is None and r['state']=='UNMEASURED'
+    assert r['measured_articulated_velocity_requests']==0
+    assert r['exploratory_cost_interval'][1]>0 and not r['quality_approved']
+
+
+def test_complete_same_motion_has_zero_cost_interval_not_unknown_reward():
+    rows=[{0:(.4,.4),1:(.6,.4),2:(.3,.6),3:(.7,.6),4:(.2+.01*i,.7),5:(.8-.01*i,.7)} for i in range(5)]
+    r=measure_review_partial_joint_trajectory(rows,rows,ticks=(10,11,12,13,14),fps=30.)
+    assert r['exploratory_cost_interval']==pytest.approx((0.,0.))
+    assert r['coverage']==1 and r['nonstationary_common_action_observed']
+    assert not r['full_action_certified'] and not r['actor_identity_certified']
+
+
 def test_coupled_focal_destination_is_optimized_instead_of_forcing_dead_center():
     a=dict(center=(.46856,.71637),width=.09,height=.16212)
     b=dict(center=(.70774,.68049),width=.08,height=.14114)
