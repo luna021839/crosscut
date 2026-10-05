@@ -56,7 +56,8 @@ def freeze_review_known_joint_duty(original_views,*,original_actor_inventory_ide
         shape=None if v is None else v['descriptor'].pose_shape
         known=sorted({p[0] for p in shape or ()})
         rows.append(dict(tick=tick,original_state='OBSERVED' if known else 'UNRESOLVED',
-            original_actor_state='UNRESOLVED' if v is None or v.get('reacquisition_ambiguous',False) else 'OBSERVED',
+            original_actor_state='UNRESOLVED' if v is None or v.get('reacquisition_ambiguous',False)
+                or v.get('original_role') in ('required_formation','observed_body_composition') else 'OBSERVED',
             original_occurrence_identity=None if v is None else digest(dict(
                 raw=v['row']['native_observation'],head=v['descriptor'].frame_local_head_id)),
             known_joint_indices=known,unresolved_joint_indices=sorted(set(range(6))-set(known)),

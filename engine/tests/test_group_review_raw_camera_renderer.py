@@ -12,8 +12,8 @@ from crosscut.group_performer_family_owner import digest
 from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
 
 
-def setup():
-    context,domain=fixture();old=context.incumbent.render_plan
+def setup(fps=30.):
+    context,domain=fixture(fps=fps);old=context.incumbent.render_plan
     camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.4),),reason='preselection_only')
     plan=realize_interval_in_plan(old,10,20,camera=camera)
     queries=compile_common_clock_camera_queries(context=context,domain=domain,
@@ -65,8 +65,9 @@ def test_post_selection_program_or_camera_slicing_cannot_be_hidden():
             session=session,native_row_for_query=row,expected_program_identity=digest(plan.to_json()))
 
 
-def test_distinct_canonical_rasters_keep_every_ordinal_and_replay_identically():
-    plan,queries,session,row=setup()
+@pytest.mark.parametrize('fps',(30.,30000/1001))
+def test_distinct_canonical_rasters_keep_every_ordinal_and_replay_identically(fps):
+    plan,queries,session,row=setup(fps)
     indices=[queries[t].sample_at(t)[2] for t in range(10,20)]
     ordinal={n:i for i,n in enumerate(indices)}
     assert len(ordinal)==10

@@ -84,6 +84,9 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
     # it is neither complete BODY nor automatic match/adoption authority.
     kind=('BODY' if body else 'PARTIAL_ACTION' if partial else
         'HEAD_ONLY' if head_only_declared and not missing and not (known&{2,3,4,5}) else 'UNKNOWN')
+    original_roles=[None if v is None else v.get('original_role') for v in reference]
+    composite=any(role in ('required_formation','observed_body_composition') for role in original_roles)
+    if composite:kind='UNKNOWN'
     # Facts are time-specific. A known wrist at t+1 is not an observation of
     # that wrist at t. The union keeps BODY/PARTIAL intent from downgrading to
     # HEAD_ONLY, but no unknown anatomical slot is painted with that union.
@@ -91,6 +94,8 @@ def freeze_selected_review_motion_intent(reference, *, requested_ticks,original_
         original_actor_identity=original_actor_identity,kind=kind,joint_requests=requests,
         known_joint_union=sorted(known),original_unmatched_ticks=missing,
         original_native_unit_keys=[list(u) for u in units],
+        independently_original_subject_roles=original_roles,
+        composition_geometry_is_single_actor_motion_intent=False,
         original_anatomical_facts_by_tick=[dict(tick=t,observed=j or [],
             unresolved=list(range(6)) if j is None else sorted(set(range(6))-set(j))) for t,j in zip(ticks,requests)],
         inferred_whole_arm_visibility_asserted=False,quality_approved=False)

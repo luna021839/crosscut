@@ -99,7 +99,8 @@ def original_actor_relation_request(tick,view,*,relation='CONTINUE_KNOWN_ORIGINA
         handoff_declaration_identity=None,handoff_declaration=None):
     if view is not None and view['row']['output_tick']!=tick:
         raise ValueError('original actor relation borrowed another instant')
-    if not review_actor_association_valid(view):
+    if (not review_actor_association_valid(view) or view.get('original_role') in
+            ('required_formation','observed_body_composition')):
         return dict(tick=tick,relation='UNRESOLVED',original_actor_known=False,
             original_occurrence_identity=None,original_vector=None)
     return dict(tick=tick,relation=relation,original_actor_known=True,

@@ -94,6 +94,16 @@ def test_part_visibility_is_per_tick_not_whole_arm_for_whole_window():
     assert compare(a,deepcopy(a))['same_time_action_supported']
 
 
+def test_composition_head_geometry_is_not_unique_original_focal_motion_intent():
+    a=[dict(view(t,t*.1),original_role='observed_body_composition') for t in TICKS]
+    frozen=intent(a)
+    assert frozen.payload['kind']=='UNKNOWN'
+    assert frozen.payload['known_joint_union']==[0,1,2,3]
+    assert not frozen.payload['composition_geometry_is_single_actor_motion_intent']
+    result=compare_frozen_review_motion_route(a,deepcopy(a),fps=30.,intent=frozen,route=route())
+    assert not result['same_time_action_supported']
+
+
 def test_selected_middle_reacquisition_ambiguity_cannot_certify_equal_pose():
     a=[view(t,t*.1) for t in TICKS];b=deepcopy(a)
     b[2]['reacquisition_ambiguous']=True

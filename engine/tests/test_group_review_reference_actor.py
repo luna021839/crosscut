@@ -116,3 +116,43 @@ def test_existing_ambiguous_original_seed_cannot_be_overwritten_by_new_associati
     selected,receipt=freeze(frames)
     assert all(v['reacquisition_ambiguous'] for v in selected.values())
     assert receipt['groups'][0]['seed_attention_ambiguous']
+
+
+def test_composition_retains_every_original_actor_without_inventing_unique_focal_intent():
+    from crosscut.group_review_actor_relation import original_actor_relation_request
+    frames={t:[view(t,0,10+t),view(t,1,20+t,center=.8)] for t in range(3)}
+    selected,receipt=freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+        original_program_identity='original',original_roles_by_tick={t:'observed_body_composition' for t in frames})
+    group=receipt['groups'][0]
+    assert len(group['independent_original_head_hypotheses'])==6
+    assert not group['unique_focal_intent_certified'] and not group['composition_role_is_single_actor_intent']
+    assert all(not v['original_attention_hypothesis_is_focal_duty'] for v in selected.values())
+    assert original_actor_relation_request(1,selected[1])['relation']=='UNRESOLVED'
+
+
+def test_original_role_change_is_separate_attention_epoch_not_a_fake_native_cut():
+    frames={t:[view(t,0,10+t)] for t in range(4)}
+    selected,receipt=freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+        original_program_identity='original',original_roles_by_tick={t:'observed_body_composition' if t<2 else 'focal_head' for t in frames})
+    assert len(receipt['groups'])==2
+    assert selected[2]['original_attention_hypothesis_is_focal_duty']
+    assert not selected[1]['original_attention_hypothesis_is_focal_duty']
+    assert not receipt['attention_scopes_are_physical_camera_cuts']
+
+
+def test_original_roles_cannot_be_filled_from_donor_success():
+    frames={0:[view(0,0,7)],1:[view(1,0,8)]}
+    for roles in ({0:'focal_head'},{0:'best_donor',1:'focal_head'}):
+        with pytest.raises(ValueError,match='roles'):
+            freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+                original_program_identity='original',original_roles_by_tick=roles)
+
+
+def test_larger_foreground_focal_alternative_is_not_erased_by_background_centrality():
+    frames={t:[view(t,0,10+t),view(t,1,20+t,center=.72,height=.36)] for t in range(3)}
+    selected,receipt=freeze_original_review_actor_inventory(frames,native_units={t:UNIT for t in frames},
+        original_program_identity='original',original_roles_by_tick={t:'focal_head' for t in frames})
+    assert all(v['reacquisition_ambiguous'] for v in selected.values())
+    assert receipt['groups'][0]['seed_attention_rivals'][0]['independently_original_focal_area_rival']
+    assert len(receipt['groups'][0]['independent_original_head_hypotheses'])==6
+    assert not receipt['focal_area_rival_ratio_is_identity_certificate']
