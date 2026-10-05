@@ -124,6 +124,36 @@ def test_temporal_corridor_does_not_soften_an_illegal_locked_action_anchor():
     assert track is None and receipt['frame_index']==0
 
 
+def test_temporal_corridor_can_pan_to_a_descending_hand_without_zooming_out_and_back():
+    keys=tuple(EditorialTransformKeyframe(i/30.,1.65,.65,.65) for i in range(13))
+    points=[[(.70,.65),(.62,.90+.095*math.sin(math.pi*i/12))] for i in range(13)]
+    track,receipt=fit_review_temporal_camera_corridor(keys,observed_points_by_frame=points,
+        locked_indices=(0,12),fps=30.)
+    assert track and min(k.zoom for k in track.keyframes)>1.60
+    assert max(k.center_y for k in track.keyframes)>.68
+    assert receipt['support_constrained_pan_is_distinct_from_zoom_release']
+    assert receipt['second_order_camera_path'] and receipt['maximum_states_per_frame']<=14
+    assert receipt['maximum_log_zoom_step']<.03
+    for k,support in zip(track.keyframes,points):
+        assert all(all(-1e-9<=v<=1+1e-9 for v in project_review_editorial_point(p,k)) for p in support)
+    assert not receipt['quality_approved']
+
+
+def test_actual_single_frame_support_does_not_force_a_one_frame_pan_impulse():
+    keys=tuple(EditorialTransformKeyframe(i/30.,1.65,.65,.65) for i in range(13))
+    points=[[(.70,.65),(.62,.90)] for _ in keys];points[6]=[(.70,.65),(.62,.995)]
+    track,receipt=fit_review_temporal_camera_corridor(keys,observed_points_by_frame=points,
+        locked_indices=(0,12),fps=30.)
+    assert track and all(k.zoom==1.65 for k in track.keyframes)
+    assert receipt['selected_camera_path_family']=='continuous_fixed_authored_zoom_pan'
+    assert receipt['maximum_camera_vector_second_difference']<.01
+    assert track.keyframes[5].center_y>keys[5].center_y
+    assert not receipt['continuous_pan_proposal']['anatomical_observations_interpolated']
+    assert not receipt['continuous_pan_proposal']['unknown_support_filled']
+    for k,support in zip(track.keyframes,points):
+        assert all(all(-1e-9<=v<=1+1e-9 for v in project_review_editorial_point(p,k)) for p in support)
+
+
 def test_partial_trajectory_keeps_occlusion_missing_not_a_perfect_action_match():
     points={0:(.4,.4),1:(.6,.4),3:(.65,.65),5:(.7,.7)}
     rows=[dict(points,**{}) for _ in range(5)]
@@ -168,3 +198,31 @@ def test_coupled_focal_destination_is_optimized_instead_of_forcing_dead_center()
     for ka,kb,receipt in new:
         assert all(all(0<=v<=1 for v in project_review_editorial_point(p,k))
             for k,points in ((ka,pa),(kb,pb)) for p in points.values())
+
+
+def test_face_anchor_family_does_not_let_viewpoint_changed_arms_drag_the_face_match():
+    a=dict(center=(.51,.61),width=.09,height=.172)
+    b=dict(center=(.71,.68),width=.08,height=.141)
+    pa={0:(.606,.726),1:(.470,.739),2:(.632,.951),3:(.409,.935)}
+    pb={0:(.745,.824),1:(.637,.817),2:(.755,.967),3:(.601,.989),5:(.581,.849)}
+    def fit(**extra):
+        return fit_review_coupled_boundary_keys(left_head=a,right_head=b,left_joint_points=pa,right_joint_points=pb,
+            left_required_visible_points=(),right_required_visible_points=(pb[5],),**extra)
+    old=fit(camera_fit_bases=('face_and_body',));new=fit()
+    assert old and new and new[0][2]['geometry_score']<=old[0][2]['geometry_score']
+    assert new[0][2]['projected_head_center_error']<.01
+    assert new[0][2]['measured_common_joint_indices']==[0,1,2,3]
+    assert new[0][2]['missing_joint_requests']=={'left':[4,5],'right':[4]}
+    assert not new[0][2]['body_requests_removed_to_fit_face']
+    assert not new[0][2]['quality_approved']
+    for _,right,receipt in new:
+        assert all(0<=v<=1 for v in project_review_editorial_point(pb[5],right))
+        assert receipt['camera_pair_count']<=receipt['maximum_geometric_camera_pairs']
+
+
+def test_coupled_family_does_not_spend_its_recipe_budget_on_float_noise_duplicates():
+    options=fit_review_coupled_boundary_keys(left_head=dict(center=(.51,.61),width=.09,height=.172),
+        right_head=dict(center=(.71,.68),width=.08,height=.141),left_joint_points={},right_joint_points={})
+    tokens=[tuple(round(v,10) for k in (a,b) for v in (k.zoom,k.center_x,k.center_y,k.roll_degrees))
+        for a,b,_ in options]
+    assert len(tokens)==len(set(tokens))
