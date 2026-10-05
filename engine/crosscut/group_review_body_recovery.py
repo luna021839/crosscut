@@ -216,7 +216,7 @@ def apply_review_body_receipt(view,receipt,*,project_point,expected_window):
     if primary is None:
         result['review_body_recovery_state']='CONFLICTING_OR_MISSING_KNOWN_PRIMARY_BODY';return result
     combined=[tuple(p) for p in points]
-    provenance={i:dict(basis='FIXED_ROI_NATIVE_MODEL',receipt_sha256=digest(receipt),
+    provenance={i:dict(basis='FIXED_ROI_NATIVE_MODEL',receipt_sha256=digest(receipt),raw_parent_sha256=digest(raw),
         model_confidence=p[2],xy_native=list(p[:2])) for i,p in enumerate(points[:6])
         if p[2]>=.42 and all(0<=v<1 for v in p[:2])}
     for i,p in primary.items():

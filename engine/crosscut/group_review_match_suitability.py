@@ -150,6 +150,8 @@ def evaluate_review_diagnostic_encode_permission(*,policy,appearance_cosine,mutu
             or appearance_cosine<p['minimum_appearance_cosine']):
         return dict(result,state='NOT_PERMITTED',reason='independent_identity_or_known_adversary_failed')
     kind=motion.get('intent_kind')
+    if original_known_duty_state!='PASS' or actor_relation_state!='PASS':
+        return dict(result,state='NOT_PERMITTED',reason='original_known_or_actor_relation_duty_not_passed')
     partial=False
     if kind=='PARTIAL_ACTION':
         from .group_review_declared_action import FrozenReviewActionDeclaration
@@ -160,8 +162,7 @@ def evaluate_review_diagnostic_encode_permission(*,policy,appearance_cosine,mutu
             and motion.get('declared_action_schema')==partial_action_declaration.payload['schema']
             and motion.get('complete_on_declared_basis') is True
             and motion.get('full_BODY_contract_complete') is False
-            and motion.get('all_declared_comparison_velocity_windows_measured') is True
-            and original_known_duty_state=='PASS' and actor_relation_state=='PASS')
+            and motion.get('all_declared_comparison_velocity_windows_measured') is True)
     if (kind=='BODY' and p['action_kind']!='BODY' or kind!='BODY' and not partial
             or motion.get('same_time_action_supported') is not True
             or not _finite(motion.get('exploration_cost'))

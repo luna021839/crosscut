@@ -2,7 +2,7 @@ from dataclasses import replace
 import pytest
 from engine.tests.test_scene_owned_program import fixture
 from crosscut.group_review_interval_compile import (clip_review_segments,assemble_review_intervals,
-    shifted_review_source_plan,realize_interval_in_plan,verify_realized_sampler)
+    shifted_review_source_plan,realize_interval_in_plan,verify_realized_sampler,cover_review_sampling_interval)
 from crosscut.group_review_edit_program import own_review_edit_program
 from crosscut.group_scene_owned_program import freeze_owned_scene_program
 from crosscut.render_boundary_clock import native_frame_clocks_for_output
@@ -90,3 +90,32 @@ def test_raster_only_contract_still_rejects_a_changed_native_frame():
     with pytest.raises(ValueError,match='selected source/native'):
         verify_realized_sampler(plan,candidate,domain,range(plan.output_frame_count),
             require_source_request_time=False)
+
+
+def test_counterfactual_window_cover_does_not_create_one_frame_render_cells_or_move_real_edit():
+    context,domain=fixture();plan=context.incumbent.render_plan
+    assert cover_review_sampling_interval(plan,31,59)==(30,60)
+    assert cover_review_sampling_interval(plan,30,60)==(30,60)
+    first,end=cover_review_sampling_interval(plan,29,31)
+    assert (first,end)==(0,60)
+    pieces=clip_review_segments(plan,first,end)
+    assert all(s.duration*plan.fps>=2 for s in pieces)
+    with pytest.raises(ValueError,match='one-frame'):clip_review_segments(plan,0,31)
+
+
+def test_sliced_fractional_duration_cell_uses_the_original_shared_render_clock():
+    from crosscut.render import RenderSegment,RenderTransition
+    context,domain=fixture(fps=29.97)
+    plan=replace(context.incumbent.render_plan,segments=(
+        RenderSegment(0,.009,1.005,0.),RenderSegment(0,1.014,1.005,1.005)),
+        transitions=(RenderTransition(tier='D'),))
+    camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),),reason='fixed_preselection')
+    candidate=realize_interval_in_plan(plan,40,50,camera=camera)
+    result=verify_realized_sampler(plan,candidate,domain,range(plan.output_frame_count),
+        require_source_request_time=False)
+    assert result['actual_native_rasters_preserved']
+    # The authored second cell starts at 1.014s, but its source raster clock
+    # begins after 30 quantized ticks of the shared first cell, not 1.005s.
+    requested=native_frame_clocks_for_output(plan,domain.clocks_by_request,(40,))[40]
+    selected=next(s for s in candidate.segments if abs(s.master_start-(1.005+10/29.97))<1e-8)
+    assert selected.source_start==pytest.approx(requested.source_request_seconds)

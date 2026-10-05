@@ -24,6 +24,7 @@ def fixture(*,old=(10,),new=(10,12),same=()):
                 CONTINUOUS_CAMERA_EDIT='CAMERA_CONTINUITY_SUPPORTED')[r['kind']]
             receipt.update(verdict=verdict,motion_policy_identity='9'*64,
                 same_time_action_supported=True,independent_suitability_passed=True,
+                candidate_comparison_basis=m.payload['comparison_basis'],
                 original_motion_cost=.3,candidate_motion_cost=.2,frozen_nonregression_tolerance=0.,
                 actual_sampler_continuity_verified=True)
         receipts.append(receipt)
@@ -147,6 +148,7 @@ def supported_fixture(*,known=False):
                 original_motion_inventory_identity=inventory.identity,
                 original_motion_measurement_evidence_identity=str(request['tick']%10)*64,
                 original_motion_cost=.3 if known else None,candidate_motion_cost=.2,
+                candidate_comparison_basis=inventory.payload['rows'][0]['comparison_basis'],
                 frozen_nonregression_tolerance=0.,motion_policy_identity='9'*64,
                 candidate_motion_intent_kind='BODY',candidate_complete_body_observation=True,
                 candidate_motion_evidence_identity='6'*64,same_time_action_supported=True,
@@ -232,3 +234,10 @@ def test_partial_candidate_cost_cannot_compare_with_known_full_body_cost():
     basis['requested_joint_indices']=[0,1,2,3];r['candidate_comparison_basis']=basis
     with pytest.raises(ValueError,match='different sealed anatomical basis'):
         decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c,protected_reference_verification=p)
+
+
+def test_omitted_candidate_basis_is_not_same_basis_evidence():
+    m,rows,c=fixture();r=next(r for r in rows if r.get('kind')=='REPLACED_CUT')
+    r.pop('candidate_comparison_basis',None)
+    with pytest.raises(ValueError,match='candidate.*basis'):
+        decide_keyed_review_adoption(manifest=m,receipts=rows,comparison=c)

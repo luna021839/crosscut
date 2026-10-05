@@ -6,6 +6,7 @@ turn a body comparison into a head comparison. This is a review hypothesis,
 not named identity, normal app admission or expert-quality certification.
 """
 from dataclasses import dataclass
+from collections.abc import Mapping
 import json
 import math
 import numpy as np
@@ -133,7 +134,7 @@ def same_native_review_continuation(outgoing,incoming,*,expected_native_addresse
         editorial_camera_continuity_certified=False)
 
 
-def freeze_review_native_motion_route(*,ticks,boundary_tick,left_native,right_native):
+def _native_motion_route_payload(*,ticks,boundary_tick,left_native,right_native):
     """Choose FULL/PAST/FUTURE from actual native units, never a low-error slice.
 
     Each signature is (source, clock, source-file token, native camera unit,
@@ -163,12 +164,52 @@ def freeze_review_native_motion_route(*,ticks,boundary_tick,left_native,right_na
     elif continuous(right_native,future) and continuous(left_native,all_indices):
         route='FUTURE_COMMON_OUTGOING_CONTINUES';indices=future;continuation='left'
     else:route='ACTUAL_ONLY_UNRESOLVED';indices=();continuation=None
-    return dict(contract='native_event_frozen_motion_route_v1',route=route,
+    value=dict(contract='native_event_frozen_motion_route_v2',route=route,
         boundary_tick=boundary_tick,requested_ticks=list(ticks),comparison_indices=list(indices),
         continuation_side=continuation,continuation_indices=list(all_indices) if continuation else [],
         left_native=[None if r is None else list(r) for r in left_native],
         right_native=[None if r is None else list(r) for r in right_native],
         route_selected_from_pose_errors=False,quality_approved=False)
+    # Common-time requests, crossing continuation and actual output coverage
+    # are distinct. Canonical indices cannot be shortened after scoring.
+    root=digest(value)
+    value['position_requests']=[dict(tick=ticks[i],index=i,
+        request_id=digest((root,'position',ticks[i]))) for i in indices]
+    value['velocity_requests']=[dict(first_tick=ticks[a],last_tick=ticks[b],
+        first_index=a,last_index=b,request_id=digest((root,'velocity',ticks[a],ticks[b])))
+        for a,b in zip(indices,indices[1:])]
+    value['output_coverage_requests']=[dict(tick=t,side='left' if t<boundary_tick else 'right',
+        request_id=digest((root,'actual-output',t))) for t in ticks]
+    return value
+
+
+@dataclass(frozen=True,slots=True)
+class FrozenReviewNativeMotionRoute(Mapping):
+    token_json:str
+
+    def __post_init__(self):
+        p=self.payload
+        try:canonical=_native_motion_route_payload(ticks=p['requested_ticks'],
+            boundary_tick=p['boundary_tick'],left_native=p['left_native'],right_native=p['right_native'])
+        except (KeyError,TypeError,IndexError) as error:
+            raise ValueError('native route is missing its exact physical request inventory') from error
+        if p!=canonical:raise ValueError('native route changed its canonical comparison/continuation requests')
+
+    @property
+    def payload(self):return json.loads(self.token_json)
+
+    @property
+    def identity(self):return digest(self.payload)
+
+    def __getitem__(self,key):return self.payload[key]
+    def __iter__(self):return iter(self.payload)
+    def __len__(self):return len(self.payload)
+
+
+def freeze_review_native_motion_route(*,ticks,boundary_tick,left_native,right_native):
+    return FrozenReviewNativeMotionRoute(json.dumps(_native_motion_route_payload(ticks=ticks,
+        boundary_tick=boundary_tick,left_native=left_native,right_native=right_native),
+        sort_keys=True,allow_nan=False))
 
 
 def compare_frozen_review_motion_route(left,right, *, fps,intent,route):
@@ -181,12 +222,26 @@ def compare_frozen_review_motion_route(left,right, *, fps,intent,route):
     if not isinstance(intent,FrozenReviewMotionIntent) or not math.isfinite(fps) or fps<=0:
         raise ValueError('motion route needs a frozen original intent and finite clock')
     token=intent.payload;ticks=tuple(token['ticks'])
-    if (len(left)!=len(ticks) or len(right)!=len(ticks)
-            or route.get('contract')!='native_event_frozen_motion_route_v1'
+    if (not isinstance(route,FrozenReviewNativeMotionRoute)
+            or len(left)!=len(ticks) or len(right)!=len(ticks)
             or tuple(route.get('requested_ticks',()))!=ticks):
         raise ValueError('motion consumer changed its frozen route/request inventory')
+    # Inspect every supplied physical observation, not just a favourable
+    # comparison slice. A missing view remains missing; a borrowed view is a
+    # contract error before its cost can be consumed.
+    for side,views in (('left',left),('right',right)):
+        for tick,view,expected in zip(ticks,views,route[side+'_native']):
+            if view is None:continue
+            raw=view['row']['native_observation']
+            actual=[raw['request_source_index'],raw['source_clock_identity'],
+                digest(raw['source_file_identity']),view.get('native_camera_unit_index'),raw['native_frame_index']]
+            if view['row']['output_tick']!=tick or actual!=expected:
+                raise ValueError('motion route borrowed another actual native source/clock/file/unit/frame')
     result=dict(contract='selected_native_common_time_motion_evidence_v2',state='INCONCLUSIVE',
-        route=route['route'],intent_identity=intent.identity,intent_kind=token['kind'],
+        route=route['route'],route_identity=route.identity,
+        position_request_ids=[r['request_id'] for r in route['position_requests']],
+        velocity_request_ids=[r['request_id'] for r in route['velocity_requests']],
+        intent_identity=intent.identity,intent_kind=token['kind'],
         exploration_cost=None,trajectory_error=None,velocity_error=None,direction_error=None,
         same_time_action_supported=False,body_motion_certified=False,quality_approved=False,
         actual_cut_tangent_penalizes_natural_turn=False)

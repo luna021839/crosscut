@@ -1,0 +1,146 @@
+"""Declared anatomical motion in the actual registered output camera.
+
+Native shoulder-normalized motion and projected screen connection are different
+measurements. This consumer uses owned native joint provenance and the complete
+registered crop/pan/zoom/roll, never a normalized pose pretending to be pixels.
+"""
+import math
+import numpy as np
+from .group_performer_family_owner import digest
+from .group_scene_camera_queries import GroupSceneRoleQuery
+from .group_source_changing_owner import project_point,_base_box
+from .render import EditorialTransformKeyframe,minimum_roll_safe_zoom
+from .group_review_camera_repair import project_review_editorial_point
+from .group_review_motion_contract import FrozenReviewNativeMotionRoute
+from .group_review_declared_action import FrozenReviewActionDeclaration
+
+
+def project_observed_review_joints(view,query,tick):
+    if not isinstance(query,GroupSceneRoleQuery):raise ValueError('projected action needs the registered complete camera')
+    if view is None:return {}
+    row=view['row'];raw=row['native_observation'];_,_,native=query.sample_at(tick)
+    query_id=row['query'].get('registered_query_sha256',digest(row['query']))
+    if (row['output_tick']!=tick or query_id!=query.key
+            or raw['native_frame_index']!=native or raw['source_clock_identity']!=query.source_clock_identity
+            or row['projection']['camera_sha256']!=query.camera.key):
+        raise ValueError('projected joint evidence borrowed another actual camera/native sample')
+    points={}
+    for index,p in view.get('review_joint_provenance',{}).items():
+        index=int(index)
+        if (not 0<=index<6 or p.get('raw_parent_sha256')!=digest(raw)
+                or p.get('basis') not in ('PRIMARY_NATIVE_MODEL','FIXED_ROI_NATIVE_MODEL')
+                or type(p.get('model_confidence')) not in (int,float)
+                or not math.isfinite(p['model_confidence']) or p['model_confidence']<.42):
+            raise ValueError('projected anatomical evidence lost its actual native parent/provenance')
+        if p['basis']=='FIXED_ROI_NATIVE_MODEL' and p.get('receipt_sha256')!=view.get('review_body_receipt_sha256'):
+            raise ValueError('projected anatomical evidence borrowed another actual fixed-ROI receipt')
+        xy=p.get('xy_native')
+        if (not isinstance(xy,(list,tuple)) or len(xy)!=2
+                or any(type(v) not in (int,float) or not math.isfinite(v) for v in xy)):
+            raise ValueError('projected action cannot reconstruct pixels from normalized shape alone')
+        segment,phase,_=query.sample_at(tick)
+        base_xy=_base_box((*xy,0.,0.),segment,phase)[:2]
+        # A pan after the base crop cannot recover a removed native pixel.
+        if not all(0<=v<=1 for v in base_xy):continue
+        points[index]=tuple(float(v) for v in project_point(xy,query,tick))
+    return points
+
+
+def measure_review_projected_action(left,right,*,left_queries,right_queries,fps,declaration,route):
+    if (not isinstance(declaration,FrozenReviewActionDeclaration)
+            or not isinstance(route,FrozenReviewNativeMotionRoute)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0):
+        raise ValueError('projected action needs independently sealed requests and a finite output clock')
+    ticks=declaration.payload['ticks'];joints=declaration.payload['requested_joint_indices']
+    if (route['requested_ticks']!=ticks or len(left)!=len(ticks) or len(right)!=len(ticks)
+            or set(left_queries)!=set(ticks) or set(right_queries)!=set(ticks)):
+        raise ValueError('projected action omitted or changed its frozen request inventory')
+    result=dict(contract='actual_registered_camera_anatomical_action_evidence_v1',state='UNKNOWN',
+        declaration_identity=declaration.identity,route_identity=route.identity,
+        units='normalized_output_width_aspect_corrected_position_relative_velocity_v1',
+        position_request_ids=[r['request_id'] for r in route['position_requests']],
+        velocity_request_ids=[r['request_id'] for r in route['velocity_requests']],
+        projected_position_error=None,projected_velocity_error=None,projected_action_error=None,
+        complete_on_declared_basis=False,quality_approved=False)
+    if not route['comparison_indices']:return result
+    points=[];bindings=[];missing=[];outside=[]
+    for side,views,queries in (('left',left,left_queries),('right',right,right_queries)):
+        values={}
+        for i in route['comparison_indices']:
+            t=ticks[i];v=views[i];q=queries[t];expected=route[side+'_native'][i]
+            if v is not None:
+                raw=v['row']['native_observation']
+                actual=[raw['request_source_index'],raw['source_clock_identity'],digest(raw['source_file_identity']),
+                    v.get('native_camera_unit_index'),raw['native_frame_index']]
+                if actual!=expected:raise ValueError('projected action borrowed another frozen native route')
+            xy=project_observed_review_joints(v,q,t);values[i]=xy
+            for joint in joints:
+                if joint not in xy:missing.append((side,t,joint))
+                elif any(not math.isfinite(n) or not 0<=n<=1 for n in xy[joint]):outside.append((side,t,joint))
+            bindings.append(dict(side=side,tick=t,registered_query_identity=q.key,
+                native_parent=None if v is None else digest(v['row']['native_observation']),
+                selected_head=None if v is None else v['descriptor'].frame_local_head_id,
+                anatomical_provenance_identity=None if v is None else v.get('review_joint_evidence_identity'),
+                projected_points={str(k):list(p) for k,p in xy.items()}))
+        points.append(values)
+    result['actual_projected_input_identity']=digest(bindings)
+    result['actual_projected_inputs']=bindings
+    if missing or outside:return dict(result,state='FAIL' if outside else 'UNKNOWN',
+        missing_declared_joint_requests=missing,outside_output_joint_requests=outside)
+    aspect=np.asarray((1.,9/16));indices=route['comparison_indices']
+    a,b=[np.asarray([[values[i][j] for j in joints] for i in indices])*aspect for values in points]
+    dt=np.diff([ticks[i]/fps for i in indices]);av,bv=np.diff(a,axis=0)/dt[:,None,None],np.diff(b,axis=0)/dt[:,None,None]
+    position=float(np.linalg.norm(a-b,axis=2).mean())
+    an,bn=np.linalg.norm(av,axis=(1,2)),np.linalg.norm(bv,axis=(1,2))
+    velocity=float((np.linalg.norm(av-bv,axis=(1,2))/(1.+np.maximum(an,bn))).mean())
+    return dict(result,state='MEASURED',projected_position_error=position,projected_velocity_error=velocity,
+        projected_action_error=2.*position+velocity,complete_on_declared_basis=True,
+        requested_joint_positions=2*len(indices)*len(joints),
+        requested_velocity_windows=len(indices)-1,measured_velocity_windows=len(dt))
+
+
+def fit_review_anatomical_key(source_points,target_points,*,requested_joints,time_seconds,
+        maximum_zoom=2.,maximum_roll_degrees=1.6):
+    """Bounded screen-space similarity fit, not a warp or missing-joint fill.
+
+    The caller chooses the full joint basis BEFORE fitting. Targets are actual
+    original entry/exit or actual donor/donor same-time anatomy, not face-only
+    centers. Legal pan and scale bounds are renderer bounds, not pose scores.
+    """
+    joints=tuple(requested_joints)
+    if (joints!=tuple(sorted(set(joints))) or len(joints)<3
+            or not 1<=maximum_zoom<=2 or not 0<=maximum_roll_degrees<=1.6):
+        raise ValueError('anatomical camera fit needs its predeclared bounded joint basis')
+    if any(j not in source_points or j not in target_points for j in joints):return None
+    aspect=np.asarray((1.,9/16));a=np.asarray([source_points[j] for j in joints])*aspect
+    b=np.asarray([target_points[j] for j in joints])*aspect
+    if not np.isfinite(a).all() or not np.isfinite(b).all():return None
+    ac,bc=a.mean(axis=0),b.mean(axis=0);aa,bb=a-ac,b-bc
+    energy=float(np.sum(aa*aa))
+    if energy<=1e-12:return None
+    dot=float(np.sum(aa*bb));cross=float(np.sum(aa[:,0]*bb[:,1]-aa[:,1]*bb[:,0]))
+    angle=max(-maximum_roll_degrees,min(maximum_roll_degrees,math.degrees(math.atan2(cross,dot))))
+    center=np.asarray((.5,.5))*aspect
+    # The unconstrained similarity optimum may show a black corner or exceed
+    # the pan bound. That does not mean the native pose is unmeasured: solve a
+    # finite, independently fixed legal camera family against the SAME joints.
+    # Every option still uses the renderer's integrity constructor.
+    options=[]
+    for roll in sorted({0.,angle}):
+        c,s=math.cos(math.radians(roll)),math.sin(math.radians(roll))
+        rotation=np.asarray(((c,-s),(s,c)));rotated=aa@rotation.T
+        optimum=max(1.,min(maximum_zoom,float(np.sum(rotated*bb))/energy))
+        zooms=sorted({1.,optimum,minimum_roll_safe_zoom(roll),1.08,1.16,1.28,1.4,1.75,maximum_zoom})
+        for zoom in zooms:
+            if not 1.<=zoom<=maximum_zoom:continue
+            rotated_center=(ac-center)@rotation.T+center
+            desired=(rotated_center-(bc-center)/zoom)/aspect
+            inset=.5/zoom;desired=np.clip(desired,max(inset,.25),min(1-inset,.75))
+            for alpha in (0.,.25,.5,.75,1.):
+                cx,cy=.5+alpha*(desired-.5)
+                try:key=EditorialTransformKeyframe(time_seconds,zoom,float(cx),float(cy),roll)
+                except ValueError:continue
+                projected=np.asarray([project_review_editorial_point(source_points[j],key) for j in joints])*aspect
+                error=float(np.sum((projected-b)**2))
+                options.append((error,key))
+    return min(options,key=lambda p:(p[0],p[1].zoom,abs(p[1].roll_degrees)))[1] if options else None

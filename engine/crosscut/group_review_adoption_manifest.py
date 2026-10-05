@@ -215,6 +215,9 @@ def validate_keyed_adoption_receipts(manifest,receipts):
             if any(k in receipt and receipt[k]!=v for k,v in basis.items()):
                 raise ValueError('motion receipt changed sealed tolerance, units or joint basis')
             candidate_basis=receipt.get('candidate_comparison_basis')
+            requires_measurement=request['kind'] in ('NEW_CUT','REPLACED_CUT')
+            if requires_measurement and candidate_basis is None:
+                raise ValueError('candidate motion comparison basis is required for a changed match')
             if candidate_basis is not None and candidate_basis!=basis:
                 raise ValueError('candidate motion cost is on a different sealed anatomical basis')
         if request['domain']=='SUPPORT' and receipt.get('part')!=request['part']:

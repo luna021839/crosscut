@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import pytest
+from crosscut.group_performer_family_owner import digest
 
 from crosscut.group_review_motion_contract import (freeze_selected_review_motion_intent,
     freeze_review_native_motion_route,compare_frozen_review_motion_route,same_native_review_continuation)
@@ -11,7 +12,7 @@ from crosscut.group_review_camera_repair import FramingDescriptor
 def view(tick,phase):
     vector=[1.]+[0.]*127
     d=FramingDescriptor((.5,.35),.3,.15,tuple((k,k*.1,phase) for k in range(4)),7,True)
-    return dict(row=dict(output_tick=tick,native_observation=dict(request_source_index=2,
+    return dict(native_camera_unit_index=0,row=dict(output_tick=tick,native_observation=dict(request_source_index=2,
         native_frame_index=tick,source_clock_identity='clock',source_file_identity=[1,2,3,4,5]),
         projection=dict(camera_sha256='camera',heads=[dict(observation_id=7,
             projected_landmarks_xy=[[.45,.3],[.55,.3],[.5,.36],[.46,.4],[.54,.4]])])),
@@ -23,7 +24,7 @@ TICKS=(8,9,10,11,12)
 
 def native(units=None):
     units=(0,)*5 if units is None else units
-    return [(2,'clock','file',u,t) for t,u in zip(TICKS,units)]
+    return [(2,'clock',digest([1,2,3,4,5]),u,t) for t,u in zip(TICKS,units)]
 
 
 def route(a=None,b=None):
@@ -37,7 +38,11 @@ def intent(a,head=False):
 
 
 def compare(a,b,r=None):
-    return compare_frozen_review_motion_route(a,b,fps=30.,intent=intent(a),route=route() if r is None else r)
+    r=route() if r is None else r
+    for side,values in (('left',a),('right',b)):
+        for v,address in zip(values,r[side+'_native']):
+            if v is not None:v['native_camera_unit_index']=address[3]
+    return compare_frozen_review_motion_route(a,b,fps=30.,intent=intent(a),route=r)
 
 
 def test_non_output_future_native_cut_uses_fixed_past_and_incoming_continuation():
@@ -131,6 +136,7 @@ def test_future_match_requires_body_on_actual_outgoing_past():
     frozen=intent(a)
     for i in (0,1):a[i]['descriptor']=replace(a[i]['descriptor'],pose_shape=None)
     r=route(b=(0,0,1,1,1))
+    for v in b[2:]:v['native_camera_unit_index']=1
     assert r['route']=='FUTURE_COMMON_OUTGOING_CONTINUES'
     result=compare_frozen_review_motion_route(a,b,fps=30.,intent=frozen,route=r)
     assert not result['same_time_action_supported'] and result['missing_actual_output_joint_requests']
@@ -224,3 +230,19 @@ def test_velocity_inventory_cannot_be_shortened_in_the_sealed_intent():
     p=intent([view(t,t*.1) for t in TICKS]).payload
     p['velocity_requests']=p['velocity_requests'][:1]
     with pytest.raises(ValueError,match='velocity'):FrozenReviewMotionIntent(json.dumps(p))
+
+
+def test_full_route_cannot_shrink_its_comparison_inventory_after_declaration():
+    a=[view(t,t*.1) for t in TICKS];b=deepcopy(a)
+    shortened=dict(route());shortened['comparison_indices']=[0,1]
+    with pytest.raises(ValueError,match='route'):
+        compare(a,b,shortened)
+
+
+@pytest.mark.parametrize('field,value',(('request_source_index',6),('native_frame_index',208),
+    ('source_clock_identity','borrowed'),('source_file_identity',[9,8,7,6,5])))
+def test_route_cannot_borrow_another_native_source_frame_clock_or_file(field,value):
+    a=[view(t,t*.1) for t in TICKS];b=deepcopy(a)
+    b[2]['row']['native_observation'][field]=value
+    with pytest.raises(ValueError,match='native'):
+        compare(a,b)

@@ -9,7 +9,7 @@ import math
 
 from .group_interval_materialization import _slice_camera,_slice_look
 from .group_cut_camera_proposal import retime_base_pan
-from .render import RenderTransition,segment_frame_counts
+from .render import RenderTransition,segment_frame_counts,_video_render_units
 from .render_boundary_clock import native_frame_clocks_for_output
 
 
@@ -17,6 +17,19 @@ def output_offsets(plan):
     values=[0]
     for count in segment_frame_counts(plan):values.append(values[-1]+count)
     return tuple(values)
+
+
+def cover_review_sampling_interval(plan,first,end):
+    """Cover counterfactual sample requests with existing whole render cells.
+
+    This does NOT move an actual edit boundary or hide a native camera cut.
+    Analysis queries need legal two-frame cells too; extending a counterfactual
+    camera's hold outside its output shot is explicit in its caller's track.
+    """
+    if any(type(t) is not int for t in (first,end)) or not 0<=first<end<=plan.output_frame_count:
+        raise ValueError('counterfactual sample interval lies outside the complete plan')
+    offsets=output_offsets(plan)
+    return max(t for t in offsets if t<=first),min(t for t in offsets if t>=end)
 
 
 def shifted_review_source_plan(plan,*,phase_frames,maximum_phase_frames=2,output_interval=None):
@@ -49,6 +62,19 @@ def clip_review_segments(plan,first,end,*,camera=None):
             or plan.authorized_shot_video_clocks or any(t.kind.uses_overlap for t in plan.transitions)):
         raise ValueError('review clipping needs one exact hard-cut output interval')
     starts=output_offsets(plan);parts=[]
+    # The renderer shares an actual clock across adjacent source segments.
+    # Segment durations need not equal their quantized frame counts / fps.
+    # Resetting a sliced segment from its authored source_start can therefore
+    # select a different native frame. Derive the request from the exact
+    # original render unit, while geometry still uses its own cell phase.
+    clocks={};cursor=0
+    for unit in _video_render_units(plan,segment_frame_counts(plan)):
+        head,tail=unit.segments[0],unit.segments[-1]
+        rate=(unit.coalesced_segment.source_playback_rate if unit.coalesced_segment is not None else
+            (tail.source_end-head.source_start)/sum(s.duration for s in unit.segments))
+        for j in range(unit.first_segment_index,unit.last_segment_index+1):
+            clocks[j]=(cursor,head.source_start,rate)
+        cursor+=unit.frame_count
     for i,s in enumerate(plan.segments):
         low,high=max(first,starts[i]),min(end,starts[i+1])
         if low>=high:continue
@@ -60,9 +86,11 @@ def clip_review_segments(plan,first,end,*,camera=None):
         if low==starts[i] and high==starts[i+1] and camera is None:
             part=s
         else:
-            part=replace(s,source_start=s.source_start+offset*s.source_playback_rate,
+            unit_first,unit_source_start,rate=clocks[i]
+            source_start=unit_source_start+(low-unit_first)/plan.fps*rate
+            part=replace(s,source_start=source_start,
                 master_start=s.master_start+offset,duration=duration,
-                source_duration=duration*s.source_playback_rate if s.source_duration is not None else None,
+                source_duration=duration*rate,
                 pan_crop=retime_base_pan(s.pan_crop,relative_shift=offset,duration=duration),
                 editorial_transform=(_slice_camera(s.editorial_transform,offset_seconds=offset,duration=duration)
                     if camera is None else _slice_camera(camera,

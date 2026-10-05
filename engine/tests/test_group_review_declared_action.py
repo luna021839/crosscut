@@ -6,12 +6,13 @@ from crosscut.group_review_declared_action import (freeze_review_action_declarat
     compare_declared_review_action_route,FrozenReviewActionDeclaration)
 from crosscut.group_review_motion_contract import freeze_selected_review_motion_intent,freeze_review_native_motion_route
 from crosscut.group_review_camera_repair import FramingDescriptor
+from crosscut.group_performer_family_owner import digest
 
 TICKS=(8,9,10,11,12)
 
 def view(t,shape=True):
     d=FramingDescriptor((.5,.35),.3,.15,tuple((k,k*.1,t*.1) for k in (0,1,3,5)) if shape else None,7,True)
-    return dict(row=dict(output_tick=t,native_observation=dict(request_source_index=2,native_frame_index=t,
+    return dict(native_camera_unit_index=0,row=dict(output_tick=t,native_observation=dict(request_source_index=2,native_frame_index=t,
         source_clock_identity='clock',source_file_identity=[1,2,3,4,5]),
         projection=dict(camera_sha256='camera')),descriptor=d,vector=[1.]+[0.]*127)
 
@@ -19,7 +20,7 @@ def setup():
     old=freeze_selected_review_motion_intent([None]*5,requested_ticks=TICKS,original_actor_identity='actual-old')
     duty=freeze_review_action_declaration(schema='right_arm_with_shoulders_v1',ticks=TICKS,
         original_motion_intent=old,original_preservation_duty_identity='a'*64,declared_scope_identity='b'*64)
-    raw=[(2,'clock','file',0,t) for t in TICKS]
+    raw=[(2,'clock',digest([1,2,3,4,5]),0,t) for t in TICKS]
     route=freeze_review_native_motion_route(ticks=TICKS,boundary_tick=10,left_native=raw,right_native=raw)
     return old,duty,route
 

@@ -112,7 +112,8 @@ def test_one_technical_diagnostic_is_separate_from_uncalibrated_suitability():
         motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2,
             nonstationary_native_action_observed=True,full_BODY_contract_complete=True),
         actual_required_support_state='PASS',complete_keyed_incident_state='PASS',
-        protected_reference_state='PASS',candidate_full_output_replay_state='PASS')
+        protected_reference_state='PASS',candidate_full_output_replay_state='PASS',
+        original_known_duty_state='PASS',actor_relation_state='PASS')
     r=evaluate_review_diagnostic_encode_permission(**kwargs)
     assert r['diagnostic_encode_permitted'] and r['maximum_encodes']==1
     assert not r['match_suitable'] and not r['adoption_permitted']
@@ -120,6 +121,20 @@ def test_one_technical_diagnostic_is_separate_from_uncalibrated_suitability():
             'protected_reference_state','candidate_full_output_replay_state'):
         assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,**{field:'UNKNOWN'}))['diagnostic_encode_permitted']
     assert not evaluate_review_diagnostic_encode_permission(**dict(kwargs,policy=partial_policy('PASS')))['diagnostic_encode_permitted']
+
+
+@pytest.mark.parametrize('field',('original_known_duty_state','actor_relation_state'))
+@pytest.mark.parametrize('state',('UNKNOWN','FAIL'))
+def test_body_diagnostic_cannot_bypass_original_or_actor_duty(field,state):
+    from crosscut.group_review_match_suitability import evaluate_review_diagnostic_encode_permission
+    kwargs=dict(policy=partial_policy(),appearance_cosine=.7,mutual_appearance=True,
+        motion=dict(intent_kind='BODY',same_time_action_supported=True,exploration_cost=.2,
+            nonstationary_native_action_observed=True,full_BODY_contract_complete=True),
+        actual_required_support_state='PASS',complete_keyed_incident_state='PASS',
+        protected_reference_state='PASS',candidate_full_output_replay_state='PASS',
+        original_known_duty_state='PASS',actor_relation_state='PASS')
+    kwargs[field]=state
+    assert not evaluate_review_diagnostic_encode_permission(**kwargs)['diagnostic_encode_permitted']
 
 
 def test_typed_partial_diagnostic_keeps_full_body_false_and_needs_every_original_actor_duty():

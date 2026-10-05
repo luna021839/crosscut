@@ -17,6 +17,13 @@ def _shape(view):
     return None if d is None or d.pose_shape is None else {p[0]:np.asarray(p[1:],float) for p in d.pose_shape}
 
 
+def review_actor_association_valid(view):
+    """Same observed/unresolved boundary for original and candidate actors."""
+    return bool(view is not None and view.get('descriptor') is not None
+        and not view.get('reacquisition_ambiguous',False)
+        and view.get('selected_actor_association_state') not in ('AMBIGUOUS','UNMATCHED','UNKNOWN'))
+
+
 def _window_links(sequence):
     """Check every sampled edge; equal endpoints do not establish a path.
 
@@ -24,10 +31,7 @@ def _window_links(sequence):
     Missing observations remain unresolved. A changed clock/native address is
     a contract error; a camera/gap/appearance bridge is unmeasured evidence.
     """
-    if any(v is None or v.get('descriptor') is None
-            or v.get('reacquisition_ambiguous',False)
-            or v.get('selected_actor_association_state') in ('AMBIGUOUS','UNMATCHED','UNKNOWN')
-            for v in sequence):
+    if any(not review_actor_association_valid(v) for v in sequence):
         return False
     for left,right in zip(sequence,sequence[1:]):
         a,b=left['row'],right['row']
