@@ -8,11 +8,98 @@ import math
 import numpy as np
 from .group_performer_family_owner import digest
 from .group_scene_camera_queries import GroupSceneRoleQuery
-from .group_source_changing_owner import project_point,_base_box
+from .group_source_changing_owner import project_point,project_box,_base_box
 from .render import EditorialTransformKeyframe,minimum_roll_safe_zoom
 from .group_review_camera_repair import project_review_editorial_point
 from .group_review_motion_contract import FrozenReviewNativeMotionRoute
 from .group_review_declared_action import FrozenReviewActionDeclaration
+from .group_review_motion_seam import review_actor_association_valid
+
+
+def project_observed_review_face(view,query,tick):
+    """The selected native occurrence under its ACTUAL registered camera.
+
+    A descriptor alone is not evidence: recompute its box from the bound raw
+    head and compare it with the registered projection. Missing/ambiguous or
+    cropped heads remain unknown. No body point can stand in for a face.
+    """
+    if not isinstance(query,GroupSceneRoleQuery):
+        raise ValueError('projected face needs the registered complete camera')
+    if not review_actor_association_valid(view):return None
+    row=view['row'];raw=row['native_observation'];_,_,native=query.sample_at(tick)
+    if (row['output_tick']!=tick
+            or row['query'].get('registered_query_sha256',digest(row['query']))!=query.key
+            or raw['native_frame_index']!=native or raw['source_clock_identity']!=query.source_clock_identity
+            or row['projection']['camera_sha256']!=query.camera.key):
+        raise ValueError('projected face borrowed another actual camera/native sample')
+    head_id=view['descriptor'].frame_local_head_id
+    heads=[h for h in raw.get('heads',()) if h['observation_id']==head_id]
+    projected=[h for h in row['projection'].get('heads',()) if h['observation_id']==head_id]
+    if len(heads)!=1 or len(projected)!=1:return None
+    box,fraction=project_box(heads[0]['box_xywh'],query,tick)
+    recorded=projected[0]
+    if (len(recorded['projected_box_xywh'])!=4
+            or any(not math.isfinite(v) for v in (*box,*recorded['projected_box_xywh']))
+            or any(not math.isclose(a,b,rel_tol=1e-8,abs_tol=1e-9)
+                for a,b in zip(box,recorded['projected_box_xywh']))
+            or not math.isclose(fraction,recorded['visible_fraction'],rel_tol=1e-8,abs_tol=1e-9)):
+        raise ValueError('projected face box differs from its bound actual raw occurrence/camera')
+    x,y,w,h=box
+    if fraction<.995 or w<=0 or h<=0:return None
+    return dict(center=(x+w/2,y+h/2),width=w,height=h,
+        native_parent=digest(raw),selected_head=head_id,registered_query_identity=query.key,
+        native_head_identity=digest(heads[0]),camera_identity=query.camera.key)
+
+
+def measure_review_projected_face(left,right,*,left_queries,right_queries,fps,route):
+    """Separate actual screen/face-scale costs, never an actor/quality badge.
+
+    Consume the same immutable physical route and EVERY requested sample.
+    This can expose a bad visual match even when normalized arm poses agree.
+    """
+    if (not isinstance(route,FrozenReviewNativeMotionRoute)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0):
+        raise ValueError('projected face needs its sealed native route and output clock')
+    ticks=route['requested_ticks']
+    if (len(left)!=len(ticks) or len(right)!=len(ticks)
+            or set(left_queries)!=set(ticks) or set(right_queries)!=set(ticks)):
+        raise ValueError('projected face omitted or changed its frozen request inventory')
+    indices=route['comparison_indices'];values=[];bindings=[];missing=[];sizes=set()
+    for side,views,queries in (('left',left,left_queries),('right',right,right_queries)):
+        faces=[]
+        for i in indices:
+            t=ticks[i];v=views[i];q=queries[t]
+            if not isinstance(q,GroupSceneRoleQuery) or not math.isclose(q.camera.output_fps,fps,abs_tol=1e-9):
+                raise ValueError('projected face changed its actual output clock')
+            sizes.add(tuple(q.camera.output_size))
+            if v is not None:
+                raw=v['row']['native_observation']
+                actual=[raw['request_source_index'],raw['source_clock_identity'],digest(raw['source_file_identity']),
+                    v.get('native_camera_unit_index'),raw['native_frame_index']]
+                if actual!=route[side+'_native'][i]:
+                    raise ValueError('projected face borrowed another frozen native route')
+            face=project_observed_review_face(v,q,t);faces.append(face)
+            if face is None:missing.append((side,t))
+            bindings.append(dict(side=side,tick=t,registered_query_identity=q.key,face=face))
+        values.append(faces)
+    if indices and len(sizes)!=1:raise ValueError('projected face changed its common output canvas')
+    result=dict(contract='actual_registered_camera_face_connection_evidence_v1',state='UNKNOWN',
+        geometry_kind='observed_detector_head_box_not_eye_landmarks',
+        route_identity=route.identity,actual_input_identity=digest(bindings),actual_inputs=bindings,
+        face_center_position_error=None,face_scale_log_error=None,face_aspect_log_error=None,
+        face_center_velocity_error=None,complete_on_declared_basis=False,
+        actor_correspondence_certified=False,motion_suitability_certified=False,quality_approved=False)
+    if not indices or missing:return dict(result,missing_face_requests=missing)
+    width,height=next(iter(sizes));aspect=np.asarray((1.,height/width))
+    a,b=[np.asarray([f['center'] for f in faces])*aspect for faces in values]
+    dt=np.diff([ticks[i]/fps for i in indices]);av,bv=np.diff(a,axis=0)/dt[:,None],np.diff(b,axis=0)/dt[:,None]
+    velocity=float((np.linalg.norm(av-bv,axis=1)/(1.+np.maximum(np.linalg.norm(av,axis=1),
+        np.linalg.norm(bv,axis=1)))).mean()) if len(dt) else None
+    return dict(result,state='MEASURED',face_center_position_error=float(np.linalg.norm(a-b,axis=1).mean()),
+        face_scale_log_error=float(np.mean([abs(math.log(y['height']/x['height'])) for x,y in zip(*values)])),
+        face_aspect_log_error=float(np.mean([abs(math.log((y['width']/y['height'])/(x['width']/x['height'])))
+            for x,y in zip(*values)])),face_center_velocity_error=velocity,
+        measured_position_samples=len(indices),measured_velocity_windows=len(dt),complete_on_declared_basis=True)
 
 
 def project_observed_review_joints(view,query,tick):

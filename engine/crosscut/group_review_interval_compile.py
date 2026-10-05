@@ -83,11 +83,16 @@ def clip_review_segments(plan,first,end,*,camera=None):
         offset=(low-starts[i])/plan.fps
         stop=s.duration if high==starts[i+1] else (high-starts[i])/plan.fps
         duration=stop-offset
+        unit_first,unit_source_start,rate=clocks[i]
+        source_start=unit_source_start+(low-unit_first)/plan.fps*rate
         if low==starts[i] and high==starts[i+1] and camera is None:
-            part=s
+            # Borrowing an ENTIRE authored cell can still detach it from the
+            # shared decode clock which previously supplied its first raster.
+            # Keep geometry/look objects exact, but materialize that physical
+            # clock even when no local geometry slicing was necessary.
+            part=(s if abs(s.source_start-source_start)<=1e-12 and abs(s.source_playback_rate-rate)<=1e-12
+                else replace(s,source_start=source_start,source_duration=duration*rate))
         else:
-            unit_first,unit_source_start,rate=clocks[i]
-            source_start=unit_source_start+(low-unit_first)/plan.fps*rate
             part=replace(s,source_start=source_start,
                 master_start=s.master_start+offset,duration=duration,
                 source_duration=duration*rate,

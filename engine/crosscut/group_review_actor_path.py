@@ -190,3 +190,117 @@ def anonymous_review_actor_paths(frames, *, maximum_paths=2, maximum_heads=4,
                 for l in path['links']),
             named_actor_certified=False,motion_certified=False,quality_approved=False))
     return tuple(results)
+
+
+def anchored_review_actor_paths(frames, *, independent_anchor, anchor_frame_index,
+        maximum_paths=2, maximum_heads=8, maximum_native_gap=12,
+        minimum_cosine=.25, minimum_anchor_cosine=.25, ambiguity_margin=.025,
+        maximum_beam=32, work_port=None, known_native_camera_cut_edges=()):
+    """Condition on an independent original occurrence BEFORE the path cap.
+
+    Extend each actual candidate anchor backward and forward. First-frame face
+    area never chooses which performer gets compared with the original. Close
+    anchor rivals, missing observations and budget exclusions remain explicit;
+    this is an appearance hypothesis, not named identity or adoption authority.
+    """
+    if (not isinstance(frames,(list,tuple)) or not 2<=len(frames)<=32
+            or type(anchor_frame_index) is not int or not 0<=anchor_frame_index<len(frames)
+            or independent_anchor is None or independent_anchor.get('vector') is None
+            or any(type(v) is not int or not 1<=v<=cap for v,cap in
+                ((maximum_paths,4),(maximum_heads,8),(maximum_beam,64),(maximum_native_gap,12)))
+            or any(type(v) not in (int,float) or not math.isfinite(v) or not 0<=v<=1
+                for v in (minimum_cosine,minimum_anchor_cosine,ambiguity_margin))
+            or not isinstance(known_native_camera_cut_edges,tuple)
+            or tuple(sorted(set(known_native_camera_cut_edges)))!=known_native_camera_cut_edges
+            or any(type(i) is not int or not 1<=i<len(frames) for i in known_native_camera_cut_edges)):
+        raise ValueError('anchor-conditioned paths require an independent measured anchor and finite bounds')
+    keys={};rows=[];heads_truncated=False;previous=None
+    def key(v):
+        if v is None:return 'unmatched'
+        if id(v) not in keys:keys[id(v)]=_content_key(v)
+        return keys[id(v)]
+    for frame in frames:
+        if not isinstance(frame,(list,tuple)) or len(frame)>24:
+            raise ValueError('unbounded actual anchor-conditioned head inventory')
+        for v in frame:
+            if v.get('descriptor') is None or v['descriptor'].frame_local_head_id is None or v.get('vector') is None:
+                raise ValueError('anchor-conditioned paths require actual head and appearance observations')
+            address=_address(v)
+            if (previous is not None and (address[0]<=previous[0] or address[1]!=previous[1] or address[3]!=previous[3])
+                    or address!=_address(frame[0])):
+                raise ValueError('anchor-conditioned actor frames changed source, clock or output order')
+        if frame:previous=_address(frame[0])
+        if len({key(v) for v in frame})!=len(frame):raise ValueError('duplicate indistinguishable actor hypotheses')
+        # If a bound really excludes observations, it cannot certify complete
+        # competing inventory. The independent anchor, not face area, ranks it.
+        ordered=sorted(frame,key=lambda v:(-(cosine(independent_anchor['vector'],v['vector']) or 0.),key(v)))
+        heads_truncated |= len(ordered)>maximum_heads
+        rows.append(tuple(ordered[:maximum_heads])+(None,))
+    anchor_rows=[v for v in rows[anchor_frame_index] if v is not None]
+    if anchor_rows and independent_anchor['row']['output_tick']!=anchor_rows[0]['row']['output_tick']:
+        raise ValueError('independent original anchor borrowed another output instant')
+    scores={key(v):cosine(independent_anchor['vector'],v['vector']) for v in anchor_rows}
+    eligible=[v for v in anchor_rows if scores[key(v)] is not None and scores[key(v)]>=minimum_anchor_cosine]
+    eligible.sort(key=lambda v:(-scores[key(v)],key(v)))
+    anchor_budget_excluded=len(eligible)>maximum_paths
+    results=[]
+    for seed in eligible[:maximum_paths]:
+        initial=[None]*len(rows);initial[anchor_frame_index]=seed
+        beam=[dict(cost=0.,views=tuple(initial),tie=(key(seed),))];visited=1;beam_truncated=False
+        order=tuple(range(anchor_frame_index-1,-1,-1))+tuple(range(anchor_frame_index+1,len(rows)))
+        for i in order:
+            backward=i<anchor_frame_index;neighbor=i+1 if backward else i-1
+            next_beam=[]
+            if work_port is not None:
+                work_port.charge('association_nodes',len(rows[i]))
+                work_port.charge('association_edges',len(beam)*len(rows[i]))
+            for parent in beam:
+                for v in rows[i]:
+                    a,b=(v,parent['views'][neighbor]) if backward else (parent['views'][neighbor],v)
+                    edge_index=neighbor if backward else i
+                    link=_link(a,b,maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
+                        observed_native_camera_cut=edge_index in known_native_camera_cut_edges)
+                    if link is None:continue
+                    views=list(parent['views']);views[i]=v
+                    next_beam.append(dict(cost=parent['cost']+link['cost']+(1.5 if v is None else 0.),
+                        views=tuple(views),tie=tuple(key(x) for x in views)))
+                    visited+=1
+            next_beam.sort(key=lambda p:(p['cost'],p['tie']))
+            # Link costs are Markov and nonnegative: all future extensions
+            # depend on this measured endpoint, not the discarded history.
+            # The exact two best histories PER endpoint suffice for the best
+            # complete path and its nearest competing history. This is not a
+            # global heuristic beam hiding relevant alternatives. At the left
+            # -> right switch all histories share the independently fixed seed.
+            endpoint_groups={}
+            for p in next_beam:endpoint_groups.setdefault(key(p['views'][i]),[]).append(p)
+            exact=sorted((p for group in endpoint_groups.values() for p in group[:2]),key=lambda p:(p['cost'],p['tie']))
+            beam_truncated |= len(exact)>maximum_beam;beam=exact[:maximum_beam]
+        if not beam:continue
+        chosen=beam[0];rivals=[p for p in beam[1:] if p['tie']!=chosen['tie']]
+        path_margin=None if not rivals else min(p['cost']-chosen['cost'] for p in rivals)
+        anchor_rivals=[s for k,s in scores.items() if k!=key(seed) and s is not None]
+        anchor_margin=None if not anchor_rivals else scores[key(seed)]-max(anchor_rivals)
+        links=tuple(_link(a,b,maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
+            observed_native_camera_cut=i in known_native_camera_cut_edges)
+            for i,(a,b) in enumerate(zip(chosen['views'],chosen['views'][1:]),1))
+        complete=all(v is not None for v in chosen['views']) and all(l is not None and l['linked'] for l in links)
+        ambiguous=bool(independent_anchor.get('reacquisition_ambiguous',False)
+            or anchor_margin is not None and anchor_margin<ambiguity_margin
+            or path_margin is not None and path_margin<ambiguity_margin)
+        results.append(dict(observations=chosen['views'],cost=chosen['cost'],
+            frame_local_head_ids=tuple(None if v is None else v['descriptor'].frame_local_head_id for v in chosen['views']),
+            source_local_link_hypotheses=links,all_sampled_frames_connected=complete,
+            competing_path_margin=path_margin,anchor_rival_margin=anchor_margin,anchor_cosine=scores[key(seed)],
+            independent_anchor_identity=digest((independent_anchor['row']['native_observation'],
+                independent_anchor['descriptor'].frame_local_head_id,list(independent_anchor['vector']))),
+            independent_anchor_frame_index=anchor_frame_index,ambiguous=ambiguous,
+            ambiguity_scope='independent_original_anchor_and_bidirectional_path_history',
+            missing_frames=sum(v is None for v in chosen['views']),hypothesis_sha256=digest(chosen['tie']),
+            visited_states=visited,head_inventory_truncated=heads_truncated,association_beam_truncated=beam_truncated,
+            temporal_optimizer='exact_top_two_histories_per_conditioned_endpoint_v1',
+            anchor_path_budget_excluded=anchor_budget_excluded,
+            complete_competing_inventory_measured=not(heads_truncated or beam_truncated or anchor_budget_excluded),
+            budget_exclusion_is_actor_unsuitability=False,appearance_hypothesis_is_measured_LK_authority=False,
+            named_actor_certified=False,motion_certified=False,quality_approved=False))
+    return tuple(results)

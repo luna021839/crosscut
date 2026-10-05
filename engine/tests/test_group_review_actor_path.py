@@ -1,6 +1,6 @@
 from copy import deepcopy
 import pytest
-from crosscut.group_review_actor_path import anonymous_review_actor_paths
+from crosscut.group_review_actor_path import anonymous_review_actor_paths,anchored_review_actor_paths
 from crosscut.group_review_camera_repair import FramingDescriptor
 
 
@@ -143,3 +143,81 @@ def test_a_known_native_cut_does_not_turn_another_person_or_large_gap_into_a_mat
                    [[view(0,0)],[view(13,0,camera='camera-b')]]):
         assert not any(p['all_sampled_frames_connected'] for p in
             anonymous_review_actor_paths(frames,known_native_camera_cut_edges=(1,)))
+
+
+def test_independent_anchor_recovers_fifth_small_face_before_path_budget():
+    from dataclasses import replace
+    frames=[[view(t,i,10+i) for i in range(5)] for t in (0,2,4)]
+    for frame in frames:frame[4]['descriptor']=replace(frame[4]['descriptor'],face_height=.04,face_width=.02)
+    old=anonymous_review_actor_paths(frames,maximum_paths=4,maximum_heads=8,distinct_anchor_hypotheses=True)
+    assert not any(p['frame_local_head_ids']==(14,14,14) for p in old)
+    anchor=view(2,4,99);anchor['row']['native_observation']['request_source_index']=7
+    paths=anchored_review_actor_paths(frames,independent_anchor=anchor,anchor_frame_index=1)
+    assert paths[0]['frame_local_head_ids']==(14,14,14)
+    assert paths[0]['all_sampled_frames_connected'] and not paths[0]['ambiguous']
+    assert not paths[0]['named_actor_certified']
+
+
+def test_anchor_conditioning_preserves_close_rivals_not_a_false_match():
+    frames=[[view(t,0,7),view(t,1,8)] for t in (0,2,4)]
+    for frame in frames:frame[1]['vector']=list(frame[0]['vector'])
+    paths=anchored_review_actor_paths(frames,independent_anchor=view(2,0),anchor_frame_index=1)
+    assert len(paths)==2 and all(p['ambiguous'] for p in paths)
+    assert all(p['anchor_rival_margin']==pytest.approx(0.) for p in paths)
+
+
+def test_actual_interval_outside_missing_data_does_not_reject_anchored_path():
+    full=[[],[view(1,0)],[view(2,0)],[view(3,0)],[]]
+    paths=anchored_review_actor_paths(full[1:4],independent_anchor=view(2,0),anchor_frame_index=1)
+    assert paths[0]['all_sampled_frames_connected']
+    paths=anchored_review_actor_paths(full,independent_anchor=view(2,0),anchor_frame_index=2)
+    assert not paths[0]['all_sampled_frames_connected'] and paths[0]['missing_frames']==2
+
+
+def test_missing_inside_anchor_scope_and_unobserved_native_cut_stay_unresolved():
+    for frames in ([[view(0,0)],[view(1,0)],[]],
+                   [[view(0,0)],[view(1,0)],[view(2,0,camera='cut')]]):
+        p=anchored_review_actor_paths(frames,independent_anchor=view(1,0),anchor_frame_index=1)[0]
+        assert not p['all_sampled_frames_connected']
+
+
+def test_anchor_budget_loss_is_explicit_and_does_not_certify_inventory():
+    frames=[[view(t,i,i) for i in range(3)] for t in (0,2,4)]
+    for frame in frames:
+        for v in frame:v['vector']=[1.]+[0.]*127
+    p=anchored_review_actor_paths(frames,independent_anchor=view(2,0),anchor_frame_index=1,maximum_paths=1)[0]
+    assert p['anchor_path_budget_excluded'] and not p['complete_competing_inventory_measured']
+    assert p['ambiguous'] and not p['budget_exclusion_is_actor_unsuitability']
+
+
+def test_anchor_from_another_instant_is_not_borrowed():
+    with pytest.raises(ValueError,match='another output instant'):
+        anchored_review_actor_paths([[view(0,0)],[view(2,0)]],independent_anchor=view(3,0),anchor_frame_index=0)
+
+
+def test_exact_anchor_endpoint_dynamic_program_matches_exhaustive_history_costs():
+    from itertools import product
+    from crosscut.group_review_actor_path import _link
+    from dataclasses import replace
+    frames=[[view(t,0,7),view(t,1,8)] for t in range(5)]
+    for frame in frames:
+        frame[1]['vector']=[.95,.05]+[0.]*126
+        frame[1]['descriptor']=replace(frame[1]['descriptor'],head_center=(.405,.35))
+    seed=frames[2][0];enumerated=[]
+    for choices in product(*(frame+[None] if i!=2 else [seed] for i,frame in enumerate(frames))):
+        links=[_link(a,b,maximum_native_gap=12,minimum_cosine=.25) for a,b in zip(choices,choices[1:])]
+        if any(l is None for l in links):continue
+        enumerated.append(sum(l['cost'] for l in links)+1.5*sum(v is None for v in choices))
+    enumerated.sort()
+    paths=anchored_review_actor_paths(frames,independent_anchor=view(2,0),anchor_frame_index=2)
+    selected=next(p for p in paths if p['frame_local_head_ids'][2]==7)
+    assert selected['cost']==pytest.approx(enumerated[0])
+    assert selected['competing_path_margin']==pytest.approx(enumerated[1]-enumerated[0])
+    assert not selected['association_beam_truncated']
+
+
+def test_long_complete_anchor_path_does_not_lose_inventory_to_unmatched_history_explosion():
+    frames=[[view(t,0,7),view(t,1,8)] for t in range(25)]
+    p=anchored_review_actor_paths(frames,independent_anchor=view(12,0),anchor_frame_index=12)[0]
+    assert p['all_sampled_frames_connected'] and p['complete_competing_inventory_measured']
+    assert p['visited_states']<2000

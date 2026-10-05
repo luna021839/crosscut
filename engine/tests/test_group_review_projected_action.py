@@ -8,7 +8,7 @@ from crosscut.group_review_camera_repair import FramingDescriptor
 from crosscut.group_review_motion_contract import freeze_selected_review_motion_intent,freeze_review_native_motion_route
 from crosscut.group_review_declared_action import freeze_review_action_declaration
 from crosscut.group_review_projected_action import (project_observed_review_joints,measure_review_projected_action,
-    fit_review_anatomical_key)
+    fit_review_anatomical_key,project_observed_review_face,measure_review_projected_face)
 from crosscut.group_review_camera_repair import project_review_editorial_point
 from crosscut.group_performer_family_owner import digest
 from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
@@ -90,3 +90,60 @@ def test_infeasible_unconstrained_roll_does_not_discard_measured_joint_request()
     before=sum(math.dist(points[j],target[j])**2 for j in points)
     after=sum(math.dist(project_review_editorial_point(points[j],key),target[j])**2 for j in points)
     assert after<=before+1e-12
+
+
+def faces(zoom=1.):
+    from crosscut.group_source_changing_owner import project_box
+    views,queries,declaration,route=setup(zoom)
+    for t,v in zip(TICKS,views):
+        box=(.44,.27+t*.001,.12,.20)
+        v['row']['native_observation']['heads']=[dict(observation_id=0,box_xywh=box)]
+        projected,fraction=project_box(box,queries[t],t)
+        v['row']['projection']['heads']=[dict(observation_id=0,projected_box_xywh=projected,visible_fraction=fraction)]
+    return views,queries,route
+
+
+def test_actual_face_scale_and_position_are_separate_from_normalized_body_pose():
+    a,qa,route=faces();b,qb,_=faces(1.5)
+    result=measure_review_projected_face(a,b,left_queries=qa,right_queries=qb,fps=30.,route=route)
+    import math
+    assert result['state']=='MEASURED'
+    assert result['face_scale_log_error']==pytest.approx(math.log(1.5))
+    assert result['face_center_position_error']>0
+    assert result['measured_position_samples']==5 and result['measured_velocity_windows']==4
+    assert not result['quality_approved'] and not result['actor_correspondence_certified']
+    same=measure_review_projected_face(a,a,left_queries=qa,right_queries=qa,fps=30.,route=route)
+    assert same['face_scale_log_error']==0 and same['face_center_velocity_error']==0
+
+
+def test_face_request_cannot_drop_missing_middle_or_ambiguous_actor():
+    a,qa,route=faces();b=deepcopy(a);b[2]['row']['projection']['heads']=[]
+    result=measure_review_projected_face(a,b,left_queries=qa,right_queries=qa,fps=30.,route=route)
+    assert result['state']=='UNKNOWN' and result['face_scale_log_error'] is None
+    b=deepcopy(a);b[2]['reacquisition_ambiguous']=True
+    assert measure_review_projected_face(a,b,left_queries=qa,right_queries=qa,fps=30.,route=route)['state']=='UNKNOWN'
+
+
+def test_face_descriptor_cannot_supply_an_unobserved_smaller_scale():
+    a,qa,route=faces();b=deepcopy(a)
+    # Scores are reconstructed from the actual raw head, not this DTO field.
+    b[2]['descriptor']=replace(b[2]['descriptor'],face_height=.001,head_center=(.9,.9))
+    result=measure_review_projected_face(a,b,left_queries=qa,right_queries=qa,fps=30.,route=route)
+    assert result['face_scale_log_error']==0 and result['face_center_position_error']==0
+
+
+def test_forged_projected_face_box_or_neutral_camera_cannot_be_consumed():
+    a,qa,_=faces();b=deepcopy(a)
+    box=list(b[0]['row']['projection']['heads'][0]['projected_box_xywh']);box[3]*=2
+    b[0]['row']['projection']['heads'][0]['projected_box_xywh']=box
+    with pytest.raises(ValueError,match='actual raw'):project_observed_review_face(b[0],qa[8],8)
+    _,qb,_=faces(1.5)
+    with pytest.raises(ValueError,match='actual camera'):project_observed_review_face(a[0],qb[8],8)
+
+
+def test_face_measurement_keeps_actual_native_unit_and_output_clock():
+    a,qa,route=faces();b=deepcopy(a);b[2]['native_camera_unit_index']=99
+    with pytest.raises(ValueError,match='frozen native route'):
+        measure_review_projected_face(a,b,left_queries=qa,right_queries=qa,fps=30.,route=route)
+    with pytest.raises(ValueError,match='output clock'):
+        measure_review_projected_face(a,a,left_queries=qa,right_queries=qa,fps=29.97,route=route)

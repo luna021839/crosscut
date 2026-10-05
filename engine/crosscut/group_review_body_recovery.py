@@ -47,12 +47,16 @@ class FrozenReviewBodyWindow:
     def identity(self):return digest(self.payload)
 
 
-def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None):
+def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None,minimum_native_head_pixels=None):
     """No candidate error, pose success, or editorial crop selects this ROI."""
     if (not isinstance(raws,(list,tuple)) or not 2<=len(raws)<=16
             or type(native_camera_unit) is not int or native_camera_unit<0):
         raise ValueError('auxiliary review body scope is an actual single-face native close-up')
     explicit=head_ids is not None
+    if minimum_native_head_pixels is not None and (not explicit
+            or type(minimum_native_head_pixels) not in (int,float)
+            or not math.isfinite(minimum_native_head_pixels) or minimum_native_head_pixels<32):
+        raise ValueError('pixel-scoped auxiliary body needs an explicit prior actor and at least 32 native face pixels')
     if not explicit and any(len(raw['heads'])!=1 for raw in raws):
         raise ValueError('auxiliary review body scope is an actual single-face native close-up')
     if explicit and (not isinstance(head_ids,(list,tuple)) or len(head_ids)!=len(raws)
@@ -61,7 +65,13 @@ def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None):
     heads=[]
     for index,raw in enumerate(raws):
         selected=([h for h in raw['heads'] if h['observation_id']==head_ids[index]] if explicit else raw['heads'])
-        if len(selected)!=1 or selected[0]['box_xywh'][3]<(0.05 if explicit else .13):
+        normalized_small=len(selected)==1 and selected[0]['box_xywh'][3]<(0.05 if explicit else .13)
+        if minimum_native_head_pixels is not None:
+            size=raw.get('frame_size_wh')
+            if (not isinstance(size,(list,tuple)) or len(size)!=2 or any(type(v) is not int or v<=0 for v in size)):
+                raise ValueError('native pixel scope lost its actual raster dimensions')
+            normalized_small=len(selected)==1 and selected[0]['box_xywh'][3]*size[1]<minimum_native_head_pixels
+        if len(selected)!=1 or normalized_small:
             raise ValueError('selected auxiliary head is absent, repeated or below its declared measurement scope')
         heads.append(selected[0])
     boxes=[]
@@ -83,6 +93,10 @@ def freeze_review_body_window(raws,*,native_camera_unit,head_ids=None):
         roi_selection_inspected_new_pose=False,raw_detector_rows_rewritten=False,
         head_selection_scope='explicit_prior_selected_occurrences' if explicit else 'sole_native_face',
         body_ownership_certified=False,quality_approved=False)
+    if minimum_native_head_pixels is not None:
+        value.update(measurement_scope='explicit_actual_native_face_pixel_scope_v1',
+            minimum_native_head_pixels=minimum_native_head_pixels,
+            native_face_heights_pixels=[h['box_xywh'][3]*raw['frame_size_wh'][1] for h,raw in zip(heads,raws)])
     return FrozenReviewBodyWindow(json.dumps(value,sort_keys=True,allow_nan=False))
 
 

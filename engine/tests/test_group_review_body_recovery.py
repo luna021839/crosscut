@@ -188,6 +188,25 @@ def test_multiple_head_window_or_clock_gap_is_not_a_single_actor_recovery():
         freeze_review_body_window([raw(10),raw(30)],native_camera_unit=0)
 
 
+def test_explicit_native_pixel_measurement_scope_is_resolution_aware_not_quality_approval():
+    a,b=raw(10),raw(11)
+    for row in (a,b):row['heads'][0]['box_xywh'][3]=.042
+    with pytest.raises(ValueError,match='below'):freeze_review_body_window([a,b],native_camera_unit=0,head_ids=(7,7))
+    window=freeze_review_body_window([a,b],native_camera_unit=0,head_ids=(7,7),minimum_native_head_pixels=32)
+    assert window.payload['native_face_heights_pixels']==pytest.approx([45.36,45.36])
+    assert not window.payload['body_ownership_certified'] and not window.payload['quality_approved']
+    for row in (a,b):row['frame_size_wh']=[640,360]
+    with pytest.raises(ValueError,match='below'):
+        freeze_review_body_window([a,b],native_camera_unit=0,head_ids=(7,7),minimum_native_head_pixels=32)
+
+
+def test_pixel_scope_cannot_silently_lower_confidence_ownership_or_roi_contract():
+    with pytest.raises(ValueError,match='32 native'):
+        freeze_review_body_window([raw(10),raw(11)],native_camera_unit=0,head_ids=(7,7),minimum_native_head_pixels=8)
+    with pytest.raises(ValueError,match='explicit prior actor'):
+        freeze_review_body_window([raw(10),raw(11)],native_camera_unit=0,minimum_native_head_pixels=32)
+
+
 def test_explicit_prior_actor_allows_background_faces_but_not_salience_reselection():
     a,b=raw(10),raw(11)
     other=deepcopy(a['heads'][0]);other['observation_id']=99;other['box_xywh']=[.01,.01,.8,.8]

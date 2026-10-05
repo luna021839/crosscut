@@ -119,3 +119,34 @@ def test_sliced_fractional_duration_cell_uses_the_original_shared_render_clock()
     requested=native_frame_clocks_for_output(plan,domain.clocks_by_request,(40,))[40]
     selected=next(s for s in candidate.segments if abs(s.master_start-(1.005+10/29.97))<1e-8)
     assert selected.source_start==pytest.approx(requested.source_request_seconds)
+
+
+def test_whole_cell_borrowed_after_source_change_keeps_its_old_shared_clock():
+    from crosscut.render import RenderSegment,RenderTransition
+    context,domain=fixture(fps=29.97)
+    source=replace(context.incumbent.render_plan,segments=(
+        RenderSegment(0,.029,1.005,0.),RenderSegment(0,1.034,1.005,1.005)),
+        transitions=(RenderTransition(tier='D'),))
+    counts=__import__('crosscut.render',fromlist=['segment_frame_counts']).segment_frame_counts(source)
+    boundary=counts[0]
+    prefix=tuple(replace(s,source_index=1) for s in clip_review_segments(source,0,boundary))
+    borrowed=clip_review_segments(source,boundary,source.output_frame_count)
+    candidate=assemble_review_intervals(source,[(0,boundary,prefix),
+        (boundary,source.output_frame_count,borrowed)])
+    result=verify_realized_sampler(source,candidate,domain,range(boundary,source.output_frame_count),
+        require_source_request_time=False)
+    assert result['actual_native_rasters_preserved']
+    assert borrowed[0].source_start==pytest.approx(.029+boundary/source.fps)
+    assert borrowed[0].editorial_transform is source.segments[1].editorial_transform
+
+
+def test_materializing_all_whole_fractional_cells_keeps_every_physical_raster():
+    from crosscut.render import RenderSegment,RenderTransition
+    context,domain=fixture(fps=29.97)
+    source=replace(context.incumbent.render_plan,segments=tuple(
+        RenderSegment(0,.029+i*1.005,1.005,i*1.005) for i in range(4)),
+        transitions=tuple(RenderTransition(tier='D') for _ in range(3)))
+    whole=assemble_review_intervals(source,[(0,source.output_frame_count,
+        clip_review_segments(source,0,source.output_frame_count))])
+    assert verify_realized_sampler(source,whole,domain,range(source.output_frame_count),
+        require_source_request_time=False)['actual_native_rasters_preserved']
