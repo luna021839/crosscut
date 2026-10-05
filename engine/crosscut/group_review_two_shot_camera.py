@@ -135,7 +135,8 @@ def fit_review_temporal_camera_corridor(desired_keys,*,observed_points_by_frame,
 
 def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,right_joint_points,
         requested_joints=(0,1,2,3,4,5),left_required_visible_points=(),right_required_visible_points=(),
-        maximum_candidates=8,maximum_zoom=2.):
+        maximum_candidates=8,maximum_zoom=2.,target_centers=((.5,.5),(.42,.45),(.5,.45),(.58,.45),
+            (.42,.525),(.5,.525),(.58,.525),(.42,.6),(.5,.6),(.58,.6))):
     """Fit BOTH selected cameras to common actual focal anatomy, before render.
 
     Independently observed missing joints are retained as missing requests.
@@ -146,7 +147,8 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
     if (type(maximum_candidates) is not int or not 1<=maximum_candidates<=8
             or requested_joints!=tuple(sorted(set(requested_joints)))
             or not requested_joints or any(type(j) is not int or not 0<=j<6 for j in requested_joints)
-            or not 1<=maximum_zoom<=2):
+            or not 1<=maximum_zoom<=2 or not isinstance(target_centers,tuple) or not 1<=len(target_centers)<=10
+            or any(len(c)!=2 or not all(math.isfinite(v) and .25<=v<=.75 for v in c) for c in target_centers)):
         raise ValueError('coupled boundary fit needs its independently bounded actual joint request')
     def validate(head,points):
         if not isinstance(head,dict) or not isinstance(points,dict):
@@ -171,28 +173,34 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
     height=min(maximum_zoom*min(left_head['height'],right_head['height']),
         1.35*max(left_head['height'],right_head['height']))
     width=height*math.sqrt(left_head['width']/left_head['height']*right_head['width']/right_head['height'])
-    target_head=dict(center=(.5,.5),width=width,height=height);target=face(target_head)
-    for j in common:
-        target[j]=tuple(.5+height*((a[j][axis]-left_head['center'][axis])/left_head['height']+
-            (b[j][axis]-right_head['center'][axis])/right_head['height'])/2 for axis in (0,1))
-    basis=tuple(sorted(target))
-    left=fit_review_anatomical_keys(a,target,requested_joints=basis,time_seconds=0.,
-        required_visible_points=left_required_visible_points,maximum_candidates=maximum_candidates,maximum_zoom=maximum_zoom)
-    right=fit_review_anatomical_keys(b,target,requested_joints=basis,time_seconds=0.,
-        required_visible_points=right_required_visible_points,maximum_candidates=maximum_candidates,maximum_zoom=maximum_zoom)
-    options=[]
-    for ka in left:
-        for kb in right:
+    options=[];seen=set()
+    for destination in target_centers:
+        target=face(dict(center=destination,width=width,height=height))
+        for j in common:
+            target[j]=tuple(destination[axis]+height*((a[j][axis]-left_head['center'][axis])/left_head['height']+
+                (b[j][axis]-right_head['center'][axis])/right_head['height'])/2 for axis in (0,1))
+        basis=tuple(sorted(target))
+        left=fit_review_anatomical_keys(a,target,requested_joints=basis,time_seconds=0.,
+            required_visible_points=left_required_visible_points,maximum_candidates=maximum_candidates,maximum_zoom=maximum_zoom)
+        right=fit_review_anatomical_keys(b,target,requested_joints=basis,time_seconds=0.,
+            required_visible_points=right_required_visible_points,maximum_candidates=maximum_candidates,maximum_zoom=maximum_zoom)
+        for ka,kb in ((x,y) for x in left for y in right):
+            token=(ka.zoom,ka.center_x,ka.center_y,ka.roll_degrees,kb.zoom,kb.center_x,kb.center_y,kb.roll_degrees)
+            if token in seen:continue
+            seen.add(token)
             pa={j:project_review_editorial_point(p,ka) for j,p in a.items()}
             pb={j:project_review_editorial_point(p,kb) for j,p in b.items()}
             point_error=sum(math.hypot(pa[j][0]-pb[j][0],(pa[j][1]-pb[j][1])*9/16) for j in basis)/len(basis)
             size_error=abs(math.log(ka.zoom*left_head['height']/(kb.zoom*right_head['height'])))
-            score=2*point_error+.3*size_error+.005*math.log(ka.zoom*kb.zoom)
+            head_error=math.hypot(pa[16][0]-pb[16][0],(pa[16][1]-pb[16][1])*9/16)
+            score=3*head_error+point_error+.6*size_error+.005*math.log(ka.zoom*kb.zoom)
             options.append((score,ka,kb,point_error,size_error))
     options.sort(key=lambda v:(v[0],v[1].zoom,v[2].zoom,v[1].center_x,v[2].center_x))
     receipt=dict(contract='coupled_actual_focal_boundary_camera_hypotheses_v1',requested_joint_indices=list(requested_joints),
         measured_common_joint_indices=list(common),missing_joint_requests=missing,
         complete_requested_action_basis=not any(missing.values()),camera_pair_count=len(options),
+        independently_declared_common_target_centers=[list(c) for c in target_centers],
+        shared_target_must_be_dead_center=False,maximum_geometric_camera_pairs=len(target_centers)*maximum_candidates**2,
         partial_geometry_is_complete_motion_match=False,actor_identity_certified=False,
         artistic_focal_intent_certified=False,quality_approved=False)
     return tuple((ka,kb,dict(receipt,geometry_score=score,projected_point_error=point_error,

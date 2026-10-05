@@ -151,3 +151,20 @@ def test_partial_trajectory_does_not_invent_motion_through_a_missing_wrist_frame
     r=measure_review_partial_joint_trajectory(rows,rows,ticks=(10,11,12,13,14),fps=30.)
     assert r['measured_velocity_requests']==14
     assert not r['missing_joint_trajectory_interpolated']
+
+
+def test_coupled_focal_destination_is_optimized_instead_of_forcing_dead_center():
+    a=dict(center=(.46856,.71637),width=.09,height=.16212)
+    b=dict(center=(.70774,.68049),width=.08,height=.14114)
+    pa={0:(.56548,.87192),1:(.43520,.83883),3:(.39798,.99008),5:(.33289,.87419)}
+    pb={0:(.74509,.82412),1:(.63716,.81674),2:(.75505,.96728),3:(.60146,.98942),5:(.58071,.84921)}
+    def fitted(**extra):
+        return fit_review_coupled_boundary_keys(left_head=a,right_head=b,left_joint_points=pa,right_joint_points=pb,
+            left_required_visible_points=tuple(pa.values()),right_required_visible_points=tuple(pb.values()),**extra)
+    old=fitted(target_centers=((.5,.5),));new=fitted()
+    assert old and new and new[0][2]['geometry_score']<=old[0][2]['geometry_score']
+    assert not new[0][2]['shared_target_must_be_dead_center']
+    assert new[0][2]['camera_pair_count']<=new[0][2]['maximum_geometric_camera_pairs']
+    for ka,kb,receipt in new:
+        assert all(all(0<=v<=1 for v in project_review_editorial_point(p,k))
+            for k,points in ((ka,pa),(kb,pb)) for p in points.values())
