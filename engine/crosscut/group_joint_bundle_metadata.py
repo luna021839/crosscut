@@ -236,6 +236,7 @@ class GroupNativeMotionProduction:
             selected_shots=[dict(asdict(s),role=None if s.role is None else s.role.value)
                 for s in self.selected_shots],
             has_local_video_clock_context=self.shot_clock_context is not None,
+            shot_video_clock_context=None if self.shot_clock_context is None else self.shot_clock_context.to_dict(),
             has_complete_bundle=self.complete_bundle is not None,
             selection_sha256=self.selection_sha256,
             quality_approved=False)
@@ -257,9 +258,7 @@ def _selected_production_payload(production):
         render_plan=plan,complete_bundle=production.complete_bundle.to_dict(),
         request_sources=[str(path) for path in production.source_domain.request_sources],
         source_domain=production.source_domain.to_dict(),
-        shot_clock_context=None if context is None else dict(
-            phase_zero_plan=context.incumbent_plan.to_json(),
-            source_domain=context.source_domain.to_dict(),policy=asdict(context.policy)),
+        shot_clock_context=None if context is None else context.to_dict(),
         selected_shots=[dict(asdict(shot),role=None if shot.role is None else shot.role.value)
             for shot in production.selected_shots],
         original_plan_identity=production.original_plan_identity,
@@ -302,6 +301,12 @@ def _check_native_selection(production):
     if context is not None and (not isinstance(context,FrozenShotVideoClockContext)
             or context.source_domain!=production.source_domain):
         raise ValueError('native selection borrowed another phase-zero source clock context')
+    if context is not None and context.original_reference_plan is not None and (
+            _plan_identity(context.original_reference_plan)!=production.original_plan_identity
+            or context.protected_output_intervals!=production.protected_output_intervals
+            or context.mutable_output_intervals!=tuple((shot.first_output_frame,shot.end_output_frame)
+                for shot in production.selected_shots)):
+        raise ValueError('selected native program changed its original root or declared protection/scope')
     try:
         evidence=json.loads(production.selection_evidence_json)
     except (TypeError,ValueError) as exc:

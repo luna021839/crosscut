@@ -150,7 +150,8 @@ def realize_native_motion_programme(*, original, domain, sides,
     aligned = _restore_untouched_transitions(original, assemble_review_intervals(original, intervals), first, end)
     # A different cut has a different canonical scaffold. Freezing the OLD
     # incumbent and attaching its clocks would be a false authority binding.
-    context = FrozenShotVideoClockContext(aligned, domain, policy)
+    context = FrozenShotVideoClockContext(aligned, domain, policy,original,
+        tuple((side.first_output_frame,side.end_output_frame) for side in sides),protected_output_intervals)
     offsets = output_offsets(aligned)
     segments = list(aligned.segments); clocks = []
     selected_grids = []

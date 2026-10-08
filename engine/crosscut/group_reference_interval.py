@@ -79,7 +79,8 @@ def _different(left, right, tolerance):
 
 def compare_group_reference_interval(*, reference, candidate, reference_source_clocks,
         candidate_source_clocks, output_intervals, maximum_output_frames=16384,
-        maximum_complete_plan_frames=36000, numeric_tolerance=1e-9):
+        maximum_complete_plan_frames=36000, numeric_tolerance=1e-9,
+        reference_shot_clock_context=None,candidate_shot_clock_context=None):
     """Report numeric regressions, without banning a tested better alternative.
 
     Ranges are unique, ordered, disjoint [first, end) OUTPUT ticks. A source
@@ -93,9 +94,18 @@ def compare_group_reference_interval(*, reference, candidate, reference_source_c
             or reference.height != candidate.height or reference.aspect_ratio != candidate.aspect_ratio
             or reference.output_frame_count != candidate.output_frame_count):
         raise ValueError('GROUP reference comparison needs the same complete output grid')
-    if (any(t.kind.uses_overlap for p in (reference, candidate) for t in p.transitions)
-            or reference.authorized_shot_video_clocks or candidate.authorized_shot_video_clocks):
+    if any(t.kind.uses_overlap for p in (reference, candidate) for t in p.transitions):
         raise ValueError('GROUP reference comparison needs the supported pure hard-cut sampler')
+    from .shot_video_clock import FrozenShotVideoClockContext,validate_authorized_shot_video_clocks
+    for plan,clocks,context in ((reference,reference_source_clocks,reference_shot_clock_context),
+            (candidate,candidate_source_clocks,candidate_shot_clock_context)):
+        if plan.authorized_shot_video_clocks:
+            if (not isinstance(context,FrozenShotVideoClockContext)
+                    or context.source_domain.clocks_by_request!=clocks):
+                raise ValueError('GROUP reference local clocks need the matching frozen source context')
+            # Consume and validate the actual clocks. Never remove them merely
+            # to get a protected-interval comparison past the old guard.
+            validate_authorized_shot_video_clocks(plan=plan,context=context)
     if (type(maximum_output_frames) is not int or not 1 <= maximum_output_frames <= 16384
             or type(maximum_complete_plan_frames) is not int or not 1 <= maximum_complete_plan_frames <= 36000
             or type(numeric_tolerance) not in (int, float) or not math.isfinite(numeric_tolerance)

@@ -37,10 +37,13 @@ def _unit(parts):
 
 @dataclass(frozen=True, slots=True)
 class FrozenShotVideoClockContext:
-    """Caller/parent-owned pre-search context; never reconstructed from child JSON."""
+    """Caller-owned pre-search context; a transport copy is not parent authority."""
     incumbent_plan: object
     source_domain: object
     policy: object
+    original_reference_plan: object | None = None
+    mutable_output_intervals: tuple[tuple[int,int],...] = ()
+    protected_output_intervals: tuple[tuple[int,int],...] = ()
 
     def __post_init__(self):
         from .group_source_domain import bind_group_source_domain
@@ -51,6 +54,70 @@ class FrozenShotVideoClockContext:
                 or not isinstance(self.policy, NativePhaseSearchPolicy)):
             raise ValueError('shot-clock context needs an unretimed incumbent and frozen phase policy')
         bind_group_source_domain(plan=self.incumbent_plan, source_domain=self.source_domain)
+        root=self.original_reference_plan
+        if root is None:
+            if self.mutable_output_intervals or self.protected_output_intervals:
+                raise ValueError('shot-clock root intervals need their original reference plan')
+            return
+        if (not isinstance(root,RenderPlan) or root.authorized_shot_video_clocks
+                or root.sources!=self.incumbent_plan.sources
+                or root.output_frame_count!=self.incumbent_plan.output_frame_count
+                or not isinstance(self.mutable_output_intervals,tuple)
+                or len(self.mutable_output_intervals)!=2
+                or not isinstance(self.protected_output_intervals,tuple)):
+            raise ValueError('root-bound video clock requires its two declared complete mutable shots')
+        previous=None
+        for span in self.mutable_output_intervals:
+            if not isinstance(span,tuple) or len(span)!=2:
+                raise ValueError('root-bound video clock has malformed mutable shot intervals')
+            first,end=span
+            if (type(first) is not int or type(end) is not int
+                    or not 0<=first<end<=root.output_frame_count or not 2<=end-first<=160
+                    or previous is not None and first!=previous):
+                raise ValueError('root-bound video clock has malformed mutable shot intervals')
+            previous=end
+        previous=0
+        for span in self.protected_output_intervals:
+            if (not isinstance(span,tuple) or len(span)!=2 or any(type(t) is not int for t in span)
+                    or not previous<=span[0]<span[1]<=root.output_frame_count
+                    or any(a<span[1] and b>span[0] for a,b in self.mutable_output_intervals)):
+                raise ValueError('root-bound video clock intersects protected original intervals')
+            previous=span[1]
+
+    def to_dict(self):
+        from dataclasses import asdict
+        return dict(contract='frozen_phase_zero_root_bound_video_clock_context_v1',
+            phase_zero_plan=self.incumbent_plan.to_json(),source_domain=self.source_domain.to_dict(),
+            policy=asdict(self.policy),
+            original_reference_plan=None if self.original_reference_plan is None
+                else self.original_reference_plan.to_json(),
+            mutable_output_intervals=[list(span) for span in self.mutable_output_intervals],
+            protected_output_intervals=[list(span) for span in self.protected_output_intervals],
+            transport_copy_is_parent_authority=False,quality_approved=False)
+
+
+def frozen_shot_video_clock_context_from_dict(value,*,source_domain):
+    """Parse numeric transport, then require an independently frozen root later."""
+    from .render_plan_serialization import render_plan_from_json
+    from .group_joint_native_phase import NativePhaseSearchPolicy
+    if (not isinstance(value,dict)
+            or value.get('contract')!='frozen_phase_zero_root_bound_video_clock_context_v1'
+            or value.get('transport_copy_is_parent_authority') is not False
+            or value.get('quality_approved') is not False
+            or value.get('source_domain')!=json.loads(json.dumps(source_domain.to_dict(),allow_nan=False))):
+        raise ValueError('serialized phase-zero context lost its explicit source/root contract')
+    try:
+        policy=NativePhaseSearchPolicy(**value['policy'])
+        root=value['original_reference_plan']
+        context=FrozenShotVideoClockContext(render_plan_from_json(value['phase_zero_plan']),source_domain,policy,
+            None if root is None else render_plan_from_json(root),
+            tuple(tuple(span) for span in value['mutable_output_intervals']),
+            tuple(tuple(span) for span in value['protected_output_intervals']))
+    except (KeyError,TypeError) as exc:
+        raise ValueError('serialized phase-zero context lost its complete preimage') from exc
+    if json.loads(json.dumps(context.to_dict(),allow_nan=False))!=value:
+        raise ValueError('serialized phase-zero context differs from its canonical numeric preimage')
+    return context
 
 
 @dataclass(frozen=True, slots=True)

@@ -39,6 +39,60 @@ def _validate_protected_spans(spans, output_frame_count):
         raise ValueError('external protected range comparison exceeds its declared frame cap')
 
 
+def _global_header(plan):
+    # Local clocks are compared separately against a frozen, root-bound
+    # phase-zero parent. Every other current/future executable header remains.
+    return tuple(row for row in _header(plan) if row[0]!='authorized_shot_video_clocks')
+
+
+def _compare_spans(original,candidate,domain,spans,*,clock_context=None):
+    # Keep the existing 16,384-tick comparison cap. A complete exterior may
+    # require several bounded chunks; no tiny protected sample stands in for it.
+    for first,end in spans:
+        for start in range(first,end,16384):
+            result=compare_group_reference_interval(reference=original,candidate=candidate,
+                reference_source_clocks=domain.clocks_by_request,
+                candidate_source_clocks=domain.clocks_by_request,
+                output_intervals=((start,min(end,start+16384)),),
+                candidate_shot_clock_context=clock_context)
+            if not result.planned_parameters_preserved:
+                raise ValueError('candidate changed protected external source/clock/camera/look parameters')
+
+
+def _validate_root_bound_phase(*,original,plan,domain,protected_intervals,context):
+    from . import group_performer_family_owner as family
+    from .shot_video_clock import FrozenShotVideoClockContext,validate_authorized_shot_video_clocks
+    if (not isinstance(context,FrozenShotVideoClockContext)
+            or context.original_reference_plan is None or context.source_domain!=domain
+            or family.plan_payload(context.original_reference_plan)!=family.plan_payload(original)
+            or context.protected_output_intervals!=protected_intervals
+            or _global_header(context.incumbent_plan)!=_global_header(original)):
+        raise ValueError('external local clock lacks its matching original root and phase-zero context')
+    authorities=validate_authorized_shot_video_clocks(plan=plan,context=context)
+    for clock in plan.authorized_shot_video_clocks:
+        if (clock.first_output_frame,clock.end_output_frame) not in context.mutable_output_intervals:
+            raise ValueError('external local clock escaped its frozen whole-shot mutable scope')
+    if not authorities:
+        from .group_review_interval_compile import verify_realized_sampler
+        # A zero-phase programme can carry its root context without a local
+        # clock. It must then use EXACT phase-zero source times/native IDs.
+        # Deleting a nonzero clock is not permission to keep its retimed rows.
+        verify_realized_sampler(context.incumbent_plan,plan,domain,
+            tuple(t for first,end in context.mutable_output_intervals for t in range(first,end)),
+            require_source_request_time=True)
+    outside=[];cursor=0
+    for first,end in context.mutable_output_intervals:
+        if cursor<first:outside.append((cursor,first))
+        cursor=end
+    if cursor<original.output_frame_count:outside.append((cursor,original.output_frame_count))
+    # The new unretimed topology AND the actual retimed/camera programme must
+    # retain the root's entire exterior, including crop/roll/look, not only its
+    # source ordinals. Never strip clocks for these exact sampler comparisons.
+    _compare_spans(original,context.incumbent_plan,domain,tuple(outside))
+    _compare_spans(original,plan,domain,tuple(outside),clock_context=context)
+    _compare_spans(original,plan,domain,protected_intervals,clock_context=context)
+
+
 @dataclass(frozen=True, slots=True)
 class GroupExternalOriginalReference:
     original_bundle: Any
@@ -120,13 +174,23 @@ class GroupExternalOriginalReference:
         self.validate_original()
         if not isinstance(plan, RenderPlan) or getattr(bundle, 'render_plan', None) != plan:
             raise ValueError('external-reference candidate lost its complete owned GROUP plan')
-        self.validate_numeric_plan(plan)
+        context=None;production=getattr(bundle,'native_motion_production',None)
+        if production is not None or plan.authorized_shot_video_clocks:
+            from .group_joint_bundle_metadata import validate_native_motion_production
+            validate_native_motion_production(production,attached_bundle=bundle)
+            context=production.shot_clock_context
+        from .pipeline import _validate_review_first_group_bundle
+        _validate_review_first_group_bundle(bundle,eligible_indices=self.source_domain.eligible_indices,
+            offsets=self.source_domain.audio_offsets,timewarps=self.source_domain.source_timewarps,
+            common_start=self.original_bundle.render_plan.master_audio_start,
+            phrase_times=bundle.phrase_times,shot_clock_context=context)
+        self.validate_numeric_plan(plan,shot_clock_context=context)
         old = json.loads(self._frozen_preimage)['original_boundary_look']
         current = boundary_look_inventory(bundle.boundary_look_match, plan)
         if current['mode'] != old['mode']:
             raise ValueError('external original boundary-look policy forbids implicit creation/removal')
 
-    def validate_numeric_plan(self,plan):
+    def validate_numeric_plan(self,plan,*,shot_clock_context=None):
         """Exclude protected writes before selected feature/completion work.
 
         This does not admit look metadata, native duties, source freshness or
@@ -135,21 +199,19 @@ class GroupExternalOriginalReference:
         self.validate_original()
         if not isinstance(plan,RenderPlan):
             raise TypeError('external numeric preservation needs a complete RenderPlan')
-        if (_header(plan) != _header(self.original_bundle.render_plan)
-                or plan.authorized_shot_video_clocks
+        if (_global_header(plan) != _global_header(self.original_bundle.render_plan)
                 or any(t.kind.uses_overlap for t in plan.transitions)):
             raise ValueError('external reference common output/source clock authority changed')
-        if self.protected_output_intervals:
-            comparison = compare_group_reference_interval(reference=self.original_bundle.render_plan,
-                candidate=plan, reference_source_clocks=self.source_domain.clocks_by_request,
-                candidate_source_clocks=self.source_domain.clocks_by_request,
-                output_intervals=self.protected_output_intervals)
-            if not comparison.planned_parameters_preserved:
-                raise ValueError('candidate changed protected external source/clock/camera/look parameters')
+        if plan.authorized_shot_video_clocks or shot_clock_context is not None:
+            _validate_root_bound_phase(original=self.original_bundle.render_plan,plan=plan,
+                domain=self.source_domain,protected_intervals=self.protected_output_intervals,
+                context=shot_clock_context)
+        else:
+            _compare_spans(self.original_bundle.render_plan,plan,self.source_domain,self.protected_output_intervals)
 
 
 def validate_external_original_reference_payload(policy, *, plan, look, source_domain_payload,
-        source_identities, live_clocks=None):
+        source_identities, live_clocks=None,shot_clock_context_payload=None):
     """Re-derive the serialized root, actual tracks and protected native grid.
 
     The fresh parent ALSO compares this entire record to its actual external
@@ -186,8 +248,8 @@ def validate_external_original_reference_payload(policy, *, plan, look, source_d
                 or domain_payload != source_domain_payload
                 or policy['source_identities'] != source_identities
                 or family.boundary_look_inventory(look, plan)['mode'] != inventory['mode']
-                or _header(plan) != _header(original)
-                or original.authorized_shot_video_clocks or plan.authorized_shot_video_clocks
+                or _global_header(plan) != _global_header(original)
+                or original.authorized_shot_video_clocks
                 or any(t.kind.uses_overlap for t in (*original.transitions,*plan.transitions))
                 or not 1 <= original.output_frame_count <= 36000):
             raise ValueError('external original boundary-look/root/source authority changed')
@@ -196,11 +258,12 @@ def validate_external_original_reference_payload(policy, *, plan, look, source_d
             raise ValueError('external original lost its live native frame clocks')
         spans = tuple(tuple(span) for span in policy['protected_output_intervals'])
         _validate_protected_spans(spans, original.output_frame_count)
-        if spans:
-            comparison = compare_group_reference_interval(reference=original, candidate=plan,
-                reference_source_clocks=domain.clocks_by_request,
-                candidate_source_clocks=domain.clocks_by_request, output_intervals=spans)
-            if not comparison.planned_parameters_preserved:
-                raise ValueError('serialized candidate changed protected external reference parameters')
+        if plan.authorized_shot_video_clocks or shot_clock_context_payload is not None:
+            from .shot_video_clock import frozen_shot_video_clock_context_from_dict
+            context=frozen_shot_video_clock_context_from_dict(shot_clock_context_payload,source_domain=domain)
+            _validate_root_bound_phase(original=original,plan=plan,domain=domain,
+                protected_intervals=spans,context=context)
+        else:
+            _compare_spans(original,plan,domain,spans)
     except (KeyError, TypeError, IndexError) as exc:
         raise ValueError('external original policy lost its explicit root preimage') from exc

@@ -299,10 +299,16 @@ def validate_external_reference_binding(candidate, receipt, *, context=None):
     if policy is not None and receipt.get('external_original_selected_boundary_look_metadata') != (
             None if candidate.boundary_look_match is None else plain(candidate.boundary_look_match.to_dict())):
         raise ValueError('external policy selected look differs from the actual complete candidate')
+    production=getattr(candidate,'native_motion_production',None)
+    expected_clock_context=(None if production is None or production.shot_clock_context is None
+        else plain(production.shot_clock_context.to_dict()))
+    if production is not None and plain(receipt.get('external_original_shot_video_clock_context'))!=expected_clock_context:
+        raise ValueError('external policy clock context differs from the complete selected native production')
     validate_external_original_reference_payload(policy, plan=candidate.render_plan,
         look=candidate.boundary_look_match, source_domain_payload=receipt['source_domain'],
         source_identities=receipt['source_identities'],
-        live_clocks=None if context is None else context.domain.clocks_by_request)
+        live_clocks=None if context is None else context.domain.clocks_by_request,
+        shot_clock_context_payload=plain(receipt.get('external_original_shot_video_clock_context')))
 
 
 def _schedule(plan, domain):
@@ -621,6 +627,9 @@ def complete_candidate(context, camera_bundle):
             original_plan_sha256=digest(plan_payload(old.render_plan)),
             original_metadata_sha256=digest(metadata_payload(old)),
             external_original_reference=external_reference_binding(context, candidate),
+            external_original_shot_video_clock_context=(None if candidate.native_motion_production is None
+                or candidate.native_motion_production.shot_clock_context is None
+                else plain(candidate.native_motion_production.shot_clock_context.to_dict())),
             external_original_selected_boundary_look_metadata=None if candidate.boundary_look_match is None
                 else plain(candidate.boundary_look_match.to_dict()),
             source_domain=context.domain.to_dict(), synchronization_scores=list(context.sync_scores), source_identities=[list(v) for v in context.source_identities],
@@ -884,7 +893,8 @@ def _final_live_replay(plan_json, receipt, deadline):
     validate_external_original_reference_payload(plain(receipt.get('external_original_reference')),
         plan=plan, look=plain(receipt.get('external_original_selected_boundary_look_metadata')),
         source_domain_payload=raw, source_identities=receipt['source_identities'],
-        live_clocks=domain.clocks_by_request)
+        live_clocks=domain.clocks_by_request,
+        shot_clock_context_payload=plain(receipt.get('external_original_shot_video_clock_context')))
     session=GroupJointObservationSession(domain=domain,budget=JointGroupWorkBudget(
         absolute_deadline=deadline,maximum_new_decodes=MAX_NATIVE_READS))
     try:
