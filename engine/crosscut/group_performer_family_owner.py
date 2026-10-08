@@ -716,6 +716,9 @@ def propose_performer_family(context):
 
 def validate_bundle_binding(bundle):
     receipt = plain(getattr(bundle, 'performer_family_review', None))
+    if receipt is not None and receipt.get('contract') == 'selected_native_motion_complete_metadata_v1':
+        from .group_native_motion_metadata import validate_native_metadata_binding
+        return validate_native_metadata_binding(bundle)
     if receipt is not None and receipt.get('contract') == SOURCE_CONTRACT:
         from .group_source_changing_owner import validate_binding
         return validate_binding(bundle)

@@ -27538,6 +27538,7 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
         elif shot_clock_context!=production.shot_clock_context:
             raise ValueError('selected native program borrowed another local video clock context')
     authorized_clocks = {}
+    rooted_exterior_clocks = {}
     if plan.authorized_shot_video_clocks:
         from .shot_video_clock import FrozenShotVideoClockContext, validate_authorized_shot_video_clocks
         if (not isinstance(shot_clock_context, FrozenShotVideoClockContext)
@@ -27547,6 +27548,33 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
                 or shot_clock_context.incumbent_plan.master_audio_start != common_start):
             raise ValueError('GROUP local video clock lacks matching external parent alignment context')
         authorized_clocks = validate_authorized_shot_video_clocks(plan=plan, context=shot_clock_context)
+    # A variable-topology native edit slices the ORIGINAL Tier-D decoder unit.
+    # Its untouched cells therefore keep that unit's quantized sampler origin,
+    # rather than independently recalculating a global audio/warp origin for
+    # every new cell. Accept only an externally rooted phase-zero context that
+    # has independently replayed the COMPLETE exterior and protected grid.
+    # This is not permission for a producer to supply arbitrary source times.
+    if (shot_clock_context is not None
+            and getattr(shot_clock_context, 'original_reference_plan', None) is not None):
+        from .shot_video_clock import FrozenShotVideoClockContext
+        from .group_external_original_reference import _validate_root_bound_phase
+        from .render import segment_frame_counts
+        if (not isinstance(shot_clock_context, FrozenShotVideoClockContext)
+                or shot_clock_context.source_domain.request_sources != plan.sources
+                or shot_clock_context.source_domain.eligible_indices != tuple(eligible_indices)
+                or shot_clock_context.source_domain.audio_offsets != tuple(offsets)
+                or shot_clock_context.source_domain.source_timewarps != tuple(timewarps)
+                or shot_clock_context.incumbent_plan.master_audio_start != common_start):
+            raise ValueError('GROUP preserved sampler lacks its typed external root context')
+        _validate_root_bound_phase(original=shot_clock_context.original_reference_plan,
+            plan=plan, domain=shot_clock_context.source_domain,
+            protected_intervals=shot_clock_context.protected_output_intervals, context=shot_clock_context)
+        cursor = 0
+        for index, count in enumerate(segment_frame_counts(plan)):
+            end = cursor+count
+            if not any(a < end and b > cursor for a, b in shot_clock_context.mutable_output_intervals):
+                rooted_exterior_clocks[index] = shot_clock_context.incumbent_plan.segments[index]
+            cursor = end
     if len(plan.segments) != len(timeline.choices):
         raise ValueError('GROUP timeline/render cardinality changed')
     if (bundle.phrase_times is None or phrase_times is not None
@@ -27631,6 +27659,14 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
                 source_start=authority.source_start+(expected.master_start-
                     (authority.reference_start-plan.master_audio_start))*authority.source_rate,
                 source_duration=expected.duration*authority.source_rate)
+        elif index in rooted_exterior_clocks:
+            preserved = rooted_exterior_clocks[index]
+            if (preserved.source_index != expected.source_index
+                    or abs(preserved.master_start-expected.master_start)>1e-6
+                    or abs(preserved.duration-expected.duration)>1e-6):
+                raise ValueError('GROUP preserved root sampler differs from its canonical source/cadence')
+            expected = replace(expected, source_start=preserved.source_start,
+                source_duration=preserved.source_duration)
         if (type(segment.source_index) is not int or segment.source_index != expected.source_index
                 or any(abs(getattr(segment, name)-getattr(expected, name)) > 1e-6
                 for name in ('master_start', 'source_start', 'duration', 'source_end'))

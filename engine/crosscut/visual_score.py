@@ -3471,6 +3471,24 @@ class VisualTimelinePlan:
             object.__setattr__(self, 'actual_epoch_clock', _freeze_audit_value(self.actual_epoch_clock))
 
     def to_dict(self) -> dict[str, Any]:
+        if self.analysis_basis == 'selected_native_motion_fresh_timeline_v1':
+            return {
+                'analysis_basis': self.analysis_basis, 'optimizer_score': self.optimizer_score,
+                'selected_candidate_index': self.selected_candidate_index,
+                'candidate_generation_basis': self.candidate_generation_basis,
+                'candidate_count': 1, 'candidate_review_summaries': [],
+                'source_clock_basis': self.source_clock_basis, 'geometry_basis': self.geometry_basis,
+                'observation_policy': {
+                    'geometry': 'exact_selected_native_actor_occurrence_reprojection_no_reselection',
+                    'numeric_quality': 'actual_projected_pixel_sharpness_exposure_contrast_not_professional_quality',
+                    'actor_identity': 'source_local_selected_path_hypothesis_not_identity_certificate',
+                    'unknown_actor': 'null_no_salience_or_nearest_frame_fallback',
+                    'body_visibility': None, 'motion_phase': None,
+                    'optimizer_score': 'retained_selector_history_not_new_camera_quality',
+                    'dissolve_proof': 'not_produced', 'quality_approved': False,
+                },
+                'choices': [choice.to_dict() for choice in self.choices],
+            }
         if self.analysis_basis == 'normal_interval_global_native_pixel_observations_v1':
             from .visual_boundary_repair import _thaw_audit_value
             return {
