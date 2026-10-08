@@ -321,3 +321,67 @@ def test_native_run_link_ignores_editorial_query_boundaries_and_uses_native_head
     b['descriptor']=replace(b['descriptor'],head_center=(.9,.8),face_height=.4)
     linked=_link(a,b,maximum_native_gap=12,minimum_cosine=.25)
     assert linked['linked'] and linked['measured_camera_local_spatial_cost']==pytest.approx(0.)
+
+
+@pytest.mark.parametrize('anchor_index',[0,5])
+def test_fixed_anchor_cannot_reset_identity_through_one_missing_frame(anchor_index):
+    frames=[[view(0,0)],[],*[ [view(t,1)] for t in range(2,6)]]
+    if anchor_index==5:frames=list(reversed(frames))
+    for t,frame in enumerate(frames):
+        for v in frame:
+            v['row']['output_tick']=t;v['row']['native_observation']['native_frame_index']=t
+    anchor=frames[anchor_index][0]
+    path=anchored_review_actor_paths(frames,independent_anchor=anchor,anchor_frame_index=anchor_index,
+        fixed_anchor_occurrence=True)[0]
+    assert sum(v is not None for v in path['observations'])==1
+    assert path['observations'][anchor_index] is anchor
+
+
+def test_short_occlusion_reacquires_the_actual_same_actor_without_filling_missing_pose():
+    frames=[[view(0,0)],[],[view(2,0)],[view(3,0)]]
+    path=anchored_review_actor_paths(frames,independent_anchor=frames[0][0],anchor_frame_index=0,
+        fixed_anchor_occurrence=True)[0]
+    assert path['frame_local_head_ids']==(0,None,0,0)
+    assert not path['all_sampled_frames_connected'] and path['missing_frames']==1
+
+
+def test_long_future_track_cannot_amortize_a_one_frame_teleport():
+    from dataclasses import replace
+    frames=[[view(t,0,t)] for t in range(40)]
+    for t,frame in enumerate(frames):
+        v=frame[0];v['descriptor']=replace(v['descriptor'],face_height=.1,face_width=.06,
+            head_center=(.39,.43) if t==0 else (.70,.67))
+    path=anchored_review_actor_paths(frames,independent_anchor=frames[0][0],anchor_frame_index=0,
+        fixed_anchor_occurrence=True,maximum_frames=64)[0]
+    assert path['observations'][1] is None
+
+
+def test_occlusion_expanded_state_costs_and_marginals_match_exhaustive_connected_paths():
+    from itertools import product
+    from crosscut.group_review_actor_path import _link
+    frames=[[view(0,0)],[],[view(2,0,1),view(2,1,2)],[view(3,0,3),view(3,1,4)]]
+    seed=frames[0][0];possibilities=[]
+    for tail in product(*(frame+[None] for frame in frames[1:])):
+        sequence=(seed,*tail);last=seed;current=seed;cost=0.;valid=True
+        for v in tail:
+            if v is None:cost+=3.
+            else:
+                link=_link(last,v,maximum_native_gap=12,minimum_cosine=.25)
+                if link is None or not link['linked']:valid=False;break
+                cost+=link['cost']+(1.5 if current is None else 0.);last=v
+            current=v
+        if valid:possibilities.append((cost,sequence))
+    path=anchored_review_actor_paths(frames,independent_anchor=seed,anchor_frame_index=0,
+        fixed_anchor_occurrence=True)[0]
+    assert path['cost']==pytest.approx(min(c for c,_ in possibilities))
+    for i,v in enumerate(path['observations']):
+        alternative=min((c for c,s in possibilities if s[i] is not v),default=None)
+        if alternative is None:assert path['frame_competing_margins'][i] is None
+        else:assert path['frame_competing_margins'][i]==pytest.approx(alternative-path['cost'])
+
+
+def test_expired_occlusion_does_not_reacquire_an_actor_without_observed_bridge():
+    frames=[[view(0,0)],*[[] for _ in range(12)],[view(13,0)],[view(14,0)]]
+    path=anchored_review_actor_paths(frames,independent_anchor=frames[0][0],anchor_frame_index=0,
+        fixed_anchor_occurrence=True)[0]
+    assert all(v is None for v in path['observations'][1:])

@@ -69,6 +69,13 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
     if not reacquired:
         ac,ah=_native_head_geometry(left);bc,bh=_native_head_geometry(right)
         distance=math.hypot(bc[0]-ac[0],(bc[1]-ac[1])*9/16)
+        # A long future sequence of a different foreground person must not
+        # amortize an instantaneous cross-frame teleport. This deliberately
+        # broad native-raster displacement bound scales with observed gap and
+        # head extent. Real camera cuts are handled by explicit reacquisition.
+        # An excluded link leaves an unmatched slot, not an identity verdict.
+        if distance>.06*max(1,b[2]-a[2])+.4*(ah+bh):
+            return None
         spatial=.4*distance/(.12+(ah+bh)/2)
         spatial+=.2*abs(math.log(bh/ah))
     return dict(cost=2.*max(0.,1.-sim)+spatial+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.),
@@ -207,52 +214,72 @@ def anonymous_review_actor_paths(frames, *, maximum_paths=2, maximum_heads=4,
 
 def _fixed_anchor_chain(rows, seed, anchor_index, *, key, maximum_native_gap,
         minimum_cosine, known_native_camera_cut_edges, work_port):
-    """Exact min-sum chain and per-frame alternatives, without path copying.
+    """Exact anchor-conditioned paths with last-observed state over occlusion.
 
-    A rival at an unrelated missing/occluded instant must not declare every
-    observed instant ambiguous. Forward/backward min-marginals retain the
-    best WHOLE path containing each possible occurrence, not a local face max.
+    A NULL slot cannot reset identity. Both temporal directions retain the last
+    actual occurrence and must pay a measured link to reacquire another head.
+    Once the maximum native gap expires, that branch stays unmatched. Missing
+    anatomy is never interpolated; per-frame whole-path marginals still expose
+    ambiguous reacquisition without erasing independently known earlier frames.
     """
-    choices = list(rows)
-    choices[anchor_index] = (seed,)
-    unary = [[1.5 if v is None else 0. for v in row] for row in choices]
-    edges = []
-    for i in range(1, len(choices)):
-        if work_port is not None:
-            work_port.charge('association_edges', len(choices[i-1])*len(choices[i]))
-        edges.append([[_link(a,b,maximum_native_gap=maximum_native_gap,
-            minimum_cosine=minimum_cosine,observed_native_camera_cut=i in known_native_camera_cut_edges)
-            for b in choices[i]] for a in choices[i-1]])
-    if work_port is not None:
-        work_port.charge('association_nodes', sum(map(len, choices)))
-    forward=[unary[0]];parents=[[-1]*len(choices[0])]
-    for i in range(1,len(choices)):
-        costs=[];previous=[]
-        for j in range(len(choices[i])):
-            options=[(forward[i-1][k]+edge['cost']+unary[i][j],k)
-                for k,row in enumerate(edges[i-1]) if (edge:=row[j]) is not None]
-            cost,prior=min(options,default=(math.inf,-1))
-            costs.append(cost);previous.append(prior)
-        forward.append(costs);parents.append(previous)
-    index=min(range(len(choices[-1])),key=lambda j:(forward[-1][j],key(choices[-1][j])))
-    cost=forward[-1][index]
-    if not math.isfinite(cost):return None
-    indices=[index]
-    for i in range(len(choices)-1,0,-1):indices.append(parents[i][indices[-1]])
-    indices.reverse()
-    backward=[[0.]*len(row) for row in choices]
-    for i in range(len(choices)-2,-1,-1):
-        for j in range(len(choices[i])):
-            backward[i][j]=min((edge['cost']+unary[i+1][k]+backward[i+1][k]
-                for k,edge in enumerate(edges[i][j]) if edge is not None),default=math.inf)
-    margins=[]
-    for i,row in enumerate(choices):
-        alternative=min((forward[i][j]+backward[i][j] for j in range(len(row))
-            if j!=indices[i]),default=math.inf)
-        margins.append(None if not math.isfinite(alternative) else max(0.,alternative-cost))
-    views=tuple(row[j] for row,j in zip(choices,indices))
-    return dict(cost=cost,views=views,tie=tuple(key(v) for v in views),frame_margins=tuple(margins),
-        visited_states=sum(map(len,choices)))
+    def extend(order):
+        # State = last observed row/head, plus whether THIS frame is observed.
+        layers=[{(anchor_index,key(seed)):(seed,seed)}]
+        forward=[{(anchor_index,key(seed)):0.}];parents=[{}];edges=[]
+        for i in order:
+            layer={};costs={};back={};links=[]
+            for token,(last,current) in layers[-1].items():
+                for candidate in rows[i]:
+                    if candidate is None:
+                        # Retaining the last observation distinguishes A,NULL
+                        # from B,NULL. Identical NULL states must not merge them.
+                        target=token;last_after=last;edge_cost=3.
+                        measured=next((v for v in rows[i] if v is not None),None)
+                        if last is None or measured is not None and abs(
+                                _address(measured)[2]-_address(last)[2])>maximum_native_gap:
+                            target=(-1,'expired');last_after=None
+                    else:
+                        if last is None:continue
+                        a,b=(candidate,last) if i<anchor_index else (last,candidate)
+                        cut=any(min(i,token[0])<c<=max(i,token[0]) for c in known_native_camera_cut_edges)
+                        link=_link(a,b,maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,
+                            observed_native_camera_cut=cut)
+                        if link is None or not link['linked']:continue
+                        edge_cost=link['cost']+(1.5 if current is None else 0.)
+                        target=(i,key(candidate));last_after=candidate
+                    # Distinguish a currently observed occurrence from a NULL
+                    # descendant of that occurrence in this same layer.
+                    layer[target]=(last_after,candidate)
+                    cost=forward[-1][token]+edge_cost
+                    links.append((token,target,edge_cost))
+                    if target not in costs or cost<costs[target]:costs[target]=cost;back[target]=token
+            if work_port is not None:
+                work_port.charge('association_nodes',len(layer));work_port.charge('association_edges',len(links))
+            if not layer:return None
+            layers.append(layer);forward.append(costs);parents.append(back);edges.append(links)
+        if not order:return dict(cost=0.,views={},margins={},visited=1)
+        token=min(forward[-1],key=lambda t:(forward[-1][t],t));best=forward[-1][token]
+        selected=[token]
+        for i in range(len(order),0,-1):selected.append(parents[i][selected[-1]])
+        selected.reverse();suffix=[{t:0. for t in layer} for layer in layers]
+        for i in range(len(order)-1,-1,-1):
+            suffix[i]={t:math.inf for t in layers[i]}
+            for source,target,cost in edges[i]:
+                suffix[i][source]=min(suffix[i][source],cost+suffix[i+1][target])
+        views={};margins={}
+        for n,i in enumerate(order,1):
+            chosen=layers[n][selected[n]][1];views[i]=chosen
+            alternative=min((forward[n][t]+suffix[n][t] for t,(_,v) in layers[n].items()
+                if key(v)!=key(chosen)),default=math.inf)
+            margins[i]=None if not math.isfinite(alternative) else max(0.,alternative-best)
+        return dict(cost=best,views=views,margins=margins,visited=sum(map(len,layers)))
+    left=extend(tuple(range(anchor_index-1,-1,-1)));right=extend(tuple(range(anchor_index+1,len(rows))))
+    if left is None or right is None:return None
+    values={anchor_index:seed,**left['views'],**right['views']}
+    margins={anchor_index:None,**left['margins'],**right['margins']}
+    views=tuple(values[i] for i in range(len(rows)))
+    return dict(cost=left['cost']+right['cost'],views=views,tie=tuple(key(v) for v in views),
+        frame_margins=tuple(margins[i] for i in range(len(rows))),visited_states=left['visited']+right['visited']-1)
 
 
 def anchored_review_actor_paths(frames, *, independent_anchor, anchor_frame_index,
@@ -386,7 +413,7 @@ def anchored_review_actor_paths(frames, *, independent_anchor, anchor_frame_inde
             ambiguity_scope='independent_original_anchor_and_bidirectional_path_history',
             missing_frames=sum(v is None for v in chosen['views']),hypothesis_sha256=digest(chosen['tie']),
             visited_states=visited,head_inventory_truncated=heads_truncated,association_beam_truncated=beam_truncated,
-            temporal_optimizer=('exact_fixed_anchor_forward_backward_min_marginals_v1' if fixed is not None
+            temporal_optimizer=('exact_fixed_anchor_last_observed_gap_min_marginals_v2' if fixed is not None
                 else 'exact_top_two_histories_per_conditioned_endpoint_v1'),
             anchor_path_budget_excluded=anchor_budget_excluded,
             complete_competing_inventory_measured=not(heads_truncated or beam_truncated or anchor_budget_excluded),

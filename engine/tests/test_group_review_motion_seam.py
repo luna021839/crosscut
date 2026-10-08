@@ -28,6 +28,19 @@ def test_same_pose_but_reversed_action_is_worse_than_continuing_action():
     assert b['exploration_cost'] > a['exploration_cost']
 
 
+def test_native_actor_motion_stays_connected_across_authored_camera_queries():
+    from crosscut.group_review_motion_seam import review_window_connected
+    rows=[view(t,t*.1) for t in range(4)]
+    for t,v in enumerate(rows):
+        v['native_camera_unit_index']=9
+        v['row']['projection']['camera_sha256']=f'authored-pan-query-{t}'
+    assert review_window_connected(rows,require_native_motion=True)
+    rows[2]['native_camera_unit_index']=10
+    assert not review_window_connected(rows,require_native_motion=True)
+    rows[2].pop('native_camera_unit_index')
+    assert not review_window_connected(rows,require_native_motion=True)
+
+
 def head_view(tick,angle):
     v=view(tick,0.);v['descriptor']=replace(v['descriptor'],pose_shape=None)
     v['row']['projection']['heads'][0]['projected_landmarks_xy'][2][0]=.5+angle*.1

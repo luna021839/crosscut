@@ -9,6 +9,36 @@ from crosscut.group_review_two_shot_camera import (realize_review_two_shot_camer
     fit_review_temporal_camera_corridor,measure_review_partial_joint_trajectory)
 from crosscut.render import EditorialTransformKeyframe
 from crosscut.group_review_projected_action import measure_review_partial_screen_trajectory
+from crosscut.group_review_two_shot_camera import realize_review_focal_pair
+
+
+def test_focal_pair_scores_the_exact_render_tracks_without_automatic_zoom_release():
+    points={0:(.4,.5),1:(.6,.5),2:(.4,.6),3:(.6,.6),4:(.4,.4),5:(.6,.4)}
+    ticks=(13,14,15,16,17)
+    key=EditorialTransformKeyframe(0.,1.5)
+    tracks,receipt=realize_review_focal_pair(left_key=key,right_key=key,
+        left_support=[tuple(points.values())]*5,right_support=[tuple(points.values())]*5,
+        left_motion=[points]*5,right_motion=[points]*5,motion_ticks=ticks,
+        first=10,boundary=15,end=20,fps=30.,boundary_fit=dict(geometry_score=0.,
+            log_face_scale_error=0.,projected_head_center_error=0.))
+    assert tracks and all(k.zoom==1.5 for t in tracks for k in t.keyframes)
+    assert receipt['screen_motion']['exploration_score']==pytest.approx(0.)
+    assert receipt['exploration_cost']==pytest.approx(0.)
+    assert not receipt['automatic_zoom_release']
+    assert receipt['left_camera']['keyframes'][0]['zoom']==tracks[0].keyframes[0].zoom
+    assert not receipt['camera_refit_after_selection_permitted']
+
+
+def test_focal_pair_keeps_unknown_support_and_face_size_jump_in_its_score():
+    points={0:(.4,.5),1:(.6,.5),4:(.4,.4)}
+    args=dict(left_key=EditorialTransformKeyframe(0.,1.5),right_key=EditorialTransformKeyframe(0.,1.5),
+        left_support=[None]*5,right_support=[None]*5,left_motion=[points]*5,right_motion=[points]*5,
+        motion_ticks=(13,14,15,16,17),first=10,boundary=15,end=20,fps=30.)
+    _,good=realize_review_focal_pair(**args,boundary_fit=dict(geometry_score=0.,log_face_scale_error=0.,projected_head_center_error=0.))
+    _,bad=realize_review_focal_pair(**args,boundary_fit=dict(geometry_score=.25,log_face_scale_error=.4,projected_head_center_error=.1))
+    assert bad['exploration_cost']==pytest.approx(good['exploration_cost']+2.2)
+    assert all(not r['complete_support_certified'] for r in bad['support'])
+    assert not bad['full_action_certified'] and not bad['quality_approved']
 
 
 def test_opposite_screen_root_motion_is_not_erased_by_equal_relative_arm_shapes():

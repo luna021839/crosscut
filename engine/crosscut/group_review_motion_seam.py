@@ -46,7 +46,11 @@ def _window_links(sequence):
         if (ra['native_frame_index']==rb['native_frame_index']
                 and left['descriptor'].frame_local_head_id!=right['descriptor'].frame_local_head_id):
             return False
-        if (a['projection']['camera_sha256']!=b['projection']['camera_sha256']
+        native_a,native_b=left.get('native_camera_unit_index'),right.get('native_camera_unit_index')
+        same_camera=(native_a==native_b if type(native_a) is int and type(native_b) is int
+            else native_a is None and native_b is None
+            and a['projection']['camera_sha256']==b['projection']['camera_sha256'])
+        if (not same_camera
                 or rb['native_frame_index']-ra['native_frame_index']>12):
             return False
         appearance=cosine(left['vector'],right['vector'])

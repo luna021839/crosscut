@@ -13,6 +13,7 @@ from .group_performer_family_owner import digest
 from .group_review_camera_repair import fit_whole_camera_track,transformed_descriptor,geometry_cost
 from .group_review_camera_repair import project_review_editorial_point
 from .group_review_projected_action import fit_review_anatomical_keys
+from .group_review_projected_action import measure_review_partial_screen_trajectory
 from .render import EditorialTransformKeyframe,EditorialTransformTrack
 
 
@@ -414,6 +415,81 @@ def _joint_target(left,right,maximum_zoom):
         left.head_roll_radians+math.remainder(right.head_roll_radians-left.head_roll_radians,2*math.pi)/2)
     return replace(left,head_center=destination,face_height=height,face_width=height*aspect,
         body_box=None,pose_shape=None,head_roll_radians=roll)
+
+
+def realize_review_focal_pair(*, left_key, right_key, left_support, right_support,
+        left_motion, right_motion, motion_ticks, first, boundary, end, fps,
+        boundary_fit, maximum_camera_families=1):
+    """Realize, then score the SAME cameras on both sides of a focal cut.
+
+    A held editorial crop is the first physical hypothesis: it retains the
+    source's camera movement instead of always releasing a close-up to wide.
+    If known support leaves that crop, the existing bounded temporal corridor
+    supplies a separate, fully realized hypothesis. Neither missing support
+    nor an exploratory cost is a quality/adoption certificate.
+
+    ``left_motion`` and ``right_motion`` are neutral-camera observations on
+    one common output-time inventory, including counterfactual halo samples.
+    Camera evaluation clamps to the authored shot endpoints in that halo.
+    The returned tracks, not a later refit, are the render inputs.
+    """
+    if (any(type(t) is not int for t in (first,boundary,end)) or not first<boundary<end
+            or not 2<=boundary-first<=160 or not 2<=end-boundary<=160
+            or len(left_support)!=boundary-first or len(right_support)!=end-boundary
+            or not isinstance(left_key,EditorialTransformKeyframe)
+            or not isinstance(right_key,EditorialTransformKeyframe)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0
+            or maximum_camera_families!=1 or not isinstance(boundary_fit,dict)):
+        raise ValueError('focal realization needs exact shot, support and camera bounds')
+    required=('geometry_score','log_face_scale_error','projected_head_center_error')
+    if any(type(boundary_fit.get(k)) not in (int,float) or not math.isfinite(boundary_fit[k])
+            or boundary_fit[k]<0 for k in required):
+        raise ValueError('focal realization needs actual endpoint geometry')
+    tracks=[];receipts=[]
+    for key,support,n in ((left_key,left_support,boundary-first),(right_key,right_support,end-boundary)):
+        for points in support:
+            if points is not None and (not isinstance(points,(list,tuple)) or len(points)>32
+                    or any(len(p)!=2 or any(type(v) not in (int,float) or not math.isfinite(v)
+                        or not 0<=v<=1 for v in p) for p in points)):
+                raise ValueError('focal support must keep its actual observed frame')
+        keys=tuple(replace(key,time_seconds=i/fps) for i in range(n))
+        legal=all(all(-1e-9<=v<=1+1e-9 for v in project_review_editorial_point(p,k))
+            for k,points in zip(keys,support) for p in (points or ()))
+        if legal:
+            track=EditorialTransformTrack(keys,reason='held_focal_crop_preserves_native_camera_motion')
+            receipt=dict(selected_camera_path_family='held_native_camera',whole_path_cost=0.,frames=n,
+                maximum_camera_vector_step=0.,maximum_camera_vector_second_difference=0.,
+                unmeasured_support_frame_indices=[i for i,p in enumerate(support) if not p],
+                complete_support_certified=all(bool(p) for p in support),quality_approved=False)
+        else:
+            track,receipt=fit_review_temporal_camera_corridor(keys,observed_points_by_frame=support,
+                locked_indices=(n-1,) if len(tracks)==0 else (0,),fps=fps)
+        if track is None:return None,dict(state='UNREALIZABLE',support=receipts+[receipt],quality_approved=False)
+        tracks.append(track);receipts.append(receipt)
+    left_track,right_track=tracks
+    def project(points,track,start,n):
+        return [{j:project_review_editorial_point(p,track.evaluate(max(0,min(n-1,t-start))/fps))
+            for j,p in frame.items()} for t,frame in zip(motion_ticks,points)]
+    relative=measure_review_partial_joint_trajectory(left_motion,right_motion,ticks=motion_ticks,fps=fps)
+    screen=measure_review_partial_screen_trajectory(
+        project(left_motion,left_track,first,boundary-first),
+        project(right_motion,right_track,boundary,end-boundary),ticks=motion_ticks,fps=fps)
+    instability=2*max(r['maximum_camera_vector_step'] for r in receipts)+4*max(
+        r['maximum_camera_vector_second_difference'] for r in receipts)+.05*sum(
+        r['whole_path_cost']/r['frames'] for r in receipts)
+    # Anatomical scale/position remain distinct from normalized pose. A good
+    # arm shape cannot erase a large visible face jump in an additive score.
+    geometry=2.5*boundary_fit['log_face_scale_error']+12*boundary_fit['projected_head_center_error']
+    cost=relative['exploratory_cost_interval'][1]+screen['exploratory_cost_interval'][1]+geometry+instability
+    receipt=dict(contract='fully_realized_focal_pair_exploration_v1',state='REALIZED',
+        first=first,boundary=boundary,end=end,left_camera=asdict(left_track),right_camera=asdict(right_track),
+        boundary_fit=boundary_fit,support=receipts,native_motion=relative,screen_motion=screen,
+        geometry_cost=geometry,camera_instability=instability,exploration_cost=cost,
+        camera_refit_after_selection_permitted=False,automatic_zoom_release=False,
+        measured_motion_camera_scope='actual_authored_tracks_with_endpoint_clamped_halo',
+        missing_support_is_pass=False,full_action_certified=False,quality_approved=False)
+    receipt['realization_identity']=digest(receipt)
+    return (left_track,right_track),receipt
 
 
 def realize_review_two_shot_camera_pair(left_views,right_views,*,first,boundary,end,fps,
