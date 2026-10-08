@@ -56,11 +56,22 @@ def focal_extent(face):
     return center, size
 
 
-def coupled_focal_cameras(a, b, *, maximum_zoom=2.):
+def coupled_focal_cameras(a, b, *, maximum_zoom=2., minimum_extent=0.):
+    """Match focal geometry without overriding a predeclared close-up floor.
+
+    Output-space joint residuals legitimately decrease when both subjects
+    become smaller. That numeric advantage must not silently choose the shot
+    size: the caller can freeze its intended five-landmark RMS floor BEFORE
+    evaluating alternatives. An infeasible floor stays infeasible.
+    """
+    if (type(minimum_extent) not in (int,float) or not math.isfinite(minimum_extent)
+            or minimum_extent < 0):
+        raise ValueError('authored focal extent floor must be a finite nonnegative measurement')
     ac, sa = focal_extent(a['face'])
     bc, sb = focal_extent(b['face'])
     common = shared_focal_extent_domain(centers=(tuple(ac), tuple(bc)),
-        extents=(sa, sb), maximum_zoom=maximum_zoom, minimum_extent=1.12*max(sa, sb))
+        extents=(sa, sb), maximum_zoom=maximum_zoom,
+        minimum_extent=max(minimum_extent,1.12*max(sa, sb)))
     if common is None:
         return None
     target = np.clip(np.array((.5, .42)), common['lower'], common['upper'])
@@ -103,7 +114,7 @@ def project_focal_observation(row, camera):
 def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, roles,
         lookup, native_at, source_native_cuts, pose_model_identity, fps,
         cut_radius=2, phases=(-2, 0, 2), budget=ObservedProgrammeBudget(),
-        boundary_cameras=None):
+        boundary_cameras=None, focal_extent_floors=None):
     """Select one finite observed programme, leaving unknown terms unknown.
 
     ``lookup(source,tick,phase,role)`` must be cache-only, source/role frozen.
@@ -112,6 +123,9 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
     Entry/return are NOT declared pose matches; the caller owns their review.
     An optional retained first/last camera is frozen before selection and used
     in every complete grid, never refitted after the chosen programme returns.
+    Optional focal floors name the predeclared cut CENTERS, so every phase or
+    nearby-cut alternative for that layer uses the same editorial shot intent.
+    Floors measure actual boundary landmarks, not unobserved interior anatomy.
     """
     if (type(first) is not int or type(end) is not int or not 0 <= first < end
             or end-first > 1200 or type(cut_radius) is not int or not 0 <= cut_radius <= 3
@@ -131,6 +145,14 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
     for cuts in source_native_cuts.values():
         if tuple(cuts) != tuple(sorted(set(cuts))) or any(type(n) is not int or n < 0 for n in cuts):
             raise ValueError('observed programme native cuts must be exact ordered ordinals')
+    if focal_extent_floors is None:
+        focal_extent_floors = {}
+    if (type(focal_extent_floors) is not dict
+            or any(type(k) is not int or k not in cut_centers for k in focal_extent_floors)
+            or any(type(v) not in (int,float) or not math.isfinite(v) or v < 0
+                for v in focal_extent_floors.values())):
+        raise ValueError('authored focal floors must name declared cut centers with finite extent measurements')
+    authored_floors = {k:float(v) for k,v in focal_extent_floors.items()}
     if boundary_cameras is None:
         boundary_cameras = {}
     if type(boundary_cameras) is not dict or set(boundary_cameras) - {'first', 'last'}:
@@ -195,7 +217,8 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
                         if any(r is None for r in (*a, *b)):
                             unknown += 1
                             continue
-                        cameras = coupled_focal_cameras(a[-1], b[0], maximum_zoom=budget.maximum_zoom)
+                        cameras = coupled_focal_cameras(a[-1], b[0], maximum_zoom=budget.maximum_zoom,
+                            minimum_extent=authored_floors.get(center,0.))
                         if cameras is None:
                             continue
                         ap = [project_focal_observation(r, cameras[0]) for r in a]
@@ -220,6 +243,7 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
                         seam = dict(output_tick=cut, seconds=cut/fps, left=a[-1], right=b[0],
                             left_source=state['source'], right_source=source, actual_fixed_inventory_incident=proof,
                             face_scale_basis='actual_five_landmark_rms', named_identity_certified=False,
+                            authored_focal_extent_floor=authored_floors.get(center,0.),
                             body_ownership_certified=False, quality_approved=False)
                         next_beam.append(dict(score=state['score']+amount+.001*abs(cut-center)+.001*abs(phase),
                             source=source, phase=phase, first=cut, start=b[0], start_camera=cameras[1],
@@ -266,4 +290,7 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
         attempted_incidents=attempted, beam_width=budget.beam_width, completion_retries=0,
         new_model_calls=0, camera_refit_after_selection=False, normal_app_admitted=False,
         retained_boundary_cameras={k:list(v) for k,v in retained.items()},
+        authored_focal_extent_floors=authored_floors,
+        focal_floors_applied_before_cost=True,
+        focal_floor_is_boundary_measurement_not_unobserved_hold_guarantee=True,
         full_hold_action_certified=False, entry_return_pose_certified=False, professional_quality_approved=False)

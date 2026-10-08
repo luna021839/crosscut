@@ -125,3 +125,53 @@ def test_unrealizable_size_ratio_and_bad_camera_numbers_stay_declined():
 def test_invalid_resource_domain_is_not_implicitly_relaxed(budget):
     with pytest.raises(ValueError, match='budget'):
         ObservedProgrammeBudget(**budget)
+
+
+def test_authored_closeup_floor_does_not_buy_lower_action_cost_by_shrinking_faces():
+    a,b=observation(0,30,size=.035),observation(1,31,size=.045)
+    old=coupled_focal_cameras(a,b)
+    baseline=focal_extent(project_focal_observation(a,old[0])[0])[1]
+    floor=baseline*1.2
+    cameras=coupled_focal_cameras(a,b,minimum_extent=floor)
+    assert cameras is not None
+    sizes=[focal_extent(project_focal_observation(r,c)[0])[1] for r,c in zip((a,b),cameras)]
+    assert min(sizes)>=floor-1e-12
+    assert abs(sizes[0]-sizes[1])<1e-12
+
+
+def test_impossible_authored_size_is_not_clamped_to_a_wider_shot():
+    a,b=observation(0,30,size=.035),observation(1,31,size=.045)
+    assert coupled_focal_cameras(a,b,minimum_extent=1.) is None
+    with pytest.raises(ObservedProgrammeUnresolved):
+        select(focal_extent_floors={35:1.})
+
+
+def test_one_layer_floor_is_frozen_for_every_nearby_cut_and_phase():
+    floor=.05
+    authored={35:floor,58:floor}
+    result=select(focal_extent_floors=authored)
+    authored[35]=10.
+    assert result['authored_focal_extent_floors']=={35:floor,58:floor}
+    assert result['focal_floors_applied_before_cost'] is True
+    assert result['focal_floor_is_boundary_measurement_not_unobserved_hold_guarantee'] is True
+    for seam in result['seams']:
+        t=seam['output_tick']
+        for row,tick in ((seam['left'],t-1),(seam['right'],t)):
+            actual=focal_extent(project_focal_observation(row,result['cameras'][tick]['camera'])[0])[1]
+            assert actual>=floor-1e-12
+        assert seam['authored_focal_extent_floor']==floor
+        assert seam['actual_fixed_inventory_incident']['full_action_certified'] is False
+
+
+@pytest.mark.parametrize('floors',[
+    {36:.05},{True:.05},{35:True},{35:float('nan')},{35:float('inf')},{35:-.01},[(35,.05)],
+])
+def test_bad_or_undeclared_focal_floor_cannot_change_the_original_selection_domain(floors):
+    with pytest.raises(ValueError,match='focal floors'):
+        select(focal_extent_floors=floors)
+
+
+@pytest.mark.parametrize('floor',[True,float('nan'),float('inf'),-.01])
+def test_bad_pair_focal_floor_cannot_be_silently_ignored(floor):
+    with pytest.raises(ValueError,match='focal extent floor'):
+        coupled_focal_cameras(observation(0,30),observation(1,31),minimum_extent=floor)
