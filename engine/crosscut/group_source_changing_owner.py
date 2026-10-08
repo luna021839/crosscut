@@ -1068,7 +1068,7 @@ class NativeFamilySensors:
         from .group_joint_primitive_journal import primitive_reservation_bytes
         from .request_work_lease import current_request_work_phase
         from .group_native_motion_completion_schedule import (validate_completion_packages,
-            coherent_completion_schedule)
+            coherent_completion_schedule,NativeMotionCompletionCost,COMPLETION_RESOURCES)
         port = self.session.budget.request_work_phase
         if port is None or current_request_work_phase() is not port:
             raise ValueError('normal motion completion requires the active whole-request work lease')
@@ -1112,22 +1112,56 @@ class NativeFamilySensors:
             parent=port.remaining_capacity(('new_decodes','model_calls','pose_evidence_bytes'))
             return {k:max(0,min(budget.limits[k]-budget.counts[k]-budget.reserved[k],parent[k]))
                 for k in parent}
-        available=remaining()
-        limit=min(maximum_new_observations,len(missing),available['new_decodes'])
+        limit=min(maximum_new_observations,len(missing))
         evidence_reserve=primitive_reservation_bytes(MAX_NATIVE_JSON_BYTES)
-        if available['pose_evidence_bytes'] < evidence_reserve:limit=0
+        known={s.demand.native_key:s.observation for s in current.supplies}
+        bindings={s.demand.native_key:s for s in current.supplies}
+        appearances={s.demand.native_key:s.appearance for s in current.supplies if s.appearance is not None}
+        member_features={s.demand.native_key:s.member_features for s in current.supplies if s.member_features is not None}
+        need_appearance={d.native_key for d in demands if d.require_appearance}
+        need_member_features={d.native_key for d in demands if d.require_member_features}
+        core_demands={s.demand.native_key:replace(s.demand,
+            require_appearance=s.demand.native_key in need_appearance,
+            require_member_features=not member_features_optional and s.demand.native_key in need_member_features)
+            for s in core_current.supplies}
+        def work_cost(key,*,optional_member_only=False):
+            raw=known[key]
+            probe=getattr(self.session,'native_raster_cache_available',None)
+            cached=bool(probe is not None and probe(key[0],key[1],
+                expected_pixel_sha256=None if raw is None else raw.native_pixel_sha256))
+            heads=24 if raw is None else len(raw.heads)
+            raw_calls=14 if raw is None else 0
+            appearance_calls=heads if key in need_appearance and key not in appearances else 0
+            member_calls=heads if key in need_member_features and key not in member_features else 0
+            if optional_member_only:raw_calls=appearance_calls=0
+            elif member_features_optional:member_calls=0
+            # Only NEW normalized raw observations reserve the raw-view prefix.
+            # Existing raw-parent descriptor completion does not execute that
+            # primitive, and must not be rejected for an unrelated 512KiB hold.
+            return NativeMotionCompletionCost(int(not cached),raw_calls+appearance_calls+member_calls,
+                evidence_reserve if raw is None and not optional_member_only else 0)
+        self.motion_completion_result=replace(current,completion_consumed=True,status='ADMISSION_STARTED')
+        try:
+            resource_costs={key:work_cost(key) for key in missing}
+            available=remaining()  # Capacity after live-raster verification, not a copied allocation.
+        except BaseException:
+            self.motion_completion_result=replace(current,completion_consumed=True,
+                status='ADMISSION_INTERRUPTED_PARTIAL')
+            raise
         counts={}; pending=dict(missing); scheduled=[]
         raw_limit=(maximum_new_observations if maximum_new_raw_observations is None
             else maximum_new_raw_observations)
         raw_scheduled=0
-        raw_by_key={s.demand.native_key:s.observation for s in current.supplies}
+        raw_by_key=known
+        admission_remaining=dict(available)
         # Bit-reversed order visits distributed time bands before adjacent
         # bands. A later wall/IPC cutoff does not leave a chronological prefix.
         bits=max(1,(limit-1).bit_length())
         bands=sorted(range(limit),key=lambda n:int(format(n,'0'+str(bits)+'b')[::-1],2))
         for band in bands:
             eligible={key:rows for key,rows in pending.items()
-                if raw_by_key[key] is not None or raw_scheduled<raw_limit}
+                if (raw_by_key[key] is not None or raw_scheduled<raw_limit)
+                and all(getattr(resource_costs[key],r)<=admission_remaining[r] for r in COMPLETION_RESOURCES)}
             if not eligible:break
             target=first+(band+.5)*(end-first)/max(1,limit)
             def priority(d):
@@ -1139,35 +1173,56 @@ class NativeFamilySensors:
                 key=lambda item:priority(item[1]))
             aliases=pending.pop(key)
             scheduled.append(demand)
+            for r in COMPLETION_RESOURCES:admission_remaining[r]-=getattr(resource_costs[key],r)
             if raw_by_key[key] is None:raw_scheduled+=1
             # One native fact services every output use. Do not erase a later
             # moving-closeup use by selecting an earlier 'other' representative.
             for lane in {(d.source_family,d.opportunity) for d in aliases}:
                 counts[lane]=counts.get(lane,0)+1
-        schedule_receipt=dict(policy='source_opportunity_time_band_balanced_v1',
+        schedule_receipt=dict(policy='source_opportunity_resource_feasible_time_band_balanced_v2',
+            initial_live_resource_capacity=available,
+            admitted_resource_upper_bounds={r:available[r]-admission_remaining[r] for r in COMPLETION_RESOURCES},
+            resource_admission_is_not_atomic_parent_reservation=True,
             successful_observations_or_connected_actors_certified=False,quality_approved=False)
         if required_native_keys or completion_packages:
             scheduled,schedule_receipt=coherent_completion_schedule(core_current,
                 required_native_keys=required_native_keys,packages=completion_packages,
                 maximum_observations=limit,maximum_raw_observations=raw_limit,
+                resource_costs=resource_costs,remaining_resources=available,
                 critical_required_native_keys=critical_required_native_keys)
-        attempted=[];optional_attempted=[];optional_unavailable=[]
+        admitted=tuple(d.native_key for d in scheduled)
+        # Consume already-verified live rasters before any new decode can evict
+        # them. Never pin extra raster copies or grant a stale zero-decode claim.
+        scheduled=tuple(sorted(scheduled,key=lambda d:resource_costs[d.native_key].new_decodes))
+        attempted=[];core_attempted=[];optional_attempted=[];optional_unavailable=[];preflight_skipped=[]
         schedule_receipt.update(optional_member_features_are_core_admission_authority=not member_features_optional)
-        known={s.demand.native_key:s.observation for s in current.supplies}
-        bindings={s.demand.native_key:s for s in current.supplies}
-        appearances={s.demand.native_key:s.appearance for s in current.supplies if s.appearance is not None}
-        member_features={s.demand.native_key:s.member_features for s in current.supplies if s.member_features is not None}
-        need_appearance={d.native_key for d in demands if d.require_appearance}
-        need_member_features={d.native_key for d in demands if d.require_member_features}
+        schedule_receipt.update(admitted_core_native_keys=admitted,
+            execution_schedule_core_native_keys=tuple(d.native_key for d in scheduled),
+            execution_order_policy='verified_live_rasters_before_cache_misses_no_editorial_rescoring',
+            admission_resource_costs=[dict(native_key=k,**resource_costs[k].resources()) for k in admitted])
         status=('BUDGET_PARTIAL' if len(scheduled)<len(missing)
             else 'COMPLETED_ONCE')
         if schedule_receipt.get('terminal_required_dependencies'):status='TERMINAL_REQUIRED_INPUT_BLOCKER'
         def snapshot(state):
             # These rows were validated in this pass. Do not reopen source/model
             # I/O after its deadline merely to construct the result container.
+            core_states={k:NativeMotionSupply(d,known[k],appearances.get(k),bindings[k].recorded_input_state,
+                bindings[k].source_equivalence_json,member_features.get(k)) for k,d in core_demands.items()}
+            completed={k for k,s in core_states.items() if not s.missing_modalities and s.state=='NATIVE_ROWS_AVAILABLE'}
             schedule_receipt.update(attempted_optional_member_native_keys=list(optional_attempted),
                 optional_member_unavailable_inputs=list(optional_unavailable),
-                attempted_unique_native_keys=list(attempted))
+                attempted_unique_native_keys=list(attempted),attempted_core_native_keys=list(core_attempted),
+                unattempted_admitted_core_native_keys=[k for k in admitted if k not in core_attempted],
+                completed_attempted_core_native_keys=[k for k in core_attempted if k in completed],
+                incomplete_attempted_core_inputs=[dict(native_key=k,state=core_states[k].state)
+                    for k in core_attempted if k not in completed],
+                live_preflight_skipped_native_inputs=list(preflight_skipped),
+                completion_interrupted=state=='INTERRUPTED_PARTIAL',
+                package_execution=[dict(identity=p['identity'],
+                    attempted_admitted_native_keys=[k for k in p['admitted_missing_native_keys'] if k in core_attempted],
+                    unattempted_admitted_native_keys=[k for k in p['admitted_missing_native_keys'] if k not in core_attempted],
+                    entire_admitted_core_inputs_completed=all(k in completed for k in p['admitted_missing_native_keys']))
+                    for p in schedule_receipt.get('selected_packages',[])])
             schedule_json=__import__('json').dumps(schedule_receipt,sort_keys=True,allow_nan=False)
             value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key),
                 bindings[d.native_key].recorded_input_state,bindings[d.native_key].source_equivalence_json,
@@ -1180,18 +1235,14 @@ class NativeFamilySensors:
             for demand in scheduled:
                 budget.check()
                 raw=known[demand.native_key]
-                raw_calls=14 if raw is None else 0
-                appearance_calls=((24 if raw is None else len(raw.heads))
-                    if demand.native_key in need_appearance and demand.native_key not in appearances else 0)
-                member_calls=((24 if raw is None else len(raw.heads))
-                    if demand.native_key in need_member_features and demand.native_key not in member_features else 0)
-                if member_features_optional:member_calls=0
-                required=dict(new_decodes=1,model_calls=raw_calls+appearance_calls+member_calls,
-                    pose_evidence_bytes=evidence_reserve)
+                required=work_cost(demand.native_key).resources()
                 available=remaining()
                 if any(available[k]<n for k,n in required.items()):
+                    preflight_skipped.append(dict(native_key=demand.native_key,
+                        state='LIVE_RESOURCE_CAPACITY_CHANGED',required=required,remaining=available))
                     status='BUDGET_PARTIAL';continue
                 attempted.append(demand.native_key)
+                core_attempted.append(demand.native_key)
                 snapshot('RUNNING')
                 if raw is None:
                     known[demand.native_key]=self.native_at(demand.source_index,
@@ -1199,11 +1250,11 @@ class NativeFamilySensors:
                     bindings[demand.native_key]=NativeMotionSupply(demand,known[demand.native_key])
                 raw=known[demand.native_key]
                 if (demand.native_key in need_appearance and demand.native_key not in appearances
-                        and raw.native_pixel_sha256 is not None):
+                        and raw is not None and raw.native_pixel_sha256 is not None):
                     appearances[demand.native_key]=self._complete_motion_appearance(replace(bindings[demand.native_key],
                         observation=raw))
                 if (demand.native_key in need_member_features and demand.native_key not in member_features
-                        and raw.native_pixel_sha256 is not None and not member_features_optional):
+                        and raw is not None and raw.native_pixel_sha256 is not None and not member_features_optional):
                     member_features[demand.native_key]=self.member_features_at(replace(bindings[demand.native_key],
                         observation=raw))
                 snapshot('RUNNING')
@@ -1216,9 +1267,9 @@ class NativeFamilySensors:
                     if raw is None or raw.native_pixel_sha256 is None or key in member_features:continue
                     if key in need_appearance and key not in appearances:continue
                     if key not in attempted and len(attempted)>=maximum_new_observations:continue
+                    required=work_cost(key,optional_member_only=True).resources()
                     available=remaining()
-                    if any(available[k]<n for k,n in dict(new_decodes=1,model_calls=len(raw.heads),
-                            pose_evidence_bytes=evidence_reserve).items()):continue
+                    if any(available[k]<n for k,n in required.items()):continue
                     equivalence=bindings[key].source_equivalence_json
                     if equivalence is not None and __import__('json').loads(equivalence)['state']=='CONTENT_VERIFIED_DEVICE_REMOUNT':
                         optional_unavailable.append(dict(native_key=key,state='ARCHIVED_OPTIONAL_RECOMPUTE_UNAVAILABLE'))

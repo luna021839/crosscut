@@ -2,6 +2,8 @@
 from dataclasses import replace
 from types import SimpleNamespace
 from time import monotonic
+import shutil
+import subprocess
 import pytest
 
 from crosscut.group_source_changing_owner import NativeFamilySensors,NativeMotionDemand
@@ -53,15 +55,15 @@ class SyntheticSensors(NativeFamilySensors):
         return self.appearance_rows.get(key)
 
 
-def controller(tmp_path,model_calls=100):
+def controller(tmp_path,model_calls=100,*,phase_resources=None):
     plan=RenderPlan((tmp_path/'not-read.mp4',),(RenderSegment(0,0.,1.,0.),),0,'16:9',tmp_path/'not-rendered.mp4')
     owner=FirstResultController(ReviewFirstRuntime(enabled=True),sources=plan.sources,
         source_durations=(2.,),master_start=0.,duration=1.)
     owner.install_baseline(plan,plan=plan,authority='synthetic inventory accounting only')
-    allocations={p:PhaseAllocation(dict(journal_bytes=1024*1024,
+    allocations={p:PhaseAllocation({**dict(journal_bytes=1024*1024,
         native_completion_passes=int(p=='selected_completion'),model_calls=model_calls,
         new_decodes=20,pose_evidence_bytes=8*1024*1024,identity_reads=128,
-        model_hash_bytes=1024*1024),10.) for p in PHASES}
+        model_hash_bytes=1024*1024),**(phase_resources or {})},10.) for p in PHASES}
     lease=owner.reserve_request_work(total_limits={k:sum(a.resources[k] for a in allocations.values())
         for k in RESOURCES},allocations=allocations,journal_path=tmp_path/'work.jsonl')
     return owner,lease
@@ -215,6 +217,152 @@ def test_coherent_completion_uses_one_partial_package_instead_of_scattering_rema
     finally:lease.close()
 
 
+def test_coherent_admission_prefers_a_complete_affordable_descriptor_package(tmp_path):
+    # Synthetic heads/counters reproduce resource admission, not NN quality.
+    owner,lease=controller(tmp_path,2)
+    def run():
+        s=sensors(2);payload,_=native_record();base=restore_native_row(payload)
+        demands=tuple(NativeMotionDemand(source,native,tick,f'family-{source}',
+            'moving_closeup',require_appearance=True)
+            for source,native,tick in ((2,80,8),(2,81,9),(3,90,10),(3,91,11)))
+        for i,d in enumerate(demands):
+            heads=tuple(replace(base.heads[0],observation_id=n) for n in range(24)) if i==0 else base.heads
+            s.raw_rows[d.native_key]=replace(base,request_source_index=d.source_index,
+                native_frame_index=d.native_frame_index,heads=heads)
+        done=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=2,
+            completion_packages=(NativeMotionCompletionPackage('A',tuple(d.native_key for d in demands[:2])),
+                NativeMotionCompletionPackage('B',tuple(d.native_key for d in demands[2:]))))
+        assert done.attempted_native_keys==tuple(d.native_key for d in demands[2:])
+        assert s.appearance_calls==[(3,90),(3,91)] and not s.raw_calls
+        receipt=json.loads(done.completion_schedule_json)
+        assert receipt['selected_packages'][0]['identity']=='B'
+        assert receipt['selected_packages'][0]['entire_missing_input_package_admitted']
+        assert not receipt['successful_observations_or_connected_actors_certified']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+@pytest.mark.parametrize('resource',('new_decodes','pose_evidence_bytes'))
+def test_coherent_admission_accounts_for_decode_and_raw_prefix_vectors(tmp_path,resource):
+    # A needs two fresh raw observations. B needs two known-parent descriptors.
+    # Head/model measurements here are synthetic and cannot approve media.
+    capacity=2 if resource=='new_decodes' else 1_100_000
+    owner,lease=controller(tmp_path,100,phase_resources={resource:capacity})
+    def run():
+        s=sensors();payload,_=native_record();base=restore_native_row(payload)
+        demands=tuple(NativeMotionDemand(source,native,tick,f'family-{source}','moving_closeup',
+            require_appearance=i>=2) for i,(source,native,tick) in
+            enumerate(((2,80,8),(2,81,9),(3,90,10),(3,91,11))))
+        # With two decode slots, a single prior parent decode leaves one. All
+        # B rasters are explicitly synthetic cost inputs for THIS vector test.
+        if resource=='new_decodes':
+            lease.ports['selected_completion'].charge('new_decodes')
+            s.session.native_raster_cache_available=lambda source,native,**kw:source==3
+        for d in demands[2:]:
+            s.raw_rows[d.native_key]=replace(base,request_source_index=d.source_index,
+                native_frame_index=d.native_frame_index)
+        done=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=2,
+            completion_packages=(NativeMotionCompletionPackage('A',tuple(d.native_key for d in demands[:2])),
+                NativeMotionCompletionPackage('B',tuple(d.native_key for d in demands[2:]))))
+        assert done.attempted_native_keys==tuple(d.native_key for d in demands[2:])
+        assert not s.raw_calls and s.appearance_calls==[(3,90),(3,91)]
+        receipt=json.loads(done.completion_schedule_json)
+        assert receipt['selected_packages'][0]['identity']=='B'
+        assert receipt['admitted_resource_upper_bounds'][resource]==0
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'),reason='FFmpeg required')
+@pytest.mark.parametrize('raster_available',(False,True))
+def test_descriptor_admission_at_zero_decode_capacity_requires_a_real_live_raster(tmp_path,raster_available):
+    # Real disposable chart decode/cache + synthetic heads/descriptor counters.
+    # This proves raster/admission accounting, NOT real face inference or QA.
+    from crosscut.group_joint_observations import GroupJointObservationSession
+    from crosscut.group_source_domain import GroupSourceDomain
+    from crosscut.render_frame_schedule import probe_render_frame_clock
+    video=tmp_path/'disposable-chart.mp4'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=s=96x54:r=30',
+        '-frames:v','90','-c:v','libx264','-crf','0','-pix_fmt','yuv420p',str(video)],
+        capture_output=True,check=True,timeout=10.)
+    clock=probe_render_frame_clock(video)
+    sources=tuple(video if i==2 else tmp_path/f'never-open-{i}.mp4' for i in range(3))
+    domain=GroupSourceDomain(sources,(2,),(0.,),(None,),((),),(clock,))
+    owner,lease=controller(tmp_path,1,phase_resources=dict(new_decodes=1,source_probes=1,decoder_opens=1,
+        pose_evidence_bytes=0))
+    def run():
+        budget=JointGroupWorkBudget(absolute_deadline=monotonic()+8.,maximum_new_decodes=1,maximum_model_calls=1)
+        with GroupJointObservationSession(domain=domain,budget=budget) as session:
+            pixels=session.native_pixels(2,80)
+            parent_sha=hashlib.sha256(memoryview(pixels)).hexdigest()
+            if not raster_available:session.retain_native_pixels(())
+            s=SyntheticSensors(budget);s.session=session
+            payload,_=native_record()
+            s.raw_rows[2,80,None]=replace(restore_native_row(payload),native_pixel_sha256=parent_sha,
+                source_file_identity=_file_identity(video),frame_size_wh=(96,54))
+            demand=NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True)
+            done=s.complete_motion_inventory_once(s.motion_inventory((demand,)),maximum_new_observations=1,
+                completion_packages=(NativeMotionCompletionPackage('one',(demand.native_key,)),))
+            assert bool(done.attempted_native_keys)==raster_available
+            assert bool(s.appearance_calls)==raster_available
+            assert budget.counts['new_decodes']==1
+            assert lease.ports['selected_completion'].charged['new_decodes']==1
+            assert budget.counts['pose_evidence_bytes']==0
+            receipt=json.loads(done.completion_schedule_json)
+            assert receipt['initial_live_resource_capacity']['new_decodes']==0
+            assert not receipt['quality_approved']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_live_parent_capacity_change_is_reported_as_unattempted_not_success(tmp_path):
+    owner,lease=controller(tmp_path,2)
+    def run():
+        s=sensors(2);payload,_=native_record();base=restore_native_row(payload)
+        demands=tuple(NativeMotionDemand(2,native,tick,'family','moving_closeup',require_appearance=True)
+            for native,tick in ((80,8),(81,9)))
+        for d in demands:s.raw_rows[d.native_key]=replace(base,native_frame_index=d.native_frame_index)
+        probes=[]
+        def cost_probe(*args,**kwargs):
+            probes.append(args)
+            if len(probes)==3:
+                lease.ports['selected_completion'].charge('model_calls',model='synthetic_other_parent_work')
+            return False
+        s.session.native_raster_cache_available=cost_probe
+        done=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=2,
+            completion_packages=(NativeMotionCompletionPackage('pair',tuple(d.native_key for d in demands)),))
+        receipt=json.loads(done.completion_schedule_json)
+        assert done.attempted_native_keys==(demands[0].native_key,)
+        assert receipt['selected_packages'][0]['entire_missing_input_package_admitted']
+        assert receipt['package_execution'][0]['unattempted_admitted_native_keys']==[list(demands[1].native_key)]
+        assert not receipt['package_execution'][0]['entire_admitted_core_inputs_completed']
+        assert receipt['live_preflight_skipped_native_inputs'][0]['state']=='LIVE_RESOURCE_CAPACITY_CHANGED'
+        assert not receipt['successful_observations_or_connected_actors_certified']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_interrupted_package_preserves_attempted_and_unattempted_inputs(tmp_path):
+    owner,lease=controller(tmp_path,2)
+    def run():
+        s=sensors(2);s.interrupt=True;payload,_=native_record();base=restore_native_row(payload)
+        demands=tuple(NativeMotionDemand(2,native,tick,'family','moving_closeup',require_appearance=True)
+            for native,tick in ((80,8),(81,9)))
+        for d in demands:s.raw_rows[d.native_key]=replace(base,native_frame_index=d.native_frame_index)
+        with pytest.raises(InterruptedError):
+            s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=2,
+                completion_packages=(NativeMotionCompletionPackage('pair',tuple(d.native_key for d in demands)),))
+        done=s.motion_completion_result;receipt=json.loads(done.completion_schedule_json)
+        assert done.status=='INTERRUPTED_PARTIAL' and receipt['completion_interrupted']
+        assert receipt['attempted_core_native_keys']==[list(demands[0].native_key)]
+        assert receipt['unattempted_admitted_core_native_keys']==[list(demands[1].native_key)]
+        assert receipt['completed_attempted_core_native_keys']==[]
+        assert not receipt['package_execution'][0]['entire_admitted_core_inputs_completed']
+        assert not receipt['quality_approved']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
 def test_invalid_completion_obligation_is_rejected_before_consuming_the_single_pass(tmp_path):
     owner,lease=controller(tmp_path)
     def run():
@@ -280,7 +428,7 @@ def test_cancelled_appearance_is_partial_and_cannot_restart_under_a_new_session(
     finally:lease.close()
 
 
-def recorded_sensors(tmp_path,*,remount=False,appearance=True,appearance_adapter='f'*64):
+def recorded_sensors(tmp_path,*,remount=False,appearance=True,appearance_adapter='f'*64,decode_failure=False):
     """Real archive/file binding with explicitly synthetic model/pixel methods."""
     path=tmp_path/'source.fixture';path.write_bytes(b'independently retained source bytes')
     identity=_file_identity(path)
@@ -296,7 +444,13 @@ def recorded_sensors(tmp_path,*,remount=False,appearance=True,appearance_adapter
         native_pixel_sha256=hashlib.sha256(memoryview(pixels)).hexdigest()).to_dict()))
     app.update({k:raw[k] for k in ('source_file_identity','source_clock_identity','native_pixel_sha256')})
     app['recorded_native_observation_sha256']=digest(raw)
-    index=RecordedGroupReviewIndex();index.add_native_record(raw,app if appearance else None,provenance='explicit fixture manifest')
+    index=RecordedGroupReviewIndex()
+    if decode_failure:
+        raw=replace(restore_native_row(raw),native_pixel_sha256=None,frame_size_wh=(0,0),heads=(),people=(),
+            reason='exact_native_decode_unavailable').to_dict()
+        raw=json.loads(json.dumps(raw))
+        index.add_native_decode_failure(raw,provenance='explicit persisted failed fixture read')
+    else:index.add_native_record(raw,app if appearance else None,provenance='explicit fixture manifest')
     s=sensors();s.session.closed=False
     s.session.domain=SimpleNamespace(eligible_indices=(2,),request_sources=(path,path,path),
         clocks_by_request={2:clock})
@@ -316,6 +470,28 @@ def recorded_sensors(tmp_path,*,remount=False,appearance=True,appearance_adapter
     s.bind_recorded_motion_index(index,source_identities={2:recorded},
         source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()})
     return s,index,raw,app,path
+
+
+@pytest.mark.parametrize('remount',(False,True))
+def test_reloaded_exact_failure_is_not_retried_by_normal_completion(tmp_path,remount):
+    owner,lease=controller(tmp_path)
+    def run():
+        s,index,raw,app,path=recorded_sensors(tmp_path,remount=remount,decode_failure=True)
+        fixed=NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True)
+        donor=NativeMotionDemand(2,90,9,'family','moving_closeup',require_appearance=True)
+        initial=s.motion_inventory((fixed,donor))
+        assert initial.supplies[0].state=='EXACT_DECODE_UNAVAILABLE'
+        assert initial.supplies[0].observation.to_dict()==restore_native_row(raw).to_dict()
+        done=s.complete_motion_inventory_once(initial,maximum_new_observations=2,
+            required_native_keys=(fixed.native_key,),critical_required_native_keys=(fixed.native_key,),
+            completion_packages=(NativeMotionCompletionPackage('donor',(donor.native_key,)),))
+        assert done.status=='TERMINAL_REQUIRED_INPUT_BLOCKER'
+        assert done.attempted_native_keys==() and not s.raw_calls and not s.appearance_calls
+        assert s.session.budget.counts['new_decodes']==s.session.budget.counts['model_calls']==0
+        assert done.supplies[0].observation.native_pixel_sha256 is None
+        assert not json.loads(done.completion_schedule_json)['quality_approved']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
 
 
 def test_persisted_native_and_appearance_service_new_request_with_no_reinference(tmp_path):

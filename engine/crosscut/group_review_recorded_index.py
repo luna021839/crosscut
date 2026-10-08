@@ -102,6 +102,23 @@ def _key(source, native, clock, identity):
     return source, native, clock, tuple(identity)
 
 
+def _validate_exact_decode_failure(raw):
+    """A measured failed exact read, never an unobserved missing input.
+
+    This validates persisted recorded evidence, not a fresh live decode. Keep
+    its full source/file/clock/model/adapter/reason preimage; no neighboring
+    frame, head, feature or successful-raster identity may be attached to it.
+    """
+    from .group_scene_focal_pose_motion import restore_native_row
+    restored=restore_native_row(raw)
+    if (restored.native_pixel_sha256 is not None or restored.frame_size_wh!=(0,0)
+            or restored.people or restored.heads or restored.reason!='exact_native_decode_unavailable'
+            or restored.raw_person_detector_json is not None or native_analysis_variant(raw) is None
+            or raw.get('quality_approved') is not False
+            or _freeze(restored.to_dict())!=_freeze(raw)):
+        raise ValueError('recorded decode failure requires its exact unavailable native attempt preimage')
+
+
 class RecordedGroupReviewIndex:
     def __init__(self, *, maximum_rows=16384, maximum_bytes=128*1024*1024, work_port=None):
         if (type(maximum_rows) is not int or not 1 <= maximum_rows <= 65536
@@ -138,7 +155,37 @@ class RecordedGroupReviewIndex:
         validate_recorded_appearance(raw,appearance)
         self._import_records(((raw,None,appearance,None),),provenance=provenance)
 
-    def _import_records(self,rows,*,provenance):
+    def add_native_decode_failure(self,raw,*,provenance):
+        self.add_native_completion_records((),decode_failures=(raw,),provenance=provenance)
+
+    def add_native_completion_records(self,records,*,decode_failures=(),provenance):
+        """Atomically reload explicit success/failure cache entries, without NN.
+
+        Persisted failure origin survives as an occurrence with no invented
+        output tick. Success and failure at the same declared physical variant
+        stay conflicting; a subsequent request cannot silently retry until one
+        wins. This importer neither reads directories nor rewrites raw parents.
+        """
+        from .group_scene_focal_pose_motion import restore_native_row
+        if (not isinstance(records,(tuple,list)) or not isinstance(decode_failures,(tuple,list))
+                or not 1<=len(records)+len(decode_failures)<=self.maximum_rows-self.imported_rows):
+            raise ValueError('native completion reload requires bounded explicit records')
+        rows=[]
+        for record in records:
+            if not isinstance(record,dict) or set(record)!={'native_observation','appearance'}:
+                raise ValueError('native completion success record changed its explicit schema')
+            raw,appearance=record['native_observation'],record['appearance']
+            restore_native_row(raw)
+            if raw.get('native_pixel_sha256') is None or native_analysis_variant(raw) is None:
+                raise ValueError('native completion success needs its exact pixel and analysis parent')
+            validate_recorded_appearance(raw,appearance)
+            rows.append((raw,None,appearance,None))
+        for failure in decode_failures:
+            _validate_exact_decode_failure(failure)
+            rows.append((failure,None,None,None))
+        self._import_records(tuple(rows),provenance=provenance,allow_decode_failures=True)
+
+    def _import_records(self,rows,*,provenance,allow_decode_failures=False):
         if not isinstance(provenance,str) or not provenance or len(provenance)>1024:
             raise ValueError('recorded index needs explicit bounded provenance')
         if self.imported_rows+len(rows)>self.maximum_rows:
@@ -151,7 +198,11 @@ class RecordedGroupReviewIndex:
             key = _key(raw['request_source_index'], raw['native_frame_index'],
                 raw['source_clock_identity'], raw['source_file_identity'])
             pixel = raw.get('native_pixel_sha256')
-            if (not isinstance(pixel, str) or len(pixel) != 64
+            if pixel is None and allow_decode_failures:
+                _validate_exact_decode_failure(raw)
+                if patches is not None or appearance is not None:
+                    raise ValueError('recorded failed decode cannot have raster-dependent features')
+            elif (not isinstance(pixel, str) or len(pixel) != 64
                     or any(c not in '0123456789abcdef' for c in pixel)):
                 raise ValueError('recorded index raw observation has no exact pixel identity')
             if appearance is not None:
@@ -217,6 +268,7 @@ class RecordedGroupReviewIndex:
                 result[name] = json.loads(next(iter(variants.values())))
         result['state'] = ('CONFLICTING_FEATURE_RECORDS'
             if len(features['patches']) > 1 or len(features['appearance']) > 1
+            else 'RECORDED_EXACT_DECODE_UNAVAILABLE' if result['raw']['native_pixel_sha256'] is None
             else 'RECORDED_NATIVE_REVIEW_INPUT')
         return result
 
@@ -226,7 +278,7 @@ class RecordedGroupReviewIndex:
         found = self.lookup(source=source, native=native,
             clock=query.source_clock_identity, identity=source_file_identity,
             analysis_variant_sha256=analysis_variant_sha256)
-        if found['raw'] is not None:
+        if found['raw'] is not None and found['raw']['native_pixel_sha256'] is not None:
             found['row'] = reproject_recorded_static_query(query, tick, found['raw'], domain=domain,compact=compact)
         else:
             found['row'] = None

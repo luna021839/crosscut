@@ -66,6 +66,22 @@ class JointObservationSessionTests(unittest.TestCase):
             for operation in (lambda:session.native_pixels(2,15),lambda:session.projected_pixels(self.state,15)):
                 with self.assertRaisesRegex(ValueError,'source identity changed'):operation()
 
+    def test_verified_live_raster_cache_probe_never_decodes_or_opens_an_absent_source(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget(maximum_new_decodes=1)) as session:
+            self.assertFalse(session.native_raster_cache_available(2,15))
+            self.assertEqual(session.captures,{})
+            pixels=session.native_pixels(2,15)
+            expected=hashlib.sha256(memoryview(pixels)).hexdigest()
+            self.assertTrue(session.native_raster_cache_available(2,15,expected_pixel_sha256=expected))
+            self.assertFalse(session.native_raster_cache_available(2,16))
+            self.assertEqual(session.budget.counts['new_decodes'],1)
+            with self.assertRaisesRegex(ValueError,'cached native raster content'):
+                session.native_raster_cache_available(2,15,expected_pixel_sha256='0'*64)
+            with self.video.open('ab') as stream:stream.write(b'changed disposable fixture')
+            with self.assertRaisesRegex(ValueError,'source identity changed'):
+                session.native_raster_cache_available(2,15,expected_pixel_sha256=expected)
+            self.assertEqual(session.budget.counts['new_decodes'],1)
+
     def test_wrong_clock_fails_before_opening_any_decoder(self):
         domain=replace(self.domain,render_frame_clocks=(self.clock,replace(self.clock,packet_grid_sha256='f'*64),self.clock))
         with GroupJointObservationSession(domain=domain,budget=self.budget()) as session:

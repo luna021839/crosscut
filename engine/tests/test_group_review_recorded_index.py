@@ -186,6 +186,63 @@ def test_raw_native_import_needs_no_fabricated_output_capture_and_keeps_missing_
     assert lookup(index)['appearance']==appearance and raw==saved
 
 
+def decode_failure_record():
+    raw,_=native_record(reason='exact_native_decode_unavailable')
+    return dict(raw,native_pixel_sha256=None,frame_size_wh=[0,0],heads=[],people=[])
+
+
+def test_exact_decode_failure_survives_an_explicit_native_cache_reload(tmp_path):
+    raw=decode_failure_record();saved=deepcopy(raw)
+    index=RecordedGroupReviewIndex()
+    cache_path=tmp_path/'explicit-native-input-cache.json'
+    cache_path.write_text(json.dumps(dict(rows=[],decode_failures=[raw])),encoding='utf-8')
+    persisted=json.loads(cache_path.read_text(encoding='utf-8'))
+    index.add_native_completion_records(persisted['rows'],decode_failures=persisted['decode_failures'],
+        provenance='persisted exact decode attempt')
+    result=lookup(index,analysis_variant_sha256=native_analysis_variant(raw))
+    assert result['state']=='RECORDED_EXACT_DECODE_UNAVAILABLE'
+    assert result['raw']==saved and result['appearance'] is None and result['patches'] is None
+    assert result['occurrences'][0]['output_tick'] is None
+    assert not result['fresh_inference_performed'] and not result['live_native_authority']
+    assert raw==saved
+    for changes in (dict(native=81),dict(clock='e'*64),dict(identity=[1,2,3,4,6])):
+        assert lookup(index,**changes)['state']=='MISSING'
+
+
+@pytest.mark.parametrize('failure_first',(False,True))
+def test_success_cannot_hide_a_retained_exact_decode_failure(failure_first):
+    raw,app=native_record();failure=decode_failure_record();index=RecordedGroupReviewIndex()
+    operations=(lambda:index.add_native_decode_failure(failure,provenance='exact failed read'),
+        lambda:index.add_native_record(raw,app,provenance='different successful measurement'))
+    for operation in operations if failure_first else operations[::-1]:operation()
+    result=lookup(index,analysis_variant_sha256=native_analysis_variant(raw))
+    assert result['state']=='CONFLICTING_NATIVE_RECORDS' and result['raw'] is None
+    assert len(result['raw_variant_sha256'])==2
+
+
+@pytest.mark.parametrize('damage',('reason','head','dimensions','appearance','approval'))
+def test_failure_import_cannot_smuggle_successful_features_or_an_unobserved_miss(damage):
+    raw,app=native_record();failure=decode_failure_record();index=RecordedGroupReviewIndex()
+    if damage=='reason':failure['reason']='unknown_not_observed'
+    if damage=='head':failure['heads']=raw['heads']
+    if damage=='dimensions':failure['frame_size_wh']=[1920,1080]
+    if damage=='approval':failure['quality_approved']=True
+    good=dict(native_observation=raw,appearance=app)
+    if damage=='appearance':good=dict(native_observation=failure,appearance=app)
+    with pytest.raises(ValueError):
+        index.add_native_completion_records([good],decode_failures=[failure],provenance='invalid mixed input')
+    assert index.imported_rows==0 and index.stored_bytes==0 and not index.rows
+
+
+def test_observed_failure_does_not_block_a_different_declared_model_variant():
+    failure=decode_failure_record();changed,_=native_record(adapter='e'*64)
+    index=RecordedGroupReviewIndex();index.add_native_decode_failure(failure,provenance='old analysis variant')
+    assert lookup(index,analysis_variant_sha256=native_analysis_variant(changed))['state']=='MISSING_DECLARED_ANALYSIS_VARIANT'
+    index.add_native_record(changed,provenance='explicit different declared analysis')
+    assert lookup(index,analysis_variant_sha256=native_analysis_variant(changed))['raw']==changed
+    assert lookup(index,analysis_variant_sha256=native_analysis_variant(failure))['state']=='RECORDED_EXACT_DECODE_UNAVAILABLE'
+
+
 def test_predeclared_analysis_variants_keep_their_own_raw_parent_features():
     index=RecordedGroupReviewIndex();a,aa=native_record();b,bb=native_record(adapter='e'*64)
     bb['heads'][0]['embedding']=[0.,1.]+[0.]*126

@@ -124,6 +124,39 @@ class GroupJointObservationSession:
             self.raw_peak_bytes=max(self.raw_peak_bytes,self.raw_bytes)
         return frame
 
+    def native_raster_cache_available(self,source,native_frame,*,expected_pixel_sha256=None):
+        """Verify an owned LIVE raster, without opening or decoding a miss.
+
+        A recorded raw row/model result is not a raster. Cache absence is only
+        a conservative cost estimate; a hit checks the current file, exact
+        native clock and (when supplied) raw-parent pixel content. No private
+        pixel/vector is returned. Recheck before execution, since the LRU can
+        change after admission.
+        """
+        self.budget.check()
+        if self.closed:raise ValueError('joint observation session is closed')
+        clock=self.domain.render_frame_clocks[self.domain.eligible_index(source)]
+        if type(native_frame) is not int or not 0<=native_frame<clock.frame_count:
+            raise ValueError('native raster cache probe is outside the verified source')
+        if expected_pixel_sha256 is not None and (not isinstance(expected_pixel_sha256,str)
+                or len(expected_pixel_sha256)!=64
+                or any(c not in '0123456789abcdef' for c in expected_pixel_sha256)):
+            raise ValueError('native raster cache probe needs an explicit pixel SHA256')
+        identity=self.identities.get(source)
+        key=(source,identity,clock.packet_grid_sha256,native_frame)
+        pixels=self.raw.get(key)
+        if identity is None or pixels is None:return False
+        path=self.domain.request_sources[source]
+        if self._identity(path)!=identity:
+            raise ValueError('joint source identity changed; cached/native observations cannot be reused')
+        if (expected_pixel_sha256 is not None
+                and hashlib.sha256(memoryview(pixels)).hexdigest()!=expected_pixel_sha256):
+            raise ValueError('cached native raster content differs from its recorded parent')
+        self.budget.check()
+        if self._identity(path)!=identity:
+            raise ValueError('joint source identity changed during cached native raster verification')
+        return True
+
     def retain_native_pixels(self,keys):
         """Drop obsolete raster cache entries, not model/raw-feature evidence.
 
