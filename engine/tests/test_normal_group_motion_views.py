@@ -111,3 +111,108 @@ def test_appearance_alias_conflict_cannot_choose_the_favorable_vector():
     inventory=NativeMotionInventory((first,replace(first,appearance=changed)),(),True,'COMPLETED_ONCE')
     with pytest.raises(ValueError,match='aliases changed their appearance'):
         NativeMotionViews(views.sensors,inventory)
+
+
+def test_live_typed_appearance_and_json_archive_have_the_same_physical_parent():
+    views,queries,_=world()
+    old=next(iter(views.supplies.values()))
+    live=dict(old.appearance,source_file_identity=old.observation.source_file_identity)
+    inventory=NativeMotionInventory((replace(old,appearance=live),old),(),True,'COMPLETED_ONCE')
+    actual=NativeMotionViews(views.sensors,inventory)
+    found=actual.record(queries[30],30)
+    assert found['appearance']['source_file_identity']==found['row']['native_observation']['source_file_identity']
+    assert found['appearance']['recorded_native_observation_sha256']==digest(found['row']['native_observation'])
+    assert actual.candidates(queries[30],30,association_ready=True)
+    assert not inventory.supplies[0].observation.to_dict()['quality_approved']
+
+
+def test_verified_archived_and_live_mount_parents_share_one_physical_actor_run():
+    views,queries,original=world()
+    current=views.sensors.session._assert_source_identity(2)
+    archived=(current[0]+1,*current[1:])
+    binding=json.dumps(dict(state='CONTENT_VERIFIED_DEVICE_REMOUNT',content_sha256='a'*64,
+        recorded_file_identity=archived,current_file_identity=current,archived_observations_rewritten=False),
+        sort_keys=True,separators=(',',':'))
+    views.sensors.recorded_motion_bindings={2:binding}
+    supplies=[]
+    for supply in views.supplies.values():
+        if supply.demand.output_tick%2:
+            raw=replace(supply.observation,source_file_identity=archived)
+            app=dict(supply.appearance,source_file_identity=list(archived),
+                recorded_native_observation_sha256=digest(raw.to_dict()))
+            supply=replace(supply,observation=raw,appearance=app,source_equivalence_json=binding)
+        supplies.append(supply)
+    mixed=NativeMotionViews(views.sensors,NativeMotionInventory(tuple(supplies),(),True,'COMPLETED_ONCE'))
+    anchor=mixed.candidates(queries[32],32,association_ready=True)[0]
+    selected,receipt=mixed.connected_actor_views(queries,tuple(queries),anchor)
+    assert all(v is not None for v in selected.values()) and receipt['all_sampled_frames_connected']
+    assert selected[33]['row']['native_observation']['source_file_identity']==list(archived)
+    assert selected[32]['row']['native_observation']['source_file_identity']==list(current)
+    from crosscut.group_review_motion_seam import review_native_window_continuous
+    assert review_native_window_continuous(list(selected.values()))
+    frozen,proof=mixed.freeze_original_actors(queries,tuple(queries),
+        original_program_identity=original.program_sha256)
+    assert all(v is not None for v in frozen.values()) and len(proof['groups'])==1
+    assert mixed.sensors.session.budget.counts['new_decodes']==0
+
+
+def test_unverified_mount_alias_or_changed_raw_parent_cannot_grant_actor_continuity():
+    from crosscut.group_review_source_equivalence import physical_review_file_identity
+    views,queries,_=world();head=views.candidates(queries[32],32,association_ready=True)[0]
+    untyped=dict(head,verified_native_file_binding=dict(physical_file_identity=(1,2,3,4,5)))
+    with pytest.raises(ValueError,match='untyped source alias'):
+        physical_review_file_identity(untyped)
+    changed=dict(head,row=dict(head['row'],native_observation=dict(head['row']['native_observation'],native_frame_index=999)))
+    with pytest.raises(ValueError,match='another native raw parent'):
+        physical_review_file_identity(changed)
+    old=next(iter(views.supplies.values()));identity=old.observation.source_file_identity
+    bad=replace(old,observation=replace(old.observation,source_file_identity=(identity[0]+1,*identity[1:])))
+    unverified=NativeMotionViews(views.sensors,NativeMotionInventory((bad,),(),True,'COMPLETED_ONCE'))
+    # No features: isolate the file-equivalence failure, not a feature-parent mismatch.
+    unverified.supplies[old.demand.native_key]=replace(bad,appearance=None)
+    with pytest.raises(ValueError,match='sensor-verified source equivalence'):
+        unverified.record(queries[30],30)
+
+
+def test_authored_camera_projects_the_selected_path_without_a_second_actor_search():
+    from types import SimpleNamespace as NS
+    views,queries,_=world()
+    anchor=views.candidates(queries[32],32,association_ready=True)[0]
+    selected,receipt=views.connected_actor_views(queries,tuple(queries),anchor)
+    selected[33]=None
+    selected[34]=dict(selected[34],reacquisition_ambiguous=True)
+    before=queries[32].camera._registry.plan
+    camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2),))
+    plan=replace(before,segments=(before.segments[0],replace(before.segments[1],
+        editorial_transform=camera),*before.segments[2:]))
+    context=NS(incumbent=NS(render_plan=before,visual_timeline=NS(choices=[
+        NS(shot_type=k) for k in ('medium','group_wide','close_up','medium')]),face_match_plan=None))
+    original=freeze_owned_scene_program(context,views.domain)
+    compiled=compile_common_clock_camera_queries(context=context,domain=views.domain,original_program=original,
+        candidate_plan=plan,output_intervals=((30,36),))
+    authored={t:q for q in compiled.queries for t in range(q.first_output_frame,q.end_output_frame)}
+    actual=views.reproject_selected_actor_path(authored,selected)
+    assert actual[33] is None and actual[34]['reacquisition_ambiguous']
+    for tick,value in actual.items():
+        if value is None:continue
+        assert value['source_actor_path_identity']==receipt['hypothesis_sha256']
+        assert value['descriptor'].frame_local_head_id==selected[tick]['descriptor'].frame_local_head_id
+        assert value['row']['native_observation']==selected[tick]['row']['native_observation']
+    assert actual[32]['descriptor'].face_height>selected[32]['descriptor'].face_height
+    assert views.sensors.session.budget.counts['model_calls']==0
+
+
+def test_authored_camera_cannot_reuse_an_actor_from_another_native_phase():
+    views,queries,_=world()
+    selected={32:views.candidates(queries[32],32,association_ready=True)[0]}
+    context,domain,_=fixture(native_fps=Fraction(30))
+    context.incumbent.face_match_plan=None
+    original=freeze_owned_scene_program(context,domain)
+    before=context.incumbent.render_plan
+    changed=replace(before,segments=(before.segments[0],replace(before.segments[1],
+        source_start=before.segments[1].source_start+1/30),*before.segments[2:]))
+    compiled=compile_common_clock_camera_queries(context=context,domain=domain,original_program=original,
+        candidate_plan=changed,output_intervals=((30,36),))
+    phased={t:q for q in compiled.queries for t in range(q.first_output_frame,q.end_output_frame)}
+    with pytest.raises(ValueError,match='native schedule'):
+        views.reproject_selected_actor_path(phased,selected)

@@ -10,6 +10,7 @@ import math
 
 from .group_performer_family_owner import digest
 from .group_review_actor_path import _link
+from .group_review_source_equivalence import physical_review_file_identity
 
 
 def _native_association_view(view,unit):
@@ -65,7 +66,7 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
             raw=view['row']['native_observation']
             if (view['row']['output_tick']!=tick or raw['request_source_index']!=unit[0]
                     or raw['source_clock_identity']!=unit[1]
-                    or digest(raw['source_file_identity'])!=unit[2]):
+                    or digest(physical_review_file_identity(view))!=unit[2]):
                 raise ValueError('original actor inventory borrowed another raster or native unit')
         # Repeated visits to one native camera, separated by other original
         # shots, are NOT one continuous actor request. Output attention scopes

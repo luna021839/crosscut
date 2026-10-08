@@ -10,6 +10,7 @@ import math
 from .group_performer_family_owner import digest
 from .group_review_camera_repair import shape_cost
 from .group_review_native_window import cosine
+from .group_review_source_equivalence import physical_review_file_identity
 
 
 def _content_key(view):
@@ -54,7 +55,7 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
         raise ValueError('same native frame has conflicting actor-path observations')
     if a[2] == b[2] and left['descriptor'].frame_local_head_id != right['descriptor'].frame_local_head_id:
         return None  # Two occurrences in ONE raster are not a temporal association.
-    if left['row']['native_observation'].get('source_file_identity') != right['row']['native_observation'].get('source_file_identity'):
+    if physical_review_file_identity(left) != physical_review_file_identity(right):
         raise ValueError('source-local actor path changed source file identity')
     sim = cosine(left['vector'],right['vector'])
     if sim is None or sim < minimum_cosine:
@@ -451,7 +452,7 @@ def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum
         for v in frames[i]:
             raw=v['row']['native_observation']
             address=(raw['request_source_index'],raw['source_clock_identity'],
-                digest(raw.get('source_file_identity')),v.get('native_camera_unit_index'))
+                digest(physical_review_file_identity(v)),v.get('native_camera_unit_index'))
             if v['row']['output_tick']!=ticks[i] or address!=tuple(unit):
                 raise ValueError('actor path view changed its physical source file clock or run')
     selected={t:None for t in ticks}

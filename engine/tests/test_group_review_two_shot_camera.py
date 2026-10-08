@@ -128,6 +128,34 @@ def test_good_middle_cannot_buy_a_worse_return_or_discard_known_action():
     assert compare_review_focal_incident_inventory(original,original)['eligible_for_further_review']
 
 
+def test_better_facial_geometry_cannot_buy_a_known_moving_wrist_reversal():
+    before_data=incident_fixture()
+    face=before_data['right_faces'][0]['landmarks_xy']
+    before_data['right_faces']=[dict(landmarks_xy=tuple((.5+(x-.5)*1.4,.35+(y-.35)*1.4)
+        for x,y in face))]*3
+    before=measure_review_focal_incident(**before_data)
+    after_data=incident_fixture()
+    start=after_data['right_points'][0][4]
+    for offset,points in enumerate(after_data['right_points']):
+        points[4]=(start[0]-.005*offset,start[1])
+    after=measure_review_focal_incident(**after_data)
+    assert after['face_scale_log_error']<before['face_scale_log_error']
+    comparison=compare_review_focal_incident_inventory((before,),(after,))
+    assert not comparison['eligible_for_further_review']
+    assert any(r['reason']=='KNOWN_ACTION_DIRECTION_REVERSAL' and r['metric']=='joint_4_direction'
+        for r in comparison['failures'])
+
+
+@pytest.mark.parametrize('applicability',('ONE_SIDED_MOTION','BOTH_STATIONARY'))
+def test_inapplicable_direction_is_not_invented_to_reject_a_camera(applicability):
+    from copy import deepcopy
+    before=measure_review_focal_incident(**incident_fixture());after=deepcopy(before)
+    row=next(r for r in after['joint_requests'] if r['joint']==4)
+    row.update(direction_applicability=applicability,direction_error=None)
+    result=compare_review_focal_incident_inventory((before,),(after,))
+    assert result['eligible_for_further_review'] and not result['quality_approved']
+
+
 def test_focal_pair_scores_the_exact_render_tracks_without_automatic_zoom_release():
     points={0:(.4,.5),1:(.6,.5),2:(.4,.6),3:(.6,.6),4:(.4,.4),5:(.6,.4)}
     ticks=(13,14,15,16,17)

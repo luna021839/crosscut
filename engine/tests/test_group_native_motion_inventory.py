@@ -5,6 +5,7 @@ from time import monotonic
 import pytest
 
 from crosscut.group_source_changing_owner import NativeFamilySensors,NativeMotionDemand
+from crosscut.group_native_motion_completion_schedule import NativeMotionCompletionPackage
 from crosscut.group_joint_source_camera import JointGroupWorkBudget
 from crosscut.group_scene_focal_pose_motion import restore_native_row
 from crosscut.first_result_controller import FirstResultController
@@ -116,6 +117,94 @@ def test_raw_alias_still_completes_appearance_requested_by_another_output_use(tm
     finally:lease.close()
 
 
+def test_coherent_completion_services_fixed_return_before_cheaper_scattered_donors(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        s=sensors()
+        demands=tuple(NativeMotionDemand(source,native,tick,f'family-{source}','moving_closeup')
+            for source,native,tick in ((2,80,8),(2,81,9),(3,90,10),(3,91,11),(5,120,12)))
+        packages=(NativeMotionCompletionPackage('pair-2',tuple(d.native_key for d in demands[:2])),
+            NativeMotionCompletionPackage('pair-3',tuple(d.native_key for d in demands[2:4])))
+        done=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=3,
+            required_native_keys=(demands[-1].native_key,),completion_packages=packages)
+        assert done.attempted_native_keys==((5,120,None),(2,80,None),(2,81,None))
+        assert s.raw_calls==list(done.attempted_native_keys)
+        receipt=json.loads(done.completion_schedule_json)
+        assert receipt['selected_packages'][0]['entire_missing_input_package_admitted'] is True
+        assert receipt['unadmitted_required_native_keys']==[]
+        assert not receipt['successful_observations_or_connected_actors_certified']
+        assert not receipt['quality_approved']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_coherent_completion_uses_one_partial_package_instead_of_scattering_remaining_budget(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        s=sensors()
+        demands=tuple(NativeMotionDemand(source,native,tick,f'family-{source}','moving_closeup')
+            for source,native,tick in ((2,80,8),(2,81,9),(3,90,10),(3,91,11)))
+        packages=(NativeMotionCompletionPackage('pair-2',tuple(d.native_key for d in demands[:2])),
+            NativeMotionCompletionPackage('pair-3',tuple(d.native_key for d in demands[2:])))
+        done=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=1,
+            completion_packages=packages)
+        assert done.attempted_native_keys==((2,80,None),)
+        receipt=json.loads(done.completion_schedule_json)
+        assert len(receipt['selected_packages'])==1
+        assert receipt['selected_packages'][0]['unadmitted_missing_native_keys']==[[2,81,None]]
+        assert not receipt['selected_packages'][0]['entire_missing_input_package_admitted']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_invalid_completion_obligation_is_rejected_before_consuming_the_single_pass(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        s=sensors();d=NativeMotionDemand(2,80,8,'family','other')
+        inventory=s.motion_inventory((d,))
+        with pytest.raises(ValueError,match='frozen request inventory'):
+            s.complete_motion_inventory_once(inventory,maximum_new_observations=1,
+                required_native_keys=((2,999,None),))
+        assert not getattr(s.session,'_native_motion_completion_consumed',False)
+        assert not s.raw_calls and not s.appearance_calls
+        done=s.complete_motion_inventory_once(inventory,maximum_new_observations=1,
+            required_native_keys=(d.native_key,))
+        assert done.attempted_native_keys==(d.native_key,)
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_alias_census_reads_each_physical_fact_once_with_union_modalities(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        class CountingSensors(SyntheticSensors):
+            def __init__(self,budget):
+                super().__init__(budget);self.cache_reads=[];self.archive_reads=[]
+            def native_at(self,source,native,roll=None,*,cached_only=False):
+                if cached_only:self.cache_reads.append((source,native,roll))
+                return super().native_at(source,native,roll,cached_only=cached_only)
+            def _recorded_motion_supply(self,demand):
+                from crosscut.group_source_changing_owner import NativeMotionSupply
+                self.archive_reads.append(demand)
+                return NativeMotionSupply(demand,None)
+        s=CountingSensors(sensors().session.budget)
+        raw=NativeMotionDemand(2,80,8,'family','other')
+        app=replace(raw,output_tick=12,opportunity='moving_closeup',require_appearance=True)
+        member=replace(raw,output_tick=14,require_member_features=True)
+        s.member_gallery=object()  # No rows exist, so no gallery/model method is invoked.
+        inventory=s.motion_inventory((raw,app,member)*100)
+        assert s.cache_reads==[(2,80,None)]
+        assert len(s.archive_reads)==1
+        assert s.archive_reads[0].require_appearance and s.archive_reads[0].require_member_features
+        assert len(inventory.supplies)==300
+        assert inventory.supplies[0].missing_modalities==('RAW',)
+        assert inventory.supplies[1].missing_modalities==('RAW','APPEARANCE')
+        assert inventory.supplies[2].missing_modalities==('RAW','MEMBER_FEATURES')
+        assert not s.raw_calls and not s.appearance_calls
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
 def test_cancelled_appearance_is_partial_and_cannot_restart_under_a_new_session(tmp_path):
     owner,lease=controller(tmp_path)
     def run():
@@ -185,6 +274,53 @@ def test_persisted_native_and_appearance_service_new_request_with_no_reinference
         assert not done.attempted_native_keys and not s.raw_calls and not s.appearance_calls
         assert not s.raw_rows  # Archived parents never silently become live detector rows.
         assert s.session.budget.counts['new_decodes']==s.session.budget.counts['model_calls']==0
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_post_remount_completion_cache_services_absent_addresses_without_rewriting_old_parents(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        old,index,raw,app,path=recorded_sensors(tmp_path,remount=True)
+        live=replace(restore_native_row(raw),native_frame_index=90,source_file_identity=_file_identity(path))
+        live_raw=json.loads(json.dumps(live.to_dict()))
+        live_app=json.loads(json.dumps(app))
+        live_app.update({k:live_raw[k] for k in ('native_frame_index','source_file_identity')},
+            recorded_native_observation_sha256=digest(live_raw))
+        index.add_native_record(live_raw,live_app,provenance='explicit one-pass completion fixture')
+        fresh=sensors();fresh.session=old.session
+        fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+            source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+            additional_source_identities={2:_file_identity(path)})
+        demands=tuple(NativeMotionDemand(2,native,tick,'family','moving_closeup',require_appearance=True)
+            for native,tick in ((80,8),(90,9)))
+        done=fresh.complete_motion_inventory_once(fresh.motion_inventory(demands),maximum_new_observations=2)
+        assert done.supplies[0].observation.source_file_identity==tuple(raw['source_file_identity'])
+        assert done.supplies[1].observation.source_file_identity==_file_identity(path)
+        assert json.loads(done.supplies[1].source_equivalence_json)['state']=='EXACT_FILE_IDENTITY'
+        assert all(not r.missing_modalities for r in done.supplies)
+        assert not fresh.raw_calls and not fresh.appearance_calls and not done.attempted_native_keys
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+def test_additional_manifest_cannot_replace_a_conflicting_existing_native_result(tmp_path):
+    owner,lease=controller(tmp_path)
+    def run():
+        old,index,raw,app,path=recorded_sensors(tmp_path,remount=True)
+        altered=replace(restore_native_row(raw),reason='different_measured_result')
+        index.add_native_record(json.loads(json.dumps(altered.to_dict())),
+            provenance='explicit conflicting fixture')
+        live=replace(restore_native_row(raw),source_file_identity=_file_identity(path))
+        index.add_native_record(json.loads(json.dumps(live.to_dict())),provenance='additional live fixture')
+        fresh=sensors();fresh.session=old.session
+        fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+            source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+            additional_source_identities={2:_file_identity(path)})
+        d=NativeMotionDemand(2,80,8,'family','other',require_appearance=True)
+        value=fresh.motion_inventory((d,)).supplies[0]
+        assert value.state=='CONFLICTING_NATIVE_RECORDS' and value.observation is None
+        assert not value.missing_modalities
     try:owner.run_work_phase('selected_completion',run)
     finally:lease.close()
 

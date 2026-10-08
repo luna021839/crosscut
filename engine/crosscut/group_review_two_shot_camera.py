@@ -17,7 +17,8 @@ from .group_review_projected_action import measure_review_partial_screen_traject
 from .render import EditorialTransformKeyframe,EditorialTransformTrack
 
 
-def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joints=(0,1,2,3,4,5)):
+def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joints=(0,1,2,3,4,5),
+        left_aspects=None,right_aspects=None):
     """Exploration evidence for visible anatomy; NOT complete action admission.
 
     Missing joints keep explicit request IDs and bounded cost intervals. Rank
@@ -32,19 +33,26 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
             or any(type(j) is not int or not 0<=j<6 for j in requested_joints)
             or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0):
         raise ValueError('partial trajectory needs its exact predeclared physical time/joint inventory')
+    aspects=[]
+    for value in (left_aspects,right_aspects):
+        value=(9/16,)*len(ticks) if value is None else value
+        if (not isinstance(value,tuple) or len(value)!=len(ticks) or any(
+                type(a) not in (int,float) or not math.isfinite(a) or a<=0 for a in value)):
+            raise ValueError('native articulation needs each actual raster aspect')
+        aspects.append(value)
     normalized=[];missing=[]
-    for side,frames in (('left',left),('right',right)):
+    for side,frames,ratios in (('left',left,aspects[0]),('right',right,aspects[1])):
         values=[]
-        for t,points in zip(ticks,frames):
+        for t,points,aspect in zip(ticks,frames,ratios):
             if not isinstance(points,dict) or any(j not in range(6) or len(p)!=2 or
                     not all(math.isfinite(v) and 0<=v<=1 for v in p) for j,p in points.items()):
                 raise ValueError('partial trajectory points must be directly observed finite screen anatomy')
             missing.extend((side,t,j) for j in requested_joints if j not in points)
             if not {0,1}<=set(points):values.append({});continue
-            center=((points[0][0]+points[1][0])/2,(points[0][1]+points[1][1])*9/32)
-            width=math.hypot(points[0][0]-points[1][0],(points[0][1]-points[1][1])*9/16)
+            center=((points[0][0]+points[1][0])/2,(points[0][1]+points[1][1])*aspect/2)
+            width=math.hypot(points[0][0]-points[1][0],(points[0][1]-points[1][1])*aspect)
             if width<=1e-6:values.append({});continue
-            values.append({j:((points[j][0]-center[0])/width,(points[j][1]*9/16-center[1])/width)
+            values.append({j:((points[j][0]-center[0])/width,(points[j][1]*aspect-center[1])/width)
                 for j in requested_joints if j in points})
         normalized.append(values)
     a,b=normalized;positions=[];velocities=[];directions=[]
@@ -227,6 +235,16 @@ def compare_review_focal_incident_inventory(original,candidate):
         for j,row in prior.items():
             if row['state']=='OBSERVED' and current[j]['state']!='OBSERVED':
                 failures.append(dict(incident=i,metric=f'joint_{j}',reason='LOST_KNOWN_ACTION_OBSERVATION'))
+            # Matching the face must not purchase a known reversal of a hand
+            # or arm tangent. The 0.5 boundary means dot(v_left,v_right)=0,
+            # not a newly invented perceptual-quality threshold. Stillness,
+            # one-sided motion and missing directions remain inapplicable.
+            a,b=row.get('direction_error'),current[j].get('direction_error')
+            if (j>=2 and row.get('direction_applicability')=='BOTH_MOVING'
+                    and current[j].get('direction_applicability')=='BOTH_MOVING'
+                    and a is not None and b is not None and a<=.5 and b>.5+1e-9):
+                failures.append(dict(incident=i,metric=f'joint_{j}_direction',original=a,candidate=b,
+                    reason='KNOWN_ACTION_DIRECTION_REVERSAL'))
     return dict(contract='paired_focal_incident_known_evidence_preservation_v1',
         state='KNOWN_REGRESSION' if failures else 'NO_MEASURED_INCIDENT_REGRESSION',
         eligible_for_further_review=not failures,failures=failures,original_unknown_metrics=unknown,
@@ -527,7 +545,7 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
             or requested_joints!=tuple(sorted(set(requested_joints)))
             or not requested_joints or any(type(j) is not int or not 0<=j<6 for j in requested_joints)
             or not 1<=maximum_zoom<=2 or not isinstance(target_centers,tuple) or not 1<=len(target_centers)<=10
-            or any(len(c)!=2 or not all(math.isfinite(v) and .25<=v<=.75 for v in c) for c in target_centers)
+            or any(len(c)!=2 or not all(math.isfinite(v) and 0<=v<=1 for v in c) for c in target_centers)
             or not isinstance(camera_fit_bases,tuple) or not 1<=len(camera_fit_bases)<=2
             or len(set(camera_fit_bases))!=len(camera_fit_bases)
             or any(b not in ('face_and_body','face_anchor') for b in camera_fit_bases)):

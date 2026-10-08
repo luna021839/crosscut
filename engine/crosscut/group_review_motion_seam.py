@@ -10,6 +10,7 @@ import numpy as np
 
 from .group_review_measured_features import local_motion, pair_risk
 from .group_review_native_window import cosine
+from .group_review_source_equivalence import physical_review_file_identity
 
 
 def _shape(view):
@@ -32,7 +33,7 @@ def review_native_window_continuous(sequence):
         run=view.get('native_camera_unit_index');row=view['row'];raw=row['native_observation']
         if type(run) is not int or run<0:return False
         key=(raw['request_source_index'],raw['source_clock_identity'],
-            tuple(raw['source_file_identity']),run)
+            physical_review_file_identity(view),run)
         tick=row['output_tick'];native=raw['native_frame_index']
         if type(tick) is not int or type(native) is not int:return False
         if previous is not None:
@@ -56,7 +57,7 @@ def _window_links(sequence):
         ra,rb=a['native_observation'],b['native_observation']
         if (ra['request_source_index']!=rb['request_source_index']
                 or ra['source_clock_identity']!=rb['source_clock_identity']
-                or ra['source_file_identity']!=rb['source_file_identity']
+                or physical_review_file_identity(left)!=physical_review_file_identity(right)
                 or ra['native_frame_index']>rb['native_frame_index']):
             raise ValueError('motion seam window changed source/native/clock identity')
         if ra['native_frame_index']==rb['native_frame_index'] and ra!=rb:

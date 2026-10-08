@@ -231,6 +231,7 @@ class NativeMotionInventory:
     attempted_native_keys: tuple
     completion_consumed: bool
     status: str
+    completion_schedule_json: str | None = None
 
 
 class NativeMotionViews:
@@ -250,6 +251,15 @@ class NativeMotionViews:
         self.sensors=sensors;self.domain=sensors.session.domain
         self.supplies={};self.payloads={};self.records={};self.views={};self.paths={}
         for supply in inventory.supplies:
+            # Live observers inherit typed tuple containers from raw.to_dict;
+            # persisted inputs have JSON arrays. Canonicalize containers at
+            # this consumer seam, exactly as the raw payload below. Do not
+            # rewrite a physical parent, descriptor, coordinate or member hint.
+            supply=replace(supply,
+                appearance=None if supply.appearance is None else json.loads(json.dumps(
+                    supply.appearance,sort_keys=True,allow_nan=False)),
+                member_features=None if supply.member_features is None else json.loads(json.dumps(
+                    supply.member_features,sort_keys=True,allow_nan=False)))
             key=supply.demand.native_key
             previous=self.supplies.get(key)
             if previous is not None:
@@ -294,8 +304,11 @@ class NativeMotionViews:
                 validate_recorded_member_features(raw,member_features,gallery=self.sensors.member_gallery,
                     expected_space=native_descriptor_space(self.sensors.session,ARCFACE_MODEL_NAME))
             row=reproject_recorded_static_query(query,tick,raw,domain=self.domain,compact=True)
+            from .group_review_source_equivalence import freeze_verified_native_file_binding
+            file_binding=freeze_verified_native_file_binding(self.sensors,raw,supply.source_equivalence_json)
             result=dict(state=supply.state,row=row,appearance=appearance,member_features=member_features,
                 source_equivalence_json=supply.source_equivalence_json,
+                verified_native_file_binding=file_binding,
                 head_inventory=tuple(h['observation_id'] for h in raw['heads']),quality_approved=False)
         self.records[key]=result
         return result
@@ -304,21 +317,42 @@ class NativeMotionViews:
         from bisect import bisect_right
         import json
         source=self.domain.request_index(query.eligible_source_index);_,_,native=query.sample_at(tick)
-        supply=self.supplies.get((source,native,analysis_roll))
-        if supply is not None and supply.observation is not None:
-            identity=supply.observation.source_file_identity
-        else:
-            binding=self.sensors.recorded_motion_bindings.get(source)
-            identity=(json.loads(binding)['recorded_file_identity'] if binding is not None
-                else self.sensors.session._assert_source_identity(source))
+        self.sensors.session.budget.check()
+        if self.sensors.session.closed:raise ValueError('native signature lost its live request session')
+        # One live physical file defines the camera run, including unobserved
+        # ticks. Recorded device aliases are independently bound in record();
+        # their actual raw/body/feature parents are NOT rewritten here.
+        identity=self.sensors.session._assert_source_identity(source)
         clock=self.domain.clocks_by_request[source]
         cuts=tuple(math.ceil(t*float(clock.frame_rate)-1e-9) for t in self.domain.cuts_for_request(source))
         return source,query.source_clock_identity,family.digest(identity),bisect_right(cuts,native),native
+
+    def observation_status(self,query,tick,*,selected=None):
+        """A compact exact-address diagnostic, never an identity certificate.
+
+        Missing raw, missing features, an unmatched DP occurrence and an
+        ambiguous selected occurrence are different failure layers. No
+        embedding or private-gallery content leaves this receipt.
+        """
+        found=self.record(query,tick)
+        candidates=self.candidates(query,tick)
+        raw=None if found['row'] is None else found['row']['native_observation']
+        return dict(output_tick=tick,request_source_index=self.domain.request_index(query.eligible_source_index),
+            requested_native_frame_index=query.sample_at(tick)[2],native_supply_state=found['state'],
+            raw_observed=raw is not None,visible_head_occurrences=len(candidates),
+            appearance_ready_head_occurrences=sum(v['vector'] is not None for v in candidates),
+            selected_head_id=None if selected is None else selected['descriptor'].frame_local_head_id,
+            selected_actor_state=('UNMATCHED' if selected is None else
+                'AMBIGUOUS' if selected.get('reacquisition_ambiguous',False) else 'OBSERVED_PATH_HYPOTHESIS'),
+            original_role=None if query.role is None else query.role.value,
+            private_embeddings_included=False,quality_approved=False)
 
     def candidates(self,query,tick,*,analysis_roll=None,association_ready=False):
         from .group_review_camera_repair import ReviewActorSelection,framing_descriptor,effective_face_detail_pixels
         from .group_review_body_recovery import (apply_review_primary_joint_observation,
             apply_review_body_receipt,head_fingerprint)
+        self.sensors.session.budget.check()
+        if self.sensors.session.closed:raise ValueError('native candidates lost their live request session')
         key=(query.key,tick,analysis_roll)
         if key not in self.views:
             found=self.record(query,tick,analysis_roll=analysis_roll);result=[]
@@ -337,6 +371,7 @@ class NativeMotionViews:
                     near=min(1.,max(0.,(descriptor.face_height-.13)/.13))
                     if detail is not None:near*=min(1.,detail/150.)
                     view=dict(row=row,descriptor=descriptor,vector=embeddings.get(head_id),
+                        verified_native_file_binding=found['verified_native_file_binding'],
                         appearance=appearance,member_hint=member_hints.get(head_id),near=near,detail_risk=None,
                         native_camera_unit_index=self.native_signature(query,tick,analysis_roll=analysis_roll)[3],
                         actor_association_state='APPEARANCE_UNOBSERVED' if embeddings.get(head_id) is None
@@ -369,6 +404,42 @@ class NativeMotionViews:
                 anchor=anchor,maximum_frames=512,work_port=self.sensors.session.budget.request_work_phase)
         return self.paths[key]
 
+    def reproject_selected_actor_path(self,queries,selected,*,analysis_roll=None):
+        """Keep the exact selected occurrences under a newly authored camera.
+
+        This is not a second actor search. An unmatched tick stays unmatched,
+        and an unavailable/changed raw parent cannot be replaced by the nearest
+        face. Native phase must already have been selected before this call.
+        Connected-path uncertainty is retained, not erased by reprojection.
+        """
+        if (not isinstance(selected,dict) or not selected or len(selected)>512
+                or not set(selected)<=set(queries)):
+            raise ValueError('selected actor projection needs one bounded explicit tick path')
+        result={}
+        association_fields=('source_actor_path_identity','reacquisition_ambiguous',
+            'selected_actor_association_state','original_role',
+            'original_attention_hypothesis_is_focal_duty','original_actor_inventory_seed',
+            'original_attention_scope')
+        for tick,prior in selected.items():
+            self.sensors.session.budget.check()
+            if prior is None:
+                result[tick]=None
+                continue
+            raw=prior['row']['native_observation'];query=queries[tick]
+            source=self.domain.request_index(query.eligible_source_index)
+            if (prior['row']['output_tick']!=tick or raw['request_source_index']!=source
+                    or raw['native_frame_index']!=query.sample_at(tick)[2]
+                    or raw['source_clock_identity']!=query.source_clock_identity):
+                raise ValueError('selected camera changed the already selected actor native schedule')
+            head=prior['descriptor'].frame_local_head_id
+            candidates=[v for v in self.candidates(query,tick,analysis_roll=analysis_roll)
+                if v['descriptor'].frame_local_head_id==head
+                and family.digest(v['row']['native_observation'])==family.digest(raw)]
+            if len(candidates)!=1:
+                raise ValueError('selected camera lost the exact observed actor raw parent')
+            result[tick]=dict(candidates[0],**{k:prior[k] for k in association_fields if k in prior})
+        return result
+
     def freeze_original_actors(self,queries,ticks,*,original_program_identity):
         from .group_review_reference_actor import freeze_original_review_actor_inventory
         ticks=tuple(sorted(set(ticks)))
@@ -379,6 +450,235 @@ class NativeMotionViews:
             original_program_identity=original_program_identity,
             original_attention_scopes={t:queries[t].original_unit_id for t in ticks},
             original_roles_by_tick=roles)
+
+
+def _balanced_native_motion_tuples(sources,cut_ticks,native_phases,maximum_tuples):
+    """A declared finite subset, NOT an endpoint-cost ranking or full optimum."""
+    from itertools import product
+    if (not isinstance(sources,tuple) or not 2<=len(sources)<=12 or len(set(sources))!=len(sources)
+            or any(type(s) is not int or s<0 for s in sources)
+            or not isinstance(cut_ticks,tuple) or not 1<=len(cut_ticks)<=3
+            or cut_ticks!=tuple(sorted(set(cut_ticks)))
+            or any(type(t) is not int or t<0 for t in cut_ticks)
+            or not isinstance(native_phases,tuple) or not 1<=len(native_phases)<=5
+            or len(set(native_phases))!=len(native_phases)
+            or any(type(p) is not int or abs(p)>2 for p in native_phases)
+            or type(maximum_tuples) is not int or not 1<=maximum_tuples<=64):
+        raise ValueError('native motion frontier needs finite externally declared strata')
+    remaining=[(a,b,cut,pa,pb,ha,hb) for a,b,cut,pa,pb,ha,hb in
+        product(sources,sources,cut_ticks,native_phases,native_phases,(0,1),(0,1)) if a!=b]
+    counts={};result=[]
+    # Pure tie-break hashes are immutable. Do not serialize/hash the same
+    # theoretical tuple again during every balanced admission round.
+    ties={row:family.digest(row) for row in remaining}
+    def strata(row):
+        a,b,cut,pa,pb,ha,hb=row
+        return (('left_source',a),('right_source',b),('cut',cut),
+            ('left_phase',pa),('right_phase',pb),('left_actor',ha),('right_actor',hb))
+    def priority(row):
+        keys=strata(row)
+        return (max(counts.get(k,0) for k in keys[:2]),
+            sum(counts.get(k,0) for k in keys[:2]),
+            sum(counts.get(k,0) for k in keys[2:]),
+            abs(row[3])+abs(row[4]),row[5]+row[6],ties[row])
+    for _ in range(min(maximum_tuples,len(remaining))):
+        chosen=min(remaining,key=priority);remaining.remove(chosen);result.append(chosen)
+        for key in strata(chosen):counts[key]=counts.get(key,0)+1
+    return tuple(result)
+
+
+def realize_normal_native_motion_frontier(*,context,sensors,first_output_frame,end_output_frame,
+        cut_ticks,native_phases=(-1,0,1),maximum_tuples=64,maximum_camera_candidates=2,
+        maximum_new_observations=0,maximum_new_raw_observations=0,
+        protected_output_intervals=(),body_receipt_bundles=(),source_families=None):
+    """Own the real source/actor/native-phase/cut/camera frontier in ONE pass.
+
+    Native demand comes from each actual materialized topology, not an old
+    whole-song discovery sampler. Missing facts are completed at most once.
+    This is the normal producer's selection stage: it returns exact evaluated
+    whole plans and actor references. It does not substitute for full fresh
+    bundle metadata, final replay, encoding or expert-quality admission.
+    """
+    from .group_scene_owned_program import freeze_owned_scene_program
+    from .group_scene_epoch_program import compile_common_clock_camera_queries
+    from .group_native_motion_programme import NativeMotionSide,realize_native_motion_programme
+    from .group_native_motion_camera_producer import produce_two_sided_native_cameras
+    from .request_work_lease import current_request_work_phase
+    from .group_native_motion_completion_schedule import NativeMotionCompletionPackage
+    from time import monotonic
+    started=monotonic();stage_seconds={};stage_start=started
+    domain=sensors.session.domain;plan=context.incumbent.render_plan
+    port=sensors.session.budget.request_work_phase
+    if getattr(sensors.session,'_native_motion_completion_consumed',False):
+        raise ValueError('native motion completion already consumed this session')
+    if (port is None or current_request_work_phase() is not port or sensors.session.closed
+            or any(type(t) is not int for t in (first_output_frame,end_output_frame))
+            or not 3<=first_output_frame<end_output_frame<=plan.output_frame_count-3
+            or not isinstance(cut_ticks,tuple) or any(not first_output_frame+4<=t<=end_output_frame-4
+                or t-first_output_frame>160 or end_output_frame-t>160 for t in cut_ticks)):
+        raise ValueError('normal native frontier requires its active bounded request-owned interval')
+    original=freeze_owned_scene_program(context,domain)
+    original_shots=tuple(s.to_dict() for s in visible_group_shots(plan,domain))
+    halo=tuple(range(first_output_frame-3,end_output_frame+3))
+    if type(maximum_tuples) is not int or not 1<=maximum_tuples<=64:
+        raise ValueError('native motion frontier needs its declared tuple capacity')
+    effective_tuples=min(maximum_tuples,(16384-len(halo))//(end_output_frame-first_output_frame))
+    proposed=_balanced_native_motion_tuples(domain.eligible_indices,cut_ticks,native_phases,effective_tuples)
+    def queries(candidate):
+        compiled=compile_common_clock_camera_queries(context=context,domain=domain,original_program=original,
+            candidate_plan=candidate,output_intervals=((halo[0],halo[-1]+1),))
+        return {t:q for q in compiled.queries for t in range(q.first_output_frame,q.end_output_frame)}
+    base=queries(plan)
+    families=({s:'physical-file-'+family.digest(sensors.session._assert_source_identity(s))
+        for s in domain.eligible_indices} if source_families is None else source_families)
+    if (not isinstance(families,dict) or set(families)!=set(domain.eligible_indices)
+            or any(not isinstance(v,str) or not v for v in families.values())):
+        raise ValueError('native frontier source families differ from its frozen source domain')
+    demands=[]
+    def request(q,t):
+        source=domain.request_index(q.eligible_source_index)
+        opportunity=('moving_closeup' if q.role in (GroupOutputRole.FOCAL_HEAD,GroupOutputRole.FOCAL_HEAD_ARMS)
+            else 'other')
+        return NativeMotionDemand(source,q.sample_at(t)[2],t,families[source],opportunity,
+            require_appearance=True,require_member_features=sensors.member_gallery is not None)
+    demands.extend(request(base[t],t) for t in halo)
+    declarations=[];trials=[]
+    # Native topology, duty/protection and alias inventories precede all donor
+    # actor/camera costs. Invalid physical shots are recorded, not retried with
+    # a widened interval or a nearby native raster.
+    for index,spec in enumerate(proposed):
+        sensors.session.budget.check();port.charge('states')
+        a,b,cut,pa,pb,ha,hb=spec
+        sides=(NativeMotionSide(first_output_frame,cut,a,pa),NativeMotionSide(cut,end_output_frame,b,pb))
+        try:
+            numeric=realize_native_motion_programme(original=plan,domain=domain,sides=sides,
+                protected_output_intervals=protected_output_intervals)
+        except ValueError as exc:
+            if str(exc) not in ('joint state crosses an observed actual native camera cut',
+                    'one motion side crosses an actual native broadcaster cut',
+                    'phase base grid differs from the complete actual renderer clock',
+                    'native motion programme intersects protected original pixels'):
+                raise
+            trials.append(dict(tuple_index=index,spec=spec,state='INADMISSIBLE_NATIVE_TOPOLOGY',reason=str(exc)))
+            continue
+        qs=queries(numeric.render_plan)
+        demands.extend(request(qs[t],t) for t in range(first_output_frame,end_output_frame))
+        declarations.append((index,spec,sides,qs))
+    if len(demands)>16384:
+        raise ValueError('declared native motion alias inventory exceeds its request cap')
+    stage_seconds['numeric_declaration']=monotonic()-stage_start;stage_start=monotonic()
+    cached=sensors.motion_inventory(tuple(demands))
+    stage_seconds['cache_census']=monotonic()-stage_start;stage_start=monotonic()
+    # The original context/KEEP programme is shared by every alternative. Its
+    # exact entry/return flanks come first, followed by all original actor
+    # inputs. Donor packages are frozen numeric topologies, not match winners.
+    original_order=tuple(dict.fromkeys((first_output_frame-1,end_output_frame,
+        *range(first_output_frame-3,first_output_frame),
+        *range(end_output_frame,end_output_frame+3),*halo)))
+    required_keys=tuple(dict.fromkeys(request(base[t],t).native_key for t in original_order))
+    packages=tuple(NativeMotionCompletionPackage(f'joint-tuple-{index:03d}',
+        tuple(dict.fromkeys(request(qs[t],t).native_key
+            for t in range(first_output_frame,end_output_frame))))
+        for index,spec,sides,qs in declarations)
+    completed=sensors.complete_motion_inventory_once(cached,maximum_new_observations=maximum_new_observations,
+        maximum_new_raw_observations=maximum_new_raw_observations,
+        required_native_keys=required_keys,completion_packages=packages)
+    stage_seconds['one_completion']=monotonic()-stage_start;stage_start=monotonic()
+    views=NativeMotionViews(sensors,completed,body_receipt_bundles=body_receipt_bundles)
+    original_actors,original_receipt=views.freeze_original_actors(base,halo,
+        original_program_identity=original.program_sha256)
+    stage_seconds['original_actor_freeze']=monotonic()-stage_start;stage_start=monotonic()
+    # Freeze each source-local actor hypothesis before fitting a donor camera.
+    # Equivalent physical paths reuse the same DP, then exactly reproject into
+    # each new query scope. A camera cannot trigger a more favourable actor.
+    path_cache={};candidates=[];actor_seconds=0.;camera_seconds=0.
+    from .group_review_projected_action import project_observed_review_face
+    fixed_context_faces={t:project_observed_review_face(original_actors[t],base[t],t)
+        for t in (first_output_frame-1,end_output_frame)}
+    missing_fixed_landmarks=tuple(t for t,f in fixed_context_faces.items()
+        if f is None or f['landmarks_xy'] is None)
+    for index,spec,sides,qs in declarations:
+        sensors.session.budget.check()
+        trial_start=monotonic()
+        paths=[];receipts=[]
+        for side,actor_rank in zip(sides,spec[-2:],strict=True):
+            ticks=tuple(range(side.first_output_frame,side.end_output_frame));middle=(ticks[0]+ticks[-1])/2
+            seed_tick=next((t for t in sorted(ticks,key=lambda t:(abs(t-middle),t))
+                if views.candidates(qs[t],t,association_ready=True)),None)
+            anchors=(() if seed_tick is None else tuple(sorted(views.candidates(qs[seed_tick],seed_tick,
+                association_ready=True),key=lambda v:(family.digest(v['row']['native_observation']),
+                    v['descriptor'].frame_local_head_id))))
+            anchor=None if actor_rank>=len(anchors) else anchors[actor_rank]
+            key=(tuple((t,views.native_signature(qs[t],t)) for t in ticks),None if anchor is None else
+                (family.digest(anchor['row']['native_observation']),anchor['descriptor'].frame_local_head_id))
+            if key not in path_cache:path_cache[key]=views.connected_actor_views(qs,ticks,anchor)
+            path,receipt=path_cache[key]
+            paths.append(views.reproject_selected_actor_path(qs,path));receipts.append(receipt)
+        actor_seconds+=monotonic()-trial_start
+        endpoint_inputs=tuple(views.observation_status(qs[t],t,selected=path[t])
+            for side,path in zip(sides,paths,strict=True)
+            for t in (side.first_output_frame,side.end_output_frame-1))
+        if any(r.get('state')!='CONNECTED_SOURCE_LOCAL_HYPOTHESIS' for r in receipts):
+            trials.append(dict(tuple_index=index,spec=spec,state='ACTOR_PATH_UNKNOWN',paths=receipts,
+                endpoint_inputs=endpoint_inputs));continue
+        missing_actors=tuple(t for side,path in zip(sides,paths,strict=True)
+            for t in (side.first_output_frame,side.end_output_frame-1) if path[t] is None)
+        missing_landmarks=tuple(t for side,path in zip(sides,paths,strict=True)
+            for t in (side.first_output_frame,side.end_output_frame-1)
+            if (f:=project_observed_review_face(path[t],qs[t],t)) is None or f['landmarks_xy'] is None)
+        if missing_fixed_landmarks or missing_landmarks:
+            # There is no camera score to compute without its exact fitting
+            # inputs. Do not rebuild/measure an identical full KEEP programme
+            # for every known-missing tuple; these are UNKNOWN inputs, not a
+            # geometry failure or a source-wide exclusion.
+            trials.append(dict(tuple_index=index,spec=spec,state='UNOBSERVED_ENDPOINT_ANATOMY',
+                endpoint_inputs=endpoint_inputs,receipt=dict(
+                    missing_actor_ticks=missing_actors,
+                    missing_landmark_ticks=(*missing_landmarks,*missing_fixed_landmarks),
+                    measured_keep_incidents=None,camera_fitting_started=False,
+                    missing_values_used_as_perfect_keep_score=False,quality_approved=False)))
+            continue
+        trial_start=monotonic()
+        realized,receipt=produce_two_sided_native_cameras(context=context,domain=domain,views=views,
+            original_program=original,original_actors=original_actors,original_actor_receipt=original_receipt,
+            sides=sides,side_paths=tuple(paths),side_path_receipts=tuple(receipts),
+            protected_output_intervals=protected_output_intervals,maximum_camera_candidates=maximum_camera_candidates)
+        camera_seconds+=monotonic()-trial_start
+        trials.append(dict(tuple_index=index,spec=spec,state=receipt['state'],receipt=receipt,
+            endpoint_inputs=endpoint_inputs,
+            camera_candidates=[dict(selected_plan_identity=family.digest(c.render_plan.to_json()),
+                state=c.evidence['state'],score=c.evidence['score'],measured_keep_score=c.evidence['measured_keep_score'],
+                known_incident_failures=c.evidence['incident_comparison']['failures'],
+                known_hold_observation_losses=c.evidence['known_hold_observation_losses'],
+                local_member_hint_conflict_ticks=c.evidence['local_member_hint_conflict_ticks'])
+                for c in realized]))
+        candidates.extend(realized)
+    eligible=tuple(sorted((c for c in candidates if c.evidence['state']=='REALIZED_FOR_REVIEW'),
+        key=lambda c:(c.evidence['score']-c.evidence['measured_keep_score'],family.digest(c.render_plan.to_json()))))
+    from collections import Counter
+    stage_seconds['actor_paths_and_reprojection']=actor_seconds
+    stage_seconds['joint_camera_and_incident_measurement']=camera_seconds
+    report=dict(contract='normal_joint_native_motion_frontier_selection_stage_v1',
+        original_program_identity=original.program_sha256,original_actor_inventory=original_receipt,
+        original_whole_song_shot_inventory=original_shots,
+        frozen_source_families=families,distinct_frozen_source_families=len(set(families.values())),
+        original_protected_output_intervals=protected_output_intervals,
+        proposed_joint_tuples=len(proposed),physical_topologies=len(declarations),
+        requested_maximum_joint_tuples=maximum_tuples,effective_alias_budget_tuple_cap=effective_tuples,
+        native_alias_requests=len(demands),unique_native_requests=len(views.supplies),
+        native_completion_status=completed.status,native_completion_consumed=completed.completion_consumed,
+        native_completion_schedule=__import__('json').loads(completed.completion_schedule_json),
+        native_supply_states=dict(Counter(s.state for s in completed.supplies)),
+        unique_native_supply_states=dict(Counter(s.state for s in views.supplies.values())),
+        original_context_inputs=tuple(views.observation_status(base[t],t,selected=original_actors[t])
+            for t in (first_output_frame-1,end_output_frame)),
+        actual_actor_dp_paths=len(path_cache),realized_camera_candidates=len(candidates),
+        nonregressing_camera_candidates=len(eligible),trials=sorted(trials,key=lambda r:r['tuple_index']),
+        demand_basis='exact_new_topology_authorized_native_sampler_not_old_discovery_clock',
+        full_joint_optimum_claimed=False,full_normal_metadata_constructed=False,
+        stage_seconds=stage_seconds,selection_elapsed_seconds=monotonic()-started,
+        video_rendered=False,quality_approved=False)
+    return eligible,report,views
 
 
 class NativeFamilySensors:
@@ -518,7 +818,8 @@ class NativeFamilySensors:
             raise ValueError('recorded member features need one exact pre-completion input binding')
         self.recorded_member_feature_cache=cache
 
-    def bind_recorded_motion_index(self,index,*,source_identities,source_content_sha256):
+    def bind_recorded_motion_index(self,index,*,source_identities,source_content_sha256,
+            additional_source_identities=None):
         """Bind the request's explicit archive index without rewriting raw parents.
 
         No directory search, extra cache DB or inference occurs. Device-only
@@ -535,14 +836,24 @@ class NativeFamilySensors:
             raise ValueError('recorded motion input needs one explicit request-owned source manifest')
         self.session.budget.check()
         if self.session.closed:raise ValueError('recorded motion input needs a live request session')
-        bindings={}
+        additions={} if additional_source_identities is None else additional_source_identities
+        if not isinstance(additions,dict) or not set(additions)<=set(source_identities):
+            raise ValueError('additional native input identities escaped the frozen source manifest')
+        bindings={};additional_bindings={}
         for source,identity in sorted(source_identities.items()):
             receipt=verify_recorded_source_file(self.session.domain.request_sources[source],identity,
                 content_sha256=source_content_sha256.get(source),work_port=self.session.budget.request_work_phase)
             if tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(source):
                 raise ValueError('recorded source changed while binding it to the live request')
             bindings[source]=json.dumps(receipt,sort_keys=True,separators=(',',':'),allow_nan=False)
+            if source in additions and tuple(additions[source])!=tuple(identity):
+                added=verify_recorded_source_file(self.session.domain.request_sources[source],additions[source],
+                    content_sha256=source_content_sha256.get(source),work_port=self.session.budget.request_work_phase)
+                if tuple(added['current_file_identity'])!=self.session._assert_source_identity(source):
+                    raise ValueError('additional native input source changed during request binding')
+                additional_bindings[source]=json.dumps(added,sort_keys=True,separators=(',',':'),allow_nan=False)
         self.recorded_motion_bindings=bindings
+        self.recorded_motion_additional_bindings=additional_bindings
         self.recorded_motion_index=index
 
     def _recorded_motion_supply(self,demand):
@@ -570,6 +881,20 @@ class NativeFamilySensors:
         found=index.lookup(source=demand.source_index,native=demand.native_frame_index,
             clock=family.digest(clock.to_dict()),identity=receipt['recorded_file_identity'],
             analysis_variant_sha256=variant)
+        # A later one-pass completion has live-device parents, while the
+        # older input archive may have an earlier mount identity. Reuse only
+        # an explicitly bound additional manifest for a genuinely ABSENT raw
+        # address. Never replace measured failures, conflicting rows or an
+        # existing bad actor result with a more favourable capture.
+        extra=getattr(self,'recorded_motion_additional_bindings',{}).get(demand.source_index)
+        if found['raw'] is None and found['state']=='MISSING' and extra is not None:
+            alternative=json.loads(extra)
+            if tuple(alternative['current_file_identity'])!=self.session._assert_source_identity(demand.source_index):
+                raise ValueError('additional native input source changed after request binding')
+            added=index.lookup(source=demand.source_index,native=demand.native_frame_index,
+                clock=family.digest(clock.to_dict()),identity=alternative['recorded_file_identity'],
+                analysis_variant_sha256=variant)
+            found=added;receipt=alternative;binding=extra
         raw=None if found['raw'] is None else restore_native_row(found['raw'])
         appearance=None
         if raw is not None and demand.require_appearance:
@@ -645,21 +970,31 @@ class NativeFamilySensors:
             previous=family_by_source.setdefault(d.source_index,d.source_family)
             if previous!=d.source_family:
                 raise ValueError('native demand aliases changed a frozen source family')
-        supplies=[]
+        # Inspect physical facts once, not once per camera/cut/output alias.
+        # Union modalities BEFORE inspection: a raw-only first alias must not
+        # hide a later appearance/member-feature request at the same raster.
+        union={}
         for d in demands:
+            prior=union.get(d.native_key)
+            union[d.native_key]=(d if prior is None else replace(prior,
+                require_appearance=prior.require_appearance or d.require_appearance,
+                require_member_features=prior.require_member_features or d.require_member_features))
+        physical={}
+        for key,d in union.items():
             raw=self.native_at(d.source_index,d.native_frame_index,d.analysis_roll,cached_only=True)
             if raw is None:
-                supplies.append(self._recorded_motion_supply(d));continue
+                physical[key]=self._recorded_motion_supply(d);continue
             appearance=(self.appearance_at(raw,cached_only=True) if d.require_appearance
                 and raw is not None and raw.native_pixel_sha256 is not None else None)
             supply=NativeMotionSupply(d,raw,appearance)
             if d.require_member_features and raw.native_pixel_sha256 is not None:
                 supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
-            supplies.append(supply)
-        return NativeMotionInventory(tuple(supplies),(),False,'CACHE_ONLY')
+            physical[key]=supply
+        supplies=tuple(replace(physical[d.native_key],demand=d) for d in demands)
+        return NativeMotionInventory(supplies,(),False,'CACHE_ONLY')
 
     def complete_motion_inventory_once(self,inventory,*,maximum_new_observations,
-            maximum_new_raw_observations=None):
+            maximum_new_raw_observations=None,required_native_keys=(),completion_packages=()):
         """One request-owned, time/source/opportunity-balanced missing pass.
 
         Existing successes, observed failures and absent facts remain distinct.
@@ -670,6 +1005,8 @@ class NativeFamilySensors:
         from .group_scene_native_storage import MAX_NATIVE_JSON_BYTES
         from .group_joint_primitive_journal import primitive_reservation_bytes
         from .request_work_lease import current_request_work_phase
+        from .group_native_motion_completion_schedule import (validate_completion_packages,
+            coherent_completion_schedule)
         port = self.session.budget.request_work_phase
         if port is None or current_request_work_phase() is not port:
             raise ValueError('normal motion completion requires the active whole-request work lease')
@@ -682,6 +1019,7 @@ class NativeFamilySensors:
             raise ValueError('one native completion needs the frozen cache-only inventory')
         if getattr(self.session,'_native_motion_completion_consumed',False):
             raise ValueError('native motion completion already consumed this session')
+        validate_completion_packages(inventory,required_native_keys,completion_packages)
         # Consume before the first model call, including a zero-budget pass.
         port.charge('native_completion_passes')
         self.session._native_motion_completion_consumed=True
@@ -736,6 +1074,13 @@ class NativeFamilySensors:
             # moving-closeup use by selecting an earlier 'other' representative.
             for lane in {(d.source_family,d.opportunity) for d in aliases}:
                 counts[lane]=counts.get(lane,0)+1
+        schedule_receipt=dict(policy='source_opportunity_time_band_balanced_v1',
+            successful_observations_or_connected_actors_certified=False,quality_approved=False)
+        if required_native_keys or completion_packages:
+            scheduled,schedule_receipt=coherent_completion_schedule(current,
+                required_native_keys=required_native_keys,packages=completion_packages,
+                maximum_observations=limit,maximum_raw_observations=raw_limit)
+        schedule_json=__import__('json').dumps(schedule_receipt,sort_keys=True,allow_nan=False)
         attempted=[]
         known={s.demand.native_key:s.observation for s in current.supplies}
         bindings={s.demand.native_key:s for s in current.supplies}
@@ -751,7 +1096,7 @@ class NativeFamilySensors:
             value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key),
                 bindings[d.native_key].recorded_input_state,bindings[d.native_key].source_equivalence_json,
                 member_features.get(d.native_key))
-                for d in demands),tuple(attempted),True,state)
+                for d in demands),tuple(attempted),True,state,schedule_json)
             self.motion_completion_result=value
             return value
         snapshot('RUNNING')
