@@ -1,8 +1,65 @@
 from copy import deepcopy
+from hashlib import sha256
 import pytest
 
 from crosscut.group_performer_family_owner import digest
-from crosscut.group_review_recorded_index import RecordedGroupReviewIndex
+from crosscut.group_review_recorded_index import RecordedGroupReviewIndex, verify_recorded_source_file
+from crosscut.group_joint_observations import _file_identity
+
+
+def test_remount_requires_complete_content_hash_and_preserves_recorded_address(tmp_path):
+    path = tmp_path / 'source.mp4'
+    path.write_bytes(b'actual complete source bytes')
+    current = _file_identity(path)
+    recorded = [current[0] + 1, *current[1:]]
+    original = list(recorded)
+    result = verify_recorded_source_file(path, recorded,
+        content_sha256=sha256(path.read_bytes()).hexdigest())
+    assert result['state'] == 'CONTENT_VERIFIED_DEVICE_REMOUNT'
+    assert result['recorded_file_identity'] == recorded == original
+    assert result['current_file_identity'] == list(current)
+    assert not result['archived_observations_rewritten'] and not result['quality_approved']
+    for missing_or_wrong in (None, '0' * 64):
+        with pytest.raises(ValueError):
+            verify_recorded_source_file(path, recorded, content_sha256=missing_or_wrong)
+
+
+def test_remount_does_not_accept_other_file_changes_even_with_supplied_digest(tmp_path):
+    path = tmp_path / 'source.mp4'
+    path.write_bytes(b'unchanged source')
+    current = _file_identity(path)
+    for index in (1, 2, 3, 4):
+        recorded = [current[0] + 1, *current[1:]]
+        recorded[index] += 1
+        with pytest.raises(ValueError, match='beyond'):
+            verify_recorded_source_file(path, recorded,
+                content_sha256=sha256(path.read_bytes()).hexdigest())
+
+
+def test_exact_identity_does_not_hash_source_again(tmp_path, monkeypatch):
+    path = tmp_path / 'source.mp4'
+    path.write_bytes(b'current source')
+    def forbidden_hash(*args, **kwargs):
+        raise AssertionError('unchanged identity must not repeat whole-file hashing')
+    monkeypatch.setattr('crosscut.group_review_recorded_index.file_digest', forbidden_hash)
+    result = verify_recorded_source_file(path, _file_identity(path))
+    assert result['state'] == 'EXACT_FILE_IDENTITY' and result['content_hash_bytes'] == 0
+
+
+def test_remount_rejects_change_during_hash_and_charges_io(tmp_path, monkeypatch):
+    path = tmp_path / 'source.mp4'
+    path.write_bytes(b'source')
+    current = _file_identity(path)
+    calls = []
+    class Port:
+        def charge(self, resource, amount=1):
+            calls.append((resource, amount))
+    identities = iter((current, (*current[:2], current[2] + 1, *current[3:])))
+    monkeypatch.setattr('crosscut.group_review_recorded_index._file_identity', lambda path: next(identities))
+    with pytest.raises(ValueError, match='during'):
+        verify_recorded_source_file(path, [current[0] + 1, *current[1:]],
+            content_sha256=sha256(path.read_bytes()).hexdigest(), work_port=Port())
+    assert calls == [('identity_reads', 1), ('model_hash_bytes', current[2]), ('identity_reads', 1)]
 
 
 def capture(tick=8, native=80, *, face=True, appearance=True):

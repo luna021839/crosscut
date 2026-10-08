@@ -16,6 +16,35 @@ from tests.test_visual_boundary_repair import _choice
 
 
 class GroupFirstResultBundleTests(unittest.TestCase):
+    def test_realized_producer_camera_survives_normal_bundle_constructor_exactly(self):
+        from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe
+        from crosscut.editorial_transform_events import rendered_transform_event_records
+        original=self.make_bundle()
+        track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2,.48,.46,1.),
+            EditorialTransformKeyframe(.8,1.4,.51,.48,-1.)),reason='measured_producer_camera')
+        plan=replace(original.render_plan,segments=(replace(original.render_plan.segments[0],
+            editorial_transform=track),original.render_plan.segments[1]))
+        records=rendered_transform_event_records(plan.segments,plan.fps)
+        motion=replace(original.editorial_motion_plan,segments=(replace(original.editorial_motion_plan.segments[0],
+            track=track),original.editorial_motion_plan.segments[1]),
+            zoom_event_count=len(records['zoom']),pan_event_count=len(records['pan']),
+            roll_event_count=len(records['roll']),authored_event_counts=(('zoom',0),('pan',0),('roll',0)))
+        request=SimpleNamespace(sources=plan.sources,reference_source=plan.reference_source,aspect_ratio=plan.aspect_ratio)
+        def build(**changes):
+            return _review_first_group_bundle(timeline=original.visual_timeline,request=request,
+                eligible_indices=(0,1),offsets=(0.,0.),timewarps=(None,None),common_start=0.,
+                section_plan=original.section_plan,phrase_times=original.phrase_times,
+                output=Path('/synthetic/realized-output'),reporter=SimpleNamespace(log=lambda *a,**k:None),warnings=[],
+                **dict(dict(realized_plan=plan,realized_motion=motion),**changes))
+        bundle=build();self.validate(bundle)
+        self.assertEqual(bundle.render_plan,replace(plan,output=Path('/synthetic/realized-output')))
+        self.assertIs(bundle.editorial_motion_plan,motion)
+        self.assertEqual(bundle.render_plan.segments[0].editorial_transform,track)
+        with self.assertRaisesRegex(ValueError,'both renderer and motion'):build(realized_motion=None)
+        with self.assertRaises(ValueError):build(realized_motion=original.editorial_motion_plan)
+        with self.assertRaisesRegex(ValueError,'source/reference clocks'):
+            build(realized_plan=replace(plan,segments=(replace(plan.segments[0],source_start=.1),plan.segments[1])))
+
     def test_stale_or_nonfinite_source_local_descriptor_clock_cannot_promote(self):
         bundle = self.make_bundle()
         for field, value in (('source_local_start', .01), ('source_local_end', 1.01),

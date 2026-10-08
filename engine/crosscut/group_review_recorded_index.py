@@ -6,9 +6,48 @@ cannot select the most favorable capture, borrow another clock/file, or turn
 a missing appearance vector into a missing visible person.
 """
 import json
+from hashlib import file_digest
 
 from .group_performer_family_owner import digest
+from .group_joint_observations import _file_identity
 from .group_scene_static_query import reproject_recorded_static_query
+
+
+def verify_recorded_source_file(path, recorded_identity, *, content_sha256=None, work_port=None):
+    """Retain archived addresses across a verified device-number-only remount.
+
+    A matching filename, volume label or stat tail alone is not enough. On a
+    remount the complete file must match an independently retained content
+    digest. The archived detector/appearance/body parents are never rewritten.
+    This verifies reusable source bytes, not actor identity or media quality.
+    """
+    recorded = tuple(recorded_identity)
+    if len(recorded) != 5 or any(type(v) is not int or v < 0 for v in recorded):
+        raise ValueError('recorded source needs its complete file identity')
+    if work_port is not None:
+        work_port.charge('identity_reads')
+    current = _file_identity(path)
+    receipt = dict(recorded_file_identity=list(recorded), current_file_identity=list(current),
+        archived_observations_rewritten=False, quality_approved=False)
+    if current == recorded:
+        return dict(receipt, state='EXACT_FILE_IDENTITY', content_hash_bytes=0)
+    if current[1:] != recorded[1:]:
+        raise ValueError('recorded source changed beyond a device-number remount')
+    if (not isinstance(content_sha256, str) or len(content_sha256) != 64
+            or any(c not in '0123456789abcdef' for c in content_sha256)):
+        raise ValueError('remounted source needs its retained complete content digest')
+    if work_port is not None:
+        # The request's existing hash-I/O budget also bounds source hashing.
+        work_port.charge('model_hash_bytes', current[2])
+        work_port.charge('identity_reads')
+    with path.open('rb') as stream:
+        actual = file_digest(stream, 'sha256').hexdigest()
+    if _file_identity(path) != current:
+        raise ValueError('source changed during remount content verification')
+    if actual != content_sha256:
+        raise ValueError('remounted source content differs from the recorded source')
+    return dict(receipt, state='CONTENT_VERIFIED_DEVICE_REMOUNT', content_sha256=actual,
+        content_hash_bytes=current[2])
 
 
 def _freeze(value):

@@ -309,33 +309,56 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
                 or any(j not in range(6) or len(p)!=2 or not all(math.isfinite(x) and 0<=x<=1 for x in p)
                     for j,p in points.items())):
             raise ValueError('coupled boundary input is not actual visible screen geometry')
+        landmarks=head.get('landmarks_xy')
+        if landmarks is not None and (not isinstance(landmarks,(list,tuple)) or len(landmarks)!=5
+                or any(not isinstance(p,(list,tuple)) or len(p)!=2
+                    or any(type(v) not in (int,float) or not math.isfinite(v) or not 0<=v<=1 for v in p) for p in landmarks)):
+            raise ValueError('coupled facial scale needs five actually projected finite landmarks')
     validate(left_head,left_joint_points);validate(right_head,right_joint_points)
     common=tuple(j for j in requested_joints if j in left_joint_points and j in right_joint_points)
     missing=dict(left=[j for j in requested_joints if j not in left_joint_points],
         right=[j for j in requested_joints if j not in right_joint_points])
+    use_landmarks=left_head.get('landmarks_xy') is not None and right_head.get('landmarks_xy') is not None
     def face(head):
+        if use_landmarks:
+            p=np.asarray(head['landmarks_xy']);center=tuple(p.mean(0))
+            return {16:center,**{17+i:tuple(v) for i,v in enumerate(p)}}
         x,y=head['center'];w,h=head['width'],head['height']
         return {16:(x,y),17:(x-w/2,y-h/2),18:(x+w/2,y-h/2),19:(x-w/2,y+h/2),20:(x+w/2,y+h/2)}
     a={**{j:left_joint_points[j] for j in common},**face(left_head)}
     b={**{j:right_joint_points[j] for j in common},**face(right_head)}
+    face_indices=tuple(sorted(face(left_head)))
+    def scale(points):
+        xy=np.asarray([points[j] for j in face_indices if j!=16])*[1.,9/16]
+        value=float(np.sqrt(np.mean(np.sum((xy-xy.mean(0))**2,axis=1))))
+        if value<=1e-6:raise ValueError('coupled facial landmarks have no measurable extent')
+        return value
+    size_a=scale(a) if use_landmarks else left_head['height']
+    size_b=scale(b) if use_landmarks else right_head['height']
+    center_a=a[16];center_b=b[16]
     # Target extent is derived from BOTH actual views, never a single fixed
     # context whose scale/position may be impossible for the other camera.
-    height=min(maximum_zoom*min(left_head['height'],right_head['height']),
-        1.35*max(left_head['height'],right_head['height']))
+    height=min(maximum_zoom*min(size_a,size_b),1.35*max(size_a,size_b))
     width=height*math.sqrt(left_head['width']/left_head['height']*right_head['width']/right_head['height'])
     options=[];seen=set()
     for destination in target_centers:
-        target=face(dict(center=destination,width=width,height=height))
+        if use_landmarks:
+            target={16:destination}
+            for j in face_indices:
+                if j==16:continue
+                target[j]=tuple(destination[axis]+height*((a[j][axis]-center_a[axis])/size_a+
+                    (b[j][axis]-center_b[axis])/size_b)/2 for axis in (0,1))
+        else:target=face(dict(center=destination,width=width,height=height))
         for j in common:
-            target[j]=tuple(destination[axis]+height*((a[j][axis]-left_head['center'][axis])/left_head['height']+
-                (b[j][axis]-right_head['center'][axis])/right_head['height'])/2 for axis in (0,1))
+            target[j]=tuple(destination[axis]+height*((a[j][axis]-center_a[axis])/size_a+
+                (b[j][axis]-center_b[axis])/size_b)/2 for axis in (0,1))
         basis=tuple(sorted(target))
         for fit_basis in camera_fit_bases:
             # Perspective differences cannot all be repaired by one 2-D
             # camera. Keep a face-anchor proposal as well as the anatomical
             # compromise; ALL common joints still contribute to scoring and
             # ALL independently required points still constrain visibility.
-            fitted_basis=basis if fit_basis=='face_and_body' else (16,17,18,19,20)
+            fitted_basis=basis if fit_basis=='face_and_body' else face_indices
             source_a={j:a[j] for j in fitted_basis};source_b={j:b[j] for j in fitted_basis}
             fitted_target={j:target[j] for j in fitted_basis}
             left=fit_review_anatomical_keys(source_a,fitted_target,requested_joints=fitted_basis,time_seconds=0.,
@@ -350,12 +373,15 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
                 pa={j:project_review_editorial_point(p,ka) for j,p in a.items()}
                 pb={j:project_review_editorial_point(p,kb) for j,p in b.items()}
                 point_error=sum(math.hypot(pa[j][0]-pb[j][0],(pa[j][1]-pb[j][1])*9/16) for j in basis)/len(basis)
-                size_error=abs(math.log(ka.zoom*left_head['height']/(kb.zoom*right_head['height'])))
+                size_error=abs(math.log(ka.zoom*size_a/(kb.zoom*size_b)))
                 head_error=math.hypot(pa[16][0]-pb[16][0],(pa[16][1]-pb[16][1])*9/16)
                 score=3*head_error+point_error+.6*size_error+.005*math.log(ka.zoom*kb.zoom)
                 options.append((score,ka,kb,point_error,size_error,fit_basis,head_error))
     options.sort(key=lambda v:(v[0],v[1].zoom,v[2].zoom,v[1].center_x,v[2].center_x))
     receipt=dict(contract='coupled_actual_focal_boundary_camera_hypotheses_v1',requested_joint_indices=list(requested_joints),
+        face_scale_basis='projected_five_anatomical_landmarks_rms' if use_landmarks else 'detector_box_height_proxy',
+        actual_facial_landmarks_used=use_landmarks,detector_box_height_is_verified_facial_size=False,
+        left_scale_measurement=size_a,right_scale_measurement=size_b,
         measured_common_joint_indices=list(common),missing_joint_requests=missing,
         complete_requested_action_basis=not any(missing.values()),camera_pair_count=len(options),
         independently_declared_common_target_centers=[list(c) for c in target_centers],

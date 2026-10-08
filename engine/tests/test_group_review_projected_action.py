@@ -149,6 +149,25 @@ def test_actual_face_scale_and_position_are_separate_from_normalized_body_pose()
     assert same['face_scale_log_error']==0 and same['face_center_velocity_error']==0
 
 
+def test_actual_facial_landmarks_have_the_registered_camera_scale_not_detector_box_extent():
+    a,qa,_=faces();b,qb,_=faces(1.5)
+    points=((.46,.30),(.54,.30),(.5,.34),(.47,.38),(.53,.38))
+    for views in (a,b):
+        for view in views:view['row']['native_observation']['heads'][0]['landmarks_xy']=points
+    first=project_observed_review_face(a[0],qa[8],8)
+    second=project_observed_review_face(b[0],qb[8],8)
+    assert first['facial_landmark_geometry_state']=='OBSERVED'
+    assert second['five_point_scale']/first['five_point_scale']==pytest.approx(1.5)
+    assert second['eye_span']/first['eye_span']==pytest.approx(1.5)
+    assert not first['detector_box_extent_is_facial_scale']
+
+
+def test_missing_facial_landmarks_are_not_fabricated_from_detector_box():
+    a,qa,_=faces();result=project_observed_review_face(a[0],qa[8],8)
+    assert result['landmarks_xy'] is None and result['five_point_scale'] is None
+    assert result['facial_landmark_geometry_state']=='UNAVAILABLE'
+
+
 def test_face_request_cannot_drop_missing_middle_or_ambiguous_actor():
     a,qa,route=faces();b=deepcopy(a);b[2]['row']['projection']['heads']=[]
     result=measure_review_projected_face(a,b,left_queries=qa,right_queries=qa,fps=30.,route=route)

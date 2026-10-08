@@ -8,6 +8,31 @@ from crosscut.group_review_two_shot_camera import (realize_review_two_shot_camer
     FrozenRealizedTwoShotCandidate,select_review_two_shot_diagnostic,fit_review_coupled_boundary_keys,
     fit_review_temporal_camera_corridor,measure_review_partial_joint_trajectory)
 from crosscut.render import EditorialTransformKeyframe
+from crosscut.group_review_projected_action import measure_review_partial_screen_trajectory
+
+
+def test_opposite_screen_root_motion_is_not_erased_by_equal_relative_arm_shapes():
+    ticks=(0,1,2,3,4)
+    shape={0:(.4,.45),1:(.6,.45),2:(.3,.55),3:(.7,.55),4:(.3,.35),5:(.7,.35)}
+    a=[{j:(x+.005*t,y) for j,(x,y) in shape.items()} for t in ticks]
+    b=[{j:(x-.005*t,y) for j,(x,y) in shape.items()} for t in ticks]
+    relative=measure_review_partial_joint_trajectory(a,b,ticks=ticks,fps=30.)
+    screen=measure_review_partial_screen_trajectory(a,b,ticks=ticks,fps=30.)
+    same=measure_review_partial_screen_trajectory(a,a,ticks=ticks,fps=30.)
+    assert relative['exploration_score']==pytest.approx(0.,abs=1e-10)
+    assert screen['observed_root_direction_error']==pytest.approx(1.)
+    assert screen['exploration_score']>same['exploration_score']+.5
+    assert not screen['actual_screen_root_translation_removed']
+
+
+def test_deleting_bad_screen_motion_observations_cannot_improve_upper_cost():
+    ticks=(0,1,2,3,4)
+    a=[{0:(.4,.4),1:(.6,.4),4:(.2+t*.03,.2)} for t in ticks]
+    b=[{0:(.4,.4),1:(.6,.4),4:(.8-t*.03,.8)} for t in ticks]
+    observed=measure_review_partial_screen_trajectory(a,b,ticks=ticks,fps=30.)
+    removed=measure_review_partial_screen_trajectory(a,[{j:p for j,p in r.items() if j!=4} for r in b],ticks=ticks,fps=30.)
+    assert removed['exploration_score']>=observed['exploration_score']
+    assert not removed['full_action_certified'] and not removed['missing_observations_interpolated']
 
 
 def view(t,x,h):
@@ -214,6 +239,29 @@ def test_complete_same_motion_has_zero_cost_interval_not_unknown_reward():
     assert r['exploratory_cost_interval']==pytest.approx((0.,0.))
     assert r['coverage']==1 and r['nonstationary_common_action_observed']
     assert not r['full_action_certified'] and not r['actor_identity_certified']
+
+
+def test_equal_detector_boxes_do_not_override_twofold_actual_facial_landmark_scale():
+    points=((.48,.43),(.52,.43),(.5,.45),(.485,.47),(.515,.47))
+    a=dict(center=(.5,.45),width=.12,height=.20,landmarks_xy=points)
+    b=dict(a,landmarks_xy=tuple((.5+2*(x-.5),.45+2*(y-.45)) for x,y in points))
+    pairs=fit_review_coupled_boundary_keys(left_head=a,right_head=b,left_joint_points={},right_joint_points={})
+    assert pairs and pairs[0][0].zoom/pairs[0][1].zoom==pytest.approx(2.,rel=.02)
+    receipt=pairs[0][2]
+    assert receipt['actual_facial_landmarks_used']
+    assert receipt['face_scale_basis']=='projected_five_anatomical_landmarks_rms'
+    assert receipt['log_face_scale_error']<.02 and not receipt['quality_approved']
+    assert not receipt['detector_box_height_is_verified_facial_size']
+
+
+def test_absent_or_malformed_facial_landmarks_are_not_a_verified_face_size():
+    a=dict(center=(.5,.45),width=.12,height=.20)
+    pairs=fit_review_coupled_boundary_keys(left_head=a,right_head=a,left_joint_points={},right_joint_points={})
+    assert pairs[0][2]['face_scale_basis']=='detector_box_height_proxy'
+    assert not pairs[0][2]['actual_facial_landmarks_used']
+    with pytest.raises(ValueError,match='five actually projected'):
+        fit_review_coupled_boundary_keys(left_head=dict(a,landmarks_xy=((.5,.4),)),right_head=a,
+            left_joint_points={},right_joint_points={})
 
 
 def test_coupled_focal_destination_is_optimized_instead_of_forcing_dead_center():

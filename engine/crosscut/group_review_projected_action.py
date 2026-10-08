@@ -46,9 +46,24 @@ def project_observed_review_face(view,query,tick):
         raise ValueError('projected face box differs from its bound actual raw occurrence/camera')
     x,y,w,h=box
     if fraction<.995 or w<=0 or h<=0:return None
+    landmarks=heads[0].get('landmarks_xy');projected_landmarks=None;landmark_scale=None;eye_span=None
+    if (isinstance(landmarks,(tuple,list)) and len(landmarks)==5
+            and all(isinstance(p,(tuple,list)) and len(p)==2
+                and all(type(v) in (int,float) and math.isfinite(v) and 0<=v<=1 for v in p) for p in landmarks)):
+        points=tuple(tuple(float(v) for v in project_point(p,query,tick)) for p in landmarks)
+        if all(all(math.isfinite(v) and 0<=v<=1 for v in p) for p in points):
+            aspect=query.camera.output_size[1]/query.camera.output_size[0]
+            physical=np.asarray(points)*[1.,aspect]
+            extent=float(np.sqrt(np.mean(np.sum((physical-physical.mean(0))**2,axis=1))))
+            eyes=float(np.linalg.norm(physical[0]-physical[1]))
+            if extent>1e-6 and eyes>1e-6:
+                projected_landmarks=points;landmark_scale=extent;eye_span=eyes
     return dict(center=(x+w/2,y+h/2),width=w,height=h,
         native_parent=digest(raw),selected_head=head_id,registered_query_identity=query.key,
-        native_head_identity=digest(heads[0]),camera_identity=query.camera.key)
+        native_head_identity=digest(heads[0]),camera_identity=query.camera.key,
+        landmarks_xy=projected_landmarks,five_point_scale=landmark_scale,eye_span=eye_span,
+        facial_landmark_geometry_state='OBSERVED' if projected_landmarks is not None else 'UNAVAILABLE',
+        detector_box_extent_is_facial_scale=False)
 
 
 def measure_review_projected_face(left,right,*,left_queries,right_queries,fps,route):
@@ -104,7 +119,7 @@ def measure_review_projected_face(left,right,*,left_queries,right_queries,fps,ro
 
 def project_observed_review_joints(view,query,tick):
     if not isinstance(query,GroupSceneRoleQuery):raise ValueError('projected action needs the registered complete camera')
-    if view is None:return {}
+    if not review_actor_association_valid(view):return {}
     row=view['row'];raw=row['native_observation'];_,_,native=query.sample_at(tick)
     query_id=row['query'].get('registered_query_sha256',digest(row['query']))
     if (row['output_tick']!=tick or query_id!=query.key
@@ -131,6 +146,65 @@ def project_observed_review_joints(view,query,tick):
         if not all(0<=v<=1 for v in base_xy):continue
         points[index]=tuple(float(v) for v in project_point(xy,query,tick))
     return points
+
+
+def measure_review_partial_screen_trajectory(left,right,*,ticks,fps,aspect=9/16):
+    """Keep actual screen translation in a bounded partial motion comparison.
+
+    Inputs must already use the cameras being compared. Unlike shoulder-relative
+    articulation this retains root travel and absolute hand direction. Missing
+    terms occupy their original denominator and never improve the upper cost.
+    It is exploration evidence, not a complete-action or perceptual certificate.
+    """
+    if (not isinstance(ticks,tuple) or not 3<=len(ticks)<=15 or ticks!=tuple(sorted(set(ticks)))
+            or any(type(t) is not int for t in ticks) or len(left)!=len(ticks) or len(right)!=len(ticks)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0
+            or type(aspect) not in (int,float) or not math.isfinite(aspect) or aspect<=0):
+        raise ValueError('screen motion needs exact bounded output times and aspect')
+    values=[]
+    for sequence in (left,right):
+        frames=[]
+        for points in sequence:
+            if (not isinstance(points,dict) or any(type(j) is not int or not 0<=j<6
+                    or len(p)!=2 or any(type(v) not in (int,float) or not math.isfinite(v) for v in p)
+                    for j,p in points.items())):
+                raise ValueError('screen motion needs actual finite joint positions')
+            frame={j:np.asarray((p[0],p[1]*aspect)) for j,p in points.items()}
+            if 0 in frame and 1 in frame:frame['root']=(frame[0]+frame[1])/2
+            frames.append(frame)
+        values.append(frames)
+    weights={0:.1,1:.1,2:1.,3:1.,4:1.5,5:1.5,'root':2.}
+    losses=[0.,0.,0.];known=[0.,0.,0.];roots=[];measured_velocity=0
+    for i,(a,b) in enumerate(zip(*values)):
+        for joint,weight in weights.items():
+            if joint in a and joint in b:
+                distance=float(np.linalg.norm(a[joint]-b[joint]))
+                losses[0]+=weight*distance/(.05+distance);known[0]+=weight
+            if i==0 or not all(joint in f for f in (values[0][i-1],a,values[1][i-1],b)):continue
+            dt=(ticks[i]-ticks[i-1])/fps
+            av=(a[joint]-values[0][i-1][joint])/dt
+            bv=(b[joint]-values[1][i-1][joint])/dt
+            an,bn=float(np.linalg.norm(av)),float(np.linalg.norm(bv))
+            difference=float(np.linalg.norm(av-bv))
+            velocity=difference/(.15+an+bn)
+            direction=0. if min(an,bn)<.02 else (1-float(np.clip(av@bv/(an*bn),-1.,1.)))/2
+            losses[1]+=weight*velocity;losses[2]+=weight*direction
+            known[1]+=weight;known[2]+=weight;measured_velocity+=1
+            if joint=='root':roots.append(dict(tick=ticks[i],left_velocity=av.tolist(),
+                right_velocity=bv.tolist(),velocity_difference=difference,direction_error=direction,
+                both_nonstationary=min(an,bn)>=.02))
+    total=sum(weights.values());denominators=[len(ticks)*total,(len(ticks)-1)*total,(len(ticks)-1)*total]
+    intervals=[(loss/d,(loss+max(0.,d-k))/d) for loss,k,d in zip(losses,known,denominators)]
+    cost=tuple(2*intervals[0][i]+intervals[1][i]+.7*intervals[2][i] for i in (0,1))
+    return dict(contract='partial_actual_screen_root_and_joint_motion_v1',
+        state='UNMEASURED' if not measured_velocity else 'PARTIAL_OBSERVED_HYPOTHESIS',
+        exploratory_cost_interval=list(cost),exploration_score=None if not measured_velocity else cost[1],
+        position_cost_interval=list(intervals[0]),velocity_cost_interval=list(intervals[1]),
+        direction_cost_interval=list(intervals[2]),root_velocity_samples=roots,
+        observed_root_direction_error=None if not roots else sum(r['direction_error'] for r in roots)/len(roots),
+        measured_velocity_requests=measured_velocity,coverage=known[0]/denominators[0],
+        actual_screen_root_translation_removed=False,missing_observations_interpolated=False,
+        full_action_certified=False,quality_approved=False)
 
 
 def measure_review_projected_action(left,right,*,left_queries,right_queries,fps,declaration,route):

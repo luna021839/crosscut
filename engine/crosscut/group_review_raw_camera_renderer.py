@@ -45,9 +45,16 @@ def render_selected_review_rasters(*,plan,queries,changed_intervals,session,nati
             if source!=segment.source_index:raise ValueError('raw renderer query borrowed another selected source')
             row=native_row_for_query(query,tick)
             raw=row['native_observation']
+            current_file=tuple(session._assert_source_identity(source))
+            recorded_file=tuple(raw['source_file_identity'])
+            # Device numbers are ephemeral after remount. Every used native
+            # raster is independently decoded and hash-compared below; allow
+            # only this metadata difference, never relabel the archived row.
+            same_file=(recorded_file==current_file or len(recorded_file)==len(current_file)==5
+                and recorded_file[1:]==current_file[1:])
             if (row['output_tick']!=tick or raw['request_source_index']!=source
                     or raw['native_frame_index']!=index or raw['source_clock_identity']!=query.source_clock_identity
-                    or tuple(raw['source_file_identity'])!=tuple(session._assert_source_identity(source))):
+                    or not same_file):
                 raise ValueError('raw renderer observation borrowed another actual source/frame/file/clock')
             pixels=session.native_pixels(source,index)
             if pixels is None or hashlib.sha256(memoryview(pixels)).hexdigest()!=raw['native_pixel_sha256']:
@@ -55,6 +62,8 @@ def render_selected_review_rasters(*,plan,queries,changed_intervals,session,nati
             native.append(pixels)
             bindings.append(dict(tick=tick,source=source,native=index,raw_parent=digest(raw),
                 registered_query_identity=query.key,camera_identity=query.camera.key,
+                recorded_source_file_identity=list(recorded_file),current_source_file_identity=list(current_file),
+                file_binding_basis='exact_file_identity' if recorded_file==current_file else 'device_remount_and_exact_native_pixel_hash',
                 native_pixel_sha256=raw['native_pixel_sha256']))
         shape=native[0].shape
         if any(p.shape!=shape or p.dtype!=np.uint8 for p in native):

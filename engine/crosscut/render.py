@@ -1649,6 +1649,10 @@ def _editorial_transform_filters(
         int(math.ceil(height * maximum_zoom / 2.0)) * 2,
     )
     filters = [
+        # Geometry must run before chroma subsampling. In 4:2:0 zoompan
+        # rounds crop origins to chroma blocks, shifting the whole image
+        # away from the camera coordinates used by the selector.
+        "format=gbrp",
         (
             f"scale={working_width}:{working_height}:"
             "force_original_aspect_ratio=increase"
@@ -1678,6 +1682,9 @@ def _editorial_transform_filters(
         f"ih*({center_y_expression})-ih/(2*zoom)))':"
         f"d=1:s={width}x{height}:fps={fps:.6f}"
     )
+    # Constrain BOTH sides: otherwise downstream yuv420p can negotiate a
+    # conversion before zoompan despite the RGB input format above.
+    filters.append("format=gbrp")
     return filters
 
 

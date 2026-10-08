@@ -221,3 +221,103 @@ def test_long_complete_anchor_path_does_not_lose_inventory_to_unmatched_history_
     p=anchored_review_actor_paths(frames,independent_anchor=view(12,0),anchor_frame_index=12)[0]
     assert p['all_sampled_frames_connected'] and p['complete_competing_inventory_measured']
     assert p['visited_states']<2000
+
+
+def test_fixed_native_occurrence_extends_full_shot_without_framewise_embedding_winner():
+    from dataclasses import replace
+    from crosscut.group_review_actor_path import connected_source_actor_views
+    from crosscut.group_performer_family_owner import digest
+    ticks=tuple(range(80));frames=[]
+    for t in ticks:
+        near=view(t,0,2*t);far=view(t,0,2*t+1)
+        near['descriptor']=replace(near['descriptor'],head_center=(.35+t*.002,.40))
+        far['descriptor']=replace(far['descriptor'],head_center=(.83-t*.001,.72))
+        near['vector']=[.98,.2]+[0.]*126
+        if t==40:near['vector']=[1.]+[0.]*127
+        far['vector']=[1.]+[0.]*127
+        for v in (near,far):v['native_camera_unit_index']=0
+        frames.append([near,far])
+    units={t:(2,'clock',digest(None),0) for t in ticks}
+    selected,receipt=connected_source_actor_views(frames,ticks=ticks,native_units=units,anchor=frames[40][0])
+    assert [selected[t]['descriptor'].frame_local_head_id for t in ticks]==[2*t for t in ticks]
+    assert receipt['fixed_anchor_occurrence'] and receipt['all_sampled_frames_connected']
+    assert receipt['visited_states']<8000 and not receipt['named_actor_certified']
+
+
+def test_connected_actor_keeps_missing_slots_and_other_camera_runs_unmatched():
+    from crosscut.group_review_actor_path import connected_source_actor_views
+    from crosscut.group_performer_family_owner import digest
+    ticks=tuple(range(6));frames=[[view(t,0,t)] for t in ticks];frames[3]=[]
+    for t,frame in enumerate(frames):
+        for v in frame:v['native_camera_unit_index']=int(t>=4)
+    units={t:(2,'clock',digest(None),int(t>=4)) for t in ticks}
+    selected,receipt=connected_source_actor_views(frames,ticks=ticks,native_units=units,anchor=frames[1][0])
+    assert selected[1] is not None
+    assert all(selected[t] is None for t in (3,4,5))
+    assert receipt['other_physical_run_ticks']==[4,5]
+    assert not receipt['all_sampled_frames_connected']
+
+
+def test_fixed_occurrence_cannot_borrow_a_cross_source_anchor():
+    anchor=view(1,0);anchor['row']['native_observation']['request_source_index']=99
+    with pytest.raises(ValueError,match='anchor occurrence'):
+        anchored_review_actor_paths([[view(t,0)] for t in range(3)],independent_anchor=anchor,
+            anchor_frame_index=1,fixed_anchor_occurrence=True)
+
+
+def test_frame_ambiguity_does_not_erase_independent_known_anchor_and_close_neighbors():
+    from dataclasses import replace
+    from crosscut.group_review_actor_path import connected_source_actor_views
+    from crosscut.group_performer_family_owner import digest
+    ticks=tuple(range(8));frames=[[view(t,0,t)] for t in ticks]
+    # Two equally good reacquisitions after an unobserved frame. Neither is
+    # evidence that the independently fixed first half suddenly became unknown.
+    frames[5]=[]
+    for t in (6,7):
+        other=view(t,0,t+100)
+        other['descriptor']=replace(other['descriptor'],head_center=(.401,.35))
+        frames[t].append(other)
+    for frame in frames:
+        for v in frame:v['native_camera_unit_index']=0
+    units={t:(2,'clock',digest(None),0) for t in ticks}
+    selected,receipt=connected_source_actor_views(frames,ticks=ticks,native_units=units,anchor=frames[2][0])
+    assert receipt['ambiguous']
+    assert not any(selected[t]['reacquisition_ambiguous'] for t in range(5))
+    assert selected[5] is None
+    assert all(selected[t]['reacquisition_ambiguous'] for t in (6,7))
+    assert set(receipt['ambiguous_frame_indices'])=={6,7}
+
+
+def test_fixed_min_marginals_equal_exhaustive_whole_paths():
+    from itertools import product
+    from dataclasses import replace
+    from crosscut.group_review_actor_path import _link
+    frames=[[view(t,0,7),view(t,1,8)] for t in range(4)]
+    for frame in frames:
+        frame[1]['vector']=[.95,.05]+[0.]*126
+        frame[1]['descriptor']=replace(frame[1]['descriptor'],head_center=(.43,.35))
+    seed=frames[1][0];possibilities=[]
+    for sequence in product(*(frame+[None] if i!=1 else [seed] for i,frame in enumerate(frames))):
+        links=[_link(a,b,maximum_native_gap=12,minimum_cosine=.25) for a,b in zip(sequence,sequence[1:])]
+        if any(link is None for link in links):continue
+        possibilities.append((sum(link['cost'] for link in links)+1.5*sum(v is None for v in sequence),sequence))
+    path=anchored_review_actor_paths(frames,independent_anchor=seed,anchor_frame_index=1,
+        fixed_anchor_occurrence=True)[0]
+    assert path['cost']==pytest.approx(min(cost for cost,_ in possibilities))
+    for i,selected in enumerate(path['observations']):
+        alternate=min((cost for cost,sequence in possibilities if sequence[i] is not selected),default=None)
+        margin=path['frame_competing_margins'][i]
+        assert margin is None if alternate is None else margin==pytest.approx(alternate-path['cost'])
+
+
+def test_native_run_link_ignores_editorial_query_boundaries_and_uses_native_head_geometry():
+    from dataclasses import replace
+    from crosscut.group_review_actor_path import _link
+    a,b=view(0,0),view(1,0,camera='new-editorial-crop')
+    for v in (a,b):
+        v['native_camera_unit_index']=4
+        v['row']['native_observation']['heads']=[dict(observation_id=v['descriptor'].frame_local_head_id,
+            box_xywh=(.35,.25,.1,.2))]
+    b['descriptor']=replace(b['descriptor'],head_center=(.9,.8),face_height=.4)
+    linked=_link(a,b,maximum_native_gap=12,minimum_cosine=.25)
+    assert linked['linked'] and linked['measured_camera_local_spatial_cost']==pytest.approx(0.)

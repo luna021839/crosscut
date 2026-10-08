@@ -27391,25 +27391,46 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
 
 
 def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, timewarps,
-                               common_start, section_plan, phrase_times, output, reporter, warnings):
-    """Freeze source clocks, geometry and exact shot IDs before optional work."""
+                               common_start, section_plan, phrase_times, output, reporter, warnings,
+                               realized_plan=None, realized_motion=None, shot_clock_context=None):
+    """Retain a realized program, or construct the explicitly neutral baseline.
+
+    A motion producer must supply its exact renderer and motion together. It
+    must not send only choices and silently lose its native phase or camera.
+    The normal bundle validator checks clocks, source order and renderer-bound
+    motion before accepting the realized path; this is not a quality approval.
+    """
+    if (realized_plan is None)!=(realized_motion is None):
+        raise ValueError('realized GROUP producer must supply both renderer and motion')
     width, height = output_size(request.aspect_ratio)
-    segments = tuple(aligned_render_segment(source_index=eligible_indices[item.source_index],
-        reference_start=item.canonical_master_start, common_master_start=common_start,
-        source_offset=offsets[item.source_index], duration=item.duration_seconds,
-        timewarp=timewarps[item.source_index]) for item in timeline.choices)
-    transitions = GroupTransitionPlan(tuple(RenderTransition(tier="C",
-        reason="review_first_clock_verified_primitive") for _ in range(len(segments)-1)),
-        analysis_basis="review_first_complete_primitive_v1")
-    plan = RenderPlan(sources=request.sources, segments=segments, reference_source=request.reference_source,
-        aspect_ratio=request.aspect_ratio, output=output, master_audio_start=common_start,
-        width=width, height=height, transitions=transitions.transitions)
+    if realized_plan is None:
+        segments = tuple(aligned_render_segment(source_index=eligible_indices[item.source_index],
+            reference_start=item.canonical_master_start, common_master_start=common_start,
+            source_offset=offsets[item.source_index], duration=item.duration_seconds,
+            timewarp=timewarps[item.source_index]) for item in timeline.choices)
+        transitions = GroupTransitionPlan(tuple(RenderTransition(tier="C",
+            reason="review_first_clock_verified_primitive") for _ in range(len(segments)-1)),
+            analysis_basis="review_first_complete_primitive_v1")
+        plan = RenderPlan(sources=request.sources, segments=segments, reference_source=request.reference_source,
+            aspect_ratio=request.aspect_ratio, output=output, master_audio_start=common_start,
+            width=width, height=height, transitions=transitions.transitions)
+    else:
+        if (not isinstance(realized_plan,RenderPlan) or not isinstance(realized_motion,EditorialMotionPlan)
+                or realized_plan.sources!=request.sources or realized_plan.reference_source!=request.reference_source
+                or realized_plan.aspect_ratio!=request.aspect_ratio
+                or (realized_plan.width,realized_plan.height)!=(width,height)
+                or not math.isclose(realized_plan.master_audio_start,common_start,abs_tol=1e-9)):
+            raise ValueError('realized GROUP renderer differs from the actual request domain')
+        # Output relocation is the only mutation. Source/time/crop/roll/zoom,
+        # transition recipes and authorized local video clocks stay intact.
+        plan=replace(realized_plan,output=output)
+        transitions=GroupTransitionPlan(plan.transitions,analysis_basis='realized_group_motion_program_v1')
     review = _review_visual_timeline_for_render(timeline, available_source_count=len(eligible_indices),
         reporter=reporter, warnings=warnings, comparison_render_allowed=True)
     phrase_inputs=tuple(phrase_times)
     clock = _deterministic_exact_shot_clock_from_timeline(timeline,
         section_plan=section_plan, phrase_times=phrase_inputs)
-    neutral_motion = EditorialMotionPlan(
+    motion = realized_motion if realized_motion is not None else EditorialMotionPlan(
         segments=tuple(EditorialMotionSegment(index, choice.source_index, None,
             ("review_first_primitive_no_authored_motion",))
             for index, choice in enumerate(timeline.choices)),
@@ -27417,12 +27438,18 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         roll_event_count=0, blocked_dissolve_segment_count=0,
         analysis_basis="review_first_primitive_explicit_neutral_tracks_v1",
         eligible_request_indices=tuple(eligible_indices))
-    return _GroupRenderCandidateBundle(candidate_index=0, review_rank=0,
-        cadence_profile="deterministic_full_song_visual_selector", pre_render_score=float(review.weighted_score),
+    bundle = _GroupRenderCandidateBundle(candidate_index=0, review_rank=0,
+        cadence_profile=("deterministic_full_song_visual_selector" if realized_plan is None else
+            "realized_group_motion_program"), pre_render_score=float(review.weighted_score),
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
-        group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=neutral_motion,
+        group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=motion,
         render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan,
         phrase_times=phrase_inputs)
+    if realized_plan is not None:
+        _validate_review_first_group_bundle(bundle,eligible_indices=eligible_indices,offsets=offsets,
+            timewarps=timewarps,common_start=common_start,phrase_times=phrase_inputs,
+            shot_clock_context=shot_clock_context)
+    return bundle
 
 
 def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, timewarps, common_start,
