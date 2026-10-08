@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -27985,6 +27985,32 @@ def analyze(
     group_broadcast_slot_hints: tuple[str | None, ...] = (),
     group_external_original_reference=None,
 ) -> AnalysisArtifact:
+    # One public lifetime boundary also covers acquisition-only returns and
+    # exceptions in the long non-optional analysis body. MEMBER behaviour is
+    # unchanged; only the normal review-first GROUP controller installs work.
+    with ExitStack() as request_work_resources:
+        return _analyze_impl(request, reporter,
+            allow_failed_comparison_render=allow_failed_comparison_render,
+            review_rendered_proxies=review_rendered_proxies,
+            review_first_deadline_monotonic_seconds=review_first_deadline_monotonic_seconds,
+            acquisition_identity_authority=acquisition_identity_authority,
+            group_broadcast_slot_hints=group_broadcast_slot_hints,
+            group_external_original_reference=group_external_original_reference,
+            request_work_resources=request_work_resources)
+
+
+def _analyze_impl(
+    request: AnalysisRequest,
+    reporter: EventReporter,
+    *,
+    allow_failed_comparison_render: bool,
+    review_rendered_proxies: bool,
+    review_first_deadline_monotonic_seconds: float | None,
+    acquisition_identity_authority,
+    group_broadcast_slot_hints: tuple[str | None, ...],
+    group_external_original_reference,
+    request_work_resources: ExitStack,
+) -> AnalysisArtifact:
     if not isinstance(allow_failed_comparison_render, bool):
         raise TypeError("allow_failed_comparison_render must be a boolean")
     if not isinstance(review_rendered_proxies, bool):
@@ -28731,6 +28757,7 @@ def analyze(
     materialized_group_candidates: tuple[Any, ...] = ()
     complete_group_candidates: tuple[_GroupRenderCandidateBundle, ...] = ()
     group_first = None
+    group_request_work = None
     review_first_verified_candidate_bundle = None
     candidate_derivation_failures: list[dict[str, Any]] = []
     candidate_post_repair_review_rejections: list[dict[str, Any]] = []
@@ -34273,6 +34300,11 @@ def analyze(
                         authority=('external_original_group_reference'
                             if group_external_original_reference is not None
                             else 'deterministic_full_song_visual_selector'))
+                    if request.source_mode is SourceMode.AUTOMATIC:
+                        from .group_request_work import install_group_request_work
+                        group_request_work = install_group_request_work(controller=group_first,
+                            resources=request_work_resources,
+                            journal_path=request.output_directory / f"{base_filename}-group-request-work.jsonl")
                     if group_external_original_reference is not None:
                         review_first_verified_candidate_bundle = baseline_bundle
                         review_first_visual_selection_payload['authority'] = 'external_original_group_reference'
@@ -35844,11 +35876,16 @@ def analyze(
                     # when the measured surrogate gain was negative. Keep normal
                     # request time for the actual owner and final render/QA.
                     from .group_performer_family_owner import attempt_performer_family
-                    attempt_performer_family(controller=group_first, request=request,
-                        eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
-                        scene_cut_times=scene_cut_times, sync_scores=sync_scores,
-                        source_derivatives=source_derivative_diversity_result,
-                        archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
+                    def complete_selected_performer_family():
+                        return attempt_performer_family(controller=group_first, request=request,
+                            eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                            scene_cut_times=scene_cut_times, sync_scores=sync_scores,
+                            source_derivatives=source_derivative_diversity_result,
+                            archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
+                    if group_request_work is not None:
+                        group_request_work.run('selected_completion',complete_selected_performer_family)
+                    else:
+                        complete_selected_performer_family()
                 # Consume one owned bundle, including clock/review/geometry.
                 # A rejected proposal cannot leak any of its local metadata.
                 kept = review_first_singleton_bundle = group_first.incumbent
@@ -36243,38 +36280,34 @@ def analyze(
                     f"over_threshold={cut_local_sync_payload.get('threshold_exceeding_boundary_count')}; "
                     f"reasons={cut_local_sync_payload.get('unknown_reason_counts')}"
                 )
-        if group_first is not None and group_first.incumbent.normal_interval_review is not None:
-            from .group_normal_interval_owner import validate_bundle_binding, replay_final_sources
-            validate_bundle_binding(group_first.incumbent)
-            replay_final_sources(plan.to_json(), group_first.incumbent.to_dict()['normal_interval_review'])
-        if group_first is not None and group_first.incumbent.performer_family_review is not None:
-            from .group_performer_family_owner import validate_bundle_binding as validate_performer_binding
-            from .group_performer_family_owner import replay_final_sources as replay_performer_sources
-            validate_performer_binding(group_first.incumbent)
-            replay_performer_sources(plan.to_json(), group_first.incumbent.to_dict()['performer_family_review'])
-        write_plan(plan, render_plan_path)
+        def validate_final_group_plan():
+            if group_first is not None and group_first.incumbent.normal_interval_review is not None:
+                from .group_normal_interval_owner import validate_bundle_binding, replay_final_sources
+                validate_bundle_binding(group_first.incumbent)
+                replay_final_sources(plan.to_json(), group_first.incumbent.to_dict()['normal_interval_review'])
+            if group_first is not None and group_first.incumbent.performer_family_review is not None:
+                from .group_performer_family_owner import validate_bundle_binding as validate_performer_binding
+                from .group_performer_family_owner import replay_final_sources as replay_performer_sources
+                validate_performer_binding(group_first.incumbent)
+                replay_performer_sources(plan.to_json(), group_first.incumbent.to_dict()['performer_family_review'])
+            write_plan(plan, render_plan_path)
+        if group_request_work is not None:
+            group_request_work.run('final', validate_final_group_plan)
+        else:
+            validate_final_group_plan()
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
         from .render_process import render_log_callback
         review_first_runtime.checkpoint("full_render_started")
-        codec = render(
-            plan,
-            progress_callback=render_log_callback(
-                reporter,
-                total_frames=plan.output_frame_count,
-            ),
-            **(
-                {
-                    "maximum_runtime_seconds": (
-                        review_first_runtime.bounded_timeout(
-                            900.0,
-                            "group full render",
-                        )
-                    )
-                }
-                if getattr(request, "review_first_enabled", False)
-                else {}
-            ),
-        )
+        def render_final_group_plan():
+            limits = ({"maximum_runtime_seconds": review_first_runtime.bounded_timeout(
+                900.0, "group full render")} if request.review_first_enabled else {})
+            if group_request_work is not None:
+                limits['maximum_runtime_seconds'] = min(limits['maximum_runtime_seconds'],
+                    group_request_work.live_remaining_seconds)
+            return render(plan, progress_callback=render_log_callback(reporter,
+                total_frames=plan.output_frame_count), **limits)
+        codec = (group_request_work.run('encode', render_final_group_plan)
+            if group_request_work is not None else render_final_group_plan())
         review_first_runtime.checkpoint("full_render_complete")
         if group_first is not None:
             group_first.render_complete()
@@ -40438,8 +40471,8 @@ def analyze(
     filename = f"{base_filename}-analysis.json"
     manifest_path = request.output_directory / filename
     _write_analysis_manifest_atomically(manifest_path, manifest)
-    mandatory_group_post_render_qa_path = (
-        _enforce_automatic_stage_edit_post_render_qa(
+    def run_mandatory_group_post_render_qa():
+        return _enforce_automatic_stage_edit_post_render_qa(
             registered_stage_edit_bundle=registered_stage_edit_bundle,
             manifest=manifest,
             manifest_path=manifest_path,
@@ -40453,7 +40486,8 @@ def analyze(
             ),
             rendered_montage_config=rendered_montage_config,
         )
-    )
+    mandatory_group_post_render_qa_path = (group_request_work.run('decoded_qa', run_mandatory_group_post_render_qa)
+        if group_request_work is not None else run_mandatory_group_post_render_qa())
     mandatory_member_post_render_qa_path = (
         _enforce_automatic_member_post_render_qa(
             manifest=manifest,

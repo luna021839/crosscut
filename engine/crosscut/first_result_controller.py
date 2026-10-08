@@ -122,7 +122,15 @@ class FirstResultController:
         self._request_work_lease = RequestWorkLease(runtime=self.runtime,
             controller_identity=self.transaction_token().content_sha256,
             total_limits=total_limits, allocations=allocations, journal_path=journal_path)
-        self._persist()
+        try:
+            self._persist()
+        except BaseException:
+            # The constructor has already opened its exclusive raw history,
+            # but no public lifetime context owns it until this method returns.
+            # Never leak that handle or renew the admission after publication
+            # failure. Preserve the closed failed lease for diagnostics.
+            self._request_work_lease.close()
+            raise
         return self._request_work_lease
 
     def run_work_phase(self, name, operation):

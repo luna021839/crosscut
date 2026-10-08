@@ -120,6 +120,8 @@ class RequestWorkLease:
         self.active = None
         self.sequence, self.prefix_sha256 = 0, "0" * 64
         self.journal_failed = False
+        self.request_terminal = None
+        self.closed = False
         self._lock = RLock()
         setup=PhaseWorkPort(self,"terminal",self.deadline)
         header=dict(controller_identity=controller_identity,total_limits=dict(self.total_limits),
@@ -133,13 +135,22 @@ class RequestWorkLease:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         self._stream = os.fdopen(fd, "wb", buffering=0)
-        self._append("lease",header,setup)
+        try:
+            self._append("lease",header,setup)
+        except BaseException:
+            self._stream.close()
+            self.closed = True
+            raise
 
     def _owned(self):
         if os.getpid() != self.owner_pid:
             raise ValueError("request lease authority cannot be copied into a child")
         if self.journal_failed:
             raise OSError("controller work journal failed; no further work admitted")
+        if self.request_terminal is not None:
+            raise ValueError("controller request work is terminal; no renewed admission")
+        if self.closed:
+            raise ValueError("controller request work is closed; no further admission")
 
     @property
     def remaining_seconds(self):
@@ -230,15 +241,43 @@ class RequestWorkLease:
                         phases={p: v.to_dict() for p, v in self.ports.items()},
                         journal_path=str(self.journal_path), journal_event_count=self.sequence,
                         journal_prefix_sha256=self.prefix_sha256, journal_failed=self.journal_failed,
+                        request_terminal=None if self.request_terminal is None else dict(self.request_terminal),
+                        closed=self.closed,
                         counter_copies_are_authority=False, retry_renews_budget=False,
                         all_model_call_sites_metered=False, all_raw_results_journaled=False,
                         runtime_calibrated=False, process_peak_rss_bounded=False, quality_approved=False)
+
+    def finish_request(self, *, outcome, last_entered_phase, last_requested_phase=None,
+            error_type=None, error=None):
+        """Durably record the request exit without asking for renewed time.
+
+        An exception between phases must not look like a successful analysis.
+        Terminal persistence uses the originally reserved terminal journal
+        capacity, even after the scheduling deadline. It is not another work
+        phase, a quality certificate or permission to launch a final worker.
+        """
+        with self._lock:
+            self._owned()
+            if (self.active is not None or any(p.live_workers for p in self.ports.values())
+                    or outcome not in ('returned','failed','cancelled','budget_partial','budget_not_started')
+                    or last_entered_phase is not None and last_entered_phase not in PHASES
+                    or last_requested_phase is not None and last_requested_phase not in PHASES
+                    or error_type is not None and (not isinstance(error_type,str) or len(error_type)>160)
+                    or error is not None and (not isinstance(error,str) or len(error)>2000)):
+                raise ValueError('request terminal needs reaped owned work and its bounded actual outcome')
+            payload=dict(outcome=outcome,last_entered_phase=last_entered_phase,
+                last_requested_phase=last_requested_phase,
+                error_type=error_type,error=error,phase_states=dict(self.states),
+                original_deadline=self.deadline,quality_approved=False)
+            self._append('request_terminal',payload,self.ports['terminal'])
+            self.request_terminal=payload
 
     def close(self):
         with self._lock:
             if self.active is not None:
                 raise ValueError("cannot close an active request phase")
             self._stream.close()
+            self.closed = True
 
 
 class PhaseWorkPort:
