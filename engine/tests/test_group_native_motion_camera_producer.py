@@ -22,7 +22,37 @@ from tests.test_scene_role_epoch_program import fixture
 from tests.test_group_review_recorded_index import native_record
 
 
-def inputs(*,missing_tick=None,member_hint_by_source=None):
+def _synthetic_owned_body(raw,source,tick,damage):
+    """Typed SYNTHETIC raw input, upstream of actual DP and projection.
+
+    Source 3 has the same anatomical pose at its smaller native face scale.
+    Damage is deliberately candidate-only; original rows remain available.
+    This supplies no actual model inference or pixel-quality evidence.
+    """
+    from crosscut.group_joint_person_ownership import OwnedPersonObservation
+    points=[(.38,.45,.9),(.52,.45,.9),(.32,.55,.9),(.57,.55,.9),
+        (.32+.002*(tick-30),.62,.9),(.58,.63,.9),(.4,.8,.9),(.5,.8,.9)]
+    if source==3:
+        if damage=='wrist_jump':points[4]=(points[4][0]+.16,.62,.9)
+        elif damage=='cut_side_stop':points[4]=(.35,.62,.9)
+        elif damage=='hold_reversal':points[4]=(.38-.002*(tick-45),.62,.9)
+        elif damage=='unsampled_wrist_loss' and tick==51:
+            points[4]=(*points[4][:2],.1)
+        points=[(.45+(x-.45)*.625,.3+(y-.3)*.625,c) for x,y,c in points]
+    raw_points=[(0.,0.,0.)]*17
+    raw_points[0]=(*raw.heads[0].landmarks_xy[2],.9)
+    for index,point in zip((5,6,7,8,9,10,11,12),points,strict=True):raw_points[index]=point
+    box=(.3,.18,.3,.65) if source!=3 else (.35625,.225,.1875,.40625)
+    person=OwnedPersonObservation(1,box,tuple(points),.9,pose_crop_xywh=box,
+        source_pixel_to_pose_input_affine=((1.,0.,0.),(0.,1.,0.)),raw_pose_xyc=tuple(raw_points),
+        pose_reason='observed',candidate_head_observation_ids=(7,),unique_head_observation_id=7,
+        body_ownership_state='observed',face_anchor_consistent=True,
+        part_states=(('shoulder_anchor','observed'),
+            ('left_arm','unknown' if points[4][2]<.42 else 'observed'),('right_arm','observed')))
+    return replace(raw,people=(person,),heads=(replace(raw.heads[0],candidate_body_observation_ids=(1,)),))
+
+
+def inputs(*,missing_tick=None,member_hint_by_source=None,body_damage=None):
     context,domain,_=fixture(native_fps=Fraction(30))
     context.incumbent.face_match_plan=None
     original=freeze_owned_scene_program(context,domain)
@@ -45,6 +75,7 @@ def inputs(*,missing_tick=None,member_hint_by_source=None):
                     for x,y in head.landmarks_xy)
                 raw=replace(raw,heads=(replace(head,box_xywh=(.41875,.2375,.0625,.125),landmarks_xy=points),))
             raw=replace(raw,request_source_index=source,native_frame_index=native,source_clock_identity=q.source_clock_identity)
+            if body_damage is not None:raw=_synthetic_owned_body(raw,source,tick,body_damage)
             payload=json.loads(json.dumps(raw.to_dict()))
             app.update({k:payload[k] for k in ('request_source_index','native_frame_index','source_clock_identity',
                 'source_file_identity','native_pixel_sha256')})
@@ -264,3 +295,20 @@ def test_hold_measurement_retains_all_known_ticks_and_negative_motion(damage):
     else:
         assert any(r['reason']==('KNOWN_HOLD_DIRECTION_REVERSAL' if damage=='reversed_wrist'
             else 'KNOWN_HOLD_CANDIDATE_MOTION_STOP') for r in hold['known_motion_failures'])
+
+
+@pytest.mark.parametrize('damage',('wrist_jump','cut_side_stop','hold_reversal','unsampled_wrist_loss'))
+def test_actual_camera_producer_retains_candidate_only_damage_after_face_fit(damage):
+    candidates,receipt=produce_two_sided_native_cameras(**inputs(body_damage=damage))
+    assert candidates and receipt['state']=='REALIZED'
+    for candidate in candidates:
+        evidence=candidate.evidence
+        assert evidence['state']=='KNOWN_INCIDENT_OR_HOLD_REGRESSION'
+        assert evidence['known_hold_observation_losses'] or evidence['known_hold_motion_failures'] or (
+            evidence['incident_comparison']['failures'])
+        # Face fitting remains available and cannot erase adverse action.
+        assert evidence['coupled_landmark_fit']['face_scale_basis']=='projected_five_anatomical_landmarks_rms'
+        assert not evidence['quality_approved']
+        if damage=='unsampled_wrist_loss':
+            assert [51,'known_joint_4'] in evidence['known_hold_observation_losses']
+            assert 51 not in evidence['actual_holds'][1]['requested_ticks']

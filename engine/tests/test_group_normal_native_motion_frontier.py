@@ -133,3 +133,39 @@ def test_missing_fixed_context_does_not_enter_a_camera_fit_or_invent_keep_score(
         assert budget.counts['new_decodes']==budget.counts['model_calls']==0
     try:owner.run_work_phase('selected_completion',run)
     finally:lease.close()
+
+
+@pytest.mark.parametrize('damage',('wrist_jump','cut_side_stop','hold_reversal','unsampled_wrist_loss'))
+def test_final_frontier_does_not_count_face_fitted_known_motion_damage_as_nonregression(tmp_path,damage):
+    args=inputs(body_damage=damage);owner,lease=lease_for(args,tmp_path)
+    def run():
+        budget=JointGroupWorkBudget(absolute_deadline=monotonic()+8.,maximum_model_calls=1,maximum_new_decodes=1)
+        sensors=SyntheticSensors(budget);source_session=args['views'].sensors.session
+        sensors.session=SimpleNamespace(domain=args['domain'],budget=budget,closed=False,
+            models=source_session.models,model_adapters=source_session.model_adapters,
+            _assert_model_assets=source_session._assert_model_assets,
+            _assert_source_identity=source_session._assert_source_identity)
+        sensors.recorded_motion_bindings={}
+        for key,supply in args['views'].supplies.items():
+            if supply.observation is not None:
+                sensors.raw_rows[key]=supply.observation;sensors.appearance_rows[key[:2]]=supply.appearance
+        candidates,report,_=realize_normal_native_motion_frontier(context=args['context'],sensors=sensors,
+            first_output_frame=30,end_output_frame=60,cut_ticks=(45,),native_phases=(0,),maximum_tuples=48)
+        target=[r for r in report['trials'] if tuple(r['spec'])==(2,3,45,0,0,0,0)]
+        assert len(target)==1 and target[0]['camera_candidates']
+        rejected=target[0]['camera_candidates']
+        assert all(r['state']=='KNOWN_INCIDENT_OR_HOLD_REGRESSION' for r in rejected)
+        assert all(r['known_incident_failures'] or r['known_hold_observation_losses'] or (
+            r['known_hold_motion_failures']) for r in rejected)
+        rejected_plans={r['selected_plan_identity'] for r in rejected}
+        from crosscut.group_performer_family_owner import digest
+        assert not rejected_plans.intersection(digest(c.render_plan.to_json()) for c in candidates)
+        trials=[c for row in report['trials'] for c in row.get('camera_candidates',())]
+        assert report['nonregressing_camera_candidates']==len(candidates)==sum(
+            c['state']=='REALIZED_FOR_REVIEW' for c in trials)
+        assert report['realized_camera_candidates']>report['nonregressing_camera_candidates']
+        assert budget.counts['new_decodes']==budget.counts['model_calls']==0
+        assert not sensors.raw_calls and not sensors.appearance_calls and not report['quality_approved']
+        assert current_request_work_phase().charged['native_completion_passes']==1
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()

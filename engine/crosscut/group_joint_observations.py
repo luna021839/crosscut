@@ -32,9 +32,10 @@ def _file_identity(path):
 
 class GroupJointObservationSession:
     def __init__(self,*,domain,budget,maximum_raw_cache_bytes=64*1024*1024,
-            maximum_model_observation_bytes=8*1024*1024):
+            maximum_model_observation_bytes=8*1024*1024,maximum_active_raster_bytes=128*1024*1024):
         if (not isinstance(domain,GroupSourceDomain) or not isinstance(budget,JointGroupWorkBudget)
-                or any(type(n) is not int or n<1 for n in (maximum_raw_cache_bytes,maximum_model_observation_bytes))):
+                or any(type(n) is not int or n<1 for n in (maximum_raw_cache_bytes,maximum_model_observation_bytes,
+                    maximum_active_raster_bytes)) or maximum_active_raster_bytes>256*1024*1024):
             raise ValueError('joint observation session needs bound sources and finite cache/work budgets')
         self.domain=domain;self.budget=budget;self.raw_limit=maximum_raw_cache_bytes
         self.captures={};self.readers={};self.identities={};self.raw=OrderedDict();self.raw_bytes=0
@@ -46,6 +47,12 @@ class GroupJointObservationSession:
         self.cache_reuse=0;self.closed=False
         self.raw_peak_bytes=0;self.raw_evictions=0;self.native_frame_bytes={}
         self.peak_owned_raw_decode_bytes=0;self.native_pixel_copies=0
+        # One overflow raster lives outside the LRU, never one per model/ROI.
+        # This cap bounds retained active pixels, not decoder/model/process RSS
+        # or a first decoded frame whose dimensions were previously unknown.
+        self.active_raster_limit=maximum_active_raster_bytes;self.active_raster=None
+        self.active_raster_peak_bytes=0;self.raw_pixel_hashes={}
+        self.native_raster_capacity_failures={};self.reader_clocks={}
 
     def _identity(self,path):
         if self.budget.request_work_phase is not None:
@@ -60,14 +67,22 @@ class GroupJointObservationSession:
         identity=self._identity(path)
         if source not in self.identities:
             self.identities[source]=identity
+        elif identity!=self.identities[source]:
+            raise ValueError('joint source identity changed; cached/native observations cannot be reused')
+        return identity
+
+    def _reader_for_source(self,source,identity,clock):
+        """Probe/open only for a genuine raster miss, not archive/file binding."""
+        path=self.domain.request_sources[source]
+        if source not in self.readers:
             capture=None
             try:
                 if self.budget.request_work_phase is not None:
                     self.budget.request_work_phase.charge('source_probes')
-                clock=probe_render_frame_clock(path,
+                actual=probe_render_frame_clock(path,
                     timeout_seconds=max(.01,min(10.,self.budget.deadline-self.budget.clock())))
                 self.budget.check()
-                if clock!=self.domain.render_frame_clocks[local] or self._identity(path)!=identity:
+                if actual!=clock or self._identity(path)!=identity:
                     raise ValueError('joint observation native clock/file changed before decoder opening')
                 if self.budget.request_work_phase is not None:
                     self.budget.request_work_phase.charge('decoder_opens')
@@ -75,14 +90,19 @@ class GroupJointObservationSession:
                 if not capture.isOpened():raise ValueError('joint eligible source decoder unavailable')
                 reader=ExactNativeFrameReader(capture,clock)
                 if self._identity(path)!=identity:raise ValueError('joint source changed during decoder opening')
-                self.captures[source]=capture;self.readers[source]=reader
+                self.captures[source]=capture;self.readers[source]=reader;self.reader_clocks[source]=clock
             except BaseException:
                 if capture is not None:capture.release()
-                self.identities.pop(source,None)
                 raise
-        elif identity!=self.identities[source]:
-            raise ValueError('joint source identity changed; cached/native observations cannot be reused')
-        return identity
+        elif self.reader_clocks[source]!=clock:
+            raise ValueError('joint observation native clock/file changed after decoder opening')
+        return self.readers[source]
+
+    @staticmethod
+    def _assert_raster_integrity(pixels,pixel_sha256):
+        if (pixels.flags.writeable
+                or hashlib.sha256(memoryview(pixels)).hexdigest()!=pixel_sha256):
+            raise ValueError('owned native raster content or immutable buffer changed')
 
     def native_pixels(self,source,native_frame):
         identity=self._assert_source_identity(source)
@@ -90,8 +110,17 @@ class GroupJointObservationSession:
         if type(native_frame) is not int or not 0<=native_frame<clock.frame_count:
             raise ValueError('joint observation native frame is outside the verified source')
         key=(source,identity,clock.packet_grid_sha256,native_frame)
+        if key in self.native_raster_capacity_failures:
+            raise ValueError('native active raster capacity exceeded for this retained exact attempt')
         if key in self.raw:
-            value=self.raw.pop(key);self.raw[key]=value;self.cache_reuse+=1;return value
+            value=self.raw.pop(key);self.raw[key]=value
+            if value is not None:self._assert_raster_integrity(value,self.raw_pixel_hashes[key])
+            self.cache_reuse+=1;return value
+        if self.active_raster is not None and self.active_raster[0]==key:
+            _,pixels,pixel_sha=self.active_raster
+            self._assert_raster_integrity(pixels,pixel_sha);self.cache_reuse+=1;return pixels
+        self.active_raster=None  # Release the old overflow before another allocation.
+        reader=self._reader_for_source(source,identity,clock)
         # Count materialized native reads, not invisible codec/keyframe work.
         # ExactNativeFrameReader separately exposes skipped RGB grabs and seeks.
         self.budget.spend('new_decodes')
@@ -100,13 +129,21 @@ class GroupJointObservationSession:
         # 4K raster into a 64MiB cache. Unknown first-source dimensions are
         # reported honestly; pair-streaming callers release obsolete frames.
         while self.raw and self.raw_bytes+expected>self.raw_limit:
-            _,old=self.raw.popitem(last=False)
+            old_key,old=self.raw.popitem(last=False);self.raw_pixel_hashes.pop(old_key,None)
             self.raw_bytes-=0 if old is None else old.nbytes;self.raw_evictions+=1
-        frame=self.readers[source].frame_at(native_frame)
+        frame=reader.frame_at(native_frame)
         self._assert_source_identity(source)
         if frame is not None:
             size=frame.nbytes
             self.peak_owned_raw_decode_bytes=max(self.peak_owned_raw_decode_bytes,self.raw_bytes+size)
+            if size>self.active_raster_limit:
+                # Capacity failure is distinct from an exact decoder failure.
+                # Retain it at the physical address so later models cannot
+                # repeatedly read an unsupported raster. No NN ran on it.
+                self.native_raster_capacity_failures[key]=dict(frame_bytes=size,
+                    maximum_active_raster_bytes=self.active_raster_limit,
+                    state='ACTIVE_NATIVE_RASTER_CAPACITY_EXCEEDED',quality_approved=False)
+                raise ValueError('native active raster capacity exceeded for this retained exact attempt')
             # OpenCV owns each returned ndarray and ExactNativeFrameReader
             # retains no raster. A view needs a private copy; an owned buffer
             # can be frozen without allocating another entire 4K frame.
@@ -115,13 +152,19 @@ class GroupJointObservationSession:
                 frame=frame.copy();self.native_pixel_copies+=1
             frame.setflags(write=False)
             self.native_frame_bytes[source]=size
+            pixel_sha=hashlib.sha256(memoryview(frame)).hexdigest()
         size=0 if frame is None else frame.nbytes
         if size<=self.raw_limit:
             self.raw[key]=frame;self.raw_bytes+=size
+            if frame is not None:self.raw_pixel_hashes[key]=pixel_sha
             while self.raw_bytes>self.raw_limit or len(self.raw)>1200:
-                _,old=self.raw.popitem(last=False);self.raw_bytes-=0 if old is None else old.nbytes
+                old_key,old=self.raw.popitem(last=False);self.raw_pixel_hashes.pop(old_key,None)
+                self.raw_bytes-=0 if old is None else old.nbytes
                 self.raw_evictions+=1
             self.raw_peak_bytes=max(self.raw_peak_bytes,self.raw_bytes)
+        elif frame is not None:
+            self.active_raster=(key,frame,pixel_sha)
+            self.active_raster_peak_bytes=max(self.active_raster_peak_bytes,size)
         return frame
 
     def native_raster_cache_available(self,source,native_frame,*,expected_pixel_sha256=None):
@@ -145,10 +188,14 @@ class GroupJointObservationSession:
         identity=self.identities.get(source)
         key=(source,identity,clock.packet_grid_sha256,native_frame)
         pixels=self.raw.get(key)
+        pixel_sha=self.raw_pixel_hashes.get(key)
+        if pixels is None and self.active_raster is not None and self.active_raster[0]==key:
+            _,pixels,pixel_sha=self.active_raster
         if identity is None or pixels is None:return False
         path=self.domain.request_sources[source]
         if self._identity(path)!=identity:
             raise ValueError('joint source identity changed; cached/native observations cannot be reused')
+        self._assert_raster_integrity(pixels,pixel_sha)
         if (expected_pixel_sha256 is not None
                 and hashlib.sha256(memoryview(pixels)).hexdigest()!=expected_pixel_sha256):
             raise ValueError('cached native raster content differs from its recorded parent')
@@ -178,7 +225,10 @@ class GroupJointObservationSession:
             wanted.add(key)
         for key in tuple(self.raw):
             if (key[0],key[3]) not in wanted:
-                old=self.raw.pop(key);self.raw_bytes-=0 if old is None else old.nbytes;self.raw_evictions+=1
+                old=self.raw.pop(key);self.raw_pixel_hashes.pop(key,None)
+                self.raw_bytes-=0 if old is None else old.nbytes;self.raw_evictions+=1
+        if self.active_raster is not None and (self.active_raster[0][0],self.active_raster[0][3]) not in wanted:
+            self.active_raster=None
 
     def projected_pixels(self,state,output_tick):
         from .group_scene_camera_queries import GroupWholeCameraObservation,GroupSceneRoleQuery
@@ -334,12 +384,15 @@ class GroupJointObservationSession:
         key=('source_native',source,source_identity,clock.packet_grid_sha256,native_frame,model,digest,
             self.model_adapters[model],encoded)
         if key in self.model_observations:
+            self.native_raster_cache_available(source,native_frame)
             payload=self.model_observations.pop(key);self.model_observations[key]=payload;self.model_reuse+=1
             return pickle.loads(payload)
         pixels=self.native_pixels(source,native_frame)
         if pixels is None:return None
+        pixel_sha=hashlib.sha256(memoryview(pixels)).hexdigest()
         self.budget.spend('model_calls',model=model)
-        value=observer(pixels) if bound_arguments is None else observer(pixels,**bound_arguments)
+        try:value=observer(pixels) if bound_arguments is None else observer(pixels,**bound_arguments)
+        finally:self._assert_raster_integrity(pixels,pixel_sha)
         self.budget.check()
         self._assert_model_assets(model)
         self._assert_source_identity(source)
@@ -356,6 +409,12 @@ class GroupJointObservationSession:
             maximum_raw_pixel_cache_bytes=self.raw_limit,peak_raw_pixel_cache_bytes=self.raw_peak_bytes,
             raw_pixel_cache_eviction_count=self.raw_evictions,native_pixel_copy_count=self.native_pixel_copies,
             peak_owned_raw_raster_bytes_during_decode=self.peak_owned_raw_decode_bytes,
+            active_native_raster_bytes=0 if self.active_raster is None else self.active_raster[1].nbytes,
+            maximum_active_native_raster_bytes=self.active_raster_limit,
+            peak_active_native_raster_bytes=self.active_raster_peak_bytes,
+            retained_active_raster_capacity_failures=[dict(request_source_index=k[0],source_file_identity=k[1],
+                native_clock_packet_grid_sha256=k[2],native_frame_index=k[3],**v)
+                for k,v in self.native_raster_capacity_failures.items()],
             raw_decode_peak_excludes_codec_model_and_caller_retained_memory=True,process_peak_rss_measured=False,
             projected_pixel_cache_bytes=self.projected.bytes,native_pixel_cache_reuse=self.cache_reuse,
             source_readers={str(s):r.diagnostics() for s,r in self.readers.items()},
@@ -371,6 +430,8 @@ class GroupJointObservationSession:
     def close(self):
         for capture in self.captures.values():capture.release()
         self.captures.clear();self.readers.clear();self.raw.clear();self.raw_bytes=0
+        self.active_raster=None;self.raw_pixel_hashes.clear();self.reader_clocks.clear()
+        self.native_raster_capacity_failures.clear()
         self.projected.rows.clear();self.projected.bytes=0;self.geometry.clear();self.models.clear();self.model_adapters.clear()
         self.model_adapter_preimages.clear()
         self.model_asset_dependencies.clear()

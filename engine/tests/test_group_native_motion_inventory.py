@@ -559,6 +559,154 @@ def test_additional_manifest_cannot_replace_a_conflicting_existing_native_result
     finally:lease.close()
 
 
+@pytest.mark.parametrize('failure_on_primary',(False,True))
+def test_all_verified_device_aliases_keep_same_variant_success_failure_conflict(tmp_path,failure_on_primary):
+    old,index,raw,app,path=recorded_sensors(tmp_path,remount=True,decode_failure=failure_on_primary)
+    added=replace(restore_native_row(raw),source_file_identity=_file_identity(path))
+    if failure_on_primary:
+        clean,unused=native_record()
+        added=replace(restore_native_row(clean),request_source_index=raw['request_source_index'],
+            native_frame_index=raw['native_frame_index'],source_clock_identity=raw['source_clock_identity'],
+            source_file_identity=_file_identity(path),model_content_sha256=tuple(map(tuple,raw['model_content_sha256'])),
+            model_adapter_fingerprints=tuple(map(tuple,raw['model_adapter_fingerprints'])),
+            person_ownership_policy_sha256=raw['person_ownership_policy_sha256'])
+    else:
+        added=replace(added,native_pixel_sha256=None,frame_size_wh=(0,0),heads=(),people=(),
+            reason='exact_native_decode_unavailable')
+    added_raw=json.loads(json.dumps(added.to_dict()))
+    if failure_on_primary:index.add_native_record(added_raw,provenance='equivalent alias successful fixture')
+    else:index.add_native_decode_failure(added_raw,provenance='equivalent alias failed fixture')
+    fresh=sensors();fresh.session=old.session
+    fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+        source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+        additional_source_identities={2:_file_identity(path)})
+    demand=NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True)
+    result=fresh.motion_inventory((demand,)).supplies[0]
+    assert result.state=='CONFLICTING_NATIVE_RECORDS' and result.observation is None
+    assert not result.missing_modalities and not fresh.raw_calls and not fresh.appearance_calls
+
+
+@pytest.mark.parametrize('decode_failure',(False,True))
+def test_requested_variant_in_equivalent_alias_is_not_hidden_by_primary_other_variant(tmp_path,decode_failure):
+    old,unused,raw,app,path=recorded_sensors(tmp_path,remount=True)
+    primary=replace(restore_native_row(raw),model_adapter_fingerprints=tuple(
+        (name,'e'*64) for name,adapter in restore_native_row(raw).model_adapter_fingerprints))
+    added=replace(restore_native_row(raw),source_file_identity=_file_identity(path))
+    if decode_failure:
+        added=replace(added,native_pixel_sha256=None,frame_size_wh=(0,0),heads=(),people=(),
+            reason='exact_native_decode_unavailable')
+    index=RecordedGroupReviewIndex()
+    index.add_native_record(json.loads(json.dumps(primary.to_dict())),provenance='primary different analysis fixture')
+    if decode_failure:
+        index.add_native_decode_failure(json.loads(json.dumps(added.to_dict())),
+            provenance='equivalent requested failed analysis fixture')
+    else:index.add_native_record(json.loads(json.dumps(added.to_dict())),provenance='equivalent requested analysis fixture')
+    fresh=sensors();fresh.session=old.session
+    fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+        source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+        additional_source_identities={2:_file_identity(path)})
+    result=fresh.motion_inventory((NativeMotionDemand(2,80,8,'family','other'),)).supplies[0]
+    assert result.state==('EXACT_DECODE_UNAVAILABLE' if decode_failure else 'NATIVE_ROWS_AVAILABLE')
+    assert result.observation.to_dict()==added.to_dict() and not result.missing_modalities
+    assert not fresh.raw_calls and not fresh.appearance_calls
+
+
+def _alias_record(raw,appearance,identity):
+    # Independently parent-bound SYNTHETIC archived copies, never rebind real caches.
+    added=json.loads(json.dumps(raw));added['source_file_identity']=list(identity)
+    if 'raw_person_detector_result' in added:
+        added['raw_person_detector_result']['source_file_identity']=list(identity)
+    restore_native_row(added)
+    app=None if appearance is None else json.loads(json.dumps(appearance))
+    if app is not None:
+        app.update(source_file_identity=list(identity),recorded_native_observation_sha256=digest(added))
+    return added,app
+
+
+@pytest.mark.parametrize('primary_is_current',(False,True))
+@pytest.mark.parametrize('reverse_import',(False,True))
+@pytest.mark.parametrize('feature_case',('duplicate','unobserved','observed_failure','different_vector'))
+def test_verified_alias_feature_census_is_order_independent_without_parent_rewrite(
+        tmp_path,primary_is_current,reverse_import,feature_case):
+    old,unused,raw,app,path=recorded_sensors(tmp_path,remount=True)
+    added,added_app=_alias_record(raw,app,_file_identity(path))
+    if feature_case=='unobserved':added_app=None
+    elif feature_case=='observed_failure':
+        added_app['heads'][0]['embedding']=None
+        added_app['heads'][0]['reason']='synthetic measured descriptor unavailable'
+    elif feature_case=='different_vector':added_app['heads'][0]['embedding']=[0.,1.]+[0.]*126
+    before=json.loads(json.dumps((raw,app,added,added_app)))
+    records=[(raw,app),(added,added_app)]
+    index=RecordedGroupReviewIndex()
+    for i,(r,a) in enumerate(records[::-1] if reverse_import else records):
+        index.add_native_record(r,a,provenance=f'synthetic independent alias {i}')
+        index.add_native_record(r,a,provenance=f'synthetic duplicate occurrence {i}')
+    fresh=sensors();fresh.session=old.session
+    identities=(_file_identity(path),raw['source_file_identity']) if primary_is_current else (
+        raw['source_file_identity'],_file_identity(path))
+    fresh.bind_recorded_motion_index(index,source_identities={2:identities[0]},
+        source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+        additional_source_identities={2:identities[1]})
+    demand=NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True)
+    value=fresh.motion_inventory((demand,)).supplies[0]
+    if feature_case in ('observed_failure','different_vector'):
+        assert value.state=='CONFLICTING_FEATURE_RECORDS' and value.observation.heads
+        assert value.appearance is None and not value.missing_modalities
+    else:
+        assert value.state=='NATIVE_ROWS_AVAILABLE' and value.appearance is not None
+        assert value.appearance['source_file_identity']==list(value.observation.source_file_identity)
+        assert value.appearance['recorded_native_observation_sha256']==digest(value.observation.to_dict())
+        if feature_case=='duplicate':assert value.observation.source_file_identity==_file_identity(path)
+        else:assert value.observation.source_file_identity==tuple(raw['source_file_identity'])
+    assert json.loads(json.dumps((raw,app,added,added_app)))==before
+    assert not fresh.raw_calls and not fresh.appearance_calls
+
+
+def test_verified_alias_comparison_preserves_nested_detector_and_live_feature_parents(tmp_path):
+    from crosscut.group_native_detector_result import capture_detector_result
+    old,unused,raw,app,path=recorded_sensors(tmp_path,remount=True)
+    detector=capture_detector_result(None,binding={k:raw[k] for k in (
+        'request_source_index','native_frame_index','source_clock_identity','source_file_identity','native_pixel_sha256')},
+        model_content_sha256=dict(raw['model_content_sha256'])['nanodet_people'],
+        model_adapter_sha256=dict(raw['model_adapter_fingerprints'])['nanodet_people'])
+    raw=json.loads(json.dumps(replace(restore_native_row(raw),raw_person_detector_json=json.dumps(detector)).to_dict()))
+    app=dict(app,recorded_native_observation_sha256=digest(raw))
+    added,added_app=_alias_record(raw,app,_file_identity(path))
+    index=RecordedGroupReviewIndex()
+    index.add_native_record(raw,app,provenance='synthetic original v4 parent')
+    index.add_native_record(added,added_app,provenance='synthetic independently-bound current v4 parent')
+    fresh=sensors();fresh.session=old.session
+    fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+        source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+        additional_source_identities={2:_file_identity(path)})
+    fresh.raw_rows[2,80,None]=restore_native_row(added)
+    fresh.appearance_rows[digest(added)]=added_app
+    fresh.appearance_at=lambda r,**kw:NativeFamilySensors.appearance_at(fresh,r,**kw)
+    value=fresh.motion_inventory((NativeMotionDemand(2,80,8,'family','other',require_appearance=True),)).supplies[0]
+    assert value.state=='NATIVE_ROWS_AVAILABLE' and value.observation.to_dict()==restore_native_row(added).to_dict()
+    assert value.appearance==added_app and digest(raw)==app['recorded_native_observation_sha256']
+    assert value.observation.to_dict()['raw_person_detector_result']['source_file_identity']==list(_file_identity(path))
+    added_app['heads'][0]['embedding']=None
+    added_app['heads'][0]['reason']='synthetic live measured descriptor failure'
+    value=fresh.motion_inventory((NativeMotionDemand(2,80,8,'family','other',require_appearance=True),)).supplies[0]
+    assert value.state=='CONFLICTING_FEATURE_RECORDS' and not value.missing_modalities
+    assert not fresh.raw_calls and not fresh.appearance_calls
+
+
+def test_alias_failure_of_other_clock_does_not_poison_requested_clock(tmp_path):
+    old,index,raw,app,path=recorded_sensors(tmp_path,remount=True)
+    added=replace(restore_native_row(raw),source_file_identity=_file_identity(path),source_clock_identity='0'*64,
+        native_pixel_sha256=None,frame_size_wh=(0,0),heads=(),people=(),reason='exact_native_decode_unavailable')
+    index.add_native_decode_failure(json.loads(json.dumps(added.to_dict())),provenance='other clock failure fixture')
+    fresh=sensors();fresh.session=old.session
+    fresh.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+        source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()},
+        additional_source_identities={2:_file_identity(path)})
+    value=fresh.motion_inventory((NativeMotionDemand(2,80,8,'family','other',require_appearance=True),)).supplies[0]
+    assert value.state=='NATIVE_ROWS_AVAILABLE' and value.appearance==app
+    assert not fresh.raw_calls and not fresh.appearance_calls
+
+
 @pytest.mark.parametrize('bind_order',('live_first','archive_first'))
 def test_live_raw_cannot_erase_a_known_archive_conflict(tmp_path,bind_order):
     old,index,raw,app,path=recorded_sensors(tmp_path)

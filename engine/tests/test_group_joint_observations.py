@@ -89,6 +89,44 @@ class JointObservationSessionTests(unittest.TestCase):
             self.assertEqual(session.captures,{})
             self.assertEqual(session.budget.counts['new_decodes'],0)
 
+    def test_cache_only_file_binding_does_not_probe_clock_or_construct_decoder(self):
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget()) as session:
+            with (patch('crosscut.group_joint_observations.probe_render_frame_clock',
+                    side_effect=AssertionError('cache-only identity cannot probe clock')),
+                    patch('crosscut.group_joint_observations.cv2.VideoCapture',
+                    side_effect=AssertionError('cache-only identity cannot open decoder'))):
+                identity=session._assert_source_identity(2)
+                self.assertEqual(identity,session._assert_source_identity(2))
+                self.assertFalse(session.native_raster_cache_available(2,15))
+            self.assertEqual(session.captures,{})
+            self.assertEqual(session.readers,{})
+            self.assertEqual(session.budget.counts['new_decodes'],0)
+            self.assertEqual(session.native_pixels(2,15).shape,(54,96,3))
+
+    def test_lru_overflow_uses_one_active_raster_for_all_native_models(self):
+        # Real OpenCV decoder and registered shape callbacks, not face NN quality.
+        with GroupJointObservationSession(domain=self.domain,budget=self.budget(maximum_new_decodes=1),
+                maximum_raw_cache_bytes=8) as session:
+            calls=[]
+            session.register_model('head-fixture',self.model,
+                lambda p:calls.append(('head',p)) or p.shape)
+            session.register_model('body-fixture',self.model,
+                lambda p,*,roi:calls.append(('body',p)) or tuple(roi))
+            raster=session.native_pixels(2,15)
+            self.assertEqual(session.observe_native(2,15,model='head-fixture'),(54,96,3))
+            self.assertEqual(session.observe_native(2,15,model='body-fixture',arguments={'roi':[1,2]}),(1,2))
+            self.assertEqual(session.observe_native(2,15,model='body-fixture',arguments={'roi':[3,4]}),(3,4))
+            self.assertTrue(all(p is raster for _,p in calls))
+            self.assertFalse(raster.flags.writeable)
+            self.assertEqual(session.budget.counts['new_decodes'],1)
+            self.assertEqual(session.readers[2].read_count,1)
+            self.assertTrue(session.native_raster_cache_available(2,15,
+                expected_pixel_sha256=hashlib.sha256(memoryview(raster)).hexdigest()))
+            report=session.diagnostics()
+            self.assertEqual(report['active_native_raster_bytes'],96*54*3)
+            self.assertEqual(report['raw_pixel_cache_bytes'],0)
+            self.assertFalse(report['process_peak_rss_measured'])
+
     def test_decode_and_named_model_budgets_are_real_work_counts(self):
         budget=self.budget(maximum_new_decodes=2,maximum_model_calls=1)
         with GroupJointObservationSession(domain=self.domain,budget=budget) as session:

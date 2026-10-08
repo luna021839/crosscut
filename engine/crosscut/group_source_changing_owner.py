@@ -234,6 +234,72 @@ class NativeMotionInventory:
     completion_schedule_json: str | None = None
 
 
+def _equivalent_native_preimage(supply,current_identity):
+    """Comparison only: verified device aliases retain their stored parents.
+
+    The nested raw detector address is the only other file-address field in
+    the validated native schema. No detector result, pixel, feature or model
+    payload is relabelled in the index or in the returned supply.
+    """
+    import json
+    raw=json.loads(json.dumps(supply.observation.to_dict(),sort_keys=True,allow_nan=False))
+    identity=tuple(raw['source_file_identity'])
+    if identity!=current_identity:
+        receipt=None if supply.source_equivalence_json is None else json.loads(supply.source_equivalence_json)
+        if (receipt is None or receipt.get('state')!='CONTENT_VERIFIED_DEVICE_REMOUNT'
+                or tuple(receipt.get('recorded_file_identity',()))!=identity
+                or tuple(receipt.get('current_file_identity',()))!=current_identity
+                or identity[1:]!=current_identity[1:]):
+            raise ValueError('native comparison needs its independently verified device alias')
+    raw['source_file_identity']=list(current_identity)
+    if 'raw_person_detector_result' in raw:
+        raw['raw_person_detector_result']['source_file_identity']=list(current_identity)
+    return raw
+
+
+def _equivalent_native_feature(feature,raw,current_identity):
+    """Compare exact validated feature parents, without rewriting either one."""
+    import json
+    value=json.loads(json.dumps(feature,sort_keys=True,allow_nan=False))
+    value['source_file_identity']=list(current_identity)
+    value['recorded_native_observation_sha256']=family.digest(raw)
+    return value
+
+
+def _census_native_motion_supplies(demand,supplies,current_identity):
+    """Census every verified alias/live result before choosing a stored parent.
+
+    Choice depends only on declared modality availability and stable physical
+    addresses, never on face similarity, pose quality or success preference.
+    A missing alias is not a failure; a measured failure cannot hide a success
+    or vice versa. Distinct analysis variants are filtered by the caller.
+    """
+    supplies=tuple(supplies)
+    if any(s.state=='CONFLICTING_NATIVE_RECORDS' for s in supplies):
+        return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
+    present=tuple(s for s in supplies if s.observation is not None)
+    if not present:
+        state=('MISSING_DECLARED_ANALYSIS_VARIANT' if any(
+            s.recorded_input_state=='MISSING_DECLARED_ANALYSIS_VARIANT' for s in supplies) else 'MISSING')
+        return NativeMotionSupply(demand,None,recorded_input_state=state)
+    normalized=tuple(_equivalent_native_preimage(s,current_identity) for s in present)
+    if len({family.digest(r) for r in normalized})!=1:
+        return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
+    selected=min(present,key=lambda s:(len(s.missing_modalities),
+        s.observation.source_file_identity,family.digest(s.observation.to_dict())))
+    feature_conflict=any(s.state=='CONFLICTING_FEATURE_RECORDS' for s in supplies)
+    for field in ('appearance','member_features'):
+        variants={family.digest(_equivalent_native_feature(getattr(s,field),r,current_identity))
+            for s,r in zip(present,normalized,strict=True) if getattr(s,field) is not None}
+        feature_conflict=feature_conflict or len(variants)>1
+    if feature_conflict:
+        return replace(selected,appearance=None,member_features=None,
+            recorded_input_state='CONFLICTING_FEATURE_RECORDS')
+    # Do not copy a feature from a different exact raw parent to fill a gap.
+    # The parent selected above keeps its own features and equivalence receipt.
+    return selected
+
+
 def _native_actor_anchor_cache_identity(anchor):
     if anchor is None:return None
     return family.digest(dict(raw=anchor['row']['native_observation'],
@@ -794,7 +860,10 @@ class NativeFamilySensors:
         from .group_review_actor_appearance import observe_recorded_head_appearances
         from .group_review_recorded_index import validate_recorded_appearance
         from .native_face_descriptor import native_descriptor_space,SFACE_MODEL_NAME
-        payload=raw.to_dict();key=family.digest(payload)
+        import json
+        # Persisted JSON and typed native tuples have the same canonical parent,
+        # but exact field validation must use the same JSON container schema.
+        payload=json.loads(json.dumps(raw.to_dict(),sort_keys=True,allow_nan=False));key=family.digest(payload)
         value=self.appearance_rows.get(key)
         if value is None and cached_only:return None
         space=native_descriptor_space(self.session,SFACE_MODEL_NAME)
@@ -886,11 +955,9 @@ class NativeFamilySensors:
         index=getattr(self,'recorded_motion_index',None)
         binding=getattr(self,'recorded_motion_bindings',{}).get(demand.source_index)
         if index is None or binding is None:return NativeMotionSupply(demand,None)
-        receipt=json.loads(binding)
         if self.session.closed:raise ValueError('recorded motion cannot reuse a closed session')
         self.session.budget.check()
-        if tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(demand.source_index):
-            raise ValueError('recorded motion source changed after request binding')
+        current_identity=self.session._assert_source_identity(demand.source_index)
         names=('nanodet_people','rtmpose_body7',native_head_analysis_spec(demand.analysis_roll)[0])
         for name in names:self.session._assert_model_assets(name)
         variant=native_analysis_variant(dict(
@@ -898,37 +965,35 @@ class NativeFamilySensors:
             model_adapter_fingerprints=tuple((name,self.session.model_adapters[name]) for name in names),
             person_ownership_policy_sha256=ownership_policy_fingerprint()))
         clock=self.session.domain.clocks_by_request[demand.source_index]
-        found=index.lookup(source=demand.source_index,native=demand.native_frame_index,
-            clock=family.digest(clock.to_dict()),identity=receipt['recorded_file_identity'],
-            analysis_variant_sha256=variant)
-        # A later one-pass completion has live-device parents, while the
-        # older input archive may have an earlier mount identity. Reuse only
-        # an explicitly bound additional manifest for a genuinely ABSENT raw
-        # address. Never replace measured failures, conflicting rows or an
-        # existing bad actor result with a more favourable capture.
         extra=getattr(self,'recorded_motion_additional_bindings',{}).get(demand.source_index)
-        if found['raw'] is None and found['state']=='MISSING' and extra is not None:
-            alternative=json.loads(extra)
-            if tuple(alternative['current_file_identity'])!=self.session._assert_source_identity(demand.source_index):
-                raise ValueError('additional native input source changed after request binding')
-            added=index.lookup(source=demand.source_index,native=demand.native_frame_index,
-                clock=family.digest(clock.to_dict()),identity=alternative['recorded_file_identity'],
+        supplies=[]
+        for alias in (binding,) if extra is None else (binding,extra):
+            receipt=json.loads(alias)
+            if tuple(receipt['current_file_identity'])!=current_identity:
+                raise ValueError('recorded motion source changed after request binding')
+            found=index.lookup(source=demand.source_index,native=demand.native_frame_index,
+                clock=family.digest(clock.to_dict()),identity=receipt['recorded_file_identity'],
                 analysis_variant_sha256=variant)
-            found=added;receipt=alternative;binding=extra
-        raw=None if found['raw'] is None else restore_native_row(found['raw'])
-        appearance=None
-        if raw is not None and demand.require_appearance:
-            appearance=self.appearance_rows.get(family.digest(raw.to_dict()),found['appearance'])
-            if appearance is not None:
-                space=native_descriptor_space(self.session,SFACE_MODEL_NAME)
-                actual=validate_recorded_appearance(found['raw'],appearance)
-                if actual!=space:
-                    # Keep the actual raw heads, but never mix descriptor spaces.
-                    appearance=None;found=dict(found,state='APPEARANCE_SPACE_MISMATCH')
-        supply=NativeMotionSupply(demand,raw,appearance,found['state'],binding)
-        if demand.require_member_features and raw is not None and raw.native_pixel_sha256 is not None:
-            supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
-        return supply
+            raw=None if found['raw'] is None else restore_native_row(found['raw'])
+            appearance=None
+            if raw is not None and demand.require_appearance:
+                cached=self.appearance_rows.get(family.digest(raw.to_dict()))
+                appearance=found['appearance'] if cached is None else cached
+                if cached is not None and found['appearance'] is not None and family.digest(cached)!=family.digest(found['appearance']):
+                    found=dict(found,state='CONFLICTING_FEATURE_RECORDS')
+                if appearance is not None:
+                    space=native_descriptor_space(self.session,SFACE_MODEL_NAME)
+                    actual=validate_recorded_appearance(found['raw'],appearance)
+                    if actual!=space:
+                        # Keep raw visibility without borrowing another space.
+                        appearance=None
+                        if found['state']!='CONFLICTING_FEATURE_RECORDS':
+                            found=dict(found,state='APPEARANCE_SPACE_MISMATCH')
+            supply=NativeMotionSupply(demand,raw,appearance,found['state'],alias)
+            if demand.require_member_features and raw is not None and raw.native_pixel_sha256 is not None:
+                supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
+            supplies.append(supply)
+        return _census_native_motion_supplies(demand,supplies,current_identity)
 
     def _joint_motion_supply(self,demand,live_raw):
         """Census live and archived facts; neither may hide adverse evidence.
@@ -937,7 +1002,6 @@ class NativeFamilySensors:
         comparison. The selected archive and every feature keep their exact
         original parents. Distinct declared model variants are not conflicts.
         """
-        import json
         recorded=self._recorded_motion_supply(demand)
         if live_raw is None:
             return recorded
@@ -951,32 +1015,15 @@ class NativeFamilySensors:
             live=replace(live,member_features=self.member_features_at(live,cached_only=True))
         if recorded.observation is None:
             return live
-        before=json.loads(json.dumps(recorded.observation.to_dict(),sort_keys=True,allow_nan=False))
-        after=json.loads(json.dumps(live_raw.to_dict(),sort_keys=True,allow_nan=False))
-        same_parent=before['source_file_identity']==after['source_file_identity']
-        if not same_parent:
-            receipt=(None if recorded.source_equivalence_json is None else
-                json.loads(recorded.source_equivalence_json))
-            if (receipt is None or receipt.get('state')!='CONTENT_VERIFIED_DEVICE_REMOUNT'
-                    or receipt.get('recorded_file_identity')!=before['source_file_identity']
-                    or receipt.get('current_file_identity')!=after['source_file_identity']
-                    or before['source_file_identity'][1:]!=after['source_file_identity'][1:]):
-                return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
-            after=dict(after,source_file_identity=before['source_file_identity'])
-        if before!=after:
-            return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
-        # A feature measured on a different raw parent is never copied or
-        # relabelled just because the underlying source file is equivalent.
-        if not same_parent:
-            return recorded
-        for field in ('appearance','member_features'):
-            a,b=getattr(recorded,field),getattr(live,field)
-            if a is not None and b is not None and family.digest(a)!=family.digest(b):
-                return replace(recorded,appearance=None,member_features=None,
-                    recorded_input_state='CONFLICTING_FEATURE_RECORDS')
-        return replace(recorded,
-            appearance=recorded.appearance if recorded.appearance is not None else live.appearance,
-            member_features=recorded.member_features if recorded.member_features is not None else live.member_features)
+        current_identity=self.session._assert_source_identity(demand.source_index)
+        result=_census_native_motion_supplies(demand,(recorded,live),current_identity)
+        if result.state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS'):
+            return result
+        if recorded.observation.source_file_identity==live_raw.source_file_identity:
+            return replace(recorded,
+                appearance=recorded.appearance if recorded.appearance is not None else live.appearance,
+                member_features=recorded.member_features if recorded.member_features is not None else live.member_features)
+        return result
 
     def _complete_motion_appearance(self,supply):
         """Complete an archived raw parent's appearance on verified live pixels."""
