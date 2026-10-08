@@ -406,6 +406,111 @@ def fit_review_temporal_camera_corridor(desired_keys,*,observed_points_by_frame,
         complete_support_certified=not unknown,actor_identity_certified=False,quality_approved=False)
 
 
+def fit_review_fixed_context_face_key(source_head,target_head,*,required_visible_points=()):
+    """Fit an actual selected face to an immutable neighbouring output face.
+
+    Five observed anatomical landmarks are required. A detector box is not a
+    substitute for facial size. The neighbour never moves to make this fit
+    look better, and an infeasible crop remains an infeasible alternative.
+    """
+    frames=[]
+    for head in (source_head,target_head):
+        points=None if head is None else head.get('landmarks_xy')
+        if points is None:return None
+        if (not isinstance(points,(tuple,list)) or len(points)!=5
+                or any(len(p)!=2 or any(type(v) not in (int,float) or not math.isfinite(v)
+                    or not 0<=v<=1 for v in p) for p in points)):
+            raise ValueError('fixed context fit requires actual five-point facial anatomy')
+        frames.append({16+i:tuple(p) for i,p in enumerate(points)})
+    aspect=np.asarray((1.,9/16));a,b=[np.asarray(tuple(row.values()))*aspect for row in frames]
+    ac,bc=a.mean(0),b.mean(0);aa,bb=a-ac,b-bc
+    ea,eb=float(np.mean(np.sum(aa*aa,axis=1))),float(np.mean(np.sum(bb*bb,axis=1)))
+    if min(ea,eb)<=1e-12:return None
+    # The plural anatomical fitter offers approximate legal alternatives.
+    # A fixed neighbour has a stronger contract: solve its requested facial
+    # scale and centre exactly, or decline this endpoint. Clamping an
+    # impossible 0.4x/3x zoom to 1x/2x is NOT a successful context match.
+    zoom=math.sqrt(eb/ea)
+    if not 1.-1e-9<=zoom<=2.+1e-9:return None
+    zoom=max(1.,min(2.,zoom))
+    visible=tuple(required_visible_points)
+    if any(len(p)!=2 or any(type(v) not in (int,float) or not math.isfinite(v)
+            or not 0<=v<=1 for v in p) for p in visible):
+        raise ValueError('fixed context support must be observed inside the source raster')
+    dot=float(np.sum(aa*bb));cross=float(np.sum(aa[:,0]*bb[:,1]-aa[:,1]*bb[:,0]))
+    angle=max(-1.6,min(1.6,math.degrees(math.atan2(cross,dot))))
+    canvas=np.asarray((.5,.5))*aspect;options=[]
+    for roll in sorted({0.,angle}):
+        c,s=math.cos(math.radians(roll)),math.sin(math.radians(roll))
+        rotation=np.asarray(((c,-s),(s,c)))
+        center=((ac-canvas)@rotation.T+canvas-(bc-canvas)/zoom)/aspect
+        try:key=EditorialTransformKeyframe(0.,zoom,float(center[0]),float(center[1]),roll)
+        except ValueError:continue
+        if any(not all(-1e-9<=v<=1+1e-9 for v in project_review_editorial_point(p,key)) for p in visible):continue
+        projected=np.asarray([project_review_editorial_point(p,key) for p in frames[0].values()])*aspect
+        options.append((float(np.sum((projected-b)**2)),key))
+    return min(options,key=lambda row:row[0])[1] if options else None
+
+
+def realize_review_contextual_focal_shot(*,entry_key,exit_key,support,fps):
+    """Author BOTH fixed incident cameras, not only the cut in the middle.
+
+    The smooth bounded path retains native subject motion. Known per-instant
+    support is checked throughout the hold; a corridor may adjust the interior
+    but neither locked incident. It never substitutes a different actor or
+    silently releases an endpoint to a neutral wide shot.
+    """
+    n=len(support)
+    if (not isinstance(entry_key,EditorialTransformKeyframe)
+            or not isinstance(exit_key,EditorialTransformKeyframe)
+            or not 2<=n<=160 or type(fps) not in (int,float)
+            or not math.isfinite(fps) or fps<=0):
+        raise ValueError('contextual focal shot needs two actual endpoint cameras and a finite hold')
+    for points in support:
+        if points is not None and (not isinstance(points,(list,tuple)) or len(points)>32
+                or any(len(p)!=2 or any(type(v) not in (int,float) or not math.isfinite(v)
+                    or not 0<=v<=1 for v in p) for p in points)):
+            raise ValueError('contextual focal support must belong to its observed instant')
+    desired=[]
+    try:
+        for i in range(n):
+            u=i/(n-1);w=u*u*(3-2*u)
+            desired.append(EditorialTransformKeyframe(i/fps,
+                math.exp((1-w)*math.log(entry_key.zoom)+w*math.log(exit_key.zoom)),
+                (1-w)*entry_key.center_x+w*exit_key.center_x,
+                (1-w)*entry_key.center_y+w*exit_key.center_y,
+                (1-w)*entry_key.roll_degrees+w*exit_key.roll_degrees))
+        # Preserve the exact authoring objects at both incidents, including
+        # floating-point endpoint values. This is also the encoder input.
+        desired[0]=replace(entry_key,time_seconds=0.)
+        desired[-1]=replace(exit_key,time_seconds=(n-1)/fps)
+        legal=all(all(-1e-9<=v<=1+1e-9 for v in project_review_editorial_point(p,k))
+            for k,points in zip(desired,support) for p in (points or ()))
+        track=EditorialTransformTrack(tuple(desired),reason='both_incident_locked_focal_camera') if legal else None
+    except ValueError:
+        return None,dict(state='UNREALIZABLE',reason='endpoint_interpolation_camera_integrity',quality_approved=False)
+    if track is None:
+        track,receipt=fit_review_temporal_camera_corridor(desired,observed_points_by_frame=support,
+            locked_indices=(0,n-1),fps=fps)
+        if track is None:return None,dict(receipt,state='UNREALIZABLE')
+    else:
+        receipt=dict(selected_camera_path_family='smooth_both_incident_interpolation',
+            unmeasured_support_frame_indices=[i for i,p in enumerate(support) if not p],
+            complete_support_certified=all(bool(p) for p in support))
+    keys=track.keyframes
+    if keys[0]!=desired[0] or keys[-1]!=desired[-1]:
+        raise ValueError('contextual focal camera changed a locked incident')
+    vectors=[np.asarray((k.center_x,k.center_y*9/16,math.log(k.zoom)/math.sqrt(2),
+        k.roll_degrees*.01)) for k in keys]
+    receipt=dict(receipt,contract='both_incident_locked_focal_shot_v1',state='REALIZED',frames=n,
+        locked_frame_indices=[0,n-1],actual_camera=asdict(track),
+        maximum_camera_vector_step=max(float(np.linalg.norm(b-a)) for a,b in zip(vectors,vectors[1:])),
+        maximum_camera_vector_second_difference=max((float(np.linalg.norm(c-2*b+a))
+            for a,b,c in zip(vectors,vectors[1:],vectors[2:])),default=0.),
+        actor_path_unchanged=True,camera_refit_after_selection_permitted=False,quality_approved=False)
+    return track,receipt
+
+
 def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,right_joint_points,
         requested_joints=(0,1,2,3,4,5),left_required_visible_points=(),right_required_visible_points=(),
         maximum_candidates=8,maximum_zoom=2.,target_centers=((.5,.5),(.42,.45),(.5,.45),(.58,.45),

@@ -11,7 +11,67 @@ from crosscut.render import EditorialTransformKeyframe
 from crosscut.group_review_projected_action import measure_review_partial_screen_trajectory
 from crosscut.group_review_two_shot_camera import realize_review_focal_pair
 from crosscut.group_review_two_shot_camera import (measure_review_focal_incident,
-    compare_review_focal_incident_inventory)
+    compare_review_focal_incident_inventory,fit_review_fixed_context_face_key,
+    realize_review_contextual_focal_shot)
+
+
+def test_context_face_fit_uses_landmarks_and_does_not_move_the_neighbour():
+    points=((.42,.40),(.48,.40),(.45,.43),(.43,.46),(.47,.46))
+    source=dict(landmarks_xy=points)
+    expected=EditorialTransformKeyframe(0.,1.4,.46,.47)
+    target=dict(landmarks_xy=tuple(project_review_editorial_point(p,expected) for p in points))
+    original=dict(target)
+    key=fit_review_fixed_context_face_key(source,target,required_visible_points=points)
+    assert key is not None and target==original
+    for a,b in zip(points,target['landmarks_xy']):
+        assert project_review_editorial_point(a,key)==pytest.approx(b,abs=1e-6)
+    assert fit_review_fixed_context_face_key(dict(center=(.4,.4),height=.2),target) is None
+
+
+def test_contextual_focal_hold_preserves_both_actual_incident_cameras():
+    entry=EditorialTransformKeyframe(0.,1.25,.48,.48)
+    exit=EditorialTransformKeyframe(0.,1.6,.53,.49)
+    points=((.4,.4),(.6,.5),(.5,.6))
+    track,receipt=realize_review_contextual_focal_shot(entry_key=entry,exit_key=exit,
+        support=[points]*30,fps=30.)
+    assert track.keyframes[0]==entry
+    assert track.keyframes[-1]==replace(exit,time_seconds=29/30)
+    assert receipt['locked_frame_indices']==[0,29]
+    assert len(track.keyframes)==30 and not receipt['camera_refit_after_selection_permitted']
+    assert all(all(0<=v<=1 for v in project_review_editorial_point(p,k))
+        for k in track.keyframes for p in points)
+    assert not receipt['quality_approved']
+
+
+@pytest.mark.parametrize('scale',(.4,2.5))
+def test_fixed_context_never_calls_a_clamped_impossible_face_size_matched(scale):
+    points=((.47,.40),(.53,.40),(.5,.43),(.48,.46),(.52,.46))
+    source=dict(landmarks_xy=points)
+    target=dict(landmarks_xy=tuple((.5+(x-.5)*scale,.43+(y-.43)*scale) for x,y in points))
+    assert fit_review_fixed_context_face_key(source,target) is None
+
+
+def test_fixed_context_rejects_impossible_pan_without_moving_the_target():
+    points=((.27,.40),(.33,.40),(.3,.43),(.28,.46),(.32,.46))
+    source=dict(landmarks_xy=points)
+    target=dict(landmarks_xy=tuple((x+.5,y) for x,y in points))
+    assert fit_review_fixed_context_face_key(source,target) is None
+
+
+def test_contextual_focal_cannot_hide_a_bad_locked_return_with_zoom_release():
+    entry=EditorialTransformKeyframe(0.,1.)
+    exit=EditorialTransformKeyframe(0.,2.)
+    track,receipt=realize_review_contextual_focal_shot(entry_key=entry,exit_key=exit,
+        support=[((.5,.5),)]*9+[((.05,.05),)],fps=30.)
+    assert track is None and receipt['state']=='UNREALIZABLE'
+
+
+def test_contextual_focal_missing_hold_observations_remain_unobserved():
+    key=EditorialTransformKeyframe(0.,1.4)
+    track,receipt=realize_review_contextual_focal_shot(entry_key=key,exit_key=key,
+        support=[((.5,.5),),None,((.5,.5),)],fps=30.)
+    assert track is not None and receipt['unmeasured_support_frame_indices']==[1]
+    assert not receipt['complete_support_certified']
 
 
 def incident_fixture():
