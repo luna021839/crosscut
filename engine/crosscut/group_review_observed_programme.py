@@ -102,13 +102,16 @@ def project_focal_observation(row, camera):
 
 def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, roles,
         lookup, native_at, source_native_cuts, pose_model_identity, fps,
-        cut_radius=2, phases=(-2, 0, 2), budget=ObservedProgrammeBudget()):
+        cut_radius=2, phases=(-2, 0, 2), budget=ObservedProgrammeBudget(),
+        boundary_cameras=None):
     """Select one finite observed programme, leaving unknown terms unknown.
 
     ``lookup(source,tick,phase,role)`` must be cache-only, source/role frozen.
     Native ordinals must come from the declared clock, not nearby-frame repair.
     Missing anatomy keeps the fixed six-joint upper cost in every comparison.
     Entry/return are NOT declared pose matches; the caller owns their review.
+    An optional retained first/last camera is frozen before selection and used
+    in every complete grid, never refitted after the chosen programme returns.
     """
     if (type(first) is not int or type(end) is not int or not 0 <= first < end
             or end-first > 1200 or type(cut_radius) is not int or not 0 <= cut_radius <= 3
@@ -128,6 +131,20 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
     for cuts in source_native_cuts.values():
         if tuple(cuts) != tuple(sorted(set(cuts))) or any(type(n) is not int or n < 0 for n in cuts):
             raise ValueError('observed programme native cuts must be exact ordered ordinals')
+    if boundary_cameras is None:
+        boundary_cameras = {}
+    if type(boundary_cameras) is not dict or set(boundary_cameras) - {'first', 'last'}:
+        raise ValueError('retained boundary cameras must name only first and last')
+    retained = {}
+    for name, value in boundary_cameras.items():
+        if (not isinstance(value, (tuple, list)) or len(value) != 4
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in value)):
+            raise ValueError('retained boundary camera must be a finite actual raster crop')
+        z, x, y, roll = value
+        if not (1 <= z <= budget.maximum_zoom and roll == 0
+                and all(-1e-9 <= v <= 1+1e-9 for v in (x-.5/z, x+.5/z, y-.5/z, y+.5/z))):
+            raise ValueError('retained boundary camera exceeds its declared raster domain')
+        retained[name] = tuple(float(v) for v in value)
     started = time.monotonic()
     deadline = started+budget.maximum_seconds
     measured = unknown = attempted = 0
@@ -158,7 +175,8 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
             start = row(source, first, phase, roles[0])
             if start is not None:
                 beam.append(dict(score=.05*(budget.maximum_zoom-single_focal_camera(start, budget.maximum_zoom)[0]),
-                    source=source, phase=phase, first=first, start=start, complete=[], seams=[]))
+                    source=source, phase=phase, first=first, start=start,
+                    start_camera=retained.get('first'), complete=[], seams=[]))
     for layer, center in enumerate(cut_centers):
         next_beam = []
         for state in beam:
@@ -219,7 +237,7 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
             continue
         clip = dict(first=state['first'], end=end, source_index=state['source'], phase_native_frames=state['phase'],
             start_observation=state['start'], end_observation=last, start_camera=state['start_camera'],
-            end_camera=single_focal_camera(last, budget.maximum_zoom))
+            end_camera=retained.get('last') or single_focal_camera(last, budget.maximum_zoom))
         clips = [*state['complete'], clip]
         cameras = {}
         legal = True
@@ -247,4 +265,5 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
         cameras=cameras, score=score, measured_incidents=measured, unknown_alternatives=unknown,
         attempted_incidents=attempted, beam_width=budget.beam_width, completion_retries=0,
         new_model_calls=0, camera_refit_after_selection=False, normal_app_admitted=False,
+        retained_boundary_cameras={k:list(v) for k,v in retained.items()},
         full_hold_action_certified=False, entry_return_pose_certified=False, professional_quality_approved=False)

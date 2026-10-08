@@ -50,6 +50,28 @@ def test_full_chosen_native_camera_grid_survives_without_postselection_refit():
         assert y-.5/z >= -1e-9 and y+.5/z <= 1+1e-9
 
 
+def test_retained_exterior_cameras_are_frozen_before_constructing_the_full_grid():
+    cameras = {'first':[1.4,.42,.45,0.], 'last':[1.2,.52,.48,0.]}
+    result = select(boundary_cameras=cameras)
+    assert result['cameras'][10]['camera'] == cameras['first']
+    assert result['cameras'][79]['camera'] == cameras['last']
+    assert result['camera_refit_after_selection'] is False
+    assert result['entry_return_pose_certified'] is False
+    cameras['first'][0] = 2.
+    assert result['retained_boundary_cameras']['first'][0] == 1.4
+    assert result['clips'][0]['start_camera'][0] == 1.4
+
+
+@pytest.mark.parametrize('cameras',[
+    {'middle':[1.,.5,.5,0.]}, {'first':[1.,.1,.5,0.]},
+    {'last':[2.1,.5,.5,0.]}, {'first':[1.,.5,.5,float('nan')]},
+    {'last':[1.,.5,.5,True]},
+])
+def test_retained_boundary_cameras_cannot_hide_an_invalid_crop_or_new_zoom_capacity(cameras):
+    with pytest.raises(ValueError, match='retained boundary'):
+        select(boundary_cameras=cameras)
+
+
 def test_missing_wrists_and_body_keep_fixed_upper_cost_not_a_match():
     result = select()
     for seam in result['seams']:
