@@ -12,7 +12,53 @@ from crosscut.group_review_projected_action import measure_review_partial_screen
 from crosscut.group_review_two_shot_camera import realize_review_focal_pair
 from crosscut.group_review_two_shot_camera import (measure_review_focal_incident,
     compare_review_focal_incident_inventory,fit_review_fixed_context_face_key,
-    realize_review_contextual_focal_shot)
+    realize_review_contextual_focal_shot,shared_focal_extent_domain)
+
+
+def test_shared_camera_domain_finds_legal_larger_extent_without_raising_zoom_cap():
+    domain=shared_focal_extent_domain(centers=((.5,.18),(.5,.385)),extents=(.266,.257),
+        maximum_zoom=2.4,minimum_extent=.31)
+    assert domain is not None and domain['extent']>.31
+    assert domain['extent']/.266<=2.4 and domain['extent']/.257<=2.4
+    assert all(a<=b+1e-10 for a,b in zip(domain['lower'],domain['upper']))
+    assert not domain['anatomy_visibility_certified'] and not domain['quality_approved']
+
+
+def test_shared_camera_domain_preserves_already_feasible_extent():
+    domain=shared_focal_extent_domain(centers=((.45,.4),(.5,.4)),extents=(.2,.2),
+        maximum_zoom=2.,minimum_extent=.27)
+    assert domain['extent']==pytest.approx(.27)
+    assert not domain['extent_increased_to_make_shared_position_feasible']
+
+
+def test_shared_camera_domain_never_buys_a_match_by_shrinking_or_raising_the_cap():
+    assert shared_focal_extent_domain(centers=((.5,.1),(.5,.9)),extents=(.2,.2),
+        maximum_zoom=2.,minimum_extent=.2) is None
+    assert shared_focal_extent_domain(centers=((.5,.5),(.5,.5)),extents=(.1,.4),
+        maximum_zoom=2.,minimum_extent=.1) is None
+
+
+@pytest.mark.parametrize('bad', (True,float('nan'),-.1))
+def test_shared_camera_domain_rejects_invalid_observations(bad):
+    with pytest.raises(ValueError):
+        shared_focal_extent_domain(centers=((.5,bad),(.5,.4)),extents=(.2,.2),maximum_zoom=2.)
+
+
+def test_normal_coupled_fitter_reframes_to_a_feasible_common_position():
+    pattern=((-0.03,-.02),(.03,-.02),(0.,0.),(-.02,.025),(.02,.025))
+    def head(y):
+        return dict(center=(.5,y),width=.1,height=.15,
+            landmarks_xy=tuple((.5+x,y+v) for x,v in pattern))
+    options=fit_review_coupled_boundary_keys(left_head=head(.18),right_head=head(.385),
+        left_joint_points={},right_joint_points={},target_centers=((.5,.45),),
+        camera_fit_bases=('face_anchor',),maximum_zoom=2.)
+    assert options
+    a,b,receipt=options[0]
+    assert receipt['projected_head_center_error']<1e-8
+    assert receipt['log_face_scale_error']<1e-8
+    assert 1<=a.zoom<=2 and 1<=b.zoom<=2
+    assert receipt['missing_joint_requests']==dict(left=list(range(6)),right=list(range(6)))
+    assert not receipt['quality_approved']
 
 
 def test_context_face_fit_uses_landmarks_and_does_not_move_the_neighbour():

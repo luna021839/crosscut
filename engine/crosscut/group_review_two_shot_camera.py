@@ -544,6 +544,50 @@ def realize_review_contextual_focal_shot(*,entry_key,exit_key,support,fps):
     return track,receipt
 
 
+def shared_focal_extent_domain(*, centers, extents, maximum_zoom, minimum_extent=0.):
+    """Legal common extent/point domain for two zero-roll crop cameras.
+
+    The unit canvas cannot shrink. A shared point is feasible only when the
+    two crop intervals intersect on BOTH axes. Solve the smallest common
+    extent before rejecting a target: trying one preferred small zoom is not
+    a proof that no legal camera exists. Extent is a caller-owned measurement
+    (anatomical RMS in the normal fitter), not a physical-head certificate.
+    Required visible anatomy is still checked by the downstream camera fit.
+    """
+    def finite_number(value):
+        return (isinstance(value,(int,float,np.floating)) and not isinstance(value,(bool,np.bool_))
+            and math.isfinite(value))
+    if (not isinstance(centers,(list,tuple)) or len(centers)!=2
+            or any(not isinstance(c,(list,tuple)) or len(c)!=2
+                or any(not finite_number(v) or not 0<=v<=1 for v in c)
+                for c in centers)
+            or not isinstance(extents,(list,tuple)) or len(extents)!=2
+            or any(not finite_number(v) or v<=0 for v in extents)
+            or not finite_number(maximum_zoom) or maximum_zoom<1
+            or not finite_number(minimum_extent) or minimum_extent<0):
+        raise ValueError('shared focal domain needs two finite observed points/extents and a declared zoom cap')
+    centers=tuple(tuple(float(v) for v in c) for c in centers)
+    extents=tuple(float(v) for v in extents)
+    floor=max(*extents,minimum_extent)
+    ceiling=maximum_zoom*min(extents)
+    # For every lower_i <= upper_j: 1 <= H*((1-c_i)/e_i+c_j/e_j).
+    # These constraints also include each individual no-shrinking canvas.
+    for axis in (0,1):
+        for i in (0,1):
+            for j in (0,1):
+                slope=(1-centers[i][axis])/extents[i]+centers[j][axis]/extents[j]
+                if slope<=0:return None
+                floor=max(floor,1/slope)
+    if floor>ceiling+1e-12:return None
+    extent=min(floor,ceiling)
+    lower=tuple(max(1+(c[axis]-1)*extent/e for c,e in zip(centers,extents)) for axis in (0,1))
+    upper=tuple(min(c[axis]*extent/e for c,e in zip(centers,extents)) for axis in (0,1))
+    if any(a>b+1e-10 for a,b in zip(lower,upper)):return None
+    return dict(extent=extent,lower=lower,upper=upper,maximum_zoom=maximum_zoom,
+        extent_increased_to_make_shared_position_feasible=extent>minimum_extent+1e-12,
+        anatomy_visibility_certified=False,quality_approved=False)
+
+
 def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,right_joint_points,
         requested_joints=(0,1,2,3,4,5),left_required_visible_points=(),right_required_visible_points=(),
         maximum_candidates=8,maximum_zoom=2.,target_centers=((.5,.5),(.42,.45),(.5,.45),(.58,.45),
@@ -604,9 +648,18 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
     # Target extent is derived from BOTH actual views, never a single fixed
     # context whose scale/position may be impossible for the other camera.
     height=min(maximum_zoom*min(size_a,size_b),1.35*max(size_a,size_b))
+    shared=shared_focal_extent_domain(centers=(center_a,center_b),extents=(size_a,size_b),
+        maximum_zoom=maximum_zoom,minimum_extent=height)
+    # An impossible shared domain does not acquire a larger zoom allowance.
+    # Approximate perspective/body alternatives retain their existing bounded
+    # fitter; feasible shared targets use the analytically derived legal floor.
+    if shared is not None:height=shared['extent']
     width=height*math.sqrt(left_head['width']/left_head['height']*right_head['width']/right_head['height'])
     options=[];seen=set()
     for destination in target_centers:
+        if shared is not None:
+            destination=tuple(max(lo,min(hi,value)) for value,lo,hi in
+                zip(destination,shared['lower'],shared['upper']))
         if use_landmarks:
             target={16:destination}
             for j in face_indices:
@@ -650,6 +703,7 @@ def fit_review_coupled_boundary_keys(*,left_head,right_head,left_joint_points,ri
         measured_common_joint_indices=list(common),missing_joint_requests=missing,
         complete_requested_action_basis=not any(missing.values()),camera_pair_count=len(options),
         independently_declared_common_target_centers=[list(c) for c in target_centers],
+        shared_focal_extent_domain=shared,
         shared_target_must_be_dead_center=False,independently_declared_camera_fit_bases=list(camera_fit_bases),
         maximum_geometric_camera_pairs=len(target_centers)*len(camera_fit_bases)*maximum_candidates**2,
         body_requests_removed_to_fit_face=False,
