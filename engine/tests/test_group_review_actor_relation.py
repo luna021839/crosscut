@@ -1,6 +1,6 @@
 from copy import deepcopy
-from types import SimpleNamespace
 import pytest
+from crosscut.group_review_camera_repair import FramingDescriptor
 from crosscut.group_review_actor_relation import (freeze_review_actor_relation_duty,
     original_actor_relation_request,evaluate_review_actor_relation)
 
@@ -8,7 +8,7 @@ from crosscut.group_review_actor_relation import (freeze_review_actor_relation_d
 def view(t,vector):
     return dict(row=dict(output_tick=t,native_observation=dict(request_source_index=2,native_frame_index=t,
         source_clock_identity='clock',source_file_identity=[1,2,3,4,5]),projection=dict(camera_sha256='camera')),
-        descriptor=SimpleNamespace(frame_local_head_id=0),vector=vector)
+        descriptor=FramingDescriptor((.5,.35),.2,.1,None,0,False),vector=vector,native_camera_unit_index=0)
 
 
 def duty():

@@ -18,7 +18,10 @@ import stat
 from statistics import median
 import tempfile
 from time import monotonic
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .group_joint_bundle_metadata import GroupNativeMotionProduction
 
 from numpy.typing import NDArray
 import numpy as np
@@ -20437,6 +20440,7 @@ class _GroupRenderCandidateBundle:
     phrase_times: tuple[float,...] | None = None
     normal_interval_review: Mapping[str, Any] | None = None
     performer_family_review: Mapping[str, Any] | None = None
+    native_motion_production: GroupNativeMotionProduction | None = None
 
     def __post_init__(self):
         from .visual_boundary_repair import _freeze_audit_value
@@ -20460,6 +20464,8 @@ class _GroupRenderCandidateBundle:
         from .visual_boundary_repair import _thaw_audit_value
         from .group_scene_native_storage import expand_native_evidence
         return {
+            "native_motion_production": (None if self.native_motion_production is None
+                else self.native_motion_production.to_dict()),
             "performer_family_review": (
                 expand_native_evidence(_thaw_audit_value(self.performer_family_review))
                 if self.performer_family_review is not None else None),
@@ -22215,8 +22221,32 @@ def _derive_complete_group_candidate(
     boundary_descriptor_cache: BoundaryDescriptorCache | None = None,
     splice_feasibility_graph: LazySpliceFeasibilityGraph | None = None,
     boundary_search_budget: _BoundarySearchBudget | None = None,
+    native_motion_production: GroupNativeMotionProduction | None = None,
+    native_motion_reporter=None,
+    native_motion_warnings=None,
 ) -> _GroupRenderCandidateBundle:
     """Derive a renderer-ready plan without sharing mutable selected state."""
+
+    if native_motion_production is not None:
+        if (native_motion_reporter is None or native_motion_warnings is None
+                or visual_timeline_override is not None or precomputed_boundary_repairs is not None
+                or materialized.visual_plan != native_motion_production.visual_timeline):
+            raise ValueError('normal native producer needs its corresponding materialized timeline without legacy repairs')
+        if (type(materialized.candidate_index) is not int or materialized.candidate_index<0
+                or type(materialized.review_rank) is not int or materialized.review_rank<0
+                or not isinstance(materialized.cadence_profile,str) or not materialized.cadence_profile):
+            raise ValueError('normal native candidate needs its actual stream identity and rank')
+        bundle = _review_first_group_bundle(
+            timeline=native_motion_production.visual_timeline,request=request,
+            eligible_indices=eligible_indices,offsets=audio_offsets,timewarps=source_timewarps,
+            common_start=common_master_start,section_plan=section_plan,phrase_times=phrase_times,
+            output=output,reporter=native_motion_reporter,warnings=native_motion_warnings,
+            native_motion_production=native_motion_production)
+        # A singleton producer result may enter a finite normal candidate stream
+        # once. It is not candidate zero for every pre-existing visual candidate.
+        return replace(bundle,candidate_index=materialized.candidate_index,
+            review_rank=materialized.review_rank,cadence_profile=materialized.cadence_profile,
+            candidate_origin='normal_native_motion_program')
 
     local_sources = tuple(
         request.sources[index] for index in eligible_indices
@@ -27392,7 +27422,8 @@ def _build_member_camera_with_provider(*, dense_face_provider, direct_visual_sel
 
 def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, timewarps,
                                common_start, section_plan, phrase_times, output, reporter, warnings,
-                               realized_plan=None, realized_motion=None, shot_clock_context=None):
+                               realized_plan=None, realized_motion=None, shot_clock_context=None,
+                               native_motion_production: GroupNativeMotionProduction | None = None):
     """Retain a realized program, or construct the explicitly neutral baseline.
 
     A motion producer must supply its exact renderer and motion together. It
@@ -27400,6 +27431,20 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
     The normal bundle validator checks clocks, source order and renderer-bound
     motion before accepting the realized path; this is not a quality approval.
     """
+    if native_motion_production is not None:
+        from .group_joint_bundle_metadata import GroupNativeMotionProduction
+        if (not isinstance(native_motion_production,GroupNativeMotionProduction)
+                or realized_plan is not None or realized_motion is not None or shot_clock_context is not None
+                or timeline != native_motion_production.visual_timeline
+                or native_motion_production.source_domain.request_sources != request.sources
+                or native_motion_production.source_domain.eligible_indices != tuple(eligible_indices)
+                or native_motion_production.source_domain.audio_offsets != tuple(offsets)
+                or native_motion_production.source_domain.source_timewarps != tuple(timewarps)
+                or native_motion_production.state not in ('SELECTED_FOR_REVIEW','KEEP_ORIGINAL')):
+            raise ValueError('normal native production changed its selected source/timeline/domain')
+        realized_plan=native_motion_production.render_plan
+        realized_motion=native_motion_production.editorial_motion_plan
+        shot_clock_context=native_motion_production.shot_clock_context
     if (realized_plan is None)!=(realized_motion is None):
         raise ValueError('realized GROUP producer must supply both renderer and motion')
     width, height = output_size(request.aspect_ratio)
@@ -27444,7 +27489,7 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         visual_timeline=timeline, boundary_repairs=None, timeline_review=review, face_match_plan=None,
         group_transition_plan=transitions, boundary_affine_plan=None, editorial_motion_plan=motion,
         render_plan=plan, stage_edit_exact_shot_clock=clock, section_plan=section_plan,
-        phrase_times=phrase_inputs)
+        phrase_times=phrase_inputs,native_motion_production=native_motion_production)
     if realized_plan is not None:
         _validate_review_first_group_bundle(bundle,eligible_indices=eligible_indices,offsets=offsets,
             timewarps=timewarps,common_start=common_start,phrase_times=phrase_inputs,
@@ -27463,6 +27508,17 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     if bundle.section_plan is None or not math.isfinite(bundle.pre_render_score):
         raise ValueError('complete GROUP bundle requires finite review and section authority')
     plan, timeline = bundle.render_plan, bundle.visual_timeline
+    if bundle.native_motion_production is not None:
+        production=bundle.native_motion_production
+        from .group_joint_bundle_metadata import GroupNativeMotionProduction
+        if (not isinstance(production,GroupNativeMotionProduction)
+                or replace(plan,output=production.render_plan.output)!=production.render_plan
+                or timeline!=production.visual_timeline
+                or bundle.editorial_motion_plan!=production.editorial_motion_plan):
+            raise ValueError('selected native program was changed after motion/camera evaluation')
+        if shot_clock_context is None:shot_clock_context=production.shot_clock_context
+        elif shot_clock_context!=production.shot_clock_context:
+            raise ValueError('selected native program borrowed another local video clock context')
     authorized_clocks = {}
     if plan.authorized_shot_video_clocks:
         from .shot_video_clock import FrozenShotVideoClockContext, validate_authorized_shot_video_clocks
@@ -35661,65 +35717,70 @@ def analyze(
 
             review_first_singleton_bundle: _GroupRenderCandidateBundle | None = None
             if group_first is not None:
-                if review_first_verified_candidate_bundle is None:
+                if (review_first_verified_candidate_bundle is None
+                        and group_first.incumbent.native_motion_production is None):
                     proposal = group_first.run_optional("final_geometry_plan", complete_group_bundle)
                     if proposal is not None:
                         group_first.promote(proposal, plan=proposal.render_plan, authority=proposal.cadence_profile)
-                camera_bundle = group_first.run_optional(
-                    "joint_motion_camera_refinement",
-                    lambda: _review_first_group_motion_camera_bundle(group_first.incumbent,
-                        request=request,eligible_indices=eligible_indices,offsets=offsets,
-                        timewarps=eligible_timewarps,scene_cut_times=scene_cut_times,phrase_times=phrase_times),
-                    validate=lambda value: _validate_review_first_group_bundle(value,
-                        eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
-                        common_start=common_start,phrase_times=phrase_times) if value is not None else None)
-                if camera_bundle is not None:
-                    group_first.promote(camera_bundle,plan=camera_bundle.render_plan,
-                        authority=camera_bundle.cadence_profile)
-                context_bundle = group_first.run_optional(
-                    "two_sided_shot_context_framing",
-                    lambda: _review_first_group_shot_context_bundle(group_first.incumbent,
-                        # RenderPlan keeps request-domain source indices even
-                        # when acquisition/alignment excludes some sources.
-                        scene_cut_times=tuple(tuple(float(change['timestamp_seconds'])
-                            for change in payload['changes']) for payload in scene_payloads)),
-                    validate=lambda value: _validate_review_first_group_bundle(value,
-                        eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
-                        common_start=common_start,phrase_times=phrase_times) if value is not None else None)
-                if context_bundle is not None:
-                    group_first.promote(context_bundle,plan=context_bundle.render_plan,
-                        authority=context_bundle.cadence_profile)
-                # Look matching used to exist only in the legacy multi-candidate
-                # path. Apply it once to the actual retained final geometry;
-                # failure/cutoff must not discard that incumbent or rerun cuts.
-                if (group_first.incumbent.boundary_look_match is None
-                        and group_first.boundary_look_creation_allowed):
-                    look_bundle = group_first.run_optional(
-                        "boundary_look_match_render_admission",
-                        lambda: _review_first_group_boundary_look_bundle(
-                            group_first.incumbent,
-                            group_16x9_safe=source_aspects_are_editorial_safe),
-                        validate=lambda value: _validate_review_first_group_bundle(
-                            value, eligible_indices=eligible_indices, offsets=offsets,
-                            timewarps=eligible_timewarps, common_start=common_start,phrase_times=phrase_times))
-                    if look_bundle is not None:
-                        group_first.promote(look_bundle, plan=look_bundle.render_plan,
-                                            authority=look_bundle.cadence_profile)
-                # Normal performer owner composes retained face/motion/look.
-                # It never suppresses the established refinement families above.
-                # No experimental-pixel flag enables it, and no model download
-                # is permitted by its installed-only asset resolver.
-                # The model-free texture trial is an explicit diagnostic API,
-                # not an automatic precursor to subject-aware editing. Its
-                # full-movie encode consumed this same optional deadline even
-                # when the measured surrogate gain was negative. Keep normal
-                # request time for the actual owner and final render/QA.
-                from .group_performer_family_owner import attempt_performer_family
-                attempt_performer_family(controller=group_first, request=request,
-                    eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
-                    scene_cut_times=scene_cut_times, sync_scores=sync_scores,
-                    source_derivatives=source_derivative_diversity_result,
-                    archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
+                # Every camera/context/look operation for an exact native
+                # production was realized before selection. Do not spend its
+                # remaining request budget refitting a different program here.
+                if group_first.incumbent.native_motion_production is None:
+                    camera_bundle = group_first.run_optional(
+                        "joint_motion_camera_refinement",
+                        lambda: _review_first_group_motion_camera_bundle(group_first.incumbent,
+                            request=request,eligible_indices=eligible_indices,offsets=offsets,
+                            timewarps=eligible_timewarps,scene_cut_times=scene_cut_times,phrase_times=phrase_times),
+                        validate=lambda value: _validate_review_first_group_bundle(value,
+                            eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
+                            common_start=common_start,phrase_times=phrase_times) if value is not None else None)
+                    if camera_bundle is not None:
+                        group_first.promote(camera_bundle,plan=camera_bundle.render_plan,
+                            authority=camera_bundle.cadence_profile)
+                    context_bundle = group_first.run_optional(
+                        "two_sided_shot_context_framing",
+                        lambda: _review_first_group_shot_context_bundle(group_first.incumbent,
+                            # RenderPlan keeps request-domain source indices even
+                            # when acquisition/alignment excludes some sources.
+                            scene_cut_times=tuple(tuple(float(change['timestamp_seconds'])
+                                for change in payload['changes']) for payload in scene_payloads)),
+                        validate=lambda value: _validate_review_first_group_bundle(value,
+                            eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
+                            common_start=common_start,phrase_times=phrase_times) if value is not None else None)
+                    if context_bundle is not None:
+                        group_first.promote(context_bundle,plan=context_bundle.render_plan,
+                            authority=context_bundle.cadence_profile)
+                    # Look matching used to exist only in the legacy multi-candidate
+                    # path. Apply it once to the actual retained final geometry;
+                    # failure/cutoff must not discard that incumbent or rerun cuts.
+                    if (group_first.incumbent.boundary_look_match is None
+                            and group_first.boundary_look_creation_allowed):
+                        look_bundle = group_first.run_optional(
+                            "boundary_look_match_render_admission",
+                            lambda: _review_first_group_boundary_look_bundle(
+                                group_first.incumbent,
+                                group_16x9_safe=source_aspects_are_editorial_safe),
+                            validate=lambda value: _validate_review_first_group_bundle(
+                                value, eligible_indices=eligible_indices, offsets=offsets,
+                                timewarps=eligible_timewarps, common_start=common_start,phrase_times=phrase_times))
+                        if look_bundle is not None:
+                            group_first.promote(look_bundle, plan=look_bundle.render_plan,
+                                                authority=look_bundle.cadence_profile)
+                    # Normal performer owner composes retained face/motion/look.
+                    # It never suppresses the established refinement families above.
+                    # No experimental-pixel flag enables it, and no model download
+                    # is permitted by its installed-only asset resolver.
+                    # The model-free texture trial is an explicit diagnostic API,
+                    # not an automatic precursor to subject-aware editing. Its
+                    # full-movie encode consumed this same optional deadline even
+                    # when the measured surrogate gain was negative. Keep normal
+                    # request time for the actual owner and final render/QA.
+                    from .group_performer_family_owner import attempt_performer_family
+                    attempt_performer_family(controller=group_first, request=request,
+                        eligible_indices=eligible_indices, offsets=offsets, timewarps=eligible_timewarps,
+                        scene_cut_times=scene_cut_times, sync_scores=sync_scores,
+                        source_derivatives=source_derivative_diversity_result,
+                        archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
                 # Consume one owned bundle, including clock/review/geometry.
                 # A rejected proposal cannot leak any of its local metadata.
                 kept = review_first_singleton_bundle = group_first.incumbent

@@ -6,7 +6,8 @@ motion cost for an added cut. Added-match admission needs a separate contract.
 """
 from .group_review_camera_repair import effective_face_detail_pixels
 from .group_review_measured_features import pair_risk
-from .group_review_motion_seam import score_review_motion_seam,score_review_head_seam
+from .group_review_motion_seam import (score_review_motion_seam,score_review_head_seam,
+    review_native_window_continuous)
 
 
 def selected_pair_side(evidence,views,*,association_states,full_plan_identity):
@@ -38,11 +39,7 @@ def selected_pair_side(evidence,views,*,association_states,full_plan_identity):
 
 
 def _physical(sequence):
-    if len(sequence)<2 or any(v is None for v in sequence):return False
-    return len({(v['row']['native_observation']['request_source_index'],
-        v['row']['native_observation']['source_clock_identity'],
-        tuple(v['row']['native_observation']['source_file_identity']),
-        v['row']['projection']['camera_sha256']) for v in sequence})==1
+    return review_native_window_continuous(sequence)
 
 
 def selected_incident_measurements(evidence,views,*,actual_cut_ticks):

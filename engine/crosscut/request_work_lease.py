@@ -24,7 +24,7 @@ PHASES = ("original", "heads", "discovery", "selected_completion", "parent",
 RESOURCES = ("states", "edges", "dense_paths", "new_decodes", "model_calls", "model_loads",
              "pose_comparisons", "pose_evidence_bytes", "region_flow_feature_updates",
              "association_nodes", "association_edges", "workers", "ipc_bytes",
-             "identity_reads", "model_hash_bytes", "source_probes", "decoder_opens",
+             "identity_reads", "model_hash_bytes", "source_probes", "decoder_opens", "native_completion_passes",
              "journal_bytes")
 TERMINAL_BYTES = 4096
 PRIMITIVE_TERMINAL_IPC_BYTES = 2048
@@ -97,6 +97,8 @@ def bind_request_work_phase(port):
 class RequestWorkLease:
     def __init__(self, *, runtime, controller_identity, total_limits, allocations, journal_path):
         totals = _amounts(total_limits)
+        if totals.get("native_completion_passes",0)>1:
+            raise ValueError("one request may admit at most one fair native completion pass")
         if (not isinstance(controller_identity, str) or len(controller_identity) != 64
                 or any(c not in "0123456789abcdef" for c in controller_identity)
                 or set(allocations) != set(PHASES)

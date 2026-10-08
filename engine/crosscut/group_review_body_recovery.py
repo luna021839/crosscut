@@ -155,14 +155,26 @@ def plan_partial_review_body_windows(raws, *, requested_ticks, native_signatures
         if len(available)<2:
             unavailable.append(dict(ticks=[v[0] for v in run],reason='fewer_than_two_available_native_occurrences'))
             continue
-        pairs=[available[n] for n in sorted(available)]
-        try:
-            window=freeze_review_body_window([v[0] for v in pairs],
-                native_camera_unit=run[0][3][3],head_ids=[v[1] for v in pairs],
-                minimum_native_head_pixels=minimum_native_head_pixels)
-        except ValueError as error:
-            unavailable.append(dict(ticks=[v[0] for v in run],reason=str(error)));continue
-        windows.append(window)
+        # A continuous sampler can have a long detector gap. Partition actual
+        # available requests so an isolated early row cannot erase a later pair.
+        groups=[]
+        for native in sorted(available):
+            if not groups or native-groups[-1][-1]>12:groups.append([])
+            groups[-1].append(native)
+        for natives in groups:
+            group_ticks=[v[0] for v in run if v[3][4] in natives]
+            if len(natives)<2:
+                unavailable.append(dict(ticks=group_ticks,
+                    reason='fewer_than_two_available_native_occurrences_within_maximum_gap'))
+                continue
+            pairs=[available[n] for n in natives]
+            try:
+                window=freeze_review_body_window([v[0] for v in pairs],
+                    native_camera_unit=run[0][3][3],head_ids=[v[1] for v in pairs],
+                    minimum_native_head_pixels=minimum_native_head_pixels)
+            except ValueError as error:
+                unavailable.append(dict(ticks=group_ticks,reason=str(error)));continue
+            windows.append(window)
     return tuple(windows),dict(requested_slots=slots,physical_run_count=len(runs),
         available_native_window_count=len(windows),unavailable=unavailable,
         missing_or_ambiguous_slots=[v['tick'] for v in slots if v['state']!='AVAILABLE'],
@@ -197,6 +209,37 @@ def bind_review_body_receipts(bundle):
         if key in receipts:raise ValueError('two body receipts compete for one exact selected raster')
         receipts[key]=(window,receipt)
     return receipts
+
+
+def merge_review_body_receipts(*bundles):
+    """Return unambiguous receipts and explicit order-independent conflicts.
+
+    A competing frozen ROI cannot overwrite another one. Its exact physical
+    occurrence stays unresolved while unrelated valid observations remain usable.
+    Primary model observations are not changed by an auxiliary conflict.
+    """
+    if len(bundles)>32:
+        raise ValueError('body receipt merge exceeds its explicit bundle bound')
+    groups={}
+    for bundle in bundles:
+        for key,value in bind_review_body_receipts(bundle).items():
+            if key not in groups and len(groups)>=4096:
+                raise ValueError('body receipt merge exceeds its native occurrence bound')
+            identity=(value[0].identity,digest(value[1]))
+            groups.setdefault(key,{}).setdefault(identity,value)
+    merged={};conflicts=[]
+    for key,variants in sorted(groups.items(),key=lambda item:digest(item[0])):
+        if len(variants)==1:
+            merged[key]=next(iter(variants.values()))
+        else:
+            conflicts.append(dict(physical_occurrence_identity=digest(key),
+                request_source_index=key[0],native_frame_index=key[1],
+                head_fingerprint=key[-1],state='CONFLICTING_FROZEN_BODY_RECEIPTS',
+                variants=[dict(window_identity=w,receipt_sha256=r) for w,r in sorted(variants)]))
+    return merged,dict(contract='order_independent_body_receipt_merge_v1',
+        physical_occurrences=len(groups),usable_occurrences=len(merged),conflicts=conflicts,
+        conflicting_occurrences_promoted=False,primary_native_evidence_replaced=False,
+        quality_approved=False)
 
 
 def _primary_native_points(view):

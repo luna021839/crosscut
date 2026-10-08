@@ -52,7 +52,7 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
     observed_articulation=0;known_weight=0.;error=0.
     bounded_position=0.;bounded_velocity=0.;velocity_weight=0.
     bounded_direction=0.;direction_weight=0.;articulated_velocity_requests=0
-    nonstationary_windows=0
+    nonstationary_windows=0;direction_requests=[]
     for t,pa,pb in zip(ticks,a,b):
         for j in requested_joints:
             if j not in pa or j not in pb:continue
@@ -71,13 +71,23 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
             weight=weights[j];velocity_weight+=weight
             bounded_velocity+=weight*math.dist(av,bv)/(1.+an+bn)
             if j>=2:
-                articulated_velocity_requests+=1;direction_weight+=weight
-                nonstationary_windows+=max(an,bn)>.05
+                articulated_velocity_requests+=1
+                direction=None
                 if min(an,bn)>.05:
                     direction=(1-max(-1.,min(1.,sum(x*y for x,y in zip(av,bv))/(an*bn))))/2.
                     directions.append(direction);bounded_direction+=weight*direction
-                # A stationary side has no defined direction. The measured
-                # speed discrepancy remains in velocity; do not invent one.
+                    direction_weight+=weight;nonstationary_windows+=1
+                    applicability='BOTH_MOVING'
+                elif max(an,bn)<=.05:
+                    # Observed stillness is inapplicable, not a measured angle.
+                    direction_weight+=weight;applicability='BOTH_STATIONARY'
+                else:
+                    # One-sided motion has no comparable angle. Keep that
+                    # request unresolved in the fixed upper-cost denominator.
+                    applicability='ONE_SIDED_MOTION'
+                direction_requests.append(dict(tick=ticks[i],joint=j,
+                    applicability=applicability,direction_error=direction,
+                    left_speed=an,right_speed=bn))
     expected=len(ticks)*sum(weights.values());coverage=known_weight/expected
     expected_velocity=(len(ticks)-1)*sum(weights.values())
     expected_direction=(len(ticks)-1)*sum(w for j,w in weights.items() if j>=2)
@@ -99,6 +109,8 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
         bounded_position_cost_interval=list(position_interval),
         bounded_velocity_cost_interval=list(velocity_interval),
         bounded_direction_cost_interval=list(direction_interval),
+        direction_requests=direction_requests,measured_direction_requests=len(directions),
+        observed_direction_error=None if not directions else sum(directions)/len(directions),
         observed_subset_position_error=None if not known_weight else error/known_weight,
         measured_articulated_velocity_requests=articulated_velocity_requests,
         nonstationary_common_action_observed=bool(nonstationary_windows),
@@ -106,6 +118,120 @@ def measure_review_partial_joint_trajectory(left,right,*,ticks,fps,requested_joi
         measured_velocity_requests=len(velocities),expected_velocity_requests=(len(ticks)-1)*len(requested_joints),
         missing_imputed_as_zero=False,missing_joint_trajectory_interpolated=False,
         full_action_certified=False,actor_identity_certified=False,quality_approved=False)
+
+
+def measure_review_focal_incident(*,left_faces,right_faces,left_points,right_points,
+        left_ticks,right_ticks,fps,left_native=None,right_native=None):
+    """Measure an actual entry/internal/exit seam with a fixed partial basis.
+
+    Face scale uses five landmarks, not a detector-box proxy. Two nearest
+    observations measure each tangent; every supplied interior point remains
+    in the evidence binding. This is a local exploratory cost, not a complete
+    choreography or expert-quality decision. Missing terms have upper cost 1.
+    """
+    for faces,points,ticks in ((left_faces,left_points,left_ticks),(right_faces,right_points,right_ticks)):
+        if (not isinstance(ticks,tuple) or not 2<=len(ticks)<=12
+                or ticks!=tuple(sorted(set(ticks))) or any(type(t) is not int or t<0 for t in ticks)
+                or len(faces)!=len(ticks) or len(points)!=len(ticks)):
+            raise ValueError('incident needs its exact bounded observed flanks')
+    if (type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0
+            or left_ticks[-1]>=right_ticks[0]):
+        raise ValueError('incident needs a forward finite output clock')
+    def face(value):
+        if value is None or value.get('landmarks_xy') is None:return None
+        xy=np.asarray(value['landmarks_xy'],float)
+        if xy.shape!=(5,2) or not np.isfinite(xy).all():raise ValueError('incident needs actual five-point landmarks')
+        xy=xy*[1.,9/16];center=xy.mean(0)
+        scale=float(np.sqrt(np.mean(np.sum((xy-center)**2,axis=1))))
+        return None if scale<=1e-6 else (center,scale)
+    faces_a,faces_b=[list(map(face,values)) for values in (left_faces,right_faces)]
+    def physical(signatures,ticks,outgoing):
+        if signatures is None:return False
+        if len(signatures)!=len(ticks):raise ValueError('incident native inventory differs from output requests')
+        a,b=signatures[-2:] if outgoing else signatures[:2]
+        if a is None or b is None:return False
+        if any(len(v)!=5 or type(v[3]) is not int or v[3]<0 or type(v[4]) is not int or v[4]<0 for v in (a,b)):
+            raise ValueError('incident native observation lost its physical run/frame')
+        return tuple(a[:4])==tuple(b[:4]) and 0<b[4]-a[4]<=12
+    physical_motion=physical(left_native,left_ticks,True) and physical(right_native,right_ticks,False)
+    position=scale_error=None
+    if faces_a[-1] is not None and faces_b[0] is not None:
+        position=float(np.linalg.norm(faces_a[-1][0]-faces_b[0][0]))
+        scale_error=abs(math.log(faces_a[-1][1]/faces_b[0][1]))
+    def bounded(value,unit):return None if value is None else value/(unit+value)
+    geometry=[bounded(position,.05),bounded(scale_error,.2)]
+    losses=[0.,0.,0.];known=[0.,0.,0.];requests=[]
+    weights={0:.1,1:.1,2:1.,3:1.,4:1.5,5:1.5}
+    for frame in (*left_points,*right_points):
+        if (not isinstance(frame,dict) or any(j not in weights or len(p)!=2
+                or not all(type(x) in (int,float) and math.isfinite(x) for x in p) for j,p in frame.items())):
+            raise ValueError('incident needs actual finite screen joints')
+    for j,w in weights.items():
+        values=[p.get(j) for p in (*left_points[-2:],*right_points[:2])]
+        if not physical_motion or any(p is None for p in values):
+            requests.append(dict(joint=j,state='UNOBSERVED'));continue
+        a0,a1,b0,b1=np.asarray(values)*[1.,9/16]
+        av=(a1-a0)/((left_ticks[-1]-left_ticks[-2])/fps)
+        bv=(b1-b0)/((right_ticks[1]-right_ticks[0])/fps)
+        an,bn=float(np.linalg.norm(av)),float(np.linalg.norm(bv))
+        prediction=a1+av*((right_ticks[0]-left_ticks[-1])/fps)
+        residual=float(np.linalg.norm(b0-prediction));velocity=float(np.linalg.norm(av-bv))
+        losses[0]+=w*bounded(residual,.05);losses[1]+=w*velocity/(.15+an+bn)
+        known[0]+=w;known[1]+=w;direction=None
+        if min(an,bn)>=.02:
+            direction=(1-float(np.clip(av@bv/(an*bn),-1.,1.)))/2
+            losses[2]+=w*direction;known[2]+=w;applicability='BOTH_MOVING'
+        elif max(an,bn)<.02:known[2]+=w;applicability='BOTH_STATIONARY'
+        else:applicability='ONE_SIDED_MOTION'
+        requests.append(dict(joint=j,state='OBSERVED',position_residual=residual,
+            velocity_difference=velocity,direction_error=direction,direction_applicability=applicability))
+    total=sum(weights.values())
+    intervals=[(s/total,(s+total-k)/total) for s,k in zip(losses,known)]
+    face_interval=(sum(v for v in geometry if v is not None)/2,
+        sum(1. if v is None else v for v in geometry)/2)
+    cost=tuple((2*face_interval[i]+intervals[0][i]+intervals[1][i]+intervals[2][i])/5 for i in (0,1))
+    return dict(contract='actual_focal_incident_fixed_inventory_upper_cost_v1',
+        left_ticks=left_ticks,right_ticks=right_ticks,face_scale_basis='five_landmark_rms',
+        face_position_error=position,face_scale_log_error=scale_error,
+        face_cost_interval=face_interval,action_cost_intervals=intervals,joint_requests=requests,
+        exploratory_cost_interval=cost,exploration_score=cost[1],
+        fixed_requested_joint_indices=list(weights),missing_terms_are_measured_zero=False,
+        physical_tangents_observed=physical_motion,
+        actual_input_identity=digest(dict(left_faces=left_faces,right_faces=right_faces,
+            left_points=left_points,right_points=right_points,left_ticks=left_ticks,right_ticks=right_ticks,
+            left_native=left_native,right_native=right_native)),
+        full_action_certified=False,quality_approved=False)
+
+
+def compare_review_focal_incident_inventory(original,candidate):
+    """A better middle cut cannot erase measured damage at entry or return.
+
+    This is relative to the same declared baseline requests, not an invented
+    professional threshold. Passing only permits continued review; it neither
+    admits an edit nor promotes unobserved action into a match.
+    """
+    if not isinstance(original,(tuple,list)) or not original or len(original)!=len(candidate):
+        raise ValueError('incident comparison needs identical nonempty request inventories')
+    failures=[];unknown=[]
+    for i,(before,after) in enumerate(zip(original,candidate)):
+        if any(before[k]!=after[k] for k in ('contract','left_ticks','right_ticks','fixed_requested_joint_indices')):
+            raise ValueError('incident comparison changed its declared request basis')
+        for field in ('face_position_error','face_scale_log_error'):
+            a,b=before[field],after[field]
+            if a is None:unknown.append(dict(incident=i,metric=field));continue
+            if b is None or b>a+1e-9:
+                failures.append(dict(incident=i,metric=field,original=a,candidate=b,
+                    reason='LOST_KNOWN_OBSERVATION' if b is None else 'KNOWN_GEOMETRY_REGRESSION'))
+        prior={r['joint']:r for r in before['joint_requests']}
+        current={r['joint']:r for r in after['joint_requests']}
+        for j,row in prior.items():
+            if row['state']=='OBSERVED' and current[j]['state']!='OBSERVED':
+                failures.append(dict(incident=i,metric=f'joint_{j}',reason='LOST_KNOWN_ACTION_OBSERVATION'))
+    return dict(contract='paired_focal_incident_known_evidence_preservation_v1',
+        state='KNOWN_REGRESSION' if failures else 'NO_MEASURED_INCIDENT_REGRESSION',
+        eligible_for_further_review=not failures,failures=failures,original_unknown_metrics=unknown,
+        threshold_basis='same_original_measured_incident_not_calibrated_expert_threshold',
+        total_score_cannot_override_known_incident_loss=True,quality_approved=False)
 
 
 def _fixed_zoom_support_pan_path(desired_keys,points_by_frame,locked_indices,fps):

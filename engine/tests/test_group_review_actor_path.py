@@ -288,6 +288,16 @@ def test_frame_ambiguity_does_not_erase_independent_known_anchor_and_close_neigh
     assert set(receipt['ambiguous_frame_indices'])=={6,7}
 
 
+def test_same_anchor_instant_is_an_occurrence_not_fabricated_motion():
+    from crosscut.group_review_actor_path import connected_source_actor_views
+    from crosscut.group_performer_family_owner import digest
+    anchor=view(8,0,7);anchor['native_camera_unit_index']=3
+    selected,receipt=connected_source_actor_views([[anchor]],ticks=(8,),
+        native_units={8:(2,'clock',digest(None),3)},anchor=anchor)
+    assert selected[8] is anchor and receipt['state']=='SINGLE_OBSERVED_OCCURRENCE'
+    assert not receipt['connected_motion_observed']
+
+
 def test_fixed_min_marginals_equal_exhaustive_whole_paths():
     from itertools import product
     from dataclasses import replace

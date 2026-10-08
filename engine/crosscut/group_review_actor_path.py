@@ -432,7 +432,7 @@ def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum
     if (not isinstance(ticks,tuple) or ticks!=tuple(sorted(set(ticks)))
             or len(frames)!=len(ticks) or set(native_units)!=set(ticks)
             or type(maximum_frames) is not int or not 2<=maximum_frames<=512
-            or not 2<=len(ticks)<=maximum_frames):
+            or not 1<=len(ticks)<=maximum_frames):
         raise ValueError('connected actor needs its bounded ordered physical request inventory')
     if anchor is None:return {t:None for t in ticks},dict(state='ANCHOR_UNOBSERVED')
     at=anchor['row']['output_tick']

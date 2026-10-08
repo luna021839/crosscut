@@ -13,7 +13,7 @@ formation/shot-context authorities are declined, not silently carried over.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import math
 from pathlib import Path
@@ -38,7 +38,7 @@ from .group_joint_state_factory import (candidate_joint_group_state,
     assemble_single_group_source_camera_state, assemble_joint_group_states,
     fixed_neighbor_state_from_render_plan)
 from .group_joint_focal_camera import propose_endpoint_focal_face_roi_camera
-from .group_joint_native_observer import observe_native_group, register_joint_native_models
+from .group_joint_native_observer import NativeGroupObservation, observe_native_group, register_joint_native_models
 from .group_native_head_orientation import (SUPPORTED_ANALYSIS_ROLLS,
     register_native_head_orientation_models)
 from .group_focal_attention import focal_landmarks_track
@@ -164,6 +164,62 @@ def _dominant(row, role):
     return head,person
 
 
+@dataclass(frozen=True,slots=True)
+class NativeMotionDemand:
+    source_index: int
+    native_frame_index: int
+    output_tick: int
+    source_family: str
+    opportunity: str
+    analysis_roll: float | None = None
+    require_appearance: bool = False
+
+    def __post_init__(self):
+        if (any(type(n) is not int or n<0 for n in
+                (self.source_index,self.native_frame_index,self.output_tick))
+                or not isinstance(self.source_family,str) or not self.source_family
+                or self.opportunity not in ('moving_closeup','other')
+                or type(self.require_appearance) is not bool):
+            raise ValueError('native motion demand needs a physical address and original opportunity')
+        from .group_native_head_orientation import native_head_analysis_spec
+        native_head_analysis_spec(self.analysis_roll)
+
+    @property
+    def native_key(self):
+        return self.source_index,self.native_frame_index,self.analysis_roll
+
+
+@dataclass(frozen=True,slots=True)
+class NativeMotionSupply:
+    demand: NativeMotionDemand
+    observation: NativeGroupObservation | None
+    appearance: dict | None = None
+
+    @property
+    def missing_modalities(self):
+        if self.observation is None:
+            return ('RAW','APPEARANCE') if self.demand.require_appearance else ('RAW',)
+        # A measured decode failure is retained, not a fresh completion miss.
+        if self.observation.native_pixel_sha256 is None:return ()
+        return ('APPEARANCE',) if self.demand.require_appearance and self.appearance is None else ()
+
+    @property
+    def state(self):
+        if self.observation is None:return 'UNKNOWN_NOT_OBSERVED'
+        if self.observation.native_pixel_sha256 is None:return 'EXACT_DECODE_UNAVAILABLE'
+        if self.missing_modalities:return 'RAW_AVAILABLE_APPEARANCE_UNOBSERVED'
+        # Available native rows can still have absent/ambiguous heads or limbs.
+        return 'NATIVE_ROWS_AVAILABLE'
+
+
+@dataclass(frozen=True,slots=True)
+class NativeMotionInventory:
+    supplies: tuple[NativeMotionSupply,...]
+    attempted_native_keys: tuple
+    completion_consumed: bool
+    status: str
+
+
 class NativeFamilySensors:
     """One live raw-native cache/model owner; no camera-dependent cohort choice."""
     def __init__(self,session,assets,*,frozen_declarations=None):
@@ -172,6 +228,7 @@ class NativeFamilySensors:
         register_native_head_orientation_models(session,assets['head_model_path'])
         self.declarations = {}
         self.raw_rows = {}
+        self.appearance_rows = {}
         if frozen_declarations is not None:
             for row in frozen_declarations:
                 self.declarations[tuple(row['span_key'])] = row
@@ -186,20 +243,199 @@ class NativeFamilySensors:
         return self.raw_native(state,native,roll)
 
     def raw_native(self,state,native,roll):
-        """Shared exact raw sensing, including actually inferred middle rasters."""
+        """Read one exact native fact; editorial boundaries are not cache keys."""
         source = self.session.domain.request_index(state.eligible_source_index)
         if (type(native) is not int or not state.native_frame_indices[0]<=native<=state.native_frame_indices[-1]):
             raise ValueError('native observation escaped the complete source-camera state')
+        return self.native_at(source, native, roll)
+
+    def native_at(self,source,native,roll=None,*,cached_only=False):
+        """Use the existing raw_rows cache; never choose a dominant performer.
+
+        cached_only does not decode a missing frame or invoke any detector.
+        Actual cached rows still require their owning live session and exact
+        source/clock/model/adapter bindings. A saved focal box is not a raw row.
+        """
+        from .group_native_head_orientation import native_head_analysis_spec
+        if type(cached_only) is not bool:
+            raise ValueError('native cache mode must be explicit')
+        self.session.budget.check()
+        if self.session.closed:
+            raise ValueError('native motion cannot reuse a closed session')
+        local = self.session.domain.eligible_index(source)
+        clock = self.session.domain.render_frame_clocks[local]
+        if type(native) is not int or not 0 <= native < clock.frame_count:
+            raise ValueError('native motion request is outside its source clock')
+        head_model,_ = native_head_analysis_spec(roll)
+        required_models = ('nanodet_people','rtmpose_body7',head_model)
         key = source,native,roll
-        if key not in self.raw_rows:
-            row = self.session.budget.normalized_native_views.measure(label='native_focal_observation_view',
-                input_binding=dict(request_source_index=source,native_frame_index=native,
-                    source_clock_identity=getattr(state,'source_clock_identity',None),
-                    head_analysis_roll=roll),
-                producer=lambda:observe_native_group(self.session,request_source_index=source,
-                    native_frame_index=native,head_analysis_roll=roll))
-            self.raw_rows[key]=row
-        return self.raw_rows[key]
+        row = self.raw_rows.get(key)
+        if row is None and cached_only:
+            return None
+        if row is not None:
+            identity = self.session._assert_source_identity(source)
+            expected_clock = family.digest(clock.to_dict())
+            if (row.request_source_index != source or row.native_frame_index != native
+                    or row.source_clock_identity != expected_clock
+                    or row.source_file_identity != identity):
+                raise ValueError('cached native fact changed source/clock/file/frame')
+            if (tuple(name for name,_ in row.model_content_sha256) != required_models
+                    or tuple(name for name,_ in row.model_adapter_fingerprints) != required_models):
+                raise ValueError('cached native fact changed the declared model/analysis variant')
+            for name, model_sha in row.model_content_sha256:
+                self.session._assert_model_assets(name)
+                if self.session.models[name][2] != model_sha:
+                    raise ValueError('cached native fact changed model content')
+            if tuple((name,self.session.model_adapters[name]) for name,_ in
+                    row.model_adapter_fingerprints) != row.model_adapter_fingerprints:
+                raise ValueError('cached native fact changed model adapter')
+            return row
+        row = self.session.budget.normalized_native_views.measure(
+            label='native_focal_observation_view',
+            input_binding=dict(request_source_index=source,native_frame_index=native,
+                source_clock_identity=family.digest(clock.to_dict()),head_analysis_roll=roll),
+            producer=lambda:observe_native_group(self.session,request_source_index=source,
+                native_frame_index=native,head_analysis_roll=roll))
+        self.raw_rows[key]=row
+        return row
+
+    def appearance_at(self,raw,*,cached_only=False):
+        """An exact raw-parent SFace result; absent vectors do not erase heads."""
+        from .group_review_actor_appearance import observe_recorded_head_appearances
+        from .group_review_recorded_index import validate_recorded_appearance
+        from .native_face_descriptor import native_descriptor_space,SFACE_MODEL_NAME
+        payload=raw.to_dict();key=family.digest(payload)
+        value=self.appearance_rows.get(key)
+        if value is None and cached_only:return None
+        space=native_descriptor_space(self.session,SFACE_MODEL_NAME)
+        if value is None:
+            value=observe_recorded_head_appearances(self.session,payload)
+            self.appearance_rows[key]=value
+        validate_recorded_appearance(payload,value,expected_space=space)
+        return value
+
+    def motion_inventory(self,demands):
+        """Inspect every declared time/source opportunity without new NN work."""
+        demands = tuple(demands)
+        if (not demands or len(demands)>16384
+                or any(not isinstance(d,NativeMotionDemand) for d in demands)):
+            raise ValueError('native motion inventory needs bounded typed demands')
+        family_by_source={}
+        for d in demands:
+            previous=family_by_source.setdefault(d.source_index,d.source_family)
+            if previous!=d.source_family:
+                raise ValueError('native demand aliases changed a frozen source family')
+        supplies=[]
+        for d in demands:
+            raw=self.native_at(d.source_index,d.native_frame_index,d.analysis_roll,cached_only=True)
+            appearance=(self.appearance_at(raw,cached_only=True) if d.require_appearance
+                and raw is not None and raw.native_pixel_sha256 is not None else None)
+            supplies.append(NativeMotionSupply(d,raw,appearance))
+        return NativeMotionInventory(tuple(supplies),(),False,'CACHE_ONLY')
+
+    def complete_motion_inventory_once(self,inventory,*,maximum_new_observations):
+        """One request-owned, time/source/opportunity-balanced missing pass.
+
+        Existing successes, observed failures and absent facts remain distinct.
+        The entire inventory is inspected BEFORE admitting any missing row.
+        Camera count, actor alternatives and phase count do not multiply NN work.
+        The caller keeps this one session through realization and selection.
+        """
+        from .group_scene_native_storage import MAX_NATIVE_JSON_BYTES
+        from .group_joint_primitive_journal import primitive_reservation_bytes
+        from .request_work_lease import current_request_work_phase
+        port = self.session.budget.request_work_phase
+        if port is None or current_request_work_phase() is not port:
+            raise ValueError('normal motion completion requires the active whole-request work lease')
+        if (not isinstance(inventory,NativeMotionInventory) or inventory.completion_consumed
+                or type(maximum_new_observations) is not int
+                or not 0<=maximum_new_observations<=1200):
+            raise ValueError('one native completion needs the frozen cache-only inventory')
+        if getattr(self.session,'_native_motion_completion_consumed',False):
+            raise ValueError('native motion completion already consumed this session')
+        # Consume before the first model call, including a zero-budget pass.
+        port.charge('native_completion_passes')
+        self.session._native_motion_completion_consumed=True
+        demands=tuple(s.demand for s in inventory.supplies)
+        # A cache can go stale between the first inventory and admission. The
+        # pass is already consumed, but no newly inferred observation exists.
+        unvalidated=tuple(NativeMotionSupply(d,None) for d in demands)
+        self.motion_completion_result=NativeMotionInventory(
+            unvalidated,(),True,'CACHE_REVALIDATION_STARTED')
+        try:
+            current=self.motion_inventory(demands)
+        except BaseException:
+            self.motion_completion_result=NativeMotionInventory(
+                unvalidated,(),True,'CACHE_REVALIDATION_FAILED')
+            raise
+        missing={}
+        for supply in current.supplies:
+            if supply.missing_modalities:
+                missing.setdefault(supply.demand.native_key,[]).append(supply.demand)
+        first=min(d.output_tick for d in demands)
+        end=max(d.output_tick for d in demands)+1
+        budget=self.session.budget
+        remaining=lambda k:max(0,budget.limits[k]-budget.counts[k]-budget.reserved[k])
+        limit=min(maximum_new_observations,len(missing),remaining('new_decodes'))
+        evidence_reserve=primitive_reservation_bytes(MAX_NATIVE_JSON_BYTES)
+        if remaining('pose_evidence_bytes') < evidence_reserve:limit=0
+        counts={}; pending=dict(missing); scheduled=[]
+        # Bit-reversed order visits distributed time bands before adjacent
+        # bands. A later wall/IPC cutoff does not leave a chronological prefix.
+        bits=max(1,(limit-1).bit_length())
+        bands=sorted(range(limit),key=lambda n:int(format(n,'0'+str(bits)+'b')[::-1],2))
+        for band in bands:
+            target=first+(band+.5)*(end-first)/max(1,limit)
+            def priority(d):
+                return (counts.get((d.source_family,d.opportunity),0),
+                    abs(d.output_tick-target),d.source_family,d.opportunity,
+                    d.source_index,d.native_frame_index,
+                    -1000. if d.analysis_roll is None else d.analysis_roll)
+            key,demand=min(((key,min(rows,key=priority)) for key,rows in pending.items()),
+                key=lambda item:priority(item[1]))
+            aliases=pending.pop(key)
+            scheduled.append(demand)
+            # One native fact services every output use. Do not erase a later
+            # moving-closeup use by selecting an earlier 'other' representative.
+            for lane in {(d.source_family,d.opportunity) for d in aliases}:
+                counts[lane]=counts.get(lane,0)+1
+        attempted=[]
+        known={s.demand.native_key:s.observation for s in current.supplies}
+        appearances={s.demand.native_key:s.appearance for s in current.supplies if s.appearance is not None}
+        need_appearance={d.native_key for d in demands if d.require_appearance}
+        status=('BUDGET_PARTIAL' if limit<len(missing)
+            else 'COMPLETED_ONCE')
+        def snapshot(state):
+            # These rows were validated in this pass. Do not reopen source/model
+            # I/O after its deadline merely to construct the result container.
+            value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key))
+                for d in demands),tuple(attempted),True,state)
+            self.motion_completion_result=value
+            return value
+        snapshot('RUNNING')
+        try:
+            for demand in scheduled:
+                budget.check()
+                raw=known[demand.native_key]
+                raw_calls=14 if raw is None else 0
+                appearance_calls=((24 if raw is None else len(raw.heads))
+                    if demand.native_key in need_appearance and demand.native_key not in appearances else 0)
+                required=dict(new_decodes=1,model_calls=raw_calls+appearance_calls,
+                    pose_evidence_bytes=evidence_reserve)
+                if any(remaining(k)<n for k,n in required.items()):
+                    status='BUDGET_PARTIAL';continue
+                attempted.append(demand.native_key)
+                snapshot('RUNNING')
+                known[demand.native_key]=self.native_at(demand.source_index,
+                    demand.native_frame_index,demand.analysis_roll)
+                raw=known[demand.native_key]
+                if demand.native_key in need_appearance and raw.native_pixel_sha256 is not None:
+                    appearances[demand.native_key]=self.appearance_at(raw)
+                snapshot('RUNNING')
+        except BaseException:
+            snapshot('INTERRUPTED_PARTIAL')
+            raise  # Preserve cancellation/cutoff; never synthesize successful completion.
+        return snapshot(status)
 
     def declare(self,state):
         key = self.span_key(state)

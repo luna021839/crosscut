@@ -6,11 +6,49 @@ cannot select the most favorable capture, borrow another clock/file, or turn
 a missing appearance vector into a missing visible person.
 """
 import json
+import math
 from hashlib import file_digest
 
 from .group_performer_family_owner import digest
 from .group_joint_observations import _file_identity
 from .group_scene_static_query import reproject_recorded_static_query
+
+
+def native_analysis_variant(raw):
+    """Declared detector/model/adapter alternative, not the favorable output."""
+    models=raw.get('model_content_sha256',())
+    adapters=raw.get('model_adapter_fingerprints',())
+    if not models or not adapters:return None
+    return digest(dict(models=sorted(map(tuple,models)),adapters=sorted(map(tuple,adapters)),
+        ownership_policy=raw.get('person_ownership_policy_sha256')))
+
+
+def validate_recorded_appearance(raw,appearance,*,expected_space=None):
+    """Keep exact raw parent, all head IDs and pinned descriptor space."""
+    from .native_face_descriptor import NativeFaceDescriptorSpace,SFACE_MODEL_NAME
+    if appearance is None:return None
+    for field in ('request_source_index','native_frame_index','source_clock_identity',
+            'source_file_identity','native_pixel_sha256'):
+        if appearance.get(field)!=raw.get(field):
+            raise ValueError('recorded appearance borrowed a different native parent')
+    if (appearance.get('recorded_native_observation_sha256')!=digest(raw)
+            or appearance.get('quality_approved') is not False):
+        raise ValueError('recorded appearance borrowed a different native parent or approval')
+    space=NativeFaceDescriptorSpace(**appearance.get('descriptor_space',{}))
+    if space.model_name!=SFACE_MODEL_NAME or expected_space is not None and space!=expected_space:
+        raise ValueError('recorded appearance changed its declared SFace model/adapter space')
+    heads=appearance.get('heads',())
+    expected={h['observation_id'] for h in raw['heads']}
+    if (not isinstance(heads,(list,tuple)) or len(heads)!=len(expected)
+            or {h.get('observation_id') for h in heads}!=expected):
+        raise ValueError('recorded appearance omitted or repeated native head occurrences')
+    for head in heads:
+        v=head.get('embedding')
+        if v is not None and (not isinstance(v,(list,tuple)) or len(v)!=space.dimension
+                or any(type(x) not in (int,float) or not math.isfinite(x) for x in v)
+                or sum(x*x for x in v)<=1e-12):
+            raise ValueError('recorded appearance needs a finite nonzero vector in its exact space')
+    return space
 
 
 def verify_recorded_source_file(path, recorded_identity, *, content_sha256=None, work_port=None):
@@ -83,12 +121,31 @@ class RecordedGroupReviewIndex:
             raise ValueError('recorded index needs a bounded unapproved capture and explicit provenance')
         if self.imported_rows + len(capture['rows']) > self.maximum_rows:
             raise ValueError('recorded index imported-row budget exceeded before reuse')
-        pending = []
-        byte_count = 0
-        for tick, row in capture['rows'].items():
+        rows=[]
+        for tick,row in capture['rows'].items():
             if str(row['output_tick']) != tick:
                 raise ValueError('recorded index capture changed its output occurrence address')
-            raw = row['native_observation']
+            rows.append((row['native_observation'],capture.get('patches',{}).get(tick),
+                capture.get('appearance',{}).get(tick),row['output_tick']))
+        self._import_records(rows,provenance=provenance)
+
+    def add_native_record(self,raw,appearance=None,*,provenance):
+        """Import a real native payload without inventing an output occurrence."""
+        from .group_scene_focal_pose_motion import restore_native_row
+        restore_native_row(raw)
+        if native_analysis_variant(raw) is None:
+            raise ValueError('native record needs its exact model and adapter variant')
+        validate_recorded_appearance(raw,appearance)
+        self._import_records(((raw,None,appearance,None),),provenance=provenance)
+
+    def _import_records(self,rows,*,provenance):
+        if not isinstance(provenance,str) or not provenance or len(provenance)>1024:
+            raise ValueError('recorded index needs explicit bounded provenance')
+        if self.imported_rows+len(rows)>self.maximum_rows:
+            raise ValueError('recorded index imported-row budget exceeded before reuse')
+        pending = []
+        byte_count = 0
+        for raw,patches,appearance,tick in rows:
             if raw.get('quality_approved') is not False:
                 raise ValueError('recorded index cannot grant or import quality approval')
             key = _key(raw['request_source_index'], raw['native_frame_index'],
@@ -97,7 +154,6 @@ class RecordedGroupReviewIndex:
             if (not isinstance(pixel, str) or len(pixel) != 64
                     or any(c not in '0123456789abcdef' for c in pixel)):
                 raise ValueError('recorded index raw observation has no exact pixel identity')
-            appearance = capture.get('appearance', {}).get(tick)
             if appearance is not None:
                 if (_key(appearance['request_source_index'], appearance['native_frame_index'],
                         appearance['source_clock_identity'], appearance['source_file_identity']) != key
@@ -105,26 +161,33 @@ class RecordedGroupReviewIndex:
                         or appearance['recorded_native_observation_sha256'] != digest(raw)
                         or appearance.get('quality_approved') is not False):
                     raise ValueError('recorded appearance borrowed a different native parent')
+                if 'descriptor_space' in appearance:
+                    validate_recorded_appearance(raw,appearance)
             # Visibility/patch data survives missing appearance and tracking.
-            value = dict(raw=raw, patches=capture.get('patches', {}).get(tick), appearance=appearance)
+            value = dict(raw=raw, patches=patches, appearance=appearance)
             frozen = {name: None if payload is None else _freeze(payload) for name, payload in value.items()}
             byte_count += sum(len(payload.encode()) for payload in frozen.values() if payload is not None)
-            pending.append((key, frozen, provenance, row['output_tick']))
+            pending.append((key, frozen, provenance, tick,native_analysis_variant(raw)))
         if self.stored_bytes + byte_count > self.maximum_bytes:
             raise ValueError('recorded index byte budget exceeded before reuse')
         if self.work_port is not None:
             self.work_port.charge('pose_evidence_bytes', byte_count)
-        for key, frozen, origin, tick in pending:
-            record = self.rows.setdefault(key, dict(raw={}, patches={}, appearance={}, occurrences=[]))
+        for key, frozen, origin, tick,variant in pending:
+            record = self.rows.setdefault(key, dict(raw={}, patches={}, appearance={}, occurrences=[],
+                analysis_variants={},features_by_raw={}))
+            raw_sha=digest(frozen['raw'])
+            record['analysis_variants'][raw_sha]=variant
+            features=record['features_by_raw'].setdefault(raw_sha,dict(patches={},appearance={}))
             for name, payload in frozen.items():
                 if payload is not None:
                     record[name].setdefault(digest(payload), payload)
+                    if name!='raw':features[name].setdefault(digest(payload),payload)
             record['occurrences'].append(dict(provenance=origin, output_tick=tick))
         self.imported_rows += len(pending)
         # Count import bytes, including aliases. De-duplication is not free work.
         self.stored_bytes += byte_count
 
-    def lookup(self, *, source, native, clock, identity):
+    def lookup(self, *, source, native, clock, identity,analysis_variant_sha256=None):
         key = _key(source, native, clock, identity)
         record = self.rows.get(key)
         result = dict(state='MISSING', raw=None, patches=None, appearance=None,
@@ -134,24 +197,35 @@ class RecordedGroupReviewIndex:
             return result
         result['occurrences'] = tuple(dict(r) for r in record['occurrences'])
         result['raw_variant_sha256'] = tuple(sorted(record['raw']))
-        if len(record['raw']) != 1:
+        result['available_analysis_variants']=tuple(sorted({v for v in record['analysis_variants'].values() if v is not None}))
+        raws=record['raw']
+        if analysis_variant_sha256 is not None:
+            if (not isinstance(analysis_variant_sha256,str) or len(analysis_variant_sha256)!=64
+                    or any(c not in '0123456789abcdef' for c in analysis_variant_sha256)):
+                raise ValueError('recorded lookup needs its prior exact analysis variant')
+            raws={k:v for k,v in raws.items() if record['analysis_variants'][k]==analysis_variant_sha256}
+            if not raws:return dict(result,state='MISSING_DECLARED_ANALYSIS_VARIANT')
+        if len(raws) != 1:
             return dict(result, state='CONFLICTING_NATIVE_RECORDS')
-        result['raw'] = json.loads(next(iter(record['raw'].values())))
+        raw_sha=next(iter(raws))
+        result['raw'] = json.loads(raws[raw_sha])
+        features=record['features_by_raw'][raw_sha]
         for name in ('patches', 'appearance'):
-            variants = record[name]
+            variants = features[name]
             result[name + '_variant_sha256'] = tuple(sorted(variants))
             if len(variants) == 1:
                 result[name] = json.loads(next(iter(variants.values())))
         result['state'] = ('CONFLICTING_FEATURE_RECORDS'
-            if len(record['patches']) > 1 or len(record['appearance']) > 1
+            if len(features['patches']) > 1 or len(features['appearance']) > 1
             else 'RECORDED_NATIVE_REVIEW_INPUT')
         return result
 
-    def reproject(self, query, tick, *, domain, source_file_identity,compact=False):
+    def reproject(self, query, tick, *, domain, source_file_identity,compact=False,analysis_variant_sha256=None):
         _, _, native = query.sample_at(tick)
         source = domain.request_index(query.eligible_source_index)
         found = self.lookup(source=source, native=native,
-            clock=query.source_clock_identity, identity=source_file_identity)
+            clock=query.source_clock_identity, identity=source_file_identity,
+            analysis_variant_sha256=analysis_variant_sha256)
         if found['raw'] is not None:
             found['row'] = reproject_recorded_static_query(query, tick, found['raw'], domain=domain,compact=compact)
         else:

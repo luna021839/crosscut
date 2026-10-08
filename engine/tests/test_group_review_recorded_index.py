@@ -1,9 +1,11 @@
 from copy import deepcopy
 from hashlib import sha256
+import json
 import pytest
 
 from crosscut.group_performer_family_owner import digest
-from crosscut.group_review_recorded_index import RecordedGroupReviewIndex, verify_recorded_source_file
+from crosscut.group_review_recorded_index import (RecordedGroupReviewIndex,verify_recorded_source_file,
+    native_analysis_variant)
 from crosscut.group_joint_observations import _file_identity
 
 
@@ -154,3 +156,62 @@ def test_returned_payload_cannot_mutate_recorded_index_or_gain_authority():
     result['raw']['heads'].clear()
     assert lookup(index)['raw']['heads']
     assert not result['quality_approved'] and not result['fresh_inference_performed']
+
+
+def native_record(*,adapter='d'*64,reason='observed'):
+    from crosscut.group_joint_native_observer import NativeGroupObservation,NativeGroupHead
+    from crosscut.native_face_descriptor import NativeFaceDescriptorSpace,SFACE_MODEL_NAME
+    from crosscut.face_identity import SFACE_SHA256
+    names=('nanodet_people','rtmpose_body7','yunet_heads')
+    head=NativeGroupHead(7,(.4,.2,.1,.2),((.41,.25),(.48,.25),(.45,.3),(.42,.35),(.47,.35)),.9)
+    raw=NativeGroupObservation(2,80,(1920,1080),'c'*64,(1,2,3,4,5),'a'*64,
+        tuple((n,'b'*64) for n in names),(),(head,),reason,
+        model_adapter_fingerprints=tuple((n,adapter) for n in names)).to_dict()
+    raw=json.loads(json.dumps(raw))
+    appearance={k:deepcopy(raw[k]) for k in ('request_source_index','native_frame_index',
+        'source_clock_identity','source_file_identity','native_pixel_sha256')}
+    appearance.update(recorded_native_observation_sha256=digest(raw),quality_approved=False,
+        descriptor_space=NativeFaceDescriptorSpace(SFACE_MODEL_NAME,128,SFACE_SHA256,'f'*64).to_dict(),
+        heads=[dict(observation_id=7,embedding=[1.]+[0.]*127)])
+    return raw,appearance
+
+
+def test_raw_native_import_needs_no_fabricated_output_capture_and_keeps_missing_appearance():
+    index=RecordedGroupReviewIndex();raw,appearance=native_record();saved=deepcopy(raw)
+    index.add_native_record(raw,provenance='normalized-native-packet')
+    result=lookup(index,analysis_variant_sha256=native_analysis_variant(raw))
+    assert result['raw']==saved and result['appearance'] is None
+    assert result['occurrences'][0]['output_tick'] is None
+    index.add_native_record(raw,appearance,provenance='appearance-completion')
+    assert lookup(index)['appearance']==appearance and raw==saved
+
+
+def test_predeclared_analysis_variants_keep_their_own_raw_parent_features():
+    index=RecordedGroupReviewIndex();a,aa=native_record();b,bb=native_record(adapter='e'*64)
+    bb['heads'][0]['embedding']=[0.,1.]+[0.]*126
+    for raw,app in ((a,aa),(b,bb)):index.add_native_record(raw,app,provenance='declared-variant')
+    assert lookup(index)['state']=='CONFLICTING_NATIVE_RECORDS'
+    for raw,app in ((a,aa),(b,bb)):
+        found=lookup(index,analysis_variant_sha256=native_analysis_variant(raw))
+        assert found['raw']==raw and found['appearance']==app
+        assert found['state']=='RECORDED_NATIVE_REVIEW_INPUT'
+    assert lookup(index,analysis_variant_sha256='0'*64)['state']=='MISSING_DECLARED_ANALYSIS_VARIANT'
+    bad,badapp=native_record(reason='different output within same variant')
+    index.add_native_record(bad,badapp,provenance='conflict')
+    assert lookup(index,analysis_variant_sha256=native_analysis_variant(a))['state']=='CONFLICTING_NATIVE_RECORDS'
+    assert lookup(index,analysis_variant_sha256=native_analysis_variant(b))['raw']==b
+
+
+@pytest.mark.parametrize('kind',('wrong_parent','dimension','duplicate','foreign_head','zero','nonfinite','adapter','missing_head'))
+def test_native_import_rejects_invalid_appearance_without_partial_cache_mutation(kind):
+    raw,app=native_record();index=RecordedGroupReviewIndex()
+    if kind=='wrong_parent':app['recorded_native_observation_sha256']='0'*64
+    elif kind=='dimension':app['heads'][0]['embedding']*=4
+    elif kind=='duplicate':app['heads'].append(deepcopy(app['heads'][0]))
+    elif kind=='foreign_head':app['heads'][0]['observation_id']=8
+    elif kind=='zero':app['heads'][0]['embedding']=[0.]*128
+    elif kind=='nonfinite':app['heads'][0]['embedding'][0]=float('nan')
+    elif kind=='adapter':app['descriptor_space']['adapter_sha256']='unknown'
+    elif kind=='missing_head':app['heads']=[]
+    with pytest.raises(ValueError):index.add_native_record(raw,app,provenance='invalid')
+    assert not index.rows and index.imported_rows==0

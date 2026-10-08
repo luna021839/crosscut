@@ -5,7 +5,16 @@ raw-v2 admission. The static owner must supply freshly produced source/camera
 dependent motion and face metadata; the parent still owes raw semantic replay.
 No child `complete` flag and no descriptor hash certifies media observations.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .render import RenderPlan
+    from .visual_score import VisualTimelinePlan
+    from .shot_video_clock import FrozenShotVideoClockContext
+    from .group_joint_source_camera import GroupOutputRole
 
 from .group_joint_native_preparation import _plan_identity
 from .group_joint_render_observations import GroupJointRenderedObservations
@@ -171,3 +180,55 @@ def complete_joint_group_bundle_metadata(*, incumbent, observations, domain,
         offsets=domain.audio_offsets, timewarps=domain.source_timewarps,
         common_start=before.master_audio_start, phrase_times=phrases, shot_clock_context=shot_clock_context)
     return GroupJointMetadataProposal(_plan_identity(before), candidate, changed)
+
+
+@dataclass(frozen=True,slots=True)
+class SelectedNativeActorFrame:
+    output_tick: int
+    request_source_index: int
+    native_frame_index: int
+    frame_local_head_id: int | None
+    native_observation_sha256: str | None
+
+
+@dataclass(frozen=True,slots=True)
+class SelectedNativeMotionShot:
+    first_output_frame: int
+    end_output_frame: int
+    request_source_index: int
+    physical_native_run: tuple[int,int]
+    role: GroupOutputRole | None
+    phase_native_frames: int
+    actor_path_identity: str | None
+    actor_frames: tuple[SelectedNativeActorFrame,...]
+    render_segment_indices: tuple[int,...]
+
+
+@dataclass(frozen=True,slots=True)
+class GroupNativeMotionProduction:
+    """The selected program itself, carried intact from producer to encoder.
+
+    This record does not create native observations, actor appearance vectors,
+    cameras, phase permission or a quality decision. Its normal producer must
+    already have selected those exact objects before constructing the record.
+    """
+    visual_timeline: VisualTimelinePlan
+    render_plan: RenderPlan
+    editorial_motion_plan: EditorialMotionPlan
+    source_domain: GroupSourceDomain
+    shot_clock_context: FrozenShotVideoClockContext | None
+    selected_shots: tuple[SelectedNativeMotionShot,...]
+    original_plan_identity: str
+    protected_output_intervals: tuple[tuple[int,int],...]
+    state: Literal['SELECTED_FOR_REVIEW','KEEP_ORIGINAL']
+
+    def to_dict(self):
+        from dataclasses import asdict
+        return dict(contract='normal_native_motion_selected_program_v1',state=self.state,
+            original_plan_identity=self.original_plan_identity,
+            selected_plan_identity=_plan_identity(self.render_plan),
+            protected_output_intervals=[list(x) for x in self.protected_output_intervals],
+            selected_shots=[dict(asdict(s),role=None if s.role is None else s.role.value)
+                for s in self.selected_shots],
+            has_local_video_clock_context=self.shot_clock_context is not None,
+            quality_approved=False)

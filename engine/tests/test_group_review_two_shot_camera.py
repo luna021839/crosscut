@@ -10,6 +10,62 @@ from crosscut.group_review_two_shot_camera import (realize_review_two_shot_camer
 from crosscut.render import EditorialTransformKeyframe
 from crosscut.group_review_projected_action import measure_review_partial_screen_trajectory
 from crosscut.group_review_two_shot_camera import realize_review_focal_pair
+from crosscut.group_review_two_shot_camera import (measure_review_focal_incident,
+    compare_review_focal_incident_inventory)
+
+
+def incident_fixture():
+    points={0:(.4,.45),1:(.6,.45),2:(.3,.55),3:(.7,.55),4:(.3,.35),5:(.7,.35)}
+    frames=[{j:(x+.005*t,y) for j,(x,y) in points.items()} for t in range(6)]
+    face=dict(landmarks_xy=((.45,.3),(.55,.3),(.5,.35),(.46,.4),(.54,.4)))
+    return dict(left_faces=[face]*3,right_faces=[face]*3,left_points=frames[:3],right_points=frames[3:],
+        left_ticks=(0,1,2),right_ticks=(3,4,5),fps=30.,
+        left_native=[(0,'c','file',7,t) for t in range(3)],
+        right_native=[(1,'d','other-file',3,t) for t in range(3,6)])
+
+
+def test_actual_entry_and_return_use_measured_face_and_motion_not_perfect_continuation_badge():
+    data=incident_fixture();good=measure_review_focal_incident(**data)
+    assert good['exploration_score']==pytest.approx(0.,abs=1e-12)
+    data['right_points']=[{j:(x+.2,y) for j,(x,y) in f.items()} for f in data['right_points']]
+    bad=measure_review_focal_incident(**data)
+    assert bad['exploration_score']>good['exploration_score']
+    assert bad['actual_input_identity']!=good['actual_input_identity']
+    assert not bad['full_action_certified']
+
+
+def test_incident_erasing_bad_observations_cannot_improve_fixed_upper_cost():
+    data=incident_fixture()
+    data['right_points']=[{j:(-10.*x,y) for j,(x,y) in f.items()} for f in data['right_points']]
+    observed=measure_review_focal_incident(**data)
+    data['right_points']=[{}]*3;data['right_faces']=[None]*3
+    missing=measure_review_focal_incident(**data)
+    assert missing['exploration_score']>=observed['exploration_score']
+    assert missing['face_scale_log_error'] is None
+
+
+def test_incident_cannot_call_a_native_cut_or_repeated_raster_a_measured_tangent():
+    for native in (None,[(1,'d','other-file',3,3),(1,'d','other-file',4,4),(1,'d','other-file',4,5)],
+            [(1,'d','other-file',3,3)]*3):
+        data=incident_fixture();data['right_native']=native
+        result=measure_review_focal_incident(**data)
+        assert not result['physical_tangents_observed']
+        assert result['action_cost_intervals']==[(0.,1.)]*3
+
+
+def test_good_middle_cannot_buy_a_worse_return_or_discard_known_action():
+    from copy import deepcopy
+    baseline=measure_review_focal_incident(**incident_fixture())
+    original=[deepcopy(baseline) for _ in range(3)]
+    original[1]['face_scale_log_error']=.5
+    candidate=deepcopy(original);candidate[1]['face_scale_log_error']=0.
+    candidate[2]['face_scale_log_error']=.9
+    result=compare_review_focal_incident_inventory(original,candidate)
+    assert not result['eligible_for_further_review']
+    assert result['failures'][0]['incident']==2
+    candidate=deepcopy(original);candidate[0]['joint_requests'][0]['state']='UNOBSERVED'
+    assert not compare_review_focal_incident_inventory(original,candidate)['eligible_for_further_review']
+    assert compare_review_focal_incident_inventory(original,original)['eligible_for_further_review']
 
 
 def test_focal_pair_scores_the_exact_render_tracks_without_automatic_zoom_release():
@@ -63,6 +119,36 @@ def test_deleting_bad_screen_motion_observations_cannot_improve_upper_cost():
     removed=measure_review_partial_screen_trajectory(a,[{j:p for j,p in r.items() if j!=4} for r in b],ticks=ticks,fps=30.)
     assert removed['exploration_score']>=observed['exploration_score']
     assert not removed['full_action_certified'] and not removed['missing_observations_interpolated']
+
+
+def test_one_sided_wrist_motion_has_no_measured_common_direction():
+    ticks=(0,1,2,3,4)
+    shape={0:(.4,.45),1:(.6,.45),2:(.3,.55),3:(.7,.55),4:(.3,.35),5:(.7,.35)}
+    still=[dict(shape) for _ in ticks]
+    moving=[dict(shape) for _ in ticks]
+    for t,frame in zip(ticks,moving):frame[4]=(.3+.01*t,.35)
+    relative=measure_review_partial_joint_trajectory(still,moving,ticks=ticks,fps=30.)
+    assert not relative['nonstationary_common_action_observed']
+    assert relative['observed_direction_error'] is None
+    assert relative['bounded_direction_cost_interval'][1]>0.
+    assert all(r['direction_error'] is None for r in relative['direction_requests'])
+    assert any(r['applicability']=='ONE_SIDED_MOTION' for r in relative['direction_requests'])
+    screen=measure_review_partial_screen_trajectory(still,moving,ticks=ticks,fps=30.)
+    assert screen['observed_root_direction_error'] is None
+    assert screen['direction_cost_interval'][1]>0.
+    assert screen['measured_direction_requests']==0
+    assert all(r['direction_applicability']=='BOTH_STATIONARY' for r in screen['root_velocity_samples'])
+
+
+def test_observed_stillness_is_not_a_measured_angle_or_common_moving_action():
+    ticks=(0,1,2)
+    points={0:(.4,.45),1:(.6,.45),2:(.3,.55),3:(.7,.55),4:(.3,.35),5:(.7,.35)}
+    for measure in (measure_review_partial_joint_trajectory,measure_review_partial_screen_trajectory):
+        result=measure([points]*3,[points]*3,ticks=ticks,fps=30.)
+        assert result['exploration_score']==pytest.approx(0.)
+        assert result['measured_direction_requests']==0
+        assert all(r['applicability']=='BOTH_STATIONARY' and r['direction_error'] is None
+            for r in result['direction_requests'])
 
 
 def view(t,x,h):

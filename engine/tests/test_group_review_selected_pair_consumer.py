@@ -47,6 +47,16 @@ def test_mixed_source_flank_is_unknown_not_a_temporal_contract_exception():
     assert selected_incident_measurements(plan,rows,actual_cut_ticks={15})[1]['body']['state']=='INCONCLUSIVE'
 
 
+def test_physical_run_is_independent_of_authored_camera_and_never_inferred_when_missing():
+    plan,rows,states=fixture()
+    for t,v in rows.items():v['row']['projection']['camera_sha256']=f'pan-{t}'
+    assert selected_incident_measurements(plan,rows,actual_cut_ticks={10})[0]['body']['state']=='OBSERVED_BODY_PHASE_HYPOTHESIS'
+    rows[9]['native_camera_unit_index']=1
+    assert selected_incident_measurements(plan,rows,actual_cut_ticks={10})[0]['body']['state']=='INCONCLUSIVE'
+    rows[9].pop('native_camera_unit_index')
+    assert selected_incident_measurements(plan,rows,actual_cut_ticks={10})[0]['body']['state']=='INCONCLUSIVE'
+
+
 def test_known_support_loss_cannot_use_the_original_unknown_allowance():
     original=[dict(output_tick=3,state='PASS'),dict(output_tick=4,state='UNKNOWN')]
     candidate=[dict(output_tick=3,state='UNKNOWN'),dict(output_tick=4,state='UNKNOWN')]

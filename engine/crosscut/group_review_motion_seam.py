@@ -24,6 +24,24 @@ def review_actor_association_valid(view):
         and view.get('selected_actor_association_state') not in ('AMBIGUOUS','UNMATCHED','UNKNOWN'))
 
 
+def review_native_window_continuous(sequence):
+    """Physical continuity is independent of the authored projection camera."""
+    if len(sequence)<2 or any(v is None for v in sequence):return False
+    previous=None
+    for view in sequence:
+        run=view.get('native_camera_unit_index');row=view['row'];raw=row['native_observation']
+        if type(run) is not int or run<0:return False
+        key=(raw['request_source_index'],raw['source_clock_identity'],
+            tuple(raw['source_file_identity']),run)
+        tick=row['output_tick'];native=raw['native_frame_index']
+        if type(tick) is not int or type(native) is not int:return False
+        if previous is not None:
+            old_key,old_tick,old_native=previous
+            if key!=old_key or tick<=old_tick or not 0<=native-old_native<=12:return False
+        previous=(key,tick,native)
+    return True
+
+
 def _window_links(sequence):
     """Check every sampled edge; equal endpoints do not establish a path.
 
@@ -47,16 +65,19 @@ def _window_links(sequence):
                 and left['descriptor'].frame_local_head_id!=right['descriptor'].frame_local_head_id):
             return False
         native_a,native_b=left.get('native_camera_unit_index'),right.get('native_camera_unit_index')
-        same_camera=(native_a==native_b if type(native_a) is int and type(native_b) is int
-            else native_a is None and native_b is None
-            and a['projection']['camera_sha256']==b['projection']['camera_sha256'])
+        same_camera=(type(native_a) is int and type(native_b) is int
+            and native_a>=0 and native_a==native_b)
         if (not same_camera
                 or rb['native_frame_index']-ra['native_frame_index']>12):
             return False
         appearance=cosine(left['vector'],right['vector'])
         if appearance is None or appearance<.25:
             return False
-    return True
+        from .group_review_actor_path import _link
+        actual_link=_link(left,right,maximum_native_gap=12,minimum_cosine=.25)
+        if actual_link is None or not actual_link['linked']:
+            return False
+    return review_native_window_continuous(sequence)
 
 
 def review_window_connected(sequence, *, require_native_motion=False):

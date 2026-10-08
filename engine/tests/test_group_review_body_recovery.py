@@ -1,11 +1,12 @@
 from copy import deepcopy
 from dataclasses import replace
+import json
 import pytest
 
 from crosscut.group_review_body_recovery import (freeze_review_body_window,
     apply_review_body_receipt,apply_review_primary_joint_observation,
     head_fingerprint,native_binding,consume_head_conditioned_review_support,
-    plan_partial_review_body_windows)
+    plan_partial_review_body_windows,merge_review_body_receipts,FrozenReviewBodyWindow)
 from crosscut.body_pose_2d import RTMPOSE_BODY7_MODEL_SHA256
 from crosscut.group_performer_family_owner import digest
 from crosscut.group_review_camera_repair import FramingDescriptor
@@ -72,6 +73,35 @@ def test_partial_body_recovery_splits_actual_camera_cuts_without_erasing_other_r
     assert [[v['binding']['native'] for v in w.payload['requests']] for w in windows]==[[10,11],[12,14]]
     assert [w.payload['native_camera_unit'] for w in windows]==[0,1]
     assert report['physical_run_count']==2 and report['missing_or_ambiguous_slots']==[103]
+
+
+def test_detector_gap_does_not_discard_later_available_native_pair():
+    natives=[0,5,10,15,20,25,30,31]
+    windows,report=partial_scope([raw(n) if n in (0,30,31) else None for n in natives],natives=natives)
+    assert [[r['binding']['native'] for r in w.payload['requests']] for w in windows]==[[30,31]]
+    assert report['unavailable'][0]['ticks']==[100]
+
+
+def test_cross_bundle_roi_conflict_is_order_independent_without_erasing_unrelated_evidence():
+    window,_,receipt=fixture()
+    bundle=dict(contract='bounded_actual_fixed_roi_body_review_receipts_v1',
+        windows=[dict(identity=window.identity,token=window.payload)],receipts=[receipt])
+    other=deepcopy(bundle);token=other['windows'][0]['token']
+    for r in token['requests']:r['roi']=[.3,.15,.45,.75]
+    alternate=FrozenReviewBodyWindow(json.dumps(token))
+    other['windows'][0]['identity']=alternate.identity
+    other['receipts'][0]['window_identity']=alternate.identity
+    other['receipts'][0]['pose']['bbox_xywh']=[.3,.15,.45,.75]
+    unrelated=deepcopy(receipt);request=window.payload['requests'][2]
+    unrelated.update(binding=request['binding'],raw_parent_sha256=request['raw_parent_sha256'])
+    bundle['receipts'].append(unrelated)
+    merged,audit=merge_review_body_receipts(bundle,other)
+    reverse,reverse_audit=merge_review_body_receipts(other,bundle)
+    assert merged==reverse and audit==reverse_audit
+    assert len(merged)==1 and next(iter(merged))[1]==12
+    assert len(audit['conflicts'])==1 and audit['conflicts'][0]['native_frame_index']==11
+    duplicate,duplicate_audit=merge_review_body_receipts(bundle,deepcopy(bundle))
+    assert len(duplicate)==2 and not duplicate_audit['conflicts']
 
 
 def test_ambiguous_actor_is_not_completed_or_allowed_to_hide_other_occurrences():

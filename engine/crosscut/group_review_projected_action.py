@@ -174,7 +174,7 @@ def measure_review_partial_screen_trajectory(left,right,*,ticks,fps,aspect=9/16)
             frames.append(frame)
         values.append(frames)
     weights={0:.1,1:.1,2:1.,3:1.,4:1.5,5:1.5,'root':2.}
-    losses=[0.,0.,0.];known=[0.,0.,0.];roots=[];measured_velocity=0
+    losses=[0.,0.,0.];known=[0.,0.,0.];roots=[];measured_velocity=0;direction_requests=[]
     for i,(a,b) in enumerate(zip(*values)):
         for joint,weight in weights.items():
             if joint in a and joint in b:
@@ -187,21 +187,34 @@ def measure_review_partial_screen_trajectory(left,right,*,ticks,fps,aspect=9/16)
             an,bn=float(np.linalg.norm(av)),float(np.linalg.norm(bv))
             difference=float(np.linalg.norm(av-bv))
             velocity=difference/(.15+an+bn)
-            direction=0. if min(an,bn)<.02 else (1-float(np.clip(av@bv/(an*bn),-1.,1.)))/2
-            losses[1]+=weight*velocity;losses[2]+=weight*direction
-            known[1]+=weight;known[2]+=weight;measured_velocity+=1
+            direction=None
+            if min(an,bn)>=.02:
+                direction=(1-float(np.clip(av@bv/(an*bn),-1.,1.)))/2
+                losses[2]+=weight*direction;known[2]+=weight
+                applicability='BOTH_MOVING'
+            elif max(an,bn)<.02:
+                known[2]+=weight;applicability='BOTH_STATIONARY'
+            else:
+                applicability='ONE_SIDED_MOTION'
+            losses[1]+=weight*velocity
+            known[1]+=weight;measured_velocity+=1
+            direction_requests.append(dict(tick=ticks[i],joint=joint,
+                applicability=applicability,direction_error=direction))
             if joint=='root':roots.append(dict(tick=ticks[i],left_velocity=av.tolist(),
                 right_velocity=bv.tolist(),velocity_difference=difference,direction_error=direction,
-                both_nonstationary=min(an,bn)>=.02))
+                direction_applicability=applicability,both_nonstationary=min(an,bn)>=.02))
     total=sum(weights.values());denominators=[len(ticks)*total,(len(ticks)-1)*total,(len(ticks)-1)*total]
     intervals=[(loss/d,(loss+max(0.,d-k))/d) for loss,k,d in zip(losses,known,denominators)]
     cost=tuple(2*intervals[0][i]+intervals[1][i]+.7*intervals[2][i] for i in (0,1))
+    root_directions=[r['direction_error'] for r in roots if r['direction_error'] is not None]
     return dict(contract='partial_actual_screen_root_and_joint_motion_v1',
         state='UNMEASURED' if not measured_velocity else 'PARTIAL_OBSERVED_HYPOTHESIS',
         exploratory_cost_interval=list(cost),exploration_score=None if not measured_velocity else cost[1],
         position_cost_interval=list(intervals[0]),velocity_cost_interval=list(intervals[1]),
         direction_cost_interval=list(intervals[2]),root_velocity_samples=roots,
-        observed_root_direction_error=None if not roots else sum(r['direction_error'] for r in roots)/len(roots),
+        observed_root_direction_error=None if not root_directions else sum(root_directions)/len(root_directions),
+        direction_requests=direction_requests,
+        measured_direction_requests=sum(r['direction_error'] is not None for r in direction_requests),
         measured_velocity_requests=measured_velocity,coverage=known[0]/denominators[0],
         actual_screen_root_translation_removed=False,missing_observations_interpolated=False,
         full_action_certified=False,quality_approved=False)

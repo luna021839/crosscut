@@ -24,8 +24,8 @@ def face_shape_risk(a,b):
 def local_motion(a,b,fps):
     if a is None or b is None or a['descriptor'] is None or b['descriptor'] is None: return None
     ra,rb = a['row'],b['row']
-    if (ra['projection']['camera_sha256'] != rb['projection']['camera_sha256']
-            or rb['output_tick'] <= ra['output_tick']): return None
+    from .group_review_motion_seam import review_native_window_continuous
+    if not review_native_window_continuous((a,b)):return None
     sim = cosine(a['vector'],b['vector'])
     if sim is None or sim < .25: return None
     dt = (rb['output_tick']-ra['output_tick'])/fps
