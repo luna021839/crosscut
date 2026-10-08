@@ -26,29 +26,21 @@ class GeometryJointSampler(JointSampler):
 
 class JointCompleteMetadataTests(unittest.TestCase):
     def test_typed_native_program_reaches_normal_candidate_consumer_without_camera_refit(self):
-        from crosscut.group_joint_bundle_metadata import GroupNativeMotionProduction
-        from crosscut.group_joint_native_preparation import _plan_identity
+        from tests.test_group_native_motion_bundle import synthetic_production, consumer_kwargs
         from crosscut.pipeline import _derive_complete_group_candidate
-        args=self.fixture(camera=True)
-        selected=complete_joint_group_bundle_metadata(**args).candidate_bundle
-        domain=args['domain'];plan=selected.render_plan
-        # Synthetic already-realized input tests the CONSUMER, not the absent
-        # normal producer or actual actor/media validity.
-        production=GroupNativeMotionProduction(selected.visual_timeline,plan,selected.editorial_motion_plan,
-            domain,None,(),_plan_identity(args['incumbent'].render_plan),(),'SELECTED_FOR_REVIEW')
+        production=synthetic_production();selected=production.complete_bundle
+        domain=production.source_domain;plan=selected.render_plan
+        # Typed numeric input tests metadata transport, not model observations
+        # or the still-incomplete full-topology normal producer.
         materialized=SimpleNamespace(visual_plan=selected.visual_timeline,candidate_index=7,
             review_rank=3,cadence_profile='synthetic_native_program_consumer')
-        request=SimpleNamespace(sources=plan.sources,reference_source=0,aspect_ratio=plan.aspect_ratio)
-        kwargs=dict(request=request,eligible_indices=domain.eligible_indices,audio_offsets=domain.audio_offsets,
-            source_timewarps=domain.source_timewarps,scene_cut_times=domain.scene_cut_times,
-            source_aspect_ratios=(16/9,)*4,source_durations_seconds=(10.,)*4,beat_period_seconds=1.,
-            phrase_times=selected.phrase_times,section_plan=selected.section_plan,common_master_start=0.,
-            width=plan.width,height=plan.height,output=Path('/synthetic/renamed-only.mp4'),
-            native_motion_production=production,native_motion_reporter=SimpleNamespace(log=lambda *a:None),
-            native_motion_warnings=[])
+        kwargs=consumer_kwargs(production)
         bundle=_derive_complete_group_candidate(materialized,**kwargs)
         self.assertEqual(bundle.render_plan,replace(plan,output=kwargs['output']))
         self.assertIs(bundle.editorial_motion_plan,production.editorial_motion_plan)
+        self.assertIs(bundle.face_match_plan,selected.face_match_plan)
+        self.assertIs(bundle.boundary_look_match,selected.boundary_look_match)
+        self.assertIs(bundle.boundary_repairs,selected.boundary_repairs)
         self.assertIs(bundle.native_motion_production,production)
         self.assertEqual((bundle.candidate_index,bundle.review_rank,bundle.cadence_profile),
             (7,3,'synthetic_native_program_consumer'))
@@ -61,7 +53,7 @@ class JointCompleteMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'corresponding materialized'):
             _derive_complete_group_candidate(materialized,**dict(kwargs,
                 visual_timeline_override=selected.visual_timeline))
-        mismatched=SimpleNamespace(visual_plan=args['incumbent'].visual_timeline,candidate_index=7,
+        mismatched=SimpleNamespace(visual_plan=replace(selected.visual_timeline,analysis_basis='another_timeline'),candidate_index=7,
             review_rank=3,cadence_profile='synthetic_native_program_consumer')
         with self.assertRaisesRegex(ValueError,'corresponding materialized'):
             _derive_complete_group_candidate(mismatched,**kwargs)

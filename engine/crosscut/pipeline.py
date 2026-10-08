@@ -22242,11 +22242,12 @@ def _derive_complete_group_candidate(
             common_start=common_master_start,section_plan=section_plan,phrase_times=phrase_times,
             output=output,reporter=native_motion_reporter,warnings=native_motion_warnings,
             native_motion_production=native_motion_production)
-        # A singleton producer result may enter a finite normal candidate stream
-        # once. It is not candidate zero for every pre-existing visual candidate.
-        return replace(bundle,candidate_index=materialized.candidate_index,
-            review_rank=materialized.review_rank,cadence_profile=materialized.cadence_profile,
-            candidate_origin='normal_native_motion_program')
+        # Identity/rank belong to the frozen selected bundle. Relabeling one
+        # producer result for several existing candidates is not stream insertion.
+        if (bundle.candidate_index,bundle.review_rank,bundle.cadence_profile)!=(
+                materialized.candidate_index,materialized.review_rank,materialized.cadence_profile):
+            raise ValueError('normal native candidate differs from its sealed stream identity and rank')
+        return bundle
 
     local_sources = tuple(
         request.sources[index] for index in eligible_indices
@@ -27432,7 +27433,8 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
     motion before accepting the realized path; this is not a quality approval.
     """
     if native_motion_production is not None:
-        from .group_joint_bundle_metadata import GroupNativeMotionProduction
+        from .group_joint_bundle_metadata import (GroupNativeMotionProduction,
+            validate_native_motion_production)
         if (not isinstance(native_motion_production,GroupNativeMotionProduction)
                 or realized_plan is not None or realized_motion is not None or shot_clock_context is not None
                 or timeline != native_motion_production.visual_timeline
@@ -27442,6 +27444,7 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
                 or native_motion_production.source_domain.source_timewarps != tuple(timewarps)
                 or native_motion_production.state not in ('SELECTED_FOR_REVIEW','KEEP_ORIGINAL')):
             raise ValueError('normal native production changed its selected source/timeline/domain')
+        validate_native_motion_production(native_motion_production)
         realized_plan=native_motion_production.render_plan
         realized_motion=native_motion_production.editorial_motion_plan
         shot_clock_context=native_motion_production.shot_clock_context
@@ -27470,6 +27473,19 @@ def _review_first_group_bundle(*, timeline, request, eligible_indices, offsets, 
         # transition recipes and authorized local video clocks stay intact.
         plan=replace(realized_plan,output=output)
         transitions=GroupTransitionPlan(plan.transitions,analysis_basis='realized_group_motion_program_v1')
+    if native_motion_production is not None:
+        selected=native_motion_production.complete_bundle
+        if (section_plan!=selected.section_plan
+                or tuple(float(value) for value in phrase_times)!=selected.phrase_times):
+            raise ValueError('normal native production changed its frozen music/section authority')
+        # Never reconstruct a selected result as a neutral baseline. Preserve
+        # face scale, repairs, look, affine, raw history and learned provenance;
+        # only relocate the final output and attach the non-cyclic envelope.
+        bundle=replace(selected,render_plan=plan,native_motion_production=native_motion_production)
+        _validate_review_first_group_bundle(bundle,eligible_indices=eligible_indices,offsets=offsets,
+            timewarps=timewarps,common_start=common_start,phrase_times=selected.phrase_times,
+            shot_clock_context=shot_clock_context)
+        return bundle
     review = _review_visual_timeline_for_render(timeline, available_source_count=len(eligible_indices),
         reporter=reporter, warnings=warnings, comparison_render_allowed=True)
     phrase_inputs=tuple(phrase_times)
@@ -27510,12 +27526,14 @@ def _validate_review_first_group_bundle(bundle, *, eligible_indices, offsets, ti
     plan, timeline = bundle.render_plan, bundle.visual_timeline
     if bundle.native_motion_production is not None:
         production=bundle.native_motion_production
-        from .group_joint_bundle_metadata import GroupNativeMotionProduction
+        from .group_joint_bundle_metadata import (GroupNativeMotionProduction,
+            validate_native_motion_production)
         if (not isinstance(production,GroupNativeMotionProduction)
                 or replace(plan,output=production.render_plan.output)!=production.render_plan
                 or timeline!=production.visual_timeline
                 or bundle.editorial_motion_plan!=production.editorial_motion_plan):
             raise ValueError('selected native program was changed after motion/camera evaluation')
+        validate_native_motion_production(production,attached_bundle=bundle)
         if shot_clock_context is None:shot_clock_context=production.shot_clock_context
         elif shot_clock_context!=production.shot_clock_context:
             raise ValueError('selected native program borrowed another local video clock context')
@@ -34522,6 +34540,17 @@ def analyze(
                 visual_timeline = group_first.incumbent.visual_timeline
                 review_first_verified_candidate_bundle = group_first.incumbent
 
+        selected_native_group_bundle = (group_first.incumbent if group_first is not None
+            and group_first.incumbent.native_motion_production is not None else None)
+        if selected_native_group_bundle is not None:
+            _validate_review_first_group_bundle(selected_native_group_bundle,
+                eligible_indices=eligible_indices,offsets=offsets,timewarps=eligible_timewarps,
+                common_start=common_start,phrase_times=phrase_times)
+            visual_boundary_repairs = selected_native_group_bundle.boundary_repairs
+            face_match_plan = selected_native_group_bundle.face_match_plan
+            group_transition_plan = selected_native_group_bundle.group_transition_plan
+            boundary_affine_plan = selected_native_group_bundle.boundary_affine_plan
+            editorial_motion_plan = selected_native_group_bundle.editorial_motion_plan
         def optional_group_refinement(stage, operation, validate=None):
             return group_first.run_optional(stage, operation, validate=validate) if group_first is not None else operation()
         def validate_boundary_repair(proposal):
@@ -34537,7 +34566,8 @@ def analyze(
                 offsets=offsets, timewarps=eligible_timewarps, common_start=common_start,
                 phrase_times=phrase_times)
             group_first.validate_plan(bundle.render_plan)
-        if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
+        if (selected_native_group_bundle is None
+                and visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
                 and (not review_first_runtime.enabled or review_first_runtime.optional_refinement_allowed)):
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
             try:
@@ -34620,13 +34650,15 @@ def analyze(
                 timeline_review=timeline_review,
                 allow_failed_comparison_render=allow_failed_comparison_render,
             )
-        if visual_timeline is not None and visual_timeline.geometry_basis == "prescribed_render_geometry_v1":
+        if (selected_native_group_bundle is None and visual_timeline is not None
+                and visual_timeline.geometry_basis == "prescribed_render_geometry_v1"):
             group_transition_plan = GroupTransitionPlan(
                 tuple(RenderTransition(tier="C", reason="prescribed_learned_geometry_pending_decoded_review")
                       for _ in range(max(0, len(visual_timeline.choices) - 1))),
                 analysis_basis="prescribed_render_geometry_single_authority_v1",
             )
-        if (visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
+        if (selected_native_group_bundle is None
+                and visual_timeline is not None and visual_timeline.geometry_basis == "source_pixels"
                 and (group_first is None or review_first_runtime.optional_refinement_allowed)):
             try:
                 if any(value <= 0.0 for value in source_aspect_ratios):
