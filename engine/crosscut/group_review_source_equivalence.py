@@ -7,10 +7,19 @@ This is file equivalence, never actor, motion or perceptual-quality authority.
 """
 from dataclasses import dataclass,field
 import json
+import hashlib
+import hmac
+import secrets
 
 from .group_performer_family_owner import digest
 
 _OWNER=object()
+_SEAL_KEY=secrets.token_bytes(32)
+
+
+def _binding_seal(source,clock,raw_parent,recorded,current):
+    fields=json.dumps((source,clock,raw_parent,recorded,current),separators=(',',':'),allow_nan=False).encode()
+    return hmac.new(_SEAL_KEY,fields,hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True,slots=True)
@@ -21,9 +30,13 @@ class VerifiedNativeFileBinding:
     recorded_file_identity: tuple[int,...]
     physical_file_identity: tuple[int,...]
     _owner: object=field(repr=False,compare=False)
+    _seal: str=field(repr=False,compare=False)
 
     def __post_init__(self):
-        if self._owner is not _OWNER:
+        if (self._owner is not _OWNER or not isinstance(self._seal,str)
+                or not hmac.compare_digest(self._seal,_binding_seal(self.request_source_index,
+                    self.source_clock_identity,self.raw_parent_identity,self.recorded_file_identity,
+                    self.physical_file_identity))):
             raise ValueError('physical file continuity requires the live verified sensor binding')
 
     def identity_for(self,raw):
@@ -58,7 +71,9 @@ def freeze_verified_native_file_binding(sensors,raw,source_equivalence_json):
                 or any(c not in '0123456789abcdef' for c in sha)
                 or receipt.get('archived_observations_rewritten') is not False):
             raise ValueError('archived parent changed beyond verified device-only remount')
-    return VerifiedNativeFileBinding(source,raw['source_clock_identity'],digest(raw),recorded,current,_OWNER)
+    parent=digest(raw);clock=raw['source_clock_identity']
+    return VerifiedNativeFileBinding(source,clock,parent,recorded,current,_OWNER,
+        _binding_seal(source,clock,parent,recorded,current))
 
 
 def physical_review_file_identity(view):

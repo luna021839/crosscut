@@ -75,6 +75,18 @@ def test_detector_head_id_permutation_does_not_change_content_or_rank():
     assert [(p['hypothesis_sha256'],p['cost']) for p in a]==[(p['hypothesis_sha256'],p['cost']) for p in b]
 
 
+def test_optional_endpoint_link_diagnostic_reports_cosine_without_private_vectors():
+    from crosscut.group_review_actor_path import _link
+    left,right=view(0,0),view(1,1)
+    diagnostic={}
+    assert _link(left,right,maximum_native_gap=12,minimum_cosine=.25,diagnostic=diagnostic) is None
+    assert diagnostic['state']=='BELOW_MINIMUM_SFACE_COSINE'
+    assert diagnostic['sface_cosine']==0.
+    assert not diagnostic['private_embeddings_included'] and 'vector' not in diagnostic
+    assert _link(left,right,maximum_native_gap=12,minimum_cosine=.25) is None
+    assert diagnostic['fixed_chain_null_edge_cost']==3.
+
+
 def test_missing_exit_is_not_largest_face_reacquisition():
     paths=anonymous_review_actor_paths([[view(0,0)],[view(2,0)],[]])
     assert paths[0]['frame_local_head_ids'][-1] is None

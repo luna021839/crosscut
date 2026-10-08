@@ -281,6 +281,20 @@ class PhaseWorkPort:
             if self.charged[k] + self.reserved[k] + n > self.allocation.resources[k]:
                 self._deny(k)
 
+    def remaining_capacity(self,kinds):
+        """Bounded live capacity for admission planning, never a reservation.
+
+        The real subsequent charge/start ACK remains authoritative. A worker
+        must query this owning port rather than copy allocation/counter state.
+        """
+        with self.lease._lock:
+            self._check()
+            if (not isinstance(kinds,(tuple,list)) or not 1<=len(kinds)<=4
+                    or any(not isinstance(k,str) or k not in RESOURCES for k in kinds)
+                    or len(set(kinds))!=len(kinds)):
+                raise ValueError('capacity query needs at most four unique named work dimensions')
+            return {k:max(0,self.allocation.resources[k]-self.charged[k]-self.reserved[k]) for k in kinds}
+
     def _reserve_terminal(self, key):
         self._capacity({"journal_bytes": TERMINAL_BYTES})
         self.reserved["journal_bytes"] += TERMINAL_BYTES

@@ -250,3 +250,10 @@ def synthetic_mlx_head(version=3):
             if version==3:return materialize_stage_edit_head_frames_v3(checkpoint_directory=path, sequence=fixture.sequence,
                 canonical_source_ids=('A','B'), derivative_family_id_by_source={'A':0,'B':1})
             return materialize_stage_edit_head_frames_v2(checkpoint_directory=path,sequence=fixture.sequence,canonical_source_ids=('A','B'))
+def phase_remaining_capacity():
+    from crosscut.request_work_lease import current_request_work_phase
+    port=current_request_work_phase()
+    first=port.remaining_capacity(('model_calls','new_decodes'))
+    port.charge('model_calls',1,model='synthetic-capacity-query')
+    second=port.remaining_capacity(('model_calls','new_decodes'))
+    return dict(first=first,second=second,copied_budget_authority=False)

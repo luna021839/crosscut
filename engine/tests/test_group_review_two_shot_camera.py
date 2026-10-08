@@ -146,6 +146,27 @@ def test_better_facial_geometry_cannot_buy_a_known_moving_wrist_reversal():
         for r in comparison['failures'])
 
 
+@pytest.mark.parametrize('damage', ('position_jump', 'cut_side_stop'))
+def test_observed_wrist_damage_is_not_reported_as_incident_nonregression(damage):
+    before=measure_review_focal_incident(**incident_fixture())
+    data=incident_fixture()
+    if damage=='position_jump':
+        for frame in data['right_points']:
+            x,y=frame[4];frame[4]=(x+.2,y)
+    else:
+        start=data['right_points'][0][4]
+        for frame in data['right_points']:
+            frame[4]=start
+    after=measure_review_focal_incident(**data)
+    assert before['face_position_error']==after['face_position_error']
+    assert before['face_scale_log_error']==after['face_scale_log_error']
+    result=compare_review_focal_incident_inventory((before,),(after,))
+    assert not result['eligible_for_further_review']
+    assert any(row['incident']==0 and row['metric'].startswith('joint_4_')
+        for row in result['failures'])
+    assert not result['quality_approved']
+
+
 @pytest.mark.parametrize('applicability',('ONE_SIDED_MOTION','BOTH_STATIONARY'))
 def test_inapplicable_direction_is_not_invented_to_reject_a_camera(applicability):
     from copy import deepcopy

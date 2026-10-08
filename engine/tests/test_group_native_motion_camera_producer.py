@@ -22,7 +22,7 @@ from tests.test_scene_role_epoch_program import fixture
 from tests.test_group_review_recorded_index import native_record
 
 
-def inputs(*,missing_tick=None):
+def inputs(*,missing_tick=None,member_hint_by_source=None):
     context,domain,_=fixture(native_fps=Fraction(30))
     context.incumbent.face_match_plan=None
     original=freeze_owned_scene_program(context,domain)
@@ -53,6 +53,17 @@ def inputs(*,missing_tick=None):
             supplies[demand.native_key]=NativeMotionSupply(demand,None if tick==missing_tick else raw,
                 None if tick==missing_tick else app)
     model_owner=world()[0].sensors
+    if member_hint_by_source is not None:
+        from tests.test_ive_local_arcface_gallery import gallery,cached_features,SPACE
+        from crosscut.native_face_descriptor import ARCFACE_MODEL_NAME,ARCFACE_R50_SHA256
+        model_owner.member_gallery=gallery()
+        model_owner.session.models[ARCFACE_MODEL_NAME]=(None,None,ARCFACE_R50_SHA256)
+        model_owner.session.model_adapters[ARCFACE_MODEL_NAME]=SPACE.adapter_sha256
+        supplies={key:replace(supply,demand=replace(supply.demand,require_member_features=True),
+            member_features=None if supply.observation is None else cached_features(
+                json.loads(json.dumps(supply.observation.to_dict())),model_owner.member_gallery,
+                member_hint_by_source.get(supply.demand.source_index,0)))
+            for key,supply in supplies.items()}
     views=NativeMotionViews(model_owner,NativeMotionInventory(tuple(supplies.values()),(),True,'COMPLETED_ONCE'))
     actors,receipt=views.freeze_original_actors(before,tuple(before),original_program_identity=original.program_sha256)
     paths=[];path_receipts=[]
@@ -157,3 +168,99 @@ def test_member_hints_are_an_additional_conflict_check_not_a_named_actor_certifi
     assert all(not r['named_actor_certified'] and not r['quality_approved'] for r in evidence)
     selected[45]=dict(right,member_hint=None)
     assert not _appearance_incidents(selected,30,45,60)[1]['local_member_hint_conflict']
+
+
+def test_uncalibrated_photo_member_hint_cannot_veto_a_measured_camera_candidate():
+    args=inputs(member_hint_by_source={3:1})
+    candidates,_=produce_two_sided_native_cameras(**args)
+    assert candidates
+    for candidate in candidates:
+        evidence=candidate.evidence
+        assert evidence['local_member_hint_conflict_ticks']==[45,60]
+        assert evidence['state']=='REALIZED_FOR_REVIEW'
+        assert not evidence['member_hints_are_hard_eligibility_authority']
+        assert evidence['local_member_hint_exploration_penalty']>0
+        assert all(not row['named_actor_certified'] for row in evidence['actual_appearance_incidents'])
+        assert not evidence['quality_approved']
+    assert args['views'].sensors.session.budget.counts['model_calls']==0
+
+
+def test_changed_anchor_ambiguity_cannot_reuse_the_unambiguous_cached_path():
+    args=inputs();side=args['sides'][0];views=args['views']
+    numeric=realize_native_motion_programme(original=args['context'].incumbent.render_plan,
+        domain=args['domain'],sides=args['sides'])
+    compiled=compile_common_clock_camera_queries(context=args['context'],domain=args['domain'],
+        original_program=args['original_program'],candidate_plan=numeric.render_plan,
+        output_intervals=((27,63),))
+    qs={t:q for q in compiled.queries for t in range(q.first_output_frame,q.end_output_frame)}
+    ticks=tuple(range(side.first_output_frame,side.end_output_frame))
+    anchor=views.candidates(qs[ticks[0]],ticks[0],association_ready=True)[0]
+    _,clear=views.connected_actor_views(qs,ticks,anchor)
+    changed,uncertain=views.connected_actor_views(qs,ticks,dict(anchor,reacquisition_ambiguous=True))
+    assert not clear['ambiguous'] and uncertain['ambiguous']
+    assert changed[ticks[0]]['reacquisition_ambiguous']
+    assert views.connected_actor_views(qs,ticks,anchor)[1] is clear
+    assert views.sensors.session.budget.counts['model_calls']==0
+
+
+def test_dataclass_replace_cannot_change_a_sensor_verified_physical_file_binding():
+    args=inputs();binding=next(v['verified_native_file_binding'] for v in args['side_paths'][0].values()
+        if v is not None)
+    assert replace(binding).physical_file_identity==binding.physical_file_identity
+    with pytest.raises(ValueError,match='physical file continuity'):
+        replace(binding,physical_file_identity=(999,*binding.physical_file_identity[1:]))
+
+
+@pytest.mark.parametrize('damage',('head','ambiguity','role','scope','receipt_body'))
+def test_stale_original_actor_receipt_is_rejected_before_camera_fit(damage):
+    args=inputs();original=dict(args['original_actors']);receipt=dict(args['original_actor_receipt'])
+    tick=30;view=original[tick]
+    if damage=='head':
+        original[tick]=dict(view,descriptor=replace(view['descriptor'],frame_local_head_id=8))
+    elif damage=='ambiguity':original[tick]=dict(view,reacquisition_ambiguous=True)
+    elif damage=='role':original[tick]=dict(view,original_role='required_formation')
+    elif damage=='scope':original[tick]=dict(view,original_attention_scope='another-original-scope')
+    else:receipt=dict(receipt,minimum_cosine=.123)
+    with pytest.raises(ValueError,match='original actor.*receipt'):
+        produce_two_sided_native_cameras(**dict(args,original_actors=original,original_actor_receipt=receipt))
+
+
+def test_borrowed_donor_path_receipt_with_same_geometry_is_rejected():
+    args=inputs();receipt=dict(args['side_path_receipts'][0])
+    changed=dict(args['side_paths'][0]);tick=30;view=changed[tick]
+    row=dict(view['row']);raw=dict(row['native_observation'],request_source_index=3)
+    changed[tick]=dict(view,row=dict(row,native_observation=raw))
+    with pytest.raises(ValueError,match='actor path.*receipt'):
+        produce_two_sided_native_cameras(**dict(args,side_paths=(changed,args['side_paths'][1]),
+            side_path_receipts=(receipt,args['side_path_receipts'][1])))
+
+
+@pytest.mark.parametrize('damage',('unsampled_wrist_loss','reversed_wrist','stopped_wrist'))
+def test_hold_measurement_retains_all_known_ticks_and_negative_motion(damage):
+    from crosscut.group_native_motion_camera_producer import _measure_holds
+    args=inputs();side=args['sides'][1]
+    compiled=compile_common_clock_camera_queries(context=args['context'],domain=args['domain'],
+        original_program=args['original_program'],candidate_plan=args['context'].incumbent.render_plan,
+        output_intervals=((27,63),))
+    qs={t:q for q in compiled.queries for t in range(q.first_output_frame,q.end_output_frame)}
+    before=args['views'].reproject_selected_actor_path(qs,args['original_actors']);after={}
+    for t in range(side.first_output_frame,side.end_output_frame):
+        view=before[t]
+        # Explicit SYNTHETIC native coordinates exercise the real registered
+        # projector/trajectory consumer, not a model or media quality proof.
+        xy={0:(.4,.45),1:(.6,.45),4:(.3+.003*t,.6)}
+        provenance={j:dict(raw_parent_sha256=digest(view['row']['native_observation']),
+            basis='PRIMARY_NATIVE_MODEL',model_confidence=.9,xy_native=p) for j,p in xy.items()}
+        before[t]=dict(view,review_joint_provenance=provenance)
+        altered={j:dict(p) for j,p in provenance.items()}
+        if damage=='unsampled_wrist_loss' and t==51:altered.pop(4)
+        if damage=='reversed_wrist':altered[4]['xy_native']=(.6-.003*t,.6)
+        if damage=='stopped_wrist':altered[4]['xy_native']=(.3+.003*side.first_output_frame,.6)
+        after[t]=dict(view,review_joint_provenance=altered)
+    hold=_measure_holds(qs,before,qs,after,(side,),30.)[0]
+    assert 51 not in hold['requested_ticks'] and 51 in hold['known_observation_audit_ticks']
+    if damage=='unsampled_wrist_loss':
+        assert (51,'known_joint_4') in hold['known_observation_losses']
+    else:
+        assert any(r['reason']==('KNOWN_HOLD_DIRECTION_REVERSAL' if damage=='reversed_wrist'
+            else 'KNOWN_HOLD_CANDIDATE_MOTION_STOP') for r in hold['known_motion_failures'])

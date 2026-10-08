@@ -59,10 +59,10 @@ def _support(view,query,tick):
         if all(isfinite(v) and 0<=v<=1 for v in p))))
 
 
-def _native_joints(view,query,tick):
+def _native_joints(view,query,tick,*,observed=None):
     # Validate the exact raw parent/ROI receipt through the registered consumer;
     # then consume its native coordinates, never camera-projected articulation.
-    observed=project_observed_review_joints(view,query,tick)
+    if observed is None:observed=project_observed_review_joints(view,query,tick)
     if view is None:return {},9/16
     raw=view['row']['native_observation']
     width,height=raw['frame_size_wh']
@@ -88,14 +88,18 @@ def _measure_holds(before_queries,before,after_queries,after,sides,fps):
     result=[]
     for side in sides:
         ticks=_sample_ticks(side.first_output_frame,side.end_output_frame)
-        before_faces=[project_observed_review_face(before[t],before_queries[t],t) for t in ticks]
-        after_faces=[project_observed_review_face(after[t],after_queries[t],t) for t in ticks]
-        a=[project_observed_review_joints(before[t],before_queries[t],t) for t in ticks]
-        b=[project_observed_review_joints(after[t],after_queries[t],t) for t in ticks]
-        native_a=[_native_joints(before[t],before_queries[t],t) for t in ticks]
-        native_b=[_native_joints(after[t],after_queries[t],t) for t in ticks]
+        audit_ticks=tuple(range(side.first_output_frame,side.end_output_frame))
+        before_faces={t:project_observed_review_face(before[t],before_queries[t],t) for t in audit_ticks}
+        after_faces={t:project_observed_review_face(after[t],after_queries[t],t) for t in audit_ticks}
+        all_a={t:project_observed_review_joints(before[t],before_queries[t],t) for t in audit_ticks}
+        all_b={t:project_observed_review_joints(after[t],after_queries[t],t) for t in audit_ticks}
+        all_native_a={t:_native_joints(before[t],before_queries[t],t,observed=all_a[t]) for t in audit_ticks}
+        all_native_b={t:_native_joints(after[t],after_queries[t],t,observed=all_b[t]) for t in audit_ticks}
+        a=[all_a[t] for t in ticks];b=[all_b[t] for t in ticks]
+        native_a=[all_native_a[t] for t in ticks];native_b=[all_native_b[t] for t in ticks]
         lost=[];unknown=[]
-        for t,fa,fb,pa,pb in zip(ticks,before_faces,after_faces,a,b,strict=True):
+        for t in audit_ticks:
+            fa,fb,pa,pb=before_faces[t],after_faces[t],all_a[t],all_b[t]
             if fa is not None and fa['landmarks_xy'] is not None and (fb is None or fb['landmarks_xy'] is None):
                 lost.append((t,'known_facial_landmarks'))
             if fa is None or fa['landmarks_xy'] is None:unknown.append((t,'original_facial_landmarks'))
@@ -104,7 +108,43 @@ def _measure_holds(before_queries,before,after_queries,after,sides,fps):
                         and not all(0<=v<=1 for v in pb[joint])):
                     lost.append((t,f'known_joint_{joint}'))
             unknown.extend((t,f'original_joint_{j}') for j in range(6) if j not in pa)
+        failures={}
+        def physical_edge(path,t):
+            left,right=path.get(t-1),path.get(t)
+            if left is None or right is None:return False
+            x,y=(v['row']['native_observation'] for v in (left,right))
+            return (tuple(x['source_file_identity'])==tuple(y['source_file_identity'])
+                and x['request_source_index']==y['request_source_index']
+                and x['source_clock_identity']==y['source_clock_identity']
+                and left.get('native_camera_unit_index')==right.get('native_camera_unit_index')
+                and 0<=y['native_frame_index']-x['native_frame_index']<=12)
+        # The seven-sample costs remain exploratory. Known losses and clearly
+        # adverse tangents must retain EVERY owned tick, including tick 51.
+        # Chunking bounds existing trajectory APIs while sharing one endpoint
+        # so no adjacent known velocity request disappears at a chunk edge.
+        for start in range(0,len(audit_ticks)-1,14):
+            window=audit_ticks[start:start+15]
+            if len(window)<3:window=audit_ticks[-3:]
+            na=[all_native_a[t] for t in window];nb=[all_native_b[t] for t in window]
+            native=measure_review_partial_joint_trajectory([p for p,_ in na],[p for p,_ in nb],
+                ticks=window,fps=fps,left_aspects=tuple(r for _,r in na),right_aspects=tuple(r for _,r in nb))
+            screen=measure_review_partial_screen_trajectory([all_a[t] for t in window],[all_b[t] for t in window],
+                ticks=window,fps=fps)
+            for basis,measured,threshold in (('native_articulation',native,.05),('actual_screen_motion',screen,.02)):
+                for row in measured['direction_requests']:
+                    t=row['tick'];joint=row['joint']
+                    if joint in (0,1) or not physical_edge(before,t) or not physical_edge(after,t):continue
+                    reason=None
+                    if row['applicability']=='BOTH_MOVING' and row['direction_error']>.5+1e-9:
+                        reason='KNOWN_HOLD_DIRECTION_REVERSAL'
+                    elif (row['applicability']=='ONE_SIDED_MOTION'
+                            and row['left_speed']>threshold and row['right_speed']<=threshold):
+                        reason='KNOWN_HOLD_CANDIDATE_MOTION_STOP'
+                    if reason is not None:
+                        failures[basis,t,joint]=dict(basis=basis,tick=t,joint=joint,reason=reason,
+                            direction_error=row['direction_error'],left_speed=row['left_speed'],right_speed=row['right_speed'])
         result.append(dict(requested_ticks=ticks,known_observation_losses=lost,
+            known_observation_audit_ticks=audit_ticks,known_motion_failures=list(failures.values()),
             original_unknown_requests=unknown,
             native_articulation=measure_review_partial_joint_trajectory(
                 [p for p,_ in native_a],[p for p,_ in native_b],ticks=ticks,fps=fps,
@@ -206,12 +246,16 @@ def produce_two_sided_native_cameras(*,context,domain,views,original_program,
     halo=tuple(range(first-3,end+3))
     if not set(halo)<=set(original_actors):
         raise ValueError('original actor inventory omitted a declared incident or hold')
+    from .group_review_reference_actor import validate_original_review_actor_inventory
+    from .group_review_actor_path import validate_connected_actor_path_receipt
+    validate_original_review_actor_inventory(original_actors,original_actor_receipt)
     for side,path,receipt in zip(sides,side_paths,side_path_receipts,strict=True):
         if (set(path)!=set(range(side.first_output_frame,side.end_output_frame))
                 or receipt.get('state')!='CONNECTED_SOURCE_LOCAL_HYPOTHESIS'
                 or any(v is not None and v.get('source_actor_path_identity')!=receipt.get('hypothesis_sha256')
                     for v in path.values())):
             raise ValueError('camera proposal borrowed an unconnected or partially addressed actor path')
+        validate_connected_actor_path_receipt(path,receipt)
     original_plan=context.incumbent.render_plan
     base_queries=_queries(context,domain,original_program,original_plan,first-3,end+3)
     # Registered query scopes can differ despite identical source/native/
@@ -220,6 +264,8 @@ def produce_two_sided_native_cameras(*,context,domain,views,original_program,
     # KEEP has real measured incidents on the SAME request basis, not zero.
     keep_incidents=_measure_programme(views,base_queries,original,first,cut,end,original_plan.fps)
     keep_holds=_measure_holds(base_queries,original,base_queries,original,sides,original_plan.fps)
+    keep_appearance=_appearance_incidents(original,first,cut,end)
+    keep_member_penalty=2.*sum(row['local_member_hint_conflict'] for row in keep_appearance)
     numeric=realize_native_motion_programme(original=original_plan,domain=domain,sides=sides,
         protected_output_intervals=protected_output_intervals)
     neutral_queries=_queries(context,domain,original_program,numeric.render_plan,first-3,end+3)
@@ -285,8 +331,14 @@ def produce_two_sided_native_cameras(*,context,domain,views,original_program,
         holds=_measure_holds(base_queries,original,actual_queries,selected,sides,original_plan.fps)
         appearance=_appearance_incidents(selected,first,cut,end)
         losses=[loss for hold in holds for loss in hold['known_observation_losses']]
+        motion_failures=[failure for hold in holds for failure in hold['known_motion_failures']]
         conflicts=[row['boundary_tick'] for row in appearance if row['local_member_hint_conflict']]
-        evidence=dict(state='REALIZED_FOR_REVIEW' if comparison['eligible_for_further_review'] and not losses and not conflicts
+        # The private photo bank supplies an uncalibrated selection hint, not
+        # stage-video member authority. Preserve conflicts and use the same
+        # soft exploration weight as source-local association; never veto a
+        # measured camera solely because a photo hint disagrees at a cut.
+        member_penalty=2.*len(conflicts)
+        evidence=dict(state='REALIZED_FOR_REVIEW' if comparison['eligible_for_further_review'] and not losses and not motion_failures
                 else 'KNOWN_INCIDENT_OR_HOLD_REGRESSION',
             original_program_identity=original_program.program_sha256,
             original_actor_inventory_identity=original_actor_receipt['inventory_identity'],
@@ -294,14 +346,19 @@ def produce_two_sided_native_cameras(*,context,domain,views,original_program,
             measured_keep_incidents=keep_incidents,measured_keep_holds=keep_holds,
             actual_incidents=incidents,incident_comparison=comparison,
             actual_holds=holds,known_hold_observation_losses=losses,
+            known_hold_motion_failures=motion_failures,
             actual_appearance_incidents=appearance,local_member_hint_conflict_ticks=conflicts,
+            measured_keep_appearance_incidents=keep_appearance,
+            measured_keep_member_hint_exploration_penalty=keep_member_penalty,
+            local_member_hint_exploration_penalty=member_penalty,
+            member_hints_are_hard_eligibility_authority=False,
             coupled_landmark_fit=pair_receipt,whole_camera_receipts=track_receipts,
             exact_sampler_preservation=authored.preservation,
-            measured_keep_score=sum(i['exploration_score'] for i in keep_incidents)+sum(
+            measured_keep_score=keep_member_penalty+sum(i['exploration_score'] for i in keep_incidents)+sum(
                 h['native_articulation']['exploratory_cost_interval'][1]
                 +h['actual_screen_motion']['exploratory_cost_interval'][1]
                 for h in keep_holds),
-            score=sum(i['exploration_score'] for i in incidents)+sum(
+            score=member_penalty+sum(i['exploration_score'] for i in incidents)+sum(
                 h['native_articulation']['exploratory_cost_interval'][1]
                 +h['actual_screen_motion']['exploratory_cost_interval'][1] for h in holds),
             actor_reselected_after_camera_fit=False,camera_refit_after_selection=False,

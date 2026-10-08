@@ -235,6 +235,21 @@ def compare_review_focal_incident_inventory(original,candidate):
         for j,row in prior.items():
             if row['state']=='OBSERVED' and current[j]['state']!='OBSERVED':
                 failures.append(dict(incident=i,metric=f'joint_{j}',reason='LOST_KNOWN_ACTION_OBSERVATION'))
+                continue
+            if row['state']=='OBSERVED':
+                # The direction angle alone misses a spatial jump with the
+                # same tangent and a wrist stopping at the cut. Compare the
+                # actually measured residual/speed requests too. This is a
+                # baseline nonregression check, not an expert-quality gate;
+                # inapplicable or unknown directions are never invented.
+                for field in ('position_residual','velocity_difference'):
+                    a,b=row.get(field),current[j].get(field)
+                    if a is None:
+                        unknown.append(dict(incident=i,metric=f'joint_{j}_{field}'))
+                    elif b is None or b>a+1e-9:
+                        failures.append(dict(incident=i,metric=f'joint_{j}_{field}',
+                            original=a,candidate=b,reason='LOST_KNOWN_ACTION_MEASUREMENT'
+                                if b is None else 'KNOWN_ACTION_MEASUREMENT_REGRESSION'))
             # Matching the face must not purchase a known reversal of a hand
             # or arm tangent. The 0.5 boundary means dot(v_left,v_right)=0,
             # not a newly invented perceptual-quality threshold. Stillness,

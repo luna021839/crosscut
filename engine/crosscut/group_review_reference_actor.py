@@ -13,6 +13,42 @@ from .group_review_actor_path import _link
 from .group_review_source_equivalence import physical_review_file_identity
 
 
+def original_review_actor_binding(tick,view,*,role,scope):
+    raw=None if view is None else view['row']['native_observation']
+    return dict(output_tick=tick,head_id=None if view is None else view['descriptor'].frame_local_head_id,
+        raw_parent=None if raw is None else digest(raw),
+        request_source_index=None if raw is None else raw['request_source_index'],
+        source_clock_identity=None if raw is None else raw['source_clock_identity'],
+        native_frame_index=None if raw is None else raw['native_frame_index'],
+        physical_file_identity=None if view is None else physical_review_file_identity(view),
+        ambiguous=False if view is None else view.get('reacquisition_ambiguous',False),
+        original_role=role,original_attention_scope=scope,
+        original_actor_inventory_seed=False if view is None else view.get('original_actor_inventory_seed',False),
+        original_attention_hypothesis_is_focal_duty=False if view is None else
+            view.get('original_attention_hypothesis_is_focal_duty',False),
+        state='UNMATCHED' if view is None else 'OBSERVED_ANCHORED_ORIGINAL_ACTOR_HYPOTHESIS')
+
+
+def validate_original_review_actor_inventory(selected,receipt):
+    """Validate occurrences, not registered query scopes or new camera keys."""
+    body={k:v for k,v in receipt.items() if k!='inventory_identity'}
+    if (receipt.get('inventory_identity')!=digest(body) or not isinstance(selected,dict)
+            or receipt.get('donor_costs_used') is not False):
+        raise ValueError('original actor inventory receipt changed its frozen body')
+    bindings=receipt.get('bindings',());by_tick={b['output_tick']:b for b in bindings}
+    if len(by_tick)!=len(bindings) or set(by_tick)!=set(selected):
+        raise ValueError('original actor inventory receipt changed its requested ticks')
+    for tick,view in selected.items():
+        sealed=by_tick[tick]
+        if view is not None and view['row']['output_tick']!=tick:
+            raise ValueError('original actor inventory receipt changed its output occurrence')
+        actual=original_review_actor_binding(tick,view,
+            role=sealed['original_role'] if view is None else view.get('original_role'),
+            scope=sealed['original_attention_scope'] if view is None else view.get('original_attention_scope'))
+        if digest(actual)!=digest(sealed):
+            raise ValueError('original actor inventory receipt changed its selected occurrence or intent')
+
+
 def _native_association_view(view,unit):
     raw=view['row']['native_observation'];d=view['descriptor']
     head=next((h for h in raw['heads'] if h['observation_id']==d.frame_local_head_id),None)
@@ -98,6 +134,7 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
                 seed_area*focal_area_rival_ratio]
         seed_ambiguous=bool(seed.get('reacquisition_ambiguous',False) or seed_rivals)
         seed=dict(seed,reacquisition_ambiguous=seed_ambiguous,original_role=role,
+            original_attention_scope=attention_scope,
             unique_focal_intent_certified=False,
             original_attention_hypothesis_is_focal_duty=role in focal_roles)
         selected[seed_tick]=dict(seed,original_actor_inventory_seed=True)
@@ -118,6 +155,7 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
                 value=dict(best[2],reacquisition_ambiguous=bool(
                     best[2].get('reacquisition_ambiguous',False) or anchor.get('reacquisition_ambiguous',False)
                     or margin is not None and margin<ambiguity_margin),original_role=role,
+                    original_attention_scope=attention_scope,
                     unique_focal_intent_certified=False,
                     original_attention_hypothesis_is_focal_duty=role in focal_roles)
                 selected[tick]=value;association_links.append(dict(anchor_tick=anchor_tick,target_tick=tick,
@@ -145,11 +183,7 @@ def freeze_original_review_actor_inventory(frames,*,native_units,original_progra
             seed_basis='independent_original_output_attention_not_donor_pose_error'))
     bindings=[]
     for tick,view in sorted(selected.items()):
-        raw=None if view is None else view['row']['native_observation']
-        bindings.append(dict(output_tick=tick,head_id=None if view is None else view['descriptor'].frame_local_head_id,
-            raw_parent=None if raw is None else digest(raw),
-            ambiguous=False if view is None else view.get('reacquisition_ambiguous',False),
-            state='UNMATCHED' if view is None else 'OBSERVED_ANCHORED_ORIGINAL_ACTOR_HYPOTHESIS'))
+        bindings.append(original_review_actor_binding(tick,view,role=roles[tick],scope=scopes[tick]))
     receipt=dict(contract='original_native_shot_anchored_actor_inventory_v1',
         original_program_identity=original_program_identity,groups=groups_receipts,bindings=bindings,
         maximum_native_gap=maximum_native_gap,minimum_cosine=minimum_cosine,

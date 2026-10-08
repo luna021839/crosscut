@@ -30,7 +30,7 @@ class NativeMotionCompletionPackage:
             raise ValueError('native completion package needs a finite unique physical inventory')
 
 
-def validate_completion_packages(inventory, required_native_keys, packages):
+def validate_completion_packages(inventory, required_native_keys, packages,critical_required_native_keys=()):
     keys = {s.demand.native_key for s in inventory.supplies}
     if (not isinstance(required_native_keys, tuple) or len(required_native_keys) > 16384
             or any(not _physical_key(k) for k in required_native_keys)
@@ -41,10 +41,14 @@ def validate_completion_packages(inventory, required_native_keys, packages):
                 for p in packages)
             or len({p.identity for p in packages}) != len(packages)):
         raise ValueError('native completion obligations differ from the frozen request inventory')
+    if (not isinstance(critical_required_native_keys,tuple)
+            or len(set(critical_required_native_keys))!=len(critical_required_native_keys)
+            or not set(critical_required_native_keys)<=set(required_native_keys)):
+        raise ValueError('critical native dependencies differ from the frozen request inventory')
 
 
 def coherent_completion_schedule(inventory, *, required_native_keys, packages,
-        maximum_observations, maximum_raw_observations):
+        maximum_observations, maximum_raw_observations,critical_required_native_keys=()):
     """Admit complete feasible packages, or ONE explicit partial package.
 
     A small remaining budget must not buy isolated frames from every donor and
@@ -52,13 +56,24 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
     package ordering uses only missing-input count and frozen source families.
     This reserves inputs, not NN success, actor connectivity or quality.
     """
-    validate_completion_packages(inventory, required_native_keys, packages)
+    validate_completion_packages(inventory, required_native_keys, packages,critical_required_native_keys)
     aliases = {}; physical = {}
     for supply in inventory.supplies:
         physical[supply.demand.native_key] = supply
         if supply.missing_modalities:
             aliases.setdefault(supply.demand.native_key, []).append(supply.demand)
     pending = dict(aliases); scheduled = []; raw_count = 0; family_counts = {}
+    terminal=tuple(dict(native_key=k,state=physical[k].state) for k in critical_required_native_keys
+        if physical[k].state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS','EXACT_DECODE_UNAVAILABLE'))
+    if terminal:
+        # Only explicitly declared fixed entry/return dependencies stop the
+        # programme. An original interior UNKNOWN is not a universal veto.
+        return (),dict(policy='shared_context_then_coherent_declared_programmes_v1',
+            basis='cache_modalities_and_frozen_families_not_pose_face_or_camera_cost',
+            required_native_keys=required_native_keys,unadmitted_required_native_keys=tuple(
+                k for k in required_native_keys if k in pending),terminal_required_dependencies=terminal,
+            scheduled_unique_facts=0,scheduled_new_raw_facts=0,selected_packages=[],unretryable_packages=[],
+            successful_observations_or_connected_actors_certified=False,quality_approved=False)
 
     def admit(key):
         nonlocal raw_count
@@ -110,6 +125,7 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
     receipt = dict(policy='shared_context_then_coherent_declared_programmes_v1',
         basis='cache_modalities_and_frozen_families_not_pose_face_or_camera_cost',
         required_native_keys=required_native_keys,unadmitted_required_native_keys=required_left,
+        terminal_required_dependencies=terminal,
         scheduled_unique_facts=len(scheduled),scheduled_new_raw_facts=raw_count,
         selected_packages=selected,unretryable_packages=blocked,
         successful_observations_or_connected_actors_certified=False,quality_approved=False)

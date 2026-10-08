@@ -41,8 +41,9 @@ def lease_for(args,tmp_path):
     return owner,lease
 
 
-def test_real_selection_stage_keeps_one_completion_and_exact_new_sampler_aliases(tmp_path):
-    args=inputs();owner,lease=lease_for(args,tmp_path)
+@pytest.mark.parametrize('member_conflict',(False,True))
+def test_real_selection_stage_keeps_one_completion_and_exact_new_sampler_aliases(tmp_path,member_conflict):
+    args=inputs(member_hint_by_source={3:1} if member_conflict else None);owner,lease=lease_for(args,tmp_path)
     def run():
         # JointGroupWorkBudget requires positive local capacities; the active
         # request phase below has authoritative ZERO decode/model allowances.
@@ -54,13 +55,20 @@ def test_real_selection_stage_keeps_one_completion_and_exact_new_sampler_aliases
             _assert_model_assets=source_session._assert_model_assets,
             _assert_source_identity=source_session._assert_source_identity)
         sensors.recorded_motion_bindings={}
+        sensors.member_gallery=getattr(args['views'].sensors,'member_gallery',None)
         for key,supply in args['views'].supplies.items():
             if supply.observation is not None:
                 sensors.raw_rows[key]=supply.observation
                 sensors.appearance_rows[key[:2]]=supply.appearance
+                if supply.member_features is not None:
+                    from crosscut.group_performer_family_owner import digest
+                    sensors.member_feature_rows[digest(supply.observation.to_dict()),sensors.member_gallery.identity]=supply.member_features
         candidates,report,views=realize_normal_native_motion_frontier(context=args['context'],sensors=sensors,
             first_output_frame=30,end_output_frame=60,cut_ticks=(45,),native_phases=(0,),maximum_tuples=48)
         assert candidates and report['nonregressing_camera_candidates']
+        if member_conflict:
+            assert any(c.evidence['local_member_hint_conflict_ticks'] for c in candidates)
+            assert all(not c.evidence['member_hints_are_hard_eligibility_authority'] for c in candidates)
         assert report['native_completion_consumed'] and report['original_actor_inventory']['donor_costs_used'] is False
         assert report['native_alias_requests']>report['unique_native_requests']
         assert report['demand_basis']=='exact_new_topology_authorized_native_sampler_not_old_discovery_clock'
@@ -84,6 +92,20 @@ def test_real_selection_stage_keeps_one_completion_and_exact_new_sampler_aliases
                 first_output_frame=30,end_output_frame=60,cut_ticks=(45,),native_phases=(0,),maximum_tuples=1)
     try:owner.run_work_phase('selected_completion',run)
     finally:lease.close()
+
+
+@pytest.mark.parametrize('stage',('enumeration','balanced_linear_pass'))
+def test_large_finite_declaration_checks_cancellation_inside_its_cpu_work(stage):
+    calls=0
+    # 12*12*3*5*5*4 theoretical rows => 338 enumeration checks.
+    stop_at=2 if stage=='enumeration' else 339
+    def check():
+        nonlocal calls
+        calls+=1
+        if calls==stop_at:raise InterruptedError('synthetic declaration cancellation')
+    with pytest.raises(InterruptedError,match='declaration cancellation'):
+        _balanced_native_motion_tuples(tuple(range(12)),(40,45,50),(-2,-1,0,1,2),64,check=check)
+    assert calls==stop_at
 
 
 def test_missing_fixed_context_does_not_enter_a_camera_fit_or_invent_keep_score(tmp_path):

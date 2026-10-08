@@ -234,6 +234,15 @@ class NativeMotionInventory:
     completion_schedule_json: str | None = None
 
 
+def _native_actor_anchor_cache_identity(anchor):
+    if anchor is None:return None
+    return family.digest(dict(raw=anchor['row']['native_observation'],
+        head=anchor['descriptor'].frame_local_head_id,vector=anchor.get('vector'),
+        ambiguity=anchor.get('reacquisition_ambiguous',False),
+        association_state=anchor.get('selected_actor_association_state'),
+        original_role=anchor.get('original_role'),scope=anchor.get('original_attention_scope')))
+
+
 class NativeMotionViews:
     """Project one completed request inventory into explicit actor occurrences.
 
@@ -395,8 +404,7 @@ class NativeMotionViews:
     def connected_actor_views(self,queries,ticks,anchor,*,analysis_roll=None):
         from .group_review_actor_path import connected_source_actor_views
         ticks=tuple(ticks)
-        key=(tuple((t,queries[t].key) for t in ticks),analysis_roll,None if anchor is None else
-            (family.digest(anchor['row']['native_observation']),anchor['descriptor'].frame_local_head_id))
+        key=(tuple((t,queries[t].key) for t in ticks),analysis_roll,_native_actor_anchor_cache_identity(anchor))
         if key not in self.paths:
             frames=[self.candidates(queries[t],t,analysis_roll=analysis_roll,association_ready=True) for t in ticks]
             units={t:self.native_signature(queries[t],t,analysis_roll=analysis_roll)[:4] for t in ticks}
@@ -452,7 +460,7 @@ class NativeMotionViews:
             original_roles_by_tick=roles)
 
 
-def _balanced_native_motion_tuples(sources,cut_ticks,native_phases,maximum_tuples):
+def _balanced_native_motion_tuples(sources,cut_ticks,native_phases,maximum_tuples,*,check=None):
     """A declared finite subset, NOT an endpoint-cost ranking or full optimum."""
     from itertools import product
     if (not isinstance(sources,tuple) or not 2<=len(sources)<=12 or len(set(sources))!=len(sources)
@@ -465,12 +473,14 @@ def _balanced_native_motion_tuples(sources,cut_ticks,native_phases,maximum_tuple
             or any(type(p) is not int or abs(p)>2 for p in native_phases)
             or type(maximum_tuples) is not int or not 1<=maximum_tuples<=64):
         raise ValueError('native motion frontier needs finite externally declared strata')
-    remaining=[(a,b,cut,pa,pb,ha,hb) for a,b,cut,pa,pb,ha,hb in
-        product(sources,sources,cut_ticks,native_phases,native_phases,(0,1),(0,1)) if a!=b]
+    remaining=[];ties={}
+    for i,row in enumerate(product(sources,sources,cut_ticks,native_phases,native_phases,(0,1),(0,1))):
+        if check is not None and i%128==0:check()
+        if row[0]!=row[1]:
+            remaining.append(row);ties[row]=family.digest(row)
     counts={};result=[]
     # Pure tie-break hashes are immutable. Do not serialize/hash the same
     # theoretical tuple again during every balanced admission round.
-    ties={row:family.digest(row) for row in remaining}
     def strata(row):
         a,b,cut,pa,pb,ha,hb=row
         return (('left_source',a),('right_source',b),('cut',cut),
@@ -482,7 +492,14 @@ def _balanced_native_motion_tuples(sources,cut_ticks,native_phases,maximum_tuple
             sum(counts.get(k,0) for k in keys[2:]),
             abs(row[3])+abs(row[4]),row[5]+row[6],ties[row])
     for _ in range(min(maximum_tuples,len(remaining))):
-        chosen=min(remaining,key=priority);remaining.remove(chosen);result.append(chosen)
+        # Cancellation/deadline remain responsive inside the bounded linear
+        # pass as well as enumeration. This is still a finite rank-0/1 subset.
+        chosen=None;best=None
+        for i,row in enumerate(remaining):
+            if check is not None and i%128==0:check()
+            score=priority(row)
+            if best is None or score<best:chosen=row;best=score
+        remaining.remove(chosen);result.append(chosen)
         for key in strata(chosen):counts[key]=counts.get(key,0)+1
     return tuple(result)
 
@@ -523,7 +540,8 @@ def realize_normal_native_motion_frontier(*,context,sensors,first_output_frame,e
     if type(maximum_tuples) is not int or not 1<=maximum_tuples<=64:
         raise ValueError('native motion frontier needs its declared tuple capacity')
     effective_tuples=min(maximum_tuples,(16384-len(halo))//(end_output_frame-first_output_frame))
-    proposed=_balanced_native_motion_tuples(domain.eligible_indices,cut_ticks,native_phases,effective_tuples)
+    proposed=_balanced_native_motion_tuples(domain.eligible_indices,cut_ticks,native_phases,effective_tuples,
+        check=sensors.session.budget.check)
     def queries(candidate):
         compiled=compile_common_clock_camera_queries(context=context,domain=domain,original_program=original,
             candidate_plan=candidate,output_intervals=((halo[0],halo[-1]+1),))
@@ -582,7 +600,9 @@ def realize_normal_native_motion_frontier(*,context,sensors,first_output_frame,e
         for index,spec,sides,qs in declarations)
     completed=sensors.complete_motion_inventory_once(cached,maximum_new_observations=maximum_new_observations,
         maximum_new_raw_observations=maximum_new_raw_observations,
-        required_native_keys=required_keys,completion_packages=packages)
+        required_native_keys=required_keys,completion_packages=packages,
+        critical_required_native_keys=tuple(dict.fromkeys(request(base[t],t).native_key
+            for t in (first_output_frame-1,end_output_frame))),member_features_optional=True)
     stage_seconds['one_completion']=monotonic()-stage_start;stage_start=monotonic()
     views=NativeMotionViews(sensors,completed,body_receipt_bundles=body_receipt_bundles)
     original_actors,original_receipt=views.freeze_original_actors(base,halo,
@@ -609,8 +629,7 @@ def realize_normal_native_motion_frontier(*,context,sensors,first_output_frame,e
                 association_ready=True),key=lambda v:(family.digest(v['row']['native_observation']),
                     v['descriptor'].frame_local_head_id))))
             anchor=None if actor_rank>=len(anchors) else anchors[actor_rank]
-            key=(tuple((t,views.native_signature(qs[t],t)) for t in ticks),None if anchor is None else
-                (family.digest(anchor['row']['native_observation']),anchor['descriptor'].frame_local_head_id))
+            key=(tuple((t,views.native_signature(qs[t],t)) for t in ticks),_native_actor_anchor_cache_identity(anchor))
             if key not in path_cache:path_cache[key]=views.connected_actor_views(qs,ticks,anchor)
             path,receipt=path_cache[key]
             paths.append(views.reproject_selected_actor_path(qs,path));receipts.append(receipt)
@@ -650,6 +669,7 @@ def realize_normal_native_motion_frontier(*,context,sensors,first_output_frame,e
                 state=c.evidence['state'],score=c.evidence['score'],measured_keep_score=c.evidence['measured_keep_score'],
                 known_incident_failures=c.evidence['incident_comparison']['failures'],
                 known_hold_observation_losses=c.evidence['known_hold_observation_losses'],
+                known_hold_motion_failures=c.evidence['known_hold_motion_failures'],
                 local_member_hint_conflict_ticks=c.evidence['local_member_hint_conflict_ticks'])
                 for c in realized]))
         candidates.extend(realized)
@@ -910,6 +930,54 @@ class NativeFamilySensors:
             supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
         return supply
 
+    def _joint_motion_supply(self,demand,live_raw):
+        """Census live and archived facts; neither may hide adverse evidence.
+
+        Only the verified device-remount file address is normalized for the
+        comparison. The selected archive and every feature keep their exact
+        original parents. Distinct declared model variants are not conflicts.
+        """
+        import json
+        recorded=self._recorded_motion_supply(demand)
+        if live_raw is None:
+            return recorded
+        if recorded.state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS'):
+            return replace(recorded,appearance=None,member_features=None)
+        live=NativeMotionSupply(demand,live_raw,
+            self.appearance_at(live_raw,cached_only=True) if demand.require_appearance
+                and live_raw.native_pixel_sha256 is not None else None,
+            recorded_input_state=recorded.recorded_input_state)
+        if demand.require_member_features and live_raw.native_pixel_sha256 is not None:
+            live=replace(live,member_features=self.member_features_at(live,cached_only=True))
+        if recorded.observation is None:
+            return live
+        before=json.loads(json.dumps(recorded.observation.to_dict(),sort_keys=True,allow_nan=False))
+        after=json.loads(json.dumps(live_raw.to_dict(),sort_keys=True,allow_nan=False))
+        same_parent=before['source_file_identity']==after['source_file_identity']
+        if not same_parent:
+            receipt=(None if recorded.source_equivalence_json is None else
+                json.loads(recorded.source_equivalence_json))
+            if (receipt is None or receipt.get('state')!='CONTENT_VERIFIED_DEVICE_REMOUNT'
+                    or receipt.get('recorded_file_identity')!=before['source_file_identity']
+                    or receipt.get('current_file_identity')!=after['source_file_identity']
+                    or before['source_file_identity'][1:]!=after['source_file_identity'][1:]):
+                return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
+            after=dict(after,source_file_identity=before['source_file_identity'])
+        if before!=after:
+            return NativeMotionSupply(demand,None,recorded_input_state='CONFLICTING_NATIVE_RECORDS')
+        # A feature measured on a different raw parent is never copied or
+        # relabelled just because the underlying source file is equivalent.
+        if not same_parent:
+            return recorded
+        for field in ('appearance','member_features'):
+            a,b=getattr(recorded,field),getattr(live,field)
+            if a is not None and b is not None and family.digest(a)!=family.digest(b):
+                return replace(recorded,appearance=None,member_features=None,
+                    recorded_input_state='CONFLICTING_FEATURE_RECORDS')
+        return replace(recorded,
+            appearance=recorded.appearance if recorded.appearance is not None else live.appearance,
+            member_features=recorded.member_features if recorded.member_features is not None else live.member_features)
+
     def _complete_motion_appearance(self,supply):
         """Complete an archived raw parent's appearance on verified live pixels."""
         raw=supply.observation
@@ -982,19 +1050,13 @@ class NativeFamilySensors:
         physical={}
         for key,d in union.items():
             raw=self.native_at(d.source_index,d.native_frame_index,d.analysis_roll,cached_only=True)
-            if raw is None:
-                physical[key]=self._recorded_motion_supply(d);continue
-            appearance=(self.appearance_at(raw,cached_only=True) if d.require_appearance
-                and raw is not None and raw.native_pixel_sha256 is not None else None)
-            supply=NativeMotionSupply(d,raw,appearance)
-            if d.require_member_features and raw.native_pixel_sha256 is not None:
-                supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
-            physical[key]=supply
+            physical[key]=self._joint_motion_supply(d,raw)
         supplies=tuple(replace(physical[d.native_key],demand=d) for d in demands)
         return NativeMotionInventory(supplies,(),False,'CACHE_ONLY')
 
     def complete_motion_inventory_once(self,inventory,*,maximum_new_observations,
-            maximum_new_raw_observations=None,required_native_keys=(),completion_packages=()):
+            maximum_new_raw_observations=None,required_native_keys=(),completion_packages=(),
+            critical_required_native_keys=(),member_features_optional=False):
         """One request-owned, time/source/opportunity-balanced missing pass.
 
         Existing successes, observed failures and absent facts remain distinct.
@@ -1011,6 +1073,7 @@ class NativeFamilySensors:
         if port is None or current_request_work_phase() is not port:
             raise ValueError('normal motion completion requires the active whole-request work lease')
         if (not isinstance(inventory,NativeMotionInventory) or inventory.completion_consumed
+                or type(member_features_optional) is not bool
                 or type(maximum_new_observations) is not int
                 or not 0<=maximum_new_observations<=1200
                 or maximum_new_raw_observations is not None and (
@@ -1019,7 +1082,7 @@ class NativeFamilySensors:
             raise ValueError('one native completion needs the frozen cache-only inventory')
         if getattr(self.session,'_native_motion_completion_consumed',False):
             raise ValueError('native motion completion already consumed this session')
-        validate_completion_packages(inventory,required_native_keys,completion_packages)
+        validate_completion_packages(inventory,required_native_keys,completion_packages,critical_required_native_keys)
         # Consume before the first model call, including a zero-budget pass.
         port.charge('native_completion_passes')
         self.session._native_motion_completion_consumed=True
@@ -1035,17 +1098,24 @@ class NativeFamilySensors:
             self.motion_completion_result=NativeMotionInventory(
                 unvalidated,(),True,'CACHE_REVALIDATION_FAILED')
             raise
+        core_current=(replace(current,supplies=tuple(replace(s,
+            demand=replace(s.demand,require_member_features=False)) for s in current.supplies))
+            if member_features_optional else current)
         missing={}
-        for supply in current.supplies:
+        for supply in core_current.supplies:
             if supply.missing_modalities:
                 missing.setdefault(supply.demand.native_key,[]).append(supply.demand)
         first=min(d.output_tick for d in demands)
         end=max(d.output_tick for d in demands)+1
         budget=self.session.budget
-        remaining=lambda k:max(0,budget.limits[k]-budget.counts[k]-budget.reserved[k])
-        limit=min(maximum_new_observations,len(missing),remaining('new_decodes'))
+        def remaining():
+            parent=port.remaining_capacity(('new_decodes','model_calls','pose_evidence_bytes'))
+            return {k:max(0,min(budget.limits[k]-budget.counts[k]-budget.reserved[k],parent[k]))
+                for k in parent}
+        available=remaining()
+        limit=min(maximum_new_observations,len(missing),available['new_decodes'])
         evidence_reserve=primitive_reservation_bytes(MAX_NATIVE_JSON_BYTES)
-        if remaining('pose_evidence_bytes') < evidence_reserve:limit=0
+        if available['pose_evidence_bytes'] < evidence_reserve:limit=0
         counts={}; pending=dict(missing); scheduled=[]
         raw_limit=(maximum_new_observations if maximum_new_raw_observations is None
             else maximum_new_raw_observations)
@@ -1077,11 +1147,12 @@ class NativeFamilySensors:
         schedule_receipt=dict(policy='source_opportunity_time_band_balanced_v1',
             successful_observations_or_connected_actors_certified=False,quality_approved=False)
         if required_native_keys or completion_packages:
-            scheduled,schedule_receipt=coherent_completion_schedule(current,
+            scheduled,schedule_receipt=coherent_completion_schedule(core_current,
                 required_native_keys=required_native_keys,packages=completion_packages,
-                maximum_observations=limit,maximum_raw_observations=raw_limit)
-        schedule_json=__import__('json').dumps(schedule_receipt,sort_keys=True,allow_nan=False)
-        attempted=[]
+                maximum_observations=limit,maximum_raw_observations=raw_limit,
+                critical_required_native_keys=critical_required_native_keys)
+        attempted=[];optional_attempted=[];optional_unavailable=[]
+        schedule_receipt.update(optional_member_features_are_core_admission_authority=not member_features_optional)
         known={s.demand.native_key:s.observation for s in current.supplies}
         bindings={s.demand.native_key:s for s in current.supplies}
         appearances={s.demand.native_key:s.appearance for s in current.supplies if s.appearance is not None}
@@ -1090,9 +1161,14 @@ class NativeFamilySensors:
         need_member_features={d.native_key for d in demands if d.require_member_features}
         status=('BUDGET_PARTIAL' if len(scheduled)<len(missing)
             else 'COMPLETED_ONCE')
+        if schedule_receipt.get('terminal_required_dependencies'):status='TERMINAL_REQUIRED_INPUT_BLOCKER'
         def snapshot(state):
             # These rows were validated in this pass. Do not reopen source/model
             # I/O after its deadline merely to construct the result container.
+            schedule_receipt.update(attempted_optional_member_native_keys=list(optional_attempted),
+                optional_member_unavailable_inputs=list(optional_unavailable),
+                attempted_unique_native_keys=list(attempted))
+            schedule_json=__import__('json').dumps(schedule_receipt,sort_keys=True,allow_nan=False)
             value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key),
                 bindings[d.native_key].recorded_input_state,bindings[d.native_key].source_equivalence_json,
                 member_features.get(d.native_key))
@@ -1109,9 +1185,11 @@ class NativeFamilySensors:
                     if demand.native_key in need_appearance and demand.native_key not in appearances else 0)
                 member_calls=((24 if raw is None else len(raw.heads))
                     if demand.native_key in need_member_features and demand.native_key not in member_features else 0)
+                if member_features_optional:member_calls=0
                 required=dict(new_decodes=1,model_calls=raw_calls+appearance_calls+member_calls,
                     pose_evidence_bytes=evidence_reserve)
-                if any(remaining(k)<n for k,n in required.items()):
+                available=remaining()
+                if any(available[k]<n for k,n in required.items()):
                     status='BUDGET_PARTIAL';continue
                 attempted.append(demand.native_key)
                 snapshot('RUNNING')
@@ -1125,10 +1203,33 @@ class NativeFamilySensors:
                     appearances[demand.native_key]=self._complete_motion_appearance(replace(bindings[demand.native_key],
                         observation=raw))
                 if (demand.native_key in need_member_features and demand.native_key not in member_features
-                        and raw.native_pixel_sha256 is not None):
+                        and raw.native_pixel_sha256 is not None and not member_features_optional):
                     member_features[demand.native_key]=self.member_features_at(replace(bindings[demand.native_key],
                         observation=raw))
                 snapshot('RUNNING')
+            if member_features_optional and not schedule_receipt.get('terminal_required_dependencies'):
+                # Core raw/SFace for every admitted package precede optional
+                # photo hints in THIS same consumed pass. No raw re-inference,
+                # second completion, or optional budget can displace core.
+                for key in dict.fromkeys(d.native_key for d in demands if d.require_member_features):
+                    budget.check();raw=known[key]
+                    if raw is None or raw.native_pixel_sha256 is None or key in member_features:continue
+                    if key in need_appearance and key not in appearances:continue
+                    if key not in attempted and len(attempted)>=maximum_new_observations:continue
+                    available=remaining()
+                    if any(available[k]<n for k,n in dict(new_decodes=1,model_calls=len(raw.heads),
+                            pose_evidence_bytes=evidence_reserve).items()):continue
+                    equivalence=bindings[key].source_equivalence_json
+                    if equivalence is not None and __import__('json').loads(equivalence)['state']=='CONTENT_VERIFIED_DEVICE_REMOUNT':
+                        optional_unavailable.append(dict(native_key=key,state='ARCHIVED_OPTIONAL_RECOMPUTE_UNAVAILABLE'))
+                        continue
+                    if key not in attempted:attempted.append(key)
+                    optional_attempted.append(key);snapshot('RUNNING')
+                    member_features[key]=self.member_features_at(replace(bindings[key],observation=raw))
+                    snapshot('RUNNING')
+                if status=='COMPLETED_ONCE' and any(k not in member_features and known[k] is not None
+                        and known[k].native_pixel_sha256 is not None for k in need_member_features):
+                    status='CORE_COMPLETED_OPTIONAL_FEATURES_PARTIAL'
         except BaseException:
             snapshot('INTERRUPTED_PARTIAL')
             raise  # Preserve cancellation/cutoff; never synthesize successful completion.

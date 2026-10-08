@@ -88,7 +88,7 @@ class ParentWorkTransport:
         if action == "worker_entered" and arguments == {"key": self.worker_key}:
             return self.phase.worker_entered(self.worker_key)
         permitted = {"charge": {"kind", "count", "model"}, "reserve": {"amounts"},
-                     "start": {"key"}, "settle": {"key", "evidence_bytes"}}
+                     "start": {"key"}, "settle": {"key", "evidence_bytes"},"remaining_capacity":{"kinds"}}
         if action not in permitted or set(arguments) != permitted[action]:
             raise ValueError("worker requested an undeclared phase operation")
         return getattr(self.phase, action)(**arguments)
@@ -183,6 +183,9 @@ class RemoteWorkPhase:
 
     def charge(self, kind, count=1, *, model=None):
         return self._call("charge", kind=kind, count=count, model=model)
+
+    def remaining_capacity(self,kinds):
+        return self._call('remaining_capacity',kinds=list(kinds))
 
     def reserve(self, amounts):
         return self._call("reserve", amounts=amounts)

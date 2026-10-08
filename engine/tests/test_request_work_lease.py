@@ -103,6 +103,18 @@ class RequestWorkLeaseTests(unittest.TestCase):
             self.assertFalse(terminal["budget_refunded"])
             self.assertIs(controller.incumbent,plan)
 
+    def test_remote_capacity_query_uses_the_live_parent_without_copying_its_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,lease,_=self.make(Path(directory))
+            result=controller.run_work_phase('selected_completion',lambda:run_isolated_python_call(
+                'tests.optional_worker_fixture','phase_remaining_capacity',{},deadline=monotonic()+9.))
+            self.assertEqual(result['first'],dict(model_calls=2,new_decodes=4))
+            self.assertEqual(result['second'],dict(model_calls=1,new_decodes=4))
+            self.assertEqual(lease.ports['selected_completion'].charged['model_calls'],1)
+            self.assertEqual(lease.ports['selected_completion'].charged['new_decodes'],0)
+            self.assertFalse(result['copied_budget_authority'])
+            self.assertGreater(lease.ports['selected_completion'].charged['ipc_bytes'],0)
+
     def test_dead_worker_keeps_charges_prefix_and_cannot_mint_a_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

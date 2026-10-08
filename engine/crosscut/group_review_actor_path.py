@@ -22,6 +22,29 @@ def _content_key(view):
         height=d.face_height, width=d.face_width, shape=d.pose_shape))
 
 
+def review_actor_occurrence_binding(tick,view):
+    raw=None if view is None else view['row']['native_observation']
+    return dict(output_tick=tick,raw_parent=None if raw is None else digest(raw),
+        request_source_index=None if raw is None else raw['request_source_index'],
+        source_clock_identity=None if raw is None else raw['source_clock_identity'],
+        native_frame_index=None if raw is None else raw['native_frame_index'],
+        physical_file_identity=None if view is None else physical_review_file_identity(view),
+        frame_local_head_id=None if view is None else view['descriptor'].frame_local_head_id,
+        native_camera_unit_index=None if view is None else view.get('native_camera_unit_index'),
+        ambiguous=False if view is None else view.get('reacquisition_ambiguous',False))
+
+
+def validate_connected_actor_path_receipt(path,receipt):
+    body={k:v for k,v in receipt.items() if k!='connection_receipt_identity'}
+    try:bindings=tuple(review_actor_occurrence_binding(t,v) for t,v in sorted(path.items()))
+    except ValueError as error:
+        raise ValueError('actor path connection receipt changed its native parent') from error
+    if (receipt.get('connection_receipt_identity')!=digest(body)
+            or digest(bindings)!=digest(receipt.get('physical_occurrence_bindings'))
+            or receipt.get('requested_ticks')!=sorted(path)):
+        raise ValueError('actor path connection receipt changed its frozen physical occurrences')
+
+
 def _address(view):
     row = view['row']
     raw = row['native_observation']
@@ -43,22 +66,46 @@ def _native_head_geometry(view):
     return descriptor.head_center, descriptor.face_height
 
 
-def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_camera_cut=False):
+def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_camera_cut=False,diagnostic=None):
+    if diagnostic is not None:
+        if not isinstance(diagnostic,dict):raise ValueError('actor link diagnostic must be one bounded explicit receipt')
+        diagnostic.update(maximum_native_gap=maximum_native_gap,minimum_sface_cosine=minimum_cosine,
+            fixed_chain_null_edge_cost=3.,reacquisition_after_null_cost=1.5,
+            private_embeddings_included=False,named_actor_certified=False,quality_approved=False)
     if left is None or right is None:
+        if diagnostic is not None:diagnostic.update(state='UNMATCHED_INPUT')
         return dict(cost=1.5, state='unmatched', cosine=None, linked=False)
     a,b = _address(left),_address(right)
+    if diagnostic is not None:
+        from .ive_local_arcface_gallery import local_member_hint_conflict
+        diagnostic.update(left_address=list(a),right_address=list(b),
+            left_head_id=left['descriptor'].frame_local_head_id,right_head_id=right['descriptor'].frame_local_head_id,
+            native_gap=b[2]-a[2],local_member_hint_conflict=local_member_hint_conflict(
+                left.get('member_hint'),right.get('member_hint')),member_hint_is_hard_veto=False)
+        if a[4]==b[4]:
+            ac,ah=_native_head_geometry(left);bc,bh=_native_head_geometry(right)
+            diagnostic.update(native_head_displacement=math.hypot(bc[0]-ac[0],(bc[1]-ac[1])*9/16),
+                native_head_displacement_limit=.06*max(1,b[2]-a[2])+.4*(ah+bh),
+                native_displacement_units='normalized_width_aspect_corrected_9_16',
+                continuous_native_position_bound_applicable=True)
+        else:diagnostic.update(continuous_native_position_bound_applicable=False,
+            native_head_displacement=None,native_head_displacement_limit=None)
     if a[1] != b[1] or a[3] != b[3] or a[0] >= b[0] or a[2] > b[2]:
         raise ValueError('source-local actor path borrowed another source/clock or reversed time')
     if (a[4] != b[4] and not observed_native_camera_cut) or b[2]-a[2] > maximum_native_gap:
+        if diagnostic is not None:diagnostic.update(state='UNMEASURED_CAMERA_OR_GAP_BRIDGE')
         return dict(cost=2.,state='unmeasured_camera_or_gap_bridge',cosine=None,linked=False)
     if a[2] == b[2] and left['row']['native_observation'] != right['row']['native_observation']:
         raise ValueError('same native frame has conflicting actor-path observations')
     if a[2] == b[2] and left['descriptor'].frame_local_head_id != right['descriptor'].frame_local_head_id:
+        if diagnostic is not None:diagnostic.update(state='DIFFERENT_HEADS_IN_ONE_NATIVE_RASTER')
         return None  # Two occurrences in ONE raster are not a temporal association.
     if physical_review_file_identity(left) != physical_review_file_identity(right):
         raise ValueError('source-local actor path changed source file identity')
     sim = cosine(left['vector'],right['vector'])
+    if diagnostic is not None:diagnostic.update(sface_cosine=sim)
     if sim is None or sim < minimum_cosine:
+        if diagnostic is not None:diagnostic.update(state='MISSING_SFACE_VECTOR' if sim is None else 'BELOW_MINIMUM_SFACE_COSINE')
         return None  # The real unmatched alternative remains in the graph.
     shape = shape_cost(left['descriptor'],right['descriptor'])
     from .ive_local_arcface_gallery import local_member_hint_conflict
@@ -72,15 +119,21 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
     if not reacquired:
         ac,ah=_native_head_geometry(left);bc,bh=_native_head_geometry(right)
         distance=math.hypot(bc[0]-ac[0],(bc[1]-ac[1])*9/16)
+        displacement_limit=.06*max(1,b[2]-a[2])+.4*(ah+bh)
+        if diagnostic is not None:diagnostic.update(native_head_displacement=distance,
+            native_head_displacement_limit=displacement_limit,
+            native_displacement_units='normalized_width_aspect_corrected_9_16')
         # A long future sequence of a different foreground person must not
         # amortize an instantaneous cross-frame teleport. This deliberately
         # broad native-raster displacement bound scales with observed gap and
         # head extent. Real camera cuts are handled by explicit reacquisition.
         # An excluded link leaves an unmatched slot, not an identity verdict.
-        if distance>.06*max(1,b[2]-a[2])+.4*(ah+bh):
+        if distance>displacement_limit:
+            if diagnostic is not None:diagnostic.update(state='NATIVE_HEAD_DISPLACEMENT_EXCEEDS_DECLARED_LINK_BOUND')
             return None
         spatial=.4*distance/(.12+(ah+bh)/2)
         spatial+=.2*abs(math.log(bh/ah))
+    if diagnostic is not None:diagnostic.update(state='LINKED_SOFT_APPEARANCE_HYPOTHESIS')
     return dict(cost=2.*max(0.,1.-sim)+spatial+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.)
             +(2. if member_conflict else 0.),
         measured_camera_local_spatial_cost=spatial,
@@ -470,7 +523,22 @@ def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum
         if v is not None:
             selected[t]=dict(v,reacquisition_ambiguous=bool(v.get('reacquisition_ambiguous',False) or i in ambiguous_indices),
                 source_actor_path_identity=path['hypothesis_sha256'])
+    # Keep detector-number-independent ranking keys separate from occurrence
+    # authority. Identical geometric tie content on two different sources is
+    # not the same physical selected path. Camera reprojection does not alter
+    # these raw/head/output/run bindings.
+    physical_bindings=tuple(review_actor_occurrence_binding(t,selected[t]) for t in ticks)
+    physical_identity=digest(dict(bindings=physical_bindings,unit=tuple(unit),
+        anchor=review_actor_occurrence_binding(at,anchor),
+        association_content_identity=path['hypothesis_sha256']))
+    selected={t:None if v is None else dict(v,source_actor_path_identity=physical_identity)
+        for t,v in selected.items()}
     receipt={k:v for k,v in path.items() if k!='observations'}
+    receipt.update(association_content_identity=path['hypothesis_sha256'],hypothesis_sha256=physical_identity,
+        independent_anchor_physical_binding=review_actor_occurrence_binding(at,anchor))
     receipt.update(state='CONNECTED_SOURCE_LOCAL_HYPOTHESIS',requested_ticks=list(ticks),
-        physical_run_ticks=list(selected_ticks),other_physical_run_ticks=[t for t in ticks if t not in selected_ticks])
+        physical_run_ticks=list(selected_ticks),other_physical_run_ticks=[t for t in ticks if t not in selected_ticks],
+        physical_occurrence_bindings=physical_bindings,
+        physical_run_unit=tuple(unit))
+    receipt['connection_receipt_identity']=digest(receipt)
     return selected,receipt

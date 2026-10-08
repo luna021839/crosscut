@@ -103,6 +103,64 @@ def test_raw_fourteen_calls_are_not_misrepresented_as_actor_ready_cost(tmp_path)
     finally:lease.close()
 
 
+@pytest.mark.parametrize('optional_gallery',(False,True))
+def test_optional_member_gallery_does_not_starve_a_core_descriptor(tmp_path,optional_gallery):
+    owner,lease=controller(tmp_path,1)
+    def run():
+        s=sensors(1);raw,_=native_record();s.raw_rows[2,80,None]=restore_native_row(raw)
+        if optional_gallery:
+            from tests.test_ive_local_arcface_gallery import gallery
+            s.member_gallery=gallery()
+        d=NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True,
+            require_member_features=optional_gallery)
+        done=s.complete_motion_inventory_once(s.motion_inventory((d,)),maximum_new_observations=1,
+            member_features_optional=optional_gallery)
+        assert s.appearance_calls==[(2,80)] and not s.raw_calls
+        assert done.supplies[0].appearance is not None
+        assert s.session.budget.counts['model_calls']==1
+        if optional_gallery:
+            assert done.supplies[0].member_features is None
+            assert done.supplies[0].missing_modalities==('MEMBER_FEATURES',)
+            receipt=json.loads(done.completion_schedule_json)
+            assert receipt['optional_member_features_are_core_admission_authority'] is False
+            assert not receipt['attempted_optional_member_native_keys']
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
+@pytest.mark.parametrize('terminal',('EXACT_DECODE_UNAVAILABLE','CONFLICTING_NATIVE_RECORDS'))
+@pytest.mark.parametrize('critical',(False,True))
+def test_terminal_fixed_dependency_prevents_doomed_donor_work(tmp_path,terminal,critical):
+    from crosscut.group_source_changing_owner import NativeMotionSupply
+    owner,lease=controller(tmp_path)
+    def run():
+        class FixedFailureSensors(SyntheticSensors):
+            def _recorded_motion_supply(self,demand):
+                if demand.source_index!=5:return NativeMotionSupply(demand,None)
+                raw,_=native_record()
+                failure=replace(restore_native_row(raw),native_pixel_sha256=None,heads=(),reason='synthetic exact decode failed')
+                return NativeMotionSupply(demand,None if terminal=='CONFLICTING_NATIVE_RECORDS' else failure,
+                    recorded_input_state=terminal if terminal=='CONFLICTING_NATIVE_RECORDS' else None)
+        s=FixedFailureSensors(sensors().session.budget)
+        donor=NativeMotionDemand(2,80,8,'donor','moving_closeup')
+        fixed=NativeMotionDemand(5,120,12,'fixed','other')
+        inventory=s.motion_inventory((donor,fixed))
+        done=s.complete_motion_inventory_once(inventory,maximum_new_observations=2,
+            required_native_keys=(fixed.native_key,),critical_required_native_keys=(fixed.native_key,) if critical else (),
+            completion_packages=(NativeMotionCompletionPackage('donor',(donor.native_key,)),))
+        receipt=json.loads(done.completion_schedule_json)
+        if critical:
+            assert not s.raw_calls and not s.appearance_calls and not done.attempted_native_keys
+            assert s.session.budget.counts['new_decodes']==s.session.budget.counts['model_calls']==0
+            assert receipt['terminal_required_dependencies'][0]['state']==terminal
+            assert done.status=='TERMINAL_REQUIRED_INPUT_BLOCKER'
+        else:
+            assert not receipt['terminal_required_dependencies']
+            assert s.raw_calls==[donor.native_key] and done.attempted_native_keys==(donor.native_key,)
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
 def test_raw_alias_still_completes_appearance_requested_by_another_output_use(tmp_path):
     owner,lease=controller(tmp_path)
     def run():
@@ -323,6 +381,72 @@ def test_additional_manifest_cannot_replace_a_conflicting_existing_native_result
         assert not value.missing_modalities
     try:owner.run_work_phase('selected_completion',run)
     finally:lease.close()
+
+
+@pytest.mark.parametrize('bind_order',('live_first','archive_first'))
+def test_live_raw_cannot_erase_a_known_archive_conflict(tmp_path,bind_order):
+    old,index,raw,app,path=recorded_sensors(tmp_path)
+    altered=replace(restore_native_row(raw),reason='different_measured_result')
+    index.add_native_record(json.loads(json.dumps(altered.to_dict())),provenance='conflicting fixture')
+    if bind_order=='archive_first':
+        s=old
+    else:
+        s=sensors();s.session=old.session
+        s.raw_rows[2,80,None]=restore_native_row(raw)
+        s.bind_recorded_motion_index(index,source_identities={2:raw['source_file_identity']},
+            source_content_sha256={2:hashlib.sha256(path.read_bytes()).hexdigest()})
+    s.raw_rows[2,80,None]=restore_native_row(raw)
+    d=NativeMotionDemand(2,80,8,'family','other',require_appearance=True)
+    value=s.motion_inventory((d,)).supplies[0]
+    assert value.state=='CONFLICTING_NATIVE_RECORDS'
+    assert value.observation is None and not value.missing_modalities
+    assert not s.raw_calls and not s.appearance_calls
+
+
+def test_live_adverse_difference_does_not_replace_an_archived_native_result(tmp_path):
+    s,index,raw,app,path=recorded_sensors(tmp_path)
+    live=replace(restore_native_row(raw),heads=(),reason='same_variant_different_observed_result')
+    s.raw_rows[2,80,None]=live
+    d=NativeMotionDemand(2,80,8,'family','other')
+    value=s.motion_inventory((d,)).supplies[0]
+    assert value.state=='CONFLICTING_NATIVE_RECORDS' and value.observation is None
+    assert not value.missing_modalities and not s.raw_calls
+
+
+def test_archive_adverse_result_cannot_be_erased_by_a_live_favorable_result(tmp_path):
+    s,index,raw,app,path=recorded_sensors(tmp_path)
+    adverse=replace(restore_native_row(raw),heads=(),reason='synthetic adverse archived observation')
+    index.add_native_record(json.loads(json.dumps(adverse.to_dict())),provenance='adverse fixture')
+    s.raw_rows[2,80,None]=restore_native_row(raw)
+    d=NativeMotionDemand(2,80,8,'family','other')
+    value=s.motion_inventory((d,)).supplies[0]
+    assert value.state=='CONFLICTING_NATIVE_RECORDS' and value.observation is None
+    assert not value.missing_modalities and not s.raw_calls
+
+
+def test_live_current_variant_is_not_conflated_with_another_archived_variant(tmp_path):
+    s,index,raw,app,path=recorded_sensors(tmp_path)
+    name=native_head_analysis_spec(None)[0]
+    s.session.model_adapters[name]='0'*64
+    live=replace(restore_native_row(raw),model_adapter_fingerprints=tuple(
+        (model,'0'*64 if model==name else adapter) for model,adapter in restore_native_row(raw).model_adapter_fingerprints))
+    s.raw_rows[2,80,None]=live
+    d=NativeMotionDemand(2,80,8,'family','other')
+    value=s.motion_inventory((d,)).supplies[0]
+    assert value.state=='NATIVE_ROWS_AVAILABLE' and value.observation is live
+    assert value.recorded_input_state=='MISSING_DECLARED_ANALYSIS_VARIANT'
+    assert not value.missing_modalities and not s.raw_calls
+
+
+@pytest.mark.parametrize('remount',(False,True))
+def test_duplicate_live_raw_keeps_exact_archived_feature_parent(tmp_path,remount):
+    s,index,raw,app,path=recorded_sensors(tmp_path,remount=remount)
+    s.raw_rows[2,80,None]=replace(restore_native_row(raw),source_file_identity=_file_identity(path))
+    d=NativeMotionDemand(2,80,8,'family','other',require_appearance=True)
+    value=s.motion_inventory((d,)).supplies[0]
+    assert value.observation.to_dict()==restore_native_row(raw).to_dict()
+    assert value.appearance==app and not value.missing_modalities
+    assert not s.raw_calls and not s.appearance_calls
 
 
 def test_recorded_appearance_only_remount_completion_keeps_exact_old_raw_parent(tmp_path):

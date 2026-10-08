@@ -199,7 +199,7 @@ def measure_review_partial_screen_trajectory(left,right,*,ticks,fps,aspect=9/16)
             losses[1]+=weight*velocity
             known[1]+=weight;measured_velocity+=1
             direction_requests.append(dict(tick=ticks[i],joint=joint,
-                applicability=applicability,direction_error=direction))
+                applicability=applicability,direction_error=direction,left_speed=an,right_speed=bn))
             if joint=='root':roots.append(dict(tick=ticks[i],left_velocity=av.tolist(),
                 right_velocity=bv.tolist(),velocity_difference=difference,direction_error=direction,
                 direction_applicability=applicability,both_nonstationary=min(an,bn)>=.02))
