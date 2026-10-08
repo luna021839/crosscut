@@ -173,13 +173,15 @@ class NativeMotionDemand:
     opportunity: str
     analysis_roll: float | None = None
     require_appearance: bool = False
+    require_member_features: bool = False
 
     def __post_init__(self):
         if (any(type(n) is not int or n<0 for n in
                 (self.source_index,self.native_frame_index,self.output_tick))
                 or not isinstance(self.source_family,str) or not self.source_family
                 or self.opportunity not in ('moving_closeup','other')
-                or type(self.require_appearance) is not bool):
+                or type(self.require_appearance) is not bool
+                or type(self.require_member_features) is not bool):
             raise ValueError('native motion demand needs a physical address and original opportunity')
         from .group_native_head_orientation import native_head_analysis_spec
         native_head_analysis_spec(self.analysis_roll)
@@ -194,20 +196,31 @@ class NativeMotionSupply:
     demand: NativeMotionDemand
     observation: NativeGroupObservation | None
     appearance: dict | None = None
+    recorded_input_state: str | None = None
+    source_equivalence_json: str | None = None
+    member_features: dict | None = None
 
     @property
     def missing_modalities(self):
+        if self.recorded_input_state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS'):
+            return ()  # Conflicting measurements are not an invitation to retry until one wins.
         if self.observation is None:
-            return ('RAW','APPEARANCE') if self.demand.require_appearance else ('RAW',)
+            return ('RAW',) + (('APPEARANCE',) if self.demand.require_appearance else ()) + (
+                ('MEMBER_FEATURES',) if self.demand.require_member_features else ())
         # A measured decode failure is retained, not a fresh completion miss.
         if self.observation.native_pixel_sha256 is None:return ()
-        return ('APPEARANCE',) if self.demand.require_appearance and self.appearance is None else ()
+        return (('APPEARANCE',) if self.demand.require_appearance and self.appearance is None else ()) + (
+            ('MEMBER_FEATURES',) if self.demand.require_member_features and self.member_features is None else ())
 
     @property
     def state(self):
+        if self.recorded_input_state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS'):
+            return self.recorded_input_state
         if self.observation is None:return 'UNKNOWN_NOT_OBSERVED'
         if self.observation.native_pixel_sha256 is None:return 'EXACT_DECODE_UNAVAILABLE'
-        if self.missing_modalities:return 'RAW_AVAILABLE_APPEARANCE_UNOBSERVED'
+        if self.missing_modalities:
+            return ('RAW_AVAILABLE_APPEARANCE_UNOBSERVED' if 'APPEARANCE' in self.missing_modalities
+                else 'RAW_AVAILABLE_MEMBER_FEATURES_UNOBSERVED')
         # Available native rows can still have absent/ambiguous heads or limbs.
         return 'NATIVE_ROWS_AVAILABLE'
 
@@ -220,15 +233,172 @@ class NativeMotionInventory:
     status: str
 
 
+class NativeMotionViews:
+    """Project one completed request inventory into explicit actor occurrences.
+
+    All visible heads survive absent appearance. Only heads with a vector in
+    the pinned space enter temporal association. The same connected path is
+    returned to camera, hold and incident consumers; no default salience or
+    framewise cosine reselection is performed here.
+    """
+    def __init__(self,sensors,inventory,*,body_receipt_bundles=()):
+        import json
+        from .group_review_body_recovery import merge_review_body_receipts
+        if (not isinstance(inventory,NativeMotionInventory)
+                or not inventory.completion_consumed or sensors.session.closed):
+            raise ValueError('native motion views need the completed live request inventory')
+        self.sensors=sensors;self.domain=sensors.session.domain
+        self.supplies={};self.payloads={};self.records={};self.views={};self.paths={}
+        for supply in inventory.supplies:
+            key=supply.demand.native_key
+            previous=self.supplies.get(key)
+            if previous is not None:
+                if previous.observation!=supply.observation:
+                    raise ValueError('native motion aliases changed their raw observation')
+                if previous.appearance is not None and supply.appearance is not None and previous.appearance!=supply.appearance:
+                    raise ValueError('native motion aliases changed their appearance observation')
+                if (previous.member_features is not None and supply.member_features is not None
+                        and previous.member_features != supply.member_features):
+                    raise ValueError('native motion aliases changed their member feature observation')
+                supply=replace(supply,appearance=previous.appearance if supply.appearance is None else supply.appearance,
+                    member_features=previous.member_features if supply.member_features is None else supply.member_features)
+            self.supplies[key]=supply
+            if supply.observation is not None:
+                self.payloads[key]=json.loads(json.dumps(supply.observation.to_dict(),sort_keys=True,allow_nan=False))
+        self.body_receipts,self.body_merge_audit=merge_review_body_receipts(*tuple(body_receipt_bundles))
+
+    def record(self,query,tick,*,analysis_roll=None):
+        from .group_scene_static_query import reproject_recorded_static_query
+        from .group_review_recorded_index import validate_recorded_appearance
+        from .native_face_descriptor import native_descriptor_space,SFACE_MODEL_NAME
+        self.sensors.session.budget.check()
+        if self.sensors.session.closed:raise ValueError('native motion views lost their live request session')
+        query.bind_source(self.domain)
+        _,_,native=query.sample_at(tick);source=self.domain.request_index(query.eligible_source_index)
+        address=(source,native,analysis_roll)
+        key=(query.key,tick,analysis_roll)
+        if key in self.records:return self.records[key]
+        supply=self.supplies.get(address);raw=self.payloads.get(address)
+        if supply is None or raw is None or raw['native_pixel_sha256'] is None:
+            result=dict(state='UNKNOWN_NOT_OBSERVED' if supply is None else supply.state,
+                row=None,appearance=None,head_inventory=(),quality_approved=False)
+        else:
+            appearance=supply.appearance
+            if appearance is not None:
+                validate_recorded_appearance(raw,appearance,expected_space=native_descriptor_space(
+                    self.sensors.session,SFACE_MODEL_NAME))
+            member_features=supply.member_features
+            if member_features is not None:
+                from .ive_local_arcface_gallery import validate_recorded_member_features
+                from .native_face_descriptor import ARCFACE_MODEL_NAME
+                validate_recorded_member_features(raw,member_features,gallery=self.sensors.member_gallery,
+                    expected_space=native_descriptor_space(self.sensors.session,ARCFACE_MODEL_NAME))
+            row=reproject_recorded_static_query(query,tick,raw,domain=self.domain,compact=True)
+            result=dict(state=supply.state,row=row,appearance=appearance,member_features=member_features,
+                source_equivalence_json=supply.source_equivalence_json,
+                head_inventory=tuple(h['observation_id'] for h in raw['heads']),quality_approved=False)
+        self.records[key]=result
+        return result
+
+    def native_signature(self,query,tick,*,analysis_roll=None):
+        from bisect import bisect_right
+        import json
+        source=self.domain.request_index(query.eligible_source_index);_,_,native=query.sample_at(tick)
+        supply=self.supplies.get((source,native,analysis_roll))
+        if supply is not None and supply.observation is not None:
+            identity=supply.observation.source_file_identity
+        else:
+            binding=self.sensors.recorded_motion_bindings.get(source)
+            identity=(json.loads(binding)['recorded_file_identity'] if binding is not None
+                else self.sensors.session._assert_source_identity(source))
+        clock=self.domain.clocks_by_request[source]
+        cuts=tuple(math.ceil(t*float(clock.frame_rate)-1e-9) for t in self.domain.cuts_for_request(source))
+        return source,query.source_clock_identity,family.digest(identity),bisect_right(cuts,native),native
+
+    def candidates(self,query,tick,*,analysis_roll=None,association_ready=False):
+        from .group_review_camera_repair import ReviewActorSelection,framing_descriptor,effective_face_detail_pixels
+        from .group_review_body_recovery import (apply_review_primary_joint_observation,
+            apply_review_body_receipt,head_fingerprint)
+        key=(query.key,tick,analysis_roll)
+        if key not in self.views:
+            found=self.record(query,tick,analysis_roll=analysis_roll);result=[]
+            row=found['row']
+            if row is not None:
+                raw=row['native_observation'];appearance=found['appearance']
+                embeddings={} if appearance is None else {h['observation_id']:h['embedding'] for h in appearance['heads']}
+                member_features=found.get('member_features')
+                member_hints={} if member_features is None else {
+                    h['observation_id']:h['member_hint'] for h in member_features['heads']}
+                for head in raw['heads']:
+                    head_id=head['observation_id']
+                    descriptor=framing_descriptor(row,actor_selection=ReviewActorSelection.occurrence(head_id))
+                    if descriptor is None:continue
+                    detail=effective_face_detail_pixels(descriptor)
+                    near=min(1.,max(0.,(descriptor.face_height-.13)/.13))
+                    if detail is not None:near*=min(1.,detail/150.)
+                    view=dict(row=row,descriptor=descriptor,vector=embeddings.get(head_id),
+                        appearance=appearance,member_hint=member_hints.get(head_id),near=near,detail_risk=None,
+                        native_camera_unit_index=self.native_signature(query,tick,analysis_roll=analysis_roll)[3],
+                        actor_association_state='APPEARANCE_UNOBSERVED' if embeddings.get(head_id) is None
+                            else 'EXACT_HEAD_APPEARANCE_AVAILABLE',quality_approved=False)
+                    view=apply_review_primary_joint_observation(view,project_point=lambda p:project_point(p,query,tick))
+                    physical=(raw['request_source_index'],raw['native_frame_index'],raw['source_clock_identity'],
+                        tuple(raw['source_file_identity']),raw['native_pixel_sha256'],head_fingerprint(head))
+                    receipt=self.body_receipts.get(physical)
+                    if receipt is not None:
+                        window,evidence=receipt
+                        view=apply_review_body_receipt(view,evidence,expected_window=window,
+                            project_point=lambda p:project_point(p,query,tick))
+                    elif any(v['physical_occurrence_identity']==family.digest(physical)
+                            for v in self.body_merge_audit['conflicts']):
+                        view=dict(view,review_body_recovery_state='CONFLICTING_FROZEN_BODY_RECEIPTS')
+                    result.append(view)
+            self.views[key]=tuple(result)
+        values=self.views[key]
+        return tuple(v for v in values if v['vector'] is not None) if association_ready else values
+
+    def connected_actor_views(self,queries,ticks,anchor,*,analysis_roll=None):
+        from .group_review_actor_path import connected_source_actor_views
+        ticks=tuple(ticks)
+        key=(tuple((t,queries[t].key) for t in ticks),analysis_roll,None if anchor is None else
+            (family.digest(anchor['row']['native_observation']),anchor['descriptor'].frame_local_head_id))
+        if key not in self.paths:
+            frames=[self.candidates(queries[t],t,analysis_roll=analysis_roll,association_ready=True) for t in ticks]
+            units={t:self.native_signature(queries[t],t,analysis_roll=analysis_roll)[:4] for t in ticks}
+            self.paths[key]=connected_source_actor_views(frames,ticks=ticks,native_units=units,
+                anchor=anchor,maximum_frames=512,work_port=self.sensors.session.budget.request_work_phase)
+        return self.paths[key]
+
+    def freeze_original_actors(self,queries,ticks,*,original_program_identity):
+        from .group_review_reference_actor import freeze_original_review_actor_inventory
+        ticks=tuple(sorted(set(ticks)))
+        frames={t:self.candidates(queries[t],t,association_ready=True) for t in ticks}
+        units={t:self.native_signature(queries[t],t)[:4] for t in ticks}
+        roles={t:'UNSPECIFIED' if queries[t].role is None else queries[t].role.value for t in ticks}
+        return freeze_original_review_actor_inventory(frames,native_units=units,
+            original_program_identity=original_program_identity,
+            original_attention_scopes={t:queries[t].original_unit_id for t in ticks},
+            original_roles_by_tick=roles)
+
+
 class NativeFamilySensors:
     """One live raw-native cache/model owner; no camera-dependent cohort choice."""
-    def __init__(self,session,assets,*,frozen_declarations=None):
+    def __init__(self,session,assets,*,frozen_declarations=None,member_gallery=None):
         self.session,self.assets = session,assets
         register_joint_native_models(session,**assets)
         register_native_head_orientation_models(session,assets['head_model_path'])
         self.declarations = {}
         self.raw_rows = {}
         self.appearance_rows = {}
+        self.member_feature_rows = {}
+        self.recorded_member_feature_cache = None
+        self.member_gallery = member_gallery
+        if member_gallery is not None:
+            from .ive_local_arcface_gallery import LocalIVEArcFaceGallery
+            if not isinstance(member_gallery,LocalIVEArcFaceGallery):
+                raise ValueError('native member hints need the explicitly supplied local gallery')
+        self.recorded_motion_index = None
+        self.recorded_motion_bindings = {}
         if frozen_declarations is not None:
             for row in frozen_declarations:
                 self.declarations[tuple(row['span_key'])] = row
@@ -314,6 +484,154 @@ class NativeFamilySensors:
         validate_recorded_appearance(payload,value,expected_space=space)
         return value
 
+    def member_features_at(self,supply,*,cached_only=False):
+        from .ive_local_arcface_gallery import (observe_recorded_member_features,
+            validate_recorded_member_features)
+        from .native_face_descriptor import native_descriptor_space,ARCFACE_MODEL_NAME
+        import json
+        if self.member_gallery is None:
+            raise ValueError('member feature request has no explicit local photo gallery')
+        payload=json.loads(json.dumps(supply.observation.to_dict(),sort_keys=True,allow_nan=False))
+        key=family.digest(payload),self.member_gallery.identity
+        value=self.member_feature_rows.get(key)
+        if value is None and self.recorded_member_feature_cache is not None:
+            value=self.recorded_member_feature_cache.get(payload)
+            if value is not None:self.member_feature_rows[key]=value
+        if value is None and cached_only:return None
+        space=native_descriptor_space(self.session,ARCFACE_MODEL_NAME)
+        if value is None:
+            value=observe_recorded_member_features(self.session,supply,self.member_gallery)
+            self.member_feature_rows[key]=value
+            if self.recorded_member_feature_cache is not None:
+                self.recorded_member_feature_cache.add(payload,value)
+        validate_recorded_member_features(payload,value,gallery=self.member_gallery,expected_space=space)
+        return value
+
+    def bind_recorded_member_feature_cache(self,cache):
+        from .ive_local_arcface_gallery import LocalIVEArcFaceFeatureCache
+        from .native_face_descriptor import native_descriptor_space,ARCFACE_MODEL_NAME
+        if (not isinstance(cache,LocalIVEArcFaceFeatureCache) or self.member_gallery is None
+                or self.recorded_member_feature_cache is not None
+                or getattr(self.session,'_native_motion_completion_consumed',False)
+                or cache.gallery.identity!=self.member_gallery.identity
+                or cache.space!=native_descriptor_space(self.session,ARCFACE_MODEL_NAME)):
+            raise ValueError('recorded member features need one exact pre-completion input binding')
+        self.recorded_member_feature_cache=cache
+
+    def bind_recorded_motion_index(self,index,*,source_identities,source_content_sha256):
+        """Bind the request's explicit archive index without rewriting raw parents.
+
+        No directory search, extra cache DB or inference occurs. Device-only
+        remounts require the independently retained complete content hash.
+        This is reusable observation input, not fresh pixel or quality proof.
+        """
+        from .group_review_recorded_index import RecordedGroupReviewIndex,verify_recorded_source_file
+        import json
+        if (getattr(self,'recorded_motion_index',None) is not None
+                or not isinstance(index,RecordedGroupReviewIndex)
+                or not isinstance(source_identities,dict) or not source_identities
+                or not set(source_identities)<=set(self.session.domain.eligible_indices)
+                or not isinstance(source_content_sha256,dict)):
+            raise ValueError('recorded motion input needs one explicit request-owned source manifest')
+        self.session.budget.check()
+        if self.session.closed:raise ValueError('recorded motion input needs a live request session')
+        bindings={}
+        for source,identity in sorted(source_identities.items()):
+            receipt=verify_recorded_source_file(self.session.domain.request_sources[source],identity,
+                content_sha256=source_content_sha256.get(source),work_port=self.session.budget.request_work_phase)
+            if tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(source):
+                raise ValueError('recorded source changed while binding it to the live request')
+            bindings[source]=json.dumps(receipt,sort_keys=True,separators=(',',':'),allow_nan=False)
+        self.recorded_motion_bindings=bindings
+        self.recorded_motion_index=index
+
+    def _recorded_motion_supply(self,demand):
+        from .group_review_recorded_index import native_analysis_variant,validate_recorded_appearance
+        from .group_native_head_orientation import native_head_analysis_spec
+        from .group_joint_person_ownership import ownership_policy_fingerprint
+        from .group_scene_focal_pose_motion import restore_native_row
+        from .native_face_descriptor import native_descriptor_space,SFACE_MODEL_NAME
+        import json
+        index=getattr(self,'recorded_motion_index',None)
+        binding=getattr(self,'recorded_motion_bindings',{}).get(demand.source_index)
+        if index is None or binding is None:return NativeMotionSupply(demand,None)
+        receipt=json.loads(binding)
+        if self.session.closed:raise ValueError('recorded motion cannot reuse a closed session')
+        self.session.budget.check()
+        if tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(demand.source_index):
+            raise ValueError('recorded motion source changed after request binding')
+        names=('nanodet_people','rtmpose_body7',native_head_analysis_spec(demand.analysis_roll)[0])
+        for name in names:self.session._assert_model_assets(name)
+        variant=native_analysis_variant(dict(
+            model_content_sha256=tuple((name,self.session.models[name][2]) for name in names),
+            model_adapter_fingerprints=tuple((name,self.session.model_adapters[name]) for name in names),
+            person_ownership_policy_sha256=ownership_policy_fingerprint()))
+        clock=self.session.domain.clocks_by_request[demand.source_index]
+        found=index.lookup(source=demand.source_index,native=demand.native_frame_index,
+            clock=family.digest(clock.to_dict()),identity=receipt['recorded_file_identity'],
+            analysis_variant_sha256=variant)
+        raw=None if found['raw'] is None else restore_native_row(found['raw'])
+        appearance=None
+        if raw is not None and demand.require_appearance:
+            appearance=self.appearance_rows.get(family.digest(raw.to_dict()),found['appearance'])
+            if appearance is not None:
+                space=native_descriptor_space(self.session,SFACE_MODEL_NAME)
+                actual=validate_recorded_appearance(found['raw'],appearance)
+                if actual!=space:
+                    # Keep the actual raw heads, but never mix descriptor spaces.
+                    appearance=None;found=dict(found,state='APPEARANCE_SPACE_MISMATCH')
+        supply=NativeMotionSupply(demand,raw,appearance,found['state'],binding)
+        if demand.require_member_features and raw is not None and raw.native_pixel_sha256 is not None:
+            supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
+        return supply
+
+    def _complete_motion_appearance(self,supply):
+        """Complete an archived raw parent's appearance on verified live pixels."""
+        raw=supply.observation
+        if supply.source_equivalence_json is None:return self.appearance_at(raw)
+        import hashlib,json
+        from .face_identity import _validate_normalized_face
+        from .native_face_descriptor import native_descriptor_space,SFACE_MODEL_NAME
+        from .group_review_actor_appearance import CONTRACT
+        from .group_review_recorded_index import validate_recorded_appearance
+        receipt=json.loads(supply.source_equivalence_json)
+        # The archive's canonical JSON containers remain the parent. Restore
+        # returns typed tuples; do not let that representation change make a
+        # completed appearance fail its next exact-parent cache lookup.
+        payload=json.loads(json.dumps(raw.to_dict(),sort_keys=True,allow_nan=False))
+        source=raw.request_source_index;native=raw.native_frame_index
+        if (self.session.closed or tuple(receipt['recorded_file_identity'])!=raw.source_file_identity
+                or tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(source)):
+            raise ValueError('archived appearance lost its live source equivalence')
+        if raw.source_clock_identity!=family.digest(self.session.domain.clocks_by_request[source].to_dict()):
+            raise ValueError('archived appearance changed its native source clock')
+        pixels=self.session.native_pixels(source,native)
+        if pixels is None or hashlib.sha256(memoryview(pixels)).hexdigest()!=raw.native_pixel_sha256:
+            raise ValueError('archived appearance exact native pixels changed')
+        space=native_descriptor_space(self.session,SFACE_MODEL_NAME);rows=[]
+        for head in raw.heads:
+            try:_validate_normalized_face(head.box_xywh,head.landmarks_xy)
+            except ValueError:
+                rows.append(dict(observation_id=head.observation_id,embedding=None,
+                    reason='recorded_geometry_outside_native_descriptor_input'));continue
+            vector=self.session.observe_native(source,native,model=SFACE_MODEL_NAME,
+                arguments=dict(bbox_xywh=head.box_xywh,landmarks_xy=head.landmarks_xy))
+            rows.append(dict(observation_id=head.observation_id,embedding=vector,
+                reason='actual_native_sface' if vector is not None else 'native_embedding_unavailable'))
+        if tuple(receipt['current_file_identity'])!=self.session._assert_source_identity(source):
+            raise ValueError('archived appearance source changed during completion')
+        self.session._assert_model_assets(SFACE_MODEL_NAME)
+        result=dict(contract=CONTRACT,**{k:payload[k] for k in ('request_source_index','native_frame_index',
+            'source_clock_identity','source_file_identity','native_pixel_sha256')},
+            recorded_native_observation_sha256=family.digest(payload),descriptor_space=space.to_dict(),heads=rows,
+            actual_native_raster_redecoded=True,detector_input_is_recorded=True,head_detection_reexecuted=False,
+            named_member_identity_certified=False,persistent_actor_identity_certified=False,
+            motion_certified=False,candidate_admitted=False,quality_approved=False,
+            verified_source_equivalence=receipt,archived_observation_rewritten=False)
+        validate_recorded_appearance(payload,result,expected_space=space)
+        self.appearance_rows[family.digest(payload)]=result
+        return result
+
     def motion_inventory(self,demands):
         """Inspect every declared time/source opportunity without new NN work."""
         demands = tuple(demands)
@@ -322,18 +640,26 @@ class NativeFamilySensors:
             raise ValueError('native motion inventory needs bounded typed demands')
         family_by_source={}
         for d in demands:
+            if d.require_member_features and self.member_gallery is None:
+                raise ValueError('member feature request has no explicit local photo gallery')
             previous=family_by_source.setdefault(d.source_index,d.source_family)
             if previous!=d.source_family:
                 raise ValueError('native demand aliases changed a frozen source family')
         supplies=[]
         for d in demands:
             raw=self.native_at(d.source_index,d.native_frame_index,d.analysis_roll,cached_only=True)
+            if raw is None:
+                supplies.append(self._recorded_motion_supply(d));continue
             appearance=(self.appearance_at(raw,cached_only=True) if d.require_appearance
                 and raw is not None and raw.native_pixel_sha256 is not None else None)
-            supplies.append(NativeMotionSupply(d,raw,appearance))
+            supply=NativeMotionSupply(d,raw,appearance)
+            if d.require_member_features and raw.native_pixel_sha256 is not None:
+                supply=replace(supply,member_features=self.member_features_at(supply,cached_only=True))
+            supplies.append(supply)
         return NativeMotionInventory(tuple(supplies),(),False,'CACHE_ONLY')
 
-    def complete_motion_inventory_once(self,inventory,*,maximum_new_observations):
+    def complete_motion_inventory_once(self,inventory,*,maximum_new_observations,
+            maximum_new_raw_observations=None):
         """One request-owned, time/source/opportunity-balanced missing pass.
 
         Existing successes, observed failures and absent facts remain distinct.
@@ -349,7 +675,10 @@ class NativeFamilySensors:
             raise ValueError('normal motion completion requires the active whole-request work lease')
         if (not isinstance(inventory,NativeMotionInventory) or inventory.completion_consumed
                 or type(maximum_new_observations) is not int
-                or not 0<=maximum_new_observations<=1200):
+                or not 0<=maximum_new_observations<=1200
+                or maximum_new_raw_observations is not None and (
+                    type(maximum_new_raw_observations) is not int
+                    or not 0<=maximum_new_raw_observations<=maximum_new_observations)):
             raise ValueError('one native completion needs the frozen cache-only inventory')
         if getattr(self.session,'_native_motion_completion_consumed',False):
             raise ValueError('native motion completion already consumed this session')
@@ -380,35 +709,48 @@ class NativeFamilySensors:
         evidence_reserve=primitive_reservation_bytes(MAX_NATIVE_JSON_BYTES)
         if remaining('pose_evidence_bytes') < evidence_reserve:limit=0
         counts={}; pending=dict(missing); scheduled=[]
+        raw_limit=(maximum_new_observations if maximum_new_raw_observations is None
+            else maximum_new_raw_observations)
+        raw_scheduled=0
+        raw_by_key={s.demand.native_key:s.observation for s in current.supplies}
         # Bit-reversed order visits distributed time bands before adjacent
         # bands. A later wall/IPC cutoff does not leave a chronological prefix.
         bits=max(1,(limit-1).bit_length())
         bands=sorted(range(limit),key=lambda n:int(format(n,'0'+str(bits)+'b')[::-1],2))
         for band in bands:
+            eligible={key:rows for key,rows in pending.items()
+                if raw_by_key[key] is not None or raw_scheduled<raw_limit}
+            if not eligible:break
             target=first+(band+.5)*(end-first)/max(1,limit)
             def priority(d):
                 return (counts.get((d.source_family,d.opportunity),0),
                     abs(d.output_tick-target),d.source_family,d.opportunity,
                     d.source_index,d.native_frame_index,
                     -1000. if d.analysis_roll is None else d.analysis_roll)
-            key,demand=min(((key,min(rows,key=priority)) for key,rows in pending.items()),
+            key,demand=min(((key,min(rows,key=priority)) for key,rows in eligible.items()),
                 key=lambda item:priority(item[1]))
             aliases=pending.pop(key)
             scheduled.append(demand)
+            if raw_by_key[key] is None:raw_scheduled+=1
             # One native fact services every output use. Do not erase a later
             # moving-closeup use by selecting an earlier 'other' representative.
             for lane in {(d.source_family,d.opportunity) for d in aliases}:
                 counts[lane]=counts.get(lane,0)+1
         attempted=[]
         known={s.demand.native_key:s.observation for s in current.supplies}
+        bindings={s.demand.native_key:s for s in current.supplies}
         appearances={s.demand.native_key:s.appearance for s in current.supplies if s.appearance is not None}
+        member_features={s.demand.native_key:s.member_features for s in current.supplies if s.member_features is not None}
         need_appearance={d.native_key for d in demands if d.require_appearance}
-        status=('BUDGET_PARTIAL' if limit<len(missing)
+        need_member_features={d.native_key for d in demands if d.require_member_features}
+        status=('BUDGET_PARTIAL' if len(scheduled)<len(missing)
             else 'COMPLETED_ONCE')
         def snapshot(state):
             # These rows were validated in this pass. Do not reopen source/model
             # I/O after its deadline merely to construct the result container.
-            value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key))
+            value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key),
+                bindings[d.native_key].recorded_input_state,bindings[d.native_key].source_equivalence_json,
+                member_features.get(d.native_key))
                 for d in demands),tuple(attempted),True,state)
             self.motion_completion_result=value
             return value
@@ -420,17 +762,27 @@ class NativeFamilySensors:
                 raw_calls=14 if raw is None else 0
                 appearance_calls=((24 if raw is None else len(raw.heads))
                     if demand.native_key in need_appearance and demand.native_key not in appearances else 0)
-                required=dict(new_decodes=1,model_calls=raw_calls+appearance_calls,
+                member_calls=((24 if raw is None else len(raw.heads))
+                    if demand.native_key in need_member_features and demand.native_key not in member_features else 0)
+                required=dict(new_decodes=1,model_calls=raw_calls+appearance_calls+member_calls,
                     pose_evidence_bytes=evidence_reserve)
                 if any(remaining(k)<n for k,n in required.items()):
                     status='BUDGET_PARTIAL';continue
                 attempted.append(demand.native_key)
                 snapshot('RUNNING')
-                known[demand.native_key]=self.native_at(demand.source_index,
-                    demand.native_frame_index,demand.analysis_roll)
+                if raw is None:
+                    known[demand.native_key]=self.native_at(demand.source_index,
+                        demand.native_frame_index,demand.analysis_roll)
+                    bindings[demand.native_key]=NativeMotionSupply(demand,known[demand.native_key])
                 raw=known[demand.native_key]
-                if demand.native_key in need_appearance and raw.native_pixel_sha256 is not None:
-                    appearances[demand.native_key]=self.appearance_at(raw)
+                if (demand.native_key in need_appearance and demand.native_key not in appearances
+                        and raw.native_pixel_sha256 is not None):
+                    appearances[demand.native_key]=self._complete_motion_appearance(replace(bindings[demand.native_key],
+                        observation=raw))
+                if (demand.native_key in need_member_features and demand.native_key not in member_features
+                        and raw.native_pixel_sha256 is not None):
+                    member_features[demand.native_key]=self.member_features_at(replace(bindings[demand.native_key],
+                        observation=raw))
                 snapshot('RUNNING')
         except BaseException:
             snapshot('INTERRUPTED_PARTIAL')

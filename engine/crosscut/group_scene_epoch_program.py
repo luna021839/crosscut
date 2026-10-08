@@ -108,10 +108,11 @@ def freeze_original_role_epochs(context,shot):
     A subsequent original sensor programme must freeze those lifecycles.
     """
     bundle=context.incumbent;plan=bundle.render_plan
+    face_plan=bundle.face_match_plan
     if (not isinstance(plan,RenderPlan) or not isinstance(shot,VisibleGroupShot)
             or not 0<=shot.first_output_frame<shot.end_output_frame<=plan.output_frame_count
             or len(bundle.visual_timeline.choices)!=len(plan.segments)
-            or len(bundle.face_match_plan.segments)!=len(plan.segments)):
+            or face_plan is not None and len(face_plan.segments)!=len(plan.segments)):
         raise ValueError('original role epochs need the complete external output inventory')
     offsets=_cell_offsets(plan)
     indices=tuple(i for i in range(len(plan.segments))
@@ -121,10 +122,12 @@ def freeze_original_role_epochs(context,shot):
         raise ValueError('original role epoch shot differs from its external output cells')
     cells=[]
     for index in indices:
-        choice=bundle.visual_timeline.choices[index];face=bundle.face_match_plan.segments[index]
+        choice=bundle.visual_timeline.choices[index]
+        face=None if face_plan is None else face_plan.segments[index]
         cell=dict(segment_index=index,first_output_frame=offsets[index],end_output_frame=offsets[index+1],
             shot_type=getattr(choice.shot_type,'value',choice.shot_type),
-            alignment_subject=face.alignment_subject,face_applied=face.applied)
+            alignment_subject=None if face is None else face.alignment_subject,
+            face_applied=False if face is None else face.applied)
         cells.append(cell)
     return _original_role_program(_plan_identity(plan),shot.to_dict(),cells)
 

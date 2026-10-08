@@ -64,6 +64,20 @@ def test_mixed_role_camera_is_frozen_as_distinct_original_duty_views():
     assert samples(result.plan,domain)==samples(context.incumbent.render_plan,domain)
 
 
+def test_normal_neutral_baseline_without_face_plan_retains_declared_roles():
+    from crosscut.group_scene_epoch_program import freeze_original_role_epochs
+    context,domain,shot=fixture()
+    context.incumbent.face_match_plan=None
+    program=freeze_original_role_epochs(context,shot)
+    assert [e['role'] for e in program['epochs']]==['observed_body_composition','focal_head']
+    assert all(c['alignment_subject'] is None and c['face_applied'] is False
+        for c in program['original_output_cells'])
+    context.incumbent.visual_timeline.choices[1].shot_type='unknown'
+    unknown=freeze_original_role_epochs(context,shot)
+    assert unknown['epochs'][0]['role'] is None
+    assert unknown['epochs'][0]['unresolved_reason']
+
+
 @pytest.mark.parametrize('fps,native',[(30.,Fraction(30)),(30.,Fraction(60)),
     (29.97,Fraction(30000,1001)),(29.97,Fraction(60000,1001))])
 def test_whole_camera_slice_keeps_global_phase_for_each_role_epoch(fps,native):

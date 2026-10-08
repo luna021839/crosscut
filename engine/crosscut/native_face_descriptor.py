@@ -132,10 +132,15 @@ class NativeArcFaceR50:
 
 def register_native_arcface_model(session,model_path):
     """Exactly one ORT inference per counted source/ROI invocation."""
-    session.budget.check();model=NativeArcFaceR50(model_path);session.budget.check()
+    session.budget.check()
+    before=session._identity(Path(model_path))
+    port=getattr(session.budget,'request_work_phase',None)
+    if port is not None:
+        port.charge('model_hash_bytes',before[2]);port.charge('model_loads',1,model=ARCFACE_MODEL_NAME)
+    model=NativeArcFaceR50(model_path);session.budget.check()
     import onnxruntime as ort
     session.register_model(ARCFACE_MODEL_NAME,model.path,model.embedding,
-        expected_asset_sha256=model.asset_sha256,adapter_fingerprint=dict(
+        expected_asset_sha256=model.asset_sha256,expected_file_identity=before,adapter_fingerprint=dict(
         contract='source_native_arcface_r50_512d_similarity_not_semantic_identity_v1',
         implementation_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         geometry_validation_sha256=hashlib.sha256(Path(__file__).with_name('face_identity.py').read_bytes()).hexdigest(),

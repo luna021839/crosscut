@@ -17,7 +17,7 @@ def _content_key(view):
         return 'unmatched'
     d = view['descriptor']
     # Detector head numbers are frame-local, not cross-frame identity or ties.
-    return digest(dict(vector=view['vector'], center=d.head_center,
+    return digest(dict(vector=view['vector'], member_hint=view.get('member_hint'),center=d.head_center,
         height=d.face_height, width=d.face_width, shape=d.pose_shape))
 
 
@@ -60,6 +60,8 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
     if sim is None or sim < minimum_cosine:
         return None  # The real unmatched alternative remains in the graph.
     shape = shape_cost(left['descriptor'],right['descriptor'])
+    from .ive_local_arcface_gallery import local_member_hint_conflict
+    member_conflict=local_member_hint_conflict(left.get('member_hint'),right.get('member_hint'))
     reacquired=a[4]!=b[4]
     # Identity embeddings alone can prefer another performer doing the same
     # dance. A camera-local hypothesis also owns its measured head trajectory.
@@ -78,8 +80,10 @@ def _link(left, right, *, maximum_native_gap, minimum_cosine,observed_native_cam
             return None
         spatial=.4*distance/(.12+(ah+bh)/2)
         spatial+=.2*abs(math.log(bh/ah))
-    return dict(cost=2.*max(0.,1.-sim)+spatial+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.),
+    return dict(cost=2.*max(0.,1.-sim)+spatial+(.25 if shape is None else .15*shape)+(.25 if reacquired else 0.)
+            +(2. if member_conflict else 0.),
         measured_camera_local_spatial_cost=spatial,
+        local_photo_member_hint_conflict=member_conflict,
         state='appearance_reacquisition_at_observed_native_cut' if reacquired else 'appearance_link_hypothesis',
         cosine=sim,linked=True,continuous_camera_local_track_hypothesis=not reacquired,
         observed_native_camera_cut=observed_native_camera_cut)
@@ -422,7 +426,8 @@ def anchored_review_actor_paths(frames, *, independent_anchor, anchor_frame_inde
     return tuple(results)
 
 
-def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum_frames=240):
+def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum_frames=240,
+        work_port=None):
     """Follow one selected occurrence through its physical camera run.
 
     Returns actual observed views only. Missing frames and other native camera
@@ -458,7 +463,7 @@ def connected_source_actor_views(frames, *, ticks, native_units, anchor, maximum
         return selected,dict(state='SINGLE_OBSERVED_OCCURRENCE',connected_motion_observed=False)
     path=anchored_review_actor_paths([frames[i] for i in indices],independent_anchor=anchor,
         anchor_frame_index=selected_ticks.index(at),maximum_paths=1,maximum_heads=8,
-        maximum_frames=maximum_frames,fixed_anchor_occurrence=True)[0]
+        maximum_frames=maximum_frames,fixed_anchor_occurrence=True,work_port=work_port)[0]
     ambiguous_indices=set(path['ambiguous_frame_indices'])
     for i,(t,v) in enumerate(zip(selected_ticks,path['observations'])):
         if v is not None:
