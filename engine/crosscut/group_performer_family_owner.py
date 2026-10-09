@@ -958,6 +958,9 @@ def consume_performer_family_qa(analysis,plan_json,selection):
 
 def qa_metrics_valid(metrics):
     if not isinstance(metrics,Mapping):return False
+    if metrics.get('contract')==NATIVE_METADATA_CONTRACT:
+        from .group_native_motion_final import native_qa_metrics_valid
+        return native_qa_metrics_valid(metrics)
     value=dict(metrics);identity=value.pop('evidence_sha256',None)
     return bool(value.get('contract') in FAMILY_CONTRACTS and value.get('binding_valid') is True
         and value.get('source_live_replay') is True and value.get('quality_approved') is False

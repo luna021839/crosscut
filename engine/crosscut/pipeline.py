@@ -34304,10 +34304,11 @@ def _analyze_impl(
                             if group_external_original_reference is not None
                             else 'deterministic_full_song_visual_selector'))
                     if request.source_mode is SourceMode.AUTOMATIC:
-                        from .group_request_work import install_group_request_work
+                        from .group_request_work import install_group_request_work, GroupWorkPolicy
                         group_request_work = install_group_request_work(controller=group_first,
                             resources=request_work_resources,
-                            journal_path=request.output_directory / f"{base_filename}-group-request-work.jsonl")
+                            journal_path=request.output_directory / f"{base_filename}-group-request-work.jsonl",
+                            policy=GroupWorkPolicy(whole_programme=True))
                     if group_external_original_reference is not None:
                         review_first_verified_candidate_bundle = baseline_bundle
                         review_first_visual_selection_payload['authority'] = 'external_original_group_reference'
@@ -34610,6 +34611,21 @@ def _analyze_impl(
             if normal_interval_candidate is not None:
                 visual_timeline = group_first.incumbent.visual_timeline
                 review_first_verified_candidate_bundle = group_first.incumbent
+
+        if (group_first is not None and group_request_work is not None
+                and group_first.incumbent.native_motion_production is None):
+            from .group_whole_programme_owner import attempt_whole_programme
+            whole_programme_result = attempt_whole_programme(controller=group_first,work=group_request_work,
+                request=request,reporter=reporter,eligible_indices=eligible_indices,offsets=offsets,
+                timewarps=eligible_timewarps,scene_cut_times=scene_cut_times,
+                rhythm=rhythm_analysis,section_plan=section_plan)
+            if whole_programme_result is not None:
+                visual_timeline = group_first.incumbent.visual_timeline
+                review_first_verified_candidate_bundle = group_first.incumbent
+                review_first_visual_selection_payload['whole_native_programme'] = whole_programme_result
+                reporter.log('전곡 프로그램 선택 완료 · 관측 인물 구간 '
+                    f"{whole_programme_result['selected_actor_runs']}개 / 카메라 보정 "
+                    f"{whole_programme_result['selected_authored_camera_runs']}개 · 영상 품질 미검증")
 
         selected_native_group_bundle = (group_first.incumbent if group_first is not None
             and group_first.incumbent.native_motion_production is not None else None)
@@ -35886,7 +35902,8 @@ def _analyze_impl(
                             source_derivatives=source_derivative_diversity_result,
                             archive_path=request.output_directory / f"{base_filename}-performer-family-transaction.json")
                     if group_request_work is not None:
-                        group_request_work.run('selected_completion',complete_selected_performer_family)
+                        if group_request_work.lease.states['selected_completion']=='not_requested':
+                            group_request_work.run('selected_completion',complete_selected_performer_family)
                     else:
                         complete_selected_performer_family()
                 # Consume one owned bundle, including clock/review/geometry.

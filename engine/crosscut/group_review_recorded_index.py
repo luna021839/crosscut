@@ -238,6 +238,14 @@ class RecordedGroupReviewIndex:
         # Count import bytes, including aliases. De-duplication is not free work.
         self.stored_bytes += byte_count
 
+    def contains_address(self, *, source, native, clock, identity):
+        """Cheap exact-address census only; never validates or selects a row.
+
+        Absence needs no live model-file I/O. Presence includes every adverse
+        variant and still requires normal source/model/feature validation.
+        """
+        return _key(source, native, clock, identity) in self.rows
+
     def lookup(self, *, source, native, clock, identity,analysis_variant_sha256=None):
         key = _key(source, native, clock, identity)
         record = self.rows.get(key)

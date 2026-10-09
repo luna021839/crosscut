@@ -325,6 +325,7 @@ class NativeMotionViews:
             raise ValueError('native motion views need the completed live request inventory')
         self.sensors=sensors;self.domain=sensors.session.domain
         self.supplies={};self.payloads={};self.records={};self.views={};self.paths={}
+        self._signature_source_bindings=None
         for supply in inventory.supplies:
             # Live observers inherit typed tuple containers from raw.to_dict;
             # persisted inputs have JSON arrays. Canonicalize containers at
@@ -397,10 +398,37 @@ class NativeMotionViews:
         # One live physical file defines the camera run, including unobserved
         # ticks. Recorded device aliases are independently bound in record();
         # their actual raw/body/feature parents are NOT rewritten here.
-        identity=self.sensors.session._assert_source_identity(source)
+        identity=(self.sensors.session._assert_source_identity(source)
+            if self._signature_source_bindings is None else self._signature_source_bindings[source])
         clock=self.domain.clocks_by_request[source]
         cuts=tuple(math.ceil(t*float(clock.frame_rate)-1e-9) for t in self.domain.cuts_for_request(source))
         return source,query.source_clock_identity,family.digest(identity),bisect_right(cuts,native),native
+
+    def native_signature_scope(self):
+        """Read-only, source-bound numeric census; verify both ends of the epoch.
+
+        Repeated graph queries need not stat the same file for every output
+        tick. Raster reads keep their independent live checks. This scope is
+        not a cache-entry admission or permission to publish a candidate: a
+        changed file at exit invalidates the ENTIRE numeric result.
+        """
+        from contextlib import contextmanager
+        @contextmanager
+        def scope():
+            session=self.sensors.session
+            if session.closed or self._signature_source_bindings is not None:
+                raise ValueError('native signature epoch needs one non-nested live session')
+            bindings={source:session._assert_source_identity(source)
+                for source in self.domain.eligible_indices}
+            self._signature_source_bindings=bindings
+            try:
+                yield self
+            finally:
+                self._signature_source_bindings=None
+                for source,identity in bindings.items():
+                    if session._assert_source_identity(source)!=identity:
+                        raise ValueError('source changed during the whole native numeric census')
+        return scope()
 
     def observation_status(self,query,tick,*,selected=None):
         """A compact exact-address diagnostic, never an identity certificate.
@@ -957,6 +985,13 @@ class NativeFamilySensors:
         if index is None or binding is None:return NativeMotionSupply(demand,None)
         if self.session.closed:raise ValueError('recorded motion cannot reuse a closed session')
         self.session.budget.check()
+        clock=self.session.domain.clocks_by_request[demand.source_index]
+        extra=getattr(self,'recorded_motion_additional_bindings',{}).get(demand.source_index)
+        aliases=(binding,) if extra is None else (binding,extra)
+        clock_identity=family.digest(clock.to_dict())
+        if not any(index.contains_address(source=demand.source_index,native=demand.native_frame_index,
+                clock=clock_identity,identity=json.loads(alias)['recorded_file_identity']) for alias in aliases):
+            return NativeMotionSupply(demand,None)
         current_identity=self.session._assert_source_identity(demand.source_index)
         names=('nanodet_people','rtmpose_body7',native_head_analysis_spec(demand.analysis_roll)[0])
         for name in names:self.session._assert_model_assets(name)
@@ -964,10 +999,8 @@ class NativeFamilySensors:
             model_content_sha256=tuple((name,self.session.models[name][2]) for name in names),
             model_adapter_fingerprints=tuple((name,self.session.model_adapters[name]) for name in names),
             person_ownership_policy_sha256=ownership_policy_fingerprint()))
-        clock=self.session.domain.clocks_by_request[demand.source_index]
-        extra=getattr(self,'recorded_motion_additional_bindings',{}).get(demand.source_index)
         supplies=[]
-        for alias in (binding,) if extra is None else (binding,extra):
+        for alias in aliases:
             receipt=json.loads(alias)
             if tuple(receipt['current_file_identity'])!=current_identity:
                 raise ValueError('recorded motion source changed after request binding')
@@ -1103,7 +1136,8 @@ class NativeFamilySensors:
 
     def complete_motion_inventory_once(self,inventory,*,maximum_new_observations,
             maximum_new_raw_observations=None,required_native_keys=(),completion_packages=(),
-            critical_required_native_keys=(),member_features_optional=False):
+            critical_required_native_keys=(),member_features_optional=False,stop_new_work=None,
+            on_chunk_settled=None):
         """One request-owned, time/source/opportunity-balanced missing pass.
 
         Existing successes, observed failures and absent facts remain distinct.
@@ -1122,6 +1156,8 @@ class NativeFamilySensors:
             raise ValueError('normal motion completion requires the active whole-request work lease')
         if (not isinstance(inventory,NativeMotionInventory) or inventory.completion_consumed
                 or type(member_features_optional) is not bool
+                or stop_new_work is not None and not callable(stop_new_work)
+                or on_chunk_settled is not None and not callable(on_chunk_settled)
                 or type(maximum_new_observations) is not int
                 or not 0<=maximum_new_observations<=1200
                 or maximum_new_raw_observations is not None and (
@@ -1216,6 +1252,14 @@ class NativeFamilySensors:
         schedule_receipt.update(execution_order_policy=
             'verified_live_rasters_before_cache_misses_no_editorial_rescoring',admission_resource_costs=[])
         status='COMPLETED_ONCE'
+        stopped_for_downstream=False
+
+        def should_stop():
+            if stop_new_work is None:return False
+            value=stop_new_work()
+            if type(value) is not bool:
+                raise ValueError('native completion downstream reserve must return an explicit boolean')
+            return value
 
         def current_core_inventory():
             return replace(core_current,supplies=tuple(NativeMotionSupply(s.demand,
@@ -1316,11 +1360,17 @@ class NativeFamilySensors:
         snapshot('RUNNING')
         try:
             while not schedule_receipt.get('terminal_required_dependencies'):
+                if should_stop():
+                    stopped_for_downstream=True
+                    break
                 scheduled,chunk=admit_chunk()
                 snapshot('RUNNING')
                 if not scheduled:break
                 for demand in scheduled:
                     budget.check()
+                    if should_stop():
+                        stopped_for_downstream=True
+                        break
                     raw=known[demand.native_key]
                     required=work_cost(demand.native_key).resources()
                     live=remaining()
@@ -1354,14 +1404,24 @@ class NativeFamilySensors:
                     snapshot('RUNNING')
                     if schedule_receipt.get('terminal_required_dependencies'):break
                 chunk.update(state='SETTLED',budget_counts_after={r:budget.counts[r] for r in COMPLETION_RESOURCES})
-            if schedule_receipt.get('terminal_required_dependencies'):
+                if on_chunk_settled is not None:
+                    # Persist only actual settled facts on the SAME live lease.
+                    # A later graph/cutoff cannot force already completed NN
+                    # work to be repeated; callbacks grant no quality approval.
+                    on_chunk_settled(snapshot('RUNNING'))
+                if stopped_for_downstream:break
+            schedule_receipt['stopped_for_declared_downstream_reserve']=stopped_for_downstream
+            if stopped_for_downstream:
+                status='PARTIAL_DOWNSTREAM_RESERVE'
+            elif schedule_receipt.get('terminal_required_dependencies'):
                 status='TERMINAL_REQUIRED_INPUT_BLOCKER'
             elif len(admitted)<len(missing) or preflight_skipped or feature_preflight_skipped:
                 status='BUDGET_PARTIAL'
             elif any(s.missing_modalities or s.state!='NATIVE_ROWS_AVAILABLE'
                     for s in current_core_inventory().supplies if s.demand.native_key in core_attempted):
                 status='COMPLETED_WITH_UNAVAILABLE_INPUTS'
-            if member_features_optional and not schedule_receipt.get('terminal_required_dependencies'):
+            if (member_features_optional and not stopped_for_downstream
+                    and not schedule_receipt.get('terminal_required_dependencies')):
                 # Core raw/SFace for every admitted package precede optional
                 # photo hints in THIS same consumed pass. No raw re-inference,
                 # second completion, or optional budget can displace core.

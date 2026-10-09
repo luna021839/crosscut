@@ -293,7 +293,10 @@ def compile_common_clock_camera_queries(*,context,domain,original_program,candid
                 if f.name not in ('segments','transitions','output','authorized_shot_video_clocks'))):
         raise ValueError('common-clock query changed external audio/output/canvas/source headers')
     previous=-1
-    if not isinstance(output_intervals,tuple) or not output_intervals or len(output_intervals)>256:
+    # A whole-programme metadata refresh owns at most 512 cells, each with
+    # three exact pixel taps. The old two-shot ceiling rejected otherwise
+    # valid full-song producers before the first actual raster read.
+    if not isinstance(output_intervals,tuple) or not output_intervals or len(output_intervals)>1536:
         raise ValueError('common-clock queries need an explicit bounded output scope')
     for span in output_intervals:
         if (not isinstance(span,tuple) or len(span)!=2 or any(type(t) is not int for t in span)

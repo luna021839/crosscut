@@ -132,7 +132,7 @@ class WholeProgrammeSelection:
 
 def select_whole_programme(*, opportunities, runs, transition_cost: Callable,
         protected_spans=(), budget=ProgrammeSearchBudget(), cancelled=None,
-        physically_compatible=None):
+        physically_compatible=None, work_port=None):
     """Select variable-length runs, retaining all history consumed by scoring.
 
     ``transition_cost(history, incoming)`` sees the exact selected whole runs,
@@ -160,6 +160,8 @@ def select_whole_programme(*, opportunities, runs, transition_cost: Callable,
     started=monotonic();deadline=started+budget.maximum_seconds
 
     def check_budget():
+        if work_port is not None:
+            work_port._check()
         if cancelled is not None and cancelled():
             raise InterruptedError('whole programme cancelled')
         if monotonic() > deadline:
@@ -195,7 +197,17 @@ def select_whole_programme(*, opportunities, runs, transition_cost: Callable,
     for opportunity in opportunities[1:]:
         check_budget()
         tick=opportunity.output_tick;current=[]
-        for run in sorted(by_end[tick],key=lambda r:r.identity):
+        incoming_runs=sorted(by_end[tick],key=lambda r:r.identity)
+        # One durable admission for this finite numeric layer, not a fsync
+        # per arithmetic edge. Successful searches charge exactly their
+        # measured expansions. Interrupted layers retain the admitted upper
+        # work bound; no NN/decode work is refunded or invented.
+        planned_edges=sum(len(states.get(run.first_output_frame,())) for run in incoming_runs)
+        if expansions+planned_edges>budget.maximum_expansions:
+            raise TimeoutError('whole programme original search budget exhausted; no retry')
+        if work_port is not None and planned_edges:
+            work_port.charge('edges',planned_edges)
+        for run in incoming_runs:
             for cost,path,tie in states.get(run.first_output_frame,()):
                 expansions+=1
                 if expansions>budget.maximum_expansions:
@@ -221,6 +233,10 @@ def select_whole_programme(*, opportunities, runs, transition_cost: Callable,
         check_budget()
         if budget.beam_width is not None and len(current)>budget.beam_width:
             current=current[:budget.beam_width];truncated=True
+        if work_port is not None:
+            # Count retained search states, and every attempted edge above.
+            # Pruning cannot refund edge work or renew the parent phase.
+            work_port.charge('states',len(current))
         states[tick]=current
     if not states[end]:
         raise ValueError('whole programme has no complete physically eligible source path')

@@ -22,6 +22,23 @@ CONTRACT = "selected_native_motion_complete_metadata_v1"
 MAX_FINAL_SAMPLES = 1536
 
 
+def native_qa_metrics_valid(metrics):
+    """Technical replay validity only; no actor or editorial approval."""
+    from .group_performer_family_owner import digest
+    if not isinstance(metrics,Mapping):return False
+    value=dict(metrics);identity=value.pop('evidence_sha256',None)
+    return bool(value.get('contract')==CONTRACT
+        and value.get('binding_valid') is True and value.get('source_live_replay') is True
+        and all(value.get(k) is False for k in ('quality_approved','raw_parent_admitted',
+            'body_phase_certified','cross_camera_identity_certified','decoded_output_quality_certified'))
+        and value.get('final_quality_status')=='UNAPPROVED_NATIVE_REVIEW_CANDIDATE'
+        and type(value.get('sampled_native_pixel_count')) is int
+        and 1<=value['sampled_native_pixel_count']<=MAX_FINAL_SAMPLES
+        and all(isinstance(value.get(k),str) and len(value[k])==64
+            and all(c in '0123456789abcdef' for c in value[k]) for k in ('plan_sha256','metadata_sha256'))
+        and identity==digest(value))
+
+
 def validate_serialized_native_metadata(complete):
     from .group_performer_family_owner import digest, plain
     if not isinstance(complete, Mapping):

@@ -126,16 +126,17 @@ def clip_review_segments(plan,first,end,*,camera=None):
     return tuple(parts)
 
 
-def assemble_review_intervals(original,intervals):
+def assemble_review_intervals(original,intervals,*,maximum_segments=256):
     """Only serialize already realized pieces; never refit a camera here."""
-    if not isinstance(intervals,(tuple,list)) or not 1<=len(intervals)<=256:
+    if (type(maximum_segments) is not int or not 1<=maximum_segments<=512
+            or not isinstance(intervals,(tuple,list)) or not 1<=len(intervals)<=maximum_segments):
         raise ValueError('review serialization needs a finite realized interval list')
     segments=[];previous=0
     for first,end,parts in intervals:
         if (first!=previous or not first<end or not isinstance(parts,tuple) or not parts):
             raise ValueError('review intervals omit or overlap output frames')
         segments.extend(parts);previous=end
-    if previous!=original.output_frame_count or len(segments)>256:
+    if previous!=original.output_frame_count or len(segments)>maximum_segments:
         raise ValueError('review serialization does not cover its exact bounded whole timeline')
     plan=replace(original,segments=tuple(segments),transitions=tuple(
         RenderTransition(tier='C',reason='unapproved_realized_review_boundary') for _ in segments[1:]))

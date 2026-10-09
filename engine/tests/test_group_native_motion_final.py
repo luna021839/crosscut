@@ -10,9 +10,9 @@ import pytest
 from crosscut.group_joint_native_preparation import _plan_identity
 from crosscut.group_joint_observations import GroupJointObservationSession, _file_identity
 from crosscut.group_joint_source_camera import JointGroupWorkBudget
-from crosscut.group_native_motion_final import CONTRACT, _final_inputs
+from crosscut.group_native_motion_final import CONTRACT, _final_inputs, native_qa_metrics_valid
 from crosscut.group_performer_family_owner import (
-    _final_live_replay, digest, plan_payload, replay_final_sources, validate_serialized_metadata,
+    _final_live_replay, digest, plan_payload, replay_final_sources, validate_serialized_metadata, qa_metrics_valid,
 )
 from crosscut.group_scene_camera_queries import PreparedGroupCameraQueries
 from crosscut.group_source_domain import GroupSourceDomain
@@ -74,6 +74,12 @@ def test_native_receipt_uses_actual_clock_pixel_consumer_not_model_receipt(real_
     assert actual["quality_approved"] is False and actual["body_phase_certified"] is False
     assert actual["cross_camera_identity_certified"] is False
     assert actual["raw_parent_admitted"] is False
+    assert native_qa_metrics_valid(actual) and qa_metrics_valid(actual)
+    for change in (dict(quality_approved=True),dict(body_phase_certified=True),
+            dict(sampled_native_pixel_count=0),dict(final_quality_status='UNAPPROVED_PERFORMER_REVIEW_CANDIDATE')):
+        changed=dict(actual,**change);changed.pop('evidence_sha256')
+        changed['evidence_sha256']=digest(changed)
+        assert not native_qa_metrics_valid(changed) and not qa_metrics_valid(changed)
 
 
 def test_final_replay_rejects_changed_pixel_parent(real_codec_receipt):

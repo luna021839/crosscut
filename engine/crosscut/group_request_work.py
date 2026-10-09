@@ -13,11 +13,13 @@ from .request_work_lease import PHASES, RESOURCES, PhaseAllocation, RequestWorkE
 @dataclass(frozen=True)
 class GroupWorkPolicy:
     safety_fraction: float = .9
+    whole_programme: bool = False
 
     def allocations(self, remaining_seconds):
         if (type(remaining_seconds) not in (int, float) or not math.isfinite(remaining_seconds)
                 or remaining_seconds <= 0 or type(self.safety_fraction) not in (int, float)
-                or not math.isfinite(self.safety_fraction) or not 0 < self.safety_fraction < 1):
+                or not math.isfinite(self.safety_fraction) or not 0 < self.safety_fraction < 1
+                or type(self.whole_programme) is not bool):
             raise ValueError('normal GROUP work needs remaining original time and explicit finite reserves')
         weights = dict(original=.005, heads=.005, discovery=.12, selected_completion=.20,
             parent=.005, final=.06, encode=.48, decoded_qa=.12, terminal=.005)
@@ -40,6 +42,11 @@ class GroupWorkPolicy:
                     pose_evidence_bytes=0,region_flow_feature_updates=0,
                     association_nodes=0,association_edges=0)
             resources = dict(resources, native_completion_passes=1 if name=='selected_completion' else 0)
+            if name=='selected_completion' and self.whole_programme:
+                # Two finite, paired A/B searches, at most one million
+                # expansions each. This is numeric work, not extra decodes,
+                # model calls, time, evidence memory or completion passes.
+                resources['edges']=2000000
             result[name] = PhaseAllocation(resources,
                 remaining_seconds*self.safety_fraction*weights[name],
                 16*1024**2 if name in ('heads','discovery','selected_completion','parent','final','encode','decoded_qa') else 0)
@@ -141,8 +148,8 @@ class GroupRequestWork:
         return False
 
 
-def install_group_request_work(*, controller, resources, journal_path):
-    session = GroupRequestWork(controller, journal_path=journal_path)
+def install_group_request_work(*, controller, resources, journal_path, policy=GroupWorkPolicy()):
+    session = GroupRequestWork(controller, journal_path=journal_path,policy=policy)
     resources.enter_context(session)
     session.start_optional()
     return session

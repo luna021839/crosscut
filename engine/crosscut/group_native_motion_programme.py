@@ -175,7 +175,7 @@ def realize_native_motion_programme(*, original, domain, sides,
         cursor=side.end_output_frame
     if cursor<original.output_frame_count:
         intervals.append((cursor,original.output_frame_count,_immutable_parts(original,cursor,original.output_frame_count)))
-    aligned=assemble_review_intervals(original,intervals)
+    aligned=assemble_review_intervals(original,intervals,maximum_segments=512 if variable else 256)
     aligned=(_restore_untouched_programme_transitions(original,aligned,spans) if variable
         else _restore_untouched_transitions(original,aligned,first,end))
     # A different cut has a different canonical scaffold. Freezing the OLD
