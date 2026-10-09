@@ -2,7 +2,8 @@ from dataclasses import replace
 import pytest
 from engine.tests.test_scene_owned_program import fixture
 from crosscut.group_review_interval_compile import (clip_review_segments,assemble_review_intervals,
-    shifted_review_source_plan,realize_interval_in_plan,verify_realized_sampler,cover_review_sampling_interval)
+    shifted_review_source_plan,realize_interval_in_plan,verify_realized_sampler,cover_review_sampling_interval,
+    retain_whole_review_units)
 from crosscut.group_review_edit_program import own_review_edit_program
 from crosscut.group_scene_owned_program import freeze_owned_scene_program
 from crosscut.render_boundary_clock import native_frame_clocks_for_output
@@ -150,3 +151,42 @@ def test_materializing_all_whole_fractional_cells_keeps_every_physical_raster():
         clip_review_segments(source,0,source.output_frame_count))])
     assert verify_realized_sampler(source,whole,domain,range(source.output_frame_count),
         require_source_request_time=False)['actual_native_rasters_preserved']
+
+
+def test_retaining_complete_fractional_decode_units_keeps_tier_d_and_exact_request_times():
+    from crosscut.render import RenderSegment,RenderTransition,segment_frame_counts
+    context,domain=fixture(fps=29.97)
+    source=replace(context.incumbent.render_plan,segments=(
+        RenderSegment(0,.029,1.005,0.),RenderSegment(0,1.034,1.005,1.005),
+        RenderSegment(1,.029,1.005,2.010),RenderSegment(1,1.034,1.005,3.015)),
+        transitions=(RenderTransition(tier='D'),RenderTransition(tier='C'),RenderTransition(tier='D')))
+    boundary=sum(segment_frame_counts(source)[:2])
+    prefix=retain_whole_review_units(source,0,boundary)
+    suffix=retain_whole_review_units(source,boundary,source.output_frame_count)
+    assert all(a is b for a,b in zip(prefix+suffix,source.segments,strict=True))
+    rebuilt=assemble_review_intervals(source,[(0,boundary,prefix),(boundary,source.output_frame_count,suffix)])
+    rebuilt=replace(rebuilt,transitions=source.transitions)
+    result=verify_realized_sampler(source,rebuilt,domain,range(source.output_frame_count))
+    assert result['unquantized_source_request_times_preserved']
+    assert result['source_request_time_contract']=='exact'
+    assert rebuilt.to_json()==source.to_json()
+
+
+def test_retaining_authored_cell_cannot_detach_it_from_its_shared_decoder_clock():
+    from crosscut.render import RenderSegment,RenderTransition,segment_frame_counts
+    context,domain=fixture(fps=29.97)
+    source=replace(context.incumbent.render_plan,segments=(
+        RenderSegment(0,.029,1.005,0.),RenderSegment(0,1.034,1.005,1.005)),
+        transitions=(RenderTransition(tier='D'),))
+    boundary=segment_frame_counts(source)[0]
+    with pytest.raises(ValueError,match='partial decoder unit'):
+        retain_whole_review_units(source,boundary,source.output_frame_count)
+    assert retain_whole_review_units(source,0,source.output_frame_count)==source.segments
+
+
+@pytest.mark.parametrize('bounds',[(True,60),(-1,60),(0,'past_end'),(60,60)])
+def test_whole_decoder_retention_rejects_invalid_output_intervals(bounds):
+    context,domain=fixture()
+    if bounds[1]=='past_end':bounds=(bounds[0],context.incumbent.render_plan.output_frame_count+1)
+    with pytest.raises(ValueError,match='exact hard-cut'):
+        retain_whole_review_units(context.incumbent.render_plan,*bounds)

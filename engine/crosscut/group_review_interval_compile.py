@@ -32,6 +32,27 @@ def cover_review_sampling_interval(plan,first,end):
     return max(t for t in offsets if t<=first),min(t for t in offsets if t>=end)
 
 
+def retain_whole_review_units(plan,first,end):
+    """Retain untouched complete decoder units without rebasing their cells.
+
+    Use this for an unchanged exterior whose boundaries already coincide
+    with actual renderer units. Materializing every cell independently can
+    break authored Tier-D clock continuity when fractional cell durations
+    differ from their output frame counts / fps. A detached partial unit
+    instead needs clip_review_segments' explicit physical-clock rebasing;
+    never claim that its authored source_start is the decoded raster clock.
+    """
+    if (any(type(t) is not int for t in (first,end)) or not 0<=first<end<=plan.output_frame_count
+            or plan.authorized_shot_video_clocks or any(t.kind.uses_overlap for t in plan.transitions)):
+        raise ValueError('whole review retention needs an exact hard-cut output interval')
+    starts=output_offsets(plan);bounds={0,plan.output_frame_count}
+    for unit in _video_render_units(plan,segment_frame_counts(plan)):
+        bounds.update((starts[unit.first_segment_index],starts[unit.last_segment_index+1]))
+    if first not in bounds or end not in bounds:
+        raise ValueError('whole review retention cannot detach a partial decoder unit; clip its physical clock')
+    return plan.segments[starts.index(first):starts.index(end)]
+
+
 def shifted_review_source_plan(plan,*,phase_frames,maximum_phase_frames=2,output_interval=None):
     if (type(phase_frames) is not int or type(maximum_phase_frames) is not int
             or not 0<=maximum_phase_frames<=6 or abs(phase_frames)>maximum_phase_frames
