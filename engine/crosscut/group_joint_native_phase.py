@@ -72,7 +72,7 @@ def phase_adjusted_group_state(*, state, domain, hypothesis, policy):
         raise ValueError('phase proposal differs from the frozen whole-state/policy binding')
     state.bind_source(domain)
     count = state.end_output_frame-state.first_output_frame
-    if not 2 <= count <= 300:
+    if not 2 <= count <= 36000:
         raise ValueError('phase proposal exceeds the complete mutable shot frame budget')
     first_delta, last_delta = (hypothesis.first_sample_delta_native_frames,
         hypothesis.last_sample_delta_native_frames)

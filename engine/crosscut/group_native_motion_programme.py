@@ -8,6 +8,7 @@ supply and measure the actual anonymous actor paths and all three incidents.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import ClassVar
 
 from .group_joint_source_camera import GroupOutputRole, joint_state_from_render_plan
 from .group_joint_native_phase import NativePhaseHypothesis, NativePhaseSearchPolicy, phase_adjusted_group_state
@@ -22,6 +23,7 @@ from .shot_video_clock import (FrozenShotVideoClockContext, attach_authorized_sh
 
 @dataclass(frozen=True, slots=True)
 class NativeMotionSide:
+    _maximum_output_frames: ClassVar[int] = 160
     first_output_frame: int
     end_output_frame: int
     request_source_index: int
@@ -33,7 +35,8 @@ class NativeMotionSide:
         if (any(type(v) is not int for v in (self.first_output_frame, self.end_output_frame,
                 self.request_source_index, self.phase_native_frames))
                 or not 0 <= self.first_output_frame < self.end_output_frame
-                or self.request_source_index < 0 or not 2 <= self.end_output_frame-self.first_output_frame <= 160
+                or self.request_source_index < 0
+                or not 2 <= self.end_output_frame-self.first_output_frame <= self._maximum_output_frames
                 or abs(self.phase_native_frames) > 2
                 or self.camera is not None and not isinstance(self.camera, EditorialTransformTrack)
                 or not isinstance(self.proposal_role, GroupOutputRole)):
@@ -41,11 +44,17 @@ class NativeMotionSide:
 
 
 @dataclass(frozen=True, slots=True)
+class ProgrammeNativeMotionSide(NativeMotionSide):
+    """A whole-programme proposal, not permission to enlarge local repair."""
+    _maximum_output_frames: ClassVar[int] = 36000
+
+
+@dataclass(frozen=True, slots=True)
 class RealizedNativeMotionProgramme:
     aligned_plan: RenderPlan
     render_plan: RenderPlan
     shot_clock_context: FrozenShotVideoClockContext
-    sides: tuple[NativeMotionSide, NativeMotionSide]
+    sides: tuple[NativeMotionSide, ...]
     preservation: dict
 
 
@@ -76,6 +85,16 @@ def _restore_untouched_transitions(original, plan, first, end):
     transitions = tuple(old.get(tick, transition) if tick < first or tick > end else transition
         for tick, transition in zip(new_starts[1:-1], plan.transitions, strict=True))
     return replace(plan, transitions=transitions)
+
+
+def _restore_untouched_programme_transitions(original, plan, spans):
+    old_starts = output_offsets(original)
+    old = {old_starts[i+1]: value for i, value in enumerate(original.transitions)}
+    new_starts = output_offsets(plan)
+    transitions = tuple(old.get(tick, transition)
+        if not any(first <= tick <= end for first,end in spans) else transition
+        for tick,transition in zip(new_starts[1:-1],plan.transitions,strict=True))
+    return replace(plan,transitions=transitions)
 
 
 def _immutable_parts(original, first, end):
@@ -110,53 +129,64 @@ def _immutable_parts(original, first, end):
 
 
 def realize_native_motion_programme(*, original, domain, sides,
-        protected_output_intervals=(), phase_policy=None):
-    """Both actual shots, moved cut, exact native phase and authored cameras.
+        protected_output_intervals=(), phase_policy=None, selection_scope='adjacent_two_shots'):
+    """Real selected shots, moved cuts, exact native phases and authored cameras.
 
     Existing original-role intent is deliberately not redefined here. The
     proposal_role is a computational framing hypothesis, not an inferred or
     weakened original anatomical duty. Common-clock queries retain the separate
     externally frozen original-role programme throughout sensing and selection.
     """
-    if (not isinstance(original, RenderPlan) or not isinstance(domain, GroupSourceDomain)
+    variable = selection_scope=='variable_programme'
+    if (selection_scope not in ('adjacent_two_shots','variable_programme')
+            or not isinstance(original, RenderPlan) or not isinstance(domain, GroupSourceDomain)
             or not 1 <= original.output_frame_count <= 36000
-            or not isinstance(sides, tuple) or len(sides) != 2
-            or any(not isinstance(side, NativeMotionSide) for side in sides)
-            or sides[0].end_output_frame != sides[1].first_output_frame
-            or sides[1].end_output_frame > original.output_frame_count
+            or not isinstance(sides, tuple)
+            or (not 1<=len(sides)<=1024 if variable else len(sides)!=2)
+            or any(type(side) not in (NativeMotionSide,ProgrammeNativeMotionSide) for side in sides)
+            or any(side.end_output_frame-side.first_output_frame>(36000 if variable else 160) for side in sides)
+            or any(a.end_output_frame>b.first_output_frame if variable
+                else a.end_output_frame!=b.first_output_frame for a,b in zip(sides,sides[1:]))
+            or sides[-1].end_output_frame > original.output_frame_count
             or original.authorized_shot_video_clocks
             or any(t.kind.uses_overlap for t in original.transitions)
             or original.sources != domain.request_sources):
-        raise ValueError("native motion programme requires two adjacent full renderer intervals")
-    first, end = sides[0].first_output_frame, sides[1].end_output_frame
+        raise ValueError("native motion programme requires declared ordered full renderer intervals")
+    first, end = sides[0].first_output_frame, sides[-1].end_output_frame
     if (not isinstance(protected_output_intervals, tuple)
             or any(not isinstance(span, tuple) or len(span) != 2
                 or any(type(t) is not int for t in span)
                 or not 0 <= span[0] < span[1] <= original.output_frame_count
                 for span in protected_output_intervals)
-            or any(first < b and end > a for a, b in protected_output_intervals)):
+            or any(side.first_output_frame < b and side.end_output_frame > a
+                for side in sides for a,b in protected_output_intervals)):
         raise ValueError("native motion programme intersects protected original pixels")
     policy = NativePhaseSearchPolicy() if phase_policy is None else phase_policy
     if not isinstance(policy, NativePhaseSearchPolicy):
         raise ValueError("native phase search needs its externally declared policy")
     intervals = []
-    if first:
-        intervals.append((0, first, _immutable_parts(original, 0, first)))
-    intervals.extend((s.first_output_frame, s.end_output_frame, _aligned_parts(original, domain, s))
-        for s in sides)
-    if end < original.output_frame_count:
-        intervals.append((end, original.output_frame_count,
-            _immutable_parts(original, end, original.output_frame_count)))
-    aligned = _restore_untouched_transitions(original, assemble_review_intervals(original, intervals), first, end)
+    cursor=0
+    spans=tuple((s.first_output_frame,s.end_output_frame) for s in sides)
+    for side in sides:
+        if cursor<side.first_output_frame:
+            intervals.append((cursor,side.first_output_frame,
+                _immutable_parts(original,cursor,side.first_output_frame)))
+        intervals.append((side.first_output_frame,side.end_output_frame,_aligned_parts(original,domain,side)))
+        cursor=side.end_output_frame
+    if cursor<original.output_frame_count:
+        intervals.append((cursor,original.output_frame_count,_immutable_parts(original,cursor,original.output_frame_count)))
+    aligned=assemble_review_intervals(original,intervals)
+    aligned=(_restore_untouched_programme_transitions(original,aligned,spans) if variable
+        else _restore_untouched_transitions(original,aligned,first,end))
     # A different cut has a different canonical scaffold. Freezing the OLD
     # incumbent and attaching its clocks would be a false authority binding.
     context = FrozenShotVideoClockContext(aligned, domain, policy,original,
-        tuple((side.first_output_frame,side.end_output_frame) for side in sides),protected_output_intervals)
+        spans,protected_output_intervals,selection_scope=selection_scope)
     offsets = output_offsets(aligned)
     segments = list(aligned.segments); clocks = []
     selected_grids = []
     for slot, side in enumerate(sides, 1):
-        state = joint_state_from_render_plan(plan=aligned, domain=domain, slot=slot,
+        state = joint_state_from_render_plan(plan=aligned, domain=domain, slot=1 if variable else slot,
             first_output_frame=side.first_output_frame, end_output_frame=side.end_output_frame,
             role=side.proposal_role)
         if side.phase_native_frames:
@@ -198,11 +228,13 @@ def realize_native_motion_programme(*, original, domain, sides,
             raise ValueError("one motion side crosses an actual native broadcaster cut")
         run = next(iter(ids))
         runs.append((0 if run == 0 else cuts[run-1], clock.frame_count if run == len(cuts) else cuts[run]))
-    outside = tuple(t for t in range(original.output_frame_count) if not first <= t < end)
+    outside = tuple(t for t in range(original.output_frame_count)
+        if not any(a<=t<b for a,b in spans))
     preservation = (verify_realized_sampler(original, selected, domain, outside,
         require_source_request_time=False) if outside else dict(compared_output_ticks=0,
             actual_native_rasters_preserved=True, quality_approved=False))
     preservation = dict(preservation, physical_native_runs=[list(r) for r in runs],
+        selection_scope=selection_scope,selected_shot_count=len(sides),
         topology_frozen_before_native_phase=True, constant_native_phase_not_output_frame_phase=True,
         camera_refit_after_selection=False, original_role_duties_redefined=False, quality_approved=False)
     return RealizedNativeMotionProgramme(aligned, selected, context, sides, preservation)

@@ -5,6 +5,7 @@ from fractions import Fraction
 import pytest
 
 from crosscut.group_native_motion_programme import NativeMotionSide,realize_native_motion_programme
+from crosscut.group_native_motion_programme import ProgrammeNativeMotionSide
 from crosscut.group_scene_owned_program import freeze_owned_scene_program
 from crosscut.group_scene_epoch_program import compile_common_clock_camera_queries
 from crosscut.render import EditorialTransformTrack,EditorialTransformKeyframe,segment_frame_counts,RenderSegment,RenderTransition
@@ -98,3 +99,71 @@ def test_fractional_original_tier_d_units_are_not_independently_reset_per_cell()
             before[tick].source_index,before[tick].native_frame_index)
     assert result.render_plan.transitions[0].tier=='D'
     assert result.render_plan.transitions[-1].tier=='D'
+
+
+def test_whole_programme_three_phases_preserve_immutable_gaps_and_cameras():
+    from crosscut.shot_video_clock import frozen_shot_video_clock_context_from_dict
+    context,domain,_=fixture(native_fps=Fraction(60))
+    original=context.incumbent.render_plan
+    camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1,.5,.5),
+        EditorialTransformKeyframe(1.,1.16,.5,.5)),sampling_canvas_zoom=1.2)
+    sides=(ProgrammeNativeMotionSide(6,22,0,1,camera),
+        ProgrammeNativeMotionSide(40,70,2,-1,camera),ProgrammeNativeMotionSide(88,112,3,2,camera))
+    result=realize_native_motion_programme(original=original,domain=domain,sides=sides,
+        protected_output_intervals=((26,36),(74,84)),selection_scope='variable_programme')
+    assert len(result.render_plan.authorized_shot_video_clocks)==3
+    validate_authorized_shot_video_clocks(plan=result.render_plan,context=result.shot_clock_context)
+    payload=result.shot_clock_context.to_dict()
+    assert payload['contract'].endswith('_v2') and payload['selection_scope']=='variable_programme'
+    assert frozen_shot_video_clock_context_from_dict(payload,source_domain=domain)==result.shot_clock_context
+    aligned=native_frame_clocks_for_output(result.aligned_plan,domain.clocks_by_request,range(120))
+    selected=native_frame_clocks_for_output(result.render_plan,domain.clocks_by_request,range(120))
+    old=native_frame_clocks_for_output(original,domain.clocks_by_request,range(120))
+    starts=(0,)+tuple(sum(segment_frame_counts(result.render_plan)[:i+1])
+        for i in range(len(result.render_plan.segments)))
+    for tick in range(120):
+        side=next((s for s in sides if s.first_output_frame<=tick<s.end_output_frame),None)
+        if side is None:
+            assert (selected[tick].source_index,selected[tick].native_frame_index)==(
+                old[tick].source_index,old[tick].native_frame_index)
+        else:
+            assert selected[tick].native_frame_index-aligned[tick].native_frame_index==side.phase_native_frames
+            i=next(i for i,(a,b) in enumerate(zip(starts,starts[1:])) if a<=tick<b)
+            actual=result.render_plan.segments[i].editorial_transform.evaluate((tick-starts[i])/30)
+            expected=camera.evaluate((tick-side.first_output_frame)/30)
+            assert (actual.zoom,actual.center_x,actual.center_y)==pytest.approx(
+                (expected.zoom,expected.center_x,expected.center_y))
+
+
+def test_whole_programme_scope_cannot_be_borrowed_by_legacy_or_reordered():
+    from crosscut.shot_video_clock import frozen_shot_video_clock_context_from_dict
+    context,domain,_=fixture()
+    sides=tuple(ProgrammeNativeMotionSide(a,b,s,1) for a,b,s in ((6,22,0),(40,70,2),(88,112,3)))
+    with pytest.raises(ValueError,match='declared ordered'):
+        realize_native_motion_programme(original=context.incumbent.render_plan,domain=domain,sides=sides)
+    with pytest.raises(ValueError,match='declared ordered'):
+        realize_native_motion_programme(original=context.incumbent.render_plan,domain=domain,
+            sides=tuple(reversed(sides)),selection_scope='variable_programme')
+    result=realize_native_motion_programme(original=context.incumbent.render_plan,domain=domain,
+        sides=sides,selection_scope='variable_programme')
+    payload=result.shot_clock_context.to_dict()
+    payload['contract']='frozen_phase_zero_root_bound_video_clock_context_v1'
+    payload.pop('selection_scope')
+    with pytest.raises(ValueError):
+        frozen_shot_video_clock_context_from_dict(payload,source_domain=domain)
+
+
+def test_whole_programme_long_hold_uses_one_consistent_phase_not_a_short_probe():
+    context,domain,_=fixture(native_fps=Fraction(60))
+    original=replace(context.incumbent.render_plan,
+        segments=(RenderSegment(0,0.,12.,0.),),transitions=())
+    side=ProgrammeNativeMotionSide(0,360,2,1)
+    with pytest.raises(ValueError):
+        NativeMotionSide(0,360,2,1)
+    result=realize_native_motion_programme(original=original,domain=domain,sides=(side,),
+        selection_scope='variable_programme')
+    assert len(result.render_plan.authorized_shot_video_clocks)==1
+    aligned=native_frame_clocks_for_output(result.aligned_plan,domain.clocks_by_request,range(360))
+    selected=native_frame_clocks_for_output(result.render_plan,domain.clocks_by_request,range(360))
+    assert all(selected[t].native_frame_index==aligned[t].native_frame_index+1 for t in range(360))
+    validate_authorized_shot_video_clocks(plan=result.render_plan,context=result.shot_clock_context)

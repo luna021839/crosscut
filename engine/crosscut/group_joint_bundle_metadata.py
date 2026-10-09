@@ -307,6 +307,7 @@ def _check_native_selection(production):
         raise ValueError('native selection borrowed another phase-zero source clock context')
     if context is not None and context.original_reference_plan is not None and (
             _plan_identity(context.original_reference_plan)!=production.original_plan_identity
+            or context.selection_scope!=production.selection_scope
             or context.protected_output_intervals!=production.protected_output_intervals
             or context.mutable_output_intervals!=tuple((shot.first_output_frame,shot.end_output_frame)
                 for shot in production.selected_shots)):
@@ -354,7 +355,6 @@ def _check_native_selection(production):
                 or shot.request_source_index not in domain.eligible_indices
                 or shot.role is not None and not isinstance(shot.role,GroupOutputRole)
                 or type(shot.phase_native_frames) is not int or abs(shot.phase_native_frames)>2
-                or variable and shot.phase_native_frames != 0
                 or not isinstance(shot.physical_native_run,tuple) or len(shot.physical_native_run)!=2
                 or any(type(v) is not int for v in shot.physical_native_run)
                 or not 0<=shot.physical_native_run[0]<shot.physical_native_run[1]

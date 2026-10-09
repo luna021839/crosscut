@@ -10,6 +10,7 @@ from fractions import Fraction
 import hashlib
 import json
 import math
+from typing import Literal
 
 from .render_frame_schedule import VerifiedRenderFrameClock, sampler_frame_schedule
 
@@ -44,6 +45,7 @@ class FrozenShotVideoClockContext:
     original_reference_plan: object | None = None
     mutable_output_intervals: tuple[tuple[int,int],...] = ()
     protected_output_intervals: tuple[tuple[int,int],...] = ()
+    selection_scope: Literal['adjacent_two_shots','variable_programme'] = 'adjacent_two_shots'
 
     def __post_init__(self):
         from .group_source_domain import bind_group_source_domain
@@ -51,29 +53,34 @@ class FrozenShotVideoClockContext:
         from .render import RenderPlan
         if (not isinstance(self.incumbent_plan, RenderPlan)
                 or self.incumbent_plan.authorized_shot_video_clocks
-                or not isinstance(self.policy, NativePhaseSearchPolicy)):
+                or not isinstance(self.policy, NativePhaseSearchPolicy)
+                or self.selection_scope not in ('adjacent_two_shots','variable_programme')):
             raise ValueError('shot-clock context needs an unretimed incumbent and frozen phase policy')
         bind_group_source_domain(plan=self.incumbent_plan, source_domain=self.source_domain)
         root=self.original_reference_plan
         if root is None:
-            if self.mutable_output_intervals or self.protected_output_intervals:
+            if (self.mutable_output_intervals or self.protected_output_intervals
+                    or self.selection_scope=='variable_programme'):
                 raise ValueError('shot-clock root intervals need their original reference plan')
             return
         if (not isinstance(root,RenderPlan) or root.authorized_shot_video_clocks
                 or root.sources!=self.incumbent_plan.sources
                 or root.output_frame_count!=self.incumbent_plan.output_frame_count
                 or not isinstance(self.mutable_output_intervals,tuple)
-                or len(self.mutable_output_intervals)!=2
+                or (not 1<=len(self.mutable_output_intervals)<=1024
+                    if self.selection_scope=='variable_programme' else len(self.mutable_output_intervals)!=2)
                 or not isinstance(self.protected_output_intervals,tuple)):
-            raise ValueError('root-bound video clock requires its two declared complete mutable shots')
+            raise ValueError('root-bound video clock requires its declared complete mutable shots')
         previous=None
         for span in self.mutable_output_intervals:
             if not isinstance(span,tuple) or len(span)!=2:
                 raise ValueError('root-bound video clock has malformed mutable shot intervals')
             first,end=span
             if (type(first) is not int or type(end) is not int
-                    or not 0<=first<end<=root.output_frame_count or not 2<=end-first<=160
-                    or previous is not None and first!=previous):
+                    or not 0<=first<end<=root.output_frame_count
+                    or not 2<=end-first<=(36000 if self.selection_scope=='variable_programme' else 160)
+                    or previous is not None and (first<previous
+                        if self.selection_scope=='variable_programme' else first!=previous)):
                 raise ValueError('root-bound video clock has malformed mutable shot intervals')
             previous=end
         previous=0
@@ -86,7 +93,7 @@ class FrozenShotVideoClockContext:
 
     def to_dict(self):
         from dataclasses import asdict
-        return dict(contract='frozen_phase_zero_root_bound_video_clock_context_v1',
+        result = dict(contract='frozen_phase_zero_root_bound_video_clock_context_v1',
             phase_zero_plan=self.incumbent_plan.to_json(),source_domain=self.source_domain.to_dict(),
             policy=asdict(self.policy),
             original_reference_plan=None if self.original_reference_plan is None
@@ -94,6 +101,12 @@ class FrozenShotVideoClockContext:
             mutable_output_intervals=[list(span) for span in self.mutable_output_intervals],
             protected_output_intervals=[list(span) for span in self.protected_output_intervals],
             transport_copy_is_parent_authority=False,quality_approved=False)
+        # Keep the old two-shot wire preimage exactly unchanged. Whole-song
+        # ownership must opt in before search, not enlarge a legacy receipt.
+        if self.selection_scope=='variable_programme':
+            result.update(contract='frozen_phase_zero_root_bound_video_clock_context_v2',
+                selection_scope=self.selection_scope)
+        return result
 
 
 def frozen_shot_video_clock_context_from_dict(value,*,source_domain):
@@ -101,7 +114,9 @@ def frozen_shot_video_clock_context_from_dict(value,*,source_domain):
     from .render_plan_serialization import render_plan_from_json
     from .group_joint_native_phase import NativePhaseSearchPolicy
     if (not isinstance(value,dict)
-            or value.get('contract')!='frozen_phase_zero_root_bound_video_clock_context_v1'
+            or value.get('contract') not in ('frozen_phase_zero_root_bound_video_clock_context_v1',
+                'frozen_phase_zero_root_bound_video_clock_context_v2')
+            or value.get('contract').endswith('_v2') and value.get('selection_scope')!='variable_programme'
             or value.get('transport_copy_is_parent_authority') is not False
             or value.get('quality_approved') is not False
             or value.get('source_domain')!=json.loads(json.dumps(source_domain.to_dict(),allow_nan=False))):
@@ -112,7 +127,8 @@ def frozen_shot_video_clock_context_from_dict(value,*,source_domain):
         context=FrozenShotVideoClockContext(render_plan_from_json(value['phase_zero_plan']),source_domain,policy,
             None if root is None else render_plan_from_json(root),
             tuple(tuple(span) for span in value['mutable_output_intervals']),
-            tuple(tuple(span) for span in value['protected_output_intervals']))
+            tuple(tuple(span) for span in value['protected_output_intervals']),
+            selection_scope=value.get('selection_scope','adjacent_two_shots'))
     except (KeyError,TypeError) as exc:
         raise ValueError('serialized phase-zero context lost its complete preimage') from exc
     if json.loads(json.dumps(context.to_dict(),allow_nan=False))!=value:
@@ -167,7 +183,7 @@ class AuthorizedShotVideoClockV1:
                 or self.output_fps <= 0 or self.master_audio_start < 0
                 or self.reference_start < self.master_audio_start or self.reference_end <= self.reference_start
                 or min(self.aligned_source_start, self.source_start) < 0
-                or not 2 <= self.end_output_frame-self.first_output_frame <= 300
+                or not 2 <= self.end_output_frame-self.first_output_frame <= 36000
                 or not 0 < self.maximum_absolute_offset_seconds <= .15
                 or not 0 < self.maximum_rate_change_from_aligned <= .02
                 or max(abs(self.aligned_source_rate-1), abs(self.source_rate-1)) > .02+1e-12
@@ -308,7 +324,7 @@ def validate_shot_video_clock_bindings(plan, *, frame_clocks=None):
     from .render import segment_frame_counts, _can_share_source_clock
     from .render_boundary_clock import native_frame_clocks_for_output
     rows = plan.authorized_shot_video_clocks
-    if not isinstance(rows, tuple) or len(rows) > 2:
+    if not isinstance(rows, tuple) or len(rows) > min(1024,len(plan.segments)):
         raise ValueError('shot clocks require a bounded immutable inventory')
     if not rows:
         return {}
