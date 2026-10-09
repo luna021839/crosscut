@@ -98,7 +98,7 @@ def _clip(poly,normal,bound):
     return result
 
 
-def _target_polygon(centers,sizes,rolls,extent,raster_size):
+def _target_polygon(centers,sizes,rolls,extent,raster_size,*,edge_margin=None):
     poly=[np.array(p,float) for p in ((0.,0.),(1.,0.),(1.,1.),(0.,1.))]
     for center,size,roll in zip(centers,sizes,rolls,strict=True):
         zoom=extent/size
@@ -110,7 +110,7 @@ def _target_polygon(centers,sizes,rolls,extent,raster_size):
             constraints.extend(((normal,zoom*rc[axis]),(-normal,zoom*(1-rc[axis])-1)))
         angle=math.radians(-roll);c,s=math.cos(angle),math.sin(angle)
         inverse=np.array(((c,-s*9/16),(s*16/9,c)))
-        margin=0. if roll==0 else 2/min(raster_size)
+        margin=0. if roll==0 else (2/min(raster_size) if edge_margin is None else edge_margin)
         for corner in (np.array(p) for p in ((-.5,-.5),(-.5,.5),(.5,-.5),(.5,.5))):
             base=center+inverse@(np.array((.5,.5))+corner)/zoom
             for axis in range(2):
@@ -181,3 +181,73 @@ def coupled_roll_focal_cameras(a,b,*,rolls,maximum_zoom=2.4,maximum_roll_degrees
                 maximum_roll_degrees=maximum_roll_degrees,raster_size=raster_size):return None
         cameras.append(camera)
     return cameras
+
+
+def coupled_rendered_face_height_cameras(faces,cameras,*,maximum_zoom=2.4):
+    """Match selected DECODED heads, retaining native roll and legibility.
+
+    COCO nose/eyes/ears RMS is useful for independent head orientation, but
+    is not interchangeable with the actual displayed face-box height. This
+    correction uses two explicitly selected encoded face boxes and their
+    exact native cameras. It never picks the largest face, changes the actor,
+    phases or roll, or shrinks either head to obtain a cheap residual.
+
+    The caller must bind each measured face to the selected native parent
+    before calling. This geometry operation does not establish that binding,
+    named identity, body ownership or action continuity. It may be used once
+    on a finite declared diagnostic inventory, not as an NN/re-render loop.
+    """
+    from .ive import AspectRatio
+    from .render import (EDITORIAL_TRANSFORM_EDGE_MARGIN,EditorialTransformKeyframe,
+        _rotated_crop_is_inside_frame)
+    if (not isinstance(faces,(tuple,list)) or len(faces)!=2
+            or not isinstance(cameras,(tuple,list)) or len(cameras)!=2
+            or type(maximum_zoom) not in (int,float) or not math.isfinite(maximum_zoom)
+            or not 1<=maximum_zoom<=2.4):
+        raise ValueError('decoded face correction needs one finite selected two-head camera pair')
+    centers=[];sizes=[];displayed=[];rolls=[];targets=[]
+    for face,camera in zip(faces,cameras,strict=True):
+        if not isinstance(face,dict):
+            raise ValueError('decoded face correction needs measured face boxes')
+        box=np.asarray(face.get('box_xywh'),float)
+        values=np.asarray(camera,float)
+        if (box.shape!=(4,) or not np.isfinite(box).all() or np.any(box[:2]<0)
+                or np.any(box[2:]<=0) or np.any(box[:2]+box[2:]>1)
+                or values.shape!=(4,) or not np.isfinite(values).all()):
+            raise ValueError('decoded face correction needs actual finite contained face boxes and cameras')
+        z,x,y,roll=map(float,values)
+        if not covered_roll_focal_camera(values,maximum_zoom=maximum_zoom):
+            raise ValueError('decoded face correction cannot start from an uncovered native camera')
+        center=box[:2]+box[2:]/2
+        rotated_native=np.array((x,y))+(center-.5)/z
+        centers.append(_rotated_point(rotated_native,-roll))
+        sizes.append(float(box[3]*9/16/z))
+        displayed.append(float(box[3]*9/16))
+        rolls.append(roll);targets.append(center)
+    low=max(displayed);high=maximum_zoom*min(sizes)
+    if high+1e-12<low:return None
+    # The same production margin is retained; infeasibility is not repaired
+    # by changing rollout limits, inventing fill or clamping one camera.
+    def polygon(extent):
+        return _target_polygon(centers,sizes,rolls,extent,(1920,1080),
+            edge_margin=EDITORIAL_TRANSFORM_EDGE_MARGIN)
+    if not polygon(high):return None
+    if polygon(low):extent=low
+    else:
+        for _ in range(32):
+            middle=(low+high)/2
+            if polygon(middle):high=middle
+            else:low=middle
+        extent=high
+    target=_closest_target(polygon(extent),np.mean(targets,axis=0))
+    result=[]
+    for center,size,roll in zip(centers,sizes,rolls,strict=True):
+        zoom=extent/size
+        pan=np.asarray(_rotated_point(center,roll))+(np.array((.5,.5))-target)/zoom
+        camera=[float(zoom),float(pan[0]),float(pan[1]),float(roll)]
+        try:EditorialTransformKeyframe(0.,*camera)
+        except ValueError:return None
+        if not _rotated_crop_is_inside_frame(zoom=camera[0],center_x=camera[1],center_y=camera[2],
+                roll_degrees=camera[3],aspect_ratio=AspectRatio.LANDSCAPE):return None
+        result.append(camera)
+    return result
