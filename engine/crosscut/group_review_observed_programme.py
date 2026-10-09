@@ -111,6 +111,34 @@ def project_focal_observation(row, camera):
     return face, points
 
 
+def _boundary_identity_cost(left, right):
+    """Missing cached identity is uncertainty, never a fabricated match.
+
+    Actual native face/pose observations need not retain private feature
+    vectors. Keep their fixed worst-case identity cost without rerunning a
+    model or rejecting a physically observable camera/pose candidate.
+    """
+    values = []
+    for row in (left, right):
+        value = row.get('sface_vector')
+        if value is None:
+            values.append(None)
+            continue
+        raw = np.asarray(value)
+        if (raw.ndim != 1 or raw.size < 2 or raw.dtype.kind not in 'iuf'
+                or not np.isfinite(raw).all()
+                or not math.isclose(float(np.linalg.norm(raw)), 1., rel_tol=1e-3, abs_tol=1e-3)):
+            raise ValueError('identity descriptor must be an actual finite unit vector')
+        values.append(raw.astype(float, copy=False))
+    if any(v is None for v in values):
+        return 'UNOBSERVED', None, [0., .24]
+    if values[0].shape != values[1].shape:
+        raise ValueError('identity descriptor vectors must share the same comparison dimension')
+    similarity = float(np.clip(np.dot(*values), -1., 1.))
+    cost = .12 * (1. - similarity)
+    return 'OBSERVED_DESCRIPTOR_SIMILARITY_NOT_NAMED_IDENTITY', similarity, [cost, cost]
+
+
 def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, roles,
         lookup, native_at, source_native_cuts, pose_model_identity, fps,
         cut_radius=2, phases=(-2, 0, 2), budget=ObservedProgrammeBudget(),
@@ -233,8 +261,12 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
                             right_ticks=(cut, cut+1), fps=fps, left_native=signatures(a), right_native=signatures(b))
                         handoff = roles[layer] != roles[layer+1]
                         proof['singing_part_handoff_not_same_member_pose_match'] = handoff
-                        similarity = float(np.dot(a[-1]['sface_vector'], b[0]['sface_vector']))
-                        amount = proof['exploration_score']+(0. if handoff else .12*(1-float(np.clip(similarity,-1.,1.))))
+                        identity_state, similarity, identity_interval = _boundary_identity_cost(a[-1], b[0])
+                        proof.update(identity_observation_state=identity_state,
+                            identity_descriptor_similarity=similarity, identity_cost_interval=identity_interval,
+                            missing_identity_not_imputed_as_match=True,
+                            identity_cost_applied_to_role_handoff=False)
+                        amount = proof['exploration_score']+(0. if handoff else identity_interval[1])
                         measured += 1
                         clip = dict(first=state['first'], end=cut, source_index=state['source'],
                             phase_native_frames=state['phase'], start_observation=state['start'], end_observation=a[-1],
@@ -292,5 +324,6 @@ def select_observed_focal_programme(*, first, end, layer_sources, cut_centers, r
         retained_boundary_cameras={k:list(v) for k,v in retained.items()},
         authored_focal_extent_floors=authored_floors,
         focal_floors_applied_before_cost=True,
+        missing_identity_descriptors_are_unknown=True,
         focal_floor_is_boundary_measurement_not_unobserved_hold_guarantee=True,
         full_hold_action_certified=False, entry_return_pose_certified=False, professional_quality_approved=False)

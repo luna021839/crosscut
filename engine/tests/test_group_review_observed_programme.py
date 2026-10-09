@@ -175,3 +175,67 @@ def test_bad_or_undeclared_focal_floor_cannot_change_the_original_selection_doma
 def test_bad_pair_focal_floor_cannot_be_silently_ignored(floor):
     with pytest.raises(ValueError,match='focal extent floor'):
         coupled_focal_cameras(observation(0,30),observation(1,31),minimum_extent=floor)
+
+
+def test_actual_cached_pose_without_identity_vector_is_not_rejected_or_invented():
+    def without_identity(s, t, p, role):
+        row = observation(s, t + p, size=.045 if s == 0 else .055)
+        del row['sface_vector']
+        return row
+    original = select()
+    result = select(lookup=without_identity)
+    assert result['score'] == pytest.approx(original['score'] + .24 * len(result['seams']))
+    assert result['new_model_calls'] == result['completion_retries'] == 0
+    for seam in result['seams']:
+        proof = seam['actual_fixed_inventory_incident']
+        assert proof['identity_observation_state'] == 'UNOBSERVED'
+        assert proof['identity_descriptor_similarity'] is None
+        assert proof['missing_identity_not_imputed_as_match'] is True
+        assert proof['identity_cost_interval'] == [0., .24]
+        assert seam['named_identity_certified'] is False
+
+
+def test_vocal_handoff_does_not_require_a_fake_descriptor_to_construct_real_cameras():
+    def without_identity(s, t, p, role):
+        row = observation(s, t + p)
+        row['sface_vector'] = None
+        return row
+    result = select(lookup=without_identity, roles=('a', 'b', 'a'))
+    for seam in result['seams']:
+        proof = seam['actual_fixed_inventory_incident']
+        assert proof['singing_part_handoff_not_same_member_pose_match'] is True
+        assert proof['identity_observation_state'] == 'UNOBSERVED'
+        assert proof['identity_cost_applied_to_role_handoff'] is False
+
+
+def test_missing_one_side_does_not_beat_a_measured_worst_case_identity_pair():
+    def missing(s, t, p, role):
+        row = observation(s, t + p)
+        if s == 1:
+            del row['sface_vector']
+        return row
+    def opposed(s, t, p, role):
+        row = observation(s, t + p)
+        row['sface_vector'] = [1. if s == 0 else -1., 0.]
+        return row
+    assert select(lookup=missing)['score'] == pytest.approx(select(lookup=opposed)['score'])
+
+
+@pytest.mark.parametrize('vector', [[], [float('nan'), 0.], [float('inf'), 0.],
+                                   [0., 0.], [2., 0.], [True, False], [[1., 0.]]])
+def test_invalid_identity_vector_is_not_a_missing_identity_shortcut(vector):
+    def malformed(s, t, p, role):
+        row = observation(s, t + p)
+        row['sface_vector'] = vector
+        return row
+    with pytest.raises(ValueError, match='identity descriptor'):
+        select(lookup=malformed)
+
+
+def test_identity_vectors_with_different_dimensions_are_not_compared():
+    def incompatible(s, t, p, role):
+        row = observation(s, t + p)
+        row['sface_vector'] = [1., 0.] if s == 0 else [1., 0., 0.]
+        return row
+    with pytest.raises(ValueError, match='comparison dimension'):
+        select(lookup=incompatible)
