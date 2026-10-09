@@ -135,6 +135,14 @@ class MotionCameraRankTests(unittest.TestCase):
         self.assertIsNone(camera_motion_rank(better_motion, (.0, .251)))
         self.assertIsNotNone(camera_motion_rank(worse_motion, (.5,.3),enforce_face_limits=False))
 
+    def test_whole_camera_burden_can_overturn_face_only_seam_gain_without_waiving_motion(self):
+        gesture=self.gesture()
+        baseline=camera_motion_rank(gesture,(.10,.10),added_camera_cost=0.)
+        self.assertLess(camera_motion_rank(gesture,(.01,.01),added_camera_cost=0.),baseline)
+        self.assertGreater(camera_motion_rank(gesture,(.01,.01),added_camera_cost=1.),baseline)
+        for missing in (None,True,-1.,float('nan')):
+            self.assertIsNone(camera_motion_rank(gesture,(.01,.01),added_camera_cost=missing))
+
     def test_motion_comparison_preserves_all_temporally_observed_bones(self):
         before=replace(self.gesture(),bone_mismatches=(.1,.2,.3,None))
         better=self.gesture(pose=.1,velocity=.05)

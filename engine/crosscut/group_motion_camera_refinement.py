@@ -30,6 +30,7 @@ from .timeline import ShotType
 from .timeline_review import review_timeline
 from .visual_boundary_repair import _visual_evidence,_updated_entry,_updated_exit,_new_hard_failures
 from .visual_score import _VideoSampler
+from .group_added_camera_motion import measure_added_camera_motion
 
 
 PROJECTED_ARM_HEAD_CONTRACT = 'exact_output_arm_motion_with_independently_measured_head_guard_v1'
@@ -218,10 +219,12 @@ class GroupMotionCameraRefinement:
             head_and_arm_costs_averaged=False)
 
 
-def camera_motion_rank(gesture, face_metrics, *, enforce_face_limits=True):
+def camera_motion_rank(gesture, face_metrics, *, enforce_face_limits=True, added_camera_cost=0.):
     """Missing motion/face evidence has no numeric rank; legacy QA limits stay."""
     limits=ProxyReviewConfig()
-    if gesture is None or gesture.motion is None or face_metrics is None:
+    if (gesture is None or gesture.motion is None or face_metrics is None
+            or type(added_camera_cost) not in (int,float)
+            or not math.isfinite(added_camera_cost) or added_camera_cost<0):
         return None
     scale,position=face_metrics
     if (any(type(value) not in (int,float) or not math.isfinite(value) or not 0 <= value <= 1
@@ -229,7 +232,10 @@ def camera_motion_rank(gesture, face_metrics, *, enforce_face_limits=True):
             or enforce_face_limits and (scale > limits.maximum_face_scale_discontinuity
                 or position > limits.maximum_face_position_discontinuity)):
         return None
-    return gesture.ranking_cost+scale+position
+    # Soft, uncalibrated editorial preference. A four-frame seam gain must
+    # pay for the whole authored camera path, not only its endpoint crop.
+    # This never buys a waiver of measured head/arm or physical canvas gates.
+    return gesture.ranking_cost+scale+position+.2*added_camera_cost
 
 
 def measured_motion_improves(candidate, before):
@@ -436,6 +442,17 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
     provider=CloseupGestureProvider(plan.sources,Path(model_path),verify_native_global_focal=True)
     samplers={}
     local_index={source:index for index,source in enumerate(mapping)}
+    camera_cuts={source:scene_cut_times[index] for index,source in enumerate(mapping)}
+    camera_burdens={}
+    def camera_burden(candidate,boundary):
+        key=(id(candidate),boundary)
+        if key not in camera_burdens:
+            evidence=measure_added_camera_motion(candidate,segment_indices=(boundary,boundary+1),
+                source_clocks=clocks,scene_cut_times=camera_cuts)
+            # Retain the plan too: Python cannot reuse an id in this bounded
+            # cache and accidentally transfer one camera's cost to another.
+            camera_burdens[key]=(candidate,evidence)
+        return camera_burdens[key][1]
     def sampler(source):
         if source not in samplers:
             samplers[source]=_VideoSampler(plan.sources[source],feature_cache_directory=feature_cache_directory,
@@ -491,11 +508,13 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 observation=(projected(plan,boundary,samples) if samples is not None
                     else ProjectedBoundaryObservation())
                 gesture,baseline_faces=observation.motion,observation.face_metrics
+                baseline_camera=camera_burden(plan,boundary)
             except ValueError as error:
                 attempts.append(dict(stage='baseline_motion',boundary_index=boundary,
                     admitted=False,reason=str(error)))
                 continue
-            baseline_rank=camera_motion_rank(gesture,baseline_faces,enforce_face_limits=False)
+            baseline_rank=camera_motion_rank(gesture,baseline_faces,enforce_face_limits=False,
+                added_camera_cost=baseline_camera.ranking_cost)
             if baseline_rank is not None:
                 # Cached face scale only orders sensing; missing four-frame
                 # motion/output faces do not consume a measured repair slot.
@@ -510,6 +529,7 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 source_motion_cost=source_gesture.ranking_cost if source_gesture is not None else None,
                 source_motion_evidence_basis=motion_evidence_basis(source_gesture),
                 motion_ranking_coordinate_basis='actual_projected_output_pixels',
+                whole_added_camera_motion=baseline_camera.to_dict(),
                 output_face_metrics=baseline_faces,complete_measured_candidate=baseline_rank is not None))
         attempts.append(dict(stage='bounded_measured_focal_frontier',admitted=False,
             cached_candidate_budget=maximum_candidate_boundaries,measured_candidate_budget=maximum_measured_boundaries,
@@ -556,7 +576,8 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                 preview_faces=preview_rank=None
                 if projected_motion_preserved(gesture,before):
                     preview_faces=observation.face_metrics
-                    preview_rank=camera_motion_rank(gesture,preview_faces,enforce_face_limits=False)
+                    preview_rank=camera_motion_rank(gesture,preview_faces,enforce_face_limits=False,
+                        added_camera_cost=camera_burden(preview,boundary).ranking_cost)
                 attempts.append(dict(stage='directional_candidate',boundary_index=boundary,
                     offset_frames=offset,admitted=False,motion_rank_improved=improves,
                     motion_evidence_basis=motion_evidence_basis(before),
@@ -641,11 +662,17 @@ def refine_group_motion_camera(*,plan,timeline,audio_offsets,source_timewarps,sc
                         required_basis=motion_evidence_basis(before_projected))
                         if before_projected is not None else ProjectedBoundaryObservation())
                     projected_faces,after_projected=observation.face_metrics,observation.motion
-                    output_before_rank=camera_motion_rank(before_projected,before_faces,enforce_face_limits=False)
-                    rank=camera_motion_rank(after_projected,projected_faces)
+                    old_camera=camera_burden(plan,boundary)
+                    new_camera=camera_burden(proposal.plan,boundary)
+                    output_before_rank=camera_motion_rank(before_projected,before_faces,enforce_face_limits=False,
+                        added_camera_cost=old_camera.ranking_cost)
+                    rank=camera_motion_rank(after_projected,projected_faces,
+                        added_camera_cost=new_camera.ranking_cost)
                     row.update(proposed_output_face_metrics=projected_faces,
                         before_source_motion_face_rank=camera_motion_rank(source_before,before_faces,enforce_face_limits=False),
                         before_joint_rank=output_before_rank,proposed_joint_rank=rank,
+                        before_whole_added_camera_motion=old_camera.to_dict(),
+                        proposed_whole_added_camera_motion=new_camera.to_dict(),
                         before_projected_motion=before_projected.to_dict() if before_projected else None,
                         proposed_projected_motion=after_projected.to_dict() if after_projected else None,
                         projected_motion_required_for_promotion=True)
