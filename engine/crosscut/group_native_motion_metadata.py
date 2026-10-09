@@ -149,7 +149,7 @@ def _fresh_motion(old, plan, timeline, cells, evidence):
             ('reference_calibrated_push_in', 'reference_calibrated_pull_out'))),
         ('pan', 0 if alignment is None else alignment.pan_event_count),
         ('roll', 0 if alignment is None else alignment.roll_event_count),
-        ('separately_bound_selected_native_cameras', 2))
+        ('separately_bound_selected_native_cameras', evidence.get('selected_shot_count', 2)))
     history = dict(retired_alignment_decisions=retired,
         retired_required_boundary_failures=[list(row) for row in motion.required_boundary_failures if row[0] not in edges],
         retired_accepted_boundaries=[i for i in motion.accepted_boundary_indices if i not in edges],
@@ -239,12 +239,14 @@ def complete_native_motion_metadata(*, context, selected, metadata, domain, prot
         original_plan_identity=_plan_identity(old.render_plan), protected_output_intervals=protected_output_intervals,
         state='SELECTED_FOR_REVIEW', selection_evidence=dict(contract=CONTRACT,
             selected_camera_evidence=json.loads(selected.evidence_json), timeline_evidence=evidence,
-            complete_metadata_constructed=True, candidate_admitted=False, quality_approved=False))
+            complete_metadata_constructed=True, candidate_admitted=False, quality_approved=False),
+        selection_scope=selected.selection_scope)
     return replace(candidate, native_motion_production=production)
 
 
 def produce_complete_native_motion_metadata(*, context, selected, domain, views, protected_output_intervals=()):
     metadata = build_native_motion_timeline(context=context, selected_plan=selected.render_plan,
-        domain=domain, selected_shots=selected.selected_shots, views=views)
+        domain=domain, selected_shots=selected.selected_shots, views=views,
+        selection_scope=selected.selection_scope)
     return complete_native_motion_metadata(context=context, selected=selected, metadata=metadata,
         domain=domain, protected_output_intervals=protected_output_intervals)

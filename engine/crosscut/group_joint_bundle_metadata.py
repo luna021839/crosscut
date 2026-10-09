@@ -226,10 +226,12 @@ class GroupNativeMotionProduction:
     complete_bundle: object | None = None
     selection_evidence_json: str | None = None
     selection_sha256: str | None = None
+    selection_scope: Literal['adjacent_two_shots','variable_programme'] = 'adjacent_two_shots'
 
     def to_dict(self):
         from dataclasses import asdict
         return dict(contract='normal_native_motion_selected_program_v2',state=self.state,
+            selection_scope=self.selection_scope,
             original_plan_identity=self.original_plan_identity,
             selected_plan_identity=_plan_identity(self.render_plan),
             protected_output_intervals=[list(x) for x in self.protected_output_intervals],
@@ -263,7 +265,8 @@ def _selected_production_payload(production):
             for shot in production.selected_shots],
         original_plan_identity=production.original_plan_identity,
         protected_output_intervals=[list(pair) for pair in production.protected_output_intervals],
-        state=production.state,selection_evidence=json.loads(production.selection_evidence_json))
+        state=production.state,selection_scope=production.selection_scope,
+        selection_evidence=json.loads(production.selection_evidence_json))
 
 
 def _selection_digest(production):
@@ -288,6 +291,7 @@ def _check_native_selection(production):
             or production.render_plan.sources!=production.source_domain.request_sources):
         raise ValueError('native production requires its exact complete selected bundle without a backlink')
     if (production.state not in ('SELECTED_FOR_REVIEW','KEEP_ORIGINAL')
+            or production.selection_scope not in ('adjacent_two_shots','variable_programme')
             or not isinstance(production.selected_shots,tuple)
             or not isinstance(production.protected_output_intervals,tuple)
             or not isinstance(production.original_plan_identity,str)
@@ -334,19 +338,23 @@ def _check_native_selection(production):
         if production.selected_shots or _plan_identity(production.render_plan)!=production.original_plan_identity:
             raise ValueError('KEEP_ORIGINAL must retain the original plan without replacement shots')
         return
-    if len(production.selected_shots)!=2:
+    variable = production.selection_scope == 'variable_programme'
+    if (not variable and len(production.selected_shots)!=2
+            or variable and not 1 <= len(production.selected_shots) <= 1024):
         raise ValueError('selected native production needs both complete adjacent shot paths')
     previous_end=None
     for shot in production.selected_shots:
         if (not isinstance(shot,SelectedNativeMotionShot)
                 or type(shot.first_output_frame) is not int or type(shot.end_output_frame) is not int
                 or not 0<=shot.first_output_frame<shot.end_output_frame<=offsets[-1]
-                or not 2<=shot.end_output_frame-shot.first_output_frame<=160
-                or previous_end is not None and previous_end!=shot.first_output_frame
+                or not 2<=shot.end_output_frame-shot.first_output_frame<=(36000 if variable else 160)
+                or previous_end is not None and (previous_end>shot.first_output_frame if variable
+                    else previous_end!=shot.first_output_frame)
                 or type(shot.request_source_index) is not int
                 or shot.request_source_index not in domain.eligible_indices
                 or shot.role is not None and not isinstance(shot.role,GroupOutputRole)
                 or type(shot.phase_native_frames) is not int or abs(shot.phase_native_frames)>2
+                or variable and shot.phase_native_frames != 0
                 or not isinstance(shot.physical_native_run,tuple) or len(shot.physical_native_run)!=2
                 or any(type(v) is not int for v in shot.physical_native_run)
                 or not 0<=shot.physical_native_run[0]<shot.physical_native_run[1]
@@ -396,7 +404,8 @@ def _check_native_selection(production):
 
 
 def seal_native_motion_production(*,complete_bundle,source_domain,shot_clock_context,
-        selected_shots,original_plan_identity,protected_output_intervals,state,selection_evidence):
+        selected_shots,original_plan_identity,protected_output_intervals,state,selection_evidence,
+        selection_scope='adjacent_two_shots'):
     """Seal an already complete producer result; never invent missing metadata.
 
     This function is not the full-topology observation producer or admission
@@ -406,7 +415,8 @@ def seal_native_motion_production(*,complete_bundle,source_domain,shot_clock_con
     production=GroupNativeMotionProduction(complete_bundle.visual_timeline,complete_bundle.render_plan,
         complete_bundle.editorial_motion_plan,source_domain,shot_clock_context,selected_shots,
         original_plan_identity,protected_output_intervals,state,complete_bundle,
-        json.dumps(selection_evidence,sort_keys=True,separators=(',',':'),allow_nan=False))
+        json.dumps(selection_evidence,sort_keys=True,separators=(',',':'),allow_nan=False),
+        selection_scope=selection_scope)
     _check_native_selection(production)
     return replace(production,selection_sha256=_selection_digest(production))
 

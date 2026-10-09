@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 enum IVEMember: String, CaseIterable, Codable, Identifiable {
     case anYujin = "안유진"

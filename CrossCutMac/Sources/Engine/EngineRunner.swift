@@ -431,6 +431,7 @@ enum CompletedEngineOutputSetDiscovery {
         let releasePolicy: ReviewFirstReleasePolicy?
         let candidatePool: String?
         let selectedPathAuthority: String?
+        let completeCandidates: [FamilyCompleteCandidate]?
         let exactSuccessfulDecodedReviewCountSatisfied: Bool
         let exactCompleteCandidateCountSatisfied: Bool
         let finalSelectedReview: ProxyReview
@@ -461,14 +462,19 @@ enum CompletedEngineOutputSetDiscovery {
             case releasePolicy = "release_policy"
             case candidatePool = "candidate_pool"
             case selectedPathAuthority = "selected_path_authority"
+            case completeCandidates = "complete_candidates"
         }
 
-        func isComplete(allowQualityFailure: Bool) -> Bool {
+        func isComplete(allowQualityFailure: Bool, renderedFamilyReceipt: PerformerFamilyReceipt? = nil) -> Bool {
             let indices = candidates.map(\.candidateIndex)
             let selected = candidates.filter(\.selected)
             let singleton = releasePolicy?.isReviewFirst == true
                 && candidatePool == "bounded_review_first_single_full_song_v1"
-                && ["stage_edit_generation", "stage_edit_candidate_reranker", "deterministic_full_song_visual_selector"].contains(selectedPathAuthority ?? "")
+                && (["stage_edit_generation", "stage_edit_candidate_reranker", "deterministic_full_song_visual_selector"].contains(selectedPathAuthority ?? "")
+                    || (renderedFamilyReceipt?.isBoundReviewEvidence(authority: selectedPathAuthority) == true
+                        && completeCandidates?.count == 1
+                        && completeCandidates?.first?.candidateOrigin == selectedPathAuthority
+                        && completeCandidates?.first?.performerFamilyReview == renderedFamilyReceipt))
             let qualitySingle = releasePolicy?.isQualitySingle == true
             let count = singleton || qualitySingle ? 1 : 8
             return analysisBasis == (singleton ? "bounded_review_first_single_full_song_v1" : CompletedEngineOutputSetDiscovery.selectionAnalysisBasis)
@@ -498,6 +504,45 @@ enum CompletedEngineOutputSetDiscovery {
                 && (finalSelectedReview.passed || (singleton && allowQualityFailure))
                 && finalSelectedReview.isCompleteAndSanitized
                 && ["original", "partial_reedit", "windowed_semimarkov_redecode"].contains(finalSelectedVersion)
+        }
+    }
+
+    private struct PerformerFamilyReceipt: Decodable, Equatable {
+        let contract: String
+        let planSHA256: String
+        let metadataSHA256: String
+        let qualityApproved: Bool
+        let crossCameraIdentityCertified: Bool
+        let bodyPhaseCertified: Bool
+        let decodedOutputQualityCertified: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case contract
+            case planSHA256 = "plan_sha256"
+            case metadataSHA256 = "metadata_sha256"
+            case qualityApproved = "quality_approved"
+            case crossCameraIdentityCertified = "cross_camera_identity_certified"
+            case bodyPhaseCertified = "body_phase_certified"
+            case decodedOutputQualityCertified = "decoded_output_quality_certified"
+        }
+
+        func isBoundReviewEvidence(authority: String?) -> Bool {
+            let owners = ["normal_performer_family_camera_owner_v1",
+                "normal_source_changing_family_owner_v1", "selected_native_motion_complete_metadata_v1"]
+            return authority == contract && owners.contains(contract)
+                && CompletedEngineOutputSetDiscovery.isSHA256(planSHA256)
+                && CompletedEngineOutputSetDiscovery.isSHA256(metadataSHA256)
+                && !qualityApproved && !crossCameraIdentityCertified
+                && !bodyPhaseCertified && !decodedOutputQualityCertified
+        }
+    }
+
+    private struct FamilyCompleteCandidate: Decodable, Equatable {
+        let candidateOrigin: String?
+        let performerFamilyReview: PerformerFamilyReceipt?
+        enum CodingKeys: String, CodingKey {
+            case candidateOrigin = "candidate_origin"
+            case performerFamilyReview = "performer_family_review"
         }
     }
 
@@ -687,6 +732,7 @@ enum CompletedEngineOutputSetDiscovery {
         let releasePolicy: ReviewFirstReleasePolicy?
         let candidatePool: String?
         let candidateOrigin: String?
+        let performerFamilyReview: PerformerFamilyReceipt?
 
         enum CodingKeys: String, CodingKey {
             case videoPath = "video_path"
@@ -701,6 +747,7 @@ enum CompletedEngineOutputSetDiscovery {
             case releasePolicy = "release_policy"
             case candidatePool = "candidate_pool"
             case candidateOrigin = "candidate_origin"
+            case performerFamilyReview = "performer_family_review"
         }
     }
 
@@ -1208,7 +1255,8 @@ enum CompletedEngineOutputSetDiscovery {
               interchangeAudit.artifacts.values.allSatisfy({
                 $0.sizeBytes > 0 && isSHA256($0.sha256)
               }),
-              selection.isComplete(allowQualityFailure: analysis.artifactRole == "review_ready"),
+              selection.isComplete(allowQualityFailure: analysis.artifactRole == "review_ready",
+                renderedFamilyReceipt: analysis.render.performerFamilyReview),
               selection.releasePolicy == analysis.render.releasePolicy,
               (selection.releasePolicy == nil || analysis.postRenderQA.reviewFirstDisposition != nil),
               (selection.releasePolicy?.isReviewFirst != true

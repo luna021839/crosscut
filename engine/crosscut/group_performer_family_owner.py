@@ -31,7 +31,8 @@ from .visual_boundary_repair import _thaw_audit_value
 
 CONTRACT = 'normal_performer_family_camera_owner_v1'
 SOURCE_CONTRACT = 'normal_source_changing_family_owner_v1'
-FAMILY_CONTRACTS = (CONTRACT, SOURCE_CONTRACT)
+NATIVE_METADATA_CONTRACT = 'selected_native_motion_complete_metadata_v1'
+FAMILY_CONTRACTS = (CONTRACT, SOURCE_CONTRACT, NATIVE_METADATA_CONTRACT)
 QUALITY_CODE = 'performer_family_quality_unapproved'
 MAX_OUTPUT_FRAMES = 36000
 MAX_REFRESHED_CELLS = 4
@@ -814,6 +815,9 @@ def attempt_performer_family(*, controller, request, eligible_indices, offsets, 
 def validate_serialized_metadata(complete):
     if not isinstance(complete,Mapping):
         raise ValueError('performer selected complete metadata missing')
+    if (complete.get('performer_family_review') or {}).get('contract') == NATIVE_METADATA_CONTRACT:
+        from .group_native_motion_final import validate_serialized_native_metadata
+        return validate_serialized_native_metadata(complete)
     metadata = dict(complete)
     receipt = metadata.pop('performer_family_review',None)
     if (not isinstance(receipt,Mapping) or receipt.get('contract') not in FAMILY_CONTRACTS
@@ -920,6 +924,9 @@ def _final_live_replay(plan_json, receipt, deadline):
 def replay_final_sources(plan_json,receipt):
     deadline=min(current_optional_deadline() or float('inf'),monotonic()+45.)
     with optional_native_scope(deadline):
+        if plain(receipt).get('contract') == NATIVE_METADATA_CONTRACT:
+            from .group_native_motion_final import replay_selected_native_metadata
+            return replay_selected_native_metadata(plan_json, plain(receipt), deadline)
         if plain(receipt).get('contract') == SOURCE_CONTRACT:
             from .group_source_changing_owner import final_live_replay
             return final_live_replay(plan_json,plain(receipt),deadline)

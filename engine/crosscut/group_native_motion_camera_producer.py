@@ -176,9 +176,10 @@ def _appearance_incidents(selected,first,cut,end):
 @dataclass(frozen=True,slots=True)
 class NativeMotionCameraCandidate:
     render_plan: RenderPlan
-    shot_clock_context: FrozenShotVideoClockContext
-    selected_shots: tuple[SelectedNativeMotionShot,SelectedNativeMotionShot]
+    shot_clock_context: FrozenShotVideoClockContext | None
+    selected_shots: tuple[SelectedNativeMotionShot,...]
     evidence_json: str
+    selection_scope: str = 'adjacent_two_shots'
 
     @property
     def evidence(self):

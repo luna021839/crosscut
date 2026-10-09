@@ -19,6 +19,63 @@ from tests.test_group_native_motion_bundle import synthetic_bundle
 from tests.test_group_native_motion_timeline import sample
 
 
+def variable_programme_complete():
+    """Nine fresh cells, three runs, nonidentity mapping and UNKNOWN actors."""
+    from crosscut.render import RenderSegment, RenderTransition
+    from crosscut.group_review_interval_compile import output_offsets
+    old, domain = synthetic_bundle()
+    old = replace(old,dynamic_crop_application=None,boundary_look_match=None)
+    counts = (13,)*8+(16,)
+    offsets = (0,13,26,39,52,65,78,91,104,120)
+    segments = tuple(RenderSegment((0,2,3)[i//3],offsets[i]/30,counts[i]/30,offsets[i]/30)
+        for i in range(9))
+    plan = replace(old.render_plan,segments=segments,transitions=(RenderTransition(),)*8)
+    clocks = native_frame_clocks_for_output(plan,domain.clocks_by_request,range(120))
+    shots = tuple(SelectedNativeMotionShot(a,b,s,(0,10000),GroupOutputRole.FOCAL_HEAD,0,None,
+        tuple(SelectedNativeActorFrame(t,s,clocks[t].native_frame_index,None,None) for t in range(a,b)),
+        tuple(range(first,last))) for a,b,s,first,last in ((0,39,0,0,3),(39,78,2,3,6),(78,120,3,6,9)))
+    selected = NativeMotionCameraCandidate(plan,None,shots,
+        json.dumps(dict(contract='NUMERIC_VARIABLE_PROGRAMME_TRANSPORT_ONLY',quality_approved=False)),
+        selection_scope='variable_programme')
+    cells = metadata_cells(original=old.render_plan,selected=plan,domain=domain,
+        selected_shots=shots,selection_scope='variable_programme')
+    samples = {t:sample(t) for c in cells for t in c.taps}
+    choices = tuple(_fresh_choice(c,s,domain,plan,samples,'numeric-variable',())
+        for c,s in zip(cells,segments,strict=True))
+    metadata = NativeMotionTimelineMetadata(VisualTimelinePlan(choices,1.),cells,json.dumps(dict(
+        original_plan_identity=_plan_identity(old.render_plan),selected_plan_identity=_plan_identity(plan),
+        selected_shot_count=3,selection_scope='variable_programme',samples=list(samples.values()))))
+    return SimpleNamespace(incumbent=old),selected,metadata,domain
+
+
+def test_variable_programme_complete_transports_three_runs_and_nine_changed_cells():
+    from crosscut.group_performer_family_owner import validate_serialized_metadata
+    context,selected,metadata,domain = variable_programme_complete()
+    assert len(metadata.cells)==9 and all(c.refresh_source_observations for c in metadata.cells)
+    bundle = complete_native_motion_metadata(context=context,selected=selected,metadata=metadata,domain=domain)
+    assert bundle.native_motion_production.selection_scope=='variable_programme'
+    assert len(bundle.native_motion_production.selected_shots)==3
+    assert all(row.frame_local_head_id is None for s in selected.selected_shots for row in s.actor_frames)
+    assert all(c.source_index==domain.eligible_index(s.source_index)
+        for c,s in zip(bundle.visual_timeline.choices,bundle.render_plan.segments,strict=True))
+    assert validate_serialized_metadata(bundle.to_dict())['quality_approved'] is False
+    assert dict(bundle.editorial_motion_plan.authored_event_counts)['separately_bound_selected_native_cameras']==3
+
+
+def test_variable_programme_does_not_silently_change_legacy_two_shot_contract():
+    context,selected,metadata,domain = variable_programme_complete()
+    with pytest.raises(ValueError,match='both exact selected shots'):
+        metadata_cells(original=context.incumbent.render_plan,selected=selected.render_plan,
+            domain=domain,selected_shots=selected.selected_shots)
+    with pytest.raises(ValueError):
+        metadata_cells(original=context.incumbent.render_plan,selected=selected.render_plan,
+            domain=domain,selected_shots=tuple(reversed(selected.selected_shots)),selection_scope='variable_programme')
+    with pytest.raises(ValueError):
+        # Omitting a run is not permission to change its exterior sampler.
+        metadata_cells(original=context.incumbent.render_plan,selected=selected.render_plan,
+            domain=domain,selected_shots=selected.selected_shots[1:],selection_scope='variable_programme')
+
+
 def numeric_complete(*, first=30, cut=61, end=90, fractional=False, phases=(1, -1)):
     old, domain = synthetic_bundle()
     old = replace(old, dynamic_crop_application=None, boundary_look_match=None)

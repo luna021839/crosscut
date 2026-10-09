@@ -523,6 +523,55 @@ final class EngineContractTests: XCTestCase {
         }
     }
 
+    func testReviewReadyFamilyOwnersRequireTheirMatchingCompleteReceipt() throws {
+        for owner in ["normal_performer_family_camera_owner_v1",
+                      "normal_source_changing_family_owner_v1",
+                      "selected_native_motion_complete_metadata_v1"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let files = try makeReviewReadyOutputSet(in: directory, mode: .group)
+            var analysis = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[0])) as? [String: Any])
+            var selection = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[2])) as? [String: Any])
+            var render = try XCTUnwrap(analysis["render"] as? [String: Any])
+            let receipt: [String: Any] = ["contract": owner,
+                "plan_sha256": String(repeating: "a", count: 64),
+                "metadata_sha256": String(repeating: "b", count: 64),
+                "quality_approved": false, "cross_camera_identity_certified": false,
+                "body_phase_certified": false, "decoded_output_quality_certified": false]
+            selection["selected_path_authority"] = owner
+            selection["complete_candidates"] = [["candidate_origin": owner, "performer_family_review": receipt]]
+            render["candidate_origin"] = owner
+            render["performer_family_review"] = receipt
+            func writeCurrent() throws {
+                analysis["rendered_candidate_selection"] = selection
+                render["rendered_candidate_selection"] = selection
+                analysis["render"] = render
+                try JSONSerialization.data(withJSONObject: selection).write(to: files[2], options: .atomic)
+                try JSONSerialization.data(withJSONObject: analysis).write(to: files[0], options: .atomic)
+            }
+            try writeCurrent()
+            let request = EditRequest(song: "XOXZ", targetMember: .gaeul, editMode: .group,
+                aspectRatio: .landscape, sources: [], outputDirectory: directory, sourceMode: .automatic)
+            let accepted = try XCTUnwrap(CompletedEngineOutputSetDiscovery.reported(files, for: request), owner)
+            XCTAssertEqual(accepted.artifactRole, "review_ready")
+            render.removeValue(forKey: "performer_family_review")
+            try writeCurrent()
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request), "missing receipt")
+            render["performer_family_review"] = receipt
+            var changed = receipt
+            changed["metadata_sha256"] = String(repeating: "c", count: 64)
+            selection["complete_candidates"] = [["candidate_origin": owner, "performer_family_review": changed]]
+            try writeCurrent()
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request), "different selected metadata")
+            changed = receipt
+            changed["cross_camera_identity_certified"] = true
+            render["performer_family_review"] = changed
+            selection["complete_candidates"] = [["candidate_origin": owner, "performer_family_review": changed]]
+            try writeCurrent()
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request), "invented identity approval")
+        }
+    }
+
     func testApprovedSingleDeliveryCohortsDoNotRequireEightFinalists() throws {
         for learned in [false, true] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

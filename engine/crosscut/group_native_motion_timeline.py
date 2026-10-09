@@ -28,6 +28,8 @@ from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 CONTRACT = 'selected_native_motion_fresh_timeline_v1'
 MAX_REFRESHED_CELLS = 8
 MAX_NATIVE_SAMPLES = 24
+MAX_PROGRAMME_REFRESHED_CELLS = 512
+MAX_PROGRAMME_NATIVE_SAMPLES = 1536
 
 
 def _digest(value):
@@ -73,21 +75,27 @@ class NativeMotionTimelineMetadata:
             camera_refit=False, actor_reselection=False, quality_approved=False)
 
 
-def metadata_cells(*, original, selected, domain, selected_shots):
+def metadata_cells(*, original, selected, domain, selected_shots, selection_scope='adjacent_two_shots'):
     """Declare the finite refresh footprint before reading a single pixel."""
     from .group_joint_bundle_metadata import SelectedNativeMotionShot
-    if (not isinstance(original, RenderPlan) or not isinstance(selected, RenderPlan)
+    variable = selection_scope == 'variable_programme'
+    if (selection_scope not in ('adjacent_two_shots','variable_programme')
+            or not isinstance(original, RenderPlan) or not isinstance(selected, RenderPlan)
             or not isinstance(domain, GroupSourceDomain) or original.sources != domain.request_sources
             or selected.sources != original.sources or not isinstance(selected_shots, tuple)
-            or len(selected_shots) != 2 or any(not isinstance(s, SelectedNativeMotionShot) for s in selected_shots)):
+            or (not 1 <= len(selected_shots) <= 1024 if variable else len(selected_shots) != 2)
+            or any(not isinstance(s, SelectedNativeMotionShot) for s in selected_shots)):
         raise ValueError('native metadata requires both exact selected shots and their original renderer domain')
-    first, cut, end = selected_shots[0].first_output_frame, selected_shots[0].end_output_frame, selected_shots[1].end_output_frame
-    if (selected_shots[1].first_output_frame != cut or not 0 <= first < cut < end <= original.output_frame_count
+    spans = tuple((s.first_output_frame,s.end_output_frame) for s in selected_shots)
+    if (any(type(a) is not int or type(b) is not int or not 0<=a<b<=original.output_frame_count for a,b in spans)
+            or any(a_end>b_start if variable else a_end!=b_start
+                for (_,a_end),(b_start,_) in zip(spans,spans[1:]))
             or selected.output_frame_count != original.output_frame_count
             or any(getattr(original, n) != getattr(selected, n) for n in
                 ('fps', 'width', 'height', 'aspect_ratio', 'master_audio_start', 'reference_source'))):
         raise ValueError('native metadata changed its complete output/audio/source domain')
-    outside = tuple(span for span in ((0, first), (end, original.output_frame_count)) if span[0] < span[1])
+    outside = tuple((a,b) for a,b in zip((0,*(b for _,b in spans)),
+        (*(a for a,_ in spans), original.output_frame_count)) if a<b)
     if outside:
         verify_realized_sampler(original, selected, domain,
             (tick for a, b in outside for tick in range(a, b)), require_source_request_time=False)
@@ -108,7 +116,7 @@ def metadata_cells(*, original, selected, domain, selected_shots):
     retained = []
     for i, (a, b) in enumerate(zip(starts, starts[1:])):
         old = original_cells.get((a, b))
-        if a < end and b > first:
+        if any(a<end and b>first for first,end in spans):
             old = None
         elif old is not None and selected.segments[i].source_index != original.segments[old].source_index:
             raise ValueError('immutable native metadata changed its original request source')
@@ -117,8 +125,8 @@ def metadata_cells(*, original, selected, domain, selected_shots):
         i > 0 and not (retained[i] is not None and retained[i-1] == retained[i]-1))
         for i, (a, b) in enumerate(zip(starts, starts[1:])))
     refreshed = tuple(c for c in result if c.refresh_source_observations)
-    if (len(refreshed) > MAX_REFRESHED_CELLS
-            or len({t for c in refreshed for t in c.taps}) > MAX_NATIVE_SAMPLES):
+    if (len(refreshed) > (MAX_PROGRAMME_REFRESHED_CELLS if variable else MAX_REFRESHED_CELLS)
+            or len({t for c in refreshed for t in c.taps}) > (MAX_PROGRAMME_NATIVE_SAMPLES if variable else MAX_NATIVE_SAMPLES)):
         raise ValueError('selected native metadata exceeded its predeclared finite pixel footprint')
     return result
 
@@ -198,7 +206,8 @@ def _clear_incoming_edge(choice):
         formation_transition_mismatch_from_previous=None)
 
 
-def build_native_motion_timeline(*, context, selected_plan, domain, selected_shots, views):
+def build_native_motion_timeline(*, context, selected_plan, domain, selected_shots, views,
+        selection_scope='adjacent_two_shots'):
     """Read the finite pixel footprint; consume EXACT selected actor parents.
 
     Raw/model cache misses remain unknown. Only actual raster decoding is
@@ -216,7 +225,7 @@ def build_native_motion_timeline(*, context, selected_plan, domain, selected_sho
             or not isinstance(views, NativeMotionViews) or views.domain != domain):
         raise ValueError('native timeline producer needs the completed live inventory and complete predecessor')
     cells = metadata_cells(original=incumbent.render_plan, selected=selected_plan,
-        domain=domain, selected_shots=selected_shots)
+        domain=domain, selected_shots=selected_shots, selection_scope=selection_scope)
     prepared = PreparedGroupCameraQueries(selected_plan, domain)
     requested_ticks = tuple(sorted({t for c in cells if c.refresh_source_observations for t in c.taps}))
     original = freeze_owned_scene_program(context, domain)
@@ -301,8 +310,14 @@ def build_native_motion_timeline(*, context, selected_plan, domain, selected_sho
         source_clock_basis='exact_selected_renderer_native_clock', geometry_basis='prescribed_render_geometry_v1',
         actual_epoch_clock=None)
     evidence = dict(contract=CONTRACT, original_plan_identity=_plan_identity(incumbent.render_plan),
+        selection_scope=selection_scope, selected_shot_count=len(selected_shots),
         selected_plan_identity=_plan_identity(selected_plan), samples=[samples[t] for t in sorted(samples)],
-        limits=dict(maximum_refreshed_cells=MAX_REFRESHED_CELLS, maximum_native_samples=MAX_NATIVE_SAMPLES),
+        live_source_binding=dict(contract='native_metadata_live_sources_v1', source_domain=domain.to_dict(),
+            source_identities=[list(session._assert_source_identity(i)) for i in domain.eligible_indices]),
+        limits=dict(maximum_refreshed_cells=(MAX_PROGRAMME_REFRESHED_CELLS
+                if selection_scope=='variable_programme' else MAX_REFRESHED_CELLS),
+            maximum_native_samples=(MAX_PROGRAMME_NATIVE_SAMPLES
+                if selection_scope=='variable_programme' else MAX_NATIVE_SAMPLES)),
         new_model_observations=0, source_observations_fresh=True, private_vectors_exported=False,
         family_metadata_complete=False, candidate_admitted=False, quality_approved=False)
     return NativeMotionTimelineMetadata(timeline, cells, json.dumps(evidence, sort_keys=True,
