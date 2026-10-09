@@ -193,7 +193,11 @@ EDITORIAL_TRANSFORM_EDGE_MARGIN = 0.003
 # Individual planners retain their narrower motion limits.  A decoded-output
 # inverse correction may use the wider envelope only when source resolution
 # proves the crop is lossless at delivery size.
-EDITORIAL_TRANSFORM_MAXIMUM_ZOOM = 2.0
+# The native camera producer can realize a covered 2.4x close-up. Rejecting
+# its already selected 2.1--2.2x keys here changes or loses the face match.
+# This is representation capacity only; source-resolution/quality admission
+# remains the producer's responsibility and planners keep their own limits.
+EDITORIAL_TRANSFORM_MAXIMUM_ZOOM = 2.4
 EDITORIAL_TRANSFORM_MAXIMUM_CENTER_SHIFT = 0.25
 # Representation capacity, not an instruction to author a six-degree roll.
 # The camera must still cover the real output aspect at every sample.
@@ -348,9 +352,9 @@ class EditorialTransformTrack:
         if self.sampling_canvas_zoom is not None and (
             type(self.sampling_canvas_zoom) not in (int, float)
             or not math.isfinite(self.sampling_canvas_zoom)
-            or not max(k.zoom for k in self.keyframes)<=self.sampling_canvas_zoom<=2.0
+            or not max(k.zoom for k in self.keyframes)<=self.sampling_canvas_zoom<=EDITORIAL_TRANSFORM_MAXIMUM_ZOOM
         ):
-            raise ValueError("editorial sampling canvas must cover the camera peak within 2x")
+            raise ValueError("editorial sampling canvas must cover the camera peak within the physical zoom bound")
         if abs(self.keyframes[0].time_seconds) > 1e-9:
             raise ValueError("group transform track must start at segment time zero")
         previous = -1.0

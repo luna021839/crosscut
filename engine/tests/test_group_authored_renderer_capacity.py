@@ -5,7 +5,7 @@ import pytest
 
 from crosscut.ive import AspectRatio
 from crosscut.render import (
-    EDITORIAL_TRANSFORM_MAXIMUM_ROLL, EditorialTransformKeyframe,
+    EDITORIAL_TRANSFORM_MAXIMUM_ROLL, EDITORIAL_TRANSFORM_MAXIMUM_ZOOM, EditorialTransformKeyframe,
     EditorialTransformTrack, RenderPlan, RenderSegment, _rotated_crop_is_inside_frame,
     minimum_roll_safe_zoom,
 )
@@ -117,3 +117,39 @@ def test_shared_coverage_helper_default_stays_conservative():
                   center_y=.46232565572877815, roll_degrees=-6.)
     assert not _rotated_crop_is_inside_frame(**camera)
     assert _rotated_crop_is_inside_frame(**camera, aspect_ratio=AspectRatio.LANDSCAPE)
+
+
+@pytest.mark.parametrize('camera', (
+    (2.1213206015989483, .4662727868368437, .5275052577841488, 0.),
+    (2.19668375572553, .5, .5, 0.),
+    (2.4, .5, .5, 0.),
+))
+def test_native_closeup_camera_is_not_clamped_at_the_old_twofold_cap(camera):
+    track = EditorialTransformTrack((EditorialTransformKeyframe(0., *camera),))
+    plan = plan_for(track)
+    assert EDITORIAL_TRANSFORM_MAXIMUM_ZOOM == 2.4
+    assert track.evaluate(.25).zoom == camera[0]
+    assert render_plan_from_json(plan.to_json()).to_json() == plan.to_json()
+
+
+@pytest.mark.parametrize('zoom', (2.400001, float('nan'), float('inf')))
+def test_native_closeup_representation_still_rejects_invalid_or_excess_zoom(zoom):
+    with pytest.raises(ValueError, match='zoom|finite'):
+        EditorialTransformKeyframe(0., zoom)
+
+
+def test_wider_zoom_does_not_admit_an_outside_source_crop():
+    key = EditorialTransformKeyframe(0., 2.2, .5, .75, 6.)
+    track = EditorialTransformTrack((key,))
+    with pytest.raises(ValueError, match='output aspect'):
+        plan_for(track)
+
+
+def test_sampling_canvas_uses_the_same_physical_bound_as_native_keys():
+    track = EditorialTransformTrack((EditorialTransformKeyframe(0., 2.2),),
+                                    sampling_canvas_zoom=2.4)
+    assert track.effective_sampling_canvas_zoom == 2.4
+    with pytest.raises(ValueError, match='camera peak'):
+        EditorialTransformTrack(track.keyframes, sampling_canvas_zoom=2.1)
+    with pytest.raises(ValueError, match='physical zoom bound'):
+        EditorialTransformTrack(track.keyframes, sampling_canvas_zoom=2.400001)

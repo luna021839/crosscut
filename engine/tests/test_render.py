@@ -1081,7 +1081,7 @@ class RenderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "quarter-frame"):
             EditorialTransformKeyframe(0.0, 2.0, 0.751, 0.50)
         with self.assertRaisesRegex(ValueError, "zoom"):
-            EditorialTransformKeyframe(0.0, 2.001)
+            EditorialTransformKeyframe(0.0, 2.401)
         with self.assertRaisesRegex(ValueError, "frame edges"):
             EditorialTransformKeyframe(0.0, 1.0, roll_degrees=1.0)
         track = EditorialTransformTrack((EditorialTransformKeyframe(0.0, 1.05),))
