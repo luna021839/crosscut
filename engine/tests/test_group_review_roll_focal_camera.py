@@ -9,6 +9,7 @@ from crosscut.group_review_observed_programme import coupled_focal_cameras,focal
 from crosscut.group_review_roll_focal_camera import (
     coupled_roll_focal_cameras,covered_roll_focal_camera,focal_eye_roll_degrees,
     observed_independent_head_reference,project_roll_focal_observation,
+    steady_native_camera_sequence,
 )
 from crosscut.render_geometry import reproject_editorial_frame
 
@@ -136,3 +137,38 @@ def test_nonfinite_raw_head_and_invalid_confidence_floor_do_not_enter_geometry()
         observed_independent_head_reference(value)
     with pytest.raises(ValueError,match='confidence'):
         observed_independent_head_reference(row(),minimum_confidence=True)
+
+
+def test_steady_control_removes_hunting_and_keeps_matched_incident_cameras():
+    original=[[1.5,.46,.5,0.]]+[[1.5,.5+(-1)**i*.04,.5,0.] for i in range(27)]+[[1.7,.54,.5,3.]]
+    before=deepcopy(original)
+    result=steady_native_camera_sequence(original,native_scene_ids=[(0,2)]*len(original))
+    assert result is not None and original==before
+    assert result[0]==original[0] and result[-1]==original[-1]
+    assert np.diff(np.asarray(result)[:,1]).min()>=0
+    assert np.diff(np.asarray(result)[:,3]).min()>=0
+    assert all(covered_roll_focal_camera(c) for c in result)
+
+
+def test_steady_control_keeps_native_camera_cut_flanks_without_bridging_them():
+    cameras=[[1.6,.46,.5,0.],[1.6,.51,.5,0.],[1.6,.47,.5,0.],
+        [1.6,.56,.5,0.],[1.6,.50,.5,0.],[1.6,.55,.5,0.]]
+    result=steady_native_camera_sequence(cameras,native_scene_ids=[(1,2)]*3+[(1,3)]*3)
+    assert result is not None
+    for i in (0,2,3,5):assert result[i]==cameras[i]
+    assert result[1][1]==pytest.approx(.465)
+    assert result[4][1]==pytest.approx(.555)
+
+
+def test_steady_control_preserves_single_and_two_tick_native_spans_exactly():
+    cameras=[[1.4,.5,.5,0.],[1.5,.51,.5,0.],[1.6,.52,.5,0.]]
+    assert steady_native_camera_sequence(cameras,native_scene_ids=[(0,1),(0,2),(0,2)])==cameras
+
+
+@pytest.mark.parametrize('cameras,scenes',[
+    ([[1.5,.5,.5,0.]],[]),([[float('nan'),.5,.5,0.]],[(0,1)]),
+    ([[3.,.5,.5,0.]],[(0,1)]),([[1.,.01,.5,0.]],[(0,1)]),
+])
+def test_steady_control_does_not_relax_capacity_or_fabricate_native_scene_ownership(cameras,scenes):
+    with pytest.raises(ValueError):
+        steady_native_camera_sequence(cameras,native_scene_ids=scenes)

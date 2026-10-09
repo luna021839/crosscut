@@ -376,3 +376,49 @@ def cover_native_camera_sequence(cameras):
         track=EditorialTransformTrack(tuple(EditorialTransformKeyframe(float(i),*v) for i,v in enumerate(result)))
     except ValueError:return None
     return result.tolist() if track.covers_aspect_ratio(AspectRatio.LANDSCAPE) else None
+
+
+def steady_native_camera_sequence(cameras, *, native_scene_ids):
+    """Remove framewise control hunting WITHOUT changing incident cameras.
+
+    Interpolate camera controls, not observed anatomy. The caller must bind
+    scene IDs to the actual selected native raster schedule. Each native-scene
+    span retains both endpoint cameras exactly, including its zoom and roll.
+    A source/native-camera cut therefore never becomes a smoothing bridge.
+
+    This is review geometry, not optical stabilization or automatic quality
+    approval. Short spans with materially different endpoint crops can still
+    move quickly; that needs a different incident/shot choice, not a relaxed
+    canvas or a promise that smoothing alone makes an expert edit.
+    """
+    values=np.asarray(cameras,float)
+    if (values.ndim!=2 or values.shape[1]!=4 or not 1<=len(values)<=1024
+            or not np.isfinite(values).all() or len(native_scene_ids)!=len(values)):
+        raise ValueError('steady camera needs finite controls and exact native scene IDs')
+    for camera in values:
+        covered=cover_interpolated_native_camera(camera)
+        if covered is None or not np.allclose(covered,camera,rtol=0,atol=1e-9):
+            raise ValueError('steady camera cannot begin from an uncovered native control')
+    result=values.copy();anchors=set();first=0
+    for end in range(1,len(values)+1):
+        if end<len(values) and native_scene_ids[end]==native_scene_ids[first]:
+            continue
+        anchors.update((first,end-1))
+        if end-first>=3:
+            a,b=values[first],values[end-1]
+            for tick in range(first+1,end-1):
+                u=(tick-first)/(end-first-1)
+                # Minimum-jerk endpoint control; no per-frame detector jitter.
+                alpha=u*u*u*(10.+u*(-15.+6.*u))
+                camera=(1.-alpha)*a+alpha*b
+                camera[0]=math.exp((1.-alpha)*math.log(a[0])+alpha*math.log(b[0]))
+                covered=cover_interpolated_native_camera(camera)
+                if covered is None:return None
+                result[tick]=covered
+        first=end
+    if len(result)==1:return result.tolist()
+    covered=cover_native_camera_sequence(result)
+    if covered is None:return None
+    if any(not np.allclose(covered[t],values[t],rtol=0,atol=1e-9) for t in anchors):
+        return None
+    return covered
