@@ -195,6 +195,9 @@ EDITORIAL_TRANSFORM_EDGE_MARGIN = 0.003
 # proves the crop is lossless at delivery size.
 EDITORIAL_TRANSFORM_MAXIMUM_ZOOM = 2.0
 EDITORIAL_TRANSFORM_MAXIMUM_CENTER_SHIFT = 0.25
+# Representation capacity, not an instruction to author a six-degree roll.
+# The camera must still cover the real output aspect at every sample.
+EDITORIAL_TRANSFORM_MAXIMUM_ROLL = 6.0
 
 
 def minimum_roll_safe_zoom(roll_degrees: float) -> float:
@@ -225,6 +228,7 @@ def _rotated_crop_is_inside_frame(
     center_x: float,
     center_y: float,
     roll_degrees: float,
+    aspect_ratio: AspectRatio | None = None,
 ) -> bool:
     """Check all virtual-camera corners in the unrotated source frame."""
 
@@ -243,11 +247,12 @@ def _rotated_crop_is_inside_frame(
     limit = 0.5 - EDITORIAL_TRANSFORM_EDGE_MARGIN * min(
         1.0, abs(roll_degrees)
     )
-    # The track is output-aspect agnostic so it can be shared by landscape and
-    # portrait/member modes.  Require the crop to fit under both reciprocal
-    # aspect transforms; RenderPlan can then serialize one track safely for
-    # either orientation.
-    for aspect in (16.0 / 9.0, 9.0 / 16.0):
+    # None retains the conservative shared-orientation check. An actual plan
+    # checks its own output orientation, not the other orientation as well.
+    aspects = (16.0 / 9.0, 9.0 / 16.0) if aspect_ratio is None else (
+        16.0 / 9.0 if AspectRatio(aspect_ratio) is AspectRatio.LANDSCAPE else 9.0 / 16.0,
+    )
+    for aspect in aspects:
         for x_value in (center_x - half, center_x + half):
             for y_value in (center_y - half, center_y + half):
                 dx = x_value - 0.5
@@ -296,19 +301,31 @@ class EditorialTransformKeyframe:
             > EDITORIAL_TRANSFORM_MAXIMUM_CENTER_SHIFT + 1e-9
         ):
             raise ValueError("editorial transform pan exceeds the quarter-frame cap")
-        if abs(self.roll_degrees) > 1.60:
-            raise ValueError("editorial transform roll exceeds the subtle-roll bound")
+        if abs(self.roll_degrees) > EDITORIAL_TRANSFORM_MAXIMUM_ROLL:
+            raise ValueError("editorial transform roll exceeds the physical-roll bound")
         if abs(self.roll_degrees) > 1e-9 and (
             self.zoom + 1e-9 < minimum_roll_safe_zoom(self.roll_degrees)
         ):
             raise ValueError("group transform zoom cannot hide transformed frame edges")
-        if not _rotated_crop_is_inside_frame(
-            zoom=self.zoom,
-            center_x=self.center_x,
-            center_y=self.center_y,
-            roll_degrees=self.roll_degrees,
-        ):
+        # A keyframe is an orientation-neutral representation. Final render
+        # admission below requires the WHOLE track to cover the actual plan
+        # aspect. This avoids serializing a new default field into old plans.
+        if not any(_rotated_crop_is_inside_frame(
+            zoom=self.zoom, center_x=self.center_x, center_y=self.center_y,
+            roll_degrees=self.roll_degrees, aspect_ratio=aspect,
+        ) for aspect in AspectRatio):
             raise ValueError("group transform cannot hide transformed frame edges")
+
+
+def _editorial_camera_samples(keyframes):
+    """Endpoints and the same sixteen-step continuous-path coverage check."""
+    for keyframe in keyframes:
+        yield (keyframe.zoom, keyframe.center_x, keyframe.center_y, keyframe.roll_degrees)
+    for left, right in zip(keyframes, keyframes[1:]):
+        for step in range(1, 16):
+            alpha = step / 16.0
+            yield tuple(getattr(left, name) + (getattr(right, name) - getattr(left, name)) * alpha
+                        for name in ('zoom', 'center_x', 'center_y', 'roll_degrees'))
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,37 +358,18 @@ class EditorialTransformTrack:
             if keyframe.time_seconds <= previous:
                 raise ValueError("group transform keyframe times must be strictly increasing")
             previous = keyframe.time_seconds
-        for left, right in zip(self.keyframes, self.keyframes[1:]):
-            for step in range(1, 16):
-                alpha = step / 16.0
-                zoom = left.zoom + (right.zoom - left.zoom) * alpha
-                roll_degrees = (
-                    left.roll_degrees
-                    + (right.roll_degrees - left.roll_degrees) * alpha
-                )
-                if abs(roll_degrees) > 1e-9 and (
-                    zoom + 1e-9 < minimum_roll_safe_zoom(roll_degrees)
-                ):
-                    raise ValueError(
-                        "group transform interpolation reveals transformed frame edges"
-                    )
-                if not _rotated_crop_is_inside_frame(
-                    zoom=zoom,
-                    center_x=(
-                        left.center_x
-                        + (right.center_x - left.center_x) * alpha
-                    ),
-                    center_y=(
-                        left.center_y
-                        + (right.center_y - left.center_y) * alpha
-                    ),
-                    roll_degrees=roll_degrees,
-                ):
-                    raise ValueError(
-                        "group transform interpolation reveals transformed frame edges"
-                    )
+        for zoom, _, _, roll_degrees in _editorial_camera_samples(self.keyframes):
+            if abs(roll_degrees) > 1e-9 and zoom + 1e-9 < minimum_roll_safe_zoom(roll_degrees):
+                raise ValueError("group transform interpolation reveals transformed frame edges")
+        if not any(self.covers_aspect_ratio(aspect) for aspect in AspectRatio):
+            raise ValueError("group transform interpolation reveals transformed frame edges")
         if not self.reason.strip():
             raise ValueError("group transform reason cannot be blank")
+
+    def covers_aspect_ratio(self, aspect_ratio: AspectRatio) -> bool:
+        return all(_rotated_crop_is_inside_frame(
+            zoom=zoom, center_x=x, center_y=y, roll_degrees=roll, aspect_ratio=aspect_ratio,
+        ) for zoom, x, y, roll in _editorial_camera_samples(self.keyframes))
 
     @property
     def final_keyframe(self) -> EditorialTransformKeyframe:
@@ -1124,6 +1122,9 @@ class RenderPlan:
             if abs(segment.master_start - expected) > 1e-6:
                 raise ValueError("segments must be contiguous and ordered on the master timeline")
             expected += segment.duration
+            for track in (segment.editorial_transform, segment.outgoing_overlap_transform):
+                if track is not None and not track.covers_aspect_ratio(self.aspect_ratio):
+                    raise ValueError("editorial transform reveals frame edges at the output aspect")
         if not self.transitions and len(self.segments) > 1:
             object.__setattr__(
                 self,
@@ -1229,13 +1230,23 @@ class RenderPlan:
                    for name in ('zoom','center_x','center_y','roll_degrees')):
                 raise ValueError("outgoing camera handle cannot reset the nominal camera")
             for frame in range(transition.frame_count):
-                handle.evaluate(frame/self.fps)
+                state = handle.evaluate(frame/self.fps)
+                if not _rotated_crop_is_inside_frame(
+                    zoom=state.zoom, center_x=state.center_x, center_y=state.center_y,
+                    roll_degrees=state.roll_degrees, aspect_ratio=self.aspect_ratio,
+                ):
+                    raise ValueError("outgoing camera reveals frame edges at an output-frame timestamp")
         for segment, frame_count in zip(self.segments, counts, strict=True):
             if segment.editorial_transform is None:
                 continue
             for frame_index in range(frame_count):
                 try:
-                    segment.editorial_transform.evaluate(frame_index / self.fps)
+                    state = segment.editorial_transform.evaluate(frame_index / self.fps)
+                    if not _rotated_crop_is_inside_frame(
+                        zoom=state.zoom, center_x=state.center_x, center_y=state.center_y,
+                        roll_degrees=state.roll_degrees, aspect_ratio=self.aspect_ratio,
+                    ):
+                        raise ValueError("frame edges at the output aspect")
                 except ValueError as exc:
                     raise ValueError(
                         "editorial transform is unsafe at an output-frame timestamp"
