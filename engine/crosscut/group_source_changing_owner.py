@@ -1115,7 +1115,8 @@ class NativeFamilySensors:
         from .group_joint_primitive_journal import primitive_reservation_bytes
         from .request_work_lease import current_request_work_phase
         from .group_native_motion_completion_schedule import (validate_completion_packages,
-            coherent_completion_schedule,NativeMotionCompletionCost,COMPLETION_RESOURCES)
+            coherent_completion_schedule,balanced_completion_schedule,
+            NativeMotionCompletionCost,COMPLETION_RESOURCES)
         port = self.session.budget.request_work_phase
         if port is None or current_request_work_phase() is not port:
             raise ValueError('normal motion completion requires the active whole-request work lease')
@@ -1152,14 +1153,11 @@ class NativeFamilySensors:
         for supply in core_current.supplies:
             if supply.missing_modalities:
                 missing.setdefault(supply.demand.native_key,[]).append(supply.demand)
-        first=min(d.output_tick for d in demands)
-        end=max(d.output_tick for d in demands)+1
         budget=self.session.budget
         def remaining():
             parent=port.remaining_capacity(('new_decodes','model_calls','pose_evidence_bytes'))
             return {k:max(0,min(budget.limits[k]-budget.counts[k]-budget.reserved[k],parent[k]))
                 for k in parent}
-        limit=min(maximum_new_observations,len(missing))
         evidence_reserve=primitive_reservation_bytes(MAX_NATIVE_JSON_BYTES)
         known={s.demand.native_key:s.observation for s in current.supplies}
         bindings={s.demand.native_key:s for s in current.supplies}
@@ -1176,7 +1174,11 @@ class NativeFamilySensors:
             probe=getattr(self.session,'native_raster_cache_available',None)
             cached=bool(probe is not None and probe(key[0],key[1],
                 expected_pixel_sha256=None if raw is None else raw.native_pixel_sha256))
-            heads=24 if raw is None else len(raw.heads)
+            # Cold raw work and known-head feature work are separate stages.
+            # Do not reserve 24 imagined SFace/ArcFace calls before the actual
+            # detector returns its head inventory. Post-raw work is rechecked
+            # against the SAME live lease before any feature inference.
+            heads=0 if raw is None else len(raw.heads)
             raw_calls=14 if raw is None else 0
             appearance_calls=heads if key in need_appearance and key not in appearances else 0
             member_calls=heads if key in need_member_features and key not in member_features else 0
@@ -1195,68 +1197,102 @@ class NativeFamilySensors:
             self.motion_completion_result=replace(current,completion_consumed=True,
                 status='ADMISSION_INTERRUPTED_PARTIAL')
             raise
-        counts={}; pending=dict(missing); scheduled=[]
         raw_limit=(maximum_new_observations if maximum_new_raw_observations is None
             else maximum_new_raw_observations)
-        raw_scheduled=0
-        raw_by_key=known
-        admission_remaining=dict(available)
-        # Bit-reversed order visits distributed time bands before adjacent
-        # bands. A later wall/IPC cutoff does not leave a chronological prefix.
-        bits=max(1,(limit-1).bit_length())
-        bands=sorted(range(limit),key=lambda n:int(format(n,'0'+str(bits)+'b')[::-1],2))
-        for band in bands:
-            eligible={key:rows for key,rows in pending.items()
-                if (raw_by_key[key] is not None or raw_scheduled<raw_limit)
-                and all(getattr(resource_costs[key],r)<=admission_remaining[r] for r in COMPLETION_RESOURCES)}
-            if not eligible:break
-            target=first+(band+.5)*(end-first)/max(1,limit)
-            def priority(d):
-                return (counts.get((d.source_family,d.opportunity),0),
-                    abs(d.output_tick-target),d.source_family,d.opportunity,
-                    d.source_index,d.native_frame_index,
-                    -1000. if d.analysis_roll is None else d.analysis_roll)
-            key,demand=min(((key,min(rows,key=priority)) for key,rows in eligible.items()),
-                key=lambda item:priority(item[1]))
-            aliases=pending.pop(key)
-            scheduled.append(demand)
-            for r in COMPLETION_RESOURCES:admission_remaining[r]-=getattr(resource_costs[key],r)
-            if raw_by_key[key] is None:raw_scheduled+=1
-            # One native fact services every output use. Do not erase a later
-            # moving-closeup use by selecting an earlier 'other' representative.
-            for lane in {(d.source_family,d.opportunity) for d in aliases}:
-                counts[lane]=counts.get(lane,0)+1
-        schedule_receipt=dict(policy='source_opportunity_resource_feasible_time_band_balanced_v2',
+        admitted=[];execution_order=[];raw_admitted=0;lane_counts={};chunks=[]
+        package_receipts={}
+        start_counts={r:budget.counts[r] for r in COMPLETION_RESOURCES}
+        schedule_receipt=dict(policy='settled_chunks_in_one_frozen_native_completion_pass_v3',
             initial_live_resource_capacity=available,
-            admitted_resource_upper_bounds={r:available[r]-admission_remaining[r] for r in COMPLETION_RESOURCES},
+            admitted_resource_upper_bounds={r:0 for r in COMPLETION_RESOURCES},
+            resource_bound_scope='maximum_chunk_upper_bound_not_retained_usage',
+            required_native_keys=required_native_keys,terminal_required_dependencies=(),
+            selected_packages=[],unretryable_packages=[],chunks=chunks,
             resource_admission_is_not_atomic_parent_reservation=True,
             successful_observations_or_connected_actors_certified=False,quality_approved=False)
-        if required_native_keys or completion_packages:
-            scheduled,schedule_receipt=coherent_completion_schedule(core_current,
-                required_native_keys=required_native_keys,packages=completion_packages,
-                maximum_observations=limit,maximum_raw_observations=raw_limit,
-                resource_costs=resource_costs,remaining_resources=available,
-                critical_required_native_keys=critical_required_native_keys)
-        admitted=tuple(d.native_key for d in scheduled)
-        # Consume already-verified live rasters before any new decode can evict
-        # them. Never pin extra raster copies or grant a stale zero-decode claim.
-        scheduled=tuple(sorted(scheduled,key=lambda d:resource_costs[d.native_key].new_decodes))
         attempted=[];core_attempted=[];optional_attempted=[];optional_unavailable=[];preflight_skipped=[]
+        feature_preflight_skipped=[]
         schedule_receipt.update(optional_member_features_are_core_admission_authority=not member_features_optional)
-        schedule_receipt.update(admitted_core_native_keys=admitted,
-            execution_schedule_core_native_keys=tuple(d.native_key for d in scheduled),
-            execution_order_policy='verified_live_rasters_before_cache_misses_no_editorial_rescoring',
-            admission_resource_costs=[dict(native_key=k,**resource_costs[k].resources()) for k in admitted])
-        status=('BUDGET_PARTIAL' if len(scheduled)<len(missing)
-            else 'COMPLETED_ONCE')
-        if schedule_receipt.get('terminal_required_dependencies'):status='TERMINAL_REQUIRED_INPUT_BLOCKER'
+        schedule_receipt.update(execution_order_policy=
+            'verified_live_rasters_before_cache_misses_no_editorial_rescoring',admission_resource_costs=[])
+        status='COMPLETED_ONCE'
+
+        def current_core_inventory():
+            return replace(core_current,supplies=tuple(NativeMotionSupply(s.demand,
+                known[s.demand.native_key],appearances.get(s.demand.native_key),
+                bindings[s.demand.native_key].recorded_input_state,
+                bindings[s.demand.native_key].source_equivalence_json,member_features.get(s.demand.native_key))
+                for s in core_current.supplies))
+
+        def admit_chunk():
+            nonlocal raw_admitted
+            budget.check()
+            chunk_inventory=current_core_inventory()
+            pending={s.demand.native_key for s in chunk_inventory.supplies
+                if s.missing_modalities and s.demand.native_key not in admitted}
+            slots=maximum_new_observations-len(admitted)
+            if not pending or slots<=0:return (),None
+            costs=(resource_costs if not chunks else {k:work_cost(k) for k in pending})
+            live=available if not chunks else remaining()
+            args=dict(maximum_observations=slots,maximum_raw_observations=raw_limit-raw_admitted,
+                resource_costs=costs,remaining_resources=live,excluded_native_keys=tuple(admitted))
+            if required_native_keys or completion_packages:
+                scheduled,receipt=coherent_completion_schedule(chunk_inventory,
+                    required_native_keys=required_native_keys,packages=completion_packages,
+                    critical_required_native_keys=critical_required_native_keys,**args)
+            else:
+                scheduled,receipt=balanced_completion_schedule(chunk_inventory,lane_counts=lane_counts,**args)
+            # One physical input enters at most once in this pass, whether its
+            # execution succeeds, fails or loses capacity during live preflight.
+            keys=tuple(d.native_key for d in scheduled)
+            admitted.extend(keys);raw_admitted+=sum(known[k] is None for k in keys)
+            ordered=tuple(sorted(scheduled,key=lambda d:costs[d.native_key].new_decodes))
+            execution_order.extend(d.native_key for d in ordered)
+            schedule_receipt['admission_resource_costs'].extend(
+                dict(native_key=k,**costs[k].resources()) for k in keys)
+            for r in COMPLETION_RESOURCES:
+                schedule_receipt['admitted_resource_upper_bounds'][r]=max(
+                    schedule_receipt['admitted_resource_upper_bounds'][r],receipt['admitted_resource_upper_bounds'][r])
+            schedule_receipt['terminal_required_dependencies']=receipt['terminal_required_dependencies']
+            for row in receipt['unretryable_packages']:
+                if row not in schedule_receipt['unretryable_packages']:
+                    schedule_receipt['unretryable_packages'].append(row)
+            for row in receipt['selected_packages']:
+                prior=package_receipts.setdefault(row['identity'],dict(row,admitted_missing_native_keys=()))
+                prior['admitted_missing_native_keys']=tuple(dict.fromkeys(
+                    (*prior['admitted_missing_native_keys'],*row['admitted_missing_native_keys'])))
+            chunk=dict(receipt,index=len(chunks),execution_schedule_core_native_keys=tuple(
+                d.native_key for d in ordered),budget_counts_before={r:budget.counts[r] for r in COMPLETION_RESOURCES},
+                state='ADMITTED')
+            chunks.append(chunk)
+            return ordered,chunk
+
         def snapshot(state):
             # These rows were validated in this pass. Do not reopen source/model
             # I/O after its deadline merely to construct the result container.
             core_states={k:NativeMotionSupply(d,known[k],appearances.get(k),bindings[k].recorded_input_state,
                 bindings[k].source_equivalence_json,member_features.get(k)) for k,d in core_demands.items()}
             completed={k for k,s in core_states.items() if not s.missing_modalities and s.state=='NATIVE_ROWS_AVAILABLE'}
-            schedule_receipt.update(attempted_optional_member_native_keys=list(optional_attempted),
+            terminal=tuple(dict(native_key=k,state=core_states[k].state) for k in critical_required_native_keys
+                if core_states[k].state in ('CONFLICTING_NATIVE_RECORDS','CONFLICTING_FEATURE_RECORDS','EXACT_DECODE_UNAVAILABLE'))
+            schedule_receipt['terminal_required_dependencies']=terminal
+            for package in completion_packages:
+                row=package_receipts.get(package.identity)
+                if row is not None:
+                    left=tuple(k for k in package.native_keys if k in missing and k not in admitted)
+                    row.update(unadmitted_missing_native_keys=left,entire_missing_input_package_admitted=not left,
+                        unresolved_admitted_native_keys=tuple(k for k in package.native_keys
+                            if k in admitted and k not in completed))
+            schedule_receipt.update(admitted_core_native_keys=list(admitted),
+                execution_schedule_core_native_keys=list(execution_order),
+                unadmitted_required_native_keys=[k for k in required_native_keys if k in missing and k not in admitted],
+                unadmitted_core_native_keys=[k for k in missing if k not in admitted],
+                scheduled_unique_facts=len(admitted),scheduled_new_raw_facts=raw_admitted,
+                selected_packages=list(package_receipts.values()),
+                settled_resource_usage={r:budget.counts[r]-start_counts[r] for r in COMPLETION_RESOURCES},
+                live_reserved_resources={r:budget.reserved[r] for r in COMPLETION_RESOURCES},
+                post_raw_feature_preflight_skipped_inputs=list(feature_preflight_skipped),
+                attempted_optional_member_native_keys=list(optional_attempted),
                 optional_member_unavailable_inputs=list(optional_unavailable),
                 attempted_unique_native_keys=list(attempted),attempted_core_native_keys=list(core_attempted),
                 unattempted_admitted_core_native_keys=[k for k in admitted if k not in core_attempted],
@@ -1279,32 +1315,52 @@ class NativeFamilySensors:
             return value
         snapshot('RUNNING')
         try:
-            for demand in scheduled:
-                budget.check()
-                raw=known[demand.native_key]
-                required=work_cost(demand.native_key).resources()
-                available=remaining()
-                if any(available[k]<n for k,n in required.items()):
-                    preflight_skipped.append(dict(native_key=demand.native_key,
-                        state='LIVE_RESOURCE_CAPACITY_CHANGED',required=required,remaining=available))
-                    status='BUDGET_PARTIAL';continue
-                attempted.append(demand.native_key)
-                core_attempted.append(demand.native_key)
+            while not schedule_receipt.get('terminal_required_dependencies'):
+                scheduled,chunk=admit_chunk()
                 snapshot('RUNNING')
-                if raw is None:
-                    known[demand.native_key]=self.native_at(demand.source_index,
-                        demand.native_frame_index,demand.analysis_roll)
-                    bindings[demand.native_key]=NativeMotionSupply(demand,known[demand.native_key])
-                raw=known[demand.native_key]
-                if (demand.native_key in need_appearance and demand.native_key not in appearances
-                        and raw is not None and raw.native_pixel_sha256 is not None):
-                    appearances[demand.native_key]=self._complete_motion_appearance(replace(bindings[demand.native_key],
-                        observation=raw))
-                if (demand.native_key in need_member_features and demand.native_key not in member_features
-                        and raw is not None and raw.native_pixel_sha256 is not None and not member_features_optional):
-                    member_features[demand.native_key]=self.member_features_at(replace(bindings[demand.native_key],
-                        observation=raw))
-                snapshot('RUNNING')
+                if not scheduled:break
+                for demand in scheduled:
+                    budget.check()
+                    raw=known[demand.native_key]
+                    required=work_cost(demand.native_key).resources()
+                    live=remaining()
+                    if any(live[k]<n for k,n in required.items()):
+                        preflight_skipped.append(dict(native_key=demand.native_key,
+                            state='LIVE_RESOURCE_CAPACITY_CHANGED',required=required,remaining=live))
+                        continue
+                    attempted.append(demand.native_key)
+                    core_attempted.append(demand.native_key)
+                    snapshot('RUNNING')
+                    if raw is None:
+                        known[demand.native_key]=self.native_at(demand.source_index,
+                            demand.native_frame_index,demand.analysis_roll)
+                        bindings[demand.native_key]=NativeMotionSupply(demand,known[demand.native_key])
+                    raw=known[demand.native_key]
+                    if raw is not None and raw.native_pixel_sha256 is not None:
+                        feature_cost=work_cost(demand.native_key).resources()
+                        live=remaining()
+                        if any(live[k]<n for k,n in feature_cost.items()):
+                            feature_preflight_skipped.append(dict(native_key=demand.native_key,
+                                state='MEASURED_HEAD_FEATURE_CAPACITY_UNAVAILABLE',
+                                required=feature_cost,remaining=live,measured_heads=len(raw.heads)))
+                        else:
+                            if demand.native_key in need_appearance and demand.native_key not in appearances:
+                                appearances[demand.native_key]=self._complete_motion_appearance(
+                                    replace(bindings[demand.native_key],observation=raw))
+                            if (demand.native_key in need_member_features and demand.native_key not in member_features
+                                    and not member_features_optional):
+                                member_features[demand.native_key]=self.member_features_at(
+                                    replace(bindings[demand.native_key],observation=raw))
+                    snapshot('RUNNING')
+                    if schedule_receipt.get('terminal_required_dependencies'):break
+                chunk.update(state='SETTLED',budget_counts_after={r:budget.counts[r] for r in COMPLETION_RESOURCES})
+            if schedule_receipt.get('terminal_required_dependencies'):
+                status='TERMINAL_REQUIRED_INPUT_BLOCKER'
+            elif len(admitted)<len(missing) or preflight_skipped or feature_preflight_skipped:
+                status='BUDGET_PARTIAL'
+            elif any(s.missing_modalities or s.state!='NATIVE_ROWS_AVAILABLE'
+                    for s in current_core_inventory().supplies if s.demand.native_key in core_attempted):
+                status='COMPLETED_WITH_UNAVAILABLE_INPUTS'
             if member_features_optional and not schedule_receipt.get('terminal_required_dependencies'):
                 # Core raw/SFace for every admitted package precede optional
                 # photo hints in THIS same consumed pass. No raw re-inference,

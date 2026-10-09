@@ -99,8 +99,13 @@ def test_raw_fourteen_calls_are_not_misrepresented_as_actor_ready_cost(tmp_path)
         s=sensors(14)
         demands=(NativeMotionDemand(2,80,8,'family','moving_closeup',require_appearance=True),)
         result=s.complete_motion_inventory_once(s.motion_inventory(demands),maximum_new_observations=1)
-        assert not s.raw_calls and not s.appearance_calls
-        assert result.status=='BUDGET_PARTIAL' and result.supplies[0].missing_modalities==('RAW','APPEARANCE')
+        assert s.raw_calls==[(2,80,None)] and not s.appearance_calls
+        assert result.status=='BUDGET_PARTIAL' and result.supplies[0].missing_modalities==('APPEARANCE',)
+        assert result.supplies[0].state=='RAW_AVAILABLE_APPEARANCE_UNOBSERVED'
+        assert s.session.budget.counts['model_calls']==14
+        receipt=json.loads(result.completion_schedule_json)
+        assert receipt['post_raw_feature_preflight_skipped_inputs'][0]['measured_heads']==1
+        assert not receipt['successful_observations_or_connected_actors_certified']
     try:owner.run_work_phase('selected_completion',run)
     finally:lease.close()
 

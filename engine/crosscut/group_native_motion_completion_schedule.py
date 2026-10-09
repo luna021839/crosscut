@@ -66,7 +66,7 @@ def validate_completion_packages(inventory, required_native_keys, packages,criti
 
 def coherent_completion_schedule(inventory, *, required_native_keys, packages,
         maximum_observations, maximum_raw_observations,resource_costs,remaining_resources,
-        critical_required_native_keys=()):
+        critical_required_native_keys=(),excluded_native_keys=()):
     """Admit complete feasible packages, or ONE explicit partial package.
 
     A small remaining budget must not buy isolated frames from every donor and
@@ -77,11 +77,23 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
     still needs its live parent ACK; execution receipts must report cutoffs.
     """
     validate_completion_packages(inventory, required_native_keys, packages,critical_required_native_keys)
+    keys={s.demand.native_key for s in inventory.supplies}
+    if (not isinstance(excluded_native_keys,tuple)
+            or any(not _physical_key(k) for k in excluded_native_keys)
+            or len(set(excluded_native_keys))!=len(excluded_native_keys)
+            or not set(excluded_native_keys)<=keys):
+        raise ValueError('previous chunk inputs differ from the frozen request inventory')
+    excluded=set(excluded_native_keys)
     aliases = {}; physical = {}
     for supply in inventory.supplies:
         physical[supply.demand.native_key] = supply
-        if supply.missing_modalities:
+        if supply.missing_modalities and supply.demand.native_key not in excluded:
             aliases.setdefault(supply.demand.native_key, []).append(supply.demand)
+    # Exclusion means already admitted/attempted or live-preflight skipped,
+    # NEVER measured success. Failed partial observations cannot invite a retry
+    # or make a package's actual completion receipt appear successful.
+    unresolved_excluded=tuple(k for k in excluded_native_keys if physical[k].missing_modalities
+        or physical[k].state!='NATIVE_ROWS_AVAILABLE')
     if (not isinstance(resource_costs,dict) or set(resource_costs)!=set(aliases)
             or any(not isinstance(c,NativeMotionCompletionCost) for c in resource_costs.values())
             or not isinstance(remaining_resources,dict) or set(remaining_resources)!=set(COMPLETION_RESOURCES)
@@ -106,6 +118,7 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
                 k for k in required_native_keys if k in pending),terminal_required_dependencies=terminal,
             scheduled_unique_facts=0,scheduled_new_raw_facts=0,selected_packages=[],unretryable_packages=[],
             initial_live_resource_capacity=remaining_resources,admitted_resource_upper_bounds=spent,
+            excluded_native_keys=excluded_native_keys,unresolved_excluded_native_keys=unresolved_excluded,
             resource_admission_is_not_atomic_parent_reservation=True,
             successful_observations_or_connected_actors_certified=False,quality_approved=False)
 
@@ -167,7 +180,56 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
         terminal_required_dependencies=terminal,
         scheduled_unique_facts=len(scheduled),scheduled_new_raw_facts=raw_count,
         initial_live_resource_capacity=remaining_resources,admitted_resource_upper_bounds=spent,
+        excluded_native_keys=excluded_native_keys,unresolved_excluded_native_keys=unresolved_excluded,
         resource_admission_is_not_atomic_parent_reservation=True,
         selected_packages=selected,unretryable_packages=blocked,
         successful_observations_or_connected_actors_certified=False,quality_approved=False)
     return tuple(scheduled), receipt
+
+
+def balanced_completion_schedule(inventory, *, maximum_observations, maximum_raw_observations,
+        resource_costs, remaining_resources, excluded_native_keys=(), lane_counts=None):
+    """One finite time/source-balanced chunk, not a renewed work allocation."""
+    # Reuse validation and the physical resource contract without using package
+    # ordering. The caller retains lane counts across chunks in this pass.
+    _,receipt=coherent_completion_schedule(inventory,required_native_keys=(),packages=(),
+        maximum_observations=maximum_observations,maximum_raw_observations=maximum_raw_observations,
+        resource_costs=resource_costs,remaining_resources=remaining_resources,
+        excluded_native_keys=excluded_native_keys)
+    counts={} if lane_counts is None else lane_counts
+    if (not isinstance(counts,dict) or any(not isinstance(k,tuple) or len(k)!=2
+            or any(not isinstance(v,str) or not v for v in k)
+            or type(n) is not int or n<0 for k,n in counts.items())):
+        raise ValueError('completion time bands need retained source/opportunity counts')
+    excluded=set(excluded_native_keys);pending={};physical={}
+    for supply in inventory.supplies:
+        key=supply.demand.native_key;physical[key]=supply
+        if supply.missing_modalities and key not in excluded:
+            pending.setdefault(key,[]).append(supply.demand)
+    limit=min(maximum_observations,len(pending));scheduled=[];raw_count=0
+    capacity=dict(remaining_resources)
+    first=min(s.demand.output_tick for s in inventory.supplies)
+    end=max(s.demand.output_tick for s in inventory.supplies)+1
+    bits=max(1,(limit-1).bit_length())
+    bands=sorted(range(limit),key=lambda n:int(format(n,'0'+str(bits)+'b')[::-1],2))
+    for band in bands:
+        eligible={key:rows for key,rows in pending.items()
+            if (physical[key].observation is not None or raw_count<maximum_raw_observations)
+            and all(getattr(resource_costs[key],r)<=capacity[r] for r in COMPLETION_RESOURCES)}
+        if not eligible:break
+        target=first+(band+.5)*(end-first)/max(1,limit)
+        def priority(d):
+            return (counts.get((d.source_family,d.opportunity),0),abs(d.output_tick-target),
+                d.source_family,d.opportunity,d.source_index,d.native_frame_index,
+                -1000. if d.analysis_roll is None else d.analysis_roll)
+        key,demand=min(((key,min(rows,key=priority)) for key,rows in eligible.items()),
+            key=lambda row:priority(row[1]))
+        aliases=pending.pop(key);scheduled.append(demand)
+        raw_count+=physical[key].observation is None
+        for resource in COMPLETION_RESOURCES:capacity[resource]-=getattr(resource_costs[key],resource)
+        for lane in {(d.source_family,d.opportunity) for d in aliases}:
+            counts[lane]=counts.get(lane,0)+1
+    receipt.update(policy='source_opportunity_resource_feasible_time_band_balanced_v3',
+        scheduled_unique_facts=len(scheduled),scheduled_new_raw_facts=raw_count,
+        admitted_resource_upper_bounds={r:remaining_resources[r]-capacity[r] for r in COMPLETION_RESOURCES})
+    return tuple(scheduled),receipt
