@@ -172,3 +172,30 @@ def test_steady_control_preserves_single_and_two_tick_native_spans_exactly():
 def test_steady_control_does_not_relax_capacity_or_fabricate_native_scene_ownership(cameras,scenes):
     with pytest.raises(ValueError):
         steady_native_camera_sequence(cameras,native_scene_ids=scenes)
+
+
+def test_steady_slow_path_retains_broad_movement_without_framewise_hunting():
+    ticks=np.linspace(0.,1.,49)
+    cameras=[[1.6,.5,.5+.06*np.sin(np.pi*t)+(.012*(-1)**i if 0<i<48 else 0.),0.]
+        for i,t in enumerate(ticks)]
+    result=steady_native_camera_sequence(cameras,native_scene_ids=[(0,1)]*49,retain_slow_path=True)
+    assert result is not None
+    assert result[0]==cameras[0] and result[-1]==cameras[-1]
+    before=np.asarray(cameras)[:,2];after=np.asarray(result)[:,2]
+    assert after.max()>.55
+    assert np.abs(np.diff(after)).max()<np.abs(np.diff(before)).max()/4
+    assert all(covered_roll_focal_camera(c) for c in result)
+
+
+def test_steady_slow_path_never_filters_across_native_camera_cuts():
+    cameras=[[1.6,.45,.5,0.],[1.6,.48,.5,0.],[1.6,.46,.5,0.],
+        [1.6,.55,.5,0.],[1.6,.58,.5,0.],[1.6,.56,.5,0.]]
+    result=steady_native_camera_sequence(cameras,native_scene_ids=[(0,1)]*3+[(0,2)]*3,
+        retain_slow_path=True)
+    assert result is not None
+    for i in (0,2,3,5):assert result[i]==cameras[i]
+
+
+def test_steady_path_policy_is_not_an_implicit_truthy_quality_flag():
+    with pytest.raises(ValueError,match='explicit boolean'):
+        steady_native_camera_sequence([[1.5,.5,.5,0.]],native_scene_ids=[(0,1)],retain_slow_path=1)

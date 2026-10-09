@@ -378,19 +378,23 @@ def cover_native_camera_sequence(cameras):
     return result.tolist() if track.covers_aspect_ratio(AspectRatio.LANDSCAPE) else None
 
 
-def steady_native_camera_sequence(cameras, *, native_scene_ids):
+def steady_native_camera_sequence(cameras, *, native_scene_ids, retain_slow_path=False):
     """Remove framewise control hunting WITHOUT changing incident cameras.
 
     Interpolate camera controls, not observed anatomy. The caller must bind
     scene IDs to the actual selected native raster schedule. Each native-scene
     span retains both endpoint cameras exactly, including its zoom and roll.
     A source/native-camera cut therefore never becomes a smoothing bridge.
+    retain_slow_path preserves low-frequency movement from the input controls;
+    otherwise the path is a minimum-jerk incident-to-incident interpolation.
 
     This is review geometry, not optical stabilization or automatic quality
     approval. Short spans with materially different endpoint crops can still
     move quickly; that needs a different incident/shot choice, not a relaxed
     canvas or a promise that smoothing alone makes an expert edit.
     """
+    if type(retain_slow_path) is not bool:
+        raise ValueError('steady camera path policy must be an explicit boolean')
     values=np.asarray(cameras,float)
     if (values.ndim!=2 or values.shape[1]!=4 or not 1<=len(values)<=1024
             or not np.isfinite(values).all() or len(native_scene_ids)!=len(values)):
@@ -406,12 +410,36 @@ def steady_native_camera_sequence(cameras, *, native_scene_ids):
         anchors.update((first,end-1))
         if end-first>=3:
             a,b=values[first],values[end-1]
+            filtered=None
+            if retain_slow_path:
+                # A finite, scene-local second-derivative penalty removes
+                # framewise hunting while retaining broad observed movement.
+                # Endpoints are fixed variables, not heavily weighted guesses.
+                count=end-first
+                basis=np.eye(count)
+                curvature=basis[:-2]-2.*basis[1:-1]+basis[2:]
+                matrix=basis+64.*np.einsum('ki,kj->ij',curvature,curvature,optimize=False)
+                controls=values[first:end].copy()
+                controls[:,0]=np.log(controls[:,0])
+                interior=np.arange(1,count-1);fixed=np.array((0,count-1))
+                rhs=controls[interior]-np.einsum('ij,jk->ik',matrix[np.ix_(interior,fixed)],
+                    controls[fixed],optimize=False)
+                filtered=controls.copy()
+                filtered[interior]=np.linalg.solve(matrix[np.ix_(interior,interior)],rhs)
+                filtered[:,0]=np.exp(filtered[:,0])
+                if not np.isfinite(filtered).all():return None
             for tick in range(first+1,end-1):
-                u=(tick-first)/(end-first-1)
-                # Minimum-jerk endpoint control; no per-frame detector jitter.
-                alpha=u*u*u*(10.+u*(-15.+6.*u))
-                camera=(1.-alpha)*a+alpha*b
-                camera[0]=math.exp((1.-alpha)*math.log(a[0])+alpha*math.log(b[0]))
+                if filtered is not None:
+                    camera=filtered[tick-first]
+                    if (not 1<=camera[0]<=2.4 or abs(camera[3])>6
+                            or np.any(np.abs(camera[1:3]-.5)>.25)):
+                        return None
+                else:
+                    u=(tick-first)/(end-first-1)
+                    # Minimum-jerk endpoint control; no per-frame detector jitter.
+                    alpha=u*u*u*(10.+u*(-15.+6.*u))
+                    camera=(1.-alpha)*a+alpha*b
+                    camera[0]=math.exp((1.-alpha)*math.log(a[0])+alpha*math.log(b[0]))
                 covered=cover_interpolated_native_camera(camera)
                 if covered is None:return None
                 result[tick]=covered
