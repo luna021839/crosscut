@@ -82,6 +82,34 @@ enum OutputAspectRatio: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+struct GroupOriginalReferenceInput: Codable, Equatable {
+    let file: String
+    let sha256: String
+
+    init(file: URL, sha256: String) throws {
+        guard file.isFileURL, !file.path.isEmpty,
+              sha256.count == 64,
+              sha256.allSatisfy({ "0123456789abcdef".contains($0) }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.file = file.standardizedFileURL.path
+        self.sha256 = sha256
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let file = try container.decode(String.self, forKey: .file)
+        let sha256 = try container.decode(String.self, forKey: .sha256)
+        guard file.hasPrefix("/"), sha256.count == 64,
+              sha256.allSatisfy({ "0123456789abcdef".contains($0) }) else {
+            throw DecodingError.dataCorruptedError(forKey: .sha256, in: container,
+                debugDescription: "Complete original needs an absolute file and lowercase SHA-256")
+        }
+        self.file = file
+        self.sha256 = sha256
+    }
+}
+
 struct EditRequest: Codable, Equatable {
     static let automaticMemberSourceCount = 10
     static let minimumAutomaticMemberSourceCount = 4
@@ -99,6 +127,7 @@ struct EditRequest: Codable, Equatable {
     let sourceCacheDirectory: String
     let catalogCacheDirectory: String?
     let acquireOnly: Bool
+    let groupExternalOriginalReference: GroupOriginalReferenceInput?
 
     init(
         song: String,
@@ -113,8 +142,11 @@ struct EditRequest: Codable, Equatable {
         desiredSourceCount: Int = 10,
         sourceCacheDirectory: URL? = nil,
         catalogCacheDirectory: URL? = nil,
-        acquireOnly: Bool = false
+        acquireOnly: Bool = false,
+        groupExternalOriginalReference: GroupOriginalReferenceInput? = nil
     ) {
+        precondition(groupExternalOriginalReference == nil || (editMode == .group && !acquireOnly),
+            "Complete originals are only valid for GROUP renders")
         self.song = song
         self.targetMember = editMode == .member ? targetMember.rawValue : nil
         self.editMode = editMode.rawValue
@@ -141,6 +173,7 @@ struct EditRequest: Codable, Equatable {
             .appendingPathComponent("CrossCut Sources", isDirectory: true)).path
         self.catalogCacheDirectory = catalogCacheDirectory?.path
         self.acquireOnly = acquireOnly
+        self.groupExternalOriginalReference = groupExternalOriginalReference
     }
 
     enum CodingKeys: String, CodingKey {
@@ -157,6 +190,7 @@ struct EditRequest: Codable, Equatable {
         case sourceCacheDirectory = "source_cache_directory"
         case catalogCacheDirectory = "catalog_cache_directory"
         case acquireOnly = "acquire_only"
+        case groupExternalOriginalReference = "group_external_original_reference"
     }
 
     init(from decoder: Decoder) throws {
@@ -188,6 +222,12 @@ struct EditRequest: Codable, Equatable {
             forKey: .catalogCacheDirectory
         )
         acquireOnly = try container.decode(Bool.self, forKey: .acquireOnly)
+        groupExternalOriginalReference = try container.decodeIfPresent(
+            GroupOriginalReferenceInput.self, forKey: .groupExternalOriginalReference)
+        if groupExternalOriginalReference != nil && (editMode != "group" || acquireOnly) {
+            throw DecodingError.dataCorruptedError(forKey: .groupExternalOriginalReference,
+                in: container, debugDescription: "Complete originals require a GROUP render")
+        }
     }
 }
 

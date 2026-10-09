@@ -27988,6 +27988,9 @@ def analyze(
     # One public lifetime boundary also covers acquisition-only returns and
     # exceptions in the long non-optional analysis body. MEMBER behaviour is
     # unchanged; only the normal review-first GROUP controller installs work.
+    from .group_original_reference_file import resolve_request_original_reference
+    group_external_original_reference = resolve_request_original_reference(
+        request, group_external_original_reference)
     with ExitStack() as request_work_resources:
         return _analyze_impl(request, reporter,
             allow_failed_comparison_render=allow_failed_comparison_render,

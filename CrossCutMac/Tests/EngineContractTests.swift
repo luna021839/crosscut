@@ -1313,6 +1313,49 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(anchors[0]["bbox_xyxy"] as? [Double], [0.1, 0.2, 0.7, 0.9])
     }
 
+    func testCompleteGroupOriginalReferenceRoundTripsWithoutClearingInputAuthority() throws {
+        let original = try GroupOriginalReferenceInput(file: URL(fileURLWithPath: "/tmp/complete-original.json"),
+            sha256: String(repeating: "a", count: 64))
+        let request = EditRequest(song: "XOXZ", targetMember: .gaeul, editMode: .group,
+            aspectRatio: .landscape, sources: [], outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceMode: .automatic, groupExternalOriginalReference: original)
+        let data = try JSONEncoder().encode(request)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let input = try XCTUnwrap(object["group_external_original_reference"] as? [String: String])
+        XCTAssertEqual(input["file"], "/tmp/complete-original.json")
+        XCTAssertEqual(input["sha256"], String(repeating: "a", count: 64))
+        XCTAssertEqual(try JSONDecoder().decode(EditRequest.self, from: data), request)
+        var changed = object
+        changed["edit_mode"] = "member"
+        XCTAssertThrowsError(try JSONDecoder().decode(EditRequest.self,
+            from: JSONSerialization.data(withJSONObject: changed)))
+        changed = object
+        changed["acquire_only"] = true
+        XCTAssertThrowsError(try JSONDecoder().decode(EditRequest.self,
+            from: JSONSerialization.data(withJSONObject: changed)))
+    }
+
+    func testCompleteGroupOriginalReferenceRejectsMalformedPathsAndContentHashes() throws {
+        for hash in ["", String(repeating: "a", count: 63), String(repeating: "A", count: 64),
+                     String(repeating: "z", count: 64)] {
+            XCTAssertThrowsError(try GroupOriginalReferenceInput(
+                file: URL(fileURLWithPath: "/tmp/original.json"), sha256: hash))
+        }
+        let malformed = ["file": "relative.json", "sha256": String(repeating: "a", count: 64)]
+        XCTAssertThrowsError(try JSONDecoder().decode(GroupOriginalReferenceInput.self,
+            from: JSONSerialization.data(withJSONObject: malformed)))
+    }
+
+    func testLegacyRequestDoesNotImplicitlyActivateExternalOriginalPreservation() throws {
+        let request = EditRequest(song: "XOXZ", targetMember: .gaeul, editMode: .group,
+            aspectRatio: .landscape, sources: [], outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceMode: .automatic)
+        let data = try JSONEncoder().encode(request)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["group_external_original_reference"])
+        XCTAssertNil(try JSONDecoder().decode(EditRequest.self, from: data).groupExternalOriginalReference)
+    }
+
     func testAutomaticRequestAllowsZeroManualSourcesAndUsesTenByDefault() throws {
         let request = EditRequest(
             song: "ATTITUDE",

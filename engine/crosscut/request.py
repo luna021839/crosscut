@@ -88,6 +88,33 @@ class MemberAnchorRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupOriginalReferenceInput:
+    """A local complete original, pinned independently of its inner claims."""
+
+    file: Path
+    sha256: str
+
+    def __post_init__(self) -> None:
+        path = Path(self.file).expanduser()
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("group external original must be an existing non-symlink file")
+        if (not isinstance(self.sha256, str) or len(self.sha256) != 64
+                or any(character not in "0123456789abcdef" for character in self.sha256)):
+            raise ValueError("group external original sha256 must be 64 lowercase hex characters")
+        object.__setattr__(self, "file", path.resolve())
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "GroupOriginalReferenceInput":
+        if (not isinstance(payload, dict) or set(payload) != {"file", "sha256"}
+                or not isinstance(payload["file"], str) or not payload["file"].strip()):
+            raise ValueError("group_external_original_reference needs exactly file and sha256")
+        return cls(Path(payload["file"]), payload["sha256"])
+
+    def as_dict(self) -> dict[str, str]:
+        return {"file": str(self.file), "sha256": self.sha256}
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisRequest:
     song: str
     edit_mode: EditMode
@@ -111,6 +138,7 @@ class AnalysisRequest:
     # available for explicit integration experiments, never as an automatic
     # replacement for established face/pose/look refinement in ordinary jobs.
     experimental_pixel_camera_review: bool = False
+    group_external_original_reference: GroupOriginalReferenceInput | None = None
     source_mode: SourceMode = SourceMode.LOCAL
     desired_source_count: int = DEFAULT_AUTOMATIC_SOURCE_COUNT
     source_cache_directory: Path | None = None
@@ -160,6 +188,11 @@ class AnalysisRequest:
             raise ValueError("review_first_enabled must be a boolean")
         if not isinstance(self.experimental_pixel_camera_review, bool):
             raise ValueError("experimental_pixel_camera_review must be a boolean")
+        if self.group_external_original_reference is not None:
+            if (not isinstance(self.group_external_original_reference, GroupOriginalReferenceInput)
+                    or self.edit_mode is not EditMode.GROUP or not self.review_first_enabled
+                    or self.acquire_only):
+                raise ValueError("group_external_original_reference requires a review-first GROUP render")
         if self.experimental_pixel_camera_review and (
             not self.review_first_enabled or self.edit_mode is not EditMode.GROUP
             or self.source_mode is not SourceMode.AUTOMATIC or self.acquire_only
@@ -575,6 +608,11 @@ class AnalysisRequest:
         raw_pixel_review = payload.get("experimental_pixel_camera_review", False)
         if not isinstance(raw_pixel_review, bool):
             raise ValueError("experimental_pixel_camera_review must be a boolean")
+        original_reference = None
+        if "group_external_original_reference" in payload:
+            original_reference = GroupOriginalReferenceInput.from_dict(
+                payload["group_external_original_reference"]
+            )
 
         raw_output = payload.get("output_directory") or "outputs"
         if not isinstance(raw_output, str):
@@ -894,6 +932,7 @@ class AnalysisRequest:
             member_pose_dissolve_enabled=raw_member_pose_dissolve_enabled,
             review_first_enabled=raw_review_first_enabled,
             experimental_pixel_camera_review=raw_pixel_review,
+            group_external_original_reference=original_reference,
             source_mode=source_mode,
             desired_source_count=desired_source_count,
             source_cache_directory=source_cache_directory,
@@ -972,6 +1011,8 @@ class AnalysisRequest:
             payload["catalog_cache_directory"] = str(
                 self.catalog_cache_directory
             )
+        if self.group_external_original_reference is not None:
+            payload["group_external_original_reference"] = self.group_external_original_reference.as_dict()
         if self.visual_feature_derived_cache_directory is not None:
             payload["visual_feature_derived_cache_directory"] = str(
                 self.visual_feature_derived_cache_directory
