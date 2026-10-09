@@ -61,3 +61,32 @@ def test_diagonal_crop_respects_existing_renderer_radial_pan_cap():
     for c in (a, b):
         assert np.linalg.norm([c.x - .5, c.y - .5]) <= .25 + 1e-12
     assert loss > 0
+
+
+def test_background_identity_match_does_not_override_salient_subjects():
+    a = heads([[.5, .4, .15, .95], [.55, .45, .07, .94]])
+    b = heads([[.5, .4, .15, .95], [.55, .45, .07, .94]])
+    av, bv = np.zeros((3, 128)), np.zeros((3, 128))
+    av[0, :2] = [1., 0.]; bv[0, :2] = [.5, np.sqrt(.75)]
+    av[1, 2] = bv[1, 2] = 1.
+    match = match_heads(a, b, av, bv)
+    assert match.left_head_index == match.right_head_index == 0
+
+
+def test_soft_occluder_salience_preserves_the_persistent_focal_head():
+    a = heads([[.6, .5, .22, .95], [.42, .38, .15, .94]])
+    b = heads([[.44, .38, .15, .94]])
+    av, bv = np.zeros((3, 128)), np.zeros((3, 128))
+    av[0, 0] = 1; av[1, 1] = 1; bv[0, 1] = 1
+    match = match_heads(a, b, av, bv, left_salience=[.3, .7, 0])
+    assert match.left_head_index == 1 and match.right_head_index == 0
+
+
+def test_background_ensemble_fit_does_not_hide_a_foreground_subject_change():
+    a = heads([[.5, .4, .16, .95], [.3, .5, .055, .94], [.7, .5, .055, .94]])
+    b = heads([[.5, .4, .12, .95], [.3, .5, .06, .94], [.7, .5, .06, .94]])
+    av, bv = np.zeros((3, 128)), np.zeros((3, 128))
+    av[0, 0] = bv[0, 0] = 1.
+    matched = match_heads(a, b, av, bv)
+    assert matched.role == 'focal'
+    assert matched.left_head_index == matched.right_head_index == 0

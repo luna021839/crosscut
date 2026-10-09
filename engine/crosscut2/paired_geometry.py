@@ -29,6 +29,8 @@ class Match:
     cost: float
     geometry_loss: float
     appearance_cosine: float | None = None
+    left_head_index: int | None = None
+    right_head_index: int | None = None
 
 
 def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35)):
@@ -76,7 +78,7 @@ def _cosine(a, b):
     return float(np.clip(a @ b / (na * nb), -1., 1.))
 
 
-def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35)):
+def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, right_salience=None):
     """Compare focal and anonymous formation hypotheses, including occluders.
 
     Head rows are (center_x, center_y, height, confidence). Missing appearance
@@ -88,6 +90,16 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35)):
     b = right[(right[:, 2] > .019) & (right[:, 3] >= .75)]
     if not len(a) or not len(b):
         return Match(Camera(), Camera(), 'unobserved', 4., 4.)
+    def salience(rows, values):
+        if values is None:
+            values = rows[:3, 2] / rows[:, 2].max()
+        values = np.asarray(values, float)
+        if values.shape != (3,) or not np.isfinite(values).all() or np.any(values < 0):
+            raise ValueError('finite per-head salience required')
+        return values / max(.001, values.max())
+    sa, sb = salience(left, left_salience), salience(right, right_salience)
+    formation_intent = sum(len(rows) >= 3 and np.max(rows[:, 2]) < 1.6 * np.sort(rows[:, 2])[-2]
+        for rows in (a, b))
     hypotheses = []
     for i, fa in enumerate(left[:3]):
         if fa[2] < .055 or fa[3] < .75:
@@ -99,9 +111,11 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35)):
             similarity = _cosine(lv[i], rv[j])
             # SFace cosine is evidence of appearance, NOT a calibrated label.
             identity = 1.4 if similarity is None else 5. * max(0., .65 - similarity)
-            salience = .45 * (math.log(a[:, 2].max() / fa[2]) + math.log(b[:, 2].max() / fb[2]))
-            hypotheses.append(Match(ca, cb, 'focal', geometry + identity + salience,
-                geometry, similarity))
+            # A background head match is not the same as keeping the viewer's
+            # subject. Temporal salience can discount a brief foreground occluder.
+            focal_priority = -2. * (math.log(max(.02, sa[i])) + math.log(max(.02, sb[j])))
+            hypotheses.append(Match(ca, cb, 'focal', geometry + identity + focal_priority + formation_intent,
+                geometry, similarity, i, j))
     if min(len(a), len(b)) >= 3:
         # Keep the central foreground scale band, rather than tiny back heads.
         a = a[a[:, 2] >= .55 * np.median(a[:, 2])]
@@ -120,6 +134,10 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35)):
                 distances = np.linalg.norm((centered_a[:, None] - centered_b[None]) * [1., 9 / 16], axis=2)
                 layout = float((distances.min(0).mean() + distances.min(1).mean()) / 2) / .08
             loss = geometry + layout + .45 * abs(len(a) - len(b))
-            hypotheses.append(Match(ca, cb, 'formation', loss + .35, loss))
+            # Matching background layout is not a formation match when one
+            # side has a dominant foreground subject. Keep this a finite
+            # editorial cost rather than banning an otherwise useful source.
+            role_change = 3. * (2 - formation_intent)
+            hypotheses.append(Match(ca, cb, 'formation', loss + .35 + role_change, loss))
     return min(hypotheses, key=lambda r: (r.cost, r.role)) if hypotheses else Match(
         Camera(), Camera(), 'distant', 3., 3.)

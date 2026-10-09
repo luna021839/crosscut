@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from crosscut2.stage_mix import camera_track, semi_markov
+from crosscut2.stage_mix import camera_track, native_event_cost, resume_plan, semi_markov
 from crosscut2.paired_geometry import Camera
 
 
@@ -38,3 +38,46 @@ def test_one_source_has_full_coverage_without_artificial_editorial_cuts():
         unary=np.ones((1, 20)), seam_cost=np.zeros((21, 1, 1)))
     assert runs == ((0, 20, 0),)
     assert score == pytest.approx(20.)
+
+
+def test_resume_uses_exact_saved_plan_and_refuses_changed_sources(tmp_path):
+    from crosscut.render import AspectRatio, RenderPlan, RenderSegment
+    from crosscut2.grid_perception import file_identity
+    source = tmp_path / 'source.mp4'
+    source.touch()
+    output = tmp_path / 'output.mp4'
+    original = RenderPlan((source,), (RenderSegment(0, 0., 6., 0.),), 0,
+        AspectRatio.LANDSCAPE, output)
+    record = dict(render_plan=original.to_json(), sparse_perception=[
+        dict(source=0, source_file_identity=file_identity(source))])
+    resumed = resume_plan(record, original, output)
+    assert resumed.to_json() == original.to_json()
+    with pytest.raises(ValueError, match='differs'):
+        resume_plan(record, original, tmp_path / 'another.mp4')
+    source.write_bytes(b'changed')
+    with pytest.raises(OSError, match='source changed'):
+        resume_plan(record, original, output)
+
+
+def test_native_cut_cost_distinguishes_a_boundary_from_a_tiny_retained_fragment():
+    assert native_event_cost(20, 40, np.array([20, 40]), 10) == 0.
+    assert native_event_cost(20, 40, np.array([30]), 10) == pytest.approx(.25)
+    assert native_event_cost(20, 40, np.array([21]), 10) > 3.
+    assert native_event_cost(20, 40, np.array([39]), 10) > 3.
+
+
+def test_dp_can_avoid_native_cut_bursts_without_reducing_editorial_cuts():
+    nodes = np.arange(0, 61, 10)
+    unary = np.array([[5, 5, 0, 0, 5, 5], [0, 0, 0, 0, 0, 0], [5, 5, .1, .1, 5, 5]])
+    seams = np.full((7, 3, 3), .1)
+    original, _ = semi_markov(nodes, fps=10, unary=unary, seam_cost=seams)
+    adjusted, _ = semi_markov(nodes, fps=10, unary=unary, seam_cost=seams,
+        source_events=(np.array([21]), np.array([]), np.array([])))
+    assert [s for _, _, s in original] == [1, 0, 1]
+    assert [s for _, _, s in adjusted] == [1, 2, 1]
+
+
+def test_native_cut_clock_mismatch_is_not_silently_ignored():
+    with pytest.raises(ValueError, match='output-clock'):
+        semi_markov(np.arange(0, 61, 10), fps=10, unary=np.zeros((2, 6)),
+            seam_cost=np.zeros((7, 2, 2)), source_events=(np.array([61]), np.array([])))
