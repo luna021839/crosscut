@@ -91,7 +91,69 @@ def freeze_whole_sensing_recipes(cached, *, fps, maximum_recipes=64):
     return tuple(selected)
 
 
-def freeze_whole_native_demands(cached, *, maximum_demands=16384, sensing_recipes=None):
+def _whole_native_sample_indices(recipe):
+    """The original required flank/bridge addresses, before any work cap."""
+    grid=recipe.native_frame_indices;n=len(grid)
+    if n<2:raise ValueError('whole native hold needs its exact physical sample grid')
+    selected={0,min(1,n-1),min(2,n-1),n//2,max(0,n-3),max(0,n-2),n-1}
+    anchor=0
+    for i,native in enumerate(grid):
+        if native-grid[anchor]>12:
+            selected.add(max(anchor+1,i-1));anchor=max(anchor+1,i-1)
+    return tuple(sorted(selected))
+
+
+def freeze_whole_completion_recipe_groups(cached,sensing,*,maximum_packages=64):
+    """Freeze a CUT plus its same-source continuous-HOLD comparator together.
+
+    Both tangents and both actor bridges belong to one immutable dependency
+    union. The third recipe is a physically available continuous alternative
+    over the SAME span, not an old montage cell. Normal whole-song production
+    has no frozen outside original; entry/exit dependencies of these recipes
+    are nevertheless included. Scores/NN outcomes never choose these groups.
+    """
+    from collections import defaultdict
+    from .group_performer_family_owner import digest
+    if type(maximum_packages) is not int or not 1<=maximum_packages<=64:
+        raise ValueError('joint whole sensing packages need their frozen finite bound')
+    members={r.run.identity:r for r in cached.recipes if not r.run.protected_reference}
+    if (not isinstance(sensing,tuple) or len(sensing)>512
+            or any(r.run.identity not in members for r in sensing)
+            or len({r.run.identity for r in sensing})!=len(sensing)):
+        raise ValueError('joint whole sensing differs from its physical base recipes')
+    spans={(r.run.first_output_frame,r.run.end_output_frame,r.run.request_source_index):r
+        for r in members.values()}
+    by_first=defaultdict(list)
+    for r in sensing:by_first[r.run.first_output_frame].append(r)
+    families=defaultdict(list)
+    for left in sorted(sensing,key=lambda r:r.run.identity):
+        a,b=left.run.first_output_frame,left.run.end_output_frame
+        for right in sorted(by_first.get(b,()),key=lambda r:r.run.identity):
+            if left.run.request_source_index==right.run.request_source_index:continue
+            end=right.run.end_output_frame
+            hold=spans.get((a,end,left.run.request_source_index))
+            if hold is None:hold=spans.get((a,end,right.run.request_source_index))
+            if hold is None:continue  # Not a made-up continuous camera span.
+            rows=(left,right,hold)
+            identity='joint-cut-hold-'+digest(tuple(r.run.identity for r in rows))[:32]
+            families[left.run.request_source_index,right.run.request_source_index].append((identity,rows))
+    # Spread over time inside each source pair, then round-robin source pairs.
+    # This is a pre-observation work frontier, never a cut/actor quality rank.
+    ordered={}
+    for pair,rows in sorted(families.items()):
+        rows=sorted(rows,key=lambda row:(row[1][0].run.end_output_frame,row[0]))
+        width=max(1,(len(rows)-1).bit_length())
+        ordered[pair]=[r for _,r in sorted(enumerate(rows),key=lambda p:(
+            int(format(p[0],f'0{width}b')[::-1],2),p[0]))]
+    selected=[]
+    for i in range(max(map(len,ordered.values()),default=0)):
+        for pair,rows in sorted(ordered.items()):
+            if i<len(rows) and len(selected)<maximum_packages:selected.append(rows[i])
+    return tuple(selected)
+
+
+def freeze_whole_native_demands(cached, *, maximum_demands=16384, sensing_recipes=None,
+        completion_recipe_groups=()):
     """Outcome-independent finite source/time census, BEFORE the first NN.
 
     Each recipe requests both three-frame flanks, its midpoint and exact
@@ -107,18 +169,12 @@ def freeze_whole_native_demands(cached, *, maximum_demands=16384, sensing_recipe
     if type(maximum_demands) is not int or not 1<=maximum_demands<=16384:
         raise ValueError('whole native input census needs a finite declared bound')
     physical={}
-    for recipe in cached.recipes if sensing_recipes is None else sensing_recipes:
-        run=recipe.run;n=len(recipe.native_frame_indices)
-        selected_indices={0,min(1,n-1),min(2,n-1),n//2,max(0,n-3),max(0,n-2),n-1}
-        anchor=0
-        for i,native in enumerate(recipe.native_frame_indices):
-            if native-recipe.native_frame_indices[anchor]>12:
-                # Admit an actual frozen output sample, never a made-up raw
-                # interpolation. An inherently wider sampler remains UNKNOWN.
-                selected_indices.add(max(anchor+1,i-1))
-                anchor=max(anchor+1,i-1)
-        indices=sorted(selected_indices)
-        for i in indices:
+    recipes={r.run.identity:r for r in (cached.recipes if sensing_recipes is None else sensing_recipes)}
+    for _,group in completion_recipe_groups:
+        recipes.update((r.run.identity,r) for r in group)
+    for recipe in recipes.values():
+        run=recipe.run
+        for i in _whole_native_sample_indices(recipe):
             key=(run.request_source_index,recipe.native_frame_indices[i],None)
             demand=NativeMotionDemand(key[0],key[1],run.first_output_frame+i,
                 f'whole-source-{key[0]}','moving_closeup',require_appearance=True)
@@ -140,18 +196,68 @@ def freeze_whole_native_demands(cached, *, maximum_demands=16384, sensing_recipe
         selection_scores_used=False)
 
 
-def freeze_whole_completion_packages(sensing, demands):
-    """Keep each predeclared actor hold coherent in one consumed NN pass."""
+def freeze_whole_completion_packages(sensing, demands,*,recipe_groups=None):
+    """Bind complete original requirements without shrinking them after a cap."""
     from .group_native_motion_completion_schedule import NativeMotionCompletionPackage
     available={d.native_key for d in demands}
     packages=[]
-    for recipe in sensing:
-        source=recipe.run.request_source_index
-        keys=tuple(dict.fromkeys((source,n,None) for n in recipe.native_frame_indices
-            if (source,n,None) in available))
-        if keys:packages.append(NativeMotionCompletionPackage(recipe.run.identity,keys))
+    groups=tuple((r.run.identity,(r,)) for r in sensing) if recipe_groups is None else recipe_groups
+    for identity,group in groups:
+        keys=[]
+        if len(group)>=2:
+            # Both sides of the actual cut lead the execution order. Remaining
+            # entry/exit flanks and actor/support bridges follow in THIS union.
+            left,right=group[:2]
+            keys.extend((left.run.request_source_index,n,None) for n in left.native_frame_indices[-3:])
+            keys.extend((right.run.request_source_index,n,None) for n in right.native_frame_indices[:3])
+        for recipe in group:
+            keys.extend((recipe.run.request_source_index,recipe.native_frame_indices[i],None)
+                for i in _whole_native_sample_indices(recipe))
+        keys=tuple(dict.fromkeys(keys))
+        packages.append(NativeMotionCompletionPackage(identity,keys,
+            tuple(k for k in keys if k not in available)))
     if len(packages)>64:raise ValueError('whole native holds exceeded their frozen completion-package bound')
     return tuple(packages)
+
+
+def union_cached_whole_demands(cached, demands, *, indexed_addresses, maximum_demands=16384,
+        check=None):
+    """Reuse all bound cache addresses that an exact candidate sampler uses.
+
+    This census occurs BEFORE the one NN completion. Address presence is not
+    successful actor evidence: conflicts/failed captures remain in the normal
+    importer, and unobserved candidate durations remain physically eligible.
+    """
+    from collections import defaultdict
+    from .group_source_changing_owner import NativeMotionDemand
+    if (type(maximum_demands) is not int or not 1<=maximum_demands<=16384
+            or not isinstance(demands,tuple) or len(demands)>maximum_demands
+            or any(not isinstance(d,NativeMotionDemand) for d in demands)
+            or not isinstance(indexed_addresses,(set,frozenset)) or len(indexed_addresses)>16384
+            or any(not isinstance(k,tuple) or len(k)!=2 or any(type(n) is not int or n<0 for n in k)
+                for k in indexed_addresses) or check is not None and not callable(check)):
+        raise ValueError('whole cache reuse needs a finite bound physical address census')
+    existing={d.native_key for d in demands};extra={}
+    for i,recipe in enumerate(cached.recipes):
+        if check is not None and i%128==0:check()
+        source=recipe.run.request_source_index
+        for offset,native in enumerate(recipe.native_frame_indices):
+            key=(source,native,None)
+            if (source,native) not in indexed_addresses or key in existing:continue
+            tick=recipe.run.first_output_frame+offset
+            extra[key]=min(tick,extra.get(key,tick))
+    by_source=defaultdict(list)
+    for key,tick in sorted(extra.items()):by_source[key[0]].append((key,tick))
+    selected=[]
+    for i in range(max(map(len,by_source.values()),default=0)):
+        for source,rows in sorted(by_source.items()):
+            if i<len(rows) and len(demands)+len(selected)<maximum_demands:
+                key,tick=rows[i]
+                selected.append(NativeMotionDemand(key[0],key[1],tick,
+                    f'whole-source-{source}','other',require_appearance=True))
+    return (*demands,*selected),dict(indexed_native_addresses=len(indexed_addresses),
+        added_cached_native_addresses=len(selected),unrequested_cached_native_addresses=len(extra)-len(selected),
+        cache_address_presence_is_observation_validation=False)
 
 
 def _opportunities(original, domain, rhythm, section_plan, protected):
@@ -241,8 +347,9 @@ def produce_whole_programme(*,controller,request,eligible_indices,offsets,timewa
     cached=build_cached_programme_inventory(original=old.render_plan,domain=domain,inventories=cached_inventories,
         opportunities=opportunities,protected_spans=protected,maximum_seconds=min(30.,remaining()))
     sensing=freeze_whole_sensing_recipes(cached,fps=old.render_plan.fps)
-    demands,census=freeze_whole_native_demands(cached,sensing_recipes=sensing)
-    packages=freeze_whole_completion_packages(sensing,demands)
+    recipe_groups=freeze_whole_completion_recipe_groups(cached,sensing)
+    demands,census=freeze_whole_native_demands(cached,sensing_recipes=sensing,
+        completion_recipe_groups=recipe_groups)
     census['sensed_recipe_count']=len(sensing)
     census['all_base_run_count']=len(cached.recipes)
     census['sensing_frontier_basis']='source-balanced-shared-seam-chains-before-observation'
@@ -268,11 +375,37 @@ def produce_whole_programme(*,controller,request,eligible_indices,offsets,timewa
             from .group_whole_native_cache import WholeNativeFactCache
             fact_cache=WholeNativeFactCache(root=request.source_cache_directory,sensors=sensors)
             cache_hit=fact_cache.bind_existing()
+        import json
+        from .group_performer_family_owner import digest
+        indexed=set()
+        if sensors.recorded_motion_index is not None:
+            for source,binding in sensors.recorded_motion_bindings.items():
+                aliases=[binding]
+                extra=getattr(sensors,'recorded_motion_additional_bindings',{}).get(source)
+                if extra is not None:aliases.append(extra)
+                for alias in aliases:
+                    indexed.update((source,n) for n in sensors.recorded_motion_index.native_addresses_for_binding(
+                        source=source,clock=digest(domain.clocks_by_request[source].to_dict()),
+                        identity=json.loads(alias)['recorded_file_identity']))
+        demands,cache_census=union_cached_whole_demands(cached,demands,indexed_addresses=indexed,check=port._check)
+        census.update(cache_census)
+        census['declared_native_inputs']=len(demands)
+        census['physical_union_count']+=cache_census['added_cached_native_addresses']
+        # Cache-address reuse may expand the input census, but neither a cap
+        # nor cached outcomes can shrink a package's ORIGINAL dependencies.
+        packages=freeze_whole_completion_packages(sensing,demands,recipe_groups=recipe_groups)
+        census['joint_cut_with_continuous_hold_packages']=len(packages)
+        census['original_package_requirements_before_input_cap']=sum(len(p.native_keys) for p in packages)
+        census['unrequested_original_package_requirements']=sum(len(p.unrequested_native_keys) for p in packages)
         inventory=sensors.motion_inventory(demands)
         # Freeze this allocation before NN outcomes. Leave time for the SAME
         # request's whole graph, selection and real metadata pixel reads.
         # These reserves are not a calibrated latency or quality guarantee.
-        downstream_reserve=min(45.,remaining()*.55)
+        # Previous real warm production used about 85s AFTER native work.
+        # Keep that producer/consumer reserve inside the ORIGINAL lease;
+        # otherwise a cold completion predictably spends its render/metadata
+        # runway and loses a valid plan late. This is not an app latency SLA.
+        downstream_reserve=min(85.,remaining()*.80)
         downstream_identity_reserve=min(4096,math.ceil(
             port.remaining_capacity(('identity_reads',))['identity_reads']*.55))
         def preserve_downstream():
@@ -292,9 +425,13 @@ def produce_whole_programme(*,controller,request,eligible_indices,offsets,timewa
         if fact_cache is not None:cache_saved=fact_cache.preserve_completed(completed)
         stage_seconds['cache_and_native_completion']=monotonic()-stage_started;stage_started=monotonic()
         views=NativeMotionViews(sensors,completed)
+        complete_keys={s.demand.native_key for s in completed.supplies if s.state=='NATIVE_ROWS_AVAILABLE'}
+        complete_groups={p.identity for p in packages if set(p.native_keys)<=complete_keys}
+        joint_projection=tuple(dict.fromkeys(r.run.identity for identity,group in recipe_groups
+            if identity in complete_groups for r in group))
         bank=freeze_whole_native_inventory(context=context,domain=domain,cached=cached,views=views,
             protected_spans=protected,work_port=port,maximum_seconds=min(30.,remaining()),
-            sensed_recipe_ids=frozenset(r.run.identity for r in sensing))
+            completed_joint_recipe_ids=joint_projection)
         stage_seconds['actor_paths_and_prefit_cameras']=monotonic()-stage_started;stage_started=monotonic()
         control,selected=select_whole_native_programme(inventory=bank,work_port=port,
             maximum_seconds=min(20.,remaining()))
@@ -309,20 +446,23 @@ def produce_whole_programme(*,controller,request,eligible_indices,offsets,timewa
         stage_seconds['full_native_metadata_and_publication']=monotonic()-stage_started
         by_id={r.run.identity:r for r in bank.recipes}
         selected_recipes=tuple(by_id[r.identity] for r in selected.runs)
-        complete_keys={s.demand.native_key for s in completed.supplies if s.state=='NATIVE_ROWS_AVAILABLE'}
         sensing_ids={r.run.identity for r in sensing}
         from collections import Counter
         return dict(state='COMPLETE_WHOLE_PROGRAMME_SELECTED_FOR_REVIEW',census=census,
             inventory=bank.evidence(),control=control.to_dict(),selected=selected.to_dict(),
             actor_action_changed_plan=tuple(r.identity for r in control.runs)!=tuple(r.identity for r in selected.runs),
             native_completion_status=completed.status,native_work=budget.to_dict(),
+            native_input_schedule=json.loads(completed.completion_schedule_json),
             declared_downstream_reserve_seconds=downstream_reserve,
             declared_downstream_identity_reads=downstream_identity_reserve,
             native_supply_states=dict(Counter(s.state for s in completed.supplies)),
-            fully_observed_declared_recipes=sum(set(p.native_keys)<=complete_keys for p in packages),
+            fully_observed_required_input_packages=sum(set(p.native_keys)<=complete_keys for p in packages),
+            native_package_inputs_certify_full_actor_or_camera_support=False,
             selected_actor_runs=sum(r.actor_path is not None for r in selected_recipes),
             selected_authored_camera_runs=sum(r.side is not None and r.side.camera is not None for r in selected_recipes),
             selected_sensed_recipe_runs=sum(r.base.run.identity in sensing_ids for r in selected_recipes),
+            selected_projected_recipe_runs=sum(r.base.run.identity in bank.projected_base_recipe_ids
+                for r in selected_recipes),
             selected_native_observed_output_frames=sum((r.run.request_source_index,n,None) in complete_keys
                 for r in selected_recipes for n in r.base.native_frame_indices),
             selected_output_frames=sum(r.run.end_output_frame-r.run.first_output_frame for r in selected_recipes),

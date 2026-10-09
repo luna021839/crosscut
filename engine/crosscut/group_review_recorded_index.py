@@ -246,6 +246,17 @@ class RecordedGroupReviewIndex:
         """
         return _key(source, native, clock, identity) in self.rows
 
+    def native_addresses_for_binding(self, *, source, clock, identity):
+        """Exact address census, including adverse variants; not row admission.
+
+        A different shot duration may reuse a physical native observation.
+        Every returned address still needs normal live model/source validation.
+        No raw result, feature vector or editorial score is selected here.
+        """
+        source,_,clock,identity=_key(source,0,clock,identity)
+        return tuple(sorted(n for s,n,c,f in self.rows
+            if (s,c,f)==(source,clock,identity)))
+
     def lookup(self, *, source, native, clock, identity,analysis_variant_sha256=None):
         key = _key(source, native, clock, identity)
         record = self.rows.get(key)

@@ -38,12 +38,20 @@ def _physical_key(key):
 class NativeMotionCompletionPackage:
     identity: str
     native_keys: tuple
+    # The ORIGINAL dependency union, frozen before any input cap, is never
+    # intersected down to the inputs that happened to enter the inventory.
+    # Omitted addresses remain explicit unrequested obligations, not success.
+    unrequested_native_keys: tuple = ()
 
     def __post_init__(self):
         if (not isinstance(self.identity, str) or not 1 <= len(self.identity) <= 128
                 or not isinstance(self.native_keys, tuple) or not 1 <= len(self.native_keys) <= 1024
                 or any(not _physical_key(k) for k in self.native_keys)
-                or len(set(self.native_keys)) != len(self.native_keys)):
+                or len(set(self.native_keys)) != len(self.native_keys)
+                or not isinstance(self.unrequested_native_keys,tuple)
+                or any(not _physical_key(k) for k in self.unrequested_native_keys)
+                or len(set(self.unrequested_native_keys))!=len(self.unrequested_native_keys)
+                or not set(self.unrequested_native_keys)<=set(self.native_keys)):
             raise ValueError('native completion package needs a finite unique physical inventory')
 
 
@@ -54,7 +62,8 @@ def validate_completion_packages(inventory, required_native_keys, packages,criti
             or len(set(required_native_keys)) != len(required_native_keys)
             or not set(required_native_keys) <= keys
             or not isinstance(packages, tuple) or len(packages) > 64
-            or any(not isinstance(p, NativeMotionCompletionPackage) or not set(p.native_keys) <= keys
+            or any(not isinstance(p, NativeMotionCompletionPackage)
+                or set(p.native_keys)-keys!=set(p.unrequested_native_keys)
                 for p in packages)
             or len({p.identity for p in packages}) != len(packages)):
         raise ValueError('native completion obligations differ from the frozen request inventory')
@@ -66,7 +75,7 @@ def validate_completion_packages(inventory, required_native_keys, packages,criti
 
 def coherent_completion_schedule(inventory, *, required_native_keys, packages,
         maximum_observations, maximum_raw_observations,resource_costs,remaining_resources,
-        critical_required_native_keys=(),excluded_native_keys=()):
+        critical_required_native_keys=(),excluded_native_keys=(),active_package_identity=None):
     """Admit complete feasible packages, or ONE explicit partial package.
 
     A small remaining budget must not buy isolated frames from every donor and
@@ -77,6 +86,9 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
     still needs its live parent ACK; execution receipts must report cutoffs.
     """
     validate_completion_packages(inventory, required_native_keys, packages,critical_required_native_keys)
+    if (active_package_identity is not None and (not isinstance(active_package_identity,str)
+            or active_package_identity not in {p.identity for p in packages})):
+        raise ValueError('active completion package differs from the frozen request inventory')
     keys={s.demand.native_key for s in inventory.supplies}
     if (not isinstance(excluded_native_keys,tuple)
             or any(not _physical_key(k) for k in excluded_native_keys)
@@ -146,33 +158,45 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
     while remaining and not required_left and len(scheduled) < maximum_observations:
         available = []
         for package in remaining:
-            failed = tuple(k for k in package.native_keys if physical[k].state in
+            failed = tuple(k for k in package.native_keys if k in physical and physical[k].state in
                 ('CONFLICTING_NATIVE_RECORDS', 'CONFLICTING_FEATURE_RECORDS', 'EXACT_DECODE_UNAVAILABLE'))
             if failed:
                 blocked.append(dict(identity=package.identity,unretryable_native_keys=failed))
                 continue
             missing = tuple(k for k in package.native_keys if k in pending)
             raw = sum(physical[k].observation is None for k in missing)
-            families = {physical[k].demand.source_family for k in package.native_keys}
+            families = {physical[k].demand.source_family for k in package.native_keys if k in physical}
             available.append((package, missing, raw, families,totals(missing)))
         remaining = [row[0] for row in available]
         if not available:
             break
-        fits = [row for row in available if len(row[1]) <= maximum_observations-len(scheduled)
+        fits = [row for row in available if not row[0].unrequested_native_keys
+            and len(row[1]) <= maximum_observations-len(scheduled)
             and row[2] <= maximum_raw_observations-raw_count and fits_resources(row[4])]
-        pool = fits or available
+        # A memory-bounded chunk is not a renewed programme choice. Once an
+        # immutable dependency union is active, finish its requestable inputs
+        # before a newly cheaper/feasible donor can steal the next chunk.
+        active=next((row for row in available if row[0].identity==active_package_identity
+            and row[1]),None)
+        pool = (active,) if active is not None else fits or available
         package, missing, raw, families,cost = min(pool, key=lambda row: (
-            len(row[1]), sum(family_counts.get(f, 0) for f in row[3]), row[0].identity))
+            bool(row[0].unrequested_native_keys),len(row[1]),
+            sum(family_counts.get(f, 0) for f in row[3]), row[0].identity))
         remaining.remove(package)
         for key in missing:
             admit(key)
-        left = tuple(k for k in package.native_keys if k in pending)
+        requestable_left=tuple(k for k in package.native_keys if k in pending)
+        left=tuple(k for k in package.native_keys if k in pending or k in package.unrequested_native_keys)
         selected.append(dict(identity=package.identity,admitted_missing_native_keys=tuple(
             k for k in missing if k not in pending),unadmitted_missing_native_keys=left,
+            original_required_native_keys=package.native_keys,
+            original_required_native_input_count=len(package.native_keys),
+            unrequested_native_keys=package.unrequested_native_keys,
+            unadmitted_requestable_native_keys=requestable_left,
             entire_missing_package_resource_upper_bounds=cost,
             admitted_missing_input_resource_upper_bounds=totals(tuple(k for k in missing if k not in pending)),
             entire_missing_input_package_admitted=not left))
-        if left:
+        if requestable_left:
             break  # No scattered partial work on a second programme.
     receipt = dict(policy='shared_context_then_resource_feasible_declared_programmes_v2',
         basis='cache_modalities_resource_vectors_and_frozen_families_not_pose_face_or_camera_cost',
@@ -183,6 +207,9 @@ def coherent_completion_schedule(inventory, *, required_native_keys, packages,
         excluded_native_keys=excluded_native_keys,unresolved_excluded_native_keys=unresolved_excluded,
         resource_admission_is_not_atomic_parent_reservation=True,
         selected_packages=selected,unretryable_packages=blocked,
+        active_package_identity=next((r['identity'] for r in selected
+            if r['unadmitted_requestable_native_keys']),None),
+        continuing_package_is_not_reselected_after_chunk_settlement=True,
         successful_observations_or_connected_actors_certified=False,quality_approved=False)
     return tuple(scheduled), receipt
 

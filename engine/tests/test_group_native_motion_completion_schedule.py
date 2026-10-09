@@ -161,3 +161,58 @@ def test_excluded_keys_cannot_silently_change_the_frozen_inventory():
         coherent_completion_schedule(frozen,required_native_keys=(),packages=(),maximum_observations=1,
             maximum_raw_observations=1,resource_costs={},remaining_resources=dict.fromkeys(COMPLETION_RESOURCES,0),
             excluded_native_keys=((99,99,None),))
+
+
+def test_active_union_finishes_across_chunks_even_if_another_package_newly_fits():
+    # Resource vectors only. No fake detector or identity observations.
+    frozen=inventory(18);keys=tuple(s.demand.native_key for s in frozen.supplies)
+    packages=(NativeMotionCompletionPackage('A',keys[:12]),
+        NativeMotionCompletionPackage('B',(*keys[:7],*keys[12:])))
+    args=dict(required_native_keys=(),packages=packages,maximum_observations=18,
+        maximum_raw_observations=18,remaining_resources=dict(new_decodes=100,model_calls=100,
+            pose_evidence_bytes=7))
+    first,receipt=coherent_completion_schedule(frozen,
+        resource_costs={k:NativeMotionCompletionCost(0,0,1) for k in keys},**args)
+    assert tuple(d.native_key for d in first)==keys[:7]
+    assert receipt['active_package_identity']=='A'
+    # A measured resource vector can change after raw settlement. B now fits
+    # this memory chunk in full; A must remain active, WITHOUT reserving its
+    # entire remaining union in memory or renewing the global input budget.
+    excluded=tuple(d.native_key for d in first)
+    costs={k:NativeMotionCompletionCost(0,0,2 if k in keys[7:12] else 1)
+        for k in keys if k not in excluded}
+    ordinary,changed=coherent_completion_schedule(frozen,resource_costs=costs,
+        excluded_native_keys=excluded,**args)
+    assert changed['selected_packages'][0]['identity']=='B' and len(ordinary)==6
+    continuing,settled=coherent_completion_schedule(frozen,resource_costs=costs,
+        excluded_native_keys=excluded,active_package_identity='A',**args)
+    assert tuple(d.native_key for d in continuing)==keys[7:10]
+    assert settled['active_package_identity']=='A'
+    assert settled['admitted_resource_upper_bounds']['pose_evidence_bytes']==6
+    assert not settled['selected_packages'][0]['entire_missing_input_package_admitted']
+
+
+def test_precap_unrequested_dependencies_remain_in_the_original_denominator():
+    frozen=inventory(1);key=frozen.supplies[0].demand.native_key;omitted=(1,99,None)
+    package=NativeMotionCompletionPackage('original-pair',(key,omitted),(omitted,))
+    scheduled,receipt=coherent_completion_schedule(frozen,required_native_keys=(),packages=(package,),
+        maximum_observations=1,maximum_raw_observations=1,
+        resource_costs={key:NativeMotionCompletionCost(0,0,0)},
+        remaining_resources=dict.fromkeys(COMPLETION_RESOURCES,0))
+    assert tuple(d.native_key for d in scheduled)==(key,)
+    row=receipt['selected_packages'][0]
+    assert row['original_required_native_input_count']==2
+    assert row['unrequested_native_keys']==row['unadmitted_missing_native_keys']==(omitted,)
+    assert not row['entire_missing_input_package_admitted']
+    assert not receipt['successful_observations_or_connected_actors_certified']
+
+
+def test_unrequested_exemption_must_exactly_match_the_original_inventory_difference():
+    frozen=inventory(1);key=frozen.supplies[0].demand.native_key;omitted=(1,99,None)
+    for package in (NativeMotionCompletionPackage('undeclared',(key,omitted)),
+            NativeMotionCompletionPackage('silently-waived',(key,),(key,))):
+        with pytest.raises(ValueError,match='frozen request inventory'):
+            coherent_completion_schedule(frozen,required_native_keys=(),packages=(package,),
+                maximum_observations=1,maximum_raw_observations=1,
+                resource_costs={key:NativeMotionCompletionCost(0,0,0)},
+                remaining_resources=dict.fromkeys(COMPLETION_RESOURCES,0))

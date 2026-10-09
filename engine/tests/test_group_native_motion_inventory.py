@@ -368,6 +368,31 @@ def test_interrupted_package_preserves_attempted_and_unattempted_inputs(tmp_path
     finally:lease.close()
 
 
+def test_completed_admitted_subset_cannot_certify_a_precap_original_package(tmp_path):
+    # Synthetic sensor accounting only; not a face/body quality certificate.
+    owner,lease=controller(tmp_path)
+    def run():
+        s=sensors();d=NativeMotionDemand(2,80,8,'family','moving_closeup')
+        omitted=(3,999,None)
+        package=NativeMotionCompletionPackage('original-pair',(d.native_key,omitted),(omitted,))
+        done=s.complete_motion_inventory_once(s.motion_inventory((d,)),maximum_new_observations=1,
+            completion_packages=(package,))
+        receipt=json.loads(done.completion_schedule_json)
+        row=receipt['selected_packages'][0]
+        assert row['original_required_native_input_count']==2
+        assert row['completed_original_required_native_input_count']==1
+        assert row['unrequested_native_keys']==[list(omitted)]
+        assert not row['entire_original_required_inputs_completed']
+        assert not row['entire_missing_input_package_admitted']
+        execution=receipt['package_execution'][0]
+        assert execution['entire_admitted_core_inputs_completed']
+        assert not execution['entire_original_required_inputs_completed']
+        assert done.attempted_native_keys==(d.native_key,) and len(s.raw_calls)==1
+        assert lease.ports['selected_completion'].charged['native_completion_passes']==1
+    try:owner.run_work_phase('selected_completion',run)
+    finally:lease.close()
+
+
 def test_invalid_completion_obligation_is_rejected_before_consuming_the_single_pass(tmp_path):
     owner,lease=controller(tmp_path)
     def run():

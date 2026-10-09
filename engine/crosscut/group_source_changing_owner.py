@@ -1236,7 +1236,7 @@ class NativeFamilySensors:
         raw_limit=(maximum_new_observations if maximum_new_raw_observations is None
             else maximum_new_raw_observations)
         admitted=[];execution_order=[];raw_admitted=0;lane_counts={};chunks=[]
-        package_receipts={}
+        package_receipts={};active_package_identity=None
         start_counts={r:budget.counts[r] for r in COMPLETION_RESOURCES}
         schedule_receipt=dict(policy='settled_chunks_in_one_frozen_native_completion_pass_v3',
             initial_live_resource_capacity=available,
@@ -1244,6 +1244,9 @@ class NativeFamilySensors:
             resource_bound_scope='maximum_chunk_upper_bound_not_retained_usage',
             required_native_keys=required_native_keys,terminal_required_dependencies=(),
             selected_packages=[],unretryable_packages=[],chunks=chunks,
+            frozen_package_requirements=[dict(identity=p.identity,
+                original_required_native_input_count=len(p.native_keys),
+                unrequested_native_keys=p.unrequested_native_keys) for p in completion_packages],
             resource_admission_is_not_atomic_parent_reservation=True,
             successful_observations_or_connected_actors_certified=False,quality_approved=False)
         attempted=[];core_attempted=[];optional_attempted=[];optional_unavailable=[];preflight_skipped=[]
@@ -1269,7 +1272,7 @@ class NativeFamilySensors:
                 for s in core_current.supplies))
 
         def admit_chunk():
-            nonlocal raw_admitted
+            nonlocal raw_admitted,active_package_identity
             budget.check()
             chunk_inventory=current_core_inventory()
             pending={s.demand.native_key for s in chunk_inventory.supplies
@@ -1283,7 +1286,9 @@ class NativeFamilySensors:
             if required_native_keys or completion_packages:
                 scheduled,receipt=coherent_completion_schedule(chunk_inventory,
                     required_native_keys=required_native_keys,packages=completion_packages,
-                    critical_required_native_keys=critical_required_native_keys,**args)
+                    critical_required_native_keys=critical_required_native_keys,
+                    active_package_identity=active_package_identity,**args)
+                active_package_identity=receipt.get('active_package_identity')
             else:
                 scheduled,receipt=balanced_completion_schedule(chunk_inventory,lane_counts=lane_counts,**args)
             # One physical input enters at most once in this pass, whether its
@@ -1323,11 +1328,19 @@ class NativeFamilySensors:
             for package in completion_packages:
                 row=package_receipts.get(package.identity)
                 if row is not None:
-                    left=tuple(k for k in package.native_keys if k in missing and k not in admitted)
+                    left=tuple(k for k in package.native_keys if k in package.unrequested_native_keys
+                        or k in missing and k not in admitted)
                     row.update(unadmitted_missing_native_keys=left,entire_missing_input_package_admitted=not left,
+                        original_required_native_keys=package.native_keys,
+                        original_required_native_input_count=len(package.native_keys),
+                        unrequested_native_keys=package.unrequested_native_keys,
+                        entire_original_required_inputs_completed=all(k in completed for k in package.native_keys),
+                        completed_original_required_native_input_count=sum(k in completed for k in package.native_keys),
                         unresolved_admitted_native_keys=tuple(k for k in package.native_keys
                             if k in admitted and k not in completed))
             schedule_receipt.update(admitted_core_native_keys=list(admitted),
+                active_package_identity=active_package_identity,
+                continuing_package_is_not_reselected_after_chunk_settlement=True,
                 execution_schedule_core_native_keys=list(execution_order),
                 unadmitted_required_native_keys=[k for k in required_native_keys if k in missing and k not in admitted],
                 unadmitted_core_native_keys=[k for k in missing if k not in admitted],
@@ -1348,7 +1361,11 @@ class NativeFamilySensors:
                 package_execution=[dict(identity=p['identity'],
                     attempted_admitted_native_keys=[k for k in p['admitted_missing_native_keys'] if k in core_attempted],
                     unattempted_admitted_native_keys=[k for k in p['admitted_missing_native_keys'] if k not in core_attempted],
-                    entire_admitted_core_inputs_completed=all(k in completed for k in p['admitted_missing_native_keys']))
+                    entire_admitted_core_inputs_completed=all(k in completed for k in p['admitted_missing_native_keys']),
+                    entire_original_required_inputs_completed=p['entire_original_required_inputs_completed'],
+                    original_required_native_input_count=p['original_required_native_input_count'],
+                    completed_original_required_native_input_count=p['completed_original_required_native_input_count'],
+                    unrequested_native_keys=p['unrequested_native_keys'])
                     for p in schedule_receipt.get('selected_packages',[])])
             schedule_json=__import__('json').dumps(schedule_receipt,sort_keys=True,allow_nan=False)
             value=NativeMotionInventory(tuple(NativeMotionSupply(d,known[d.native_key],appearances.get(d.native_key),

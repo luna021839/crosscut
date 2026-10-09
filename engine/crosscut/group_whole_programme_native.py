@@ -50,12 +50,22 @@ class WholeNativeInventory:
     observed_recipe_count: int
     actor_seed_truncations: int
     equivalent_recipe_aliases: int = 0
+    projected_base_recipe_ids: frozenset[str] = frozenset()
+    projection_budget_exhausted: bool = False
+    attempted_base_recipe_ids: tuple = ()
+    completed_base_recipe_ids: tuple = ()
 
     def evidence(self):
         return dict(contract='whole_native_actor_camera_inventory_v1',
             candidate_count=len(self.recipes), observed_recipe_count=self.observed_recipe_count,
             actor_seed_truncations=self.actor_seed_truncations,
             equivalent_recipe_aliases=self.equivalent_recipe_aliases,
+            projected_base_recipe_count=len(self.projected_base_recipe_ids),
+            attempted_base_recipe_projection_count=len(self.attempted_base_recipe_ids),
+            completed_base_recipe_projection_count=len(self.completed_base_recipe_ids),
+            actor_projection_basis='exact-native-availability-source-time-duration-strata',
+            projection_budget_exhausted=self.projection_budget_exhausted,
+            projection_budget_exclusion_is_actor_unsuitability=False,
             connected_actor_paths=sum(r.actor_receipt is not None for r in self.recipes),
             authored_cameras=sum(r.side is not None and r.side.camera is not None for r in self.recipes),
             camera_fit_before_selection=True, model_calls_in_graph_construction=0,
@@ -134,9 +144,75 @@ def _camera_key(face, target_height):
     return EditorialTransformKeyframe(0.,zoom,x,y,0.)
 
 
+def freeze_native_projection_frontier(cached, *, available_native_addresses, fps,
+        maximum_recipes=64, check=None):
+    """Bound projection work, not native reuse by a detector-shot identity.
+
+    Existing exact observations may support many different run durations.
+    Availability, source/time/duration strata and immutable IDs determine this
+    frontier before any actor/action/camera scoring. No new NN addresses are
+    requested here. Every other physical base run stays in the whole graph.
+    """
+    from collections import Counter
+    if (not isinstance(available_native_addresses,(set,frozenset))
+            or any(not isinstance(k,tuple) or len(k)!=2 or any(type(n) is not int or n<0 for n in k)
+                for k in available_native_addresses)
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0
+            or type(maximum_recipes) is not int or not 1<=maximum_recipes<=512
+            or check is not None and not callable(check)):
+        raise ValueError('native projection needs finite exact address/clock/work bounds')
+    groups={};targets=(.75,1.15,1.6,2.2,2.8,3.4,4.8)
+    for i,recipe in enumerate(cached.recipes):
+        if check is not None and i%128==0:check()
+        run=recipe.run;grid=recipe.native_frame_indices
+        if run.protected_reference or not 2<=len(grid)<=512:continue
+        known=tuple((run.request_source_index,n) in available_native_addresses for n in grid)
+        if not any(known):continue
+        a,b=sum(known[:3]),sum(known[-3:])
+        duration=(run.end_output_frame-run.first_output_frame)/fps
+        stratum=(run.request_source_index,run.native_camera_run_index,
+            min(range(len(targets)),key=lambda n:(abs(duration-targets[n]),n)),
+            int(run.first_output_frame/(fps*8.)))
+        rank=(-min(a,b),-(a+b),-sum(known)/len(known),run.identity)
+        if stratum not in groups or rank<groups[stratum][0]:groups[stratum]=(rank,run.identity)
+    counts=Counter();selected=[]
+    while groups and len(selected)<maximum_recipes:
+        if check is not None:check()
+        stratum=min(groups,key=lambda s:(counts['source',s[0]],counts['time',s[3]],
+            counts['duration',s[2]],counts['unit',s[0],s[1]],groups[s][0],s))
+        _,identity=groups.pop(stratum);selected.append(identity)
+        for key in (('source',stratum[0]),('time',stratum[3]),('duration',stratum[2]),
+                ('unit',stratum[0],stratum[1])):counts[key]+=1
+    return tuple(selected)
+
+
+class _NativeProjectionTimeExhausted(TimeoutError):
+    """Local extra-recipe budget, not a renewed/exhausted parent lease."""
+
+
+def ordered_whole_actor_seeds(candidates,*,maximum_actor_seeds):
+    """Declared GROUP focal hypotheses, never detector-ID or match-score rank.
+
+    A visible foreground head is a focal-duty hypothesis, NOT a named member
+    verdict. Keep up to six IVE occurrences by default, including the third
+    performer. Exact geometry/content breaks ties equivariantly when detector
+    IDs are permuted; no donor pose/action score spends this work allowance.
+    """
+    if (not isinstance(candidates,tuple) or len(candidates)>24
+            or type(maximum_actor_seeds) is not int or not 1<=maximum_actor_seeds<=8):
+        raise ValueError('whole GROUP seeds need their predeclared finite occurrence policy')
+    def key(view):
+        d=view['descriptor']
+        return (-(d.face_height*d.face_width),d.head_center,
+            digest(dict(vector=view['vector'],height=d.face_height,width=d.face_width,
+                center=d.head_center,shape=d.pose_shape)))
+    return tuple(sorted(candidates,key=key)[:maximum_actor_seeds])
+
+
 def freeze_whole_native_inventory(*, context, domain, cached, views,
-        protected_spans=(), maximum_actor_seeds=2, target_face_heights=(.24,.30),
-        maximum_runs=32768, maximum_seconds=45., work_port=None, sensed_recipe_ids=None):
+        protected_spans=(), maximum_actor_seeds=6, target_face_heights=(.24,.30),
+        maximum_runs=32768, maximum_seconds=45., work_port=None, sensed_recipe_ids=None,
+        completed_joint_recipe_ids=()):
     """Consume one completed native census, retaining missing/adverse facts.
 
     Raw/body/vector bindings are checked by NativeMotionViews. A legacy
@@ -146,7 +222,7 @@ def freeze_whole_native_inventory(*, context, domain, cached, views,
     """
     if (not isinstance(cached,CachedProgrammeInventory) or not isinstance(views,NativeMotionViews)
             or views.domain!=domain or context.incumbent.render_plan.sources!=domain.request_sources
-            or type(maximum_actor_seeds) is not int or not 1<=maximum_actor_seeds<=4
+            or type(maximum_actor_seeds) is not int or not 1<=maximum_actor_seeds<=8
             or not isinstance(target_face_heights,tuple) or len(target_face_heights)>3
             or any(type(h) not in (int,float) or not math.isfinite(h) or not .1<=h<=.45 for h in target_face_heights)
             or type(maximum_runs) is not int or not len(cached.recipes)<=maximum_runs<=32768
@@ -160,12 +236,37 @@ def freeze_whole_native_inventory(*, context, domain, cached, views,
     available={(s.demand.source_index,s.demand.native_frame_index) for s in views.supplies.values()
         if s.demand.analysis_roll is None and s.observation is not None and s.appearance is not None
         and s.state=='NATIVE_ROWS_AVAILABLE'}
+    # Sensing recipes allocate NN work only. They are not an eligibility
+    # gate for different-duration recipes sharing actual native observations.
+    projection_order=(freeze_native_projection_frontier(cached,available_native_addresses=available,
+        fps=original.fps,check=views.sensors.session.budget.check) if sensed_recipe_ids is None
+        else tuple(sorted(sensed_recipe_ids)))
+    if (not isinstance(completed_joint_recipe_ids,tuple) or len(completed_joint_recipe_ids)>192
+            or len(set(completed_joint_recipe_ids))!=len(completed_joint_recipe_ids)
+            or not set(completed_joint_recipe_ids)<={r.run.identity for r in cached.recipes}
+            or completed_joint_recipe_ids and sensed_recipe_ids is not None):
+        raise ValueError('completed joint projection differs from the frozen physical graph')
+    if completed_joint_recipe_ids:
+        from .group_whole_programme_owner import _whole_native_sample_indices
+        by_base={r.run.identity:r for r in cached.recipes}
+        for identity in completed_joint_recipe_ids:
+            recipe=by_base[identity]
+            required={(recipe.run.request_source_index,recipe.native_frame_indices[i])
+                for i in _whole_native_sample_indices(recipe)}
+            if not required<=available:
+                raise ValueError('completed joint projection has unobserved original native requirements')
+    # Work just spent on BOTH cut flanks and its hold comparator must reach
+    # their actor/camera projections together. Availability is not an actor
+    # quality score and never erases another physical run from the graph.
+    projection_order=tuple(dict.fromkeys((*completed_joint_recipe_ids,*projection_order)))[:64]
+    projection_ids=frozenset(projection_order)
+    projection_cutoff=False;attempted_projections=[];completed_projections=[]
     if work_port is not None:work_port.charge('states',len(cached.recipes))
 
     def check():
         views.sensors.session.budget.check()
         if work_port is not None:work_port._check()
-        if monotonic()>=deadline:raise TimeoutError('whole native graph original deadline reached; no retry')
+        if monotonic()>=deadline:raise _NativeProjectionTimeExhausted('native extra-recipe budget reached')
 
     def append(recipe, *, base=False):
         nonlocal aliases
@@ -183,82 +284,101 @@ def freeze_whole_native_inventory(*, context, domain, cached, views,
         by_identity[recipe.run.identity]=recipe
         result.append(recipe)
 
-    with views.native_signature_scope():
-        for base in cached.recipes:
+    def enrich(base):
+        nonlocal observed,truncated,aliases
+        check()
+        run=base.run;a,b=run.first_output_frame,run.end_output_frame
+        ticks=tuple(range(a,b))
+        known=[t for t,n in zip(ticks,base.native_frame_indices,strict=True)
+            if (run.request_source_index,n) in available]
+        if not known or b-a>512:
+            return
+        try:plan=_recipe_projection_plan(original,domain,base,base.side)
+        except RecipeProjectionUnavailable:return  # The physical base remains UNKNOWN, not vetoed.
+        queries=_queries(context,domain,program,plan,a,b)
+        if any(queries[t].sample_at(t)[2]!=n for t,n in zip(ticks,base.native_frame_indices,strict=True)):
+            raise ValueError('native graph changed a frozen candidate sampler before scoring')
+        # A headless early raster remains a NULL slot, not a permanent veto
+        # on actors actually observed later in this exact native-camera unit.
+        # The first available-occurrence start rule is declared before NN.
+        seeds=()
+        for tick in known:
             check()
+            seeds=views.candidates(queries[tick],tick,association_ready=True)
+            if seeds:break
+        truncated+=len(seeds)>maximum_actor_seeds
+        for seed in ordered_whole_actor_seeds(seeds,maximum_actor_seeds=maximum_actor_seeds):
+            check()
+            path,receipt=views.connected_actor_views(queries,ticks,seed)
+            if receipt.get('state')!='CONNECTED_SOURCE_LOCAL_HYPOTHESIS':
+                continue
+            from .group_review_actor_path import validate_connected_actor_path_receipt
+            validate_connected_actor_path_receipt(path,receipt)
+            observed+=1
+            count=sum(v is not None and not v.get('reacquisition_ambiguous',False) for v in path.values())
+            unknown=1-count/len(ticks)
+            cameras=[(base.side,None)]
+            if base.side is not None and b-a<=160:
+                faces={t:project_observed_review_face(path[t],queries[t],t) for t in (a,b-1)}
+                support=tuple(_support(path[t],queries[t],t) for t in ticks)
+                for height in target_face_heights:
+                    check()
+                    entry,exit=(_camera_key(faces[t],height) for t in (a,b-1))
+                    if entry is None or exit is None:continue
+                    track,measurement=realize_review_contextual_focal_shot(
+                        entry_key=entry,exit_key=exit,support=support,fps=original.fps)
+                    if track is not None:cameras.append((replace(base.side,camera=track),measurement))
+            camera_ids=set()
+            for side,camera in cameras:
+                check()
+                camera_payload=None if side is None or side.camera is None else asdict(side.camera)
+                identity=digest(dict(base=run.identity,actor=receipt['hypothesis_sha256'],camera=camera_payload))
+                if identity in camera_ids:
+                    aliases+=1
+                    continue  # Identical realized camera; no repeated query/reprojection.
+                camera_ids.add(identity)
+                actual_queries=queries
+                actual_path=path
+                camera_cost=0.
+                if camera is not None:
+                    authored=_recipe_projection_plan(original,domain,base,side)
+                    actual_queries=_queries(context,domain,program,authored,a,b)
+                    actual_path=views.reproject_selected_actor_path(actual_queries,path)
+                    camera_cost=.10*max(k.zoom-1 for k in side.camera.keyframes)+(
+                        3.*camera['maximum_camera_vector_step']+camera['maximum_camera_vector_second_difference'])
+                selected_run=replace(run,identity=identity,actor_path_identity=receipt['hypothesis_sha256'],
+                    camera_recipe_identity=digest(camera_payload),
+                    unary_cost=run.unary_cost+camera_cost)
+                append(WholeNativeRecipe(base,selected_run,side,actual_path,receipt,
+                    _flank(actual_path,actual_queries,ticks[:3],views),
+                    _flank(actual_path,actual_queries,ticks[-3:],views),unknown,camera_cost))
+    with views.native_signature_scope():
+        # Construct the COMPLETE physical graph before optional projections.
+        # A local camera/association cutoff must not discard every settled
+        # observation, omit later sources, or reset/retry the request.
+        for base in cached.recipes:
+            views.sensors.session.budget.check()
+            if work_port is not None:work_port._check()
             run=base.run;a,b=run.first_output_frame,run.end_output_frame
-            # The physical recipe stays in the graph even if every sensor is
-            # missing. This also preserves source coverage and hold options.
             append(WholeNativeRecipe(base,run,base.side,None,None,
                 _unknown_flank(a,b,True),_unknown_flank(a,b,False),1.,0.),base=True)
-            if sensed_recipe_ids is not None and run.identity not in sensed_recipe_ids:
-                continue
-            ticks=tuple(range(a,b))
-            known=[t for t,n in zip(ticks,base.native_frame_indices,strict=True)
-                if (run.request_source_index,n) in available]
-            if not known or b-a>512:
-                continue
-            try:plan=_recipe_projection_plan(original,domain,base,base.side)
-            except RecipeProjectionUnavailable:continue  # The base run remains UNKNOWN, not vetoed.
-            queries=_queries(context,domain,program,plan,a,b)
-            if any(queries[t].sample_at(t)[2]!=n for t,n in zip(ticks,base.native_frame_indices,strict=True)):
-                raise ValueError('native graph changed a frozen candidate sampler before scoring')
-            seeds=views.candidates(queries[known[0]],known[0],association_ready=True)
-            # A fixed finite detector occurrence enumeration, NOT cheapest
-            # pose/identity seeds picked after inspecting donor scores.
-            seeds=tuple(sorted(seeds,key=lambda v:v['descriptor'].frame_local_head_id))
-            truncated+=len(seeds)>maximum_actor_seeds
-            for seed in seeds[:maximum_actor_seeds]:
-                check()
-                path,receipt=views.connected_actor_views(queries,ticks,seed)
-                if receipt.get('state')!='CONNECTED_SOURCE_LOCAL_HYPOTHESIS':
-                    continue
-                from .group_review_actor_path import validate_connected_actor_path_receipt
-                validate_connected_actor_path_receipt(path,receipt)
-                observed+=1
-                count=sum(v is not None and not v.get('reacquisition_ambiguous',False) for v in path.values())
-                unknown=1-count/len(ticks)
-                cameras=[(base.side,None)]
-                if base.side is not None and b-a<=160:
-                    faces={t:project_observed_review_face(path[t],queries[t],t) for t in (a,b-1)}
-                    support=tuple(_support(path[t],queries[t],t) for t in ticks)
-                    for height in target_face_heights:
-                        check()
-                        entry,exit=(_camera_key(faces[t],height) for t in (a,b-1))
-                        if entry is None or exit is None:continue
-                        track,measurement=realize_review_contextual_focal_shot(
-                            entry_key=entry,exit_key=exit,support=support,fps=original.fps)
-                        if track is not None:cameras.append((replace(base.side,camera=track),measurement))
-                camera_ids=set()
-                for side,camera in cameras:
-                    check()
-                    camera_payload=None if side is None or side.camera is None else asdict(side.camera)
-                    identity=digest(dict(base=run.identity,actor=receipt['hypothesis_sha256'],camera=camera_payload))
-                    if identity in camera_ids:
-                        aliases+=1
-                        continue  # Identical realized camera; no repeated query/reprojection.
-                    camera_ids.add(identity)
-                    actual_queries=queries
-                    actual_path=path
-                    camera_cost=0.
-                    if camera is not None:
-                        authored=_recipe_projection_plan(original,domain,base,side)
-                        actual_queries=_queries(context,domain,program,authored,a,b)
-                        actual_path=views.reproject_selected_actor_path(actual_queries,path)
-                        camera_cost=.10*max(k.zoom-1 for k in side.camera.keyframes)+(
-                            3.*camera['maximum_camera_vector_step']+camera['maximum_camera_vector_second_difference'])
-                    selected_run=replace(run,identity=identity,actor_path_identity=receipt['hypothesis_sha256'],
-                        camera_recipe_identity=digest(camera_payload),
-                        unary_cost=run.unary_cost+camera_cost)
-                    append(WholeNativeRecipe(base,selected_run,side,actual_path,receipt,
-                        _flank(actual_path,actual_queries,ticks[:3],views),
-                        _flank(actual_path,actual_queries,ticks[-3:],views),unknown,camera_cost))
+        by_base={r.run.identity:r for r in cached.recipes}
+        try:
+            for identity in projection_order:
+                check();attempted_projections.append(identity)
+                enrich(by_base[identity]);completed_projections.append(identity)
+        except _NativeProjectionTimeExhausted:
+            # Complete, verified alternatives already appended are retained;
+            # unfinished ones remain UNKNOWN. Strict parent/storage/source
+            # failures are not caught and still invalidate the entire result.
+            projection_cutoff=True
     return WholeNativeInventory(original,domain,cached.opportunities,tuple(result),
-        protected_spans,observed,truncated,aliases)
+        protected_spans,observed,truncated,aliases,projection_ids,projection_cutoff,
+        tuple(attempted_projections),tuple(completed_projections))
 
 
 def whole_native_edge_cost(inventory, *, actor_action_enabled):
-    """Same common geometry/duration/history, with optional observed action.
+    """Identical uncertainty/geometry/cadence, differing ONLY observed losses.
 
     SFace is an uncalibrated anonymous relation, not a member probability.
     Motion uses the exact selected, owned joints and physical tangents. A
@@ -274,6 +394,13 @@ def whole_native_edge_cost(inventory, *, actor_action_enabled):
         a,b=by_id[left_id],by_id[right_id]
         left,right=a.exit,b.entry
         if min(len(left),len(right))<2:
+            return 1.,1.,1.
+        # A wholly UNKNOWN flank has no face, physical tangent or identity
+        # pair. Avoid rebuilding the same six-joint numeric measurement for
+        # hundreds of thousands of these seams; its upper costs are EXACTLY
+        # the same constants, not a faster substitute for observed evidence.
+        if any(all(r[1] is None and not r[2] and r[4] is None for r in flank)
+                for flank in (left,right)):
             return 1.,1.,1.
         measured=measure_review_focal_incident(left_faces=tuple(r[1] for r in left),
             right_faces=tuple(r[1] for r in right),left_points=tuple(r[2] for r in left),
@@ -291,14 +418,23 @@ def whole_native_edge_cost(inventory, *, actor_action_enabled):
     def edge(history, incoming):
         b=by_id[incoming.identity]
         cost=common(tuple(by_id[r.identity].base.run for r in history),b.base.run)
+        # Both conditions carry the SAME missing-evidence upper cost. Risk is
+        # a unary term on every run, not an extra B-only penalty or a free
+        # opening. All-UNKNOWN controls must therefore have identical plans.
+        cost+=.35*b.hold_uncertainty*(
+            b.run.end_output_frame-b.run.first_output_frame)/inventory.original.fps
         if not history:return cost
         face,action,identity=incident(history[-1].identity,incoming.identity)
         # Common cached geometry is a weak source-composition prior. This
         # extra term describes the actual prefit cameras, for BOTH conditions.
         cost+=face
-        if actor_action_enabled:
-            cost+=2.*action+2.*identity+.35*b.hold_uncertainty*(
-                b.run.end_output_frame-b.run.first_output_frame)/inventory.original.fps
+        # A uses the predeclared upper losses at the same requested seams;
+        # B may replace them ONLY with the bounded observed losses. Missing
+        # joints, an ambiguous identity or absent physical tangents already
+        # have upper loss 1 in incident(), for both A and B. No reward is
+        # obtained by hiding a difficult measurement or deleting a bad joint.
+        cost+=2.*(action if actor_action_enabled else 1.)
+        cost+=2.*(identity if actor_action_enabled else 1.)
         return cost
     return edge
 
