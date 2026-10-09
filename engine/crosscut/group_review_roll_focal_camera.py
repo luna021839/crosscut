@@ -251,3 +251,128 @@ def coupled_rendered_face_height_cameras(faces,cameras,*,maximum_zoom=2.4):
                 roll_degrees=camera[3],aspect_ratio=AspectRatio.LANDSCAPE):return None
         result.append(camera)
     return result
+
+
+def coupled_native_face_height_cameras(a,b,*,rolls,minimum_face_height,maximum_zoom=2.4):
+    """Construct the same displayed-height target from ACTUAL native boxes.
+
+    Unlike decoded feedback, this is available before candidate ranking. Raw
+    observations remain raw: projected coordinates are not relabelled as a
+    final decoded measurement. Both native rotated canvases and the unchanged
+    production limits must fit one shared face-height/attention target.
+    """
+    from .ive import AspectRatio
+    from .render import (EDITORIAL_TRANSFORM_EDGE_MARGIN,EditorialTransformKeyframe,
+        _rotated_crop_is_inside_frame)
+    if (not isinstance(rolls,(tuple,list)) or len(rolls)!=2
+            or any(type(v) not in (int,float) or not math.isfinite(v) or abs(v)>6 for v in rolls)
+            or type(minimum_face_height) not in (int,float) or not math.isfinite(minimum_face_height)
+            or not 0<=minimum_face_height<=1 or type(maximum_zoom) not in (int,float)
+            or not math.isfinite(maximum_zoom) or not 1<=maximum_zoom<=2.4):
+        raise ValueError('native displayed-face matching needs its finite declared height/roll envelope')
+    centers=[];sizes=[]
+    for row,roll in zip((a,b),rolls,strict=True):
+        box=np.asarray(row['face']['box_xywh'],float)
+        if (box.shape!=(4,) or not np.isfinite(box).all() or np.any(box[:2]<0)
+                or np.any(box[2:]<=0) or np.any(box[:2]+box[2:]>1)):
+            raise ValueError('native displayed-face matching needs contained observed boxes')
+        centers.append(box[:2]+box[2:]/2)
+        radians=math.radians(roll)
+        # Axis-aligned support after the renderer's native rotation, not ears
+        # RMS or an invented new detector observation.
+        sizes.append(float((box[3]*abs(math.cos(radians))
+            +box[2]*16/9*abs(math.sin(radians)))*9/16))
+    low=max(minimum_face_height*9/16,1.12*max(sizes));high=maximum_zoom*min(sizes)
+    if high<low:return None
+    def polygon(extent):
+        return _target_polygon(centers,sizes,rolls,extent,(1920,1080),edge_margin=EDITORIAL_TRANSFORM_EDGE_MARGIN)
+    if not polygon(high):return None
+    if polygon(low):extent=low
+    else:
+        for _ in range(32):
+            middle=(low+high)/2
+            if polygon(middle):high=middle
+            else:low=middle
+        extent=high
+    target=_closest_target(polygon(extent),np.array((.5,.42)))
+    cameras=[]
+    for center,size,roll in zip(centers,sizes,rolls,strict=True):
+        z=extent/size
+        pan=np.asarray(_rotated_point(center,roll))+(np.array((.5,.5))-target)/z
+        camera=[float(z),float(pan[0]),float(pan[1]),float(roll)]
+        try:EditorialTransformKeyframe(0.,*camera)
+        except ValueError:return None
+        if not _rotated_crop_is_inside_frame(zoom=camera[0],center_x=camera[1],center_y=camera[2],
+                roll_degrees=camera[3],aspect_ratio=AspectRatio.LANDSCAPE):return None
+        cameras.append(camera)
+    return cameras
+
+
+def cover_interpolated_native_camera(camera):
+    """Realize a between-key camera without sampling native canvas edges.
+
+    Feasible rotated endpoint crops are not closed under naïve interpolation.
+    Retain the actual center and roll; only increase zoom to the smallest
+    physically covered crop within the SAME production 2.4 envelope. Return
+    unknown if it cannot fit. Endpoints and editorial meaning are caller-owned.
+    No fill, shrinking, pan clamp, new pose or quality approval.
+    """
+    from .ive import AspectRatio
+    from .render import EditorialTransformKeyframe,_rotated_crop_is_inside_frame
+    values=np.asarray(camera,float)
+    if (values.shape!=(4,) or not np.isfinite(values).all() or not 1<=values[0]<=2.4
+            or abs(values[3])>6 or np.any(np.abs(values[1:3]-.5)>.25)):
+        raise ValueError('interpolated native camera left the unchanged production envelope')
+    def covered(zoom):
+        try:
+            EditorialTransformKeyframe(0.,float(zoom),*map(float,values[1:]))
+        except ValueError:return False
+        return _rotated_crop_is_inside_frame(zoom=float(zoom),center_x=float(values[1]),
+            center_y=float(values[2]),roll_degrees=float(values[3]),aspect_ratio=AspectRatio.LANDSCAPE)
+    if covered(values[0]):return values.tolist()
+    if not covered(2.4):return None
+    low,high=float(values[0]),2.4
+    for _ in range(40):
+        middle=(low+high)/2
+        if covered(middle):high=middle
+        else:low=middle
+    result=values.copy();result[0]=high
+    return result.tolist()
+
+
+def cover_native_camera_sequence(cameras):
+    """Keep BOTH endpoint cameras and realize the renderer's continuous path.
+
+    A finite one-way pass checks the same sixteen subdivisions as the real
+    track. Interior zoom increases are monotone, so they cannot uncover any
+    earlier cell. No endpoint, center, roll or production capacity changes.
+    """
+    from .ive import AspectRatio
+    from .render import EditorialTransformKeyframe,EditorialTransformTrack
+    values=np.asarray(cameras,float)
+    if values.ndim!=2 or values.shape[1]!=4 or not 2<=len(values)<=1024:
+        raise ValueError('native camera sequence needs its finite actual camera inventory')
+    result=values.copy()
+    if not np.isfinite(result).all():raise ValueError('native camera sequence must be finite')
+    for camera in result:
+        covered=cover_interpolated_native_camera(camera)
+        if covered is None or not np.allclose(covered,camera,rtol=0,atol=1e-9):
+            raise ValueError('sequence input cameras must already cover their actual output ticks')
+    for i in range(len(result)-1):
+        for step in range(1,16):
+            alpha=step/16.;sample=(1-alpha)*result[i]+alpha*result[i+1]
+            covered=cover_interpolated_native_camera(sample)
+            if covered is None:return None
+            deficit=float(covered[0]-sample[0])
+            if deficit<=1e-10:continue
+            left=i>0;right=i+1<len(result)-1
+            weight=(1-alpha if left else 0.)+(alpha if right else 0.)
+            if weight==0:return None
+            increase=(deficit+1e-8)/weight
+            if left:result[i,0]+=increase
+            if right:result[i+1,0]+=increase
+            if max(result[i,0],result[i+1,0])>2.4:return None
+    try:
+        track=EditorialTransformTrack(tuple(EditorialTransformKeyframe(float(i),*v) for i,v in enumerate(result)))
+    except ValueError:return None
+    return result.tolist() if track.covers_aspect_ratio(AspectRatio.LANDSCAPE) else None
