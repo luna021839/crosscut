@@ -18,6 +18,7 @@ from .action_geometry import (action_crop_cost, compare_action, compare_screen_m
     normalized_body, synchronous_velocity)
 from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
+from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,7 @@ def clamped_camera(head, cap, support):
     """
     if head[2] < .035:
         return Camera()
-    goal = .20
+    goal = DEFAULT_POLICY.focal_lower
     desired = min(cap, max(1., goal / float(head[2])))
     points = np.asarray(support, float).reshape(2, 8, 3)
     visible = (points[:, :, 2] >= .3) & (points[:, :, :2] >= 0).all(2) & (points[:, :, :2] <= 1).all(2)
@@ -98,7 +99,8 @@ def clamped_camera(head, cap, support):
         delta = center - .5
         center = .5 + delta * min(1., .25 / max(1e-12, float(np.linalg.norm(delta))))
         camera = Camera(float(zoom), float(center[0]), float(center[1]))
-        cost = 1.4 * abs(math.log(float(head[2]) * zoom / goal)) + .65 * math.log(zoom)
+        # There is no enlargement reward inside the declared comfortable band.
+        cost = 1.4 * max(0.,math.log(goal / (float(head[2]) * zoom))) + .65 * math.log(zoom)
         cost += float(action_crop_cost([zoom], [center], points)[0])
         cost += 6. * max(0., float(head[2]) * zoom - max(.24, float(head[2])))
         candidates.append((cost, zoom, camera))
@@ -109,12 +111,17 @@ def _curve_at(ticks, values, query):
     return np.array([np.interp(query, ticks, values[:, i]) for i in range(3)]).T
 
 
-def make_states(nodes, banks, poses, *, fps, source_events=None):
+def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None):
     """Freeze source-local actor paths, camera curves and whole-hold costs."""
     states, data, cluster_counts = [], [], []
+    if body_states is not None and (len(body_states)!=len(banks) or any(
+            np.asarray(value).shape!=(len(nodes),4,3) or np.any((value<0)|(value>3)) for value in body_states)):
+        raise ValueError('source-bound cached body observation states required')
     for source, bank in enumerate(banks):
         labels, count = local_actor_hypotheses(bank)
         cluster_counts.append(count)
+        events = np.array([],int) if source_events is None else source_events[source]
+        salience = source_local_salience(bank,labels,nodes,events,fps=fps)
         for actor, family in [(None, family) for family in ('native', 'action_fit')] + [
                 (a, family) for a in range(count) for family in ('native', 'action_fit')]:
             heads = np.zeros((len(nodes), 2, 4), float)
@@ -126,6 +133,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None):
             quality = np.full((len(nodes), 2), 1.2)
             cameras = np.tile([1., .5, .5], (len(nodes), 2, 1))
             observed = np.zeros((len(nodes), 2), bool)
+            owner = np.full((len(nodes),2),-1,np.int16)
+            utility_parts = {key:np.zeros((len(nodes),2)) for key in ('scale','salience','visibility_uncertainty',
+                'ownership_uncertainty','crop_effort','crop_clipping')}
+            utility_parts['scale'][:]=1.2
             for n in range(len(nodes)):
                 for side in (0, 1):
                     visible = bank['heads'][n, side]
@@ -136,7 +147,9 @@ def make_states(nodes, banks, poses, *, fps, source_events=None):
                             group = group[group[:, 2] >= .55 * np.median(group[:, 2])]
                             formation_heads[n, side, :len(group)] = group[np.argsort(group[:, 0])]
                             heads[n, side] = (*group[:, :2].mean(0), np.median(group[:, 2]), .9)
-                            quality[n, side] = node_quality(visible)
+                            parts=soft_hold_utility(float(heads[n,side,2]),formation=True)
+                            quality[n,side]=sum(parts.values())
+                            for key,value in parts.items():utility_parts[key][n,side]=value
                             observed[n, side] = True
                             continue
                         index = 0 if visible[0, 2] > .019 else -1
@@ -148,23 +161,29 @@ def make_states(nodes, banks, poses, *, fps, source_events=None):
                         continue  # a true NULL, not another head silently chosen
                     observed[n, side] = True
                     head = visible[index]
+                    owner[n,side] = labels[n,side,index]
                     heads[n, side] = head
                     vectors[n, side] = bank['vectors'][n, side, index]
                     support = np.zeros((2, 8, 3)) if poses is None else poses[source][n, side * 2:side * 2 + 2, index]
                     body[n, side * 2:side * 2 + 2] = support
                     camera = Camera() if family == 'native' else clamped_camera(head, bank['zoom_cap'], support)
                     cameras[n, side] = (camera.zoom, camera.x, camera.y)
-                    relative = float(head[2]) / max(.001, float(visible[:, 2].max()))
-                    quality[n, side] = (-.4 if head[2] * camera.zoom >= .07 else .35)
-                    if actor is not None:
-                        quality[n, side] += -1.5 * math.log(max(.02, relative))
-                    else:
+                    cached = None if body_states is None else body_states[source][n,side*2:side*2+2,index]
+                    parts=soft_hold_utility(float(head[2]),camera.zoom,
+                        salience=salience[n,side,index],body_states=cached)
+                    for key,value in parts.items():utility_parts[key][n,side]=value
+                    quality[n,side]=sum(parts.values())
+                    if actor is None:
                         # Finite ownership uncertainty, also present in the
                         # action-disabled control. NULL must stay possible but
                         # cannot freely follow a different foreground actor.
                         quality[n, side] += .18
-                    quality[n, side] += .65 * math.log(camera.zoom)
-                    quality[n, side] += float(action_crop_cost([camera.zoom], [[camera.x, camera.y]], support)[0])
+                        utility_parts['ownership_uncertainty'][n,side]=.18
+                    effort=.65*math.log(camera.zoom)
+                    clipping=float(action_crop_cost([camera.zoom], [[camera.x, camera.y]], support)[0])
+                    quality[n,side] += effort + clipping
+                    utility_parts['crop_effort'][n,side]=effort
+                    utility_parts['crop_clipping'][n,side]=clipping
             # The complete curve is frozen here. Duration/neighbor choices do
             # not refit it; the exact same curve will be sent to the renderer.
             knots = {}
@@ -189,12 +208,20 @@ def make_states(nodes, banks, poses, *, fps, source_events=None):
             jump = cameras[1:-1, 1] - cameras[1:-1, 0]
             through[1:-1] = 6. * (np.linalg.norm(jump[:, 1:] * [16/9, 1.], axis=1)
                 + np.abs(np.log(cameras[1:-1, 1, 0] / cameras[1:-1, 0, 0])))
+            camera_through=through.copy()
+            owner_through=DEFAULT_POLICY.owner_switch*known_switch(owner[:,0],owner[:,1])
+            owner_through[[0,-1]]=0.
+            through += owner_through
             # Same-source camera acceleration is not free inside a hold.
             lengths = np.diff(nodes) / fps
             a, b = cameras[:-1, 1], cameras[1:, 0]
             speed = np.linalg.norm((a[:, 1:] - b[:, 1:]) * [16 / 9, 1.], axis=1) / lengths
             zoom_speed = np.abs(np.log(a[:, 0] / b[:, 0])) / lengths
             unary = (quality[:-1, 1] + quality[1:, 0]) / 2
+            readability_tail=.35*np.maximum(0.,np.maximum(quality[:-1,1],quality[1:,0]))
+            unary += readability_tail
+            interval_owner_switch=DEFAULT_POLICY.owner_switch*known_switch(owner[:-1,1],owner[1:,0])
+            unary += interval_owner_switch/lengths
             unary += .8 * np.maximum(0., speed - .15) + .3 * np.maximum(0., zoom_speed - .25)
             projected = body.copy()
             for n, tick in enumerate(nodes):
@@ -233,7 +260,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None):
             data.append(dict(heads=heads, vectors=vectors, body=body, projected=projected,
                 indices=indices, formation=formation, formation_heads=formation_heads,
                 cameras=cameras, ticks=ticks, curve=values, unary=unary, through=through,
-                motion=motion, motion_valid=motion_valid, continuous=continuous))
+                motion=motion, motion_valid=motion_valid, continuous=continuous,
+                owner=owner,owner_through=owner_through,camera_through=camera_through,
+                interval_owner_switch=interval_owner_switch,utility_parts=utility_parts,
+                quality=quality,readability_tail=readability_tail))
     return tuple(states), data, cluster_counts
 
 
@@ -377,9 +407,11 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
     return tuple(reversed(runs)), score
 
 
-def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check, action_enabled=True):
+def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check,
+                       action_enabled=True, body_states=None):
     started = monotonic()
-    states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps, source_events=source_events)
+    states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps,
+        source_events=source_events,body_states=body_states)
     count = len(states)
     tensor_bytes = len(nodes) * count * count * np.dtype(np.float32).itemsize
     if tensor_bytes > 200 * 1024**2:
@@ -405,10 +437,40 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     runs, score = coupled_semi_markov(nodes, fps=fps, unary=np.array([d['unary'] for d in data]),
         seam_cost=costs, state_sources=np.array([s.source for s in states]), source_events=source_events,
         through=np.array([d['through'] for d in data]))
+    decomposition=[];cumulative=0.
+    for i,(start,end,state_index) in enumerate(runs):
+        row=data[state_index];state=states[state_index]
+        seconds=np.diff(nodes)[start:end]/fps
+        duration=float(seconds.sum())
+        parts={key:float(((value[start:end,1]+value[start+1:end+1,0])/2) @ seconds)
+            for key,value in row['utility_parts'].items()}
+        unary_total=float(row['unary'][start:end] @ seconds)
+        parts['readability_tail']=float(row['readability_tail'][start:end] @ seconds)
+        parts['interval_owner_switch']=float(row['interval_owner_switch'][start:end].sum())
+        parts['interval_camera_motion']=unary_total-sum(parts.values())
+        parts['camera_through']=float(row['camera_through'][start+1:end].sum())
+        parts['owner_through']=float(row['owner_through'][start+1:end].sum())
+        parts['native_fragments']=0. if len(banks)==1 else native_event_cost(nodes[start],nodes[end],source_events[state.source],fps)
+        parts['duration_grammar']=0. if len(banks)==1 else .23*(duration-2.4)**2+2.*max(0.,.9-duration)
+        parts['entry_port']=0. if not i else float(costs[start,runs[i-1][2],state_index])
+        parts['editorial_switch']=0. if not i else .35
+        parts['short_source_return']=.7 if i>=2 and duration<3. and states[runs[i-2][2]].source==state.source else 0.
+        prior=cumulative;cumulative+=sum(parts.values())
+        next_exit=None if i==len(runs)-1 else float(costs[end,state_index,runs[i+1][2]])
+        decomposition.append(dict(first_frame=int(nodes[start]),final_frame=int(nodes[end]),source=state.source,
+            actor_hypothesis=state.actor,camera_family=state.family,prior_cumulative_cost=prior,
+            cumulative_cost=cumulative,next_selected_exit_cost=next_exit,components=parts,
+            ownership_is_not_dense_actor_certification=True))
+    if not math.isclose(cumulative,score,rel_tol=1e-7,abs_tol=1e-6):
+        raise AssertionError('selected programme cost decomposition differs from exact DP objective')
     return runs, states, data, score, dict(fixed_states=count,source_local_appearance_clusters=cluster_counts,
         source_local_actor_hypotheses_are_not_certified=True,camera_alternatives_fixed_before_dp=True,
         actor_camera_endpoint_state_retained=True,whole_hold_observed_action_support_consumed=True,
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
+        cached_body_states_consumed=body_states is not None,
+        body_states_are_not_occlusion_certificates=True,
+        known_owner_changes_are_finite_events=True,
+        selected_hold_cost_decomposition=decomposition,
         selection_seconds=monotonic()-started,cost_tensor_bytes=costs.nbytes)
 
 

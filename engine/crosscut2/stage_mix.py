@@ -335,11 +335,11 @@ def main():
         fps=original.fps, nodes=nodes, cache=args.cache, models=args.models, check=check,
         maximum_seconds=args.maximum_perception_seconds)
     camera_census = census(original.sources, cache=args.cache.parent / 'crosscut2-camera-census-v1', check=check)
-    poses, body_receipts = (None, []) if args.body_pose_model is None else measure_pose_grid(
+    poses, body_receipts, body_states = (None, [], None) if args.body_pose_model is None else measure_pose_grid(
         sources=original.sources, warps=warps, nodes=nodes, master_start=original.master_audio_start,
         fps=original.fps, banks=banks, models=args.models, body_model=args.body_pose_model,
         cache=args.cache.parent / 'crosscut2-body-grid-v1', check=check, camera_census=camera_census,
-        maximum_seconds=args.maximum_perception_seconds)
+        maximum_seconds=args.maximum_perception_seconds,include_states=True)
     # Retain the observed face grid. Newly measured native cuts change interval
     # costs without invalidating face caches or inventing unobserved heads.
     source_events = tuple(np.asarray(sorted({round((warps[s].source_to_master(frame / record['fps'])
@@ -353,7 +353,7 @@ def main():
     if args.fixed_actor_camera_holds:
         from .fixed_holds import select_fixed_holds, realize_fixed_holds
         runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
-            fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check)
+            fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states)
         plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
     else:
         runs, matches, score = choose_programme(nodes, banks, fps=original.fps, check=check,

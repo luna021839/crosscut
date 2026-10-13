@@ -73,3 +73,10 @@ def test_actual_streamed_pose_grid_cache_reuses_without_model_calls(tmp_path, mo
     reused, warm = pose_grid.measure_pose_grid(**args)
     assert warm[0]['reused'] and warm[0]['neural_pose_calls'] == 0
     assert np.array_equal(first[0], reused[0])
+    existing=sorted(args['cache'].glob('*.npz'))
+    arrays, state_receipts, cached_states = pose_grid.measure_pose_grid(**args,include_states=True)
+    assert state_receipts[0]['reused'] and state_receipts[0]['neural_pose_calls']==0
+    assert np.array_equal(arrays[0],first[0])
+    assert cached_states[0].shape==(4,4,3) and cached_states[0].dtype==np.uint8
+    assert (cached_states[0][:,:,0]==1).all() and not cached_states[0][:,:,1:].any()
+    assert sorted(args['cache'].glob('*.npz'))==existing

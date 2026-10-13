@@ -91,7 +91,7 @@ def pose_indices(warp, *, nodes, master_start, fps, native_fps, native_count):
 
 
 def measure_pose_grid(*, sources, warps, nodes, master_start, fps, banks,
-        models, body_model, cache, check, camera_census, maximum_seconds=900.):
+        models, body_model, cache, check, camera_census, maximum_seconds=900., include_states=False):
     if not math.isfinite(maximum_seconds) or not 1 <= maximum_seconds <= 1800:
         raise ValueError('one finite conditional pose allowance required')
     started = monotonic()
@@ -112,7 +112,7 @@ def measure_pose_grid(*, sources, warps, nodes, master_start, fps, banks,
         + Path(__file__).parents[1].joinpath('crosscut/body_pose_2d.py').read_bytes()
         + Path(__file__).parents[1].joinpath('crosscut/pose.py').read_bytes()
         + Path(__file__).parents[1].joinpath('crosscut/focal_pose.py').read_bytes()).hexdigest()
-    sensor, result, receipts = None, [], []
+    sensor, result, receipts, cached_states = None, [], [], []
     decoder = shutil.which('ffmpeg')
     if decoder is None:
         raise OSError('pose census requires the existing FFmpeg decoder')
@@ -199,10 +199,11 @@ def measure_pose_grid(*, sources, warps, nodes, master_start, fps, banks,
                 or tuple(binding['source_file_identity']) != file_identity(path)):
             raise ValueError('conditional body cache shape/numeric domain differs')
         result.append(poses)
+        cached_states.append(states)
         receipt = dict(source=s, reused=reused, observed_heads=int((states == 1).sum()),
             uncertain_heads=int((states >= 2).sum()), neural_pose_calls=calls,
             sparse_conditional_body_is_not_all_frame_actor_certification=True)
         receipts.append(receipt)
         print(json.dumps(dict(phase='source_body_complete', **receipt,
             elapsed_seconds=monotonic() - started)), flush=True)
-    return result, receipts
+    return (result, receipts, cached_states) if include_states else (result, receipts)

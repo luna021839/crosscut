@@ -135,6 +135,7 @@ def test_equal_centroid_and_face_scale_cannot_hide_a_different_formation_layout(
 
 def test_unknown_appearance_does_not_disable_observed_focal_camera_fitting():
     bank = bank_fixture(); bank['vectors'][:] = 0
+    bank['heads'][:,:,0,2]=.08;bank['heads'][:,:,1,2]=.06
     states, rows, _ = make_states(np.array([0,10,20,30]), [bank], None, fps=10)
     assert [(s.actor, s.family) for s in states] == [(None, 'native'), (None, 'action_fit')]
     assert np.all(rows[0]['cameras'] == [1., .5, .5])
@@ -169,6 +170,7 @@ def test_same_clock_motion_prefers_synchronized_hit_over_out_of_phase_snapshot()
 
 def test_unobserved_actor_side_does_not_insert_a_one_frame_native_camera_pulse():
     bank = bank_fixture()
+    bank['heads'][:,:,0,2]=.08;bank['heads'][:,:,1,2]=.06
     bank['vectors'][1,1,0] = 0
     states,rows,_ = make_states(np.array([0,10,20,30]),[bank],None,fps=10)
     row = rows[states.index(State(0,0,'action_fit'))]
