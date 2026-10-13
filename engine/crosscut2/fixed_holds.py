@@ -20,6 +20,8 @@ from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
 from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility
 
+MISSING_PORT_COST = 6.  # Finite uncertainty, not a measured identity/pose mismatch.
+
 
 @dataclass(frozen=True)
 class State:
@@ -159,6 +161,12 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                         index = int(matches[0]) if len(matches) else -1
                     indices[n, side] = index
                     if index < 0:
+                        if actor is not None and np.max(visible[:,2]) >= .055:
+                            # This hypothesis is absent while another readable
+                            # foreground head is observed. Do not infer a new
+                            # owner, or make the absent endpoint cheaper to cut.
+                            quality[n,side] += .65
+                            utility_parts['ownership_uncertainty'][n,side]=.65
                         continue  # a true NULL, not another head silently chosen
                     observed[n, side] = True
                     head = visible[index]
@@ -296,12 +304,12 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
     a, b = left['heads'][n, 0], right['heads'][n, 1]
     result = dict(geometry_loss=4., appearance_cosine=None, conditional_pose_loss=None,
         conditional_velocity_loss=None, comparable_action_joints=0, projected_screen_motion=None,
-        role='unobserved', soft_cost=4.)
+        role='unobserved', soft_cost=MISSING_PORT_COST)
     if min(a[2], b[2]) <= .019:
         # A one-sided missing port is not a measured connection of a readable
         # foreground subject. Keep it finite, and never penalize all-UNKNOWN
         # sources as a fabricated mismatch or forbid their native paths.
-        readable=(a[2]>=.10 and not left['formation'][n,0]) or (b[2]>=.10 and not right['formation'][n,1])
+        readable=(a[2]>=.055 and not left['formation'][n,0]) or (b[2]>=.055 and not right['formation'][n,1])
         if readable:result['soft_cost']+=2.
         return result
     ca, cb = Camera(*left['cameras'][n, 0]), Camera(*right['cameras'][n, 1])
@@ -444,7 +452,14 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     tensor_bytes = len(nodes) * count * count * np.dtype(np.float32).itemsize
     if tensor_bytes > 200 * 1024**2:
         raise ValueError('fixed-state scalar cost tensor exceeded its explicit 200MiB bound')
-    costs = np.full((len(nodes),count,count), 4., np.float32)
+    costs = np.full((len(nodes),count,count), MISSING_PORT_COST, np.float32)
+    same_show = np.zeros((count,count),np.float32)
+    if broadcast_slots is not None:
+        for a,sa in enumerate(states):
+            for b,sb in enumerate(states):
+                if sa.source != sb.source and broadcast_slots[sa.source] is not None and (
+                        broadcast_slots[sa.source]==broadcast_slots[sb.source]):
+                    same_show[a,b]=.9
     for n in range(1,len(nodes)-1):
         check()
         if monotonic()-started > 240.:
@@ -452,13 +467,17 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         # Unobserved endpoints share the finite missing port, not an NN veto.
         left = [i for i,d in enumerate(data) if d['heads'][n,0,2] > .019]
         right = [i for i,d in enumerate(data) if d['heads'][n,1,2] > .019]
+        left_readable=np.array([d['heads'][n,0,2]>=.055 and not d['formation'][n,0] for d in data])
+        right_readable=np.array([d['heads'][n,1,2]>=.055 and not d['formation'][n,1] for d in data])
+        # The observed-only nested loop must not bypass missing-port costs.
+        # Known/known cells below replace this default; all UNKNOWN stay finite.
+        costs[n] += 2.*(left_readable[:,None] | right_readable[None,:])
         for a in left:
             for b in right:
                 if states[a].source == states[b].source: continue
                 value = port_cost(n,data[a],data[b],fps=fps,action_enabled=action_enabled)['soft_cost']
-                same_show = (broadcast_slots is not None and broadcast_slots[states[a].source] is not None
-                    and broadcast_slots[states[a].source] == broadcast_slots[states[b].source])
-                costs[n,a,b] = value + (.9 if same_show else 0.)
+                costs[n,a,b] = value
+        costs[n] += same_show
         if n % 40 == 0:
             print(__import__('json').dumps(dict(phase='fixed_actor_camera_ports',nodes=n,total_nodes=len(nodes),
                 fixed_states=count,elapsed_seconds=monotonic()-started)),flush=True)
@@ -497,6 +516,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
         cached_body_states_consumed=body_states is not None,
         body_states_are_not_occlusion_certificates=True,
+        missing_port_uncertainty_cost=MISSING_PORT_COST,
+        missing_ports_and_broadcast_costs_consumed_before_dp=True,
         known_owner_changes_are_finite_events=True,
         selected_hold_cost_decomposition=decomposition,
         selection_seconds=monotonic()-started,cost_tensor_bytes=costs.nbytes)

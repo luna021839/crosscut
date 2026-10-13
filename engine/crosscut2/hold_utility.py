@@ -12,6 +12,7 @@ class HoldPolicy:
     formation_upper: float = .14
     owner_switch: float = .85
     salience_weight: float = 1.1
+    oversize_weight: float = 3.2
 
 
 DEFAULT_POLICY = HoldPolicy()
@@ -66,7 +67,7 @@ def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_sta
     lower, upper = ((policy.formation_lower,policy.formation_upper) if formation else
         (policy.focal_lower,policy.focal_upper))
     size = max(.005,height*zoom)
-    scale = (-.05 if formation else -.55) + .85*max(0.,math.log(lower/size)) + .8*max(0.,math.log(size/upper))
+    scale = (-.05 if formation else -.55) + .85*max(0.,math.log(lower/size)) + policy.oversize_weight*max(0.,math.log(size/upper))
     persistence = 0. if formation else -policy.salience_weight*math.log(max(.02,float(salience)))
     uncertainty = 0.
     if body_states is not None and not formation:
