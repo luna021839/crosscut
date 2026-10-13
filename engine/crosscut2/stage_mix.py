@@ -22,6 +22,7 @@ from crosscut.timewarp import TimeWarpMap, TimeWarpConfig, TimeWarpAnchor, TimeW
 from .grid_perception import file_identity, measure_grid
 from .paired_geometry import Camera, Match, match_heads
 from .source_cuts import census
+from .pose_grid import measure_pose_grid
 
 
 def unpack(cls, raw):
@@ -103,8 +104,10 @@ def native_event_cost(first, final, events, fps, *, edge_seconds=.7):
     inside = events[(events > first) & (events < final)]
     if not len(inside):
         return 0.
-    distances = np.minimum(inside - first, final - inside) / fps
-    return float(.25 * len(inside) + 4. * np.maximum(0., 1. - distances / edge_seconds).sum())
+    # The short piece may be between two retained native cuts far from BOTH
+    # authored ends. Measure every actual fragment, not only edge distances.
+    fragments = np.diff(np.r_[first, inside, final]) / fps
+    return float(.25 * len(inside) + 4. * np.maximum(0., 1. - fragments / edge_seconds).sum())
 
 
 def semi_markov(nodes, *, fps, unary, seam_cost, minimum_hold=1.15,
@@ -179,7 +182,7 @@ def semi_markov(nodes, *, fps, unary, seam_cost, minimum_hold=1.15,
     return tuple(reversed(runs)), optimum
 
 
-def choose_programme(nodes, banks, *, fps, check, broadcast_slots=None, source_events=None):
+def choose_programme(nodes, banks, *, fps, check, broadcast_slots=None, source_events=None, poses=None):
     count = len(banks)
     quality = np.asarray([[node_quality(h) for h in bank['heads'][:, 1]] for bank in banks])
     unary = (quality[:, :-1] + quality[:, 1:]) / 2
@@ -205,7 +208,9 @@ def choose_programme(nodes, banks, *, fps, check, broadcast_slots=None, source_e
                 a, b = banks[left], banks[right]
                 m = match_heads(a['heads'][n, 0], b['heads'][n, 1],
                     a['vectors'][n, 0], b['vectors'][n, 1], caps=(a['zoom_cap'], b['zoom_cap']),
-                    left_salience=salience[left][n, 0], right_salience=salience[right][n, 1])
+                    left_salience=salience[left][n, 0], right_salience=salience[right][n, 1],
+                    left_pose=None if poses is None else poses[left][n, :2],
+                    right_pose=None if poses is None else poses[right][n, 2:], motion_seconds=6 / fps)
                 matches[n, left, right] = m
                 same_show = (broadcast_slots is not None and broadcast_slots[left] is not None
                     and broadcast_slots[left] == broadcast_slots[right])
@@ -247,6 +252,8 @@ def realize_programme(original, warps, nodes, runs, matches, *, output):
                 geometry_loss=before.geometry_loss, soft_cost=before.cost,
                 appearance_cosine=before.appearance_cosine,
                 left_head_index=before.left_head_index, right_head_index=before.right_head_index,
+                conditional_pose_loss=before.pose_loss, conditional_velocity_loss=before.velocity_loss,
+                comparable_action_joints=before.action_joints, framing_loss=before.framing_loss,
                 anonymous_appearance_is_not_member_probability=True))
     plan = replace(original, segments=tuple(segments), output=Path(output),
         transitions=(), authorized_shot_video_clocks=(), member_pose_dissolve_requested=None,
@@ -277,6 +284,10 @@ def main():
     parser.add_argument('--cache', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--models', type=Path, required=True)
+    parser.add_argument('--body-pose-model', type=Path,
+        help='Existing pinned RTMPose asset; optional conditional action costs, not named actor authority')
+    parser.add_argument('--fixed-actor-camera-holds', action='store_true',
+        help='Keep anonymous actor and fixed full-hold camera states inside programme selection')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--resume-render', action='store_true',
         help='Render the existing exact source-bound plan without re-observation or selection')
@@ -324,6 +335,11 @@ def main():
         fps=original.fps, nodes=nodes, cache=args.cache, models=args.models, check=check,
         maximum_seconds=args.maximum_perception_seconds)
     camera_census = census(original.sources, cache=args.cache.parent / 'crosscut2-camera-census-v1', check=check)
+    poses, body_receipts = (None, []) if args.body_pose_model is None else measure_pose_grid(
+        sources=original.sources, warps=warps, nodes=nodes, master_start=original.master_audio_start,
+        fps=original.fps, banks=banks, models=args.models, body_model=args.body_pose_model,
+        cache=args.cache.parent / 'crosscut2-body-grid-v1', check=check, camera_census=camera_census,
+        maximum_seconds=args.maximum_perception_seconds)
     # Retain the observed face grid. Newly measured native cuts change interval
     # costs without invalidating face caches or inventing unobserved heads.
     source_events = tuple(np.asarray(sorted({round((warps[s].source_to_master(frame / record['fps'])
@@ -333,19 +349,33 @@ def main():
     slots = manifest.get('group_broadcast_diversity', {}).get('source_broadcast_slots')
     if slots is not None and len(slots) != len(banks):
         raise ValueError('broadcast slot domain differs from observed sources')
-    runs, matches, score = choose_programme(nodes, banks, fps=original.fps, check=check,
-        broadcast_slots=slots, source_events=source_events)
-    plan, seams = realize_programme(original, warps, nodes, runs, matches, output=args.output)
+    fixed_receipt = None
+    if args.fixed_actor_camera_holds:
+        from .fixed_holds import select_fixed_holds, realize_fixed_holds
+        runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
+            fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check)
+        plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
+    else:
+        runs, matches, score = choose_programme(nodes, banks, fps=original.fps, check=check,
+            broadcast_slots=slots, source_events=source_events, poses=poses)
+        plan, seams = realize_programme(original, warps, nodes, runs, matches, output=args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.with_suffix('.plan.json').open('x') as stream:
-        json.dump(dict(render_plan=plan.to_json(), sparse_perception=receipts,
+    # Validate the entire finite JSON before creating the exact resume plan.
+    # Serialization failures must not leave a truncated file masquerading as
+    # a source-bound saved recipe and block an otherwise warm-cache retry.
+    encoded = json.dumps(dict(render_plan=plan.to_json(), sparse_perception=receipts,
+            conditional_body_perception=body_receipts,
+            conditional_body_action_costs_enabled=poses is not None,
+            fixed_actor_camera_hold_receipt=fixed_receipt,
             grid_nodes=len(nodes), objective_cost=score, seams=seams,
             retained_source_cut_counts=[len(events) for events in source_events],
             camera_census_all_sources_decoded=all(record['all_encoded_frames_decoded'] for record in camera_census),
             retained_source_cut_detection_completeness_validated=False,
             complete_actor_motion_validated=False, professional_quality_approved=False,
             normal_app_path_executed=False, old_or_manual_editorial_choices_used=False,
-            elapsed_before_render=monotonic() - started), stream, indent=2, allow_nan=False)
+            elapsed_before_render=monotonic() - started), indent=2, allow_nan=False)
+    with args.output.with_suffix('.plan.json').open('x') as stream:
+        stream.write(encoded)
     print(json.dumps(dict(phase='whole_programme_ready', runs=len(runs),
         formation_seams=sum(s['role'] == 'formation' for s in seams),
         focal_seams=sum(s['role'] == 'focal' for s in seams), elapsed_seconds=monotonic() - started)), flush=True)

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from crosscut2.stage_mix import camera_track, native_event_cost, resume_plan, semi_markov
+from crosscut2.stage_mix import camera_track, choose_programme, native_event_cost, realize_programme, resume_plan, semi_markov
 from crosscut2.paired_geometry import Camera
 
 
@@ -81,3 +81,56 @@ def test_native_cut_clock_mismatch_is_not_silently_ignored():
     with pytest.raises(ValueError, match='output-clock'):
         semi_markov(np.arange(0, 61, 10), fps=10, unary=np.zeros((2, 6)),
             seam_cost=np.zeros((7, 2, 2)), source_events=(np.array([61]), np.array([])))
+
+
+def test_three_frame_native_burst_inside_a_long_hold_is_not_free():
+    isolated = native_event_cost(0, 150, np.array([60]), 30)
+    burst = native_event_cost(0, 150, np.array([60, 63]), 30)
+    assert isolated == pytest.approx(.25)
+    assert burst > 3.
+
+
+def test_realized_pose_recipe_is_finite_json_with_real_float32_bank(tmp_path):
+    import json
+    from crosscut.render import AspectRatio, RenderPlan, RenderSegment
+    from crosscut2.paired_geometry import match_heads
+    heads = np.zeros((8, 4), np.float32)
+    heads[0] = [.42, .35, .14, .95]
+    right = heads.copy(); right[0] = [.49, .36, .15, .95]
+    vectors = np.zeros((3, 128), np.float32); vectors[:, 0] = 1
+    pose = np.zeros((2, 3, 8, 3), np.float32)
+    match = match_heads(heads, right, vectors, vectors, left_pose=pose, right_pose=pose)
+    class IdentityWarp:
+        def master_to_source(self, value): return value
+    original = RenderPlan((tmp_path / 'a.mp4', tmp_path / 'b.mp4'),
+        (RenderSegment(0, 0., 6., 0.),), 0, AspectRatio.LANDSCAPE, tmp_path / 'old.mp4')
+    plan, seams = realize_programme(original, (IdentityWarp(), IdentityWarp()),
+        np.array([0, 90, 180]), ((0, 1, 0), (1, 2, 1)), {(1, 0, 1): match},
+        output=tmp_path / 'new.mp4')
+    restored = json.loads(json.dumps(dict(render_plan=plan.to_json(), seams=seams), allow_nan=False))
+    assert restored['seams'][0]['conditional_pose_loss'] is None
+    assert restored['seams'][0]['comparable_action_joints'] == 0
+
+
+def test_all_unknown_action_keeps_complete_graph_ranking_and_rhythm():
+    nodes = np.arange(0, 121, 10)
+    rng = np.random.default_rng(541)
+    banks = []
+    for source in range(3):
+        heads = np.zeros((len(nodes), 2, 8, 4), np.float32)
+        heads[:, :, :3, 0] = [.3, .5, .7]
+        heads[:, :, :3, 1] = .3
+        heads[:, :, :3, 2] = [.10 + source * .01, .09, .08]
+        heads[:, :, :3, 3] = .95
+        vectors = rng.normal(size=(len(nodes), 2, 3, 128)).astype(np.float32)
+        vectors /= np.linalg.norm(vectors, axis=-1, keepdims=True)
+        banks.append(dict(heads=heads, vectors=vectors, zoom_cap=1.35))
+    disabled = choose_programme(nodes, banks, fps=10, check=lambda: None)
+    enabled = choose_programme(nodes, banks, fps=10, check=lambda: None,
+        poses=[np.zeros((len(nodes), 4, 3, 8, 3), np.float32) for _ in banks])
+    assert enabled[0] == disabled[0]
+    assert enabled[2] == disabled[2]
+    for key, base in disabled[1].items():
+        refined = enabled[1][key]
+        assert refined.cost == base.cost
+        assert (refined.role, refined.left, refined.right) == (base.role, base.left, base.right)

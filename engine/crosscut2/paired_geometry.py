@@ -10,6 +10,8 @@ import math
 
 import numpy as np
 
+from .action_geometry import action_crop_cost, compare_action, framing_cost
+
 
 @dataclass(frozen=True)
 class Camera:
@@ -31,9 +33,13 @@ class Match:
     appearance_cosine: float | None = None
     left_head_index: int | None = None
     right_head_index: int | None = None
+    pose_loss: float | None = None
+    velocity_loss: float | None = None
+    action_joints: int = 0
+    framing_loss: float = 0.
 
 
-def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35)):
+def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35), *, support=(None, None)):
     """Minimize realized scale/position error with no padding or zoom-out.
 
     Search a small *shared* target-size grid; extra crop can make a common
@@ -64,9 +70,13 @@ def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35)):
     position = np.linalg.norm((xa - xb) * [1., 9 / 16], axis=1)
     scale = np.abs(np.log(ha * za / (hb * zb)))
     geometry = position / .06 + scale / .25
-    effort = .12 * (np.log(za) + np.log(zb))
+    effort = .65 * (np.log(za) + np.log(zb))
+    effort += 6. * (np.maximum(0., ha * za - max(.24, ha))
+        + np.maximum(0., hb * zb - max(.24, hb)))
+    effort += action_crop_cost(za, ca, support[0]) + action_crop_cost(zb, cb, support[1])
     chosen = int(np.argmin(geometry + effort))
-    return Camera(float(za[chosen]), *ca[chosen]), Camera(float(zb[chosen]), *cb[chosen]), float(geometry[chosen])
+    return (Camera(float(za[chosen]), float(ca[chosen, 0]), float(ca[chosen, 1])),
+        Camera(float(zb[chosen]), float(cb[chosen, 0]), float(cb[chosen, 1])), float(geometry[chosen]))
 
 
 def _cosine(a, b):
@@ -78,7 +88,8 @@ def _cosine(a, b):
     return float(np.clip(a @ b / (na * nb), -1., 1.))
 
 
-def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, right_salience=None):
+def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, right_salience=None,
+                left_pose=None, right_pose=None, motion_seconds=.2):
     """Compare focal and anonymous formation hypotheses, including occluders.
 
     Head rows are (center_x, center_y, height, confidence). Missing appearance
@@ -86,6 +97,12 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, r
     occluders do not force the largest detected face to be the edited subject.
     """
     left, right = np.asarray(left), np.asarray(right)
+    for window in (left_pose, right_pose):
+        if window is not None and (np.asarray(window).shape != (2, 3, 8, 3)
+                or not np.isfinite(window).all()):
+            raise ValueError('conditional focal pose windows require two frames and three heads')
+    if (left_pose is None) != (right_pose is None):
+        raise ValueError('both actual sides are required for a conditional action comparison')
     a = left[(left[:, 2] > .019) & (left[:, 3] >= .75)]
     b = right[(right[:, 2] > .019) & (right[:, 3] >= .75)]
     if not len(a) or not len(b):
@@ -98,7 +115,7 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, r
             raise ValueError('finite per-head salience required')
         return values / max(.001, values.max())
     sa, sb = salience(left, left_salience), salience(right, right_salience)
-    formation_intent = sum(len(rows) >= 3 and np.max(rows[:, 2]) < 1.6 * np.sort(rows[:, 2])[-2]
+    formation_intent = sum(bool(len(rows) >= 3 and np.max(rows[:, 2]) < 1.6 * np.sort(rows[:, 2])[-2])
         for rows in (a, b))
     hypotheses = []
     for i, fa in enumerate(left[:3]):
@@ -107,15 +124,29 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, r
         for j, fb in enumerate(right[:3]):
             if fb[2] < .055 or fb[3] < .75:
                 continue
-            ca, cb, geometry = joint_cameras(fa[:2], fb[:2], fa[2], fb[2], caps)
+            support = (None, None) if left_pose is None else (left_pose[:, i], right_pose[:, j])
+            ca, cb, geometry = joint_cameras(fa[:2], fb[:2], fa[2], fb[2], caps, support=support)
+            framing = framing_cost(ca, cb, fa[2], fb[2], support)
             similarity = _cosine(lv[i], rv[j])
             # SFace cosine is evidence of appearance, NOT a calibrated label.
             identity = 1.4 if similarity is None else 5. * max(0., .65 - similarity)
             # A background head match is not the same as keeping the viewer's
             # subject. Temporal salience can discount a brief foreground occluder.
             focal_priority = -2. * (math.log(max(.02, sa[i])) + math.log(max(.02, sb[j])))
-            hypotheses.append(Match(ca, cb, 'focal', geometry + identity + focal_priority + formation_intent,
-                geometry, similarity, i, j))
+            action = None if left_pose is None else compare_action(support[0], support[1], seconds=motion_seconds)
+            # Compare to the SAME finite missing-action prior (2.) whether
+            # enabled or disabled. An all-UNKNOWN bank leaves the base graph,
+            # focal/formation ranking and rhythm exactly unchanged; zero
+            # refinement is not a claim that missing motion is a match.
+            action_cost = 0. if action is None else action.cost - 2.
+            if (action is not None and action.moving_joints >= 2
+                    and action.velocity_loss is not None and action.velocity_loss < .4):
+                action_cost -= .3
+            hypotheses.append(Match(ca, cb, 'focal', geometry + identity + focal_priority
+                + formation_intent + framing + action_cost, geometry, similarity, i, j,
+                None if action is None else action.phase_loss,
+                None if action is None else action.velocity_loss,
+                0 if action is None else action.common_joints, framing))
     if min(len(a), len(b)) >= 3:
         # Keep the central foreground scale band, rather than tiny back heads.
         a = a[a[:, 2] >= .55 * np.median(a[:, 2])]
@@ -125,6 +156,7 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, r
             ma, mb = a[:, :2].mean(0), b[:, :2].mean(0)
             ha, hb = float(np.median(a[:, 2])), float(np.median(b[:, 2]))
             ca, cb, geometry = joint_cameras(ma, mb, ha, hb, caps)
+            framing = framing_cost(ca, cb, ha, hb)
             pa, pb = ca.project(a[:, :2]), cb.project(b[:, :2])
             # Sorted position is anonymous choreography geometry, not identity.
             if len(a) == len(b):
@@ -138,6 +170,7 @@ def match_heads(left, right, lv, rv, *, caps=(1.35, 1.35), left_salience=None, r
             # side has a dominant foreground subject. Keep this a finite
             # editorial cost rather than banning an otherwise useful source.
             role_change = 3. * (2 - formation_intent)
-            hypotheses.append(Match(ca, cb, 'formation', loss + .35 + role_change, loss))
+            hypotheses.append(Match(ca, cb, 'formation', loss + .35 + role_change + framing,
+                loss, framing_loss=framing))
     return min(hypotheses, key=lambda r: (r.cost, r.role)) if hypotheses else Match(
         Camera(), Camera(), 'distant', 3., 3.)

@@ -90,3 +90,28 @@ def test_background_ensemble_fit_does_not_hide_a_foreground_subject_change():
     matched = match_heads(a, b, av, bv)
     assert matched.role == 'focal'
     assert matched.left_head_index == matched.right_head_index == 0
+
+
+def test_same_face_match_but_opposite_observed_arm_motion_is_not_free():
+    a = heads([[.5, .35, .12, .95]])
+    vectors = np.zeros((3, 128)); vectors[0, 0] = 1.
+    endpoint = np.asarray([[.4, .4, .9], [.6, .4, .9], [.3, .5, .9], [.7, .5, .9],
+        [.2, .6, .9], [.8, .6, .9], [.43, .75, .9], [.57, .75, .9]])
+    prior, later = endpoint.copy(), endpoint.copy()
+    prior[4:6, 1] -= .08; later[4:6, 1] += .08
+    left, right = np.zeros((2, 3, 8, 3)), np.zeros((2, 3, 8, 3))
+    left[:, 0] = [prior, endpoint]; right[:, 0] = [endpoint, later]
+    good = match_heads(a, a, vectors, vectors, left_pose=left, right_pose=right)
+    right[1, 0] = prior
+    bad = match_heads(a, a, vectors, vectors, left_pose=left, right_pose=right)
+    assert good.geometry_loss == bad.geometry_loss == pytest.approx(0)
+    assert bad.velocity_loss > .9 and bad.cost > good.cost
+
+
+def test_missing_body_windows_are_not_claimed_as_a_measured_pose_match():
+    a = heads([[.5, .35, .12, .95]])
+    vectors = np.zeros((3, 128)); vectors[0, 0] = 1.
+    empty = np.zeros((2, 3, 8, 3))
+    match = match_heads(a, a, vectors, vectors, left_pose=empty, right_pose=empty)
+    assert match.pose_loss is None and match.velocity_loss is None and match.action_joints == 0
+    assert np.isfinite(match.cost)
