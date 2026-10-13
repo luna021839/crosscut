@@ -355,6 +355,14 @@ def main():
         runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
             fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states)
         plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
+        from .native_timing import repair_native_timing
+        def build(boundaries):
+            return realize_fixed_holds(original,warps,nodes,runs,states,data,output=args.output,
+                boundary_frames=boundaries)[0]
+        boundaries,timing_receipt=repair_native_timing(plan,build,camera_census,check=check)
+        plan,seams=realize_fixed_holds(original,warps,nodes,runs,states,data,output=args.output,
+            boundary_frames=boundaries)
+        fixed_receipt['exact_native_timing_repair']=timing_receipt
     else:
         runs, matches, score = choose_programme(nodes, banks, fps=original.fps, check=check,
             broadcast_slots=slots, source_events=source_events, poses=poses)

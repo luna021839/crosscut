@@ -124,9 +124,11 @@ def test_equal_centroid_and_face_scale_cannot_hide_a_different_formation_layout(
         bank['heads'][:] = 0
         bank['heads'][:,:,:3] = [[x, .4, .07, .95] for x in xs]
         bank['vectors'][:] = 0
-    _, rows, _ = make_states(np.array([0,10,20,30]), [a,b], None, fps=10)
-    same = port_cost(1, rows[0], rows[0], fps=10)
-    different = port_cost(1, rows[0], rows[2], fps=10)
+    states, rows, _ = make_states(np.array([0,10,20,30]), [a,b], None, fps=10)
+    first=rows[states.index(State(0,None,'native'))]
+    second=rows[states.index(State(1,None,'native'))]
+    same = port_cost(1, first, first, fps=10)
+    different = port_cost(1, first, second, fps=10)
     assert same['role'] == different['role'] == 'formation'
     assert same['formation_layout_loss'] == 0
     assert different['formation_layout_loss'] > 2
@@ -137,7 +139,8 @@ def test_unknown_appearance_does_not_disable_observed_focal_camera_fitting():
     bank = bank_fixture(); bank['vectors'][:] = 0
     bank['heads'][:,:,0,2]=.08;bank['heads'][:,:,1,2]=.06
     states, rows, _ = make_states(np.array([0,10,20,30]), [bank], None, fps=10)
-    assert [(s.actor, s.family) for s in states] == [(None, 'native'), (None, 'action_fit')]
+    assert [(s.actor, s.family) for s in states][:2] == [(None, 'native'), (None, 'action_fit')]
+    assert all(s.actor is None for s in states)
     assert np.all(rows[0]['cameras'] == [1., .5, .5])
     assert rows[1]['cameras'][:,:,0].max() > 1.
 

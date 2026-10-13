@@ -11,7 +11,7 @@ class HoldPolicy:
     formation_lower: float = .055
     formation_upper: float = .14
     owner_switch: float = .85
-    salience_weight: float = .9
+    salience_weight: float = 1.1
 
 
 DEFAULT_POLICY = HoldPolicy()
@@ -49,11 +49,11 @@ def source_local_salience(bank, labels, nodes, source_events, *, fps, radius_sec
                 owner = labels[n,side,head]
                 persistence = (.85 if owner < 0 or not distinct else
                     .25 + .75 * np.mean([np.any(labels[k,flank]==owner) for k,flank in distinct.values()]))
-                result[n,side,head] = (float(heads[n,side,head,2])/maximum)**.35 * persistence
+                result[n,side,head] = (float(heads[n,side,head,2])/maximum)**.75 * persistence
     return result
 
 
-def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_states=None,
+def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_states=None, projected_center=None,
                       policy=DEFAULT_POLICY):
     """Continuous role/size preference plus finite observation uncertainty.
 
@@ -74,4 +74,9 @@ def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_sta
         if np.any((states<0)|(states>3)):
             raise ValueError('declared cached body observation states required')
         uncertainty = float(np.mean(np.asarray([.08,0.,.32,.24])[states.astype(int)]))
-    return dict(scale=float(scale),salience=float(persistence),visibility_uncertainty=uncertainty)
+    position=0.
+    if projected_center is not None and not formation:
+        x,y=map(float,projected_center)
+        position=2.*max(0.,.15-x,x-.85)+2.5*max(0.,.18-y,y-.55)
+    return dict(scale=float(scale),salience=float(persistence),visibility_uncertainty=uncertainty,
+        framing_position=float(position))

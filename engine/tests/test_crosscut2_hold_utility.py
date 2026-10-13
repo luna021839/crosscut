@@ -57,6 +57,20 @@ def test_comfortable_native_face_is_not_zoomed_to_fill_point_twenty():
     assert camera.zoom==1.
 
 
+def test_optional_alignment_camera_can_fit_size_without_blind_native_zoom_reward():
+    head=np.array([.5,.3,.16,.95]);support=np.zeros((2,8,3))
+    native=clamped_camera(head,2.,support)
+    aligned=clamped_camera(head,2.,support,alignment_target=.24)
+    assert native.zoom==1. and aligned.zoom>1.
+    assert soft_hold_utility(.16,aligned.zoom)['scale']==soft_hold_utility(.16)['scale']
+
+
+def test_signage_framing_with_low_subject_receives_finite_native_position_cost():
+    center=soft_hold_utility(.16,projected_center=(.5,.3))
+    low=soft_hold_utility(.16,projected_center=(.5,.85))
+    assert low['framing_position']>center['framing_position']
+
+
 def test_cached_body_failures_reach_even_native_candidate_hold_utility():
     banks=[bank(),bank()];nodes=np.array([0,10,20,30])
     poses=[np.zeros((4,4,3,8,3)) for _ in banks]

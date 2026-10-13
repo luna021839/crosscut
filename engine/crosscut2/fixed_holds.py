@@ -15,7 +15,7 @@ import numpy as np
 
 from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack, RenderSegment
 from .action_geometry import (action_crop_cost, compare_action, compare_screen_motion,
-    normalized_body, synchronous_velocity)
+    normalized_body, synchronous_velocity, complete_arm_motion)
 from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
 from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility
@@ -70,7 +70,7 @@ def local_actor_hypotheses(bank, *, maximum_clusters=12, minimum_cosine=.55, amb
     return labels, len(prototypes)
 
 
-def clamped_camera(head, cap, support):
+def clamped_camera(head, cap, support, *, alignment_target=None):
     """Small fixed family: fit a focal head while preserving observed action.
 
     Unknown hands impose no fabricated clipping and no all-source ban. Native
@@ -78,7 +78,7 @@ def clamped_camera(head, cap, support):
     """
     if head[2] < .035:
         return Camera()
-    goal = DEFAULT_POLICY.focal_lower
+    goal = DEFAULT_POLICY.focal_lower if alignment_target is None else alignment_target
     desired = min(cap, max(1., goal / float(head[2])))
     points = np.asarray(support, float).reshape(2, 8, 3)
     visible = (points[:, :, 2] >= .3) & (points[:, :, :2] >= 0).all(2) & (points[:, :, :2] <= 1).all(2)
@@ -100,7 +100,8 @@ def clamped_camera(head, cap, support):
         center = .5 + delta * min(1., .25 / max(1e-12, float(np.linalg.norm(delta))))
         camera = Camera(float(zoom), float(center[0]), float(center[1]))
         # There is no enlargement reward inside the declared comfortable band.
-        cost = 1.4 * max(0.,math.log(goal / (float(head[2]) * zoom))) + .65 * math.log(zoom)
+        residual=math.log(goal / (float(head[2]) * zoom))
+        cost = 1.4 * (max(0.,residual) if alignment_target is None else abs(residual)) + .65 * math.log(zoom)
         cost += float(action_crop_cost([zoom], [center], points)[0])
         cost += 6. * max(0., float(head[2]) * zoom - max(.24, float(head[2])))
         candidates.append((cost, zoom, camera))
@@ -122,7 +123,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
         cluster_counts.append(count)
         events = np.array([],int) if source_events is None else source_events[source]
         salience = source_local_salience(bank,labels,nodes,events,fps=fps)
-        for actor, family in [(None, family) for family in ('native', 'action_fit')] + [
+        for actor, family in [(None, family) for family in ('native', 'action_fit','align_medium','align_close')] + [
                 (a, family) for a in range(count) for family in ('native', 'action_fit')]:
             heads = np.zeros((len(nodes), 2, 4), float)
             vectors = np.zeros((len(nodes), 2, 128), float)
@@ -135,7 +136,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             observed = np.zeros((len(nodes), 2), bool)
             owner = np.full((len(nodes),2),-1,np.int16)
             utility_parts = {key:np.zeros((len(nodes),2)) for key in ('scale','salience','visibility_uncertainty',
-                'ownership_uncertainty','crop_effort','crop_clipping')}
+                'ownership_uncertainty','crop_effort','crop_clipping','framing_position')}
             utility_parts['scale'][:]=1.2
             for n in range(len(nodes)):
                 for side in (0, 1):
@@ -166,11 +167,13 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                     vectors[n, side] = bank['vectors'][n, side, index]
                     support = np.zeros((2, 8, 3)) if poses is None else poses[source][n, side * 2:side * 2 + 2, index]
                     body[n, side * 2:side * 2 + 2] = support
-                    camera = Camera() if family == 'native' else clamped_camera(head, bank['zoom_cap'], support)
+                    target={'align_medium':.18,'align_close':.24}.get(family)
+                    camera = Camera() if family == 'native' else clamped_camera(head, bank['zoom_cap'], support,
+                        alignment_target=target)
                     cameras[n, side] = (camera.zoom, camera.x, camera.y)
                     cached = None if body_states is None else body_states[source][n,side*2:side*2+2,index]
                     parts=soft_hold_utility(float(head[2]),camera.zoom,
-                        salience=salience[n,side,index],body_states=cached)
+                        salience=salience[n,side,index],body_states=cached,projected_center=camera.project(head[:2]))
                     for key,value in parts.items():utility_parts[key][n,side]=value
                     quality[n,side]=sum(parts.values())
                     if actor is None:
@@ -229,8 +232,12 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                 projected[n, :, :, :2] = .5 + selected[:, None, :1] * (body[n, :, :, :2] - selected[:, None, 1:])
             motion = np.zeros((len(nodes), 2, 8, 2))
             motion_valid = np.zeros((len(nodes), 2, 8), bool)
+            arm_motion=np.zeros_like(motion);arm_valid=np.zeros_like(motion_valid)
             for n in range(len(nodes)):
                 for window in (0, 1):
+                    if (body[n,2*window,:,2]>=.3).any() and (body[n,2*window+1,:,2]>=.3).any():
+                        arm_motion[n,window],arm_valid[n,window]=complete_arm_motion(
+                            body[n,2*window],body[n,2*window+1],seconds=6/fps)
                     early, ev = normalized_body(body[n, 2*window])
                     late, lv = normalized_body(body[n, 2*window+1])
                     if early is not None and late is not None:
@@ -252,8 +259,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                 for n, tick in enumerate(nodes):
                     if np.any((cuts > tick-7) & (cuts <= tick-1)):
                         motion_valid[n, 0] = False
+                        arm_valid[n,0]=False
                     if np.any((cuts > tick) & (cuts <= tick+6)):
                         motion_valid[n, 1] = False
+                        arm_valid[n,1]=False
                     if np.any((cuts > tick-1) & (cuts <= tick)):
                         continuous[n] = False
             states.append(State(source, actor, family))
@@ -261,13 +270,14 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                 indices=indices, formation=formation, formation_heads=formation_heads,
                 cameras=cameras, ticks=ticks, curve=values, unary=unary, through=through,
                 motion=motion, motion_valid=motion_valid, continuous=continuous,
+                arm_motion=arm_motion,arm_valid=arm_valid,
                 owner=owner,owner_through=owner_through,camera_through=camera_through,
                 interval_owner_switch=interval_owner_switch,utility_parts=utility_parts,
                 quality=quality,readability_tail=readability_tail))
     return tuple(states), data, cluster_counts
 
 
-def _action_refinement(action, synchronous, screen):
+def _action_refinement(action, synchronous, screen, *, moving_threshold=2):
     velocity, moving = synchronous
     agreement = 0.
     if action.phase_loss is not None:
@@ -275,7 +285,7 @@ def _action_refinement(action, synchronous, screen):
     # Keep screen position/prediction, not the confounded pre->post direction.
     spatial = screen['cost'] - (.75*screen['velocity_loss'] if screen['velocity_loss'] is not None else 0.)
     agreement += .6*(spatial-2.)
-    active = velocity is not None and moving >= 2
+    active = velocity is not None and moving >= moving_threshold
     if active and velocity > .4:
         # Contrary SAME-CLOCK action is never canceled by a pose/position credit.
         return max(0., agreement) + 2.5*(velocity-.4)
@@ -288,6 +298,11 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
         conditional_velocity_loss=None, comparable_action_joints=0, projected_screen_motion=None,
         role='unobserved', soft_cost=4.)
     if min(a[2], b[2]) <= .019:
+        # A one-sided missing port is not a measured connection of a readable
+        # foreground subject. Keep it finite, and never penalize all-UNKNOWN
+        # sources as a fabricated mismatch or forbid their native paths.
+        readable=(a[2]>=.10 and not left['formation'][n,0]) or (b[2]>=.10 and not right['formation'][n,1])
+        if readable:result['soft_cost']+=2.
         return result
     ca, cb = Camera(*left['cameras'][n, 0]), Camera(*right['cameras'][n, 1])
     displacement = float(np.linalg.norm((ca.project(a[:2]) - cb.project(b[:2])) * [1., 9/16]))
@@ -319,13 +334,26 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
     lv, rv = left['motion_valid'][n].copy(), right['motion_valid'][n].copy()
     lv[1] &= left['continuous'][n]
     rv[0] &= right['continuous'][n]
-    synchronous = synchronous_velocity(left['motion'][n], lv, right['motion'][n], rv)
-    refinement = _action_refinement(action, synchronous, screen) if action_enabled else 0.
+    la,ra=left['arm_valid'][n].copy(),right['arm_valid'][n].copy()
+    la[1] &= left['continuous'][n];ra[0] &= right['continuous'][n]
+    # Before/after windows are independent comparisons. Both sources use the
+    # SAME basis within each window; no joint vector is compared to a bone.
+    full=(lv&rv).sum(1)>=2
+    lm=np.where(full[:,None,None],left['motion'][n],left['arm_motion'][n])
+    rm=np.where(full[:,None,None],right['motion'][n],right['arm_motion'][n])
+    lvalid=np.where(full[:,None],lv,la);rvalid=np.where(full[:,None],rv,ra)
+    synchronous = synchronous_velocity(lm,lvalid,rm,rvalid)
+    arm_active=any(not full[w] and (lvalid[w]&rvalid[w]).sum()>=2 and np.any(
+        (lvalid[w]&rvalid[w]) & (np.maximum(np.linalg.norm(lm[w],axis=1),np.linalg.norm(rm[w],axis=1))>=.3))
+        for w in (0,1))
+    refinement = _action_refinement(action, synchronous, screen,moving_threshold=1 if arm_active else 2) if action_enabled else 0.
     return dict(result, geometry_loss=float(geometry), appearance_cosine=similarity, role=role,
         conditional_pose_loss=action.phase_loss, conditional_velocity_loss=action.velocity_loss,
         conditional_action_basis=action.measurement_basis, formation_layout_loss=layout,
         comparable_action_joints=action.common_joints, projected_screen_motion=screen,
         synchronous_velocity_loss=synchronous[0], action_refinement=float(refinement),
+        synchronous_basis_per_window=[('shoulder_relative_articulation' if full[w] else 'directed_complete_arm_segments')
+            if (lvalid[w]&rvalid[w]).sum()>=2 else None for w in (0,1)],
         soft_cost=float(geometry + identity + refinement))
 
 
@@ -474,11 +502,12 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         selection_seconds=monotonic()-started,cost_tensor_bytes=costs.nbytes)
 
 
-def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, action_enabled=True):
+def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, action_enabled=True, boundary_frames=None):
     segments, seams = [], []
     for i,(start,end,state_index) in enumerate(runs):
         state, row = states[state_index], data[state_index]
-        first, final = int(nodes[start]), int(nodes[end])
+        first, final = (int(nodes[start]),int(nodes[end])) if boundary_frames is None else (
+            int(boundary_frames[i]),int(boundary_frames[i+1]))
         duration = (final-first)/original.fps
         last = final-1
         knots = sorted({first,last,*[int(t) for t in row['ticks'] if first<t<last]})
@@ -495,6 +524,8 @@ def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, a
             left_state = states[left_index]
             measurement = port_cost(start,data[left_index],row,fps=original.fps,action_enabled=action_enabled)
             seams.append(dict(measurement,output_frame=first,seconds=first/original.fps,
+                sparse_observation_frame=int(nodes[start]),
+                pose_port_retimed_unvalidated=first!=int(nodes[start]),
                 left_source=left_state.source,right_source=state.source,
                 left_actor_hypothesis=left_state.actor,right_actor_hypothesis=state.actor,
                 left_camera_family=left_state.family,right_camera_family=state.family,

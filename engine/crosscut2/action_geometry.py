@@ -71,6 +71,20 @@ def _arm_segments(points):
     return delta / np.maximum(length[:, None], 1e-12), supported
 
 
+def complete_arm_motion(early, late, *, seconds):
+    """Same-clock angular motion for actually observed complete arms.
+
+    Padded slots 2:6 carry directed bones, NOT body-relative joint positions.
+    Consumers must select a common basis before comparing the two sources.
+    """
+    if not math.isfinite(seconds) or seconds<=0:
+        raise ValueError('positive complete-arm motion window required')
+    a,av=_arm_segments(np.asarray(early,float));b,bv=_arm_segments(np.asarray(late,float))
+    velocity,valid=np.zeros((8,2)),np.zeros(8,bool)
+    velocity[2:6]=(b-a)/seconds;valid[2:6]=av&bv
+    return velocity,valid
+
+
 def _compare_partial_arm(left, right, seconds):
     a, av = _arm_segments(left[1])
     b, bv = _arm_segments(right[0])
