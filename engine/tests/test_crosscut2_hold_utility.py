@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from crosscut2.fixed_holds import State, clamped_camera, make_states
-from crosscut2.hold_utility import known_switch, soft_hold_utility
+from crosscut2.hold_utility import known_switch, soft_hold_utility,native_readability_cost
 
 
 def bank():
@@ -135,3 +135,26 @@ def test_missing_actor_is_not_replaced_with_an_observed_other_actor():
     assert row['owner'][1].tolist()==[-1,-1]
     assert np.all(row['utility_parts']['ownership_uncertainty'][1] > 0)
     assert not row['heads'][1].any()
+
+
+def test_native_pixel_quality_reaches_the_actual_hold_and_dp_cost_without_source_exclusion():
+    banks=[bank(),bank()];nodes=np.array([0,10,20,30])
+    for source,value in enumerate(banks):
+        value['native_readability']=np.tile([.15,.7 if source==0 else .15,0.,100.],(4,2,8,1))
+        value['native_readability_valid']=value['heads'][:,:,:,2]>.019
+    states,rows,_=make_states(nodes,banks,None,fps=10)
+    a=rows[states.index(State(0,None,'native'))];b=rows[states.index(State(1,None,'native'))]
+    assert total(b,nodes)>total(a,nodes)+1.
+    assert b['utility_parts']['native_readability'].max()>0 and np.isfinite(b['unary']).all()
+
+
+def test_missing_quality_is_not_imputed_and_native_saturation_is_finite():
+    assert native_readability_cost(None)==0
+    assert 0 < native_readability_cost([0,0,1,100]) <= 2
+    with pytest.raises(ValueError):native_readability_cost([.1,float('nan'),0,100])
+
+
+def test_digital_zoom_does_not_change_the_same_native_readability_cost():
+    observed=[.1,.35,0,100]
+    assert soft_hold_utility(.12,1.,native_readability=observed)['native_readability']==(
+        soft_hold_utility(.12,1.35,native_readability=observed)['native_readability'])

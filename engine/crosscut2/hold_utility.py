@@ -18,6 +18,22 @@ class HoldPolicy:
 DEFAULT_POLICY = HoldPolicy()
 
 
+def native_readability_cost(values):
+    """Finite native-pixel preference, never a measured editing-quality score.
+
+    Digital magnification is deliberately absent: matching zoom is allowed.
+    Missing face observations remain unmeasured, not an inferred occlusion.
+    """
+    if values is None:return 0.
+    contrast,edge,clipped,native_height=map(float,values)
+    if (not np.isfinite([contrast,edge,clipped,native_height]).all()
+            or min(contrast,edge,clipped,native_height)<0 or clipped>1):
+        raise ValueError('finite declared native readability observations required')
+    blur=1.4*max(0.,1.-edge/.5)
+    exposure=.3*max(0.,1.-contrast/.075)+.5*clipped
+    return min(2.,blur+exposure)
+
+
 def known_switch(a, b):
     """An observed local-label change is a soft event; equal -1 is not a match."""
     a, b = np.asarray(a), np.asarray(b)
@@ -55,7 +71,7 @@ def source_local_salience(bank, labels, nodes, source_events, *, fps, radius_sec
 
 
 def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_states=None, projected_center=None,
-                      policy=DEFAULT_POLICY):
+                      native_readability=None,policy=DEFAULT_POLICY):
     """Continuous role/size preference plus finite observation uncertainty.
 
     State 0 is unattempted, 1 observed, 2 association failed, 3 other failure.
@@ -80,4 +96,4 @@ def soft_hold_utility(height, zoom=1., *, formation=False, salience=1., body_sta
         x,y=map(float,projected_center)
         position=2.*max(0.,.15-x,x-.85)+2.5*max(0.,.18-y,y-.55)
     return dict(scale=float(scale),salience=float(persistence),visibility_uncertainty=uncertainty,
-        framing_position=float(position))
+        framing_position=float(position),native_readability=native_readability_cost(native_readability))

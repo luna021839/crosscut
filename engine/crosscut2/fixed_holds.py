@@ -18,7 +18,7 @@ from .action_geometry import (action_crop_cost, compare_action, compare_screen_m
     normalized_body, synchronous_velocity, complete_arm_motion)
 from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
-from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility
+from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility,native_readability_cost
 
 MISSING_PORT_COST = 6.  # Finite uncertainty, not a measured identity/pose mismatch.
 
@@ -121,6 +121,11 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             np.asarray(value).shape!=(len(nodes),4,3) or np.any((value<0)|(value>3)) for value in body_states)):
         raise ValueError('source-bound cached body observation states required')
     for source, bank in enumerate(banks):
+        native_quality=bank.get('native_readability');native_quality_valid=bank.get('native_readability_valid')
+        if native_quality is not None and (np.asarray(native_quality).shape!=bank['heads'].shape
+                or np.asarray(native_quality_valid).shape!=bank['heads'].shape[:3]
+                or not np.isfinite(native_quality).all()):
+            raise ValueError('source-bound native readability domain required')
         labels, count = local_actor_hypotheses(bank)
         cluster_counts.append(count)
         events = np.array([],int) if source_events is None else source_events[source]
@@ -138,7 +143,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             observed = np.zeros((len(nodes), 2), bool)
             owner = np.full((len(nodes),2),-1,np.int16)
             utility_parts = {key:np.zeros((len(nodes),2)) for key in ('scale','salience','visibility_uncertainty',
-                'ownership_uncertainty','crop_effort','crop_clipping','framing_position')}
+                'ownership_uncertainty','crop_effort','crop_clipping','framing_position','native_readability')}
             utility_parts['scale'][:]=1.2
             for n in range(len(nodes)):
                 for side in (0, 1):
@@ -151,6 +156,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                             formation_heads[n, side, :len(group)] = group[np.argsort(group[:, 0])]
                             heads[n, side] = (*group[:, :2].mean(0), np.median(group[:, 2]), .9)
                             parts=soft_hold_utility(float(heads[n,side,2]),formation=True)
+                            if native_quality is not None:
+                                relevant=(visible[:,2]>=.55*np.median(group[:,2]))&native_quality_valid[n,side]
+                                if relevant.any():parts['native_readability']=float(np.mean([
+                                    native_readability_cost(value) for value in native_quality[n,side,relevant]]))
                             quality[n,side]=sum(parts.values())
                             for key,value in parts.items():utility_parts[key][n,side]=value
                             observed[n, side] = True
@@ -181,7 +190,9 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                     cameras[n, side] = (camera.zoom, camera.x, camera.y)
                     cached = None if body_states is None else body_states[source][n,side*2:side*2+2,index]
                     parts=soft_hold_utility(float(head[2]),camera.zoom,
-                        salience=salience[n,side,index],body_states=cached,projected_center=camera.project(head[:2]))
+                        salience=salience[n,side,index],body_states=cached,projected_center=camera.project(head[:2]),
+                        native_readability=None if native_quality is None or not native_quality_valid[n,side,index]
+                            else native_quality[n,side,index])
                     for key,value in parts.items():utility_parts[key][n,side]=value
                     quality[n,side]=sum(parts.values())
                     if actor is None:
@@ -515,6 +526,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         actor_camera_endpoint_state_retained=True,whole_hold_observed_action_support_consumed=True,
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
         cached_body_states_consumed=body_states is not None,
+        native_readability_consumed=all('native_readability' in bank for bank in banks),
+        native_readability_is_not_occlusion_or_quality_certificate=True,
         body_states_are_not_occlusion_certificates=True,
         missing_port_uncertainty_cost=MISSING_PORT_COST,
         missing_ports_and_broadcast_costs_consumed_before_dp=True,

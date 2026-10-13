@@ -288,12 +288,16 @@ def main():
         help='Existing pinned RTMPose asset; optional conditional action costs, not named actor authority')
     parser.add_argument('--fixed-actor-camera-holds', action='store_true',
         help='Keep anonymous actor and fixed full-hold camera states inside programme selection')
+    parser.add_argument('--native-source-readability',action='store_true',
+        help='Reuse source-bound full-resolution scalar face-quality observations in fixed holds')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--resume-render', action='store_true',
         help='Render the existing exact source-bound plan without re-observation or selection')
     parser.add_argument('--preview-height', type=int, choices=(540, 1080), default=540)
     parser.add_argument('--maximum-perception-seconds', type=float, default=900.)
     args = parser.parse_args()
+    if args.native_source_readability and not args.fixed_actor_camera_holds:
+        raise ValueError('native readability requires the fixed hold consumer')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -335,6 +339,11 @@ def main():
         fps=original.fps, nodes=nodes, cache=args.cache, models=args.models, check=check,
         maximum_seconds=args.maximum_perception_seconds)
     camera_census = census(original.sources, cache=args.cache.parent / 'crosscut2-camera-census-v1', check=check)
+    readability_receipts=[]
+    if args.native_source_readability:
+        from .native_readability import measure_native_readability
+        banks,readability_receipts=measure_native_readability(sources=original.sources,banks=banks,
+            cache=args.cache.parent/'crosscut2-native-readability-v1',check=check,maximum_seconds=300.)
     poses, body_receipts, body_states = (None, [], None) if args.body_pose_model is None else measure_pose_grid(
         sources=original.sources, warps=warps, nodes=nodes, master_start=original.master_audio_start,
         fps=original.fps, banks=banks, models=args.models, body_model=args.body_pose_model,
@@ -372,6 +381,8 @@ def main():
     # Serialization failures must not leave a truncated file masquerading as
     # a source-bound saved recipe and block an otherwise warm-cache retry.
     encoded = json.dumps(dict(render_plan=plan.to_json(), sparse_perception=receipts,
+            native_readability_observations=readability_receipts,
+            stage_edit_transformer_used=False,
             conditional_body_perception=body_receipts,
             conditional_body_action_costs_enabled=poses is not None,
             fixed_actor_camera_hold_receipt=fixed_receipt,
