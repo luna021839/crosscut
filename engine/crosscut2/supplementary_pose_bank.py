@@ -53,6 +53,10 @@ def _frames(path,natives,*,check):
 
 
 _DECODER_IMPLEMENTATION=hashlib.sha256((inspect.getsource(_frames)+inspect.getsource(read_frames)).encode()).hexdigest()
+# This legacy cache field binds the CANONICAL raster reference above, not the
+# operational seek strategy. Verified sparse seeking must produce bit-identical
+# native select(n)+area pixels; actual execution provenance is reported below.
+# Keeping this reference unchanged preserves completed raw model inputs.
 
 
 def observe_requests(path,requests,*,sensor,cache,source_clock,check,maximum_seconds=600.,maximum_calls=6000):
@@ -77,6 +81,8 @@ def observe_requests(path,requests,*,sensor,cache,source_clock,check,maximum_sec
     key=hashlib.sha256(binding.encode()).hexdigest();cache=Path(cache);check()
     cache.mkdir(parents=True,exist_ok=True);target=cache/(key+'.npz')
     calls=0;next_check=started;written=0;dirty=False;values={}
+    decode_receipt=dict(strategy='warm_raw_cache_only',full_source_decode_used=False,
+        cache_key_uses_unchanged_canonical_raster_reference=True)
     def live():
         nonlocal next_check
         now=monotonic()
@@ -122,7 +128,23 @@ def observe_requests(path,requests,*,sensor,cache,source_clock,check,maximum_sec
         if sum(map(len,needed.values()))>maximum_calls:
             raise ValueError('supplementary request exceeds declared neural call allowance')
         if needed:
-            for native,pixels in _frames(path,sorted(needed),check=live):
+            from . import sparse_native_frames
+            wanted=sorted(needed)
+            try:
+                clock=sparse_native_frames.probe(path,check=live)
+                if clock.count!=source_clock['frame_count'] or not np.isclose(float(clock.rate),source_clock['fps'],rtol=1e-8,atol=0.):
+                    raise sparse_native_frames.UnsupportedSeek('source census and verified packet clock differ')
+                sparse_native_frames.windows(wanted,clock)
+            except sparse_native_frames.UnsupportedSeek as error:
+                # Preserve support for unproven media, without calling this
+                # fallback a bounded local seek or excluding the source.
+                decode_receipt.update(strategy='explicit_legacy_sequential_fallback',
+                    full_source_decode_used=True,sparse_unavailable_reason=str(error))
+                rasters=_frames(path,wanted,check=live)
+            else:
+                rasters=sparse_native_frames.frames(path,wanted,clock=clock,check=live,
+                    receipt=decode_receipt,maximum_seconds=min(120.,maximum_seconds))
+            for native,pixels in rasters:
                 for cell,box in needed[native].items():
                     live();observation=sensor.describe(pixels,bbox_xywh=box);calls+=1
                     raw=np.asarray(observation.wholebody_xyc,np.float32)
@@ -140,6 +162,7 @@ def observe_requests(path,requests,*,sensor,cache,source_clock,check,maximum_sec
             completed_checkpointed_inputs_survive_interrupt=True,checkpoint_every_inputs=16,
             written_checkpoints=written,cache_format='atomic_portable_npz',base_body_cache_invalidated=False,
             model=rtmw_pose.MODEL_SHA256,raw_peaks_are_not_probabilities=True,
+            native_raster_execution=decode_receipt,
             elapsed_seconds=monotonic()-started,cache_file=str(target))
     finally:checkpoint()
 

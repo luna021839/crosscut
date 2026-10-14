@@ -28,6 +28,7 @@ def test_duplicate_physical_inputs_and_new_grid_reuse_without_model_or_decode(tm
     raw,warm=bank.observe_requests(sensor=SimpleNamespace(describe=forbidden),**p)
     assert warm['new_neural_calls']==0 and warm['reused_neural_inputs']==1
     assert (raw[0][:,2]==np.float32(4.2)).all() and len(list(p['cache'].glob('*.npz')))==1
+    assert warm['native_raster_execution']['strategy']=='warm_raw_cache_only'
 
 
 def test_interrupted_source_retains_completed_cells_without_fake_success(tmp_path,monkeypatch):
@@ -49,6 +50,22 @@ def test_bad_native_range_or_excess_work_does_not_start_network(tmp_path,monkeyp
     p=args(tmp_path);sensor=Sensor();p['requests']=[(12,p['requests'][0][1])]
     with pytest.raises(ValueError,match='actual native'):bank.observe_requests(sensor=sensor,**p)
     assert sensor.calls==0
+
+
+def test_preexisting_completed_raw_inputs_do_not_probe_or_rewrite_when_sparse_reader_is_added(tmp_path,monkeypatch):
+    from crosscut2 import sparse_native_frames as sparse
+    import hashlib
+    p=args(tmp_path)
+    monkeypatch.setattr(bank,'_frames',lambda path,natives,check:iter((n,np.zeros((540,960,3),np.uint8)) for n in natives))
+    _,cold=bank.observe_requests(sensor=Sensor(),**p)
+    saved=next(p['cache'].glob('*.npz'));before=hashlib.sha256(saved.read_bytes()).hexdigest()
+    def forbidden(*a,**kw):raise AssertionError('warm cache must not probe/decode/infer')
+    monkeypatch.setattr(sparse,'probe',forbidden);monkeypatch.setattr(sparse,'frames',forbidden)
+    monkeypatch.setattr(bank,'_frames',forbidden)
+    _,warm=bank.observe_requests(sensor=type('NoNN',(),{'describe':forbidden})(),**p)
+    assert warm['new_neural_calls']==0 and warm['written_checkpoints']==0
+    assert hashlib.sha256(saved.read_bytes()).hexdigest()==before
+    assert warm['cache_file']==cold['cache_file']
 
 
 def test_failed_grid_window_uses_one_model_on_all_four_flanks_not_a_blend(tmp_path,monkeypatch):
