@@ -95,6 +95,10 @@ def test_selected_cost_decomposition_matches_single_and_multi_source_dp():
         _,_,_,score,receipt=select_fixed_holds(nodes,[bank() for _ in range(count)],None,fps=10,
             source_events=[np.array([15]) for _ in range(count)],broadcast_slots=None,check=lambda:None)
         assert receipt['selected_hold_cost_decomposition'][-1]['cumulative_cost']==pytest.approx(score)
+        assert receipt['whole_song_quadratic_tensor_allocated'] is False
+        assert receipt['port_matrix_nodes_built'] == (len(nodes)-2 if count>1 else 0)
+        assert receipt['cost_tensor_bytes'] == (receipt['fixed_states']**2*4 if count>1 else 0)
+        assert receipt['actor_owned_alignment_families_available'] is True
 
 
 def test_dp_consumes_the_same_missing_port_and_broadcast_cost_it_reports(monkeypatch):
@@ -103,7 +107,12 @@ def test_dp_consumes_the_same_missing_port_and_broadcast_cost_it_reports(monkeyp
     banks[1]['heads'][1,1]=0;banks[1]['vectors'][1,1]=0
     captured={};original=fixed.coupled_semi_markov
     def observe(*args,**kwargs):
-        captured['costs']=kwargs['seam_cost'].copy()
+        producer=kwargs['seam_cost']
+        def capture(node):
+            matrix=producer(node)
+            captured[node]=matrix.copy()
+            return matrix
+        kwargs['seam_cost']=capture
         return original(*args,**kwargs)
     monkeypatch.setattr(fixed,'coupled_semi_markov',observe)
     _,states,rows,_,_=fixed.select_fixed_holds(nodes,banks,None,fps=10,
@@ -111,13 +120,13 @@ def test_dp_consumes_the_same_missing_port_and_broadcast_cost_it_reports(monkeyp
     a=states.index(State(0,None,'native'));b=states.index(State(1,None,'native'))
     reported=fixed.port_cost(1,rows[a],rows[b],fps=10)
     assert reported['role']=='unobserved'
-    assert captured['costs'][1,a,b]==pytest.approx(reported['soft_cost']+.9)
+    assert captured[1][a,b]==pytest.approx(reported['soft_cost']+.9)
     for n in (1,2):
         for a,sa in enumerate(states):
             for b,sb in enumerate(states):
                 if sa.source==sb.source:continue
                 expected=fixed.port_cost(n,rows[a],rows[b],fps=10)['soft_cost']+.9
-                assert captured['costs'][n,a,b]==pytest.approx(expected)
+                assert captured[n][a,b]==pytest.approx(expected)
 
 
 def test_overlarge_source_face_is_not_free_just_because_digital_zoom_is_one():

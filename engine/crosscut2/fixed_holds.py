@@ -33,15 +33,49 @@ class State:
 def local_actor_hypotheses(bank, *, maximum_clusters=12, minimum_cosine=.55, ambiguity_margin=.03):
     """Reuse anonymous native appearance; order changes do not change owners.
 
-    Gaps remain -1 and a later unique appearance can reacquire its local ID.
-    No prototype is exported, no cross-model/gallery/name probability is used.
-    The finite cluster budget affects focal hypotheses, not source eligibility.
+    Recurrent native appearances seed the finite hypothesis budget BEFORE
+    labeling. First-frame singletons cannot consume every slot permanently.
+    Adjacent exit/entry frames alone are not independent recurrence. Gaps
+    remain -1; no gallery, names, nearest-position fallback or forced six-way
+    assignment is used. This offline hypothesis is not a dense track certificate.
     """
     vectors = bank['vectors']
     if vectors.shape != (len(bank['heads']), 2, 3, 128) or not np.isfinite(vectors).all():
         raise ValueError('the bound anonymous source appearance bank is required')
     labels = np.full(vectors.shape[:3], -1, np.int16)
-    prototypes, repeated = [], {}
+    # The wider bounded draft pass is not the DP hypothesis set. Its sole job
+    # is to allocate those slots by real recurrence instead of arrival order.
+    draft, supports, seen = [], [], set()
+    for n in range(len(vectors)):
+        for side in (0,1):
+            frame = int(bank['native_indices'][n,side])
+            if frame in seen: continue
+            seen.add(frame)
+            used = set()
+            for head,value in enumerate(vectors[n,side]):
+                if bank['heads'][n,side,head,2] < .035 or np.linalg.norm(value) < .5:
+                    continue
+                scores = np.array([float(value @ prototype) for prototype in draft])
+                order = np.argsort(-scores)
+                owner = None
+                if len(order) and scores[order[0]] >= minimum_cosine:
+                    best = int(order[0])
+                    ambiguous = len(order)>1 and scores[best]-scores[order[1]] < ambiguity_margin
+                    if best not in used and not ambiguous: owner=best
+                elif len(draft) < max(128,maximum_clusters):
+                    owner=len(draft)
+                    draft.append(value.astype(float).copy())
+                    supports.append([])
+                if owner is not None:
+                    supports[owner].append(frame)
+                    used.add(owner)
+                    updated=.9*draft[owner]+.1*value
+                    draft[owner]=updated/max(1e-9,float(np.linalg.norm(updated)))
+    eligible=[i for i,frames in enumerate(supports) if max(frames)-min(frames)>=2]
+    chosen=sorted(eligible,key=lambda i:(-len(supports[i]),i))[:maximum_clusters]
+    chosen.sort()  # Preserve first-observed local numbering, not density rank.
+    prototypes=[draft[i].copy() for i in chosen]
+    repeated = {}
     for n in range(len(vectors)):
         for side in (0, 1):
             key = int(bank['native_indices'][n, side])
@@ -60,9 +94,6 @@ def local_actor_hypotheses(bank, *, maximum_clusters=12, minimum_cosine=.55, amb
                     ambiguous = len(order) > 1 and scores[best] - scores[order[1]] < ambiguity_margin
                     if best not in used and not ambiguous:
                         owner = best
-                elif len(prototypes) < maximum_clusters:
-                    owner = len(prototypes)
-                    prototypes.append(value.astype(float).copy())
                 if owner is not None:
                     labels[n, side, head] = owner
                     used.add(owner)
@@ -130,8 +161,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
         cluster_counts.append(count)
         events = np.array([],int) if source_events is None else source_events[source]
         salience = source_local_salience(bank,labels,nodes,events,fps=fps)
-        for actor, family in [(None, family) for family in ('native', 'action_fit','align_medium','align_close')] + [
-                (a, family) for a in range(count) for family in ('native', 'action_fit')]:
+        # Alignment cannot require surrendering an observed local actor to
+        # NULL/head-0 ownership. Freeze the same alternatives for every owner.
+        families = ('native', 'action_fit', 'align_medium', 'align_close')
+        for actor, family in [(a, f) for a in (None, *range(count)) for f in families]:
             heads = np.zeros((len(nodes), 2, 4), float)
             vectors = np.zeros((len(nodes), 2, 128), float)
             body = np.zeros((len(nodes), 4, 8, 3), float)
@@ -380,16 +413,21 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
         minimum_hold=.9, maximum_hold=4.8, target_hold=2.4, return_penalty=.7, through=None):
     """Exact fixed-curve DP retains actor/camera state AND previous source.
 
+    ``seam_cost`` may be a dense tensor or a node->matrix callable. A callable
+    is consumed once per reached node; short/long incoming summaries are kept
+    instead of retaining every quadratic port matrix for the whole song.
     Equivalent-state dominance is safe because every state's entry/exit camera
     and one-sided motion port at a node were fixed before search, independent
     of that hold's duration. Do not replace state by source-only argmin.
     """
     nodes, state_sources = np.asarray(nodes, int), np.asarray(state_sources, int)
     q, sources = len(state_sources), int(state_sources.max()) + 1
+    lazy_ports = callable(seam_cost)
     if (nodes[0] != 0 or np.any(np.diff(nodes) <= 0) or not 0 < minimum_hold <= maximum_hold
             or not math.isfinite(fps) or fps <= 0 or unary.shape != (q, len(nodes)-1)
-            or seam_cost.shape != (len(nodes), q, q) or not np.isfinite(unary).all()
-            or not np.isfinite(seam_cost).all() or np.any(state_sources < 0)):
+            or not np.isfinite(unary).all() or np.any(state_sources < 0)
+            or (not lazy_ports and (seam_cost.shape != (len(nodes), q, q)
+                or not np.isfinite(seam_cost).all()))):
         raise ValueError('finite fixed-state complete programme graph required')
     through = np.zeros((q, len(nodes))) if through is None else np.asarray(through, float)
     if through.shape != (q, len(nodes)) or not np.isfinite(through).all() or np.any(through < 0):
@@ -407,21 +445,27 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
     def incoming(start, short):
         key = (start, short)
         if key in incoming_cache: return incoming_cache[key]
-        values, old_state, old_prior = np.full((q,sources), np.inf), np.full((q,sources),-1,int), np.full((q,sources),-1,int)
-        for new_source, targets in enumerate(by_source):
-            shifted = cost[start].copy()
-            if short: shifted[:, new_source] += return_penalty
-            priors = np.argmin(shifted, axis=1)
-            scores = shifted[np.arange(q), priors]
-            for old_source, old in enumerate(by_source):
-                if old_source == new_source or not len(old) or not len(targets): continue
-                joined = scores[old, None] + seam_cost[start][np.ix_(old, targets)]
-                arg = np.argmin(joined, axis=0)
-                picked = old[arg]
-                values[targets, old_source] = joined[arg, np.arange(len(targets))]
-                old_state[targets, old_source] = picked
-                old_prior[targets, old_source] = priors[picked]
-        incoming_cache[key] = values, old_state, old_prior
+        matrix = np.asarray(seam_cost(start) if lazy_ports else seam_cost[start])
+        if matrix.shape != (q,q) or not np.isfinite(matrix).all():
+            raise ValueError('finite fixed-state node port matrix required')
+        # cost[start] is final before any later end reaches it. Both duration
+        # classes can therefore be summarized now without rebuilding the ports.
+        for short_class in (False, True):
+            values, old_state, old_prior = np.full((q,sources), np.inf), np.full((q,sources),-1,int), np.full((q,sources),-1,int)
+            for new_source, targets in enumerate(by_source):
+                shifted = cost[start].copy()
+                if short_class: shifted[:, new_source] += return_penalty
+                priors = np.argmin(shifted, axis=1)
+                scores = shifted[np.arange(q), priors]
+                for old_source, old in enumerate(by_source):
+                    if old_source == new_source or not len(old) or not len(targets): continue
+                    joined = scores[old, None] + matrix[np.ix_(old, targets)]
+                    arg = np.argmin(joined, axis=0)
+                    picked = old[arg]
+                    values[targets, old_source] = joined[arg, np.arange(len(targets))]
+                    old_state[targets, old_source] = picked
+                    old_prior[targets, old_source] = priors[picked]
+            incoming_cache[start,short_class] = values, old_state, old_prior
         return incoming_cache[key]
     for end in range(1, len(nodes)):
         for start in range(end-1, -1, -1):
@@ -460,10 +504,9 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps,
         source_events=source_events,body_states=body_states)
     count = len(states)
-    tensor_bytes = len(nodes) * count * count * np.dtype(np.float32).itemsize
-    if tensor_bytes > 200 * 1024**2:
-        raise ValueError('fixed-state scalar cost tensor exceeded its explicit 200MiB bound')
-    costs = np.full((len(nodes),count,count), MISSING_PORT_COST, np.float32)
+    matrix_bytes = count * count * np.dtype(np.float32).itemsize
+    if matrix_bytes > 200 * 1024**2:
+        raise ValueError('fixed-state node port matrix exceeded its explicit 200MiB bound')
     same_show = np.zeros((count,count),np.float32)
     if broadcast_slots is not None:
         for a,sa in enumerate(states):
@@ -471,10 +514,13 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
                 if sa.source != sb.source and broadcast_slots[sa.source] is not None and (
                         broadcast_slots[sa.source]==broadcast_slots[sb.source]):
                     same_show[a,b]=.9
-    for n in range(1,len(nodes)-1):
+    built_nodes = 0
+    def costs(n):
+        nonlocal built_nodes
         check()
         if monotonic()-started > 240.:
             raise TimeoutError('single fixed actor/camera selection exceeded 240 seconds')
+        matrix = np.full((count,count), MISSING_PORT_COST, np.float32)
         # Unobserved endpoints share the finite missing port, not an NN veto.
         left = [i for i,d in enumerate(data) if d['heads'][n,0,2] > .019]
         right = [i for i,d in enumerate(data) if d['heads'][n,1,2] > .019]
@@ -482,16 +528,24 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         right_readable=np.array([d['heads'][n,1,2]>=.055 and not d['formation'][n,1] for d in data])
         # The observed-only nested loop must not bypass missing-port costs.
         # Known/known cells below replace this default; all UNKNOWN stay finite.
-        costs[n] += 2.*(left_readable[:,None] | right_readable[None,:])
+        matrix += 2.*(left_readable[:,None] | right_readable[None,:])
         for a in left:
             for b in right:
                 if states[a].source == states[b].source: continue
                 value = port_cost(n,data[a],data[b],fps=fps,action_enabled=action_enabled)['soft_cost']
-                costs[n,a,b] = value
-        costs[n] += same_show
-        if n % 40 == 0:
-            print(__import__('json').dumps(dict(phase='fixed_actor_camera_ports',nodes=n,total_nodes=len(nodes),
+                matrix[a,b] = value
+        matrix += same_show
+        built_nodes += 1
+        if built_nodes % 40 == 0:
+            print(__import__('json').dumps(dict(phase='fixed_actor_camera_ports',nodes=built_nodes,total_nodes=len(nodes),
                 fixed_states=count,elapsed_seconds=monotonic()-started)),flush=True)
+        return matrix
+
+    def selected_port(n, left, right):
+        # Recompute only selected scalar ports for the cost report, with the
+        # same float32 rounding as the transient matrix. Do not rebuild it.
+        value = port_cost(n,data[left],data[right],fps=fps,action_enabled=action_enabled)['soft_cost']
+        return float(np.float32(value) + same_show[left,right])
     runs, score = coupled_semi_markov(nodes, fps=fps, unary=np.array([d['unary'] for d in data]),
         seam_cost=costs, state_sources=np.array([s.source for s in states]), source_events=source_events,
         through=np.array([d['through'] for d in data]))
@@ -510,11 +564,11 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         parts['owner_through']=float(row['owner_through'][start+1:end].sum())
         parts['native_fragments']=0. if len(banks)==1 else native_event_cost(nodes[start],nodes[end],source_events[state.source],fps)
         parts['duration_grammar']=0. if len(banks)==1 else .23*(duration-2.4)**2+2.*max(0.,.9-duration)
-        parts['entry_port']=0. if not i else float(costs[start,runs[i-1][2],state_index])
+        parts['entry_port']=0. if not i else selected_port(start,runs[i-1][2],state_index)
         parts['editorial_switch']=0. if not i else .35
         parts['short_source_return']=.7 if i>=2 and duration<3. and states[runs[i-2][2]].source==state.source else 0.
         prior=cumulative;cumulative+=sum(parts.values())
-        next_exit=None if i==len(runs)-1 else float(costs[end,state_index,runs[i+1][2]])
+        next_exit=None if i==len(runs)-1 else selected_port(end,state_index,runs[i+1][2])
         decomposition.append(dict(first_frame=int(nodes[start]),final_frame=int(nodes[end]),source=state.source,
             actor_hypothesis=state.actor,camera_family=state.family,prior_cumulative_cost=prior,
             cumulative_cost=cumulative,next_selected_exit_cost=next_exit,components=parts,
@@ -523,6 +577,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         raise AssertionError('selected programme cost decomposition differs from exact DP objective')
     return runs, states, data, score, dict(fixed_states=count,source_local_appearance_clusters=cluster_counts,
         source_local_actor_hypotheses_are_not_certified=True,camera_alternatives_fixed_before_dp=True,
+        actor_budget_seeded_by_recurrent_native_observations=True,
         actor_camera_endpoint_state_retained=True,whole_hold_observed_action_support_consumed=True,
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
         cached_body_states_consumed=body_states is not None,
@@ -533,7 +588,11 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         missing_ports_and_broadcast_costs_consumed_before_dp=True,
         known_owner_changes_are_finite_events=True,
         selected_hold_cost_decomposition=decomposition,
-        selection_seconds=monotonic()-started,cost_tensor_bytes=costs.nbytes)
+        selection_seconds=monotonic()-started,cost_tensor_bytes=matrix_bytes if built_nodes else 0,
+        port_matrix_nodes_built=built_nodes,port_matrices_built_once_per_node=True,
+        whole_song_quadratic_tensor_allocated=False,
+        eager_port_tensor_bytes_avoided=len(nodes)*matrix_bytes,
+        actor_owned_alignment_families_available=True)
 
 
 def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, action_enabled=True, boundary_frames=None):

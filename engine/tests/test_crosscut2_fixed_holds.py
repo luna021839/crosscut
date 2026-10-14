@@ -29,6 +29,18 @@ def test_source_actor_hypothesis_survives_detector_order_change_and_null_reacqui
     assert labels[3,0,0] == labels[0,0,0]
 
 
+def test_early_adjacent_frame_singletons_do_not_exhaust_persistent_actor_budget():
+    bank = bank_fixture(6)
+    bank['vectors'][:] = 0
+    bank['vectors'][0,:,0,0] = 1
+    bank['vectors'][1,:,0,1] = 1
+    bank['vectors'][2:,:,0,2] = 1
+    labels,count = local_actor_hypotheses(bank,maximum_clusters=2)
+    assert count == 1
+    assert (labels[:2,:,0] == -1).all()
+    assert (labels[2:,:,0] == 0).all()
+
+
 def test_actor_hypothesis_budget_does_not_delete_any_physical_source():
     bank = bank_fixture()
     bank['vectors'][:] = 0
@@ -37,6 +49,56 @@ def test_actor_hypothesis_budget_does_not_delete_any_physical_source():
     assert {s.source for s in states if s.actor is None and s.family == 'native'} == {0,1}
     assert all(s.actor is None for s in states)
     assert all(np.isfinite(d['unary']).all() for d in rows)
+
+
+def test_actor_owned_states_keep_the_same_alignment_options_as_unknown_owner():
+    bank = bank_fixture()
+    bank['zoom_cap'] = 2.
+    bank['heads'][:,:,0,2] = .16
+    states, rows, _ = make_states(np.array([0,10,20,30]), [bank], None, fps=10)
+    expected = {'native', 'action_fit', 'align_medium', 'align_close'}
+    assert {s.family for s in states if s.actor == 0} == expected
+    owned = rows[states.index(State(0,0,'align_close'))]
+    unknown = rows[states.index(State(0,None,'align_close'))]
+    assert np.all(owned['owner'] == 0)
+    assert np.all(owned['cameras'][:,:,0] > 1.4)
+    assert np.array_equal(owned['cameras'], unknown['cameras'])
+
+
+def test_lazy_port_matrices_are_exact_and_built_once_for_both_duration_classes():
+    nodes = np.arange(0,81,10)
+    rng = np.random.default_rng(17)
+    unary = rng.uniform(0,1,(4,8))
+    seams = rng.uniform(0,4,(len(nodes),4,4)).astype(np.float32)
+    calls = []
+    def matrix(node):
+        calls.append(node)
+        return seams[node]
+    kwargs = dict(fps=10,unary=unary,state_sources=np.array([0,0,1,1]))
+    expected = coupled_semi_markov(nodes,seam_cost=seams,**kwargs)
+    actual = coupled_semi_markov(nodes,seam_cost=matrix,**kwargs)
+    assert actual == expected
+    assert len(calls) == len(set(calls)) == len(nodes)-2
+
+
+@pytest.mark.parametrize('bad', [np.zeros((3,4)), np.full((4,4),np.nan)])
+def test_lazy_port_matrices_validate_shape_and_finiteness_before_use(bad):
+    with pytest.raises(ValueError,match='finite fixed-state node port matrix'):
+        coupled_semi_markov(np.arange(0,41,10),fps=10,unary=np.zeros((4,4)),
+            seam_cost=lambda node: bad,state_sources=np.array([0,0,1,1]))
+
+
+def test_lazy_ports_keep_default_ten_source_full_hypothesis_domain():
+    sources = np.repeat(np.arange(10),13*4)
+    calls = []
+    def matrix(node):
+        calls.append(node)
+        return np.zeros((len(sources),len(sources)),np.float32)
+    runs,score = coupled_semi_markov(np.array([0,30,60,90]),fps=10,
+        unary=np.zeros((len(sources),3)),seam_cost=matrix,state_sources=sources)
+    assert len(sources) == 520
+    assert len(runs) == 3 and np.isfinite(score)
+    assert calls == [1,2]
 
 
 def test_camera_family_preserves_observed_inside_hold_wrists():
@@ -114,6 +176,15 @@ def test_all_unknown_action_leaves_actor_camera_graph_and_numeric_cost_identical
 def test_single_source_keeps_full_coverage_without_made_up_cross_source_cuts():
     runs,_ = coupled_semi_markov(np.arange(0,101,10),fps=10,
         unary=np.array([np.ones(10),np.full(10,2.)]),seam_cost=np.zeros((11,2,2)),
+        state_sources=np.array([0,0]))
+    assert runs == ((0,10,0),)
+
+
+def test_single_source_never_materializes_irrelevant_cross_source_ports():
+    def unused(node):
+        raise AssertionError('single-source programme must not ask for seam matrices')
+    runs,_ = coupled_semi_markov(np.arange(0,101,10),fps=10,
+        unary=np.array([np.ones(10),np.full(10,2.)]),seam_cost=unused,
         state_sources=np.array([0,0]))
     assert runs == ((0,10,0),)
 
