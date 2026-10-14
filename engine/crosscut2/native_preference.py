@@ -64,6 +64,13 @@ def prepare(p,model,*,native_ports,source_events,check):
             def exact(name,value):low[index[name]]=high[index[name]]=value
             cuts=np.asarray(source_events[s]);central=bool(np.any(cuts==tick) or tick in lookups[s])
             exact('outgoing_known_native_cut',float(central));exact('incoming_known_native_cut',float(central))
+            if not central:
+                # Exact relation of the SAME-CLOCK self-H encoder, not a
+                # measurement or imputation of an unseen face. Its geometric
+                # comparison is A[t] versus itself; exposed-face fallback is
+                # allowed only at a known central native cut. Actor continuity
+                # may still be unknown, so body/identity/activity stay bounded.
+                exact('face_position',0.);exact('face_scale',0.)
             for side,(a,b) in enumerate(((tick-7,tick-1),(tick,tick+6))):
                 if np.any((cuts>a)&(cuts<=b)):exact('played_pre_physical_window' if side==0 else 'played_post_physical_window',0.)
             cameras=_curve_at(row['ticks'],row['curve'],np.array([tick-1,tick]))
@@ -96,6 +103,8 @@ def prepare(p,model,*,native_ports,source_events,check):
         exact_displayed_face_proxy_choices=known,source_neural_calls=0,source_decode=0,
         uncertainty_policy='finite_learned_linear_worst_regret_upper_bound_v1',
         self_regret_zero_and_physical_copies_correlated=True,
+        no_central_native_self_H_face_error_is_encoder_identity=True,
+        unmeasured_actor_body_identity_or_visibility_not_imputed=True,
         physical_face_proxy_is_not_actor_identity_binding=True,
         unseen_motion_not_measured_as_good_or_bad=True,full_perceptual_priority_certified=False,
         authoring_grid_and_camera_domain_expanded=False,

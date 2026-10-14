@@ -5,6 +5,7 @@ from crosscut2.native_preference import prepare
 from crosscut2.preference_model import regret_bounds
 from crosscut2.event_holds import select
 from test_crosscut2_preference_integration import producer,fitted_toy_model
+from crosscut2.preference_features import FEATURE_NAMES
 
 
 def native_bank(frame):
@@ -61,3 +62,38 @@ def test_finite_score_interval_self_regret_and_physical_duplicate_correlation():
     aa,bb=regret_bounds([-2.,-2.,1.],[3.,3.,2.],physical_ids=['A','A','B'])
     np.testing.assert_array_equal(aa,a[[0,0,1]])
     np.testing.assert_array_equal(bb,b[[0,0,1]])
+
+
+def test_no_native_self_H_has_exact_zero_face_geometry_even_if_actor_continuity_is_unknown():
+    # Derive the relation from the real encoder, not a favourable assumption
+    # about unobserved video. Same-clock self comparison is identically0;
+    # exposed-face fallback is explicitly restricted to known central cuts.
+    _,_,_,p,a,_=producer(opposed=False);original_body=p.body.copy()
+    for continuous in (True,False):
+        for body_present in (True,False):
+            p.continuous[:,1]=continuous
+            p.data[a]['known_center_native_cut'][1]=False
+            p.head[a,1,1,:3]=[.8,.6,.42]
+            p.body[:]=original_body if body_present else 0.
+            values=p.preference_features(1)[a,a]
+            assert values[FEATURE_NAMES.index('face_position')]==0.
+            assert values[FEATURE_NAMES.index('face_scale')]==0.
+
+
+def test_off_grid_no_native_self_H_bounds_lock_only_provable_face_errors():
+    _,_,native,p,_,_=producer(opposed=False);native=list(native);native[1]=native_bank(90)
+    class CaptureBounds:
+        def __init__(self):self.lower=self.upper=None
+        def score_bounds(self,lower,upper):
+            self.lower,self.upper=lower.copy(),upper.copy()
+            return lower.sum(-1),upper.sum(-1)
+    model=CaptureBounds()
+    prepare(p,model,native_ports=native,source_events=[np.array([],int),np.array([90])],check=lambda:None)
+    a=np.array([s.source==0 for s in p.states]);b=~a
+    for key in ('face_position','face_scale'):
+        at=FEATURE_NAMES.index(key)
+        assert not model.lower[a,at].any() and not model.upper[a,at].any()
+        assert np.any(model.upper[b,at]>0)
+    # No-central-native does NOT imply anatomical/actor continuity: the real
+    # body fallback can still be nonzero. Keep those unknown intervals.
+    assert (model.upper[a,FEATURE_NAMES.index('arm_phase')]==1.).all()
