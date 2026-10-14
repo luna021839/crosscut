@@ -2,7 +2,7 @@ import copy
 import numpy as np
 import pytest
 from crosscut2.preference_features import FEATURE_NAMES
-from crosscut2.preference_model import fit,Model
+from crosscut2.preference_model import fit,Model,partial_choice
 
 
 def example(group='phrase-a',split='train',kind='human_av_preference'):
@@ -37,3 +37,40 @@ def test_event_wide_max_hold_and_cut_losses_are_invariant_to_option_duplication(
     h,k=m.losses(f,state_sources=[0,1]);dup=f[[0,0,1]][:,[0,0,1]]
     hh,kk=m.losses(dup,state_sources=[0,0,1])
     assert np.array_equal(hh,h[[0,0,1]]) and np.array_equal(kk,k[[0,0,1]][:,[0,0,1]])
+
+
+def weak():
+    row=example(kind='reference_editor_choice_weak_imitation');row.pop('chosen')
+    values=np.zeros((3,len(FEATURE_NAMES)));values[0,2]=1.
+    row.update(features=values.tolist(),compatible_options=[1,2],option_ids=['Ahold','AtoB','Bhold'])
+    return row
+
+
+def test_weak_incoming_B_choice_does_not_invent_cut_over_B_hold_and_deduplicates_physical_options():
+    row=weak();model=Model(fit([row]));scores=model.scores(row['features'])
+    assert scores[1]==scores[2] and scores[1]>scores[0]
+    duplicate=copy.deepcopy(row);duplicate['features'].append(row['features'][1]);duplicate['option_ids'].append('AtoB')
+    duplicate['compatible_options'].append(3)
+    again=Model(fit([duplicate]))
+    np.testing.assert_array_equal(again.weights,model.weights)
+    assert model.artifact['report']['train']['pairs']==0
+    assert model.artifact['report']['train']['weak_events']==1
+    row['chosen']=1
+    with pytest.raises(ValueError,match='strict H/K'):fit([row])
+
+
+def test_partial_marginal_gradient_matches_finite_difference_and_preserves_no_preference_inside_set():
+    score=np.array([.3,-.2,.7]);yes=[1,2];loss,gradient=partial_choice(score,yes)
+    numeric=[]
+    for i in range(3):
+        delta=np.eye(3)[i]*1e-6
+        numeric.append((partial_choice(score+delta,yes)[0]-partial_choice(score-delta,yes)[0])/2e-6)
+    np.testing.assert_allclose(gradient,numeric,atol=1e-9)
+    assert loss>0 and abs(gradient.sum())<1e-12
+
+
+def test_repeated_reference_of_same_physical_group_cannot_double_its_training_weight():
+    a=weak();b=example(group='different-phrase');base=Model(fit([a,b]))
+    again=Model(fit([a,copy.deepcopy(a),b]))
+    np.testing.assert_allclose(base.center,again.center,atol=1e-15)
+    np.testing.assert_allclose(base.weights,again.weights,atol=1e-14)

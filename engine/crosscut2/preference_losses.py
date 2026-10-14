@@ -21,5 +21,6 @@ def prepare(ports,model,*,workspace,check):
         return values
     return holds,cut,dict(event_nodes=N-2,compressed_transient_bytes=written,
         whole_song_pair_tensor_in_memory=False,source_neural_calls=0,
-        native_events_outside_authored_grid_have_no_preference_observation=True,
+        native_events_outside_authored_grid_measured_motion_still_unknown=True,
+        evaluation_only_native_bounds_supplied_separately=True,
         native_event_finite_visibility_costs_retained=True)

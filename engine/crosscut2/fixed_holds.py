@@ -355,6 +355,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             va, vb = vectors[:, 0], vectors[:, 1]
             known = (np.linalg.norm(va, axis=1) >= .5) & (np.linalg.norm(vb, axis=1) >= .5)
             continuous &= ~known | ((va*vb).sum(1) >= .55)
+            known_center_native_cut=np.zeros(len(nodes),bool)
             if source_events is not None:
                 cuts = np.asarray(source_events[source], float)
                 for n, tick in enumerate(nodes):
@@ -368,10 +369,12 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                         physical_window_valid[n,1]=False
                     if np.any((cuts > tick-1) & (cuts <= tick)):
                         continuous[n] = False
+                        known_center_native_cut[n] = True
             states.append(State(source, actor, family))
             data.append(dict(heads=heads, vectors=vectors, body=body, projected=projected,
                 pose_native_indices=bank.get('pose_native_indices'),
                 physical_window_valid=physical_window_valid,
+                known_center_native_cut=known_center_native_cut,
                 indices=indices, formation=formation, formation_heads=formation_heads,
                 cameras=cameras, ticks=ticks, curve=values, unary=unary, through=through,
                 motion=motion, motion_valid=motion_valid, continuous=continuous,

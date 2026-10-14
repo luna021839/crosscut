@@ -338,6 +338,7 @@ def main():
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
+    preference_model=None
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -507,7 +508,11 @@ def main():
             camera_census_all_sources_decoded=all(record['all_encoded_frames_decoded'] for record in camera_census),
             retained_source_cut_detection_completeness_validated=False,
             complete_actor_motion_validated=False, professional_quality_approved=False,
-            normal_app_path_executed=False, old_or_manual_editorial_choices_used=False,
+            normal_app_path_executed=False,
+            old_or_manual_editorial_choices_used=bool(preference_model is not None and
+                'reference_editor_choice_weak_imitation' in preference_model.artifact['supervision_kinds']),
+            old_or_manual_editorial_timeline_directly_copied=False,
+            preference_model_supervision=[] if preference_model is None else preference_model.artifact['supervision_kinds'],
             elapsed_before_render=monotonic() - started), indent=2, allow_nan=False)
     with args.output.with_suffix('.plan.json').open('x') as stream:
         stream.write(encoded)

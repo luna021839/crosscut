@@ -103,20 +103,27 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         import tempfile
         from pathlib import Path
         from .preference_losses import prepare
+        from .native_preference import prepare as prepare_native
         from .preference_dp import choose
         if preference_workspace is None:raise ValueError('explicit transient preference workspace required')
         Path(preference_workspace).mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='.event-preference-',dir=preference_workspace) as temporary:
             H,K,preference_receipt=prepare(measured,preference_model,workspace=temporary,check=live)
+            native_preference,native_preference_lower,native_receipt=prepare_native(measured,preference_model,
+                native_ports=native_ports,source_events=source_events,check=live)
+            preference_receipt['native_evaluation']=native_receipt
             runs,objective=choose(nodes,fps=fps,unary=unary,through=through,preference_holds=H,
-                preference_intervals=np.zeros_like(unary),preference_ports=K,
+                preference_intervals=native_preference,preference_ports=K,
                 state_sources=np.asarray([s.source for s in states]),source_events=source_events,
                 minimum_hold=support,native_cost=fragments,check=live)
             score,secondary=objective;preference_parts=[];selected={}
             for i,(first,end,index) in enumerate(runs):
                 entry=0. if not i else float(K(first)[runs[i-1][2],index])
                 if i:selected[first,runs[i-1][2],index]=entry
-                preference_parts.append(dict(internal_event_preferences=float(H[index,first+1:end].sum()),entry_preference=entry))
+                preference_parts.append(dict(internal_event_preferences=float(H[index,first+1:end].sum()),entry_preference=entry,
+                    evaluation_native_preference_upper=float(native_preference[index,first:end].sum())))
+            preference_receipt['selected_evaluation_native_preference_lower']=float(sum(
+                native_preference_lower[index,first:end].sum() for first,end,index in runs))
             measured.selected_preference_costs=selected
         preference_receipt['objective_vector']=[score,secondary]
         preference_receipt['model_sha256']=preference_model.artifact['content_sha256']

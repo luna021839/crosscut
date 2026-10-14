@@ -83,3 +83,77 @@ def test_raw_activity_requires_the_same_primitive_on_both_sides_and_physical_win
     for row in p.data:row['physical_window_valid'][1]=False
     values=extract(p,1)[a,b]
     assert values[19]==values[20]==values[21]==values[22]==0.
+
+
+def test_which_actual_arm_has_pixel_agreement_cannot_disappear_into_global_fractions():
+    nodes,banks,poses,styles=inputs()
+    for pose in poses:pose[:]=pose[:,2:3]
+    poses[1][:,:,:,5,0]+=.15  # only the right wrist estimate disagrees
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,part_observer=provisional_parts)
+    p=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'));values=[]
+    for agreed in ([0,1,4],[2,3,5]):
+        p.phase_certainty[:]=.5;p.motion_certainty[:]=.5
+        for i in (a,b):p.phase_certainty[i,1,:,agreed]=1.
+        values.append(extract(p,1)[a,b])
+    # Identical geometry AND identical confidence fractions, but agreement is
+    # attached to a different actual limb. A global max plus fractions lost it.
+    np.testing.assert_array_equal(values[0][:23],values[1][:23])
+    assert not np.array_equal(values[0],values[1])
+
+
+def test_body_absence_cannot_change_the_same_continuous_face_residual():
+    p,a,b=setup()
+    p.head[:,1,1,0]+=.02
+    before=extract(p,1)
+    p.body[:]=0.
+    after=extract(p,1)
+    np.testing.assert_array_equal(before[:,:,:2],after[:,:,:2])
+    assert after[a,a,FEATURE_NAMES.index('face_position')]==0.
+    assert after[a,a,FEATURE_NAMES.index('face_comparison_observed')]==1.
+
+
+def test_actual_native_face_discontinuity_uses_the_exposed_boundary_without_bodies():
+    p,a,b=setup();p.body[:]=0.
+    p.data[a]['known_center_native_cut'][1]=True;p.continuous[a,1]=False
+    p.head[a,1,1,0]+=.2
+    f=extract(p,1)[a,a]
+    assert f[FEATURE_NAMES.index('face_position')]>.3
+    assert f[FEATURE_NAMES.index('face_comparison_observed')]==1.
+    assert f[FEATURE_NAMES.index('outgoing_known_native_cut')]==1.
+
+
+def test_intrinsic_played_motion_survives_zero_style_and_unavailable_counterfactual_source():
+    p,a,b=setup();p.colour[:,1,1]=p.colour[0,1,0]
+    f=extract(p,1)[a,b]
+    assert f[FEATURE_NAMES.index('style_novelty')]==0.
+    assert f[FEATURE_NAMES.index('played_pre_angular_activity')]>.05
+    assert f[FEATURE_NAMES.index('played_post_angular_activity')]>.05
+    # A native cut hides the counterfactual pre-B and post-A views, not the
+    # actual played pre-A/post-B portions. Their own activity remains present.
+    p.continuous[[a,b],1]=False
+    f=extract(p,1)[a,b]
+    assert f[FEATURE_NAMES.index('played_pre_angular_activity')]>.05
+    assert f[FEATURE_NAMES.index('played_post_angular_activity')]>.05
+    assert f[FEATURE_NAMES.index('raw_model_angular_activity')]==0.
+
+
+def test_unmeasured_real_hips_and_absent_hips_have_different_geometry_presence():
+    p,a,b=setup();before=extract(p,1)[a,b]
+    p.body[:,1,:,6:8,2]=0.
+    after=extract(p,1)[a,b]
+    k=FEATURE_NAMES.index('unmeasured_torso_phase_geometry')
+    assert before[k]>after[k]
+    assert before[FEATURE_NAMES.index('torso_phase')]==after[FEATURE_NAMES.index('torso_phase')]==0.
+
+
+def test_actual_added_camera_context_and_candidate_dependent_music_are_not_discarded():
+    p,a,b=setup()
+    for row in p.data:row['ticks']=np.array([0,5,10,15,20,30]);row['curve']=np.tile([1.,.5,.5],(6,1))
+    p.data[a]['curve'][1,0]=1.2
+    f=extract(p,1)
+    assert f[a,b,FEATURE_NAMES.index('pre_added_camera_zoom_travel')]>0
+    assert f[b,b,FEATURE_NAMES.index('pre_added_camera_zoom_travel')]==0
+    assert f[a,b,FEATURE_NAMES.index('event_active_style')]>0
+    assert f[a,a,FEATURE_NAMES.index('event_active_style')]==0
