@@ -103,7 +103,7 @@ def local_actor_hypotheses(bank, *, maximum_clusters=12, minimum_cosine=.55, amb
     return labels, len(prototypes)
 
 
-def clamped_camera(head, cap, support, *, alignment_target=None):
+def clamped_camera(head, cap, support, *, alignment_target=None, alignment_position=None):
     """Small fixed family: fit a focal head while preserving observed action.
 
     Unknown hands impose no fabricated clipping and no all-source ban. Native
@@ -112,6 +112,13 @@ def clamped_camera(head, cap, support, *, alignment_target=None):
     if head[2] < .035:
         return Camera()
     goal = DEFAULT_POLICY.focal_lower if alignment_target is None else alignment_target
+    if not math.isfinite(goal) or not 0<goal<=1:
+        raise ValueError('finite physically sized alignment target required')
+    if alignment_position is not None:
+        alignment_position=np.asarray(alignment_position,float)
+        if (alignment_position.shape!=(2,) or not np.isfinite(alignment_position).all()
+                or np.any(alignment_position<0) or np.any(alignment_position>1)):
+            raise ValueError('finite projected peer position required')
     desired = min(cap, max(1., goal / float(head[2])))
     points = np.asarray(support, float).reshape(2, 8, 3)
     visible = (points[:, :, 2] >= .3) & (points[:, :, :2] >= 0).all(2) & (points[:, :, :2] <= 1).all(2)
@@ -121,9 +128,13 @@ def clamped_camera(head, cap, support, *, alignment_target=None):
     xy = np.vstack((xy, [head[0], max(0., head[1] - head[2] / 2)],
         [head[0], min(1., head[1] + head[2] / 2)]))
     candidates = []
-    for zoom in sorted({1., (1. + desired) / 2, desired}):
+    zooms={1.,(1.+desired)/2,desired}
+    if alignment_position is not None:zooms.add(cap)
+    for zoom in sorted(zooms):
         low, high = .5 / zoom, 1. - .5 / zoom
         center = np.clip(np.array([head[0], head[1] + .2 / zoom], float), low, high)
+        if alignment_position is not None:
+            center=np.clip(np.asarray(head[:2])+(.5-alignment_position)/zoom,low,high)
         # Shift toward a feasible visible-action envelope when one exists.
         lo, hi = xy.max(0) - .5 / zoom, xy.min(0) + .5 / zoom
         for axis in (0, 1):
@@ -136,7 +147,15 @@ def clamped_camera(head, cap, support, *, alignment_target=None):
         residual=math.log(goal / (float(head[2]) * zoom))
         cost = 1.4 * (max(0.,residual) if alignment_target is None else abs(residual)) + .65 * math.log(zoom)
         cost += float(action_crop_cost([zoom], [center], points)[0])
-        cost += 6. * max(0., float(head[2]) * zoom - max(.24, float(head[2])))
+        if alignment_position is not None:
+            cost+=float(np.linalg.norm((camera.project(head[:2])-alignment_position)*[1.,9/16]))/.06
+        # A declared peer-size target is not unwanted magnification beyond a
+        # comfort band. Charge overshoot of THAT target, not .24 all over
+        # again; otherwise already-close .30/.40 peers have only native
+        # framing available even with a feasible explicit .40 alignment.
+        # Actual action clipping and zoom effort above remain fully charged.
+        tight_limit=max(.24,float(head[2]),goal if alignment_target is not None else 0.)
+        cost += 6. * max(0., float(head[2]) * zoom - tight_limit)
         candidates.append((cost, zoom, camera))
     return min(candidates, key=lambda row: row[:2])[2]
 
@@ -378,7 +397,8 @@ def _action_refinement(action, synchronous, screen, *, moving_threshold=2, direc
     return risk-credit
 
 
-def port_cost(n, left, right, *, fps, action_enabled=True, music_strength=None):
+def port_cost(n, left, right, *, fps, action_enabled=True, music_strength=None, opportunity_basis='exposed'):
+    if opportunity_basis not in ('exposed','paired_clock'):raise ValueError('unknown joint opportunity clock basis')
     a, b = left['heads'][n, 0], right['heads'][n, 1]
     # A bad first/last exposed frame is a boundary event, not just a tiny
     # duration-weighted average over an otherwise readable four-second hold.
@@ -467,6 +487,9 @@ def port_cost(n, left, right, *, fps, action_enabled=True, music_strength=None):
     if music_strength is not None and action_enabled:
         from .opportunity import joint_opportunity
         measured['connection_opportunity']=joint_opportunity(n,left,right,measured,music_strength=music_strength)
+        if opportunity_basis=='paired_clock':
+            from .opportunity import paired_clock_connection
+            measured.update(paired_clock_connection(n,left,right,measured,music_strength=music_strength))
     return measured
 
 
@@ -561,7 +584,7 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
 
 def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check,
                        action_enabled=True, body_states=None, native_ports=None, boundary_readability=False,
-                       music_strengths=None):
+                       music_strengths=None,opportunity_basis='exposed'):
     started = monotonic()
     last_check=[-math.inf]
     def deadline():
@@ -569,6 +592,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         if now-started>240.:raise TimeoutError('single fixed actor/camera selection exceeded 240 seconds')
         if now-last_check[0]>.1:check();last_check[0]=now
     opportunity_mode=music_strengths is not None
+    if opportunity_basis not in ('exposed','paired_clock') or (not opportunity_mode and opportunity_basis!='exposed'):
+        raise ValueError('opportunity clock calibration requires explicit music experiment')
     if opportunity_mode:
         music_strengths=np.asarray(music_strengths,float)
         if music_strengths.shape!=(len(nodes),) or not np.isfinite(music_strengths).all() or np.any((music_strengths<0)|(music_strengths>1)):
@@ -577,7 +602,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         source_events=source_events,body_states=body_states,native_ports=native_ports,
         boundary_readability=boundary_readability,check=deadline)
     if opportunity_mode:
-        for row in data:row['music_strengths']=music_strengths
+        for row in data:
+            row['music_strengths']=music_strengths;row['opportunity_basis']=opportunity_basis
     count = len(states)
     matrix_bytes = count * count * np.dtype(np.float32).itemsize
     if matrix_bytes > 200 * 1024**2:
@@ -609,7 +635,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
             for b in right:
                 if states[a].source == states[b].source: continue
                 measured=port_cost(n,data[a],data[b],fps=fps,action_enabled=action_enabled,
-                    music_strength=None if not opportunity_mode else float(music_strengths[n]))
+                    music_strength=None if not opportunity_mode else float(music_strengths[n]),opportunity_basis=opportunity_basis)
                 value=(measured['nonnegative_risk_cost']-measured['connection_opportunity']['credit']
                     if opportunity_mode else measured['soft_cost'])
                 matrix[a,b] = value
@@ -624,7 +650,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         # Recompute only selected scalar ports for the cost report, with the
         # same float32 rounding as the transient matrix. Do not rebuild it.
         measured=port_cost(n,data[left],data[right],fps=fps,action_enabled=action_enabled,
-            music_strength=None if not opportunity_mode else float(music_strengths[n]))
+            music_strength=None if not opportunity_mode else float(music_strengths[n]),opportunity_basis=opportunity_basis)
         value=(measured['nonnegative_risk_cost']-measured['connection_opportunity']['credit']
             if opportunity_mode else measured['soft_cost'])
         return float(np.float32(value) + (0. if opportunity_mode else same_show[left,right]))
@@ -663,7 +689,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         selected_opportunity=None
         if opportunity_mode and i:
             selected_opportunity=port_cost(start,data[runs[i-1][2]],row,fps=fps,
-                action_enabled=action_enabled,music_strength=float(music_strengths[start]))['connection_opportunity']
+                action_enabled=action_enabled,music_strength=float(music_strengths[start]),
+                opportunity_basis=opportunity_basis)['connection_opportunity']
             credit=selected_opportunity['credit']
             parts['entry_port']+=credit;parts['observed_opportunity']=-credit
         diversity_parts=dict(same_show=0.,short_source_return=0.)
@@ -686,6 +713,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     return runs, states, data, score, dict(fixed_states=count,source_local_appearance_clusters=cluster_counts,
         objective_contract='observed_joint_music_opportunity_v1' if opportunity_mode else 'legacy_hold_duration_preference',
         experimental_opportunity_mode=opportunity_mode,secondary_diversity_score=secondary_score,
+        opportunity_clock_basis=opportunity_basis,
         primary_secondary_exact_ties_only=opportunity_mode,
         opportunity_cap=.8 if opportunity_mode else None,
         units=dict(unary='loss_per_second',boundary='loss_per_event'),
@@ -735,7 +763,8 @@ def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, a
             left_index = runs[i-1][2]
             left_state = states[left_index]
             measurement = port_cost(start,data[left_index],row,fps=original.fps,action_enabled=action_enabled,
-                music_strength=None if 'music_strengths' not in row else float(row['music_strengths'][start]))
+                music_strength=None if 'music_strengths' not in row else float(row['music_strengths'][start]),
+                opportunity_basis=row.get('opportunity_basis','exposed'))
             seams.append(dict(measurement,output_frame=first,seconds=first/original.fps,
                 sparse_observation_frame=int(nodes[start]),
                 pose_port_retimed_unvalidated=first!=int(nodes[start]),

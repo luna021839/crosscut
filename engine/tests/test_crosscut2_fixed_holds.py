@@ -112,6 +112,30 @@ def test_camera_family_preserves_observed_inside_hold_wrists():
     assert camera.zoom < 2.
 
 
+def test_explicit_closeup_alignment_target_is_not_suppressed_by_comfort_prior():
+    head=np.array([.5,.4,.30,.95]);empty=np.zeros((2,8,3))
+    camera=clamped_camera(head,1.5,empty,alignment_target=.40)
+    # A requested .40 match is NOT a request to enlarge every shot. Here
+    # there is a declared close-up peer target, real source capacity and no
+    # extra observed-action clipping. The previous .24 comfort term picked
+    # native instead, so no already-close .30->.40 match was available at all.
+    assert camera.zoom==pytest.approx(.40/.30)
+    ordinary=clamped_camera(head,1.5,empty)
+    assert ordinary.zoom==1.
+
+
+def test_closeup_peer_position_does_not_force_every_face_to_upper_third():
+    empty=np.zeros((2,8,3));a=np.array([.5,.4,.30,.95]);b=np.array([.5,.4,.40,.95])
+    ca=clamped_camera(a,1.5,empty,alignment_target=.40,alignment_position=(.5,.4))
+    cb=clamped_camera(b,1.5,empty,alignment_target=.40,alignment_position=(.5,.4))
+    assert np.allclose(ca.project(a[:2]),cb.project(b[:2]))
+    assert a[2]*ca.zoom==pytest.approx(b[2]*cb.zoom)
+    assert ca.project(a[:2])[1]==pytest.approx(.4)
+    assert ca.zoom>1 and cb.zoom==1
+    with pytest.raises(ValueError,match='peer position'):
+        clamped_camera(a,1.5,empty,alignment_target=.40,alignment_position=(.5,np.nan))
+
+
 def test_torso_only_alignment_is_not_an_arm_action_match():
     pose = np.zeros((2,8,3))
     pose[:,[0,1,6,7]] = [[.4,.3,.9],[.6,.3,.9],[.4,.7,.9],[.6,.7,.9]]

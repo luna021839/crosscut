@@ -286,6 +286,8 @@ def main():
     parser.add_argument('--models', type=Path, required=True)
     parser.add_argument('--body-pose-model', type=Path,
         help='Existing pinned RTMPose asset; optional conditional action costs, not named actor authority')
+    parser.add_argument('--supplementary-wholebody-model',type=Path,
+        help='Explicit optional RTMW133 failed-closeup supplement, separate source cache; not body ownership certification')
     parser.add_argument('--fixed-actor-camera-holds', action='store_true',
         help='Keep anonymous actor and fixed full-hold camera states inside programme selection')
     parser.add_argument('--native-source-readability',action='store_true',
@@ -294,6 +296,8 @@ def main():
         help='Experimental boundary event cost; not a validated whole-film quality improvement')
     parser.add_argument('--joint-musical-opportunities',action='store_true',
         help='Experimental observed music/action C-W objective; not a validated app editor')
+    parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
+        help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
         help='measure exact native-cut flanks without invalidating the song/body grids')
     parser.add_argument('--render', action='store_true')
@@ -309,6 +313,10 @@ def main():
     if args.joint_musical_opportunities and (not args.fixed_actor_camera_holds or args.body_pose_model is None
                                             or args.boundary_native_readability):
         raise ValueError('joint opportunity experiment requires fixed body-supported holds and boundary readability OFF')
+    if args.opportunity_basis!='exposed' and not args.joint_musical_opportunities:
+        raise ValueError('paired-clock matching requires the explicit joint opportunity experiment')
+    if args.supplementary_wholebody_model is not None and (args.body_pose_model is None or not args.fixed_actor_camera_holds):
+        raise ValueError('wholebody supplement requires explicit base-body fixed holds')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -368,6 +376,14 @@ def main():
         fps=original.fps, banks=banks, models=args.models, body_model=args.body_pose_model,
         cache=args.cache.parent / 'crosscut2-body-grid-v1', check=check, camera_census=camera_census,
         maximum_seconds=args.maximum_perception_seconds,include_states=True)
+    supplementary_receipts=[]
+    if args.supplementary_wholebody_model is not None:
+        from .supplementary_pose_bank import augment_missing_grid
+        poses,supplementary_receipts=augment_missing_grid(sources=original.sources,banks=banks,poses=poses,
+            body_states=body_states,warps=warps,nodes=nodes,master_start=original.master_audio_start,fps=original.fps,
+            camera_census=camera_census,model_path=args.supplementary_wholebody_model,
+            cache=args.cache.parent/'crosscut2-rtmw-supplement-v1',check=check,
+            maximum_seconds=min(600.,args.maximum_perception_seconds),maximum_calls=6000)
     # Retain the observed face grid. Newly measured native cuts change interval
     # costs without invalidating face caches or inventing unobserved heads.
     source_events = tuple(np.asarray(sorted({round((warps[s].source_to_master(frame / record['fps'])
@@ -394,7 +410,7 @@ def main():
         runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
             fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states,
             native_ports=native_ports,boundary_readability=args.boundary_native_readability,
-            music_strengths=music_strengths)
+            music_strengths=music_strengths,opportunity_basis=args.opportunity_basis)
         plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
         from .native_timing import repair_native_timing
         def build(boundaries):
@@ -417,6 +433,7 @@ def main():
             native_camera_port_observations=native_port_receipts,
             stage_edit_transformer_used=False,
             conditional_body_perception=body_receipts,
+            supplementary_wholebody_perception=supplementary_receipts,
             conditional_body_action_costs_enabled=poses is not None,
             fixed_actor_camera_hold_receipt=fixed_receipt,
             grid_nodes=len(nodes), objective_cost=score, seams=seams,
