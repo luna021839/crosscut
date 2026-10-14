@@ -140,7 +140,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 preference_intervals=native_preference,preference_ports=K,
                 state_sources=np.asarray([s.source for s in states]),source_events=source_events,
                 minimum_hold=support,native_cost=fragments,check=live,fragment_in_primary=connection_prior is not None,
-                cut_allowed=getattr(K,'allowed',None),native_hold_cost=native_hold,unified_content=unified)
+                cut_allowed=getattr(K,'allowed',None),native_hold_cost=native_hold,unified_content=unified,
+                hold_allowed=getattr(connection_prior,'hold_allowed',None))
             score,secondary=objective;preference_parts=[];selected={}
             for i,(first,end,index) in enumerate(runs):
                 entry=0. if not i else float(K(first)[runs[i-1][2],index])
@@ -183,7 +184,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         if not math.isclose(pref_total,score,rel_tol=1e-7,abs_tol=1e-6):raise AssertionError('preference H/K accounting differs')
         receipt['event_preference']=preference_receipt;receipt['selected_event_preferences']=preference_parts
     receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1' if preference_parts is None else
-        ('common_evidence_admitted_unified_played_events_v1' if unified else
+        ('played_face_geometry_unified_native_integrity_v1' if getattr(connection_prior,'played_face_prior',False) else
+        'common_evidence_admitted_unified_played_events_v1' if unified else
         'declared_monotone_connection_primary_fragment_v1' if connection_prior is not None else
         'lexicographic_same_event_preference_visibility_v1'),experimental=True,
         selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-prepared,preparation_seconds=prepared-started,

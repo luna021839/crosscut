@@ -34,6 +34,25 @@ def displayed_attention(heads,camera,index):
     return ratio,bool(index>=0 and maximum>0 and salience[index]>=maximum*(1.-1e-6))
 
 
+def displayed_focal_faces(heads,cameras):
+    """Actual GROUP focal under each physical crop, not a selected actor label.
+
+    Vectorized original face-bank observations only. Missing faces stay zero;
+    this does not identify a member or manufacture an aggregate group face.
+    """
+    centers=.5+cameras[:,:,None,:1]*(heads[...,:2]-cameras[:,:,None,1:])
+    height=heads[...,2]*cameras[:,:,None,0]
+    half=height[...,None]*[.45*9/16,.5]
+    extent=np.maximum(0.,np.minimum(1.,centers+half)-np.maximum(0.,centers-half))
+    area=np.prod(extent,axis=-1)
+    salience=area*np.exp(-((centers[...,0]-.5)/.4)**2)
+    valid=(heads[...,2]>.019)&(heads[...,3]>=.75)&(area>0)
+    salience=np.where(valid,salience,0.);at=salience.argmax(-1)
+    selected=np.take_along_axis(heads,at[...,None,None],axis=2).squeeze(2)
+    seen=salience.max(-1)>0
+    return np.where(seen[...,None],selected,0.),np.where(seen,at,-1)
+
+
 def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:None,identity_hints=None,part_observer=None):
     if len(styles)!=len(banks):raise ValueError('source-bound native style inputs required')
     bases,raw,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
@@ -86,6 +105,7 @@ def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:
                 displayed_attention_ratio=attention,displayed_attention_dominant=dominant,local_member_hint=member_hint,
                 added_crop=crop,event_loss_rate=unary,
                 camera_candidate_is_not_verified_actor_track=True)
+            record['displayed_focal_heads'],record['displayed_focal_indices']=displayed_focal_faces(native['heads'],cameras)
             # Do not accidentally send legacy objective arrays to the new DP.
             record.pop('unary');record.pop('through')
             states.append(replace(state,family='native' if family==0 else f'shot_match_{family-1}'));data.append(record)

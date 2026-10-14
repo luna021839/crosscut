@@ -12,7 +12,7 @@ import numpy as np
 def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
            preference_ports,state_sources,source_events,minimum_hold,native_cost,
            check=lambda:None,fragment_in_primary=False,cut_allowed=None,
-           native_hold_cost=None,unified_content=False):
+           native_hold_cost=None,unified_content=False,hold_allowed=None):
     nodes=np.asarray(nodes);sources=np.asarray(state_sources,int)
     q,N=len(sources),len(nodes)
     if (N<2 or not q or nodes.dtype.kind not in 'iu' or nodes[0]!=0 or np.any(np.diff(nodes)<=0)
@@ -73,6 +73,10 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
             else:
                 ep,es,old=incoming(start);a,b=ep+p,es+s+1/fps
             better=(a<primary[end])|((a==primary[end])&(b<secondary[end]))
+            if hold_allowed is not None:
+                mask=np.asarray(hold_allowed(start,end))
+                if mask.shape!=(q,) or mask.dtype!=bool:raise ValueError('explicit boolean STATE-sized hold integrity required')
+                better&=mask
             primary[end,better]=a[better];secondary[end,better]=b[better]
             for state in np.flatnonzero(better):predecessor[end,int(state)]=(start,int(old[state]))
     final_primary=primary[-1]+(visibility[:,-1] if unified_content else 0.)

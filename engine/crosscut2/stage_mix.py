@@ -308,6 +308,8 @@ def main():
         help='One declared untrained monotone face/action B prior; no weak imitation checkpoint')
     parser.add_argument('--common-evidence-connection-prior',action='store_true',
         help='Explicit untrained C: symmetric evidence admission, signed K, unified content and played-event support')
+    parser.add_argument('--played-face-connection-prior',action='store_true',
+        help='Explicit untrained GROUP D: actual played focal geometry and authored/native fragment integrity')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -344,6 +346,9 @@ def main():
     if args.common_evidence_connection_prior and (not args.native_part_pixel_support or args.fixed_connection_prior
             or args.experimental_preference_model is not None):
         raise ValueError('common-evidence prior requires partial event consumer and no other prior/checkpoint')
+    if args.played_face_connection_prior and (not args.native_part_pixel_support or args.fixed_connection_prior
+            or args.common_evidence_connection_prior or args.experimental_preference_model is not None):
+        raise ValueError('played-face prior requires partial event consumer and no other prior/checkpoint')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -360,6 +365,9 @@ def main():
     if args.common_evidence_connection_prior:
         from .common_evidence_prior import CommonEvidencePrior
         connection_prior=CommonEvidencePrior()
+    if args.played_face_connection_prior:
+        from .played_face_prior import PlayedFacePrior
+        connection_prior=PlayedFacePrior()
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -489,7 +497,7 @@ def main():
             fixed_receipt['native_event_registry']=registry_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,check=check)
-            if args.common_evidence_connection_prior:
+            if args.common_evidence_connection_prior or args.played_face_connection_prior:
                 verified=fixed_receipt['selected_clock_check']
                 if not (verified['all_source_clocks_verified'] and verified['source_observation_ordinals_exact']
                         and verified['maximum_native_ordinal_difference']==0):
@@ -537,6 +545,7 @@ def main():
             preference_model_supervision=[] if preference_model is None else preference_model.artifact['supervision_kinds'],
             fixed_connection_prior_used=connection_prior is not None,
             common_evidence_connection_prior_used=args.common_evidence_connection_prior,
+            played_face_connection_prior_used=args.played_face_connection_prior,
             elapsed_before_render=monotonic() - started), indent=2, allow_nan=False)
     with args.output.with_suffix('.plan.json').open('x') as stream:
         stream.write(encoded)
