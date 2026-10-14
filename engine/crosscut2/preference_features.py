@@ -11,8 +11,10 @@ FEATURE_NAMES=('face_position','face_scale','arm_phase','torso_phase','motion',
     'observed_opposition','phase_unmeasured','phase_contradicted','motion_unmeasured',
     'motion_contradicted','pixel_agreed_active_novelty','local_availability',
     'added_crop','featured_pair','style_novelty','event_strength',
-    'anonymous_appearance_cosine','appearance_unmeasured','recurrent_member_hint_agreement')
-SCHEMA='raw_same_event_preference_features_v1'
+    'anonymous_appearance_cosine','appearance_unmeasured','recurrent_member_hint_agreement',
+    'raw_model_angular_activity','raw_model_screen_activity',
+    'raw_model_angular_style','raw_model_screen_style')
+SCHEMA='raw_same_event_preference_features_v2'
 
 
 def extract(ports,n):
@@ -25,6 +27,7 @@ def extract(ports,n):
     phase_seen=np.zeros(shape+(2,P),bool);phase_evidence=np.ones(shape+(2,P),np.int8)
     motion_seen=np.zeros_like(phase_seen);motion_evidence=np.ones_like(phase_evidence)
     active_agreed=np.zeros(shape,bool);motion_worst=np.zeros(shape);opposition=np.zeros(shape)
+    angular_activity=np.zeros(shape);screen_activity=np.zeros(shape)
     def categories(weight,common,scoped):
         return np.where(common&scoped,np.where(weight==1.,3,np.where(weight==0.,2,1)),1)
     for side,phase in ((0,1),(1,2)):
@@ -86,6 +89,13 @@ def extract(ports,n):
             camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
             residual=np.maximum(np.maximum(direction,speed),camera_motion)
             motion_worst=np.maximum(motion_worst,np.where(common,residual,0.))
+            # Two equally moving estimates have zero *mismatch*, just like
+            # two stationary estimates. Preserve raw activity on THIS common
+            # primitive/window separately. It is not pixel/ownership credit.
+            angular_activity=np.maximum(angular_activity,np.where(common,rho(np.minimum(na,nb)),0.))
+            screen_speed=np.linalg.norm(screen[:,joint],axis=-1)/(6/p.fps)
+            screen_activity=np.maximum(screen_activity,np.where(common,
+                rho(np.minimum(screen_speed[:,None],screen_speed[None,:])/scale),0.))
             weight=np.minimum(p.motion_certainty[:,n,window,k,None],p.motion_certainty[:,n,window,k][None,:])
             evidence=categories(weight,common,scope[:,None]&scope[None,:]);motion_seen[:,:,window,k]=common
             motion_evidence[:,:,window,k]=evidence
@@ -112,5 +122,10 @@ def extract(ports,n):
     ma,mb=p.member_hint[:,n,0],p.member_hint[:,n,1]
     hinted=(ma[:,None]>=0)&(mb[None,:]>=0)
     result[:,:,18]=np.where(hinted,np.where(ma[:,None]==mb[None,:],1.,-1.),0.)
+    result[:,:,19]=angular_activity;result[:,:,20]=screen_activity
+    # Explicit raw interactions let the small linear ranker represent a
+    # moving style change, without requiring scarce pixel-agreed anatomy or
+    # treating every clothing/background change as a moving connection.
+    result[:,:,21]=angular_activity*style;result[:,:,22]=screen_activity*style
     if not np.isfinite(result).all():raise ValueError('finite raw preference observations required')
     return result

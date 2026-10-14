@@ -6,7 +6,7 @@ body{font:16px system-ui;background:#131619;color:#edf0f3;margin:24px auto;paddi
 </style>
 <h1>얼굴·동작 연결 비교</h1>
 <p>완성본이나 개선 승인 자료가 아닙니다. 같은 시점의 2초 영상 세 가지입니다. 가운데 순간에 얼굴 크기·위치와 팔·몸 동작이 함께 자연스럽게 이어지는지 비교해 주세요. 화려한 전환이 무조건 정답인 것은 아닙니다. 판단하기 어렵거나 전부 별로면 그대로 남겨 주세요.</p>
-<p>기존에 좋다고 한 I AM·XOXZ 구간은 이 학습용 자료에서 제외했습니다. 선택은 이 브라우저에만 임시 저장되며, 외부 전송은 없습니다. 내보내기 파일만 학습 입력으로 사용할 수 있습니다.</p>
+<p>I AM 51–57초·XOXZ 55.5–73.4초는 이 자료에서 제외했습니다. E02는 기존에 좋다고 한 XOXZ 21–25초와 겹치므로 비교만 하고 학습에는 사용하지 않습니다. 선택은 이 브라우저에만 임시 저장되며, 외부 전송은 없습니다.</p>
 <div id="status">자료 불러오는 중…</div><main></main>
 <button id="export" disabled>평가 JSON 내보내기</button><small>원본 영상과 기존 결과물은 변경하지 않습니다.</small>
 <script>
@@ -26,6 +26,8 @@ async function init(){
  labels=JSON.parse(localStorage.getItem('ive-preference-'+packetHash)||'{}');
  for(const item of packet.events){
    const section=create('section',null,main);create('h2',item.id,section);
+   const regressionOnly=item.global_seconds-30/packet.clip_fps<=25&&item.global_seconds+30/packet.clip_fps>=21;
+   if(regressionOnly)create('p','기존에 좋다고 한 구간과 겹침: 회귀 비교 전용 · 학습 제외',section);
    create('small','중앙 연결 순간: 재생 시작 약 1초 뒤 · 모두 일반 속도(1배속)로 비교',section);
    const grid=create('div',null,section);grid.className='videos';const videos=[];
    telemetry[item.id]={};
@@ -52,7 +54,7 @@ async function init(){
    const row=labels[item.id]||{};select.value=row.choice||'';note.value=row.note||'';
    const confirmLabel=create('label',null,section);const confirm=create('input',null,confirmLabel);confirm.type='checkbox';confirm.checked=!!row.self_reported_normal_av;
    confirmLabel.append(document.createTextNode('세 영상을 1배속·소리와 함께 확인했음 (자가 확인)'));
-   function changed(){labels[item.id]={id:item.id,choice:select.value,note:note.value,self_reported_normal_av:confirm.checked,provenance:'user_browser_choice',at:new Date().toISOString()};save();}
+   function changed(){labels[item.id]={id:item.id,choice:select.value,note:note.value,self_reported_normal_av:confirm.checked,regression_only:regressionOnly,provenance:'user_browser_choice',at:new Date().toISOString()};save();}
    select.addEventListener('change',changed);note.addEventListener('input',changed);confirm.addEventListener('change',changed);
  }
  document.querySelector('#export').disabled=false;update();

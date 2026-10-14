@@ -47,3 +47,39 @@ def test_missing_identity_is_separate_from_appearance_mismatch_and_hint_is_not_c
     assert np.all(missing[:,:,FEATURE_NAMES.index('appearance_unmeasured')]==1)
     assert np.all(missing[:,:,FEATURE_NAMES.index('anonymous_appearance_cosine')]==0)
     assert np.any(f[:,:,FEATURE_NAMES.index('appearance_unmeasured')]==0)
+
+
+def test_real_producer_retains_moving_connection_instead_of_collapsing_it_to_stationary_pose():
+    observations=[]
+    for moving in (True,False):
+        nodes,banks,poses,styles=inputs()
+        if not moving:
+            for pose in poses:pose[:]=pose[:,2:3]
+        states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+            body_states=[np.ones((4,4,3),int)]*2,part_observer=provisional_parts)
+        p=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+        a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+        observations.append(extract(p,1)[a,b])
+    moving,stationary=observations
+    # The previous19 channels collapsed these different real pose sequences.
+    np.testing.assert_allclose(moving[:19],stationary[:19],atol=1e-7,rtol=0.)
+    for name in ('raw_model_angular_activity','raw_model_screen_activity',
+                 'raw_model_angular_style','raw_model_screen_style'):
+        k=FEATURE_NAMES.index(name)
+        assert moving[k]>.05 and stationary[k]==0.
+    assert moving[FEATURE_NAMES.index('pixel_agreed_active_novelty')]==0.
+    assert moving[FEATURE_NAMES.index('motion_unmeasured')]==1.
+
+
+def test_raw_activity_requires_the_same_primitive_on_both_sides_and_physical_window():
+    p,a,b=setup()
+    p.body[[a,b],1,:,:,2]=0.
+    # A left-arm estimate and B right-arm estimate must not be combined into
+    # a moving connection. Neither the common shoulders nor missing hips move.
+    p.body[a,1,:,[0,2,4],2]=1.;p.body[b,1,:,[1,3,5],2]=1.
+    values=extract(p,1)[a,b]
+    assert values[19]==values[20]==values[21]==values[22]==0.
+    p, a, b=setup()
+    for row in p.data:row['physical_window_valid'][1]=False
+    values=extract(p,1)[a,b]
+    assert values[19]==values[20]==values[21]==values[22]==0.
