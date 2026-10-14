@@ -52,14 +52,19 @@ class SourceCatalogue:
         original=order[chosen];self.near_n=original//2;self.near_side=original%2
         closest=ordered[chosen];cuts=np.asarray(events,int)
         self.content_scope=(np.abs(closest-frames)<=6)&(np.searchsorted(cuts,closest,side='right')==np.searchsorted(cuts,frames,side='right'))
-        self.own=np.zeros(self.final)
-        for n,tick in enumerate(nodes):
-            for side,(a,b) in enumerate(((tick-7,tick-1),(tick,tick+6))):
-                first,last=max(0,int(a)),min(self.final,int(b))
-                if first>=last:continue
-                observation=self.observation(n,side,np.tile([1.,.5,.5],(7,1)))
-                activity=source_activity(observation,fps=fps)
-                self.own[first:last]=np.maximum(self.own[first:last],activity)
+        # Activity belongs to the SAME physical face sample used by rates(),
+        # not to the source or the face dominant in an unrelated native crop.
+        # Pose is unavailable for face3..7: those faces cannot borrow face0's
+        # motion. This is bounded sample quadrature, not a dense actor track.
+        self.own=np.zeros(bank['heads'].shape[:3])
+        for n in range(N):
+            for side in (0,1):
+                sl=slice(2*side,2*side+2)
+                for h in range(3):
+                    observation=dict(head=bank['heads'][n,side,h],body=self.body[n,sl,h],
+                        evidence=self.evidence[n,sl,h],ownership_ambiguity=self.ambiguity[n,sl,h],
+                        physical_window_valid=bool(self.physical[n,side]),native_indices=self.native[n,sl])
+                    self.own[n,side,h]=source_activity(observation,fps=fps)
 
     def observation(self,n,side,camera_strip):
         camera_strip=np.asarray(camera_strip,float)
@@ -103,4 +108,4 @@ class SourceCatalogue:
         valid&=(index<3)[...,None]&self.content_scope[frames,None]
         projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
         crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
-        return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[frames]
+        return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[n,side,index]
