@@ -30,7 +30,7 @@ def reliabilities(support,disagrees,*,scope):
 def retain_model_hypotheses(*,rows,states,sources,cache):
     """Consume ONLY the exact raw producer's completed source snapshots."""
     implementation=part_support_bank.cache_implementation()
-    physical={};found_sources=set()
+    physical={};found_sources=set();runtime=part_support_bank.runtime_binding_fields()
     for path in sorted(Path(cache).glob('*.npz')):
         # ExFAT macOS AppleDouble ._ sidecars are not serialized observations.
         # Never turn a failed np.load into permission to enable pickle.
@@ -38,12 +38,16 @@ def retain_model_hypotheses(*,rows,states,sources,cache):
         with np.load(path,allow_pickle=False) as saved:
             binding=json.loads(str(saved['binding']))
             if binding.get('implementation')!=implementation:continue
+            if any(binding.get(k)!=v for k,v in runtime.items()):continue
             indices=[s for s,p in enumerate(sources) if list(file_identity(p))==binding.get('source')]
             if len(indices)!=1:continue
             s=indices[0]
             if s in found_sources:raise ValueError('ambiguous source-native part snapshots; do not pick latest')
             found_sources.add(s)
-            for k,v in zip(saved['keys'],saved['disagrees']):physical[s,str(k)]=v.copy()
+            verified=saved['decode_verified'] if 'decode_verified' in saved else np.zeros(len(saved['keys']),bool)
+            if verified.shape!=(len(saved['keys']),) or verified.dtype!=bool:raise ValueError('part decode provenance shape differs')
+            for k,v,good in zip(saved['keys'],saved['disagrees'],verified):
+                if good:physical[s,str(k)]=v.copy()
     result=[]
     for state,row in zip(states,rows):
         d=dict(row);support=d['part_pair_support'];scope=d['pixel_part_scope'];raw=d['raw_body_hypotheses']
@@ -55,7 +59,8 @@ def retain_model_hypotheses(*,rows,states,sources,cache):
                 key=part_support_bank.interval_key(a,b,raw[n,first],raw[n,final],heights)
                 if (state.source,key) in physical:disagreement[n,pair]=physical[state.source,key]
         d['body']=raw.copy()
-        d['body_reliability'],d['motion_reliability']=reliabilities(support,disagreement,scope=scope)
+        verified=d.get('part_pair_decode_verified',np.zeros(support.shape[:2],bool))
+        d['body_reliability'],d['motion_reliability']=reliabilities(support&verified[...,None],disagreement,scope=scope)
         d['part_pair_model_disagreement']=disagreement
         d['uncorroborated_model_geometry_is_not_verified_anatomy']=True
         result.append(d)

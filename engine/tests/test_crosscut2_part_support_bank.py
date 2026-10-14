@@ -25,7 +25,8 @@ def fake_result():
 
 def test_atomic_physical_interval_cache_reused_without_decode_and_raw_unchanged(tmp_path,monkeypatch):
     kw,raw=setup(tmp_path);old=raw.copy();calls=[]
-    def rasters(path,needed,check):
+    def rasters(path,needed,check,**kw):
+        kw['receipt']['strategy']='verified_original_PTS_bounded_native_seek_v1'
         calls.append(1)
         for f in sorted(needed):yield f,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(bank,'_rasters',rasters);monkeypatch.setattr(bank.temporal_parts,'observe',lambda *a,**k:fake_result())
@@ -42,7 +43,8 @@ def test_atomic_physical_interval_cache_reused_without_decode_and_raw_unchanged(
 
 def test_native_cut_disallows_only_that_interval_without_false_zero_motion(tmp_path,monkeypatch):
     kw,_=setup(tmp_path);kw['census'][0]['frames']=[8]
-    def rasters(path,needed,check):
+    def rasters(path,needed,check,**kw):
+        kw['receipt']['strategy']='verified_original_PTS_bounded_native_seek_v1'
         for f in sorted(needed):yield f,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(bank,'_rasters',rasters);monkeypatch.setattr(bank.temporal_parts,'observe',lambda *a,**k:fake_result())
     rows,reports=bank.corroborate(**kw)
@@ -53,7 +55,8 @@ def test_native_cut_disallows_only_that_interval_without_false_zero_motion(tmp_p
 
 def test_partial_completion_retained_after_interruption_and_explicit_retry_reuses_it(tmp_path,monkeypatch):
     kw,_=setup(tmp_path);calls=[]
-    def rasters(path,needed,check):
+    def rasters(path,needed,check,**kw):
+        kw['receipt']['strategy']='verified_original_PTS_bounded_native_seek_v1'
         for f in sorted(needed):yield f,np.zeros((24,40,3),np.uint8)
     def interrupted(*a,**k):
         calls.append(1)

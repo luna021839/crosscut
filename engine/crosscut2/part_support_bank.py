@@ -51,22 +51,38 @@ def _sequential_rasters(path,needed,*,check):
             p.stdout.close()
 
 
-def cache_implementation():
-    """Preserve canonical pixel/part caches across a bit-exact seek change.
-
-    The entire temporal algorithm, interval key and consumer source are still
-    hashed. Only the operational reader is excluded. Any other algorithm edit
-    creates a new key, rather than silently trusting an old observation.
-    """
+def cache_contract_components():
+    """Both observation semantics AND the qualified production reader."""
+    from . import sparse_native_frames
     here=Path(__file__)
     consumer=function_text(here,'corroborate').replace('implementation=cache_implementation()',
         'implementation=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+Path(__file__).read_bytes()).hexdigest()')
     canonical_reader=function_text(here,'_sequential_rasters').replace('def _sequential_rasters(','def _rasters(')
     semantic=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+function_text(here,'interval_key').encode()+consumer.encode()
         +canonical_reader.encode()+function_text(here.with_name('source_cuts.py'),'read_frames').encode()).hexdigest()
-    if semantic=='579a27339f6227f191fed135f2930563fdce3f72ae99a063b811d149d6d07c13':
+    reader=hashlib.sha256(function_text(here,'_rasters').encode()+Path(sparse_native_frames.__file__).read_bytes()
+        +function_text(here.parent.parent/'crosscut/render_frame_schedule.py','render_frame_clock_from_probe').encode()).hexdigest()
+    return semantic,reader
+
+
+def cache_implementation():
+    """Legacy bytes stay reusable only under an explicitly qualified reader.
+
+    Legacy per-cell decoder provenance remains UNKNOWN, not retroactively
+    certified. A changed producer/clock/seek contract gets a new key.
+    """
+    semantic,reader=cache_contract_components()
+    if (semantic=='cb5a893b50205ce3bc112c7bc3b2531c05f9c611a4282226010b888e427cfc02'
+            and reader=='fb8962b51a5516b567df5a9474036f46a7094a2cfc0919bf2c9356b59833c0d3'):
         return '447432eab91d837e40edf01d482a3ef7302c210e24efa59a189266c55aba4abb'
-    return semantic
+    return hashlib.sha256((semantic+reader).encode()).hexdigest()
+
+
+def runtime_binding_fields():
+    decoder=shutil.which('ffmpeg')
+    if decoder is None:raise OSError('part observations require existing FFmpeg runtime')
+    return dict(decoder=list(file_identity(Path(decoder).resolve())),raster=[960,540],filter='area',
+        opencv=cv2.__version__,numpy=np.__version__)
 
 
 def _rasters(path,needed,*,check,maximum_seconds=120.,allow_sequential_fallback=True,receipt=None):
@@ -102,18 +118,18 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
     for source,path in enumerate(sources):
         live();identity=file_identity(path);clock=census[source];cuts=np.asarray(clock['frames'],int)
         binding=json.dumps(dict(source=identity,clock={k:clock[k] for k in ('fps','frame_count')},
-            implementation=implementation,decoder=file_identity(Path(shutil.which('ffmpeg')).resolve()),
-            raster=[960,540],filter='area',opencv=cv2.__version__,numpy=np.__version__),sort_keys=True)
+            implementation=implementation,**runtime_binding_fields()),sort_keys=True)
         target=cache/(hashlib.sha256(binding.encode()).hexdigest()+'.npz');saved={};dirty=False
         if target.is_file():
             with np.load(target,allow_pickle=False) as archive:
                 if str(archive['binding'])!=binding:raise ValueError('part-support source/runtime binding changed')
                 keys=archive['keys'];support=archive['support'];observed=archive['observed'];disagrees=archive['disagrees']
+                verified=archive['decode_verified'] if 'decode_verified' in archive else np.zeros(len(keys),bool)
             if (keys.ndim!=1 or len(keys)!=len(set(keys)) or keys.dtype.kind!='U'
                     or support.shape!=(len(keys),8) or observed.shape!=support.shape or disagrees.shape!=support.shape
-                    or any(x.dtype!=bool for x in (support,observed,disagrees))):
+                    or verified.shape!=(len(keys),) or any(x.dtype!=bool for x in (support,observed,disagrees,verified))):
                 raise ValueError('native part-support cache shape differs')
-            saved={str(k):(s,o,d) for k,s,o,d in zip(keys,support,observed,disagrees)}
+            saved={str(k):(s,o,d,bool(v)) for k,s,o,d,v in zip(keys,support,observed,disagrees,verified)}
         def checkpoint():
             nonlocal dirty
             if not dirty:return
@@ -125,7 +141,8 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
                 with os.fdopen(fd,'wb') as stream:
                     np.savez_compressed(stream,binding=binding,keys=np.asarray(keys,dtype='U64'),
                         support=np.asarray([saved[k][0] for k in keys],bool),observed=np.asarray([saved[k][1] for k in keys],bool),
-                        disagrees=np.asarray([saved[k][2] for k in keys],bool))
+                        disagrees=np.asarray([saved[k][2] for k in keys],bool),
+                        decode_verified=np.asarray([saved[k][3] for k in keys],bool))
                     stream.flush();os.fsync(stream.fileno())
                 check()
                 if file_identity(path)!=identity:raise OSError('source changed during part-support checkpoint')
@@ -136,6 +153,7 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
         for i,(state,row) in enumerate(zip(states,rows)):
             if state.source!=source:continue
             source_rows.append(i);N=len(row['body']);row['part_pair_support']=np.ones((N,3,8),bool)
+            row['part_pair_decode_verified']=np.zeros((N,3),bool)
             row['pixel_part_scope']=np.zeros(N,bool)
             clock_indices=row.get('pose_native_indices')
             if clock_indices is None:raise ValueError('part support needs the exact pose physical ordinals')
@@ -152,30 +170,39 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
                     key=interval_key(a,b,body[first],body[final],heights);links.append((i,n,pair,key))
                     if key not in saved:requests[key]=(a,b,body[first],body[final],heights)
         if spent+len(requests)>maximum_new_intervals:raise ValueError('new native intervals exceed the declared allowance')
-        decoded=0;new=0
+        decoded=0;new=0;pending={};execution=dict(strategy='warm_cache_only')
         try:
             if requests:
                 needed=set();ends={}
                 for key,(a,b,*_) in requests.items():needed.update(range(a,b+1));ends.setdefault(b,[]).append(key)
                 buffer=deque()
-                for native,pixels in _rasters(path,needed,check=live):
+                for native,pixels in _rasters(path,needed,check=live,receipt=execution):
                     live();buffer.append((native,pixels));decoded+=1
                     while buffer and buffer[0][0]<native-12:buffer.popleft()
                     frames=dict(buffer)
                     for key in ends.get(native,()):
                         a,b,first,final,heights=requests[key]
                         sample=temporal_parts.observe([frames[f] for f in range(a,b+1)],first,final,head_heights=heights)
-                        saved[key]=(sample.supported,sample.pixel_path_observed,sample.model_pixel_disagreement)
-                        dirty=True;new+=1;spent+=1
-                        if new%32==0:checkpoint()
+                        value=(sample.supported,sample.pixel_path_observed,sample.model_pixel_disagreement,True)
+                        trusted=execution.get('strategy')=='verified_original_PTS_bounded_native_seek_v1'
+                        if trusted:saved[key]=value;dirty=True
+                        else:pending[key]=value  # no durable write before a clean fallback EOF
+                        new+=1;spent+=1
+                        if trusted and new%32==0:checkpoint()
                         if new%128==0:print(json.dumps(dict(phase='native_part_paths',source=source,completed_intervals=new,
                             requested_intervals=len(requests),elapsed_seconds=monotonic()-started)),flush=True)
+                if pending:
+                    if file_identity(path)!=identity:raise OSError('source changed before validated fallback commit')
+                    saved.update(pending);dirty=True;pending.clear()
             checkpoint();live()
             if file_identity(path)!=identity:raise OSError('source changed during part-support observation')
-            for i,n,pair,key in links:rows[i]['part_pair_support'][n,pair]=saved[key][0]
+            for i,n,pair,key in links:
+                rows[i]['part_pair_support'][n,pair]=saved[key][0]
+                rows[i]['part_pair_decode_verified'][n,pair]=saved[key][3]
             supported=0;unknown=0
             for i in source_rows:
-                row=rows[i];raw=row['body'];filtered=raw.copy();pair=row['part_pair_support']
+                row=rows[i];raw=row['body'];filtered=raw.copy()
+                pair=row['part_pair_support']&row['part_pair_decode_verified'][...,None]
                 phase=np.stack((pair[:,0],pair[:,0]|pair[:,1],pair[:,1]|pair[:,2],pair[:,2]),axis=1)
                 filtered[...,2]=np.where(phase,raw[...,2],0.)
                 row['body']=filtered;row['raw_body_hypotheses']=raw
@@ -184,6 +211,8 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
             receipt=dict(source=source,new_physical_intervals=new,reused_physical_intervals=len({x[3] for x in links})-new,
                 decoded_native_rasters=decoded,new_neural_calls=0,corroborated_part_slots=supported,unknown_part_slots=unknown,
                 source_model_caches_unchanged=True,raw_joint_coordinates_unchanged=True,anatomical_ownership_certified=False,
+                native_raster_execution=execution,
+                legacy_unverified_intervals_reused=sum(not saved[k][3] for k in {x[3] for x in links}),
                 cache_bytes=target.stat().st_size if target.exists() else 0,elapsed_seconds=monotonic()-started)
             receipts.append(receipt);print(json.dumps(dict(phase='source_part_paths_complete',**receipt)),flush=True)
         finally:checkpoint()

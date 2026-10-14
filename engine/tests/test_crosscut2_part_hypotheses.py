@@ -46,7 +46,8 @@ def test_exfat_appledouble_metadata_is_not_unpickled_as_an_observation(tmp_path,
     from crosscut2.part_hypotheses import retain_model_hypotheses
     from test_crosscut2_part_support_bank import setup,fake_result
     kw,_=setup(tmp_path)
-    def rasters(path,needed,check):
+    def rasters(path,needed,check,**kw):
+        kw['receipt']['strategy']='verified_original_PTS_bounded_native_seek_v1'
         for f in sorted(needed):yield f,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(bank,'_rasters',rasters);monkeypatch.setattr(bank.temporal_parts,'observe',lambda *a,**k:fake_result())
     rows,_=bank.corroborate(**kw)
