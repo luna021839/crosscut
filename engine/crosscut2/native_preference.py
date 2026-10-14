@@ -78,7 +78,7 @@ def prepare(p,model,*,native_ports,source_events,check):
             # Motion compares each source's SAME physical velocity window to
             # itself, even if a separate native cut hides another window.
             # The encoder keeps actual pre/post movement in distinct channels.
-            for name in ('motion','observed_opposition','unmeasured_motion'):
+            for name in ('motion','observed_opposition','unmeasured_motion','motion_direction_unmeasured_geometry'):
                 exact(name,0.)
             for side,(a,b) in enumerate(((tick-7,tick-1),(tick,tick+6))):
                 if np.any((cuts>a)&(cuts<=b)):exact('played_pre_physical_window' if side==0 else 'played_post_physical_window',0.)

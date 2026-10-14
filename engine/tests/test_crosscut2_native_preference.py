@@ -97,5 +97,5 @@ def test_off_grid_no_native_self_H_bounds_lock_only_provable_face_errors():
     # Raw geometric self identity does NOT imply anatomical/actor continuity.
     assert (model.upper[a,FEATURE_NAMES.index('unmeasured_arm_phase_geometry')]==1.).all()
     assert (model.upper[a,FEATURE_NAMES.index('played_pre_angular_activity')]==1.).all()
-    for key in ('motion','observed_opposition','unmeasured_motion'):
+    for key in ('motion','observed_opposition','unmeasured_motion','motion_direction_unmeasured_geometry'):
         assert not model.upper[:,FEATURE_NAMES.index(key)].any()

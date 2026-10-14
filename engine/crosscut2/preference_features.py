@@ -6,6 +6,7 @@ physical continuity remain separate inputs; a valid pixel path is not anatomy.
 """
 import numpy as np
 from .event_ports import rho
+from .motion_direction import compare as compare_direction
 
 FEATURE_NAMES=('face_position','face_scale','arm_phase','torso_phase','motion',
     'observed_opposition','phase_unmeasured','phase_contradicted','motion_unmeasured',
@@ -24,8 +25,9 @@ FEATURE_NAMES=('face_position','face_scale','arm_phase','torso_phase','motion',
     'played_pre_physical_window','played_post_physical_window',
     'outgoing_known_native_cut','incoming_known_native_cut','event_active_style',
     'pre_added_camera_zoom_travel','pre_added_camera_x_travel','pre_added_camera_y_travel',
-    'post_added_camera_zoom_travel','post_added_camera_x_travel','post_added_camera_y_travel')
-SCHEMA='raw_same_event_preference_features_v5'
+    'post_added_camera_zoom_travel','post_added_camera_x_travel','post_added_camera_y_travel',
+    'motion_direction_unmeasured_geometry')
+SCHEMA='raw_same_event_preference_features_v6'
 
 
 def camera_context(p,n):
@@ -69,6 +71,7 @@ def extract(ports,n):
     face_seen=np.zeros(shape,bool)
     active_agreed=np.zeros(shape,bool);motion_worst=np.zeros(shape);opposition=np.zeros(shape)
     angular_activity=np.zeros(shape);screen_activity=np.zeros(shape)
+    direction_unknown=np.zeros(shape)
     def categories(weight,common,scoped):
         return np.where(common&scoped,np.where(weight==1.,3,np.where(weight==0.,2,1)),1)
     def retain_error(kind,residual,evidence,common):
@@ -144,9 +147,8 @@ def extract(ports,n):
             common&=p.continuous[:,n][None,:] if window==0 else p.continuous[:,n][:,None]
             a,b=p.velocity[:,None,n,window,k],p.velocity[None,:,n,window,k]
             na,nb=np.linalg.norm(a,axis=-1),np.linalg.norm(b,axis=-1)
-            moving=np.maximum(na,nb)>=.3;both=np.minimum(na,nb)>=.15
-            direction=np.where(both,(1.-np.clip((a*b).sum(-1)/np.maximum(1e-9,na*nb),-1,1))/2.,1.)
-            direction=np.where(moving,direction,0.)
+            direction,moving,direction_observed=compare_direction(a,b)
+            direction_unknown+=common&moving&~direction_observed
             # v dot v / (|v| |v|) can round just below1. An exact self
             # comparison is zero disagreement, not a floating epsilon that
             # may outrank the entire secondary objective in lexicographic DP.
@@ -166,7 +168,7 @@ def extract(ports,n):
             evidence=categories(weight,common,scope[:,None]&scope[None,:]);motion_seen[:,:,window,k]=common
             motion_evidence[:,:,window,k]=evidence
             retain_error(4,residual,evidence,common)
-            opposition=np.maximum(opposition,np.where(common&(evidence==3)&moving,direction,0.))
+            opposition=np.maximum(opposition,np.where(common&(evidence==3)&direction_observed,direction,0.))
             displayed=np.maximum(np.linalg.norm(screen[:,None,joint],axis=-1),
                 np.linalg.norm(screen[None,:,joint],axis=-1))/scale>=.3
             active_agreed|=common&(moving|displayed)&(evidence==3)&(phase_evidence[:,:,window,k]==3)
@@ -217,5 +219,6 @@ def extract(ports,n):
     result[:,:,52]=p.strength[n]*angular_activity*style
     context=camera_context(p,n)
     result[:,:,53:56]=context[:,None,:3];result[:,:,56:59]=context[None,:,3:]
+    result[:,:,59]=direction_unknown/(2*P)
     if not np.isfinite(result).all():raise ValueError('finite raw preference observations required')
     return result

@@ -69,6 +69,7 @@ class ConnectionPrior:
             formula='V*G*(1+G*(Aown+m*S*Aconnection)); G=product(1-raw_residual)',
             residuals=['face_position','face_scale','phase','motion','crop'],
             missing_whole_channel_prior=.5,unmeasured_activity_cap=.5,pixel_agreed_activity_cap=1.,
+            one_degenerate_angular_direction_prior=.5,direction_needs_two_moving_vectors=True,
             contradicted_activity_cap=0.,recurrent_identity_conflict_removes_positive_bonus_only=True,
             event_support_frames=6,fragment_support_frames=12,all_primary_coefficients=1.,
             native_cost='event_weight*(1-Q_native); local own central events only',

@@ -1,11 +1,12 @@
-"""Exact projection of raw v5 channels consumed by the fixed B prior.
+"""Exact projection of raw v6 channels consumed by the connection prior.
 
-Do not materialize59channels or unused per-evidence QxQxpart tensors. This
+Do not materialize all channels or unused per-evidence QxQxpart tensors. This
 does not change the prior, missing values or raw residuals. The full extractor
 remains the independent reference in equivalence tests/annotation exports.
 """
 import numpy as np
 from .event_ports import rho
+from .motion_direction import compare as compare_direction
 
 
 def extract(p,n):
@@ -61,9 +62,7 @@ def extract(p,n):
             common&=p.continuous[:,n][None,:] if window==0 else p.continuous[:,n][:,None]
             a,b=p.velocity[:,None,n,window,k],p.velocity[None,:,n,window,k]
             na,nb=np.linalg.norm(a,axis=-1),np.linalg.norm(b,axis=-1)
-            moving=np.maximum(na,nb)>=.3;both=np.minimum(na,nb)>=.15
-            direction=np.where(both,(1.-np.clip((a*b).sum(-1)/np.maximum(1e-9,na*nb),-1,1))/2.,1.)
-            direction=np.where(moving,direction,0.);np.fill_diagonal(direction,0.)
+            direction,_,_=compare_direction(a,b);np.fill_diagonal(direction,0.)
             speed=rho(abs(np.log((na+.15)/(nb+.15))))
             camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
             motion_max=np.maximum(motion_max,np.where(common,np.maximum(np.maximum(direction,speed),camera_motion),0.))
