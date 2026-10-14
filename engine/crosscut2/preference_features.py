@@ -1,0 +1,116 @@
+"""Uncalibrated raw observations for SAME-event hold/cut preferences.
+
+No fitted aesthetic coefficients, names, private vectors or probabilities.
+Geometry is never multiplied by a reliability number. Evidence category and
+physical continuity remain separate inputs; a valid pixel path is not anatomy.
+"""
+import numpy as np
+from .event_ports import rho
+
+FEATURE_NAMES=('face_position','face_scale','arm_phase','torso_phase','motion',
+    'observed_opposition','phase_unmeasured','phase_contradicted','motion_unmeasured',
+    'motion_contradicted','pixel_agreed_active_novelty','local_availability',
+    'added_crop','featured_pair','style_novelty','event_strength',
+    'anonymous_appearance_cosine','appearance_unmeasured','recurrent_member_hint_agreement')
+SCHEMA='raw_same_event_preference_features_v1'
+
+
+def extract(ports,n):
+    p=ports;q=len(p.states);shape=(q,q);P=len(p.pairs)
+    raw_valid=(p.body[...,2]>=.3)&(p.body[...,:2]>=0).all(-1)&(p.body[...,:2]<=1).all(-1)
+    geometry=raw_valid[...,p.pairs].all(-1)
+    physical=np.asarray([d['physical_window_valid'][n] for d in p.data],bool)
+    scope=np.asarray([d.get('pixel_part_scope',np.zeros(len(p.nodes),bool))[n] for d in p.data],bool)
+    result=np.zeros(shape+(len(FEATURE_NAMES),),np.float32)
+    phase_seen=np.zeros(shape+(2,P),bool);phase_evidence=np.ones(shape+(2,P),np.int8)
+    motion_seen=np.zeros_like(phase_seen);motion_evidence=np.ones_like(phase_evidence)
+    active_agreed=np.zeros(shape,bool);motion_worst=np.zeros(shape);opposition=np.zeros(shape)
+    def categories(weight,common,scoped):
+        return np.where(common&scoped,np.where(weight==1.,3,np.where(weight==0.,2,1)),1)
+    for side,phase in ((0,1),(1,2)):
+        head=p.head[:,n,side];camera=p.camera[:,n,side]
+        center=.5+camera[:,:1]*(head[:,:2]-camera[:,1:]);size=head[:,2]*camera[:,0]
+        scale=np.maximum(.005,(size[:,None]+size[None,:])/2.)
+        face=head[:,2]>.019;usable=face[:,None]&face[None,:]
+        usable&=p.continuous[:,n][None,:] if side==0 else p.continuous[:,n][:,None]
+        position=rho(np.linalg.norm((center[:,None]-center[None,:])*[16/9,1.],axis=-1)/scale)
+        ratio=rho(np.abs(np.log(np.maximum(.001,size[:,None])/np.maximum(.001,size[None,:]))))
+        result[:,:,0]=np.maximum(result[:,:,0],np.where(usable,position,0.))
+        result[:,:,1]=np.maximum(result[:,:,1],np.where(usable,ratio,0.))
+        for k,(a,b) in enumerate(p.pairs):
+            common=usable&geometry[:,n,phase,k,None]&geometry[:,n,phase,k][None,:]
+            point=p.projected[:,n,phase,b,:2]
+            screen=np.linalg.norm((point[:,None]-point[None,:])*[16/9,1.],axis=-1)/scale
+            angle=np.linalg.norm(p.bones[:,None,n,phase,k]-p.bones[None,:,n,phase,k],axis=-1)/2.
+            residual=rho(np.maximum(screen,angle));target=2 if max(a,b)<6 else 3
+            result[:,:,target]=np.maximum(result[:,:,target],np.where(common,residual,0.))
+            phase_seen[:,:,side,k]=common
+            weight=np.minimum(p.phase_certainty[:,n,phase,k,None],p.phase_certainty[:,n,phase,k][None,:])
+            phase_evidence[:,:,side,k]=categories(weight,common,scope[:,None]&scope[None,:])
+    # At a native cut the counterfactual same-clock source is unavailable.
+    # Keep actual exposed endpoints and unknown motion, not invented poses.
+    no_phase=~phase_seen.any((-1,-2))
+    h1,h2=p.head[:,n,0],p.head[:,n,1];c1,c2=p.camera[:,n,0],p.camera[:,n,1]
+    size1,size2=h1[:,2]*c1[:,0],h2[:,2]*c2[:,0]
+    scale=np.maximum(.005,(size1[:,None]+size2[None,:])/2.)
+    exposed=(h1[:,2]>.019)[:,None]&(h2[:,2]>.019)[None,:]
+    center1=.5+c1[:,:1]*(h1[:,:2]-c1[:,1:]);center2=.5+c2[:,:1]*(h2[:,:2]-c2[:,1:])
+    result[:,:,0]=np.maximum(result[:,:,0],np.where(no_phase&exposed,
+        rho(np.linalg.norm((center1[:,None]-center2[None,:])*[16/9,1.],axis=-1)/scale),0.))
+    result[:,:,1]=np.maximum(result[:,:,1],np.where(no_phase&exposed,
+        rho(np.abs(np.log(np.maximum(.001,size1[:,None])/np.maximum(.001,size2[None,:])))),0.))
+    for k,(a,b) in enumerate(p.pairs):
+        common=no_phase&exposed&geometry[:,n,1,k,None]&geometry[:,n,2,k][None,:]
+        pa,pb=p.projected[:,n,1,b,:2],p.projected[:,n,2,b,:2]
+        screen=np.linalg.norm((pa[:,None]-pb[None,:])*[16/9,1.],axis=-1)/scale
+        angle=np.linalg.norm(p.bones[:,None,n,1,k]-p.bones[None,:,n,2,k],axis=-1)/2.
+        target=2 if max(a,b)<6 else 3
+        result[:,:,target]=np.maximum(result[:,:,target],np.where(common,rho(np.maximum(screen,angle)),0.))
+        weight=np.minimum(p.phase_certainty[:,n,1,k,None],p.phase_certainty[:,n,2,k][None,:])
+        phase_evidence[:,:,0,k]=np.where(common,categories(weight,common,scope[:,None]&scope[None,:]),phase_evidence[:,:,0,k])
+    for window in (0,1):
+        early,late=(0,1) if window==0 else (2,3)
+        h=p.head[:,n,window,2]*p.camera[:,n,window,0]
+        scale=np.maximum(.005,(h[:,None]+h[None,:])/2.)
+        screen=(p.projected[:,n,late,:,:2]-p.projected[:,n,early,:,:2])*[16/9,1.]
+        for k,joint in enumerate(p.destinations):
+            valid=geometry[:,n,early,k]&geometry[:,n,late,k]&physical[:,window]
+            common=valid[:,None]&valid[None,:]
+            common&=p.continuous[:,n][None,:] if window==0 else p.continuous[:,n][:,None]
+            a,b=p.velocity[:,None,n,window,k],p.velocity[None,:,n,window,k]
+            na,nb=np.linalg.norm(a,axis=-1),np.linalg.norm(b,axis=-1)
+            moving=np.maximum(na,nb)>=.3;both=np.minimum(na,nb)>=.15
+            direction=np.where(both,(1.-np.clip((a*b).sum(-1)/np.maximum(1e-9,na*nb),-1,1))/2.,1.)
+            direction=np.where(moving,direction,0.)
+            speed=rho(np.abs(np.log((na+.15)/(nb+.15))))
+            camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
+            residual=np.maximum(np.maximum(direction,speed),camera_motion)
+            motion_worst=np.maximum(motion_worst,np.where(common,residual,0.))
+            weight=np.minimum(p.motion_certainty[:,n,window,k,None],p.motion_certainty[:,n,window,k][None,:])
+            evidence=categories(weight,common,scope[:,None]&scope[None,:]);motion_seen[:,:,window,k]=common
+            motion_evidence[:,:,window,k]=evidence
+            opposition=np.maximum(opposition,np.where(common&(evidence==3)&moving,direction,0.))
+            displayed=np.maximum(np.linalg.norm(screen[:,None,joint],axis=-1),
+                np.linalg.norm(screen[None,:,joint],axis=-1))/scale>=.3
+            active_agreed|=common&(moving|displayed)&(evidence==3)&(phase_evidence[:,:,window,k]==3)
+    result[:,:,4]=motion_worst;result[:,:,5]=opposition
+    result[:,:,6]=(phase_evidence==1).mean((-1,-2));result[:,:,7]=(phase_evidence==2).mean((-1,-2))
+    result[:,:,8]=(motion_evidence==1).mean((-1,-2));result[:,:,9]=(motion_evidence==2).mean((-1,-2))
+    ca,cb=p.colour[:,n,0],p.colour[:,n,1];style=np.zeros(shape)
+    for region in (0,1):
+        style+=.5*np.sqrt(np.maximum(0.,1.-np.einsum('ik,jk->ij',ca[:,region],cb[:,region],optimize=False)))
+    style=np.where(p.colour_valid[:,n,0,None]&p.colour_valid[:,n,1][None,:],style,0.)
+    result[:,:,10]=active_agreed*style
+    result[:,:,11]=np.minimum(p.availability[:,n,0,None],p.availability[:,n,1][None,:])
+    result[:,:,12]=np.maximum(p.crop[:,n,0,None],p.crop[:,n,1][None,:])
+    result[:,:,13]=p.dominant[:,n,0,None]&p.dominant[:,n,1][None,:]
+    result[:,:,14]=style;result[:,:,15]=p.strength[n]
+    va,vb=p.vectors[:,n,0],p.vectors[:,n,1]
+    appearance=(np.linalg.norm(va,axis=-1)>=.5)[:,None]&(np.linalg.norm(vb,axis=-1)>=.5)[None,:]
+    result[:,:,16]=np.where(appearance,np.clip(np.einsum('ik,jk->ij',va,vb,optimize=False),-1.,1.),0.)
+    result[:,:,17]=~appearance
+    ma,mb=p.member_hint[:,n,0],p.member_hint[:,n,1]
+    hinted=(ma[:,None]>=0)&(mb[None,:]>=0)
+    result[:,:,18]=np.where(hinted,np.where(ma[:,None]==mb[None,:],1.,-1.),0.)
+    if not np.isfinite(result).all():raise ValueError('finite raw preference observations required')
+    return result

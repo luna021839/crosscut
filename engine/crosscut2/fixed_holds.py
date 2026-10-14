@@ -318,6 +318,22 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             motion = np.zeros((len(nodes), 2, 8, 2))
             motion_valid = np.zeros((len(nodes), 2, 8), bool)
             arm_motion=np.zeros_like(motion);arm_valid=np.zeros_like(motion_valid)
+            # Physical continuity is independent of complete-arm geometry.
+            # Partial shoulder/wrist evidence must not resurrect a native cut.
+            physical_window_valid=np.ones((len(nodes),2),bool)
+            physical=bank.get('pose_native_indices')
+            if physical is None:physical_window_valid[:]=False
+            else:
+                physical=np.asarray(physical)
+                if physical.shape!=(len(nodes),4):raise ValueError('physical pose clock domain differs')
+                for window in (0,1):
+                    early,late=physical[:,2*window],physical[:,2*window+1]
+                    physical_window_valid[:,window]&=late>early
+                    native_cuts=bank.get('native_cut_frames')
+                    if native_cuts is not None:
+                        native_cuts=np.asarray(native_cuts,int)
+                        for n,(a,b) in enumerate(zip(early,late)):
+                            physical_window_valid[n,window]&=not np.any((native_cuts>a)&(native_cuts<=b))
             for n in range(len(nodes)):
                 for window in (0, 1):
                     if (body[n,2*window,:,2]>=.3).any() and (body[n,2*window+1,:,2]>=.3).any():
@@ -345,14 +361,17 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                     if np.any((cuts > tick-7) & (cuts <= tick-1)):
                         motion_valid[n, 0] = False
                         arm_valid[n,0]=False
+                        physical_window_valid[n,0]=False
                     if np.any((cuts > tick) & (cuts <= tick+6)):
                         motion_valid[n, 1] = False
                         arm_valid[n,1]=False
+                        physical_window_valid[n,1]=False
                     if np.any((cuts > tick-1) & (cuts <= tick)):
                         continuous[n] = False
             states.append(State(source, actor, family))
             data.append(dict(heads=heads, vectors=vectors, body=body, projected=projected,
                 pose_native_indices=bank.get('pose_native_indices'),
+                physical_window_valid=physical_window_valid,
                 indices=indices, formation=formation, formation_heads=formation_heads,
                 cameras=cameras, ticks=ticks, curve=values, unary=unary, through=through,
                 motion=motion, motion_valid=motion_valid, continuous=continuous,

@@ -52,7 +52,8 @@ class Ports:
         pixel_parts=any('part_pair_support' in d for d in data)
         # Pixel-corroborated shoulder/wrist endpoints remain useful when the
         # elbow has no texture. This chord is NOT an invented elbow/bone.
-        pairs=np.array([[0,2],[2,4],[1,3],[3,5]]+([[0,4],[1,5]] if pixel_parts else []))
+        pairs=np.array([[0,2],[2,4],[1,3],[3,5]]+([[0,4],[1,5]] if pixel_parts else [])
+            +[[0,6],[1,7],[6,7],[0,1]])
         self.pairs=pairs;self.destinations=tuple(map(int,pairs[:,1]))
         certainty=np.asarray([d.get('body_reliability',np.ones((N,4,8))) for d in data],np.float32)
         movement_certainty=np.asarray([d.get('motion_reliability',np.ones((N,2,8))) for d in data],np.float32)
@@ -64,7 +65,8 @@ class Ports:
         xy=self.body[...,:2]*[16/9,1.]
         bones=xy[...,pairs[:,1],:]-xy[...,pairs[:,0],:];length=np.linalg.norm(bones,axis=-1)
         supported=valid[...,pairs].all(-1)&(length>=.025)
-        self.arm_valid=supported if pixel_parts else np.repeat(supported.reshape(q,N,4,2,2).all(-1),2,axis=-1)
+        self.arm_valid=supported.copy()
+        if not pixel_parts:self.arm_valid[...,:4]=np.repeat(supported[...,:4].reshape(q,N,4,2,2).all(-1),2,axis=-1)
         self.bones=bones/np.maximum(1e-9,length[...,None])
         self.velocity=(self.bones[:,:,[1,3]]-self.bones[:,:,[0,2]])/(6/fps)
         self.velocity_valid=self.arm_valid[:,:,[1,3]]&self.arm_valid[:,:,[0,2]]
@@ -72,7 +74,7 @@ class Ports:
         for i,d in enumerate(data):
             legacy=d['arm_valid'][:,:,2:6]
             if pixel_parts:
-                fallback=np.concatenate((legacy,legacy[:,:,[0,2]]),axis=-1)
+                fallback=np.concatenate((legacy,legacy[:,:,[0,2]],np.ones((N,2,4),bool)),axis=-1)
                 scope=np.asarray(d.get('pixel_part_scope',np.zeros(N,bool)))
                 pair_support=np.asarray(d.get('part_pair_support',np.ones((N,3,8),bool)))
                 actual=(self.motion_certainty[i]>0) if 'motion_reliability' in d else pair_support[:,[0,2]][:,:,pairs].all(-1)
@@ -81,10 +83,14 @@ class Ports:
                 # basis. A new partial endpoint cannot bypass an old missing
                 # window merely because another row enabled the pixel bank.
                 complete=np.repeat(supported[i,:,:,:4].reshape(N,4,2,2).all(-1),2,axis=-1)
-                complete=np.concatenate((complete,complete[:,:,[0,2]]),axis=-1)
+                complete=np.concatenate((complete,complete[:,:,[0,2]],np.ones((N,4,4),bool)),axis=-1)
                 self.arm_valid[i]&=np.where(scope[:,None,None],True,complete)
                 self.velocity_valid[i]&=self.arm_valid[i][:,[1,3]]&self.arm_valid[i][:,[0,2]]
-            else:self.velocity_valid[i]&=legacy
+            else:self.velocity_valid[i,...,:4]&=legacy
+            physical=np.asarray(d.get('physical_window_valid',np.zeros((N,2),bool)))
+            if physical.shape!=(N,2) or physical.dtype!=bool:
+                raise ValueError('independent physical-window continuity required')
+            self.velocity_valid[i]&=physical[:,:,None]
             self.arm_valid[i]&=self.phase_certainty[i]>0
             self.velocity_valid[i]&=self.motion_certainty[i]>0
             clock=d.get('pose_native_indices')
@@ -134,7 +140,7 @@ class Ports:
         face=rho(np.maximum(np.linalg.norm((center_a[:,None]-center_b[None,:])*[16/9,1.],axis=-1)/scale,
             np.abs(np.log(np.maximum(.001,size_a[:,None])/np.maximum(.001,size_b[None,:])))))
         shape=face.shape;phase=np.zeros(shape);raw=np.zeros(shape);observed=np.zeros(shape,bool);active=np.zeros(shape,bool)
-        confidence=np.zeros(shape)
+        confidence=np.zeros(shape);active_confidence=np.zeros(shape)
         for bone,joint in enumerate(self.destinations):
             common=face_seen&self.arm_valid[:,n,1,bone,None]&self.arm_valid[:,n,2,bone][None,:]
             va,vb=self.velocity_valid[:,n,0,bone],self.velocity_valid[:,n,1,bone]
@@ -157,7 +163,9 @@ class Ports:
             moving=(np.maximum(angular_a[:,None],angular_b[None,:])>=.3)|(
                 np.maximum(np.where(va,da,0.)[:,None],np.where(vb,db,0.)[None,:])/scale>=.3)
             active|=common&measured&moving
-        return dict(face=face,face_seen=face_seen,phase=phase,raw_phase=raw,phase_seen=observed,active=active,confidence=confidence)
+            active_confidence=np.maximum(active_confidence,np.where(common&measured&moving,weight,0.))
+        return dict(face=face,face_seen=face_seen,phase=phase,raw_phase=raw,phase_seen=observed,active=active,
+            confidence=confidence,active_confidence=active_confidence)
 
     def matrix(self,n,*,details=False):
         q=len(self.states);shape=(q,q)
@@ -165,8 +173,9 @@ class Ports:
         phase_seen=np.zeros(shape,bool);motion_seen=np.zeros(shape,bool);active=np.zeros(shape,bool)
         opposed=np.zeros(shape,bool);phase_max=np.zeros(shape);motion_max=np.zeros(shape)
         phase_confidence=np.zeros(shape);motion_confidence=np.zeros(shape)
-        phase_basis=np.zeros(shape+(len(self.destinations),),np.float32)
+        phase_basis=np.zeros(shape+(2,len(self.destinations)),np.float32)
         motion_basis=np.zeros_like(phase_basis)
+        active_basis=np.zeros_like(phase_basis,dtype=bool)
         # Each physical clock is compared to itself across sources. A natural
         # hand movement from frame -1 to 0 is NOT a pose discontinuity.
         for side,phase in ((0,1),(1,2)):
@@ -190,7 +199,7 @@ class Ports:
                 weight=np.minimum(self.phase_certainty[:,n,phase,bone,None],self.phase_certainty[:,n,phase,bone][None,:])
                 phase_max=np.maximum(phase_max,np.where(common,residual*weight,0.));phase_seen|=common
                 phase_confidence=np.maximum(phase_confidence,np.where(common,weight,0.))
-                phase_basis[:,:,bone]=np.maximum(phase_basis[:,:,bone],np.where(common,weight,0.))
+                phase_basis[:,:,side,bone]=np.where(common,weight,0.)
         worst=np.maximum(worst,phase_max);seen[:,:,1]=phase_seen
         for window in (0,1):
             v=self.velocity[:,n,window];valid=self.velocity_valid[:,n,window]
@@ -215,10 +224,11 @@ class Ports:
                 weight=np.minimum(self.motion_certainty[:,n,window,bone,None],self.motion_certainty[:,n,window,bone][None,:])
                 motion_max=np.maximum(motion_max,np.where(common,residual*weight,0.));motion_seen|=common
                 motion_confidence=np.maximum(motion_confidence,np.where(common,weight,0.))
-                motion_basis[:,:,bone]=np.maximum(motion_basis[:,:,bone],np.where(common,weight,0.))
+                motion_basis[:,:,window,bone]=np.where(common,weight,0.)
                 displayed_moving=np.maximum(np.linalg.norm(screen[:,None,joint],axis=-1),
                     np.linalg.norm(screen[None,:,joint],axis=-1))/scale>=.3
-                active|=common&(moving|displayed_moving);opposed|=common&moving&(direction>=.5)&(weight>=1.)
+                active_basis[:,:,window,bone]=common&(moving|displayed_moving)
+                active|=active_basis[:,:,window,bone];opposed|=common&moving&(direction>=.5)&(weight>=1.)
         worst=np.maximum(worst,motion_max);seen[:,:,2]=motion_seen
         exposed=self.exposed_partial(n)
         # Prefer actual same-clock evidence whenever available. Fill absent
@@ -268,7 +278,7 @@ class Ports:
         # remain in the graph. Small measured errors remain continuous costs.
         focal=self.dominant[:,n,0,None]&self.dominant[:,n,1][None,:]
         candidate=phase_seen&motion_seen&(known|member_agreement)&active&~opposed&~appearance_disagreement&(phase_max<.5)&(motion_max<.5)&focal
-        same_primitive=np.minimum(phase_basis,motion_basis).max(-1)
+        same_primitive=np.where(active_basis,np.minimum(phase_basis,motion_basis),0.).max((-1,-2))
         connected=candidate&(same_primitive>=1.)
         partial=(~motion_seen)&phase_seen&exposed['active']&(known|member_agreement)&~opposed&~appearance_disagreement&focal&(phase_max<.5)&(exposed['raw_phase']<.5)
         # Visibility gain is already integrated over the incoming hold. An
@@ -276,7 +286,7 @@ class Ports:
         # its face, exactly the late wide-flash regression in real v19.
         # Only an actually supported joint/appearance connection earns change
         # credit; no source or unsupported/deliberate cut is removed.
-        connection_weight=np.where(candidate,same_primitive,.5*partial*phase_confidence)
+        connection_weight=np.where(candidate,same_primitive,.5*partial*exposed['active_confidence'])
         benefit=np.minimum(ra[:,None],rb[None,:])*novelty*connection_weight
         cost=self.width[n]*(loss-self.strength[n]*benefit)
         if not details:return cost.astype(np.float32)
@@ -290,6 +300,7 @@ class Ports:
             moving_connection_supported=connected,width_seconds=float(self.width[n]),
             provisional_model_connection_candidate=candidate&~connected,
             phase_evidence_reliability=phase_confidence,motion_evidence_reliability=motion_confidence,
+            active_same_primitive_reliability=same_primitive,
             same_clock_motion_observed=motion_seen,
             observed_event_strength=float(self.strength[n]))
 
@@ -308,3 +319,7 @@ class Ports:
         values=view.matrix(n,details=True)
         return {k:(float(v[0,1]) if np.asarray(v).dtype.kind!='b' else bool(v[0,1]))
             if np.ndim(v)==2 else v for k,v in values.items()}
+
+    def preference_features(self,n):
+        from .preference_features import extract
+        return extract(self,n)

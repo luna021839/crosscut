@@ -425,10 +425,15 @@ def main():
         if args.joint_motion_event_seconds:
             from .source_style import observe
             from .event_holds import select,realize,check_selected_clock
-            from .source_event_union import combine
+            from .source_event_union import combine,attach_existing_ports
             source_events,bound_source_cut_events,union_receipts=combine(sources=original.sources,manifest=manifest,
                 census=camera_census,warps=warps,master_start=original.master_audio_start,fps=original.fps,
                 final_frame=original.output_frame_count,check=check)
+            for bank,record in zip(banks,bound_source_cut_events):
+                bank['native_cut_frames']=np.asarray(record['frames'],int)
+            native_ports,registry_receipts=attach_existing_ports(bound=bound_source_cut_events,census=camera_census,
+                ports=native_ports,warps=warps,master_start=original.master_audio_start,fps=original.fps,
+                final_frame=original.output_frame_count)
             style,style_receipts=observe(sources=original.sources,banks=banks,
                 cache=args.cache.parent/'crosscut2-native-style-v1',check=check,maximum_seconds=180.)
             identity_hints=None;identity_receipts=[]
@@ -454,6 +459,7 @@ def main():
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts
+            fixed_receipt['native_event_registry']=registry_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,check=check)
         else:

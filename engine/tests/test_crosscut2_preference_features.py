@@ -1,0 +1,49 @@
+import numpy as np
+from crosscut2.preference_features import extract,FEATURE_NAMES
+from crosscut2.event_ports import Ports
+from crosscut2.event_states import build
+from crosscut2.fixed_holds import State
+from test_crosscut2_event_holds import inputs,provisional_parts,prepared
+
+
+def setup(*,opposed=False):
+    nodes,banks,poses,styles=inputs(opposed_source=1 if opposed else None)
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,part_observer=provisional_parts)
+    p=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+    return p,states.index(State(0,0,'native')),states.index(State(1,0,'native'))
+
+
+def test_unknown_evidence_does_not_scale_down_raw_motion_or_create_pixel_credit():
+    p,a,b=setup(opposed=True);feature=extract(p,1)[a,b]
+    assert feature[FEATURE_NAMES.index('motion')]>p.selected(1,a,b)['worst_motion_loss']
+    assert feature[FEATURE_NAMES.index('pixel_agreed_active_novelty')]==0
+    assert feature[FEATURE_NAMES.index('motion_unmeasured')]==1
+    assert np.isfinite(extract(p,1)).all()
+
+
+def test_real_hip_phase_has_its_own_channel_not_face_or_arm_error():
+    p,a,b=setup();before=extract(p,1)[a,b].copy()
+    p.projected[b,1,:,6:8,0]+=.15
+    after=extract(p,1)[a,b]
+    assert after[FEATURE_NAMES.index('torso_phase')]>before[FEATURE_NAMES.index('torso_phase')]
+    assert np.array_equal(after[:3],before[:3])
+
+
+def test_stationary_pixel_parts_do_not_lend_active_novelty_to_an_unknown_arm():
+    p,a,b=setup()
+    # Fully known left-side evidence, but all physical movement belongs to an
+    # unmeasured right side. The raw right motion remains available separately.
+    p.velocity[[a,b],1,:,0:2]=0.
+    p.projected[[a,b],1,0,2:5,:2]=p.projected[[a,b],1,1,2:5,:2]
+    p.projected[[a,b],1,3,2:5,:2]=p.projected[[a,b],1,2,2:5,:2]
+    p.phase_certainty[[a,b],1,:,0:2]=1.;p.motion_certainty[[a,b],1,:,0:2]=1.
+    assert extract(p,1)[a,b,FEATURE_NAMES.index('pixel_agreed_active_novelty')]==0
+
+
+def test_missing_identity_is_separate_from_appearance_mismatch_and_hint_is_not_certification():
+    *_,p,_=prepared();f=extract(p,1)
+    p.vectors[:]=0.;missing=extract(p,1)
+    assert np.all(missing[:,:,FEATURE_NAMES.index('appearance_unmeasured')]==1)
+    assert np.all(missing[:,:,FEATURE_NAMES.index('anonymous_appearance_cosine')]==0)
+    assert np.any(f[:,:,FEATURE_NAMES.index('appearance_unmeasured')]==0)

@@ -170,7 +170,8 @@ def test_corroborated_shoulder_wrist_motion_does_not_invent_an_untextured_elbow(
     result=ports.selected(1,a,b)
     assert result['moving_connection_supported'] and result['benefit']>0
     assert (ports.body[a,:, :,2,2]==0).all()  # no elbow completion
-    assert ports.destinations==(2,4,3,5,4,5)
+    assert ports.destinations[:6]==(2,4,3,5,4,5)
+    assert ports.destinations[6:]==(6,7,7,1)  # actual torso, never invented hips
 
 
 def test_selected_pair_report_is_exact_full_matrix_slice_without_redetecting_events():
@@ -234,3 +235,77 @@ def test_native_fragment_loss_is_seconds_of_missing_support_only():
     nodes=np.array([0,2,10,18,20]);f=fragment_costs(nodes,[np.array([10])],fps=10.,support_seconds=.4)
     assert f(0,4)[0]==0 and f(1,3)[0]==0
     assert f(0,1)[0]==pytest.approx(.2) and f(3,4)[0]==pytest.approx(.2)
+
+
+def test_selected_decomposition_does_not_repeat_search_sized_port_matrices(monkeypatch):
+    nodes,banks,poses,styles=inputs();events=[np.array([],int)]*2
+    native=[dict(frames=np.array([],int),heads=np.zeros((0,2,8,4)))]*2
+    calls=[];original_matrix=Ports.matrix
+    def observed_matrix(self,n,*,details=False):
+        calls.append((len(self.states),details))
+        return original_matrix(self,n,details=details)
+    monkeypatch.setattr(Ports,'matrix',observed_matrix)
+    runs,states,_,score,receipt,_=select(nodes,banks,poses,styles,fps=10.,source_events=events,
+        body_states=[np.ones((4,4,3),int)]*2,native_ports=native,music=np.array([0.,1.,.8,0.]))
+    assert len(runs)>1 and len(states)>2
+    assert sum(count==len(states) for count,_ in calls)==receipt['port_matrix_nodes_built']
+    assert sum(count==2 and details for count,details in calls)==len(runs)-1
+    assert receipt['selected_hold_cost_decomposition'][-1]['cumulative_cost']==pytest.approx(score)
+
+
+def provisional_parts(states,rows):
+    result=[]
+    for row in rows:
+        d=dict(row);N=len(d['heads'])
+        d['pixel_part_scope']=np.ones(N,bool)
+        d['part_pair_support']=np.zeros((N,3,8),bool)
+        d['body_reliability']=np.full((N,4,8),.5)
+        d['motion_reliability']=np.full((N,2,8),.5)
+        result.append(d)
+    return result,[]
+
+
+def test_stationary_corroborated_arm_cannot_certify_other_unmeasured_moving_arm():
+    nodes,banks,poses,styles=inputs()
+    for p in poses:
+        for joint in (0,2,4):p[:,:,0,joint,:2]=p[:,1:2,0,joint,:2]
+    def parts(states,rows):
+        rows,_=provisional_parts(states,rows)
+        for d in rows:
+            d['body_reliability'][:,:,[0,2,4]]=1.
+            d['motion_reliability'][:,:,[0,2,4]]=1.
+        return rows,[]
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,part_observer=parts)
+    ports=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+    result=ports.selected(1,states.index(State(0,0,'native')),states.index(State(1,0,'native')))
+    assert not result['moving_connection_supported']
+    assert result['provisional_model_connection_candidate']
+    assert result['active_same_primitive_reliability']==.5
+
+
+def test_unknown_pixel_reliability_does_not_resurrect_native_cut_motion_window():
+    _,banks,poses,styles=inputs();nodes=np.array([0,60,120,180])
+    for bank in banks:
+        bank['pose_native_indices']=np.clip(nodes[:,None]+[-7,-1,0,6],0,179)
+        bank['native_cut_frames']=np.array([56])
+    states,data,_=build(nodes,banks,poses,styles,fps=30.,source_events=[np.array([56])]*2,
+        body_states=[np.ones((4,4,3),int)]*2,part_observer=provisional_parts)
+    ports=Ports(nodes,states,data,fps=30.,music=[0.,1.,1.,0.])
+    a=states.index(State(0,0,'native'))
+    assert not data[a]['physical_window_valid'][1,0]
+    assert not ports.velocity_valid[a,1,0].any()
+    assert ports.velocity_valid[a,1,1].any()
+
+
+def test_observed_torso_displacement_changes_phase_loss_without_fabricated_hips():
+    nodes,banks,poses,styles=inputs()
+    def score():
+        states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+            body_states=[np.ones((4,4,3),int)]*2)
+        ports=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+        return ports.selected(1,states.index(State(0,0,'native')),states.index(State(1,0,'native')))
+    before=score()
+    poses[1][:,:,0,6:8,0]+=.15
+    after=score()
+    assert after['worst_phase_loss']>before['worst_phase_loss']

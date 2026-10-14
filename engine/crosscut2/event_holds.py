@@ -31,7 +31,10 @@ def native_events(nodes,states,data,ports,*,fps):
             curves=_curve_at(row['ticks'],row['curve'],np.array([frame-1,frame]))
             observed=(heads[:,2]>.019)&(heads[:,3]>=.75)
             risk=.5
-            if observed.all():
+            # A native largest face is not an arbitrary actor hypothesis.
+            # Without an exact association keep a finite unknown event.
+            associated=state.actor is None and bool(bank.get('observed',np.ones(len(bank['frames']),bool))[event])
+            if observed.all() and associated:
                 centers=.5+curves[:,:1]*(heads[:,:2]-curves[:,1:])
                 heights=heads[:,2]*curves[:,0]
                 position=np.linalg.norm((centers[0]-centers[1])*[16/9,1.])/max(.005,float(heights.mean()))
@@ -95,7 +98,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         event_seconds=True,native_cost=fragments)
     parts=[];total=0.
     for i,(first,end,index) in enumerate(runs):
-        entry=0. if not i else float(np.float32(measured.matrix(first)[runs[i-1][2],index]))+1/fps
+        # Decomposition uses the frozen chosen pair, not another all-state
+        # search-sized matrix. Preserve the DP's float32 port rounding.
+        entry=0. if not i else float(np.float32(measured.selected(first,runs[i-1][2],index)['cost']))+1/fps
         terms=dict(integrated_visibility_framing=float(unary[index,first:end]@(np.diff(nodes)[first:end]/fps)),
             internal_native_events=float(through[index,first+1:end].sum()),
             native_fragment_support=float(fragments(first,end)[states[index].source]),entry_event=entry,
