@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from crosscut2.fixed_holds import State, clamped_camera, make_states
+from crosscut2.fixed_holds import State, clamped_camera, make_states, port_cost
 from crosscut2.hold_utility import known_switch, soft_hold_utility,native_readability_cost
 
 
@@ -105,6 +105,9 @@ def test_dp_consumes_the_same_missing_port_and_broadcast_cost_it_reports(monkeyp
     import crosscut2.fixed_holds as fixed
     banks=[bank(),bank()];nodes=np.array([0,10,20,30])
     banks[1]['heads'][1,1]=0;banks[1]['vectors'][1,1]=0
+    for value in banks:
+        value['native_readability']=np.tile([.08,.25,.1,100.],(4,2,8,1))
+        value['native_readability_valid']=value['heads'][:,:,:,2]>.019
     captured={};original=fixed.coupled_semi_markov
     def observe(*args,**kwargs):
         producer=kwargs['seam_cost']
@@ -116,7 +119,8 @@ def test_dp_consumes_the_same_missing_port_and_broadcast_cost_it_reports(monkeyp
         return original(*args,**kwargs)
     monkeypatch.setattr(fixed,'coupled_semi_markov',observe)
     _,states,rows,_,_=fixed.select_fixed_holds(nodes,banks,None,fps=10,
-        source_events=[np.array([],int) for _ in banks],broadcast_slots=['mbc','mbc'],check=lambda:None)
+        source_events=[np.array([],int) for _ in banks],broadcast_slots=['mbc','mbc'],check=lambda:None,
+        boundary_readability=True)
     a=states.index(State(0,None,'native'));b=states.index(State(1,None,'native'))
     reported=fixed.port_cost(1,rows[a],rows[b],fps=10)
     assert reported['role']=='unobserved'
@@ -167,3 +171,42 @@ def test_digital_zoom_does_not_change_the_same_native_readability_cost():
     observed=[.1,.35,0,100]
     assert soft_hold_utility(.12,1.,native_readability=observed)['native_readability']==(
         soft_hold_utility(.12,1.35,native_readability=observed)['native_readability'])
+
+
+def test_readability_at_a_boundary_is_not_diluted_into_long_hold_average():
+    nodes=np.array([0,10,20,30]);banks=[bank(),bank()]
+    for value in banks:
+        value['native_readability']=np.tile([.15,.7,0.,100.],(4,2,8,1))
+        value['native_readability_valid']=value['heads'][:,:,:,2]>.019
+    banks[1]['native_readability'][1,1,0,1]=.05
+    states,rows,_=make_states(nodes,banks,None,fps=10,boundary_readability=True)
+    left=rows[states.index(State(0,0,'native'))]
+    right=rows[states.index(State(1,0,'native'))]
+    clean=port_cost(1,left,left,fps=10)
+    blurred=port_cost(1,left,right,fps=10)
+    expected=native_readability_cost([.15,.05,0.,100.])
+    assert blurred['boundary_native_readability_cost']==pytest.approx(expected)
+    assert blurred['soft_cost']-clean['soft_cost']==pytest.approx(expected)
+    assert port_cost(2,left,right,fps=10)['boundary_native_readability_cost']==0
+
+
+def test_unapproved_boundary_readability_experiment_is_off_by_default():
+    nodes=np.array([0,10,20,30]);values=[bank(),bank()]
+    for value in values:
+        value['native_readability']=np.tile([.05,.1,.1,100.],(4,2,8,1))
+        value['native_readability_valid']=value['heads'][:,:,:,2]>.019
+    states,rows,_=make_states(nodes,values,None,fps=10)
+    left=rows[states.index(State(0,0,'native'))];right=rows[states.index(State(1,0,'native'))]
+    assert port_cost(1,left,right,fps=10)['boundary_native_readability_cost']==0
+    assert not left['boundary_native_readability_enabled']
+
+
+def test_readability_event_does_not_invent_occlusion_or_exclude_unknown_sources():
+    value=bank();nodes=np.array([0,10,20,30])
+    value['heads'][1,1]=0;value['vectors'][1,1]=0
+    states,rows,_=make_states(nodes,[value],None,fps=10,boundary_readability=True)
+    row=rows[states.index(State(0,None,'native'))]
+    result=port_cost(1,row,row,fps=10)
+    assert result['role']=='unobserved'
+    assert result['boundary_native_readability_cost']==0
+    assert np.isfinite(result['soft_cost'])

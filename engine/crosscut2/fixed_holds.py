@@ -145,7 +145,8 @@ def _curve_at(ticks, values, query):
     return np.array([np.interp(query, ticks, values[:, i]) for i in range(3)]).T
 
 
-def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None, native_ports=None):
+def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None, native_ports=None,
+                boundary_readability=False):
     """Freeze source-local actor paths, camera curves and whole-hold costs."""
     states, data, cluster_counts = [], [], []
     if native_ports is not None and len(native_ports)!=len(banks):
@@ -334,6 +335,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                 owner=owner,owner_through=owner_through,camera_through=camera_through,
                 interval_owner_switch=interval_owner_switch,utility_parts=utility_parts,
                 native_interval_geometry=native_interval,native_through_geometry=native_through,
+                boundary_native_readability_enabled=boundary_readability,
                 quality=quality,readability_tail=readability_tail))
     return tuple(states), data, cluster_counts
 
@@ -355,9 +357,19 @@ def _action_refinement(action, synchronous, screen, *, moving_threshold=2):
 
 def port_cost(n, left, right, *, fps, action_enabled=True):
     a, b = left['heads'][n, 0], right['heads'][n, 1]
+    # A bad first/last exposed frame is a boundary event, not just a tiny
+    # duration-weighted average over an otherwise readable four-second hold.
+    # Reuse exactly the native scalar observations and existing preference;
+    # missing evidence adds no invented blur/occlusion or all-source veto.
+    readability = float(
+        (left['utility_parts']['native_readability'][n, 0]
+            if left.get('boundary_native_readability_enabled',False) else 0.)
+        + (right['utility_parts']['native_readability'][n, 1]
+            if right.get('boundary_native_readability_enabled',False) else 0.))
     result = dict(geometry_loss=4., appearance_cosine=None, conditional_pose_loss=None,
         conditional_velocity_loss=None, comparable_action_joints=0, projected_screen_motion=None,
-        role='unobserved', soft_cost=MISSING_PORT_COST)
+        role='unobserved', boundary_native_readability_cost=readability,
+        soft_cost=MISSING_PORT_COST + readability)
     if min(a[2], b[2]) <= .019:
         # A one-sided missing port is not a measured connection of a readable
         # foreground subject. Keep it finite, and never penalize all-UNKNOWN
@@ -415,7 +427,7 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
         synchronous_velocity_loss=synchronous[0], action_refinement=float(refinement),
         synchronous_basis_per_window=[('shoulder_relative_articulation' if full[w] else 'directed_complete_arm_segments')
             if (lvalid[w]&rvalid[w]).sum()>=2 else None for w in (0,1)],
-        soft_cost=float(geometry + identity + refinement))
+        soft_cost=float(geometry + identity + refinement + readability))
 
 
 def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_events=None,
@@ -508,10 +520,11 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
 
 
 def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check,
-                       action_enabled=True, body_states=None, native_ports=None):
+                       action_enabled=True, body_states=None, native_ports=None, boundary_readability=False):
     started = monotonic()
     states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps,
-        source_events=source_events,body_states=body_states,native_ports=native_ports)
+        source_events=source_events,body_states=body_states,native_ports=native_ports,
+        boundary_readability=boundary_readability)
     count = len(states)
     matrix_bytes = count * count * np.dtype(np.float32).itemsize
     if matrix_bytes > 200 * 1024**2:
@@ -538,6 +551,9 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         # The observed-only nested loop must not bypass missing-port costs.
         # Known/known cells below replace this default; all UNKNOWN stay finite.
         matrix += 2.*(left_readable[:,None] | right_readable[None,:])
+        if boundary_readability:
+            matrix += np.array([d['utility_parts']['native_readability'][n,0] for d in data])[:,None]
+            matrix += np.array([d['utility_parts']['native_readability'][n,1] for d in data])[None,:]
         for a in left:
             for b in right:
                 if states[a].source == states[b].source: continue
@@ -595,6 +611,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
         cached_body_states_consumed=body_states is not None,
         native_readability_consumed=all('native_readability' in bank for bank in banks),
+        boundary_native_readability_event_consumed=boundary_readability,
         native_readability_is_not_occlusion_or_quality_certificate=True,
         body_states_are_not_occlusion_certificates=True,
         missing_port_uncertainty_cost=MISSING_PORT_COST,
