@@ -30,6 +30,7 @@ PLAN = Path("/Volumes/CrossCutMedia/CrossCut-Training/four-song-loso-v3-full-hea
     "stageedit-four-song-loso-plan-a46afbdca134c4c51dccd0239429ca84b551385429b83078d521b19ed49b45ab.json")
 CONFIG_REPORT = Path("/Volumes/CrossCutMedia/CrossCut-Training/current-four-song-temporal-input-v7-20260913/"
     "stageedit-production-training-failure-report.json")
+HISTORICAL_BINDING = Path(__file__).with_name("fixtures") / "stage_edit_train_only_inputs_v1.json"
 
 
 def read_bound_json(path, expected=None):
@@ -38,6 +39,24 @@ def read_bound_json(path, expected=None):
     if expected is not None and digest != expected:
         raise ValueError(f"immutable input digest mismatch: {path}")
     return json.loads(data), digest
+
+
+def read_historical_input(path, *, kind, reference_id, binding):
+    matches = [row for row in binding["direct_inputs"]
+        if row["kind"] == kind and row["reference_id"] == reference_id]
+    if len(matches) != 1 or matches[0]["path"] != str(Path(path)):
+        raise ValueError("historical diagnostic input path/reference binding mismatch")
+    return read_bound_json(path, matches[0]["sha256"])
+
+
+def require_historical_fixture_identity(evidence, binding):
+    for key in ("plan_sha256", "config_report_sha256", "train_reference_ids", "data_id"):
+        if evidence[key] != binding[key]:
+            raise ValueError(f"historical diagnostic fixture identity mismatch: {key}")
+    digest = hashlib.sha256(json.dumps(evidence["tracks"],sort_keys=True,
+        separators=(",", ":"),allow_nan=False).encode()).hexdigest()
+    if digest != binding["selected_tracks_sha256"]:
+        raise ValueError("historical diagnostic fixture target/selection mismatch")
 
 
 def select_fixture(tracks, *, per_song=6):
@@ -87,8 +106,15 @@ def prepare_fixture():
     from crosscut.stage_edit_transformer import DEFAULT_STAGE_EDIT_SCHEMA as schema
     from crosscut.stage_edit_transformer import StageEditTransformerConfig
 
-    plan, plan_hash = read_bound_json(PLAN)
-    old_report, report_hash = read_bound_json(CONFIG_REPORT)
+    # These expected values were extracted from the saved, PRE-EXISTING third
+    # diagnostic receipt, not from whichever inputs happen to be present now.
+    # There is deliberately no refresh/accept-current-hashes command or fallback.
+    binding, binding_hash = read_bound_json(HISTORICAL_BINDING)
+    if (binding.get("binding_contract") != "historical_train_fixture_binding_v1"
+            or binding.get("train_reference_ids") != sorted(TRAIN_REFERENCES.values())):
+        raise ValueError("historical diagnostic binding contract/reference set mismatch")
+    plan, plan_hash = read_bound_json(PLAN,binding["plan_sha256"])
+    old_report, report_hash = read_bound_json(CONFIG_REPORT,binding["config_report_sha256"])
     # Partition authority is the frozen train list, not a guessed song name.
     train_ids = set(old_report["training_reference_ids"])
     validation_ids = set(old_report["validation_reference_ids"])
@@ -105,11 +131,11 @@ def prepare_fixture():
             continue
         ref = TRAIN_REFERENCES[song_id]
         snapshot_path = Path(record["feature_snapshot_paths_by_reference"][ref])
-        snapshot, snapshot_hash = read_bound_json(snapshot_path)
+        snapshot, snapshot_hash = read_historical_input(snapshot_path,kind="snapshot",reference_id=ref,binding=binding)
         snapshots[ref] = StageEditFeatureSnapshot.from_dict(snapshot, schema=schema)
         songs[ref] = song_id
         path = Path(record["supervision_paths_by_reference"][ref])
-        _, supervision_hash = read_bound_json(path)
+        _, supervision_hash = read_historical_input(path,kind="supervision",reference_id=ref,binding=binding)
         paths.append(path)
         manifest_item = record["dynamic_crop_manifest"]
         manifest, _ = read_bound_json(manifest_item["path"], manifest_item["file_sha256"])
@@ -146,6 +172,9 @@ def prepare_fixture():
             prefix_length=t.token_index+1, source_id=t.source_id,
             count=len(t.values), motion=t.motion_label, motion_masked=t.motion_label_loss_masked,
             normalized_times=t.normalized_times, values=t.values) for t in tracks])
+    require_historical_fixture_identity(evidence,binding)
+    evidence["historical_binding_sha256"] = binding_hash
+    evidence["historical_binding_source_receipt_sha256"] = binding["source_receipt_sha256"]
     return corpus, v3, config, sequences, replace(inventory, tracks=tracks), evidence
 
 
@@ -157,15 +186,22 @@ class DiagnosticBudget:
 
     def __init__(self, out):
         import psutil
-        self.out, self.start = out, time.monotonic()
+        self.out = out
         self.process = psutil.Process()
+        # Include interpreter/import/argument-validation time, not just the
+        # later model phase. The same clock also covers --prepare-only.
+        self.start = time.monotonic() - max(0., time.time() - self.process.create_time())
         self.done = threading.Event()
 
     def check(self):
-        import mlx.core as mx
         elapsed = time.monotonic() - self.start
-        rss, peak = self.process.memory_info().rss, mx.get_peak_memory()
-        if elapsed > self.seconds or rss > self.rss_bytes or peak > self.mlx_bytes:
+        # Never import/allocate an MLX runtime merely to watch preparation.
+        # Once production imports it, include its peak without resetting away
+        # any preparation-phase allocation. None means unmeasured, not zero.
+        runtime = sys.modules.get("mlx.core")
+        rss = self.process.memory_info().rss
+        peak = None if runtime is None else int(runtime.get_peak_memory())
+        if elapsed > self.seconds or rss > self.rss_bytes or (peak is not None and peak > self.mlx_bytes):
             raise RuntimeError(f"diagnostic budget exceeded: seconds={elapsed}, rss={rss}, mlx_peak={peak}")
         return dict(elapsed_seconds=elapsed, rss_bytes=rss, mlx_peak_bytes=peak)
 
@@ -208,7 +244,7 @@ def gradient_evidence(gradients, *, adapter=False):
     return groups
 
 
-def run_diagnostic(fixture, out):
+def run_diagnostic(fixture, out, *, budget):
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -222,11 +258,9 @@ def run_diagnostic(fixture, out):
         stage_edit_loss)
 
     corpus, v3, config, sequences, inventory, _ = fixture
-    budget = DiagnosticBudget(out)
     mx.set_cache_limit(128 * 2**20)
     mx.set_memory_limit(budget.mlx_bytes)
-    mx.reset_peak_memory()
-    threading.Thread(target=budget.watch, daemon=True).start()
+    budget.check()
     report = dict(diagnostic_only=True, production_activation_authorized=False,
         production_ready=False, validation_forwards=0, heldout_forwards=0,
         max_optimizer_updates=80, limits=dict(seconds=budget.seconds,
@@ -530,8 +564,41 @@ def run_diagnostic(fixture, out):
         report["error"]=f"{type(exc).__name__}: {exc}"
         write_report()
         raise
+
+
+def execute_diagnostic(out, *, prepare_only=False):
+    """One process-age budget/watchdog around preparation AND execution."""
+    budget = DiagnosticBudget(out)
+    watcher = threading.Thread(target=budget.watch, daemon=True)
+    watcher.start()
+    try:
+        budget.check()
+        fixture = prepare_fixture()
+        resources = budget.check()
+        (out / "fixture.json").write_text(json.dumps(fixture[-1], indent=2))
+        preparation = dict(status="fixture_verified", diagnostic_only=True,
+            production_activation_authorized=False, prepare_only=prepare_only,
+            tracks=len(fixture[-2].tracks), optimizer_updates=0,
+            watchdog_started_before_prepare=True, clock_origin="process_creation",
+            limits=dict(seconds=budget.seconds,rss_bytes=budget.rss_bytes,mlx_bytes=budget.mlx_bytes),
+            **resources)
+        (out / "preparation-report.json").write_text(json.dumps(preparation,indent=2))
+        print(json.dumps(preparation), flush=True)
+        if not prepare_only:
+            run_diagnostic(fixture,out,budget=budget)
+    except Exception as exc:
+        try:
+            binding_digest=hashlib.sha256(HISTORICAL_BINDING.read_bytes()).hexdigest()
+        except OSError:
+            binding_digest=None
+        (out / "failure.json").write_text(json.dumps(dict(diagnostic_only=True,
+            production_activation_authorized=False, error=f"{type(exc).__name__}: {exc}",
+            historical_binding_sha256=binding_digest,
+            elapsed_seconds=time.monotonic()-budget.start), indent=2))
+        raise
     finally:
         budget.done.set()
+        watcher.join(timeout=1.)
 
 
 def main():
@@ -546,19 +613,7 @@ def main():
     if root.parent.stat().st_dev != args.device:
         parser.error("authorized SSD device does not match")
     args.out.mkdir(parents=True, exist_ok=False)
-    started = time.monotonic()
-    try:
-        fixture = prepare_fixture()
-        (args.out / "fixture.json").write_text(json.dumps(fixture[-1], indent=2))
-        print(json.dumps(dict(status="fixture_verified", tracks=len(fixture[-2].tracks),
-            elapsed_seconds=time.monotonic()-started)), flush=True)
-        if not args.prepare_only:
-            run_diagnostic(fixture,args.out)
-    except Exception as exc:
-        (args.out / "failure.json").write_text(json.dumps(dict(diagnostic_only=True,
-            production_activation_authorized=False, error=f"{type(exc).__name__}: {exc}",
-            elapsed_seconds=time.monotonic()-started), indent=2))
-        raise
+    execute_diagnostic(args.out,prepare_only=args.prepare_only)
 
 
 if __name__ == "__main__":
