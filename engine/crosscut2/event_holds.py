@@ -64,16 +64,18 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
-           maximum_seconds=180.,identity_hints=None):
-    started=monotonic();next_check=started
+           maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.):
+    started=monotonic();next_check=started;phase_started=started
+    phase_limit=maximum_seconds if part_observer is None else maximum_preparation_seconds
     def live():
         nonlocal next_check
         now=monotonic()
-        if now-started>=maximum_seconds:raise TimeoutError('single coherent event selection allowance exhausted')
+        if now-phase_started>=phase_limit:raise TimeoutError('single coherent event preparation/selection allowance exhausted')
         if now>=next_check:check();next_check=now+.1
     states,data,receipt=build(nodes,banks,poses,styles,fps=fps,source_events=source_events,
-        body_states=body_states,check=live,identity_hints=identity_hints)
+        body_states=body_states,check=live,identity_hints=identity_hints,part_observer=part_observer)
     measured=Ports(nodes,states,data,fps=fps,music=music)
+    prepared=monotonic();phase_started=prepared;phase_limit=maximum_seconds
     native_interval,through=native_events(nodes,states,data,native_ports,fps=fps)
     unary=np.asarray([d['event_loss_rate'] for d in data])+native_interval/(np.diff(nodes)/fps)
     count=len(states);matrix_bytes=count*count*4
@@ -104,7 +106,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if not math.isclose(total,score,rel_tol=1e-7,abs_tol=1e-6):
         raise AssertionError('coherent event decomposition differs from exact programme objective')
     receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1',experimental=True,
-        selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-started,
+        selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-prepared,preparation_seconds=prepared-started,
         source_neural_calls_during_selection=0,event_strength_nodes=int(np.count_nonzero(measured.strength)),
         physical_observation_window_seconds=6/fps,minimum_hold_seconds=support,
         port_matrix_nodes_built=built,whole_song_quadratic_tensor_allocated=False,

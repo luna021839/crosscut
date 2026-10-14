@@ -49,17 +49,44 @@ class Ports:
                 or np.any((self.availability<0)|(self.availability>1))):
             raise ValueError('finite physical action/style/camera inputs required')
         valid=(self.body[...,2]>=.3)&(self.body[...,:2]>=0).all(-1)&(self.body[...,:2]<=1).all(-1)
-        pairs=np.array([[0,2],[2,4],[1,3],[3,5]])
+        pixel_parts=any('part_pair_support' in d for d in data)
+        # Pixel-corroborated shoulder/wrist endpoints remain useful when the
+        # elbow has no texture. This chord is NOT an invented elbow/bone.
+        pairs=np.array([[0,2],[2,4],[1,3],[3,5]]+([[0,4],[1,5]] if pixel_parts else []))
+        self.pairs=pairs;self.destinations=tuple(map(int,pairs[:,1]))
+        certainty=np.asarray([d.get('body_reliability',np.ones((N,4,8))) for d in data],np.float32)
+        movement_certainty=np.asarray([d.get('motion_reliability',np.ones((N,2,8))) for d in data],np.float32)
+        if certainty.shape!=(q,N,4,8) or movement_certainty.shape!=(q,N,2,8) or any(
+                not np.isfinite(v).all() or ((v<0)|(v>1)).any() for v in (certainty,movement_certainty)):
+            raise ValueError('finite separate body/trajectory reliability in[0,1] required')
+        self.phase_certainty=certainty[...,pairs].min(-1)
+        self.motion_certainty=movement_certainty[...,pairs].min(-1)
         xy=self.body[...,:2]*[16/9,1.]
         bones=xy[...,pairs[:,1],:]-xy[...,pairs[:,0],:];length=np.linalg.norm(bones,axis=-1)
         supported=valid[...,pairs].all(-1)&(length>=.025)
-        self.arm_valid=np.repeat(supported.reshape(q,N,4,2,2).all(-1),2,axis=-1)
+        self.arm_valid=supported if pixel_parts else np.repeat(supported.reshape(q,N,4,2,2).all(-1),2,axis=-1)
         self.bones=bones/np.maximum(1e-9,length[...,None])
         self.velocity=(self.bones[:,:,[1,3]]-self.bones[:,:,[0,2]])/(6/fps)
         self.velocity_valid=self.arm_valid[:,:,[1,3]]&self.arm_valid[:,:,[0,2]]
         # Native cuts/duplicate physical samples invalidate ONLY that window.
         for i,d in enumerate(data):
-            self.velocity_valid[i]&=d['arm_valid'][:,:,2:6]
+            legacy=d['arm_valid'][:,:,2:6]
+            if pixel_parts:
+                fallback=np.concatenate((legacy,legacy[:,:,[0,2]]),axis=-1)
+                scope=np.asarray(d.get('pixel_part_scope',np.zeros(N,bool)))
+                pair_support=np.asarray(d.get('part_pair_support',np.ones((N,3,8),bool)))
+                actual=(self.motion_certainty[i]>0) if 'motion_reliability' in d else pair_support[:,[0,2]][:,:,pairs].all(-1)
+                self.velocity_valid[i]&=np.where(scope[:,None,None],actual,fallback)
+                # Uncorroborated legacy rows preserve their complete-arm
+                # basis. A new partial endpoint cannot bypass an old missing
+                # window merely because another row enabled the pixel bank.
+                complete=np.repeat(supported[i,:,:,:4].reshape(N,4,2,2).all(-1),2,axis=-1)
+                complete=np.concatenate((complete,complete[:,:,[0,2]]),axis=-1)
+                self.arm_valid[i]&=np.where(scope[:,None,None],True,complete)
+                self.velocity_valid[i]&=self.arm_valid[i][:,[1,3]]&self.arm_valid[i][:,[0,2]]
+            else:self.velocity_valid[i]&=legacy
+            self.arm_valid[i]&=self.phase_certainty[i]>0
+            self.velocity_valid[i]&=self.motion_certainty[i]>0
             clock=d.get('pose_native_indices')
             if clock is None:self.velocity_valid[i]=False
             else:
@@ -107,7 +134,8 @@ class Ports:
         face=rho(np.maximum(np.linalg.norm((center_a[:,None]-center_b[None,:])*[16/9,1.],axis=-1)/scale,
             np.abs(np.log(np.maximum(.001,size_a[:,None])/np.maximum(.001,size_b[None,:])))))
         shape=face.shape;phase=np.zeros(shape);raw=np.zeros(shape);observed=np.zeros(shape,bool);active=np.zeros(shape,bool)
-        for bone,joint in enumerate((2,4,3,5)):
+        confidence=np.zeros(shape)
+        for bone,joint in enumerate(self.destinations):
             common=face_seen&self.arm_valid[:,n,1,bone,None]&self.arm_valid[:,n,2,bone][None,:]
             va,vb=self.velocity_valid[:,n,0,bone],self.velocity_valid[:,n,1,bone]
             measured=va[:,None]|vb[None,:]
@@ -122,18 +150,23 @@ class Ports:
             screen_step=np.maximum(np.where(va,da,0.)[:,None],np.where(vb,db,0.)[None,:])/6.
             residual=rho(np.maximum(np.maximum(0.,bone_jump-angular_step)/2.,np.maximum(0.,screen_jump-screen_step)/scale))
             raw_residual=rho(np.maximum(bone_jump/2.,screen_jump/scale))
-            phase=np.maximum(phase,np.where(common,residual,0.));raw=np.maximum(raw,np.where(common,raw_residual,0.))
+            weight=np.minimum(self.phase_certainty[:,n,1,bone,None],self.phase_certainty[:,n,2,bone][None,:])
+            phase=np.maximum(phase,np.where(common,residual*weight,0.));raw=np.maximum(raw,np.where(common,raw_residual*weight,0.))
+            confidence=np.maximum(confidence,np.where(common,weight,0.))
             observed|=common
             moving=(np.maximum(angular_a[:,None],angular_b[None,:])>=.3)|(
                 np.maximum(np.where(va,da,0.)[:,None],np.where(vb,db,0.)[None,:])/scale>=.3)
             active|=common&measured&moving
-        return dict(face=face,face_seen=face_seen,phase=phase,raw_phase=raw,phase_seen=observed,active=active)
+        return dict(face=face,face_seen=face_seen,phase=phase,raw_phase=raw,phase_seen=observed,active=active,confidence=confidence)
 
     def matrix(self,n,*,details=False):
         q=len(self.states);shape=(q,q)
         worst=np.zeros(shape,np.float32);seen=np.zeros(shape+(4,),bool)
         phase_seen=np.zeros(shape,bool);motion_seen=np.zeros(shape,bool);active=np.zeros(shape,bool)
         opposed=np.zeros(shape,bool);phase_max=np.zeros(shape);motion_max=np.zeros(shape)
+        phase_confidence=np.zeros(shape);motion_confidence=np.zeros(shape)
+        phase_basis=np.zeros(shape+(len(self.destinations),),np.float32)
+        motion_basis=np.zeros_like(phase_basis)
         # Each physical clock is compared to itself across sources. A natural
         # hand movement from frame -1 to 0 is NOT a pose discontinuity.
         for side,phase in ((0,1),(1,2)):
@@ -149,12 +182,15 @@ class Ports:
             face=rho(np.maximum(position,scale));worst=np.maximum(worst,np.where(usable,face,0.));seen[:,:,0]|=usable
             joints=self.projected[:,n,phase]
             bones=self.bones[:,n,phase];valid=self.arm_valid[:,n,phase]
-            for bone,joint in enumerate((2,4,3,5)):
+            for bone,joint in enumerate(self.destinations):
                 common=usable&valid[:,bone,None]&valid[None,:,bone]
                 screen=np.linalg.norm((joints[:,None,joint,:2]-joints[None,:,joint,:2])*[16/9,1.],axis=-1)/norm
                 angle=np.linalg.norm(bones[:,None,bone]-bones[None,:,bone],axis=-1)/2.
                 residual=rho(np.maximum(screen,angle))
-                phase_max=np.maximum(phase_max,np.where(common,residual,0.));phase_seen|=common
+                weight=np.minimum(self.phase_certainty[:,n,phase,bone,None],self.phase_certainty[:,n,phase,bone][None,:])
+                phase_max=np.maximum(phase_max,np.where(common,residual*weight,0.));phase_seen|=common
+                phase_confidence=np.maximum(phase_confidence,np.where(common,weight,0.))
+                phase_basis[:,:,bone]=np.maximum(phase_basis[:,:,bone],np.where(common,weight,0.))
         worst=np.maximum(worst,phase_max);seen[:,:,1]=phase_seen
         for window in (0,1):
             v=self.velocity[:,n,window];valid=self.velocity_valid[:,n,window]
@@ -162,7 +198,7 @@ class Ports:
             screen=(self.projected[:,n,late,:,:2]-self.projected[:,n,early,:,:2])*[16/9,1.]
             head=self.head[:,n,window,2]*self.camera[:,n,window,0]
             scale=np.maximum(.005,(head[:,None]+head[None,:])/2.)
-            for bone in range(4):
+            for bone in range(len(self.destinations)):
                 common=valid[:,bone,None]&valid[None,:,bone]
                 common&=self.continuous[:,n][None,:] if window==0 else self.continuous[:,n][:,None]
                 a,b=v[:,None,bone],v[None,:,bone];na,nb=np.linalg.norm(a,axis=-1),np.linalg.norm(b,axis=-1)
@@ -171,15 +207,18 @@ class Ports:
                 direction=np.where(moving,direction,0.)
                 speed=rho(np.abs(np.log((na+.15)/(nb+.15))))
                 residual=np.maximum(direction,speed)
-                joint=(2,4,3,5)[bone]
+                joint=self.destinations[bone]
                 # Actual displayed movement includes native camera pan/zoom.
                 # Directed-bone angular motion alone removes that mismatch.
                 camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
                 residual=np.maximum(residual,camera_motion)
-                motion_max=np.maximum(motion_max,np.where(common,residual,0.));motion_seen|=common
+                weight=np.minimum(self.motion_certainty[:,n,window,bone,None],self.motion_certainty[:,n,window,bone][None,:])
+                motion_max=np.maximum(motion_max,np.where(common,residual*weight,0.));motion_seen|=common
+                motion_confidence=np.maximum(motion_confidence,np.where(common,weight,0.))
+                motion_basis[:,:,bone]=np.maximum(motion_basis[:,:,bone],np.where(common,weight,0.))
                 displayed_moving=np.maximum(np.linalg.norm(screen[:,None,joint],axis=-1),
                     np.linalg.norm(screen[None,:,joint],axis=-1))/scale>=.3
-                active|=common&(moving|displayed_moving);opposed|=common&moving&(direction>=.5)
+                active|=common&(moving|displayed_moving);opposed|=common&moving&(direction>=.5)&(weight>=1.)
         worst=np.maximum(worst,motion_max);seen[:,:,2]=motion_seen
         exposed=self.exposed_partial(n)
         # Prefer actual same-clock evidence whenever available. Fill absent
@@ -189,6 +228,7 @@ class Ports:
         seen[:,:,0]|=exposed['face_seen']
         phase_max=np.maximum(phase_max,np.where(~phase_seen&exposed['phase_seen'],exposed['phase'],0.))
         phase_seen|=exposed['phase_seen'];seen[:,:,1]=phase_seen
+        phase_confidence=np.maximum(phase_confidence,exposed['confidence'])
         worst=np.maximum(worst,phase_max)
         a,b=self.vectors[:,n,0],self.vectors[:,n,1]
         known=(np.linalg.norm(a,axis=-1)>=.5)[:,None]&(np.linalg.norm(b,axis=-1)>=.5)[None,:]
@@ -206,7 +246,8 @@ class Ports:
         worst=np.maximum(worst,np.where(known|named_known,identity,0.));seen[:,:,3]=known|named_known
         crop=np.maximum(self.crop[:,n,0,None],self.crop[:,n,1][None,:])
         worst=np.maximum(worst,crop)
-        missing=1.-seen.mean(-1);loss=worst+.5*missing
+        evidence=seen.astype(np.float32);evidence[:,:,1]=phase_confidence;evidence[:,:,2]=motion_confidence
+        missing=1.-evidence.mean(-1);loss=worst+.5*missing
         ra,rb=self.availability[:,n,0],self.availability[:,n,1]
         colours_a,colours_b=self.colour[:,n,0],self.colour[:,n,1]
         style=np.zeros(shape)
@@ -226,14 +267,17 @@ class Ports:
         # This only removes the optional reward; its finite risk/cut/source
         # remain in the graph. Small measured errors remain continuous costs.
         focal=self.dominant[:,n,0,None]&self.dominant[:,n,1][None,:]
-        connected=phase_seen&motion_seen&(known|member_agreement)&active&~opposed&~appearance_disagreement&(phase_max<.5)&(motion_max<.5)&focal
+        candidate=phase_seen&motion_seen&(known|member_agreement)&active&~opposed&~appearance_disagreement&(phase_max<.5)&(motion_max<.5)&focal
+        same_primitive=np.minimum(phase_basis,motion_basis).max(-1)
+        connected=candidate&(same_primitive>=1.)
         partial=(~motion_seen)&phase_seen&exposed['active']&(known|member_agreement)&~opposed&~appearance_disagreement&focal&(phase_max<.5)&(exposed['raw_phase']<.5)
         # Visibility gain is already integrated over the incoming hold. An
         # extra (R_b-R_a)+ at a cut rewards waiting until A zooms out/loses
         # its face, exactly the late wide-flash regression in real v19.
         # Only an actually supported joint/appearance connection earns change
         # credit; no source or unsupported/deliberate cut is removed.
-        benefit=np.minimum(ra[:,None],rb[None,:])*novelty*(connected.astype(float)+.5*partial)
+        connection_weight=np.where(candidate,same_primitive,.5*partial*phase_confidence)
+        benefit=np.minimum(ra[:,None],rb[None,:])*novelty*connection_weight
         cost=self.width[n]*(loss-self.strength[n]*benefit)
         if not details:return cost.astype(np.float32)
         return dict(cost=cost,loss=loss,benefit=benefit,missing_fraction=missing,
@@ -244,10 +288,23 @@ class Ports:
             exposed_partial_connection_supported=partial,exposed_phase_raw_loss=exposed['raw_phase'],
             appearance_cosine=np.where(known,cosine,np.nan),style_distance=style,
             moving_connection_supported=connected,width_seconds=float(self.width[n]),
+            provisional_model_connection_candidate=candidate&~connected,
+            phase_evidence_reliability=phase_confidence,motion_evidence_reliability=motion_confidence,
             same_clock_motion_observed=motion_seen,
             observed_event_strength=float(self.strength[n]))
 
     def selected(self,n,a,b):
-        values=self.matrix(n,details=True)
-        return {k:(float(v[a,b]) if np.asarray(v).dtype.kind!='b' else bool(v[a,b]))
+        # The DP already chose these two states. Rebuilding a416x416 matrix
+        # for every report row repeats the entire search's pair work. Keep
+        # the ORIGINAL physical event strengths/widths and slice only states;
+        # never construct a new Ports object that redetects gesture events.
+        pair=np.array([a,b]);view=object.__new__(Ports);view.__dict__.update(self.__dict__)
+        view.states=tuple(self.states[i] for i in pair)
+        view.data=[self.data[i] for i in pair]
+        for key in ('head','camera','body','projected','vectors','continuous','formation','availability',
+                'colour','colour_valid','crop','dominant','member_hint','phase_certainty','motion_certainty',
+                'arm_valid','bones','velocity','velocity_valid'):
+            setattr(view,key,getattr(self,key)[pair])
+        values=view.matrix(n,details=True)
+        return {k:(float(v[0,1]) if np.asarray(v).dtype.kind!='b' else bool(v[0,1]))
             if np.ndim(v)==2 else v for k,v in values.items()}

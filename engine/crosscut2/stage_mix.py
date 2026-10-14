@@ -300,6 +300,8 @@ def main():
         help='Opt-in coherent same-clock motion/style events with source-shot-constant paired cameras')
     parser.add_argument('--local-ive-photo-tool',type=Path,
         help='Explicit existing local IVE ArcFace/photo-bank tool directory; references remain private and are not copied')
+    parser.add_argument('--native-part-pixel-support',action='store_true',
+        help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -327,6 +329,8 @@ def main():
         raise ValueError('coherent event experiment requires fixed body/native-readability/native-ports and legacy experiments OFF')
     if args.local_ive_photo_tool is not None and not args.joint_motion_event_seconds:
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
+    if args.native_part_pixel_support and not args.joint_motion_event_seconds:
+        raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -434,9 +438,19 @@ def main():
                     photo_tool=args.local_ive_photo_tool,models=args.models,
                     cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
                     maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288)
+            part_observer=None
+            if args.native_part_pixel_support:
+                from .part_support_bank import corroborate
+                from .part_hypotheses import retain_model_hypotheses
+                def part_observer(local_states,local_data):
+                    rows,receipts=corroborate(sources=original.sources,states=local_states,data=local_data,census=bound_source_cut_events,
+                        cache=args.cache.parent/'crosscut2-native-part-support-v1',check=check,
+                        maximum_seconds=180.,maximum_new_intervals=6000)
+                    return retain_model_hypotheses(rows=rows,states=local_states,sources=original.sources,
+                        cache=args.cache.parent/'crosscut2-native-part-support-v1'),receipts
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
-                identity_hints=identity_hints)
+                identity_hints=identity_hints,part_observer=part_observer)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts

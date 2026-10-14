@@ -34,10 +34,12 @@ def displayed_attention(heads,camera,index):
     return ratio,bool(index>=0 and maximum>0 and salience[index]>=maximum*(1.-1e-6))
 
 
-def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:None,identity_hints=None):
+def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:None,identity_hints=None,part_observer=None):
     if len(styles)!=len(banks):raise ValueError('source-bound native style inputs required')
     bases,raw,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
         body_states=body_states,check=check,camera_families=('native',))
+    part_receipts=[]
+    if part_observer is not None:raw,part_receipts=part_observer(bases,raw)
     paths,camera_report=make_paths(nodes,banks,source_events,check=check)
     states=[];data=[]
     for state,row in zip(bases,raw):
@@ -88,6 +90,7 @@ def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:
             record.pop('unary');record.pop('through')
             states.append(replace(state,family='native' if family==0 else f'shot_match_{family-1}'));data.append(record)
     return tuple(states),data,dict(source_local_appearance_clusters=counts,fixed_states=len(states),
+        native_part_corroboration=part_receipts,
         raw_actor_states_prepared_once=len(bases),camera_domain=camera_report,
         native_pixel_quality_not_increased_by_zoom=True,stage_edit_transformer_used=False,
         professional_quality_approved=False)

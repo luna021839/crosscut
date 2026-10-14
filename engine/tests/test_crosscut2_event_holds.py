@@ -153,6 +153,38 @@ def test_camera_motion_mismatch_is_not_erased_by_identical_bone_angles():
     assert result['worst_motion_loss']>=.5 and result['benefit']==0
 
 
+def test_corroborated_shoulder_wrist_motion_does_not_invent_an_untextured_elbow():
+    nodes,banks,poses,styles=inputs(one_arm=True)
+    def partial_parts(states,rows):
+        result=[]
+        for d in rows:
+            d=dict(d);d['body']=d['body'].copy();d['body'][:,:,2,2]=0.
+            d['pixel_part_scope']=np.ones(len(nodes),bool)
+            d['part_pair_support']=np.ones((len(nodes),3,8),bool)
+            d['part_pair_support'][:,:,2]=False;result.append(d)
+        return result,[dict(new_neural_calls=0)]
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,part_observer=partial_parts)
+    ports=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.])
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    result=ports.selected(1,a,b)
+    assert result['moving_connection_supported'] and result['benefit']>0
+    assert (ports.body[a,:, :,2,2]==0).all()  # no elbow completion
+    assert ports.destinations==(2,4,3,5,4,5)
+
+
+def test_selected_pair_report_is_exact_full_matrix_slice_without_redetecting_events():
+    _,_,_,_,_,states,_,ports,_=prepared(count=3,opposed_source=2)
+    full=ports.matrix(1,details=True)
+    for a,b in ((0,3),(2,6),(5,1),(0,0)):
+        report=ports.selected(1,a,b)
+        for key,value in full.items():
+            expected=value[a,b] if np.ndim(value)==2 else value
+            if np.isscalar(expected) and np.asarray(expected).dtype.kind=='f' and np.isnan(expected):
+                assert np.isnan(report[key])
+            else:assert report[key]==expected
+
+
 def test_point_curve_interpolation_preserves_multi_dimensional_query_axes():
     from crosscut2.fixed_holds import _curve_at
     ticks=np.array([0,10]);values=np.array([[1.,.5,.5],[1.2,.55,.6]])
