@@ -64,7 +64,7 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
-           maximum_seconds=180.):
+           maximum_seconds=180.,identity_hints=None):
     started=monotonic();next_check=started
     def live():
         nonlocal next_check
@@ -72,7 +72,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         if now-started>=maximum_seconds:raise TimeoutError('single coherent event selection allowance exhausted')
         if now>=next_check:check();next_check=now+.1
     states,data,receipt=build(nodes,banks,poses,styles,fps=fps,source_events=source_events,
-        body_states=body_states,check=live)
+        body_states=body_states,check=live,identity_hints=identity_hints)
     measured=Ports(nodes,states,data,fps=fps,music=music)
     native_interval,through=native_events(nodes,states,data,native_ports,fps=fps)
     unary=np.asarray([d['event_loss_rate'] for d in data])+native_interval/(np.diff(nodes)/fps)

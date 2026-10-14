@@ -298,6 +298,8 @@ def main():
         help='Experimental observed music/action C-W objective; not a validated app editor')
     parser.add_argument('--joint-motion-event-seconds',action='store_true',
         help='Opt-in coherent same-clock motion/style events with source-shot-constant paired cameras')
+    parser.add_argument('--local-ive-photo-tool',type=Path,
+        help='Explicit existing local IVE ArcFace/photo-bank tool directory; references remain private and are not copied')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -323,6 +325,8 @@ def main():
             or not args.native_source_readability or not args.native_camera_ports
             or args.joint_musical_opportunities or args.boundary_native_readability):
         raise ValueError('coherent event experiment requires fixed body/native-readability/native-ports and legacy experiments OFF')
+    if args.local_ive_photo_tool is not None and not args.joint_motion_event_seconds:
+        raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -400,6 +404,7 @@ def main():
     if slots is not None and len(slots) != len(banks):
         raise ValueError('broadcast slot domain differs from observed sources')
     fixed_receipt = None
+    bound_source_cut_events=None
     if args.fixed_actor_camera_holds:
         from .fixed_holds import select_fixed_holds, realize_fixed_holds
         music_strengths=None
@@ -416,12 +421,26 @@ def main():
         if args.joint_motion_event_seconds:
             from .source_style import observe
             from .event_holds import select,realize,check_selected_clock
+            from .source_event_union import combine
+            source_events,bound_source_cut_events,union_receipts=combine(sources=original.sources,manifest=manifest,
+                census=camera_census,warps=warps,master_start=original.master_audio_start,fps=original.fps,
+                final_frame=original.output_frame_count,check=check)
             style,style_receipts=observe(sources=original.sources,banks=banks,
                 cache=args.cache.parent/'crosscut2-native-style-v1',check=check,maximum_seconds=180.)
+            identity_hints=None;identity_receipts=[]
+            if args.local_ive_photo_tool is not None:
+                from .recurrent_member_hints import measure
+                identity_hints,identity_receipts=measure(sources=original.sources,banks=banks,census=camera_census,
+                    photo_tool=args.local_ive_photo_tool,models=args.models,
+                    cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
+                    maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
-                source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check)
+                source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
+                identity_hints=identity_hints)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
+            fixed_receipt['source_event_union']=union_receipts
+            fixed_receipt['recurrent_local_member_hints']=identity_receipts
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,check=check)
         else:
             runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
@@ -446,6 +465,7 @@ def main():
     # Serialization failures must not leave a truncated file masquerading as
     # a source-bound saved recipe and block an otherwise warm-cache retry.
     encoded = json.dumps(dict(render_plan=plan.to_json(), sparse_perception=receipts,
+            bound_source_cut_events=bound_source_cut_events,
             native_readability_observations=readability_receipts,
             native_camera_port_observations=native_port_receipts,
             stage_edit_transformer_used=False,

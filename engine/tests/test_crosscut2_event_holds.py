@@ -77,6 +77,90 @@ def test_missing_pose_is_finite_not_stationary_and_does_not_remove_source():
     assert np.isfinite(ports.matrix(1)).all() and State(1,None,'native') in states
 
 
+def test_confirmed_local_hint_disagreement_cannot_earn_moving_match_reward():
+    nodes,banks,poses,styles=inputs();banks[1]['vectors'][:,:,0]=0.;banks[1]['vectors'][:,:,0,1]=1.
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,identity_hints=[np.array([0]),np.array([1])])
+    ports=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.]);a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    result=ports.selected(1,a,b)
+    assert result['anonymous_appearance_disagreement'] and result['benefit']==0
+    assert np.isfinite(result['cost']) and State(1,None,'native') in states
+
+
+def test_displayed_foreground_not_a_better_matching_background_face():
+    from crosscut2.event_states import displayed_attention
+    h=np.zeros((8,4));h[0]=[.55,.35,.32,.95];h[1]=[.45,.35,.16,.95]
+    ratio,dominant=displayed_attention(h,np.array([1.,.5,.5]),1)
+    assert 0<ratio<.3 and not dominant
+    assert displayed_attention(h,np.array([1.,.5,.5]),0)[1]
+
+
+def test_same_member_recurrent_hints_do_not_treat_low_single_frame_cosine_as_conflict():
+    nodes,banks,poses,styles=inputs();banks[1]['vectors'][:,:,0]=0.;banks[1]['vectors'][:,:,0,0]=.42
+    banks[1]['vectors'][:,:,0,1]=np.sqrt(1.-.42**2)
+    states,data,_=build(nodes,banks,poses,styles,fps=10.,source_events=[np.array([],int)]*2,
+        body_states=[np.ones((4,4,3),int)]*2,identity_hints=[np.array([0]),np.array([0])])
+    ports=Ports(nodes,states,data,fps=10.,music=[0.,1.,1.,0.]);a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    result=ports.selected(1,a,b)
+    assert result['source_local_member_hint_agreement'] and not result['anonymous_appearance_disagreement']
+    assert result['moving_connection_supported'] and result['benefit']>0
+
+
+def test_real_exposed_arm_can_connect_when_native_cuts_hide_same_clock_counterfactuals():
+    _,_,_,_,_,states,_,ports,_=prepared(one_arm=True)
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    ports.continuous[a,1]=ports.continuous[b,1]=False
+    result=ports.selected(1,a,b)
+    assert not result['same_clock_motion_observed'] and not result['moving_connection_supported']
+    assert result['exposed_partial_connection_supported'] and result['benefit']>0
+    assert result['missing_fraction']>=.25  # no direction fabricated as known
+
+
+def test_hit_reversal_across_different_exposed_windows_is_not_same_clock_contradiction():
+    _,_,_,_,_,states,_,ports,_=prepared(one_arm=True)
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    ports.continuous[a,1]=ports.continuous[b,1]=False
+    ports.velocity[b,1,1]*=-1.
+    result=ports.selected(1,a,b)
+    assert not result['opposed_motion'] and result['exposed_partial_connection_supported']
+    assert not result['same_clock_motion_observed'] and result['missing_fraction']>=.25
+
+
+def test_supported_same_clock_opposed_limb_cannot_escape_into_exposed_partial_credit():
+    _,_,_,_,_,states,_,ports,_=prepared(one_arm=True)
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    ports.continuous[a,1]=False;ports.velocity[b,1,0]*=-1.
+    result=ports.selected(1,a,b)
+    assert result['opposed_motion'] and not result['exposed_partial_connection_supported']
+    assert result['benefit']==0
+
+
+def test_bad_outgoing_visibility_is_not_a_quality_gain_bonus_at_the_cut():
+    _,_,_,_,_,states,data,ports,_=prepared()
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    ports.availability[a,1,0]=0.;ports.availability[b,1,1]=1.
+    result=ports.selected(1,a,b)
+    assert result['benefit']==0.  # Incoming quality is already an interval rate.
+
+
+def test_camera_motion_mismatch_is_not_erased_by_identical_bone_angles():
+    _,_,_,_,_,states,data,ports,_=prepared()
+    a=states.index(State(0,0,'native'));b=states.index(State(1,0,'native'))
+    # A large native camera/body translation before the cut. Directed bones
+    # and the central same-clock poses still agree exactly.
+    ports.projected[b,1,0,:,:2]+=[.3,0.]
+    result=ports.selected(1,a,b)
+    assert result['worst_motion_loss']>=.5 and result['benefit']==0
+
+
+def test_point_curve_interpolation_preserves_multi_dimensional_query_axes():
+    from crosscut2.fixed_holds import _curve_at
+    ticks=np.array([0,10]);values=np.array([[1.,.5,.5],[1.2,.55,.6]])
+    query=np.array([[0,1],[8,9]])
+    assert _curve_at(ticks,values,query).shape==(2,2,3)
+    assert np.array_equal(_curve_at(ticks,values,query)[1,0],_curve_at(ticks,values,[8])[0])
+
+
 def test_event_duration_does_not_change_on_neutral_node_insertion():
     a=event_widths([0,10,20,30],[0,1.,.7,0],fps=10)
     b=event_widths([0,5,10,15,20,25,30],[0,0,1.,0,.7,0,0],fps=10)

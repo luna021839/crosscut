@@ -39,6 +39,8 @@ class Ports:
         self.colour=np.sqrt(np.asarray([d['colour'] for d in data],np.float32))
         self.colour_valid=np.asarray([d['colour_valid'] for d in data],bool)
         self.crop=np.asarray([d['added_crop'] for d in data],np.float32)
+        self.dominant=np.asarray([d['displayed_attention_dominant'] for d in data],bool)
+        self.member_hint=np.asarray([d['local_member_hint'] for d in data],np.int16)
         q,N=len(states),len(nodes)
         if self.body.shape!=(q,N,4,8,3) or self.head.shape!=(q,N,2,4):
             raise ValueError('same-clock fixed action/camera states required')
@@ -89,6 +91,44 @@ class Ports:
         # existing physical event's duration.
         self.width=np.where(self.strength>0,self.width,6/fps);self.width[[0,-1]]=0.
 
+    def exposed_partial(self,n):
+        """Real outgoing/incoming poses when a native cut hides counterfactuals.
+
+        An actually measured one-frame step envelope removes only plausible
+        natural movement, not arbitrary pose error. Direction compatibility
+        across pre-hit/post-hit windows is UNKNOWN, not stationary/opposed.
+        This basis can earn at most half connection credit, never certification.
+        """
+        a,b=self.head[:,n,0],self.head[:,n,1];ca,cb=self.camera[:,n,0],self.camera[:,n,1]
+        center_a=.5+ca[:,:1]*(a[:,:2]-ca[:,1:]);center_b=.5+cb[:,:1]*(b[:,:2]-cb[:,1:])
+        size_a,size_b=a[:,2]*ca[:,0],b[:,2]*cb[:,0]
+        scale=np.maximum(.005,(size_a[:,None]+size_b[None,:])/2.)
+        face_seen=((a[:,2]>.019)&~self.formation[:,n,0])[:,None]&((b[:,2]>.019)&~self.formation[:,n,1])[None,:]
+        face=rho(np.maximum(np.linalg.norm((center_a[:,None]-center_b[None,:])*[16/9,1.],axis=-1)/scale,
+            np.abs(np.log(np.maximum(.001,size_a[:,None])/np.maximum(.001,size_b[None,:])))))
+        shape=face.shape;phase=np.zeros(shape);raw=np.zeros(shape);observed=np.zeros(shape,bool);active=np.zeros(shape,bool)
+        for bone,joint in enumerate((2,4,3,5)):
+            common=face_seen&self.arm_valid[:,n,1,bone,None]&self.arm_valid[:,n,2,bone][None,:]
+            va,vb=self.velocity_valid[:,n,0,bone],self.velocity_valid[:,n,1,bone]
+            measured=va[:,None]|vb[None,:]
+            angular_a=np.linalg.norm(self.velocity[:,n,0,bone],axis=-1)
+            angular_b=np.linalg.norm(self.velocity[:,n,1,bone],axis=-1)
+            angular_step=np.maximum(np.where(va,angular_a,0.)[:,None],np.where(vb,angular_b,0.)[None,:])/self.fps
+            bone_jump=np.linalg.norm(self.bones[:,None,n,1,bone]-self.bones[None,:,n,2,bone],axis=-1)
+            pa,pb=self.projected[:,n,1,joint,:2],self.projected[:,n,2,joint,:2]
+            screen_jump=np.linalg.norm((pa[:,None]-pb[None,:])*[16/9,1.],axis=-1)
+            da=np.linalg.norm((self.projected[:,n,1,joint,:2]-self.projected[:,n,0,joint,:2])*[16/9,1.],axis=-1)
+            db=np.linalg.norm((self.projected[:,n,3,joint,:2]-self.projected[:,n,2,joint,:2])*[16/9,1.],axis=-1)
+            screen_step=np.maximum(np.where(va,da,0.)[:,None],np.where(vb,db,0.)[None,:])/6.
+            residual=rho(np.maximum(np.maximum(0.,bone_jump-angular_step)/2.,np.maximum(0.,screen_jump-screen_step)/scale))
+            raw_residual=rho(np.maximum(bone_jump/2.,screen_jump/scale))
+            phase=np.maximum(phase,np.where(common,residual,0.));raw=np.maximum(raw,np.where(common,raw_residual,0.))
+            observed|=common
+            moving=(np.maximum(angular_a[:,None],angular_b[None,:])>=.3)|(
+                np.maximum(np.where(va,da,0.)[:,None],np.where(vb,db,0.)[None,:])/scale>=.3)
+            active|=common&measured&moving
+        return dict(face=face,face_seen=face_seen,phase=phase,raw_phase=raw,phase_seen=observed,active=active)
+
     def matrix(self,n,*,details=False):
         q=len(self.states);shape=(q,q)
         worst=np.zeros(shape,np.float32);seen=np.zeros(shape+(4,),bool)
@@ -118,6 +158,10 @@ class Ports:
         worst=np.maximum(worst,phase_max);seen[:,:,1]=phase_seen
         for window in (0,1):
             v=self.velocity[:,n,window];valid=self.velocity_valid[:,n,window]
+            early,late=(0,1) if window==0 else (2,3)
+            screen=(self.projected[:,n,late,:,:2]-self.projected[:,n,early,:,:2])*[16/9,1.]
+            head=self.head[:,n,window,2]*self.camera[:,n,window,0]
+            scale=np.maximum(.005,(head[:,None]+head[None,:])/2.)
             for bone in range(4):
                 common=valid[:,bone,None]&valid[None,:,bone]
                 common&=self.continuous[:,n][None,:] if window==0 else self.continuous[:,n][:,None]
@@ -127,14 +171,39 @@ class Ports:
                 direction=np.where(moving,direction,0.)
                 speed=rho(np.abs(np.log((na+.15)/(nb+.15))))
                 residual=np.maximum(direction,speed)
+                joint=(2,4,3,5)[bone]
+                # Actual displayed movement includes native camera pan/zoom.
+                # Directed-bone angular motion alone removes that mismatch.
+                camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
+                residual=np.maximum(residual,camera_motion)
                 motion_max=np.maximum(motion_max,np.where(common,residual,0.));motion_seen|=common
-                active|=common&moving;opposed|=common&moving&(direction>=.5)
+                displayed_moving=np.maximum(np.linalg.norm(screen[:,None,joint],axis=-1),
+                    np.linalg.norm(screen[None,:,joint],axis=-1))/scale>=.3
+                active|=common&(moving|displayed_moving);opposed|=common&moving&(direction>=.5)
         worst=np.maximum(worst,motion_max);seen[:,:,2]=motion_seen
+        exposed=self.exposed_partial(n)
+        # Prefer actual same-clock evidence whenever available. Fill absent
+        # phase/face channels with real exposed endpoints; trajectory direction
+        # remains unmeasured, so its finite uncertainty is retained below.
+        worst=np.maximum(worst,np.where(~seen[:,:,0]&exposed['face_seen'],exposed['face'],0.))
+        seen[:,:,0]|=exposed['face_seen']
+        phase_max=np.maximum(phase_max,np.where(~phase_seen&exposed['phase_seen'],exposed['phase'],0.))
+        phase_seen|=exposed['phase_seen'];seen[:,:,1]=phase_seen
+        worst=np.maximum(worst,phase_max)
         a,b=self.vectors[:,n,0],self.vectors[:,n,1]
         known=(np.linalg.norm(a,axis=-1)>=.5)[:,None]&(np.linalg.norm(b,axis=-1)>=.5)[None,:]
         cosine=np.clip(np.einsum('ik,jk->ij',a,b,optimize=False),-1,1)
         identity=rho(np.maximum(0.,(.65-cosine)/.3))
-        worst=np.maximum(worst,np.where(known,identity,0.));seen[:,:,3]=known
+        member_a,member_b=self.member_hint[:,n,0],self.member_hint[:,n,1]
+        named_known=(member_a[:,None]>=0)&(member_b[None,:]>=0)
+        member_agreement=named_known&(member_a[:,None]==member_b[None,:])
+        member_conflict=named_known&~member_agreement
+        # A single SFace cosine below .55 is NOT known different identity.
+        # Actual same-Rei across costumes measured .42 in v19; use independent
+        # recurrent local hints when available, never reinterpret128D as512D.
+        appearance_disagreement=member_conflict
+        identity=np.where(member_agreement,0.,np.where(member_conflict,1.,identity))
+        worst=np.maximum(worst,np.where(known|named_known,identity,0.));seen[:,:,3]=known|named_known
         crop=np.maximum(self.crop[:,n,0,None],self.crop[:,n,1][None,:])
         worst=np.maximum(worst,crop)
         missing=1.-seen.mean(-1);loss=worst+.5*missing
@@ -152,15 +221,30 @@ class Ports:
         framing=rho(np.abs(np.log(np.maximum(.005,h1[:,2,None])/np.maximum(.005,h2[None,:,2])))+
             np.linalg.norm((h1[:,None,:2]-h2[None,:,:2])*[16/9,1.],axis=-1))
         novelty=1.-(1.-style)*(1.-framing)
-        connected=phase_seen&motion_seen&known&active&~opposed
-        benefit=np.maximum(0.,rb[None,:]-ra[:,None])+np.minimum(ra[:,None],rb[None,:])*novelty*connected
-        benefit=np.where(opposed,0.,benefit)
+        # One whole displayed face-height of residual or an equally large
+        # observed motion disagreement is not a matched-action opportunity.
+        # This only removes the optional reward; its finite risk/cut/source
+        # remain in the graph. Small measured errors remain continuous costs.
+        focal=self.dominant[:,n,0,None]&self.dominant[:,n,1][None,:]
+        connected=phase_seen&motion_seen&(known|member_agreement)&active&~opposed&~appearance_disagreement&(phase_max<.5)&(motion_max<.5)&focal
+        partial=(~motion_seen)&phase_seen&exposed['active']&(known|member_agreement)&~opposed&~appearance_disagreement&focal&(phase_max<.5)&(exposed['raw_phase']<.5)
+        # Visibility gain is already integrated over the incoming hold. An
+        # extra (R_b-R_a)+ at a cut rewards waiting until A zooms out/loses
+        # its face, exactly the late wide-flash regression in real v19.
+        # Only an actually supported joint/appearance connection earns change
+        # credit; no source or unsupported/deliberate cut is removed.
+        benefit=np.minimum(ra[:,None],rb[None,:])*novelty*(connected.astype(float)+.5*partial)
         cost=self.width[n]*(loss-self.strength[n]*benefit)
         if not details:return cost.astype(np.float32)
         return dict(cost=cost,loss=loss,benefit=benefit,missing_fraction=missing,
             worst_phase_loss=phase_max,worst_motion_loss=motion_max,opposed_motion=opposed,
+            anonymous_appearance_disagreement=appearance_disagreement,
+            source_local_member_hint_agreement=member_agreement,source_local_member_hint_conflict=member_conflict,
+            chosen_faces_are_displayed_attention_maxima=focal,
+            exposed_partial_connection_supported=partial,exposed_phase_raw_loss=exposed['raw_phase'],
             appearance_cosine=np.where(known,cosine,np.nan),style_distance=style,
             moving_connection_supported=connected,width_seconds=float(self.width[n]),
+            same_clock_motion_observed=motion_seen,
             observed_event_strength=float(self.strength[n]))
 
     def selected(self,n,a,b):

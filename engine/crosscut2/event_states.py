@@ -16,7 +16,25 @@ def crop_added_loss(body,projected):
     return clipped.sum(-1)/np.maximum(1,valid.sum(-1))
 
 
-def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:None):
+def displayed_attention(heads,camera,index):
+    """Source-only visible face salience under an ACTUAL candidate crop.
+
+    A selected background face cannot stand in for the larger visible focal
+    person in the rendered pixels. This is an attention proxy, not ownership.
+    It is computed before any cross-source match/member comparison.
+    """
+    center=.5+camera[0]*(heads[:,:2]-camera[1:]);height=heads[:,2]*camera[0]
+    half=height[:,None]*[.45*9/16,.5]
+    extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
+    area=np.prod(extent,axis=1)
+    salience=area*np.exp(-((center[:,0]-.5)/.4)**2)
+    salience=np.where((heads[:,2]>.019)&(heads[:,3]>=.75),salience,0.)
+    maximum=float(salience.max())
+    ratio=0. if index<0 or maximum<=0 else float(salience[index]/maximum)
+    return ratio,bool(index>=0 and maximum>0 and salience[index]>=maximum*(1.-1e-6))
+
+
+def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:None,identity_hints=None):
     if len(styles)!=len(banks):raise ValueError('source-bound native style inputs required')
     bases,raw,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
         body_states=body_states,check=check,camera_families=('native',))
@@ -47,13 +65,23 @@ def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:
             extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
             face_fraction=np.prod(extent/np.maximum(1e-8,2.*half),axis=-1)
             # Enlargement changes displayed framing, never native pixel quality.
-            availability=np.sqrt(np.maximum(0.,quality))*display*np.sqrt(salience)*face_fraction
+            attention=np.ones(indices.shape,np.float32);dominant=np.zeros(indices.shape,bool)
+            member_hint=np.full(indices.shape,-1,np.int16)
+            for n,side in zip(*np.nonzero(indices>=0)):
+                attention[n,side],dominant[n,side]=displayed_attention(native['heads'][n,side],cameras[n,side],int(indices[n,side]))
+                owner=int(row['owner'][n,side])
+                if identity_hints is not None and owner>=0:
+                    hints=identity_hints[source]
+                    if owner>=len(hints):raise ValueError('source-local member hint lost its actor domain')
+                    member_hint[n,side]=int(hints[owner])
+            availability=np.sqrt(np.maximum(0.,quality))*display*np.sqrt(salience)*face_fraction*attention
             presence=styles[source]['presence'];black=np.clip((presence[:,:,0]-.8)/.2,0,1)
             availability=np.clip(availability*(1.-black),0,1)
             losses=1.-availability+crop+.1*np.log(cameras[:,:,0])/np.log(2.)
             unary=(losses[:-1,1]+losses[1:,0])/2.
             record=dict(row,cameras=cameras,ticks=ticks,curve=curve,projected=projected,
                 native_quality=quality,availability=availability,colour=colour,colour_valid=colour_valid,
+                displayed_attention_ratio=attention,displayed_attention_dominant=dominant,local_member_hint=member_hint,
                 added_crop=crop,event_loss_rate=unary,
                 camera_candidate_is_not_verified_actor_track=True)
             # Do not accidentally send legacy objective arrays to the new DP.

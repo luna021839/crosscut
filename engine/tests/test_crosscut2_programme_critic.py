@@ -5,7 +5,7 @@ from fractions import Fraction
 from crosscut.render import AspectRatio, RenderPlan, RenderSegment
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut2.action_geometry import compare_screen_motion
-from crosscut2.programme_critic import boundary_union, coverage, programme_schedules, rendered_source_frame
+from crosscut2.programme_critic import boundary_union, coverage, programme_schedules, rendered_source_frame,bound_source_cuts
 
 
 def test_equal_counts_with_different_boundaries_do_not_prove_coverage():
@@ -61,3 +61,18 @@ def test_camera_pan_changes_screen_velocity_even_with_identical_source_joints():
     assert aligned['velocity_loss'] == 0.
     assert opposed['velocity_loss'] == pytest.approx(1.)
     assert opposed['cost'] > aligned['cost']
+
+
+def test_retained_transnet_cut_is_actually_in_critic_schedule_not_only_editor_metadata(tmp_path):
+    identity=(7,8,9,10);base=[dict(fps=30.,frame_count=100,frames=[50])]
+    union=[dict(contract='bound_transnet_adaptive_first_incoming_union_v1',source=0,
+        source_file_identity=list(identity),fps=30.,frame_count=100,frames=[20,50])]
+    actual=bound_source_cuts(base,union,[identity])
+    assert actual[0]['frames']==[20,50] and base[0]['frames']==[50]
+    plan=RenderPlan((tmp_path/'a.mp4',),(RenderSegment(0,0.,3.,0.),),0,
+        AspectRatio.LANDSCAPE,tmp_path/'out.mp4',fps=30.)
+    clock=VerifiedRenderFrameClock(Fraction(30),100,'0'*64)
+    _,_,native=programme_schedules(plan,[clock],[actual[0]['frames']])
+    assert native==(20,50)
+    union[0]['source_file_identity']=[7,8,9,11]
+    with pytest.raises(ValueError,match='bound to current'):bound_source_cuts(base,union,[identity])

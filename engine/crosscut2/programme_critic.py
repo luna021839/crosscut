@@ -87,6 +87,22 @@ def rendered_source_frame(schedules, tick):
     raise ValueError('output tick is outside the shared rendered source schedule')
 
 
+def bound_source_cuts(records,union,source_bindings):
+    if union is None:return records
+    if len(union)!=len(records):raise ValueError('critic bound source-cut union domain differs')
+    merged=[]
+    for s,(base,value) in enumerate(zip(records,union)):
+        frames=value.get('frames')
+        if (value.get('contract')!='bound_transnet_adaptive_first_incoming_union_v1'
+                or value.get('source')!=s or tuple(value.get('source_file_identity',()))!=source_bindings[s]
+                or value.get('frame_count')!=base['frame_count'] or value.get('fps')!=base['fps']
+                or not isinstance(frames,list) or any(type(f) is not int or not 0<f<base['frame_count'] for f in frames)
+                or frames!=sorted(set(frames))):
+            raise ValueError('critic native union is not bound to current source/cut clocks')
+        merged.append(dict(base,frames=frames))
+    return tuple(merged)
+
+
 def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, maximum_seconds=240.):
     started = monotonic()
     if not math.isfinite(maximum_seconds) or not 1 <= maximum_seconds <= 600:
@@ -109,6 +125,7 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
         live()
         clocks.append(probe_render_frame_clock(source))
     records = census(plan.sources, cache=cut_cache, check=live)
+    records=bound_source_cuts(records,record.get('bound_source_cut_events'),source_bindings)
     schedules, authored, native = programme_schedules(plan, clocks, [r['frames'] for r in records])
     mapping_seconds = monotonic() - clock_started
     fps, count, detected = scan_cuts(movie, check=live)
