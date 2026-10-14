@@ -302,6 +302,8 @@ def main():
         help='Explicit existing local IVE ArcFace/photo-bank tool directory; references remain private and are not copied')
     parser.add_argument('--native-part-pixel-support',action='store_true',
         help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
+    parser.add_argument('--experimental-preference-model',type=Path,
+        help='Explicit fitted same-event experimental model; not normal app or professional-quality approval')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -331,6 +333,8 @@ def main():
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
+    if args.experimental_preference_model is not None and not args.native_part_pixel_support:
+        raise ValueError('experimental preference requires the explicit partial-evidence event consumer')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -453,9 +457,14 @@ def main():
                         maximum_seconds=180.,maximum_new_intervals=6000)
                     return retain_model_hypotheses(rows=rows,states=local_states,sources=original.sources,
                         cache=args.cache.parent/'crosscut2-native-part-support-v1'),receipts
+            preference_model=None
+            if args.experimental_preference_model is not None:
+                from .preference_model import Model
+                preference_model=Model(json.loads(args.experimental_preference_model.read_text()))
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
-                identity_hints=identity_hints,part_observer=part_observer)
+                identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
+                preference_workspace=args.cache.parent/'crosscut2-transient-preference')
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts

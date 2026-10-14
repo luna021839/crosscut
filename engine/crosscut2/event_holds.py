@@ -67,7 +67,8 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
-           maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.):
+           maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
+           preference_model=None,preference_workspace=None):
     started=monotonic();next_check=started;phase_started=started
     phase_limit=maximum_seconds if part_observer is None else maximum_preparation_seconds
     def live():
@@ -92,15 +93,41 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 states=count,elapsed_seconds=monotonic()-started)),flush=True)
         return result
     support=12/fps;fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=support)
-    runs,score,secondary=choose_opportunities(nodes,fps=fps,unary=unary,ports=ports,
-        state_sources=np.asarray([s.source for s in states]),source_events=source_events,
-        same_show=np.zeros((count,count),np.float32),through=through,check=live,minimum_hold=support,
-        event_seconds=True,native_cost=fragments)
+    preference_parts=None;preference_receipt=None;secondary=None
+    if preference_model is None:
+        runs,score,secondary=choose_opportunities(nodes,fps=fps,unary=unary,ports=ports,
+            state_sources=np.asarray([s.source for s in states]),source_events=source_events,
+            same_show=np.zeros((count,count),np.float32),through=through,check=live,minimum_hold=support,
+            event_seconds=True,native_cost=fragments)
+    else:
+        import tempfile
+        from pathlib import Path
+        from .preference_losses import prepare
+        from .preference_dp import choose
+        if preference_workspace is None:raise ValueError('explicit transient preference workspace required')
+        Path(preference_workspace).mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.event-preference-',dir=preference_workspace) as temporary:
+            H,K,preference_receipt=prepare(measured,preference_model,workspace=temporary,check=live)
+            runs,objective=choose(nodes,fps=fps,unary=unary,through=through,preference_holds=H,
+                preference_intervals=np.zeros_like(unary),preference_ports=K,
+                state_sources=np.asarray([s.source for s in states]),source_events=source_events,
+                minimum_hold=support,native_cost=fragments,check=live)
+            score,secondary=objective;preference_parts=[];selected={}
+            for i,(first,end,index) in enumerate(runs):
+                entry=0. if not i else float(K(first)[runs[i-1][2],index])
+                if i:selected[first,runs[i-1][2],index]=entry
+                preference_parts.append(dict(internal_event_preferences=float(H[index,first+1:end].sum()),entry_preference=entry))
+            measured.selected_preference_costs=selected
+        preference_receipt['objective_vector']=[score,secondary]
+        preference_receipt['model_sha256']=preference_model.artifact['content_sha256']
+        preference_receipt['supervision_kinds']=preference_model.artifact['supervision_kinds']
+        preference_receipt['professional_quality_approved']=False
     parts=[];total=0.
     for i,(first,end,index) in enumerate(runs):
         # Decomposition uses the frozen chosen pair, not another all-state
         # search-sized matrix. Preserve the DP's float32 port rounding.
-        entry=0. if not i else float(np.float32(measured.selected(first,runs[i-1][2],index)['cost']))+1/fps
+        entry=0. if not i else (1/fps if preference_parts is not None else
+            float(np.float32(measured.selected(first,runs[i-1][2],index)['cost']))+1/fps)
         terms=dict(integrated_visibility_framing=float(unary[index,first:end]@(np.diff(nodes)[first:end]/fps)),
             internal_native_events=float(through[index,first+1:end].sum()),
             native_fragment_support=float(fragments(first,end)[states[index].source]),entry_event=entry,
@@ -108,9 +135,14 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         total+=sum(terms.values());parts.append(dict(first_frame=int(nodes[first]),final_frame=int(nodes[end]),
             source=states[index].source,actor_hypothesis=states[index].actor,camera_family=states[index].family,
             components=terms,cumulative_cost=total))
-    if not math.isclose(total,score,rel_tol=1e-7,abs_tol=1e-6):
+    if not math.isclose(total,secondary if preference_parts is not None else score,rel_tol=1e-7,abs_tol=1e-6):
         raise AssertionError('coherent event decomposition differs from exact programme objective')
-    receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1',experimental=True,
+    if preference_parts is not None:
+        pref_total=sum(sum(row.values()) for row in preference_parts)
+        if not math.isclose(pref_total,score,rel_tol=1e-7,abs_tol=1e-6):raise AssertionError('preference H/K accounting differs')
+        receipt['event_preference']=preference_receipt;receipt['selected_event_preferences']=preference_parts
+    receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1' if preference_parts is None else
+        'lexicographic_same_event_preference_visibility_v1',experimental=True,
         selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-prepared,preparation_seconds=prepared-started,
         source_neural_calls_during_selection=0,event_strength_nodes=int(np.count_nonzero(measured.strength)),
         physical_observation_window_seconds=6/fps,minimum_hold_seconds=support,
@@ -137,6 +169,9 @@ def realize(original,warps,nodes,runs,states,data,*,output,measured):
         if i:
             old=runs[i-1][2];details=measured.selected(start,old,index)
             if not math.isfinite(details['appearance_cosine']):details['appearance_cosine']=None
+            if hasattr(measured,'selected_preference_costs'):
+                details['primary_same_event_preference_loss']=measured.selected_preference_costs[start,old,index]
+                details['legacy_cost_is_diagnostic_not_optimized']=True
             seams.append(dict(details,output_frame=first,seconds=first/original.fps,left_source=states[old].source,
                 right_source=state.source,left_head_index=int(data[old]['indices'][start,0]),
                 right_head_index=int(row['indices'][start,1]),left_camera_family=states[old].family,
