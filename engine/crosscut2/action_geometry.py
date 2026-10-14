@@ -20,7 +20,7 @@ class ActionMatch:
     measurement_basis: str | None = None
 
 
-def synchronous_velocity(left_motion, left_valid, right_motion, right_valid):
+def synchronous_motion_windows(left_motion, left_valid, right_motion, right_valid):
     """Compare two sources over the SAME pre/post-cut clock windows.
 
     A synchronized choreographic hit can reverse at the beat. Comparing
@@ -32,26 +32,39 @@ def synchronous_velocity(left_motion, left_valid, right_motion, right_valid):
     if (a.shape != (2, 8, 2) or b.shape != a.shape or av.shape != (2, 8)
             or bv.shape != av.shape or not np.isfinite(a).all() or not np.isfinite(b).all()):
         raise ValueError('two finite same-clock articulation windows required')
-    losses, moving_count = [], 0
+    rows = []
     for window in (0, 1):
         shared = av[window] & bv[window]
         if shared.sum() < 2:
+            rows.append(dict(loss=None, common_joints=int(shared.sum()), moving_joints=0,
+                             maximum_direction_disagreement=None,joints=[],direction_losses=[],speed_losses=[]))
             continue
         va, vb = a[window, shared], b[window, shared]
         na, nb = np.linalg.norm(va, axis=1), np.linalg.norm(vb, axis=1)
         moving = np.maximum(na, nb) >= .3
         if not moving.any():
-            losses.append(0.)
+            rows.append(dict(loss=0., common_joints=int(shared.sum()), moving_joints=0,
+                             maximum_direction_disagreement=0.,joints=[],direction_losses=[],speed_losses=[]))
             continue
-        moving_count += int(moving.sum())
         va, vb, na, nb = va[moving], vb[moving], na[moving], nb[moving]
         direction = np.ones(len(va))
         both = np.minimum(na, nb) >= .15
         direction[both] = (1. - np.clip((va[both] * vb[both]).sum(1)
             / (na[both] * nb[both]), -1., 1.)) / 2.
         speed = np.minimum(2., np.abs(np.log((na + .15) / (nb + .15))))
-        losses.append(float(np.mean(direction + .3 * speed)))
-    return (float(np.mean(losses)), moving_count) if losses else (None, 0)
+        rows.append(dict(loss=float(np.mean(direction + .3 * speed)),
+                         common_joints=int(shared.sum()), moving_joints=int(moving.sum()),
+                         maximum_direction_disagreement=float(np.max(direction)),
+                         joints=np.flatnonzero(shared)[moving].tolist(),
+                         direction_losses=direction.tolist(),speed_losses=speed.tolist()))
+    return tuple(rows)
+
+
+def synchronous_velocity(left_motion, left_valid, right_motion, right_valid):
+    """Backward-compatible mean; cut decisions also inspect the window tails."""
+    rows = synchronous_motion_windows(left_motion, left_valid, right_motion, right_valid)
+    losses = [row['loss'] for row in rows if row['loss'] is not None]
+    return (float(np.mean(losses)), sum(row['moving_joints'] for row in rows)) if losses else (None, 0)
 
 
 def _arm_segments(points):

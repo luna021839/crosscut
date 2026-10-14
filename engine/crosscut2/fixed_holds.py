@@ -15,7 +15,7 @@ import numpy as np
 
 from crosscut.render import EditorialTransformKeyframe, EditorialTransformTrack, RenderSegment
 from .action_geometry import (action_crop_cost, compare_action, compare_screen_motion,
-    normalized_body, synchronous_velocity, complete_arm_motion)
+    normalized_body, synchronous_motion_windows, complete_arm_motion)
 from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
 from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility,native_readability_cost
@@ -146,7 +146,7 @@ def _curve_at(ticks, values, query):
 
 
 def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None, native_ports=None,
-                boundary_readability=False):
+                boundary_readability=False, check=lambda:None):
     """Freeze source-local actor paths, camera curves and whole-hold costs."""
     states, data, cluster_counts = [], [], []
     if native_ports is not None and len(native_ports)!=len(banks):
@@ -155,6 +155,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             np.asarray(value).shape!=(len(nodes),4,3) or np.any((value<0)|(value>3)) for value in body_states)):
         raise ValueError('source-bound cached body observation states required')
     for source, bank in enumerate(banks):
+        check()
         native_quality=bank.get('native_readability');native_quality_valid=bank.get('native_readability_valid')
         if native_quality is not None and (np.asarray(native_quality).shape!=bank['heads'].shape
                 or np.asarray(native_quality_valid).shape!=bank['heads'].shape[:3]
@@ -168,6 +169,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
         # NULL/head-0 ownership. Freeze the same alternatives for every owner.
         families = ('native', 'action_fit', 'align_medium', 'align_close')
         for actor, family in [(a, f) for a in (None, *range(count)) for f in families]:
+            check()
             heads = np.zeros((len(nodes), 2, 4), float)
             vectors = np.zeros((len(nodes), 2, 128), float)
             body = np.zeros((len(nodes), 4, 8, 3), float)
@@ -328,6 +330,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                         continuous[n] = False
             states.append(State(source, actor, family))
             data.append(dict(heads=heads, vectors=vectors, body=body, projected=projected,
+                pose_native_indices=bank.get('pose_native_indices'),
                 indices=indices, formation=formation, formation_heads=formation_heads,
                 cameras=cameras, ticks=ticks, curve=values, unary=unary, through=through,
                 motion=motion, motion_valid=motion_valid, continuous=continuous,
@@ -340,22 +343,42 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
     return tuple(states), data, cluster_counts
 
 
-def _action_refinement(action, synchronous, screen, *, moving_threshold=2):
+def _action_terms(action, synchronous, screen, *, moving_threshold=2, direction_disagreement=0.):
+    """Bound the match credit, never floor away the measured action error.
+
+    The previous floor on the *whole* term made a perfect connection and
+    visibly different arms receive the identical -0.6/-0.8 cost. A face match
+    must not erase the articulated pose, motion and realized screen costs.
+    Unobserved action stays finite and receives no invented match credit.
+    """
     velocity, moving = synchronous
-    agreement = 0.
-    if action.phase_loss is not None:
-        agreement = 3.*action.phase_loss - 2. + (1. if velocity is None else 1.5*min(velocity, .4))
     # Keep screen position/prediction, not the confounded pre->post direction.
-    spatial = screen['cost'] - (.75*screen['velocity_loss'] if screen['velocity_loss'] is not None else 0.)
-    agreement += .6*(spatial-2.)
+    spatial = max(0., screen['cost'] - (
+        .75*screen['velocity_loss'] if screen['velocity_loss'] is not None else 0.))
     active = velocity is not None and moving >= moving_threshold
-    if active and velocity > .4:
-        # Contrary SAME-CLOCK action is never canceled by a pose/position credit.
-        return max(0., agreement) + 2.5*(velocity-.4)
-    return max(-.8 if active else -.6, agreement)
+    penalty = 0. if action.phase_loss is None else 3.*action.phase_loss
+    if velocity is not None:
+        penalty += 1.5*velocity
+    if screen['common_joints'] >= 4:
+        penalty += .6*spatial
+    # A measured pose AND measured time window are required for a match credit.
+    credit = (.8 if active else .6) if action.phase_loss is not None and velocity is not None else 0.
+    # One opposed observed arm/window cannot be averaged away by other limbs
+    # or a matching post-cut window. This removes only match credit, not a
+    # source/transition: its finite measured penalty remains available to DP.
+    credit *= max(0., 1.-2.*direction_disagreement)
+    if active:
+        penalty += 2.5*max(0., velocity-.4)
+    return float(penalty),float(credit)
 
 
-def port_cost(n, left, right, *, fps, action_enabled=True):
+def _action_refinement(action, synchronous, screen, *, moving_threshold=2, direction_disagreement=0.):
+    risk,credit = _action_terms(action,synchronous,screen,moving_threshold=moving_threshold,
+                               direction_disagreement=direction_disagreement)
+    return risk-credit
+
+
+def port_cost(n, left, right, *, fps, action_enabled=True, music_strength=None):
     a, b = left['heads'][n, 0], right['heads'][n, 1]
     # A bad first/last exposed frame is a boundary event, not just a tiny
     # duration-weighted average over an otherwise readable four-second hold.
@@ -369,13 +392,15 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
     result = dict(geometry_loss=4., appearance_cosine=None, conditional_pose_loss=None,
         conditional_velocity_loss=None, comparable_action_joints=0, projected_screen_motion=None,
         role='unobserved', boundary_native_readability_cost=readability,
-        soft_cost=MISSING_PORT_COST + readability)
+        soft_cost=MISSING_PORT_COST + readability,nonnegative_risk_cost=MISSING_PORT_COST + readability,
+        connection_opportunity=dict(credit=0.,joint_fit=0.,reason='unobserved_joint_connection'))
     if min(a[2], b[2]) <= .019:
         # A one-sided missing port is not a measured connection of a readable
         # foreground subject. Keep it finite, and never penalize all-UNKNOWN
         # sources as a fabricated mismatch or forbid their native paths.
         readable=(a[2]>=.055 and not left['formation'][n,0]) or (b[2]>=.055 and not right['formation'][n,1])
-        if readable:result['soft_cost']+=2.
+        if readable:
+            result['soft_cost']+=2.;result['nonnegative_risk_cost']+=2.
         return result
     ca, cb = Camera(*left['cameras'][n, 0]), Camera(*right['cameras'][n, 1])
     displacement = float(np.linalg.norm((ca.project(a[:2]) - cb.project(b[:2])) * [1., 9/16]))
@@ -415,19 +440,34 @@ def port_cost(n, left, right, *, fps, action_enabled=True):
     lm=np.where(full[:,None,None],left['motion'][n],left['arm_motion'][n])
     rm=np.where(full[:,None,None],right['motion'][n],right['arm_motion'][n])
     lvalid=np.where(full[:,None],lv,la);rvalid=np.where(full[:,None],rv,ra)
-    synchronous = synchronous_velocity(lm,lvalid,rm,rvalid)
+    windows = synchronous_motion_windows(lm,lvalid,rm,rvalid)
+    losses = [w['loss'] for w in windows if w['loss'] is not None]
+    synchronous = (float(np.mean(losses)),sum(w['moving_joints'] for w in windows)) if losses else (None,0)
+    worst = max(losses) if losses else None
+    disagreement = max((w['maximum_direction_disagreement'] for w in windows
+                        if w['maximum_direction_disagreement'] is not None),default=0.)
     arm_active=any(not full[w] and (lvalid[w]&rvalid[w]).sum()>=2 and np.any(
         (lvalid[w]&rvalid[w]) & (np.maximum(np.linalg.norm(lm[w],axis=1),np.linalg.norm(rm[w],axis=1))>=.3))
         for w in (0,1))
-    refinement = _action_refinement(action, synchronous, screen,moving_threshold=1 if arm_active else 2) if action_enabled else 0.
-    return dict(result, geometry_loss=float(geometry), appearance_cosine=similarity, role=role,
+    risk,credit = _action_terms(action, (worst,synchronous[1]), screen,
+        moving_threshold=1 if arm_active else 2,direction_disagreement=disagreement) if action_enabled else (0.,0.)
+    refinement=risk-credit
+    measured = dict(result, geometry_loss=float(geometry), appearance_cosine=similarity, role=role,
         conditional_pose_loss=action.phase_loss, conditional_velocity_loss=action.velocity_loss,
         conditional_action_basis=action.measurement_basis, formation_layout_loss=layout,
         comparable_action_joints=action.common_joints, projected_screen_motion=screen,
-        synchronous_velocity_loss=synchronous[0], action_refinement=float(refinement),
+        synchronous_velocity_loss=synchronous[0], synchronous_worst_window_loss=worst,
+        synchronous_motion_windows=windows,maximum_direction_disagreement=disagreement,
+        action_refinement=float(refinement),
         synchronous_basis_per_window=[('shoulder_relative_articulation' if full[w] else 'directed_complete_arm_segments')
             if (lvalid[w]&rvalid[w]).sum()>=2 else None for w in (0,1)],
+        nonnegative_risk_cost=float(geometry+identity+risk+readability),
+        action_risk=risk,legacy_match_credit=credit,
         soft_cost=float(geometry + identity + refinement + readability))
+    if music_strength is not None and action_enabled:
+        from .opportunity import joint_opportunity
+        measured['connection_opportunity']=joint_opportunity(n,left,right,measured,music_strength=music_strength)
+    return measured
 
 
 def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_events=None,
@@ -520,11 +560,24 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
 
 
 def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check,
-                       action_enabled=True, body_states=None, native_ports=None, boundary_readability=False):
+                       action_enabled=True, body_states=None, native_ports=None, boundary_readability=False,
+                       music_strengths=None):
     started = monotonic()
+    last_check=[-math.inf]
+    def deadline():
+        now=monotonic()
+        if now-started>240.:raise TimeoutError('single fixed actor/camera selection exceeded 240 seconds')
+        if now-last_check[0]>.1:check();last_check[0]=now
+    opportunity_mode=music_strengths is not None
+    if opportunity_mode:
+        music_strengths=np.asarray(music_strengths,float)
+        if music_strengths.shape!=(len(nodes),) or not np.isfinite(music_strengths).all() or np.any((music_strengths<0)|(music_strengths>1)):
+            raise ValueError('complete node-bound observed music strengths required')
     states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps,
         source_events=source_events,body_states=body_states,native_ports=native_ports,
-        boundary_readability=boundary_readability)
+        boundary_readability=boundary_readability,check=deadline)
+    if opportunity_mode:
+        for row in data:row['music_strengths']=music_strengths
     count = len(states)
     matrix_bytes = count * count * np.dtype(np.float32).itemsize
     if matrix_bytes > 200 * 1024**2:
@@ -539,9 +592,7 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     built_nodes = 0
     def costs(n):
         nonlocal built_nodes
-        check()
-        if monotonic()-started > 240.:
-            raise TimeoutError('single fixed actor/camera selection exceeded 240 seconds')
+        deadline()
         matrix = np.full((count,count), MISSING_PORT_COST, np.float32)
         # Unobserved endpoints share the finite missing port, not an NN veto.
         left = [i for i,d in enumerate(data) if d['heads'][n,0,2] > .019]
@@ -557,9 +608,12 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         for a in left:
             for b in right:
                 if states[a].source == states[b].source: continue
-                value = port_cost(n,data[a],data[b],fps=fps,action_enabled=action_enabled)['soft_cost']
+                measured=port_cost(n,data[a],data[b],fps=fps,action_enabled=action_enabled,
+                    music_strength=None if not opportunity_mode else float(music_strengths[n]))
+                value=(measured['nonnegative_risk_cost']-measured['connection_opportunity']['credit']
+                    if opportunity_mode else measured['soft_cost'])
                 matrix[a,b] = value
-        matrix += same_show
+        if not opportunity_mode:matrix += same_show
         built_nodes += 1
         if built_nodes % 40 == 0:
             print(__import__('json').dumps(dict(phase='fixed_actor_camera_ports',nodes=built_nodes,total_nodes=len(nodes),
@@ -569,12 +623,22 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     def selected_port(n, left, right):
         # Recompute only selected scalar ports for the cost report, with the
         # same float32 rounding as the transient matrix. Do not rebuild it.
-        value = port_cost(n,data[left],data[right],fps=fps,action_enabled=action_enabled)['soft_cost']
-        return float(np.float32(value) + same_show[left,right])
-    runs, score = coupled_semi_markov(nodes, fps=fps, unary=np.array([d['unary'] for d in data]),
-        seam_cost=costs, state_sources=np.array([s.source for s in states]), source_events=source_events,
-        through=np.array([d['through'] for d in data]))
-    decomposition=[];cumulative=0.
+        measured=port_cost(n,data[left],data[right],fps=fps,action_enabled=action_enabled,
+            music_strength=None if not opportunity_mode else float(music_strengths[n]))
+        value=(measured['nonnegative_risk_cost']-measured['connection_opportunity']['credit']
+            if opportunity_mode else measured['soft_cost'])
+        return float(np.float32(value) + (0. if opportunity_mode else same_show[left,right]))
+    if opportunity_mode:
+        from .opportunity_dp import choose_opportunities
+        runs,score,secondary_score=choose_opportunities(nodes,fps=fps,unary=np.array([d['unary'] for d in data]),
+            ports=costs,state_sources=np.array([s.source for s in states]),source_events=source_events,
+            same_show=same_show,through=np.array([d['through'] for d in data]),check=deadline)
+    else:
+        runs, score = coupled_semi_markov(nodes, fps=fps, unary=np.array([d['unary'] for d in data]),
+            seam_cost=costs, state_sources=np.array([s.source for s in states]), source_events=source_events,
+            through=np.array([d['through'] for d in data]))
+        secondary_score=0.
+    decomposition=[];cumulative=0.;secondary_cumulative=0.
     for i,(start,end,state_index) in enumerate(runs):
         row=data[state_index];state=states[state_index]
         seconds=np.diff(nodes)[start:end]/fps
@@ -589,20 +653,45 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         parts['camera_through']=float(row['camera_through'][start+1:end].sum())
         parts['owner_through']=float(row['owner_through'][start+1:end].sum())
         parts['native_through_geometry']=float(row['native_through_geometry'][start+1:end].sum())
-        parts['native_fragments']=0. if len(banks)==1 else native_event_cost(nodes[start],nodes[end],source_events[state.source],fps)
-        parts['duration_grammar']=0. if len(banks)==1 else .23*(duration-2.4)**2+2.*max(0.,.9-duration)
+        parts['native_fragments']=0. if len(banks)==1 and not opportunity_mode else native_event_cost(nodes[start],nodes[end],source_events[state.source],fps)
+        parts['duration_grammar']=(2.*max(0.,.9-duration) if opportunity_mode else
+            0. if len(banks)==1 else .23*(duration-2.4)**2+2.*max(0.,.9-duration))
         parts['entry_port']=0. if not i else selected_port(start,runs[i-1][2],state_index)
         parts['editorial_switch']=0. if not i else .35
-        parts['short_source_return']=.7 if i>=2 and duration<3. and states[runs[i-2][2]].source==state.source else 0.
+        return_cost=.7 if i>=2 and duration<3. and states[runs[i-2][2]].source==state.source else 0.
+        parts['short_source_return']=0. if opportunity_mode else return_cost
+        selected_opportunity=None
+        if opportunity_mode and i:
+            selected_opportunity=port_cost(start,data[runs[i-1][2]],row,fps=fps,
+                action_enabled=action_enabled,music_strength=float(music_strengths[start]))['connection_opportunity']
+            credit=selected_opportunity['credit']
+            parts['entry_port']+=credit;parts['observed_opportunity']=-credit
+        diversity_parts=dict(same_show=0.,short_source_return=0.)
+        if opportunity_mode:
+            diversity_parts=dict(same_show=0. if not i else float(same_show[runs[i-1][2],state_index]),
+                                 short_source_return=return_cost)
+            secondary_cumulative+=sum(diversity_parts.values())
         prior=cumulative;cumulative+=sum(parts.values())
         next_exit=None if i==len(runs)-1 else selected_port(end,state_index,runs[i+1][2])
         decomposition.append(dict(first_frame=int(nodes[start]),final_frame=int(nodes[end]),source=state.source,
             actor_hypothesis=state.actor,camera_family=state.family,prior_cumulative_cost=prior,
             cumulative_cost=cumulative,next_selected_exit_cost=next_exit,components=parts,
+            selected_opportunity=selected_opportunity,secondary_components=diversity_parts,
+            cumulative_secondary_cost=secondary_cumulative,
             ownership_is_not_dense_actor_certification=True))
     if not math.isclose(cumulative,score,rel_tol=1e-7,abs_tol=1e-6):
         raise AssertionError('selected programme cost decomposition differs from exact DP objective')
+    if not math.isclose(secondary_cumulative,secondary_score,rel_tol=1e-7,abs_tol=1e-6):
+        raise AssertionError('selected diversity decomposition differs from exact secondary DP objective')
     return runs, states, data, score, dict(fixed_states=count,source_local_appearance_clusters=cluster_counts,
+        objective_contract='observed_joint_music_opportunity_v1' if opportunity_mode else 'legacy_hold_duration_preference',
+        experimental_opportunity_mode=opportunity_mode,secondary_diversity_score=secondary_score,
+        primary_secondary_exact_ties_only=opportunity_mode,
+        opportunity_cap=.8 if opportunity_mode else None,
+        units=dict(unary='loss_per_second',boundary='loss_per_event'),
+        common_opportunity_potential_omitted=opportunity_mode,
+        music_strength_nodes=0 if not opportunity_mode else int(np.count_nonzero(music_strengths)),
+        editorial_maximum_hold_removed=opportunity_mode,
         source_local_actor_hypotheses_are_not_certified=True,camera_alternatives_fixed_before_dp=True,
         actor_budget_seeded_by_recurrent_native_observations=True,
         measured_native_cut_geometry_consumed=native_ports is not None,
@@ -645,7 +734,8 @@ def realize_fixed_holds(original, warps, nodes, runs, states, data, *, output, a
         if i:
             left_index = runs[i-1][2]
             left_state = states[left_index]
-            measurement = port_cost(start,data[left_index],row,fps=original.fps,action_enabled=action_enabled)
+            measurement = port_cost(start,data[left_index],row,fps=original.fps,action_enabled=action_enabled,
+                music_strength=None if 'music_strengths' not in row else float(row['music_strengths'][start]))
             seams.append(dict(measurement,output_frame=first,seconds=first/original.fps,
                 sparse_observation_frame=int(nodes[start]),
                 pose_port_retimed_unvalidated=first!=int(nodes[start]),

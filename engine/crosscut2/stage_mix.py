@@ -292,6 +292,8 @@ def main():
         help='Reuse source-bound full-resolution scalar face-quality observations in fixed holds')
     parser.add_argument('--boundary-native-readability',action='store_true',
         help='Experimental boundary event cost; not a validated whole-film quality improvement')
+    parser.add_argument('--joint-musical-opportunities',action='store_true',
+        help='Experimental observed music/action C-W objective; not a validated app editor')
     parser.add_argument('--native-camera-ports',action='store_true',
         help='measure exact native-cut flanks without invalidating the song/body grids')
     parser.add_argument('--render', action='store_true')
@@ -304,6 +306,9 @@ def main():
         raise ValueError('native readability requires the fixed hold consumer')
     if args.boundary_native_readability and not args.native_source_readability:
         raise ValueError('experimental boundary readability requires native source observations')
+    if args.joint_musical_opportunities and (not args.fixed_actor_camera_holds or args.body_pose_model is None
+                                            or args.boundary_native_readability):
+        raise ValueError('joint opportunity experiment requires fixed body-supported holds and boundary readability OFF')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
@@ -375,9 +380,21 @@ def main():
     fixed_receipt = None
     if args.fixed_actor_camera_holds:
         from .fixed_holds import select_fixed_holds, realize_fixed_holds
+        music_strengths=None
+        if args.joint_musical_opportunities:
+            from .opportunity import music_on_nodes
+            from .pose_grid import pose_indices
+            music_strengths=music_on_nodes(nodes,fps=original.fps,master_start=original.master_audio_start,
+                                          rhythm=manifest['rhythm_analysis'])
+            for source,bank in enumerate(banks):
+                clock=camera_census[source]
+                bank['pose_native_indices']=pose_indices(warps[source],nodes=nodes,
+                    master_start=original.master_audio_start,fps=original.fps,
+                    native_fps=clock['fps'],native_count=clock['frame_count'])
         runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
             fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states,
-            native_ports=native_ports,boundary_readability=args.boundary_native_readability)
+            native_ports=native_ports,boundary_readability=args.boundary_native_readability,
+            music_strengths=music_strengths)
         plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
         from .native_timing import repair_native_timing
         def build(boundaries):
