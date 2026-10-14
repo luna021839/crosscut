@@ -20,7 +20,7 @@ from .paired_geometry import Camera
 from .stage_mix import native_event_cost, node_quality
 from .hold_utility import DEFAULT_POLICY, known_switch, source_local_salience, soft_hold_utility,native_readability_cost
 
-MISSING_PORT_COST = 6.  # Finite uncertainty, not a measured identity/pose mismatch.
+MISSING_PORT_COST = DEFAULT_POLICY.missing_port_uncertainty
 
 
 @dataclass(frozen=True)
@@ -145,9 +145,11 @@ def _curve_at(ticks, values, query):
     return np.array([np.interp(query, ticks, values[:, i]) for i in range(3)]).T
 
 
-def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None):
+def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None, native_ports=None):
     """Freeze source-local actor paths, camera curves and whole-hold costs."""
     states, data, cluster_counts = [], [], []
+    if native_ports is not None and len(native_ports)!=len(banks):
+        raise ValueError('source-matched native port banks required')
     if body_states is not None and (len(body_states)!=len(banks) or any(
             np.asarray(value).shape!=(len(nodes),4,3) or np.any((value<0)|(value>3)) for value in body_states)):
         raise ValueError('source-bound cached body observation states required')
@@ -267,6 +269,11 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             owner_through=DEFAULT_POLICY.owner_switch*known_switch(owner[:,0],owner[:,1])
             owner_through[[0,-1]]=0.
             through += owner_through
+            native_interval,native_through=np.zeros(len(nodes)-1),np.zeros(len(nodes))
+            if native_ports is not None:
+                from .native_port_costs import native_port_cost_events
+                native_interval,native_through=native_port_cost_events(nodes,native_ports[source],ticks,values)
+                through+=native_through
             # Same-source camera acceleration is not free inside a hold.
             lengths = np.diff(nodes) / fps
             a, b = cameras[:-1, 1], cameras[1:, 0]
@@ -277,6 +284,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
             unary += readability_tail
             interval_owner_switch=DEFAULT_POLICY.owner_switch*known_switch(owner[:-1,1],owner[1:,0])
             unary += interval_owner_switch/lengths
+            unary += native_interval/lengths
             unary += .8 * np.maximum(0., speed - .15) + .3 * np.maximum(0., zoom_speed - .25)
             projected = body.copy()
             for n, tick in enumerate(nodes):
@@ -325,6 +333,7 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
                 arm_motion=arm_motion,arm_valid=arm_valid,
                 owner=owner,owner_through=owner_through,camera_through=camera_through,
                 interval_owner_switch=interval_owner_switch,utility_parts=utility_parts,
+                native_interval_geometry=native_interval,native_through_geometry=native_through,
                 quality=quality,readability_tail=readability_tail))
     return tuple(states), data, cluster_counts
 
@@ -499,10 +508,10 @@ def coupled_semi_markov(nodes, *, fps, unary, seam_cost, state_sources, source_e
 
 
 def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slots, check,
-                       action_enabled=True, body_states=None):
+                       action_enabled=True, body_states=None, native_ports=None):
     started = monotonic()
     states, data, cluster_counts = make_states(nodes, banks, poses, fps=fps,
-        source_events=source_events,body_states=body_states)
+        source_events=source_events,body_states=body_states,native_ports=native_ports)
     count = len(states)
     matrix_bytes = count * count * np.dtype(np.float32).itemsize
     if matrix_bytes > 200 * 1024**2:
@@ -559,9 +568,11 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
         unary_total=float(row['unary'][start:end] @ seconds)
         parts['readability_tail']=float(row['readability_tail'][start:end] @ seconds)
         parts['interval_owner_switch']=float(row['interval_owner_switch'][start:end].sum())
+        parts['native_interval_geometry']=float(row['native_interval_geometry'][start:end].sum())
         parts['interval_camera_motion']=unary_total-sum(parts.values())
         parts['camera_through']=float(row['camera_through'][start+1:end].sum())
         parts['owner_through']=float(row['owner_through'][start+1:end].sum())
+        parts['native_through_geometry']=float(row['native_through_geometry'][start+1:end].sum())
         parts['native_fragments']=0. if len(banks)==1 else native_event_cost(nodes[start],nodes[end],source_events[state.source],fps)
         parts['duration_grammar']=0. if len(banks)==1 else .23*(duration-2.4)**2+2.*max(0.,.9-duration)
         parts['entry_port']=0. if not i else selected_port(start,runs[i-1][2],state_index)
@@ -578,6 +589,8 @@ def select_fixed_holds(nodes, banks, poses, *, fps, source_events, broadcast_slo
     return runs, states, data, score, dict(fixed_states=count,source_local_appearance_clusters=cluster_counts,
         source_local_actor_hypotheses_are_not_certified=True,camera_alternatives_fixed_before_dp=True,
         actor_budget_seeded_by_recurrent_native_observations=True,
+        measured_native_cut_geometry_consumed=native_ports is not None,
+        native_missing_ports_have_finite_uncertainty=native_ports is not None,
         actor_camera_endpoint_state_retained=True,whole_hold_observed_action_support_consumed=True,
         dense_actor_ownership_validated=False,action_enabled=action_enabled,
         cached_body_states_consumed=body_states is not None,

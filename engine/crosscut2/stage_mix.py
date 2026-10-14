@@ -290,6 +290,8 @@ def main():
         help='Keep anonymous actor and fixed full-hold camera states inside programme selection')
     parser.add_argument('--native-source-readability',action='store_true',
         help='Reuse source-bound full-resolution scalar face-quality observations in fixed holds')
+    parser.add_argument('--native-camera-ports',action='store_true',
+        help='measure exact native-cut flanks without invalidating the song/body grids')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--resume-render', action='store_true',
         help='Render the existing exact source-bound plan without re-observation or selection')
@@ -339,6 +341,14 @@ def main():
         fps=original.fps, nodes=nodes, cache=args.cache, models=args.models, check=check,
         maximum_seconds=args.maximum_perception_seconds)
     camera_census = census(original.sources, cache=args.cache.parent / 'crosscut2-camera-census-v1', check=check)
+    native_ports,native_port_receipts=None,[]
+    if args.native_camera_ports:
+        if not args.fixed_actor_camera_holds:raise ValueError('native camera ports require fixed actor/camera holds')
+        from .native_ports import measure_native_ports
+        native_ports,native_port_receipts=measure_native_ports(sources=original.sources,census=camera_census,
+            warps=warps,master_start=original.master_audio_start,fps=original.fps,
+            final_frame=original.output_frame_count,cache=args.cache.parent/'crosscut2-native-camera-ports-v1',
+            models=args.models,check=check)
     readability_receipts=[]
     if args.native_source_readability:
         from .native_readability import measure_native_readability
@@ -362,7 +372,8 @@ def main():
     if args.fixed_actor_camera_holds:
         from .fixed_holds import select_fixed_holds, realize_fixed_holds
         runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
-            fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states)
+            fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states,
+            native_ports=native_ports)
         plan, seams = realize_fixed_holds(original, warps, nodes, runs, states, data, output=args.output)
         from .native_timing import repair_native_timing
         def build(boundaries):
@@ -382,6 +393,7 @@ def main():
     # a source-bound saved recipe and block an otherwise warm-cache retry.
     encoded = json.dumps(dict(render_plan=plan.to_json(), sparse_perception=receipts,
             native_readability_observations=readability_receipts,
+            native_camera_port_observations=native_port_receipts,
             stage_edit_transformer_used=False,
             conditional_body_perception=body_receipts,
             conditional_body_action_costs_enabled=poses is not None,

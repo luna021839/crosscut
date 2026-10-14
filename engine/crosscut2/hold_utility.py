@@ -11,6 +11,7 @@ class HoldPolicy:
     formation_lower: float = .055
     formation_upper: float = .14
     owner_switch: float = .85
+    missing_port_uncertainty: float = 6.
     salience_weight: float = 1.1
     oversize_weight: float = 3.2
 
