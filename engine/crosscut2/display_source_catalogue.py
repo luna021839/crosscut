@@ -1,0 +1,106 @@
+"""Source-local physical observation catalogue and declared content quadrature.
+
+K always reads exact cached native inputs. Content integration uses nearest
+cached face/body rasters within six output frames and the same native shot;
+it does NOT claim a dense person track or new all-frame observations.
+"""
+import numpy as np
+from .physical_display_observations import (focal_metadata, duplicate_wrists,
+    UNMEASURED, MODEL_ONLY, PIXEL_SUPPORTED, CONTRADICTED)
+from .played_partial_pose import source_activity
+
+
+class SourceCatalogue:
+    def __init__(self, nodes, bank, poses, rows, style, events, *, fps):
+        self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1])
+        N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
+        self.evidence=np.where(self.body[...,2]>=.3,MODEL_ONLY,UNMEASURED).astype(np.uint8)
+        self.salience=np.full((N,2,8),.85,np.float32)
+        for row in rows:
+            raw=row.get('raw_body_hypotheses',row['body'])
+            for n,side in zip(*np.nonzero((row['indices']>=0)&(row['indices']<3))):
+                h=int(row['indices'][n,side]);sl=slice(side*2,side*2+2)
+                self.body[n,sl,h]=raw[n,sl]
+                reliability=row.get('body_reliability')
+                if reliability is not None and row.get('pixel_part_scope',np.zeros(N,bool))[n]:
+                    kind=np.where(reliability[n,sl]==1.,PIXEL_SUPPORTED,
+                        np.where(reliability[n,sl]==0.,CONTRADICTED,MODEL_ONLY))
+                    self.evidence[n,sl,h]=np.where(raw[n,sl,:,2]>=.3,kind,UNMEASURED)
+                if 'utility_parts' in row:self.salience[n,side,h]=np.exp(-row['utility_parts']['salience'][n,side]/1.1)
+        self.ambiguity=duplicate_wrists(self.body)
+        self.physical=np.ones((N,2),bool)
+        self.native=np.asarray(bank['pose_native_indices'],int)
+        native_cuts=np.asarray(bank.get('native_cut_frames',[]),int)
+        for side in (0,1):
+            a,b=self.native[:,2*side],self.native[:,2*side+1]
+            self.physical[:,side]=b>a
+            for n,(first,last) in enumerate(zip(a,b)):
+                self.physical[n,side]&=not np.any((native_cuts>first)&(native_cuts<=last))
+            self.physical[:,side]&=(self.nodes-7>=0) if side==0 else (self.nodes+6<self.final)
+        self.quality=np.full(bank['heads'].shape[:3],.5,np.float32)
+        if 'native_readability_valid' in bank:
+            contrast,edge,clipped,height=np.moveaxis(bank['native_readability'],-1,0)
+            q=np.minimum(1.,height/120.)*np.minimum(1.,edge/.5)*np.minimum(1.,contrast/.075)*(1.-clipped)
+            self.quality=np.where(bank['native_readability_valid'],q,self.quality)
+        self.black=np.clip((style['presence'][...,0]-.8)/.2,0,1)
+        # Explicit numerical integration domain; never used as native K proof.
+        ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
+        order=np.argsort(ticks,kind='stable');ordered=ticks[order]
+        frames=np.arange(self.final);right=np.searchsorted(ordered,frames)
+        a=np.maximum(0,right-1);b=np.minimum(len(ordered)-1,right)
+        chosen=np.where(frames-ordered[a]<ordered[b]-frames,a,b)
+        original=order[chosen];self.near_n=original//2;self.near_side=original%2
+        closest=ordered[chosen];cuts=np.asarray(events,int)
+        self.content_scope=(np.abs(closest-frames)<=6)&(np.searchsorted(cuts,closest,side='right')==np.searchsorted(cuts,frames,side='right'))
+        self.own=np.zeros(self.final)
+        for n,tick in enumerate(nodes):
+            for side,(a,b) in enumerate(((tick-7,tick-1),(tick,tick+6))):
+                first,last=max(0,int(a)),min(self.final,int(b))
+                if first>=last:continue
+                observation=self.observation(n,side,np.tile([1.,.5,.5],(7,1)))
+                activity=source_activity(observation,fps=fps)
+                self.own[first:last]=np.maximum(self.own[first:last],activity)
+
+    def observation(self,n,side,camera_strip):
+        camera_strip=np.asarray(camera_strip,float)
+        camera=camera_strip[-1 if side==0 else 0]
+        heads=self.bank['heads'][n:n+1,side:side+1]
+        selected,index,ambiguity,scene=focal_metadata(heads,camera.reshape(1,1,3))
+        h=int(index[0,0]);sl=slice(side*2,side*2+2)
+        body=np.zeros((2,8,3),np.float32) if not 0<=h<3 else self.body[n,sl,h]
+        evidence=np.zeros((2,8),np.uint8) if not 0<=h<3 else self.evidence[n,sl,h]
+        ownership=np.zeros((2,8),bool) if not 0<=h<3 else self.ambiguity[n,sl,h]
+        return dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
+            ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
+            native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
+            focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]))
+
+    def rates(self,frames,cameras):
+        """Vectorized (...,len(frames),3) replay camera content rates."""
+        frames=np.asarray(frames,int);camera=np.asarray(cameras,float)
+        if camera.shape[-2:]!=(len(frames),3) or frames.min(initial=0)<0 or frames.max(initial=0)>=self.final:
+            raise ValueError('actual finite source-local replay frame/camera domain required')
+        n,side=self.near_n[frames],self.near_side[frames]
+        heads=self.bank['heads'][n,side]
+        center=.5+camera[...,None,:1]*(heads[...,:2]-camera[...,None,1:])
+        size=heads[...,2]*camera[...,None,0]
+        half=size[...,None]*[.45*9/16,.5]
+        extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
+        scores=np.prod(extent,-1)*np.exp(-((center[...,0]-.5)/.4)**2)
+        seen=(heads[...,2]>.019)&(heads[...,3]>=.75)&self.content_scope[frames,None]
+        scores=np.where(seen,scores,0.);index=scores.argmax(-1)
+        h=heads[np.arange(len(frames)),index]
+        displayed_height=h[...,2]*camera[...,0]
+        focal_center=.5+camera[...,:1]*(h[...,:2]-camera[...,1:])
+        focal_half=displayed_height[...,None]*[.45*9/16,.5]
+        focal_extent=np.maximum(0.,np.minimum(1.,focal_center+focal_half)-np.maximum(0.,focal_center-focal_half))
+        fraction=np.prod(focal_extent/np.maximum(1e-8,2*focal_half),axis=-1)
+        quality=self.quality[n,side,index];salience=self.salience[n,side,index]
+        visibility=np.sqrt(quality)*np.minimum(1.,displayed_height/.22)*np.sqrt(salience)*fraction*(1.-self.black[n,side])
+        visibility=np.where(scores.max(-1)>0,np.clip(visibility,0,1),0.)
+        body=self.body[n,np.where(side==0,1,2),np.minimum(index,2)]
+        valid=(body[...,2]>=.3)&(body[...,:2]>=0).all(-1)&(body[...,:2]<=1).all(-1)
+        valid&=(index<3)[...,None]&self.content_scope[frames,None]
+        projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
+        crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
+        return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[frames]

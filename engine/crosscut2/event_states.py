@@ -5,6 +5,7 @@ one-frame camera fits. Its loss rates and event seconds are produced together
 with event_ports. Anonymous actor paths remain hypotheses, not named members.
 """
 from dataclasses import replace
+import inspect
 import numpy as np
 from .fixed_holds import make_states,_curve_at
 from .shot_camera_paths import make_paths
@@ -58,7 +59,9 @@ def build(nodes,banks,poses,styles,*,fps,source_events,body_states,check=lambda:
     bases,raw,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
         body_states=body_states,check=check,camera_families=('native',))
     part_receipts=[]
-    if part_observer is not None:raw,part_receipts=part_observer(bases,raw)
+    if part_observer is not None:
+        raw,part_receipts=(part_observer(bases,raw,check=check) if 'check' in inspect.signature(part_observer).parameters
+            else part_observer(bases,raw))
     paths,camera_report=make_paths(nodes,banks,source_events,check=check)
     states=[];data=[]
     for state,row in zip(bases,raw):

@@ -69,6 +69,13 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
            maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
            preference_model=None,preference_workspace=None,connection_prior=None):
+    if getattr(connection_prior,'port_camera_prior',False):
+        if preference_model is not None:raise ValueError('E port-camera prior cannot use a preference checkpoint')
+        from .played_pose_port_programme import select as choose_ports
+        return choose_ports(nodes,banks,poses,styles,fps=fps,source_events=source_events,body_states=body_states,
+            native_ports=native_ports,music=music,prior=connection_prior,identity_hints=identity_hints,
+            part_observer=part_observer,check=check,maximum_preparation_seconds=maximum_preparation_seconds,
+            maximum_seconds=maximum_seconds)
     if connection_prior is not None and preference_model is not None:
         raise ValueError('weak/preference model and declared connection prior cannot be combined')
     if preference_model is not None and preference_model.artifact.get('supervision_kinds')==['reference_editor_choice_weak_imitation']:
@@ -206,7 +213,7 @@ def realize(original,warps,nodes,runs,states,data,*,output,measured):
         values=_curve_at(row['ticks'],row['curve'],knots)
         transform=None if np.all(values==[1.,.5,.5]) else EditorialTransformTrack(tuple(
             EditorialTransformKeyframe((tick-first)/original.fps,float(z),float(x),float(y))
-            for tick,(z,x,y) in zip(knots,values)),reason='source_shot_constant_measured_match_candidates')
+            for tick,(z,x,y) in zip(knots,values)),reason=row.get('camera_path_reason','source_shot_constant_measured_match_candidates'))
         a=warps[state.source].master_to_source(original.master_audio_start+first/original.fps)
         b=warps[state.source].master_to_source(original.master_audio_start+final/original.fps)
         segments.append(RenderSegment(state.source,float(a),float((final-first)/original.fps),float(first/original.fps),
@@ -226,7 +233,7 @@ def realize(original,warps,nodes,runs,states,data,*,output,measured):
         member_pose_dissolve_requested=None,member_pose_dissolve_effective=None,member_pose_dissolve_count=None),seams
 
 
-def check_selected_clock(plan,nodes,runs,states,banks,*,check=lambda:None):
+def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,check=lambda:None):
     """Report real renderer ordinal drift, without silently retiming ports."""
     from crosscut.render_frame_schedule import probe_render_frame_clock,sampler_frame_schedule
     clocks=[]
@@ -235,7 +242,7 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,check=lambda:None):
     if any(c is None for c in clocks):
         return dict(all_source_clocks_verified=False,source_observation_ordinals_exact=False,
             maximum_native_ordinal_difference=None,post_selection_retimed=False)
-    differences=[];exposed=[];total=0
+    differences=[];exposed=[];total=0;pose_total=0;camera_total=0;camera_error=0.
     for segment,(first,end,index) in zip(plan.segments,runs):
         check();source=states[index].source;clock=clocks[source];size=int(nodes[end]-nodes[first])
         schedule=sampler_frame_schedule(source_start=segment.source_start,source_playback_rate=segment.source_playback_rate,
@@ -248,7 +255,24 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,check=lambda:None):
                 error=int(schedule.source_frame_indices[tick]-expected[n,side]);total+=1
                 if error:differences.append(dict(source=source,output_frame=int(nodes[first]+tick),delta=error))
                 if tick in (0,size-1):exposed.append(abs(error))
+        if data is not None and data[index].get('pose_cost_used',False):
+            expected_pose=banks[source]['pose_native_indices']
+            for n in range(first,end+1):
+                for phase,offset in enumerate((-7,-1,0,6)):
+                    tick=int(nodes[n]+offset-nodes[first])
+                    if not 0<=tick<size:continue
+                    error=int(schedule.source_frame_indices[tick]-expected_pose[n,phase]);pose_total+=1
+                    if error:differences.append(dict(source=source,output_frame=int(nodes[first]+tick),delta=error,kind='played_pose'))
+            row=data[index];frames=row['scored_camera_frames'];values=row['scored_camera_values']
+            for frame,wanted in zip(frames,values):
+                at=(int(frame)-int(nodes[first]))/plan.fps
+                value=segment.editorial_transform.evaluate(at) if segment.editorial_transform is not None else None
+                actual=np.array([1.,.5,.5]) if value is None else np.array([value.zoom,value.center_x,value.center_y])
+                camera_error=max(camera_error,float(np.max(np.abs(actual-wanted))));camera_total+=1
     maximum=max((abs(d['delta']) for d in differences),default=0)
     return dict(all_source_clocks_verified=True,source_observation_ordinals_exact=not differences,
         maximum_native_ordinal_difference=maximum,maximum_exposed_ordinal_difference=max(exposed,default=0),
-        measured_grid_inputs_checked=total,differing_inputs=differences,post_selection_retimed=False)
+        measured_grid_inputs_checked=total,played_pose_native_inputs_checked=pose_total,
+        selected_scored_camera_frames_checked=camera_total,maximum_camera_transform_difference=camera_error,
+        camera_transform_replay_exact_within_roundoff=camera_error<=1e-12,
+        differing_inputs=differences,post_selection_retimed=False)
