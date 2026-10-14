@@ -74,3 +74,16 @@ def test_repeated_reference_of_same_physical_group_cannot_double_its_training_we
     again=Model(fit([a,copy.deepcopy(a),b]))
     np.testing.assert_allclose(base.center,again.center,atol=1e-15)
     np.testing.assert_allclose(base.weights,again.weights,atol=1e-14)
+
+
+def test_linear_inference_does_not_normalize_an_entire_QQF_float64_copy(monkeypatch):
+    model=Model(fit([example()]));features=np.random.default_rng(7).random((16,17,len(FEATURE_NAMES)),dtype=np.float32)
+    expected=((features.astype(float)-model.center)/model.scale)@model.weights
+    original=np.einsum;observed=[]
+    def bounded(spec,*values,**kw):
+        if spec=='...f,f->...':observed.append(values[0].dtype==np.float32 and np.shares_memory(values[0],features))
+        return original(spec,*values,**kw)
+    monkeypatch.setattr(np,'einsum',bounded)
+    with np.errstate(all='raise'):actual=model.scores(features)
+    assert observed==[True]
+    np.testing.assert_allclose(actual,expected,atol=2e-14,rtol=2e-14)

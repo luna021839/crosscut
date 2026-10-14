@@ -130,15 +130,25 @@ class Model:
                 or np.any(self.scale<=0)):
             raise ValueError('finite fitted preference parameters required')
     def scores(self,features):
-        values=np.asarray(features,float)
+        values=np.asarray(features)
+        if values.dtype.kind not in 'biuf':
+            raise ValueError('bound finite numeric preference features required')
         if values.shape[-1:]!=(len(FEATURE_NAMES),) or not np.isfinite(values).all():raise ValueError('bound finite preference features required')
-        return ((values-self.center)/self.scale)@self.weights
+        # The affine normalization is scalar-linear. Normalize59coefficients,
+        # not everyQxQx59 observation: the latter creates multiple80MiB copies
+        # per416-state event and approaches the real selection deadline.
+        # Explicit float64 accumulation keeps the existing numeric precision
+        # without casting/copying the whole float32 input tensor.
+        coefficient=self.weights/self.scale
+        offset=-float(np.einsum('f,f->',self.center,coefficient,optimize=False,dtype=np.float64))
+        return np.einsum('...f,f->...',values,coefficient,optimize=False,dtype=np.float64)+offset
     def score_bounds(self,lower,upper):
         lower,upper=np.asarray(lower,float),np.asarray(upper,float)
         if (lower.shape!=upper.shape or lower.shape[-1:]!=(len(FEATURE_NAMES),)
                 or not np.isfinite(lower).all() or not np.isfinite(upper).all() or np.any(lower>upper)):
             raise ValueError('finite explicit raw-feature uncertainty intervals required')
-        coefficient=self.weights/self.scale;offset=-float(self.center@coefficient)
+        coefficient=self.weights/self.scale
+        offset=-float(np.einsum('f,f->',self.center,coefficient,optimize=False,dtype=np.float64))
         low=offset+(np.where(coefficient>=0,lower,upper)*coefficient).sum(-1)
         high=offset+(np.where(coefficient>=0,upper,lower)*coefficient).sum(-1)
         return low,high

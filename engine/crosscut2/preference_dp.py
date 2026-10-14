@@ -11,7 +11,7 @@ import numpy as np
 
 def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
            preference_ports,state_sources,source_events,minimum_hold,native_cost,
-           check=lambda:None):
+           check=lambda:None,fragment_in_primary=False):
     nodes=np.asarray(nodes);sources=np.asarray(state_sources,int)
     q,N=len(sources),len(nodes)
     if (N<2 or not q or nodes.dtype.kind not in 'iu' or nodes[0]!=0 or np.any(np.diff(nodes)<=0)
@@ -46,8 +46,9 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
             costs=np.asarray(native_cost(start,end),float)
             if costs.shape!=(len(source_events),) or not np.isfinite(costs).all():
                 raise ValueError('finite source-local support costs required')
+            if fragment_in_primary:p=p+costs[sources]
             s=(visibility[:,end]-visibility[:,start]+native[:,end]-native[:,start+1]
-                +costs[sources]+max(0.,minimum_hold-duration))
+                +(0. if fragment_in_primary else costs[sources]+max(0.,minimum_hold-duration)))
             if start==0:
                 a,b,old=p,s,np.full(q,-1,int)
             else:

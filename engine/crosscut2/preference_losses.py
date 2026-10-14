@@ -8,7 +8,8 @@ def prepare(ports,model,*,workspace,check):
     sources=np.asarray([s.source for s in ports.states]);holds=np.zeros((q,N));written=0
     for n in range(1,N-1):
         check();features=ports.preference_features(n)
-        h,k=model.losses(features,state_sources=sources)
+        h,k=(model.losses_at(ports,n,features) if hasattr(model,'losses_at') else
+            model.losses(features,state_sources=sources))
         holds[:,n]=h
         path=workspace/f'{n}.npz'
         with path.open('xb') as stream:np.savez_compressed(stream,k=k)

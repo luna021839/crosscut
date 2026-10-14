@@ -68,7 +68,11 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
            maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
-           preference_model=None,preference_workspace=None):
+           preference_model=None,preference_workspace=None,connection_prior=None):
+    if connection_prior is not None and preference_model is not None:
+        raise ValueError('weak/preference model and declared connection prior cannot be combined')
+    if preference_model is not None and preference_model.artifact.get('supervision_kinds')==['reference_editor_choice_weak_imitation']:
+        raise ValueError('weak source choice is diagnostic, not primary connection quality')
     started=monotonic();next_check=started;phase_started=started
     phase_limit=maximum_seconds if part_observer is None else maximum_preparation_seconds
     def live():
@@ -80,7 +84,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         body_states=body_states,check=live,identity_hints=identity_hints,part_observer=part_observer)
     measured=Ports(nodes,states,data,fps=fps,music=music)
     prepared=monotonic();phase_started=prepared;phase_limit=maximum_seconds
-    native_interval,through=native_events(nodes,states,data,native_ports,fps=fps)
+    if connection_prior is None:
+        native_interval,through=native_events(nodes,states,data,native_ports,fps=fps)
+    else:
+        native_interval=np.zeros((len(states),len(nodes)-1));through=np.zeros((len(states),len(nodes)))
     unary=np.asarray([d['event_loss_rate'] for d in data])+native_interval/(np.diff(nodes)/fps)
     count=len(states);matrix_bytes=count*count*4
     if matrix_bytes*32>200*1024**2:raise ValueError('one transient vectorized port workspace exceeds 200MiB')
@@ -94,7 +101,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         return result
     support=12/fps;fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=support)
     preference_parts=None;preference_receipt=None;secondary=None
-    if preference_model is None:
+    if preference_model is None and connection_prior is None:
         runs,score,secondary=choose_opportunities(nodes,fps=fps,unary=unary,ports=ports,
             state_sources=np.asarray([s.source for s in states]),source_events=source_events,
             same_show=np.zeros((count,count),np.float32),through=through,check=live,minimum_hold=support,
@@ -105,29 +112,39 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .preference_losses import prepare
         from .native_preference import prepare as prepare_native
         from .preference_dp import choose
+        scorer=preference_model if connection_prior is None else connection_prior
+        prior_receipt=None if connection_prior is None else connection_prior.bind(measured,native_ports=native_ports,source_events=source_events)
         if preference_workspace is None:raise ValueError('explicit transient preference workspace required')
         Path(preference_workspace).mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='.event-preference-',dir=preference_workspace) as temporary:
-            H,K,preference_receipt=prepare(measured,preference_model,workspace=temporary,check=live)
-            native_preference,native_preference_lower,native_receipt=prepare_native(measured,preference_model,
-                native_ports=native_ports,source_events=source_events,check=live)
+            H,K,preference_receipt=prepare(measured,scorer,workspace=temporary,check=live)
+            if connection_prior is None:
+                native_preference,native_preference_lower,native_receipt=prepare_native(measured,scorer,
+                    native_ports=native_ports,source_events=source_events,check=live)
+            else:
+                native_preference,native_receipt=connection_prior.native_intervals(measured,
+                    native_ports=native_ports,source_events=source_events,check=live)
+                preference_receipt['fixed_connection_prior']=dict(scorer.artifact,**prior_receipt)
             preference_receipt['native_evaluation']=native_receipt
             runs,objective=choose(nodes,fps=fps,unary=unary,through=through,preference_holds=H,
                 preference_intervals=native_preference,preference_ports=K,
                 state_sources=np.asarray([s.source for s in states]),source_events=source_events,
-                minimum_hold=support,native_cost=fragments,check=live)
+                minimum_hold=support,native_cost=fragments,check=live,fragment_in_primary=connection_prior is not None)
             score,secondary=objective;preference_parts=[];selected={}
             for i,(first,end,index) in enumerate(runs):
                 entry=0. if not i else float(K(first)[runs[i-1][2],index])
                 if i:selected[first,runs[i-1][2],index]=entry
                 preference_parts.append(dict(internal_event_preferences=float(H[index,first+1:end].sum()),entry_preference=entry,
-                    evaluation_native_preference_upper=float(native_preference[index,first:end].sum())))
-            preference_receipt['selected_evaluation_native_preference_lower']=float(sum(
-                native_preference_lower[index,first:end].sum() for first,end,index in runs))
+                    **{('native_local_connection_cost' if connection_prior is not None else 'evaluation_native_preference_upper'):
+                        float(native_preference[index,first:end].sum())}))
+                if connection_prior is not None:preference_parts[-1]['primary_fragment_support']=float(fragments(first,end)[states[index].source])
+            if connection_prior is None:
+                preference_receipt['selected_evaluation_native_preference_lower']=float(sum(
+                    native_preference_lower[index,first:end].sum() for first,end,index in runs))
             measured.selected_preference_costs=selected
         preference_receipt['objective_vector']=[score,secondary]
-        preference_receipt['model_sha256']=preference_model.artifact['content_sha256']
-        preference_receipt['supervision_kinds']=preference_model.artifact['supervision_kinds']
+        preference_receipt['model_sha256']=scorer.artifact['content_sha256']
+        preference_receipt['supervision_kinds']=scorer.artifact['supervision_kinds']
         preference_receipt['professional_quality_approved']=False
     parts=[];total=0.
     for i,(first,end,index) in enumerate(runs):
@@ -137,8 +154,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             float(np.float32(measured.selected(first,runs[i-1][2],index)['cost']))+1/fps)
         terms=dict(integrated_visibility_framing=float(unary[index,first:end]@(np.diff(nodes)[first:end]/fps)),
             internal_native_events=float(through[index,first+1:end].sum()),
-            native_fragment_support=float(fragments(first,end)[states[index].source]),entry_event=entry,
-            short_final_support=max(0.,support-(nodes[end]-nodes[first])/fps))
+            native_fragment_support=0. if connection_prior is not None else float(fragments(first,end)[states[index].source]),entry_event=entry,
+            short_final_support=0. if connection_prior is not None else max(0.,support-(nodes[end]-nodes[first])/fps))
         total+=sum(terms.values());parts.append(dict(first_frame=int(nodes[first]),final_frame=int(nodes[end]),
             source=states[index].source,actor_hypothesis=states[index].actor,camera_family=states[index].family,
             components=terms,cumulative_cost=total))
@@ -149,7 +166,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         if not math.isclose(pref_total,score,rel_tol=1e-7,abs_tol=1e-6):raise AssertionError('preference H/K accounting differs')
         receipt['event_preference']=preference_receipt;receipt['selected_event_preferences']=preference_parts
     receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1' if preference_parts is None else
-        'lexicographic_same_event_preference_visibility_v1',experimental=True,
+        ('declared_monotone_connection_primary_fragment_v1' if connection_prior is not None else
+        'lexicographic_same_event_preference_visibility_v1'),experimental=True,
         selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-prepared,preparation_seconds=prepared-started,
         source_neural_calls_during_selection=0,event_strength_nodes=int(np.count_nonzero(measured.strength)),
         physical_observation_window_seconds=6/fps,minimum_hold_seconds=support,

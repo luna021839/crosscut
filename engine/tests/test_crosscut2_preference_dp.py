@@ -22,8 +22,11 @@ def test_visibility_cannot_buy_a_preference_inferior_seam_but_good_cut_can_beat_
         assert len(result)==1 and cost[0]==score[0]
 
 
-def test_exact_two_objective_solution_matches_complete_hold_enumeration():
+@pytest.mark.parametrize('fragment_in_primary',[False,True])
+def test_exact_two_objective_solution_matches_complete_hold_enumeration(fragment_in_primary):
     kw=args();rng=np.random.default_rng(171)
+    kw['fragment_in_primary']=fragment_in_primary
+    kw['native_cost']=lambda a,b:np.array([.03*(b-a),.02*(a+1)])
     kw['unary']=rng.uniform(0,1,(2,3));kw['through']=rng.uniform(0,.3,(2,4))
     kw['preference_holds']=rng.uniform(0,1,(2,4));kw['preference_intervals']=rng.uniform(0,.2,(2,3))
     matrix=rng.uniform(0,1,(4,2,2));kw['preference_ports']=lambda n:matrix[n]
@@ -35,6 +38,8 @@ def test_exact_two_objective_solution_matches_complete_hold_enumeration():
                 if path and path[-1][2]==state:continue
                 p=kw['preference_intervals'][state,first:end].sum()+kw['preference_holds'][state,first+1:end].sum()
                 s=(2*kw['unary'][state,first:end].sum()+kw['through'][state,first+1:end].sum())
+                if fragment_in_primary:p+=kw['native_cost'](first,end)[state]
+                else:s+=kw['native_cost'](first,end)[state]
                 if path:p+=matrix[first,path[-1][2],state];s+=.1
                 visit(end,[*path,(first,end,state)],(cost[0]+p,cost[1]+s))
     visit(0,[],(0.,0.));runs,score=choose(**kw)

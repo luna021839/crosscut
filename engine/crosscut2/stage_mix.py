@@ -304,6 +304,8 @@ def main():
         help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
     parser.add_argument('--experimental-preference-model',type=Path,
         help='Explicit fitted same-event experimental model; not normal app or professional-quality approval')
+    parser.add_argument('--fixed-connection-prior',action='store_true',
+        help='One declared untrained monotone face/action B prior; no weak imitation checkpoint')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -335,10 +337,21 @@ def main():
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if args.experimental_preference_model is not None and not args.native_part_pixel_support:
         raise ValueError('experimental preference requires the explicit partial-evidence event consumer')
+    if args.fixed_connection_prior and (not args.native_part_pixel_support or args.experimental_preference_model is not None):
+        raise ValueError('fixed connection prior requires partial event consumer and no preference checkpoint')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
     started = monotonic()
     preference_model=None
+    connection_prior=None
+    if args.experimental_preference_model is not None:
+        from .preference_model import Model
+        preference_model=Model(json.loads(args.experimental_preference_model.read_text()))
+        if preference_model.artifact['supervision_kinds']==['reference_editor_choice_weak_imitation']:
+            raise ValueError('weak source-choice checkpoints are diagnostic, not primary connection quality')
+    if args.fixed_connection_prior:
+        from .connection_prior import ConnectionPrior
+        connection_prior=ConnectionPrior()
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -458,14 +471,10 @@ def main():
                         maximum_seconds=180.,maximum_new_intervals=6000)
                     return retain_model_hypotheses(rows=rows,states=local_states,sources=original.sources,
                         cache=args.cache.parent/'crosscut2-native-part-support-v1'),receipts
-            preference_model=None
-            if args.experimental_preference_model is not None:
-                from .preference_model import Model
-                preference_model=Model(json.loads(args.experimental_preference_model.read_text()))
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
-                preference_workspace=args.cache.parent/'crosscut2-transient-preference')
+                preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts
@@ -513,6 +522,7 @@ def main():
                 'reference_editor_choice_weak_imitation' in preference_model.artifact['supervision_kinds']),
             old_or_manual_editorial_timeline_directly_copied=False,
             preference_model_supervision=[] if preference_model is None else preference_model.artifact['supervision_kinds'],
+            fixed_connection_prior_used=connection_prior is not None,
             elapsed_before_render=monotonic() - started), indent=2, allow_nan=False)
     with args.output.with_suffix('.plan.json').open('x') as stream:
         stream.write(encoded)
