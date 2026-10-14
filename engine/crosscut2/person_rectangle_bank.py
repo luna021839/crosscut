@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 from time import monotonic
 
@@ -28,6 +29,10 @@ from .observation_cache_contract import function_text
 
 CONTRACT = 'exact_native_person_rectangle_bank_v1'
 FIELDS = {'binding', 'rectangles', 'raster', 'measurement'}
+# The initial successful291-raster pass used this exact orchestration file.
+# Its pixel arithmetic is qualified below, not silently relabelled as new.
+LEGACY_RAW_BANK_IMPLEMENTATION_SHA256 = 'fd3cf41c601467977beaad1aaa918a73c7498858eb89763c2817b51948f74efa'
+QUALIFIED_RAW_RECTANGLE_SEMANTICS_SHA256 = 'd18bd1337fe47311e336a4eebd87832a271d6fd3812b1270c40487409bc9752d'
 
 
 def requested_unknown_endpoints(banks, bound, registry):
@@ -68,6 +73,11 @@ def _runtime(model):
     files = [Path(__file__), Path(native_person_onnx.__file__), Path(onnx_cpu_inference.__file__),
              Path(sparse.__file__)]
     seals = [hashlib.sha256(p.read_bytes()).hexdigest() for p in files]
+    # Failure handling and queue order do not change a physical observation.
+    # Seal all pixel arithmetic, model construction and raster metadata code;
+    # keep imported decoder/model/clock implementations independently sealed.
+    semantics = '\n'.join(function_text(__file__, f) for f in ('_measure', '_validate', '_detector', '_raster'))
+    seals[0] = hashlib.sha256(semantics.encode()).hexdigest()
     seals += [hashlib.sha256(function_text(Path(sparse.__file__).with_name('source_cuts.py'),
                                           'read_frames').encode()).hexdigest(),
               hashlib.sha256(function_text(render_frame_schedule.__file__,
@@ -109,6 +119,24 @@ def _validate(rectangles, raster):
             or np.any(rectangles[:, 2:4] <= rectangles[:, :2])
             or raster.shape != (2,) or raster.dtype.kind not in 'iu' or (raster < 1).any()):
         raise ValueError('malformed normalized native person rectangles')
+
+
+def _measure(pixels, detector, raster):
+    width, height = map(int, raster)
+    rectangles = np.asarray(detector.infer(pixels), np.float32).copy()
+    rectangles[:, :4] /= np.array([width, height, width, height], np.float32)
+    _validate(rectangles, raster)
+    return rectangles
+
+
+def _qualified_legacy_runtime(runtime):
+    seals = runtime.get('implementation')
+    if (not isinstance(seals, list) or len(seals) != 6
+            or seals[0] != QUALIFIED_RAW_RECTANGLE_SEMANTICS_SHA256):
+        return None
+    # Other five reader/model/clock seals and ALL runtime/source fields must
+    # still match. Reading an old binding never rewrites its original record.
+    return dict(runtime, implementation=[LEGACY_RAW_BANK_IMPLEMENTATION_SHA256, *seals[1:]])
 
 
 def _load(target, binding):
@@ -154,6 +182,7 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
         raise ValueError('bounded source-matched native person requests required')
     check()
     runtime, model_identity = _runtime(model)
+    legacy_runtime = _qualified_legacy_runtime(runtime)
     check()
     output, receipts, identities, jobs = [], [], [], []
     cache = Path(cache)
@@ -177,6 +206,7 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
         identities.append(identity)
         result = {}; output.append(result)
         receipt = dict(source=s, contract=CONTRACT, requested_frames=len(request), reused_frames=0,
+            qualified_legacy_raw_frames_reused=0,
             new_person_forwards=0, measured_frames=0, zero_box_attempts=0, deferred_frame_budget=0,
             deferred_time_budget=0, failed_frames=0, probe_calls=0, sparse_decode_calls=0,
             decoded_native_rasters=0, errors=[], raster_executions=[],
@@ -186,13 +216,20 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
         for f, priority in request.items():
             if type(f) is not int or not 0 <= f < record['frame_count'] or type(priority) is not int or priority < 0:
                 raise ValueError('exact physical ordinal and nonnegative integer priority required')
-            binding = json.dumps(dict(contract=CONTRACT, runtime=runtime, source=list(identity),
+            domain = dict(contract=CONTRACT, runtime=runtime, source=list(identity),
                 source_sha256=record['source_sha256'], fps=record['fps'], frame_count=record['frame_count'],
-                native_ordinal=f), sort_keys=True)
+                native_ordinal=f)
+            binding = json.dumps(domain, sort_keys=True)
             target = cache / (hashlib.sha256(binding.encode()).hexdigest() + '.npz')
+            old_binding = None if legacy_runtime is None else json.dumps(dict(domain, runtime=legacy_runtime), sort_keys=True)
+            old_target = None if old_binding is None else cache / (hashlib.sha256(old_binding.encode()).hexdigest() + '.npz')
             if target.is_file():
                 result[f] = _load(target, binding)
                 receipt['reused_frames'] += 1
+            elif old_target is not None and old_target.is_file():
+                result[f] = _load(old_target, old_binding)
+                receipt['reused_frames'] += 1
+                receipt['qualified_legacy_raw_frames_reused'] += 1
             else:
                 jobs.append((priority, s, f, binding, target))
     stable()
@@ -235,9 +272,7 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
                     raise OSError('person reader returned an undeclared or different original raster')
                 receipt['decoded_native_rasters'] += 1
                 receipt['new_person_forwards'] += 1
-                rectangles = np.asarray(detector.infer(pixels), np.float32).copy()
-                rectangles[:, :4] /= np.array([width, height, width, height], np.float32)
-                _validate(rectangles, rasters[s])
+                rectangles = _measure(pixels, detector, rasters[s])
                 binding, target = pending[f]
                 measurement = json.dumps(dict(verified_original_pts_raster=True,
                     packet_grid_sha256=clocks[s].packet_digest, person_model_forwards=1,
@@ -248,10 +283,12 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
                 receipt['measured_frames'] += 1
             if any(f not in output[s] for f in pending):
                 raise OSError('person sparse reader omitted declared ordinals')
-        except (OSError, ValueError, TimeoutError) as error:
+        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
             missing = sum(f not in output[s] for f in pending)
             receipt['errors'].append(f'{type(error).__name__}: {error}')
-            if isinstance(error, TimeoutError):
+            # A single reader-window deadline is a local failure. Only an
+            # actually spent GLOBAL allowance defers later native sources.
+            if monotonic() - started >= maximum_seconds:
                 out_of_time = True; receipt['deferred_time_budget'] += missing
             else:
                 receipt['failed_frames'] += missing

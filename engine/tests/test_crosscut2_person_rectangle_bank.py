@@ -209,3 +209,75 @@ def test_real_fingerprint_pins_asset_runtime_reader_without_loading_detector(tmp
     model.write_bytes(b'corrupt fixture model')
     with pytest.raises(ValueError, match='pinned YOLO'):
         people._runtime(model)
+
+
+def test_decoder_wait_timeout_is_partial_receipt_not_pass_abort(tmp_path, monkeypatch):
+    import subprocess
+    w = world(tmp_path, monkeypatch, sources=2); original = people.sparse.frames
+    def hung(path, natives, **kw):
+        if w.paths.index(path) == 0:
+            raise subprocess.TimeoutExpired('ffmpeg', 10.)
+        yield from original(path, natives, **kw)
+    monkeypatch.setattr(people.sparse, 'frames', hung)
+    output, receipts = run(w, [{20: 0}, {40: 0}])
+    assert receipts[0]['failed_frames'] == 1 and receipts[0]['status'] == 'partial'
+    assert set(output[1]) == {40}
+
+
+def test_window_deadline_is_failure_not_global_budget(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch, sources=2); original = people.sparse.frames
+    def stuck(path, natives, **kw):
+        if w.paths.index(path) == 0:
+            raise TimeoutError('single sparse decode window exhausted')
+        yield from original(path, natives, **kw)
+    monkeypatch.setattr(people.sparse, 'frames', stuck)
+    output, receipts = run(w, [{20: 0}, {40: 0}])
+    assert receipts[0]['failed_frames'] == 1 and receipts[0]['deferred_time_budget'] == 0
+    assert set(output[1]) == {40}
+
+
+def test_extracted_measurement_is_bitwise_initial_inline_arithmetic():
+    rng = np.random.default_rng(42)
+    for count in (0, 1, 2, 12, 100):
+        xy = rng.random((count, 4), dtype=np.float32)
+        xy[:, [0, 2]] = np.sort(xy[:, [0, 2]], axis=1)
+        xy[:, [1, 3]] = np.sort(xy[:, [1, 3]], axis=1)
+        raw = np.column_stack((xy * [1920, 1080, 1920, 1080], np.full(count, .9))).astype(np.float32)
+        class Detector:
+            def infer(self, pixels):return raw.copy()
+        original = np.asarray(raw, np.float32).copy()
+        original[:, :4] /= np.array([1920, 1080, 1920, 1080], np.float32)
+        actual = people._measure(None, Detector(), np.array([1920, 1080], np.int64))
+        assert np.array_equal(actual, original)
+    text = '\n'.join(people.function_text(people.__file__, f)
+        for f in ('_measure', '_validate', '_detector', '_raster'))
+    assert hashlib.sha256(text.encode()).hexdigest() == people.QUALIFIED_RAW_RECTANGLE_SEMANTICS_SHA256
+
+
+def test_qualified_initial_numeric_cache_reused_without_rewriting_its_provenance(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch)
+    runtime = dict(implementation=[people.LEGACY_RAW_BANK_IMPLEMENTATION_SHA256, *['unchanged']*5],
+                   runtime='same-model-decoder-and-libraries')
+    monkeypatch.setattr(people, '_runtime', lambda p: (dict(runtime), file_identity(p)))
+    cold, _ = run(w, [{20: 1}])
+    target, = w.cache.glob('*.npz'); before = target.read_bytes()
+    runtime['implementation'] = [people.QUALIFIED_RAW_RECTANGLE_SEMANTICS_SHA256, *['unchanged']*5]
+    forbid_cold(monkeypatch)
+    warm, receipts = run(w, [{20: 1}], maximum_new_frames=0)
+    assert receipts[0]['qualified_legacy_raw_frames_reused'] == receipts[0]['reused_frames'] == 1
+    assert receipts[0]['new_person_forwards'] == 0 and np.array_equal(cold[0][20], warm[0][20])
+    assert target.read_bytes() == before and len(list(w.cache.glob('*.npz'))) == 1
+
+
+@pytest.mark.parametrize('index', range(1, 6))
+def test_legacy_bridge_cannot_hide_changed_model_or_reader_seals(tmp_path, monkeypatch, index):
+    w = world(tmp_path, monkeypatch)
+    runtime = dict(implementation=[people.LEGACY_RAW_BANK_IMPLEMENTATION_SHA256, *['unchanged']*5])
+    monkeypatch.setattr(people, '_runtime', lambda p: (dict(runtime), file_identity(p)))
+    run(w, [{20: 1}])
+    runtime['implementation'] = [people.QUALIFIED_RAW_RECTANGLE_SEMANTICS_SHA256, *['unchanged']*5]
+    runtime['implementation'][index] = 'changed'
+    forbid_cold(monkeypatch)
+    output, receipts = run(w, [{20: 1}], maximum_new_frames=0)
+    assert output == [{}] and receipts[0]['reused_frames'] == 0
+    assert receipts[0]['deferred_frame_budget'] == 1
