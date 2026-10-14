@@ -2412,33 +2412,41 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
 ) -> dict[str, Any]:
     """Merge all low-rank trajectory rows into the original renderer heads."""
 
-    context_delta = mx.matmul(
-        module.context_adapter.weight
-        / projection_normalizer.context_scale[None, :],
-        context_projection_matrix,
-    )
-    source_delta = mx.matmul(
-        module.source_adapter.weight
-        / projection_normalizer.source_scale[None, :],
-        source_projection_matrix,
-    )
+    # This is a one-time affine conversion, NOT a model forward. Narrow real
+    # feature variance can amplify coefficients by 1e3. Accumulating the
+    # coefficient and offset products in float32 loses avoidable digits before
+    # the merged float32 head ever runs. Compute in CPU float64, quantize once;
+    # keep the deployed model, decoder, loss and acceptance tolerances unchanged.
+    def double(value: Any) -> np.ndarray:
+        return np.asarray(value, dtype=np.float64)
+
+    context_weight = double(module.context_adapter.weight)
+    source_weight = double(module.source_adapter.weight)
+    context_delta = np.einsum("ij,jk->ik",
+        context_weight / double(projection_normalizer.context_scale)[None, :],
+        double(context_projection_matrix), optimize=False)
+    source_delta = np.einsum("ij,jk->ik",
+        source_weight / double(projection_normalizer.source_scale)[None, :],
+        double(source_projection_matrix), optimize=False)
     structured_bias_delta = (
-        module.context_adapter.bias
-        - mx.matmul(
-            module.context_adapter.weight,
-            projection_normalizer.context_mean
-            / projection_normalizer.context_scale,
-        )
-        - mx.matmul(
-            module.source_adapter.weight,
-            projection_normalizer.source_mean
-            / projection_normalizer.source_scale,
-        )
+        double(module.context_adapter.bias)
+        - np.einsum("ij,j->i", context_weight, (
+            double(projection_normalizer.context_mean)
+            / double(projection_normalizer.context_scale)
+        ), optimize=False)
+        - np.einsum("ij,j->i", source_weight, (
+            double(projection_normalizer.source_mean)
+            / double(projection_normalizer.source_scale)
+        ), optimize=False)
     )
+    if not all(np.isfinite(value).all() for value in (
+        context_delta, source_delta, structured_bias_delta,
+    )):
+        raise ValueError("Dynamic Crop v3 affine merge is nonfinite")
     snapshot = {
-        "context_weight": initial_snapshot["context_weight"] + context_delta,
-        "context_bias": initial_snapshot["context_bias"] + structured_bias_delta,
-        "source_weight": initial_snapshot["source_weight"] + source_delta,
+        "context_weight": mx.array((double(initial_snapshot["context_weight"]) + context_delta).astype(np.float32)),
+        "context_bias": mx.array((double(initial_snapshot["context_bias"]) + structured_bias_delta).astype(np.float32)),
+        "source_weight": mx.array((double(initial_snapshot["source_weight"]) + source_delta).astype(np.float32)),
     }
     mx.eval(*snapshot.values())
     return snapshot
