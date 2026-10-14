@@ -7,6 +7,7 @@ or one joint Hermite bridge. No camera fit/retiming occurs after the DP.
 import numpy as np
 from .connection_prior import physical_weights
 from .native_fragment_integrity import NativeFragmentIntegrity
+from .played_partial_pose import face_geometry
 
 
 def _hermite(a,b,da,db,length):
@@ -121,15 +122,13 @@ class ArcCosts:
         at=scores.argmax(-1);idx=np.broadcast_to(at[...,None,None],(B,E,2,1,4))
         head=np.take_along_axis(np.broadcast_to(heads,(B,)+heads.shape),idx,axis=3).squeeze(3)
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
-        norm=np.maximum(.005,h.mean(-1));distance=np.linalg.norm((c[:,:,0]-c[:,:,1])*[16/9,1.],axis=-1)/norm
-        log_scale=np.abs(np.log(np.maximum(.001,h[:,:,0])/np.maximum(.001,h[:,:,1])))
-        position=distance/(1.+distance);scale=log_scale/(1.+log_scale)
-        boxhalf=h[...,None]*[.45*9/16,.5]
-        ext=np.maximum(0.,np.minimum(1.,c+boxhalf)-np.maximum(0.,c-boxhalf))
-        fraction=np.prod(ext/np.maximum(1e-9,2*boxhalf),axis=-1)
-        visibility=.5*np.minimum(1.,h.min(-1)/.22)*fraction.min(-1)
         valid=(scores.max(-1)>0).all(-1)
-        return np.where(valid,1.-.25*visibility*(1.-position)*(1.-scale),1.-.5**5)
+        face,_,_=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)
+        # Existing native ports contain exact endpoint faces, not the exposed
+        # body windows. Use the SAME missing-pose convention as authored K.
+        # A known bad native event stays finite and playable; it is not gated
+        # out or laundered through a near-constant confidence-like1-Q rate.
+        return face+.5
 
     def native_weights(self,s,first,final,xs):
         all_xs,_,weights,_=self.native_tables[s]

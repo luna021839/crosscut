@@ -34,7 +34,7 @@ def test_failed_sequential_fallback_cannot_commit_even32_completed_intervals(tmp
     monkeypatch.setattr(sparse,'probe',unsupported)
     monkeypatch.setattr(parts,'_sequential_rasters',corrupt)
     monkeypatch.setattr(parts.temporal_parts,'observe',lambda *a,**kw:fake_result())
-    with pytest.raises(OSError,match='corrupt decode'):parts.corroborate(**kw)
+    with pytest.raises(OSError,match='corrupt decode'):parts.corroborate(**kw,allow_sequential_fallback=True)
     assert not list(kw['cache'].glob('*.npz'))
 
 
@@ -57,7 +57,7 @@ def test_clean_sequential_fallback_commits_only_after_valid_EOF(tmp_path,monkeyp
             yield tick,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(sparse,'probe',unsupported);monkeypatch.setattr(parts,'_sequential_rasters',clean)
     monkeypatch.setattr(parts.temporal_parts,'observe',lambda *a,**kw:fake_result())
-    rows,receipt=parts.corroborate(**kw)
+    rows,receipt=parts.corroborate(**kw,allow_sequential_fallback=True)
     with np.load(next(kw['cache'].glob('*.npz')),allow_pickle=False) as saved:
         assert len(saved['keys'])==36 and saved['decode_verified'].all()
     assert rows[0]['part_pair_decode_verified'].all()
@@ -68,7 +68,7 @@ def test_legacy_cells_reused_without_decode_but_never_retroactively_certified(tm
     import hashlib
     from crosscut2.part_hypotheses import retain_model_hypotheses
     kw,_=setup(tmp_path)
-    def verified(path,needed,*,check,receipt):
+    def verified(path,needed,*,check,receipt,**kw):
         receipt['strategy']='verified_original_PTS_bounded_native_seek_v1'
         for tick in sorted(needed):yield tick,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(parts,'_rasters',verified);monkeypatch.setattr(parts.temporal_parts,'observe',lambda *a,**kw:fake_result())
@@ -90,7 +90,7 @@ def test_old_runtime_snapshot_cannot_conflict_with_current_part_consumer(tmp_pat
     import json
     from crosscut2.part_hypotheses import retain_model_hypotheses
     kw,_=setup(tmp_path)
-    def verified(path,needed,*,check,receipt):
+    def verified(path,needed,*,check,receipt,**kw):
         receipt['strategy']='verified_original_PTS_bounded_native_seek_v1'
         for tick in sorted(needed):yield tick,np.zeros((24,40,3),np.uint8)
     monkeypatch.setattr(parts,'_rasters',verified);monkeypatch.setattr(parts.temporal_parts,'observe',lambda *a,**kw:fake_result())
@@ -101,3 +101,19 @@ def test_old_runtime_snapshot_cannot_conflict_with_current_part_consumer(tmp_pat
     with (kw['cache']/('0'*64+'.npz')).open('wb') as stream:np.savez_compressed(stream,**data)
     result=retain_model_hypotheses(rows=rows,states=kw['states'],sources=kw['sources'],cache=kw['cache'])
     assert result[0]['body_reliability'][:,:,4].min()==1.
+
+
+def test_production_part_queue_cannot_silently_enter_whole_source_fallback(tmp_path,monkeypatch):
+    kw,_=setup(tmp_path)
+    def unsupported(*a,**kw):raise sparse.UnsupportedSeek('unproven clock')
+    def forbidden(*a,**kw):raise AssertionError('strict production queue must not decode full source')
+    monkeypatch.setattr(sparse,'probe',unsupported);monkeypatch.setattr(parts,'_sequential_rasters',forbidden)
+    with pytest.raises(sparse.UnsupportedSeek,match='refuses full-source fallback'):parts.corroborate(**kw)
+    assert not list(kw['cache'].glob('*.npz'))
+    import ast,inspect
+    from crosscut2 import stage_mix
+    calls=[node for node in ast.walk(ast.parse(inspect.getsource(stage_mix.main)))
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='corroborate']
+    assert len(calls)==1
+    assert any(k.arg=='allow_sequential_fallback' and isinstance(k.value,ast.Constant) and k.value.value is False
+        for k in calls[0].keywords)

@@ -492,7 +492,7 @@ def main():
                 def part_observer(local_states,local_data,*,check=check):
                     rows,receipts=corroborate(sources=original.sources,states=local_states,data=local_data,census=bound_source_cut_events,
                         cache=args.cache.parent/'crosscut2-native-part-support-v1',check=check,
-                        maximum_seconds=180.,maximum_new_intervals=6000)
+                        maximum_seconds=180.,maximum_new_intervals=6000,allow_sequential_fallback=False)
                     return retain_model_hypotheses(rows=rows,states=local_states,sources=original.sources,
                         cache=args.cache.parent/'crosscut2-native-part-support-v1'),receipts
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
@@ -504,7 +504,8 @@ def main():
             fixed_receipt['source_event_union']=union_receipts
             fixed_receipt['native_event_registry']=registry_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
-            fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,check=check)
+            fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,
+                native_ports=native_ports,check=check)
             if args.common_evidence_connection_prior or args.played_face_connection_prior or args.played_pose_port_camera_prior:
                 verified=fixed_receipt['selected_clock_check']
                 if not (verified['all_source_clocks_verified'] and verified['source_observation_ordinals_exact']
@@ -512,6 +513,8 @@ def main():
                     raise ValueError('common-evidence trial refuses to render an unverified or differing source clock')
                 if args.played_pose_port_camera_prior and not verified['camera_transform_replay_exact_within_roundoff']:
                     raise ValueError('E refuses to render cameras different from its actual scored strips/path')
+                if args.played_pose_port_camera_prior and not verified['retained_native_clock_verified']:
+                    raise ValueError('E refuses differing retained native first-incoming clocks or measured flanks')
         else:
             runs, states, data, score, fixed_receipt = select_fixed_holds(nodes, banks, poses,
                 fps=original.fps, source_events=source_events, broadcast_slots=slots, check=check,body_states=body_states,

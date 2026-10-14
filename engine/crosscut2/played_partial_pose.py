@@ -22,6 +22,21 @@ def tentative(raw, kind, ambiguous):
         np.where((kind == PIXEL_SUPPORTED) & ~ambiguous, raw, .5 + .5 * (raw - .5)))
 
 
+def face_geometry(center_a,height_a,center_b,height_b,measured):
+    """Shared played geometry units for authored AND retained-native events.
+
+    Centers use the same isotropic output-height coordinate system. The raw
+    discrepancy is not flattened: a tenfold native scale jump must not cost
+    nearly the same as a matched face. Missing geometry is finite1, not an
+    observed bad face or a source veto. Authored admission is a separate rule.
+    """
+    height=np.maximum(.005,(height_a+height_b)/2.)
+    log_scale=np.abs(np.log(np.maximum(.001,height_a)/np.maximum(.001,height_b)))
+    displacement=np.linalg.norm(center_a-center_b,axis=-1)/height
+    raw=np.maximum(log_scale/math.log(1.5),displacement)
+    return np.where(measured,raw,1.),displacement,log_scale
+
+
 def features(observations, *, fps):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
@@ -66,11 +81,10 @@ def matrix(left, right, *, details=False):
     la, rb = left['endpoint'], right['endpoint']; ai = np.arange(len(la)); bi = np.arange(len(rb))
     h = np.maximum(.005, (left['height'][:, None] + right['height'][None, :]) / 2.)
     face_seen = left['seen'][:, None] & right['seen'][None, :]
-    log_scale = np.abs(np.log(np.maximum(.001, left['height'][:, None]) / np.maximum(.001, right['height'][None, :])))
-    displacement = np.linalg.norm(left['center'][:, None] - right['center'][None, :], axis=-1) / h
-    face_error = np.maximum(log_scale / math.log(1.5), displacement)
+    face_error,displacement,log_scale = face_geometry(left['center'][:,None],left['height'][:,None],
+        right['center'][None,:],right['height'][None,:],face_seen)
     allowed = ~face_seen | (face_error <= 1.)
-    face = np.where(face_seen, np.minimum(1., face_error), 1.)
+    face = face_error  # risk stays origin-blind; admission is separate
     # [source point coordinates] -> [actual per-side rendered coordinates].
     pa = left['xy'][ai, la][:, PAIRS[:, 1]]; pb = right['xy'][bi, rb][:, PAIRS[:, 1]]
     ua = left['unit'][ai, la]; ub = right['unit'][bi, rb]

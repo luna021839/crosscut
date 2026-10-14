@@ -233,7 +233,7 @@ def realize(original,warps,nodes,runs,states,data,*,output,measured):
         member_pose_dissolve_requested=None,member_pose_dissolve_effective=None,member_pose_dissolve_count=None),seams
 
 
-def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,check=lambda:None):
+def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=None,check=lambda:None):
     """Report real renderer ordinal drift, without silently retiming ports."""
     from crosscut.render_frame_schedule import probe_render_frame_clock,sampler_frame_schedule
     clocks=[]
@@ -243,10 +243,35 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,check=lambda:N
         return dict(all_source_clocks_verified=False,source_observation_ordinals_exact=False,
             maximum_native_ordinal_difference=None,post_selection_retimed=False)
     differences=[];exposed=[];total=0;pose_total=0;camera_total=0;camera_error=0.
+    native_events=0;native_inputs=0
+    native_domain=native_ports is not None and all('native_event_keys' in bank for bank in native_ports)
     for segment,(first,end,index) in zip(plan.segments,runs):
         check();source=states[index].source;clock=clocks[source];size=int(nodes[end]-nodes[first])
         schedule=sampler_frame_schedule(source_start=segment.source_start,source_playback_rate=segment.source_playback_rate,
             native_fps=float(clock.frame_rate),output_fps=plan.fps,frame_count=size,source_frame_count=clock.frame_count)
+        if native_domain:
+            bank=native_ports[source]
+            for at,tick in enumerate(bank['frames']):
+                local=int(tick)-int(nodes[first])
+                # A native at a hold endpoint is replaced by the actual
+                # authored event, not counted again as a held-through event.
+                if not 0<local<size:continue
+                native_events+=1
+                actual=np.asarray(schedule.source_frame_indices[local-1:local+1],int)
+                keys=bank['native_event_keys'][at]
+                if not keys:raise ValueError('retained native event needs physical first-incoming keys')
+                for key in keys:
+                    if not actual[0]<int(key)<=actual[1]:
+                        error=max(int(actual[0])-int(key)+1,int(key)-int(actual[1]))
+                        differences.append(dict(source=source,output_frame=int(tick),delta=error,
+                            kind='native_first_incoming_mapping',actual_native_ordinals=actual.tolist(),
+                            source_native_first_incoming=int(key)))
+                if bank['observed'][at]:
+                    if len(keys)!=1:raise ValueError('multiple native events cannot borrow one measured flank pair')
+                    wanted=np.array([keys[0]-1,keys[0]],int);native_inputs+=2
+                    for error in actual-wanted:
+                        if error:differences.append(dict(source=source,output_frame=int(tick),delta=int(error),
+                            kind='measured_retained_native_flank',actual_native_ordinals=actual.tolist()))
         expected=banks[source]['native_indices']
         for n in range(first,end+1):
             for side,offset in ((0,-1),(1,0)):
@@ -274,5 +299,8 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,check=lambda:N
         maximum_native_ordinal_difference=maximum,maximum_exposed_ordinal_difference=max(exposed,default=0),
         measured_grid_inputs_checked=total,played_pose_native_inputs_checked=pose_total,
         selected_scored_camera_frames_checked=camera_total,maximum_camera_transform_difference=camera_error,
+        retained_native_events_clock_checked=native_events,measured_retained_native_inputs_checked=native_inputs,
+        retained_native_clock_domain_provided=native_domain,
+        retained_native_clock_verified=native_domain and not any(d.get('kind','').startswith(('native_','measured_retained_')) for d in differences),
         camera_transform_replay_exact_within_roundoff=camera_error<=1e-12,
         differing_inputs=differences,post_selection_retimed=False)

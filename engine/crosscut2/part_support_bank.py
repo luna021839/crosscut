@@ -72,7 +72,9 @@ def cache_implementation():
     certified. A changed producer/clock/seek contract gets a new key.
     """
     semantic,reader=cache_contract_components()
-    if (semantic=='cb5a893b50205ce3bc112c7bc3b2531c05f9c611a4282226010b888e427cfc02'
+    # Qualified strict-queue wiring changes no interval observations. Legacy
+    # values still have UNKNOWN decoder provenance; this is not certification.
+    if (semantic=='0297fec95b6f11d0e90dcad856d9ed967e8dd5efcaf03fa870711ece927bc319'
             and reader=='fb8962b51a5516b567df5a9474036f46a7094a2cfc0919bf2c9356b59833c0d3'):
         return '447432eab91d837e40edf01d482a3ef7302c210e24efa59a189266c55aba4abb'
     return hashlib.sha256((semantic+reader).encode()).hexdigest()
@@ -105,7 +107,8 @@ def _rasters(path,needed,*,check,maximum_seconds=120.,allow_sequential_fallback=
             maximum_seconds=maximum_seconds,receipt=report)
 
 
-def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,maximum_new_intervals=6000):
+def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,maximum_new_intervals=6000,
+                allow_sequential_fallback=False):
     if not 1<=maximum_seconds<=600 or not 0<=maximum_new_intervals<=12000:
         raise ValueError('finite additive native part support allowance required')
     started=monotonic();last=started;cache=Path(cache);rows=[dict(d) for d in data];receipts=[];spent=0
@@ -176,7 +179,8 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
                 needed=set();ends={}
                 for key,(a,b,*_) in requests.items():needed.update(range(a,b+1));ends.setdefault(b,[]).append(key)
                 buffer=deque()
-                for native,pixels in _rasters(path,needed,check=live,receipt=execution):
+                for native,pixels in _rasters(path,needed,check=live,receipt=execution,
+                        allow_sequential_fallback=allow_sequential_fallback):
                     live();buffer.append((native,pixels));decoded+=1
                     while buffer and buffer[0][0]<native-12:buffer.popleft()
                     frames=dict(buffer)
@@ -212,6 +216,7 @@ def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,ma
                 decoded_native_rasters=decoded,new_neural_calls=0,corroborated_part_slots=supported,unknown_part_slots=unknown,
                 source_model_caches_unchanged=True,raw_joint_coordinates_unchanged=True,anatomical_ownership_certified=False,
                 native_raster_execution=execution,
+                sequential_fallback_allowed=bool(allow_sequential_fallback),
                 legacy_unverified_intervals_reused=sum(not saved[k][3] for k in {x[3] for x in links}),
                 cache_bytes=target.stat().st_size if target.exists() else 0,elapsed_seconds=monotonic()-started)
             receipts.append(receipt);print(json.dumps(dict(phase='source_part_paths_complete',**receipt)),flush=True)

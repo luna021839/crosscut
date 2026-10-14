@@ -28,9 +28,13 @@ class PlayedPosePortPrior:
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
-        self.artifact=dict(contract='played_partial_pose_physical_focal_boundary_port_E_v1',
+        self.artifact=dict(contract='played_partial_pose_physical_focal_boundary_port_E2_v2',
             source_code_sha256=implementation,supervision_kinds=[],new_fit=False,weak_models_used=False,
             authored_cost='played_pair_support*(D_face_rate+mean_fixed_semantic_played_pose_channels)',
+            native_cost='physical_support*(same_uncapped_played_face_geometry+unmeasured_partial_pose_.5)',
+            native_geometry_not_flattened_or_visibility_attenuated=True,
+            native_missing_pose_not_fabricated_as_measured=True,
+            own_activity_bound_to_same_displayed_face_sample=True,
             maximum_measured_face_height_ratio=1.5,maximum_measured_displacement_in_face_heights=1.,
             unknown_pose_residual=.5,model_only_shrinkage=.5,shrinkage_is_not_anatomical_probability=True,
             measured_body_action_cost_used=True,pair_conditioned_cameras_added=True,
