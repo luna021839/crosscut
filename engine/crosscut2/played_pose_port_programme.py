@@ -4,13 +4,14 @@ Untrained engineering ranking, not professional/editorial acceptance. This
 module reuses source caches; it does not acquire, train or reanalyse a source.
 """
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
 from time import monotonic
 import numpy as np
-from .fixed_holds import State,_curve_at
-from .event_states import build
+from .fixed_holds import State,_curve_at,make_states
+from .shot_camera_paths import make_paths
 from .physical_display_observations import focal_metadata
 from .display_source_catalogue import SourceCatalogue
 from .boundary_port_domain import make
@@ -55,17 +56,24 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
         if monotonic()-origin>=limit:raise TimeoutError('one shared E '+phase+' allowance exhausted')
-    states,rows,receipt=build(nodes,banks,poses,styles,fps=fps,source_events=source_events,
-        body_states=body_states,identity_hints=identity_hints,part_observer=part_observer,check=live)
-    cats=[];paths=[]
+    # E consumes raw per-face observations and four physical source paths,
+    # not the legacy actor x camera projected reward rows. Do not allocate
+    # those416 discarded rows just to recover104raw native observations.
+    states,rows,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
+        body_states=body_states,camera_families=('native',),check=live)
+    part_receipts=[]
+    if part_observer is not None:
+        rows,part_receipts=(part_observer(states,rows,check=live) if 'check' in inspect.signature(part_observer).parameters
+            else part_observer(states,rows))
+    paths,camera_receipt=make_paths(nodes,banks,source_events,check=live)
+    receipt=dict(source_local_appearance_clusters=counts,raw_actor_states_prepared_once=len(states),
+        native_part_corroboration=part_receipts,camera_domain=camera_receipt,
+        unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
+    cats=[]
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps))
-        families={}
-        for state,d in zip(states,rows):
-            if state.source==s:families.setdefault(state.family,(d['ticks'],d['curve']))
-        if len(families)!=4:raise ValueError('four frozen source camera interiors required')
-        paths.append(list(families.values()))
+    del states,rows,raw
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live)
     events=[sorted(set(map(int,xs))|set(map(int,bank['frames']))) for xs,bank in zip(source_events,native_ports)]
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
