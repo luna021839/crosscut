@@ -31,8 +31,9 @@ import numpy as np
 
 from .stage_edit_training_preflight import (
     hierarchical_prior_class_balance, require_trajectory_selection_coverage,
-    require_releasable_training_plan,
+    require_releasable_training_plan, require_original_observation_coverage,
 )
+from .stage_edit_decoded_curve_metrics import DECODED_OBSERVATION_METRIC_CONTRACT
 
 from .stage_edit_training_progress import (
     training_step_completed, training_epoch_evaluated,
@@ -392,10 +393,20 @@ def _dynamic_crop_v3_validation_selection_evidence(
     ):
         reasons.append("dynamic_crop_v3_validation_source_slot_mismatch")
 
-    improvement = _finite_metric(
-        trajectory.get("aggregate_normalized_improvement_over_static_prior")
-    )
-    if improvement is None or improvement <= 0.0:
+    decoded_metric=trajectory.get('decoded_observed_time')
+    decoded_metric=decoded_metric if isinstance(decoded_metric,Mapping) else {}
+    if (decoded_metric.get('contract')!=DECODED_OBSERVATION_METRIC_CONTRACT
+            or decoded_metric.get('complete') is not True
+            or decoded_metric.get('predicted_count_and_time_consumed') is not True
+            or decoded_metric.get('synthetic_target_points_used') is not False
+            or decoded_metric.get('source_identity_mismatch_count')!=0
+            or decoded_metric.get('expected_tracks')!=trajectory.get('track_label_count')
+            or decoded_metric.get('evaluated_tracks')!=trajectory.get('track_label_count')):
+        reasons.append('dynamic_crop_v3_validation_actual_decoded_observation_metrics_missing')
+    improvement = _finite_metric(decoded_metric.get('improvement_over_static_prior'))
+    primary_improvement=_finite_metric(trajectory.get('aggregate_normalized_improvement_over_static_prior'))
+    if (improvement is None or improvement <= 0.0 or primary_improvement is None
+            or not math.isclose(improvement,primary_improvement,abs_tol=1e-9,rel_tol=1e-7)):
         reasons.append("dynamic_crop_v3_validation_did_not_beat_static_prior")
 
     structural_health = _dynamic_crop_v3_structural_health(metrics)
@@ -429,6 +440,8 @@ def _dynamic_crop_v3_validation_selection_evidence(
         "selectable": not reasons,
         "reasons": reasons,
         "score_component": improvement,
+        "curve_score_contract": DECODED_OBSERVATION_METRIC_CONTRACT,
+        "conditional_on_target_source_and_duration": True,
         "renderer_decode_attempt_count": attempt_count,
         "renderer_decode_eligible_count": eligible_count,
         "renderer_decode_eligible_rate": eligible_rate,
@@ -3248,9 +3261,13 @@ def train_production_stage_edit(
     if dynamic_crop_v3_enabled:
         for partition,examples in (('train',split.train),('validation',split.validation)):
             try:
+                original_coverage=require_original_observation_coverage(
+                    (target for example in examples for target in dynamic_crop_corpus.sequence_for(
+                        example.sequence.sequence_id).targets),partition=partition)
                 inventory=_dynamic_crop_v3_prior_inventory(examples,dynamic_crop_corpus)
                 dynamic_crop_v3_label_admission[partition]=require_trajectory_selection_coverage(
                     inventory.tracks,partition=partition)
+                dynamic_crop_v3_label_admission[partition]['original_observation_coverage']=original_coverage
             except ValueError as error:
                 raise ValueError(f'data_contract_unsatisfiable: partition={partition}: {error}') from error
 

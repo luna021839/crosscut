@@ -201,6 +201,12 @@ def _passing_dynamic_v3_metrics() -> dict:
                 },
             },
             "aggregate_normalized_improvement_over_static_prior": 0.04,
+            "decoded_observed_time": {
+                "contract": "actual_decoded_source_count_time_renderer_on_original_observations_v1",
+                "complete": True, "expected_tracks": 10, "evaluated_tracks": 10,
+                "source_identity_mismatch_count": 0, "predicted_count_and_time_consumed": True,
+                "synthetic_target_points_used": False, "improvement_over_static_prior": 0.04,
+            },
             "teacher_forced_count_normalized_time_mae": 0.03,
             "count": {
                 "label_count": 10,

@@ -264,6 +264,8 @@ class StageEditDynamicCropSupervisionBatchV3:
     target_source_indices: Any
     sequence_ids: tuple[str, ...]
     target_contract: str = DYNAMIC_CROP_V3_TARGET_CONTRACT
+    # Supervision-only original evidence, never copied into model features.
+    original_observed_keyframes: Mapping[tuple[int,int,int],tuple[Any,...]] | None = None
 
 
 def _coerce_target_sequence_v3(
@@ -308,6 +310,7 @@ def tensorize_stage_edit_dynamic_crop_supervision_v3(
     durations = np.zeros_like(counts, dtype=np.float32)
     track_mask = np.zeros_like(counts, dtype=bool)
     target_source_indices = np.full((batch_size, max_length), -1, dtype=np.int32)
+    original_observed_keyframes={}
     candidate_mask = np.asarray(batch.source_candidate_mask, dtype=bool)
     gate_mask = np.asarray(batch.hard_source_gate_mask, dtype=bool)
 
@@ -334,6 +337,8 @@ def tensorize_stage_edit_dynamic_crop_supervision_v3(
                     f"{sequence_id}:{time_index}:{target.source_id}"
                 )
             source_index = matches[0]
+            if target.original_observed_keyframes:
+                original_observed_keyframes[batch_index,time_index,source_index]=target.original_observed_keyframes
             if not candidate_mask[batch_index, time_index, source_index]:
                 raise ValueError("dynamic crop v3 target source is unavailable")
             if not gate_mask[batch_index, time_index, source_index]:
@@ -385,6 +390,7 @@ def tensorize_stage_edit_dynamic_crop_supervision_v3(
             track_mask=mx.array(track_mask),
             target_source_indices=mx.array(target_source_indices),
             sequence_ids=tuple(batch.sequence_ids),
+            original_observed_keyframes=original_observed_keyframes,
         )
 
 
@@ -699,11 +705,12 @@ def stage_edit_dynamic_crop_v3_loss(
     base_supervision: StageEditSupervisionBatch,
     dynamic_supervision: StageEditDynamicCropSupervisionBatchV3,
     contract: DynamicCropV3LossContract = DynamicCropV3LossContract(),
+    *, output: StageEditDynamicCropModelOutputV3 | None = None,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Joint loss with source-slot masks and renderer-range normalization."""
 
     _require_mlx()
-    output = model(batch)
+    output = model(batch) if output is None else output
     base_total, base_components = stage_edit_loss(
         _OutputProxy(output), batch, base_supervision, contract.base
     )
@@ -788,7 +795,7 @@ def evaluate_stage_edit_dynamic_crop_v3(
     model.eval()
     output = model(batch)
     total, components = stage_edit_dynamic_crop_v3_loss(
-        model, batch, base_supervision, dynamic_supervision, contract
+        model, batch, base_supervision, dynamic_supervision, contract, output=output
     )
     all_count_times = dynamic_crop_v3_times_by_count(
         output.dynamic_crop_time_interval_logits
@@ -1051,6 +1058,9 @@ def evaluate_stage_edit_dynamic_crop_v3(
     from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (  # local cycle
         decode_dynamic_crop_model_source_v3,
     )
+    from .stage_edit_decoded_curve_metrics import (
+        decoded_observation_error, summarize_decoded_observations,
+    )
 
     durations = np.asarray(
         dynamic_supervision.shot_duration_seconds, dtype=np.float64
@@ -1060,6 +1070,9 @@ def evaluate_stage_edit_dynamic_crop_v3(
     renderer_projection_count = 0
     renderer_rejections: dict[str, int] = {}
     decoded_source_ids: list[str] = []
+    decoded_observation_rows=[]
+    decoded_source_mismatches=0
+    observation_metric_rejections={}
     for batch_index, token_index, source_index in np.argwhere(track_mask):
         renderer_attempts += 1
         decoded = decode_dynamic_crop_model_source_v3(
@@ -1074,10 +1087,27 @@ def evaluate_stage_edit_dynamic_crop_v3(
             config=model.dynamic_crop_config,
         )
         if decoded.eligible:
+            expected_source_id=batch.source_ids[int(batch_index)][int(token_index)][int(source_index)]
+            if decoded.source_id!=expected_source_id:
+                decoded_source_mismatches+=1
+                renderer_rejections['decoded_source_identity_mismatch']=renderer_rejections.get('decoded_source_identity_mismatch',0)+1
+                continue
             renderer_eligible += 1
             renderer_projection_count += decoded.minimum_safe_zoom_projection_count
             assert decoded.source_id is not None
             decoded_source_ids.append(decoded.source_id)
+            observed=(dynamic_supervision.original_observed_keyframes or {}).get(
+                (int(batch_index),int(token_index),int(source_index)))
+            if observed:
+                try:
+                    decoded_observation_rows.append(decoded_observation_error(decoded,observed,
+                        expected_source_id=expected_source_id))
+                except ValueError as error:
+                    reason=str(error)
+                    observation_metric_rejections[reason]=observation_metric_rejections.get(reason,0)+1
+            else:
+                observation_metric_rejections['original_observed_keyframes_missing']=observation_metric_rejections.get(
+                    'original_observed_keyframes_missing',0)+1
         else:
             for reason in decoded.rejection_reasons:
                 renderer_rejections[reason] = renderer_rejections.get(reason, 0) + 1
@@ -1087,6 +1117,10 @@ def evaluate_stage_edit_dynamic_crop_v3(
         source_index = int(source_indices[batch_index, token_index])
         if not track_mask[batch_index, token_index, source_index]:
             source_slot_mismatch_count += 1
+
+    decoded_observation_metrics=summarize_decoded_observations(decoded_observation_rows,
+        expected_tracks=int(np.sum(track_mask)),source_mismatches=decoded_source_mismatches)
+    decoded_observation_metrics['rejections']=observation_metric_rejections
 
     return {
         "schema_version": DYNAMIC_CROP_V3_SCHEMA_VERSION,
@@ -1108,18 +1142,20 @@ def evaluate_stage_edit_dynamic_crop_v3(
             "source_slot_supervision_shape": list(track_mask.shape),
             "target_source_slot_mismatch_count": source_slot_mismatch_count,
             "decoded_source_ids": decoded_source_ids,
-            "coordinates": coordinates,
+            "coordinates": decoded_observation_metrics['coordinates'],
+            "decoded_observed_time": decoded_observation_metrics,
+            "teacher_forced_value_diagnostics": dict(coordinates=coordinates,
+                aggregate_renderer_range_normalized_mae=aggregate_model_normalized_mae,
+                aggregate_static_prior_renderer_range_normalized_mae=aggregate_prior_normalized_mae,
+                curve_delta_and_range=curve_metrics),
             "aggregate_renderer_range_normalized_mae": (
-                aggregate_model_normalized_mae
+                decoded_observation_metrics['normalized_mae']
             ),
             "aggregate_static_prior_renderer_range_normalized_mae": (
-                aggregate_prior_normalized_mae
+                decoded_observation_metrics['static_prior_normalized_mae']
             ),
             "aggregate_normalized_improvement_over_static_prior": (
-                aggregate_prior_normalized_mae - aggregate_model_normalized_mae
-                if aggregate_prior_normalized_mae is not None
-                and aggregate_model_normalized_mae is not None
-                else None
+                decoded_observation_metrics['improvement_over_static_prior']
             ),
             "teacher_forced_count_normalized_time_mae": _safe_mean(time_residual),
             "count": {
@@ -1141,7 +1177,7 @@ def evaluate_stage_edit_dynamic_crop_v3(
                 "balanced_accuracy": motion_balanced_accuracy,
                 "recall": motion_recalls,
             },
-            "curve_delta_and_range": curve_metrics,
+            "curve_delta_and_range": decoded_observation_metrics['curve_delta_and_range'],
             "renderer_decode": {
                 "attempt_count": renderer_attempts,
                 "eligible_count": renderer_eligible,

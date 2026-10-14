@@ -79,6 +79,7 @@ class SimplifiedDynamicCropTrajectoryV3:
     simplification_config_fingerprint: str
     contract: str = DYNAMIC_CROP_V3_SIMPLIFICATION_CONTRACT
     source_frame_binding: DynamicCropSourceFrameBinding | None = None
+    original_observed_keyframes: tuple[EditorialTransformKeyframe, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.keyframes:
@@ -107,6 +108,16 @@ class SimplifiedDynamicCropTrajectoryV3:
             for index, keyframe in zip(self.retained_original_indices, self.keyframes)
         ):
             raise ValueError("simplified crop keyframes differ from their source-frame observations")
+        if self.original_observed_keyframes:
+            observed=tuple(self.original_observed_keyframes)
+            if len(observed)!=self.original_keyframe_count or any(
+                    self.keyframes[i]!=observed[index] for i,index in enumerate(self.retained_original_indices)):
+                raise ValueError('original crop observations differ from retained target evidence')
+            EditorialTransformTrack(observed,reason='original_v2_observed_camera_evidence')
+            if self.source_frame_binding is not None and any(
+                    point.time_seconds!=observation.time_within_shot_seconds
+                    for point,observation in zip(observed,self.source_frame_binding.observations)):
+                raise ValueError('original crop observation clock differs from source binding')
         if (
             not math.isfinite(self.maximum_normalized_reconstruction_error)
             or self.maximum_normalized_reconstruction_error < 0.0
@@ -164,6 +175,7 @@ class SimplifiedDynamicCropTrajectoryV3:
                 }
                 for item in self.keyframes
             ],
+            "original_observed_keyframes": [asdict(point) for point in self.original_observed_keyframes],
         }
 
 
@@ -343,6 +355,7 @@ def simplify_dynamic_crop_trajectory_v3(
         maximum_normalized_reconstruction_error=max(errors, default=0.0),
         simplification_config_fingerprint=config.fingerprint,
         source_frame_binding=target.source_frame_binding,
+        original_observed_keyframes=original,
     )
 
 

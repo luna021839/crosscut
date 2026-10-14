@@ -94,7 +94,7 @@ def _actual_training_args(tmp_path):
 
 
 @pytest.mark.parametrize('partition',['train','validation'])
-@pytest.mark.parametrize('kind',['single_count','missing_static','missing_dynamic','masked_only','zero_range'])
+@pytest.mark.parametrize('kind',['single_count','missing_static','missing_dynamic','masked_only','zero_range','missing_original'])
 def test_trainer_rejects_unsatisfiable_fixed_labels_before_any_optimizer(monkeypatch,tmp_path,partition,kind):
     import crosscut.stage_edit_production_training as trainer
     args=_actual_training_args(tmp_path)
@@ -103,13 +103,16 @@ def test_trainer_rejects_unsatisfiable_fixed_labels_before_any_optimizer(monkeyp
     chosen={example.sequence.sequence_id for example in getattr(split,partition)}
     def invalid(target):
         if target is None:return None
+        if kind=='missing_original':return replace(target,original_observed_keyframes=())
         if kind=='single_count':return replace(target,keyframes=target.keyframes[:1],retained_original_indices=(0,))
         if kind=='missing_static':return replace(target,motion_label='dynamic')
         if kind=='missing_dynamic':return replace(target,motion_label='static')
         if kind=='masked_only':return replace(target,motion_label_loss_masked=True)
         first=target.keyframes[0]
-        return replace(target,keyframes=tuple(replace(point,zoom=first.zoom,center_x=first.center_x,
-            center_y=first.center_y,roll_degrees=first.roll_degrees) for point in target.keyframes))
+        def fixed(point):return replace(point,zoom=first.zoom,center_x=first.center_x,
+            center_y=first.center_y,roll_degrees=first.roll_degrees)
+        return replace(target,keyframes=tuple(fixed(point) for point in target.keyframes),
+            original_observed_keyframes=tuple(fixed(point) for point in target.original_observed_keyframes))
     args['dynamic_crop_corpus']=replace(dynamic,sequences={key:replace(sequence,targets=tuple(
         invalid(target) for target in sequence.targets)) if key in chosen else sequence
         for key,sequence in dynamic.sequences.items()})

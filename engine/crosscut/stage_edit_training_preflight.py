@@ -58,6 +58,18 @@ def require_trajectory_selection_coverage(tracks: Sequence[Any], *, partition: s
         label_only=True,model_forward_performed=False,heldout_labels_consumed=False)
 
 
+def require_original_observation_coverage(targets,*,partition):
+    if partition not in {'train','validation'}:raise ValueError('must not inspect heldout labels')
+    tracks,points=0,0
+    for target in targets:
+        if target is None:continue
+        original=target.original_observed_keyframes
+        if not original or len(original)!=target.original_keyframe_count:
+            raise ValueError(f'data_contract_unsatisfiable: partition={partition}, original_observed_keyframes_missing')
+        tracks+=1;points+=len(original)
+    return dict(track_count=tracks,original_observed_keyframe_count=points,model_forward_performed=False)
+
+
 def require_releasable_training_plan(*, epochs: int, batches_per_epoch: int,
         minimum_finetune_steps: int, checkpoint_burn_in_steps: int,
         prior_may_be_retained: bool, minimum_joint_steps_after_release: int) -> dict[str, int]:
