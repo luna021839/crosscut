@@ -90,10 +90,12 @@ def test_off_grid_no_native_self_H_bounds_lock_only_provable_face_errors():
     model=CaptureBounds()
     prepare(p,model,native_ports=native,source_events=[np.array([],int),np.array([90])],check=lambda:None)
     a=np.array([s.source==0 for s in p.states]);b=~a
-    for key in ('face_position','face_scale'):
+    for key in ('face_position','face_scale','arm_phase','torso_phase'):
         at=FEATURE_NAMES.index(key)
         assert not model.lower[a,at].any() and not model.upper[a,at].any()
-        assert np.any(model.upper[b,at]>0)
-    # No-central-native does NOT imply anatomical/actor continuity: the real
-    # body fallback can still be nonzero. Keep those unknown intervals.
-    assert (model.upper[a,FEATURE_NAMES.index('arm_phase')]==1.).all()
+        if key.startswith('face_'):assert np.any(model.upper[b,at]>0)
+    # Raw geometric self identity does NOT imply anatomical/actor continuity.
+    assert (model.upper[a,FEATURE_NAMES.index('unmeasured_arm_phase_geometry')]==1.).all()
+    assert (model.upper[a,FEATURE_NAMES.index('played_pre_angular_activity')]==1.).all()
+    for key in ('motion','observed_opposition','unmeasured_motion'):
+        assert not model.upper[:,FEATURE_NAMES.index(key)].any()

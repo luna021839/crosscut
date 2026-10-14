@@ -157,3 +157,29 @@ def test_actual_added_camera_context_and_candidate_dependent_music_are_not_disca
     assert f[b,b,FEATURE_NAMES.index('pre_added_camera_zoom_travel')]==0
     assert f[a,b,FEATURE_NAMES.index('event_active_style')]>0
     assert f[a,a,FEATURE_NAMES.index('event_active_style')]==0
+
+
+def test_uninterrupted_self_H_does_not_turn_natural_played_motion_into_cut_pose_error():
+    p,a,b=setup();p.continuous[a,1]=False
+    # Tracking uncertainty is not a broadcaster cut. Retain the actual own
+    # movement but do not compare A[-1] to A[0] as a stationary cut target.
+    for phase in (2,3):
+        p.projected[a,1,phase,4,0]+=.25;p.bones[a,1,phase,1]=[0.,1.]
+    assert not p.data[a]['known_center_native_cut'][1]
+    feature=extract(p,1)[a,a]
+    assert feature[FEATURE_NAMES.index('arm_phase')]==0.
+    assert feature[FEATURE_NAMES.index('motion')]==0.
+    assert feature[FEATURE_NAMES.index('observed_opposition')]==0.
+    assert feature[FEATURE_NAMES.index('played_pre_angular_activity')]>.05
+    assert feature[FEATURE_NAMES.index('played_post_angular_activity')]>.05
+    assert feature[FEATURE_NAMES.index('phase_unmeasured')]==1.
+    assert feature[FEATURE_NAMES.index('pixel_agreed_active_novelty')]==0.
+    # A real central cut may expose that mismatch; it must not be zeroed.
+    p.data[a]['known_center_native_cut'][1]=True
+    assert extract(p,1)[a,a,FEATURE_NAMES.index('arm_phase')]>.5
+
+
+def test_self_H_native_scope_correction_does_not_erase_cross_source_exposed_pose_errors():
+    p,a,b=setup();p.continuous[[a,b],1]=False
+    p.projected[b,1,2,4,0]+=.25;p.bones[b,1,2,1]=[0.,1.]
+    assert extract(p,1)[a,b,FEATURE_NAMES.index('arm_phase')]>.5

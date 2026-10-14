@@ -25,7 +25,7 @@ FEATURE_NAMES=('face_position','face_scale','arm_phase','torso_phase','motion',
     'outgoing_known_native_cut','incoming_known_native_cut','event_active_style',
     'pre_added_camera_zoom_travel','pre_added_camera_x_travel','pre_added_camera_y_travel',
     'post_added_camera_zoom_travel','post_added_camera_x_travel','post_added_camera_y_travel')
-SCHEMA='raw_same_event_preference_features_v4'
+SCHEMA='raw_same_event_preference_features_v5'
 
 
 def camera_context(p,n):
@@ -114,8 +114,15 @@ def extract(ports,n):
         rho(np.linalg.norm((center1[:,None]-center2[None,:])*[16/9,1.],axis=-1)/scale),0.))
     result[:,:,1]=np.maximum(result[:,:,1],np.where(exposed_face_fallback&exposed,
         rho(np.abs(np.log(np.maximum(.001,size1[:,None])/np.maximum(.001,size2[None,:])))),0.))
+    uninterrupted_self=np.eye(q,dtype=bool)&~native_break[:,None]
     for k,(a,b) in enumerate(p.pairs):
-        common=no_phase&exposed&geometry[:,1,k,None]&geometry[:,2,k][None,:]
+        # H is the same-clock self comparison, not a stationary pose at the
+        # actual adjacent frames. An uncertain actor path alone cannot make
+        # natural A[-1]->A[0] motion into an EDIT error. Actual native H and
+        # cross-source exposed K keep their measured endpoint residuals.
+        # Unknown comparison masks remain unknown; own played activity above
+        # and below is not erased or declared anatomically certified.
+        common=no_phase&exposed&geometry[:,1,k,None]&geometry[:,2,k][None,:]&~uninterrupted_self
         pa,pb=p.projected[:,n,1,b,:2],p.projected[:,n,2,b,:2]
         screen=np.linalg.norm((pa[:,None]-pb[None,:])*[16/9,1.],axis=-1)/scale
         angle=np.linalg.norm(p.bones[:,None,n,1,k]-p.bones[None,:,n,2,k],axis=-1)/2.
@@ -140,6 +147,10 @@ def extract(ports,n):
             moving=np.maximum(na,nb)>=.3;both=np.minimum(na,nb)>=.15
             direction=np.where(both,(1.-np.clip((a*b).sum(-1)/np.maximum(1e-9,na*nb),-1,1))/2.,1.)
             direction=np.where(moving,direction,0.)
+            # v dot v / (|v| |v|) can round just below1. An exact self
+            # comparison is zero disagreement, not a floating epsilon that
+            # may outrank the entire secondary objective in lexicographic DP.
+            np.fill_diagonal(direction,0.)
             speed=rho(np.abs(np.log((na+.15)/(nb+.15))))
             camera_motion=rho(np.linalg.norm(screen[:,None,joint]-screen[None,:,joint],axis=-1)/scale)
             residual=np.maximum(np.maximum(direction,speed),camera_motion)
