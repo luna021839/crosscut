@@ -101,6 +101,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         return result
     support=12/fps;fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=support)
     preference_parts=None;preference_receipt=None;secondary=None
+    unified=bool(connection_prior is not None and getattr(connection_prior,'unified_content',False))
+    content_unary=unary.copy() if unified else None;motion_reward=None;native_hold=None
     if preference_model is None and connection_prior is None:
         runs,score,secondary=choose_opportunities(nodes,fps=fps,unary=unary,ports=ports,
             state_sources=np.asarray([s.source for s in states]),source_events=source_events,
@@ -114,6 +116,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .preference_dp import choose
         scorer=preference_model if connection_prior is None else connection_prior
         prior_receipt=None if connection_prior is None else connection_prior.bind(measured,native_ports=native_ports,source_events=source_events)
+        if unified:
+            motion_reward,movement_receipt=connection_prior.content_reward(measured,check=live)
+            unary=unary-motion_reward/(np.diff(nodes)/fps)
+            native_hold,native_receipt=connection_prior.native_holds(measured,native_ports=native_ports,check=live)
         if preference_workspace is None:raise ValueError('explicit transient preference workspace required')
         Path(preference_workspace).mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='.event-preference-',dir=preference_workspace) as temporary:
@@ -121,23 +127,31 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             if connection_prior is None:
                 native_preference,native_preference_lower,native_receipt=prepare_native(measured,scorer,
                     native_ports=native_ports,source_events=source_events,check=live)
-            else:
+            elif not unified:
                 native_preference,native_receipt=connection_prior.native_intervals(measured,
                     native_ports=native_ports,source_events=source_events,check=live)
+            else:
+                native_preference=np.zeros((count,len(nodes)-1))
+            if connection_prior is not None:
                 preference_receipt['fixed_connection_prior']=dict(scorer.artifact,**prior_receipt)
+            if unified:preference_receipt['observed_own_motion']=movement_receipt
             preference_receipt['native_evaluation']=native_receipt
             runs,objective=choose(nodes,fps=fps,unary=unary,through=through,preference_holds=H,
                 preference_intervals=native_preference,preference_ports=K,
                 state_sources=np.asarray([s.source for s in states]),source_events=source_events,
-                minimum_hold=support,native_cost=fragments,check=live,fragment_in_primary=connection_prior is not None)
+                minimum_hold=support,native_cost=fragments,check=live,fragment_in_primary=connection_prior is not None,
+                cut_allowed=getattr(K,'allowed',None),native_hold_cost=native_hold,unified_content=unified)
             score,secondary=objective;preference_parts=[];selected={}
             for i,(first,end,index) in enumerate(runs):
                 entry=0. if not i else float(K(first)[runs[i-1][2],index])
                 if i:selected[first,runs[i-1][2],index]=entry
                 preference_parts.append(dict(internal_event_preferences=float(H[index,first+1:end].sum()),entry_preference=entry,
                     **{('native_local_connection_cost' if connection_prior is not None else 'evaluation_native_preference_upper'):
-                        float(native_preference[index,first:end].sum())}))
+                        float(native_hold(first,end)[index] if unified else native_preference[index,first:end].sum())}))
                 if connection_prior is not None:preference_parts[-1]['primary_fragment_support']=float(fragments(first,end)[states[index].source])
+                if unified:
+                    preference_parts[-1].update(integrated_content=float(content_unary[index,first:end]@(np.diff(nodes)[first:end]/fps)),
+                        observed_own_motion_reward=-float(motion_reward[index,first:end].sum()))
             if connection_prior is None:
                 preference_receipt['selected_evaluation_native_preference_lower']=float(sum(
                     native_preference_lower[index,first:end].sum() for first,end,index in runs))
@@ -156,17 +170,21 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             internal_native_events=float(through[index,first+1:end].sum()),
             native_fragment_support=0. if connection_prior is not None else float(fragments(first,end)[states[index].source]),entry_event=entry,
             short_final_support=0. if connection_prior is not None else max(0.,support-(nodes[end]-nodes[first])/fps))
+        if unified:
+            terms=dict(preference_parts[i]);entry=0. if not i else 1/fps
         total+=sum(terms.values());parts.append(dict(first_frame=int(nodes[first]),final_frame=int(nodes[end]),
             source=states[index].source,actor_hypothesis=states[index].actor,camera_family=states[index].family,
             components=terms,cumulative_cost=total))
-    if not math.isclose(total,secondary if preference_parts is not None else score,rel_tol=1e-7,abs_tol=1e-6):
+        if unified:parts[-1]['entry_tie_seconds']=entry
+    if not math.isclose(total,score if unified else secondary if preference_parts is not None else score,rel_tol=1e-7,abs_tol=1e-6):
         raise AssertionError('coherent event decomposition differs from exact programme objective')
     if preference_parts is not None:
         pref_total=sum(sum(row.values()) for row in preference_parts)
         if not math.isclose(pref_total,score,rel_tol=1e-7,abs_tol=1e-6):raise AssertionError('preference H/K accounting differs')
         receipt['event_preference']=preference_receipt;receipt['selected_event_preferences']=preference_parts
     receipt.update(objective_contract='bounded_joint_motion_style_event_seconds_v1' if preference_parts is None else
-        ('declared_monotone_connection_primary_fragment_v1' if connection_prior is not None else
+        ('common_evidence_admitted_unified_played_events_v1' if unified else
+        'declared_monotone_connection_primary_fragment_v1' if connection_prior is not None else
         'lexicographic_same_event_preference_visibility_v1'),experimental=True,
         selected_hold_cost_decomposition=parts,selection_seconds=monotonic()-prepared,preparation_seconds=prepared-started,
         source_neural_calls_during_selection=0,event_strength_nodes=int(np.count_nonzero(measured.strength)),

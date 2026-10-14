@@ -10,14 +10,19 @@ def prepare(ports,model,*,workspace,check):
     sources=np.asarray([s.source for s in ports.states]);holds=np.zeros((q,N));written=0
     for n in range(1,N-1):
         check()
-        if hasattr(model,'losses_from_ports'):h,k=model.losses_from_ports(ports,n)
+        allowed=None
+        if hasattr(model,'costs_and_mask'):
+            k,allowed=model.costs_and_mask(ports,n);h=np.zeros(q)
+            if allowed.shape!=(q,q) or allowed.dtype!=bool:raise ValueError('explicit boolean admission shape required')
+        elif hasattr(model,'losses_from_ports'):h,k=model.losses_from_ports(ports,n)
         else:
             features=ports.preference_features(n)
             h,k=(model.losses_at(ports,n,features) if hasattr(model,'losses_at') else
                 model.losses(features,state_sources=sources))
         holds[:,n]=h
         path=workspace/f'{n}.npz'
-        with path.open('xb') as stream:np.savez_compressed(stream,k=k)
+        with path.open('xb') as stream:
+            np.savez_compressed(stream,k=k,**({} if allowed is None else dict(allowed=allowed)))
         written+=path.stat().st_size
         if written>512*1024**2:raise ValueError('transient preference workspace exceeds512MiB; no silent truncation')
         if n%40==0:print(json.dumps(dict(phase='same_event_cost_preparation',completed_events=n,
@@ -27,6 +32,13 @@ def prepare(ports,model,*,workspace,check):
         with np.load(workspace/f'{n}.npz',allow_pickle=False) as saved:values=saved['k']
         if values.shape!=(q,q) or not np.isfinite(values).all():raise ValueError('transient same-event loss domain differs')
         return values
+    if hasattr(model,'costs_and_mask'):
+        def allowed(n):
+            check()
+            with np.load(workspace/f'{n}.npz',allow_pickle=False) as saved:mask=saved['allowed']
+            if mask.shape!=(q,q) or mask.dtype!=bool:raise ValueError('saved admission domain differs')
+            return mask
+        cut.allowed=allowed
     return holds,cut,dict(event_nodes=N-2,compressed_transient_bytes=written,
         whole_song_pair_tensor_in_memory=False,source_neural_calls=0,
         native_events_outside_authored_grid_measured_motion_still_unknown=True,

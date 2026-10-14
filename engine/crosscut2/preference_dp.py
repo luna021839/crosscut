@@ -11,7 +11,8 @@ import numpy as np
 
 def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
            preference_ports,state_sources,source_events,minimum_hold,native_cost,
-           check=lambda:None,fragment_in_primary=False):
+           check=lambda:None,fragment_in_primary=False,cut_allowed=None,
+           native_hold_cost=None,unified_content=False):
     nodes=np.asarray(nodes);sources=np.asarray(state_sources,int)
     q,N=len(sources),len(nodes)
     if (N<2 or not q or nodes.dtype.kind not in 'iu' or nodes[0]!=0 or np.any(np.diff(nodes)<=0)
@@ -21,6 +22,8 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
             or not all(np.isfinite(v).all() for v in (unary,through,preference_holds,preference_intervals))
             or np.any(sources<0) or np.any(sources>=len(source_events))):
         raise ValueError('finite fixed-state lexicographic preference graph required')
+    if unified_content and (np.any(through) or np.any(preference_holds) or np.any(preference_intervals)):
+        raise ValueError('unified content uses zero continuous H and separate played-native holds')
     visibility=np.pad(np.cumsum(unary*np.diff(nodes)/fps,axis=1),((0,0),(1,0)))
     native=np.pad(np.cumsum(through,axis=1),((0,0),(1,0)))
     holds=np.pad(np.cumsum(preference_holds,axis=1),((0,0),(1,0)))
@@ -32,7 +35,17 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
         check();matrix=np.asarray(preference_ports(n))
         if matrix.shape!=(q,q) or not np.isfinite(matrix).all():raise ValueError('finite same-event K matrix required')
         a=primary[n,:,None]+matrix;b=np.broadcast_to(secondary[n,:,None],(q,q)).copy()
-        a=np.where(different,a,np.inf);b=np.where(different,b,np.inf)
+        if unified_content:
+            # State potential removes content-prefix cancellation from every
+            # candidate hold. Identical physical content then has exact0
+            # reduced transition cost, not tiny phantom edit advantages.
+            a=primary[n,:,None]+(visibility[:,n,None]-visibility[None,:,n])+matrix
+        allowed=different
+        if cut_allowed is not None:
+            mask=np.asarray(cut_allowed(n))
+            if mask.shape!=(q,q) or mask.dtype!=bool:raise ValueError('explicit boolean cut admission required')
+            allowed=allowed&mask
+        a=np.where(allowed,a,np.inf);b=np.where(allowed,b,np.inf)
         old=np.lexsort((b,a),axis=0)[0];at=np.arange(q)
         entries[n]=(a[old,at],b[old,at],old)
         return entries[n]
@@ -43,12 +56,18 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
             # Only strictly internal grid events consume H. The entry event
             # consumes K once; the final endpoint belongs to the next hold.
             p=intervals[:,end]-intervals[:,start]+holds[:,end]-holds[:,start+1]
+            if native_hold_cost is not None:
+                played=np.asarray(native_hold_cost(start,end),float)
+                if played.shape!=(q,) or not np.isfinite(played).all():
+                    raise ValueError('finite STATE-sized played-native hold cost required')
+                p=p+played
             costs=np.asarray(native_cost(start,end),float)
             if costs.shape!=(len(source_events),) or not np.isfinite(costs).all():
                 raise ValueError('finite source-local support costs required')
             if fragment_in_primary:p=p+costs[sources]
             s=(visibility[:,end]-visibility[:,start]+native[:,end]-native[:,start+1]
                 +(0. if fragment_in_primary else costs[sources]+max(0.,minimum_hold-duration)))
+            if unified_content:s=np.zeros(q)
             if start==0:
                 a,b,old=p,s,np.full(q,-1,int)
             else:
@@ -56,8 +75,9 @@ def choose(nodes,*,fps,unary,through,preference_holds,preference_intervals,
             better=(a<primary[end])|((a==primary[end])&(b<secondary[end]))
             primary[end,better]=a[better];secondary[end,better]=b[better]
             for state in np.flatnonzero(better):predecessor[end,int(state)]=(start,int(old[state]))
-    state=int(np.lexsort((secondary[-1],primary[-1]))[0])
-    objective=(float(primary[-1,state]),float(secondary[-1,state]))
+    final_primary=primary[-1]+(visibility[:,-1] if unified_content else 0.)
+    state=int(np.lexsort((secondary[-1],final_primary))[0])
+    objective=(float(final_primary[state]),float(secondary[-1,state]))
     if not all(math.isfinite(v) for v in objective):raise ValueError('no complete preference programme')
     end=N-1;runs=[]
     while end:
