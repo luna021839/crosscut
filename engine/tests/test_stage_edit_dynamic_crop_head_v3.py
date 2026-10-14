@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from crosscut.stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION,
     DYNAMIC_CROP_V3_TIME_BLOCK_SLICES,
     DYNAMIC_CROP_V3_TIME_LOGIT_COUNT,
+    StageEditDynamicCropCheckpointMetadataV3,
     StageEditDynamicCropModelOutputV3,
     StageEditTransformerDynamicCropV3,
     dynamic_crop_v3_times_by_count,
@@ -33,6 +35,7 @@ from crosscut.stage_edit_dynamic_crop_head_v3 import (
     save_stage_edit_dynamic_crop_checkpoint_v3,
     stage_edit_dynamic_crop_v3_parameter_count,
     tensorize_stage_edit_dynamic_crop_supervision_v3,
+    _FixedCenteredLinear,
 )
 from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT,
@@ -62,6 +65,8 @@ from tests.test_stage_edit_transformer import (
 
 try:
     import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten
 except ImportError:  # pragma: no cover - optional outside Apple Silicon.
     mx = None
@@ -435,6 +440,101 @@ class StageEditDynamicCropHeadV3Tests(unittest.TestCase):
             ),
         )
 
+    def test_fixed_affine_center_is_not_an_optimizer_parameter_and_keeps_input_gradient(self) -> None:
+        with mx.stream(mx.cpu):
+            mx.random.seed(417)
+            layer = _FixedCenteredLinear(16, 7)
+            center = np.linspace(-1000., 1000., 16, dtype=np.float32)
+            layer.set_input_center(center)
+            layer.freeze()
+            layer.unfreeze()
+            self.assertEqual(set(dict(tree_flatten(layer.parameters()))), {"weight", "bias"})
+            self.assertEqual(set(dict(tree_flatten(layer.trainable_parameters()))), {"weight", "bias"})
+            inputs = mx.array(center)[None, :] + .5
+            input_grad = mx.grad(lambda value: layer(value).sum())(inputs)
+            before_weight = np.array(layer.weight)
+            value, gradient = nn.value_and_grad(
+                layer, lambda head: mx.square(head(inputs) - 1.).mean()
+            )(layer)
+            optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=.1)
+            optimizer.update(layer, gradient)
+            mx.eval(layer.parameters(), optimizer.state, input_grad, value)
+            self.assertTrue(np.isfinite(np.asarray(input_grad)).all())
+            self.assertGreater(float(mx.abs(input_grad).sum()), 0.)
+            self.assertFalse(np.array_equal(before_weight, np.asarray(layer.weight)))
+            np.testing.assert_array_equal(np.asarray(layer.input_center), center)
+
+    def test_prior_snapshot_digest_binds_centers_and_rejects_partial_invalid_assignment(self) -> None:
+        from crosscut.stage_edit_production_training import (
+            _assign_dynamic_crop_v3_prior_head_snapshot,
+            _dynamic_crop_v3_prior_parameter_digests,
+            _parameter_tree_sha256,
+        )
+        with mx.stream(mx.cpu):
+            model = StageEditTransformerDynamicCropV3(self.config)
+            dimension = self.config.model_dimension
+            snapshot = {
+                "context_weight": model.dynamic_crop_context_head.weight + .01,
+                "context_bias": model.dynamic_crop_context_head.bias + .1,
+                "source_weight": model.dynamic_crop_source_head.weight + .02,
+                "context_center": mx.ones((dimension,)) * 3.,
+                "source_center": mx.ones((dimension,)) * -2.,
+            }
+            _assign_dynamic_crop_v3_prior_head_snapshot(model, snapshot)
+            digest = _dynamic_crop_v3_prior_parameter_digests(model)
+            self.assertEqual(digest["dynamic_head_parameter_tree_sha256"],
+                             _parameter_tree_sha256(snapshot))
+            for invalid in (
+                {**snapshot, "context_center": mx.zeros((dimension + 1,))},
+                {**snapshot, "source_center": mx.full((dimension,), float("nan"))},
+                {**snapshot, "source_weight": mx.zeros((1, dimension))},
+            ):
+                with self.assertRaisesRegex(ValueError, "snapshot .* is invalid"):
+                    _assign_dynamic_crop_v3_prior_head_snapshot(model, invalid)
+                self.assertEqual(_dynamic_crop_v3_prior_parameter_digests(model), digest)
+            missing = {key: value for key, value in snapshot.items() if key != "source_center"}
+            with self.assertRaisesRegex(ValueError, "fixed centers are missing"):
+                _assign_dynamic_crop_v3_prior_head_snapshot(model, missing)
+
+    def test_centered_checkpoint_contract_rejects_legacy_or_missing_representation(self) -> None:
+        metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
+            "center-contract", SCHEMA, self.config, training_steps=1, weights_trained=True
+        )
+        payload = metadata.to_dict()
+        legacy = dict(payload, format_version=1)
+        with self.assertRaisesRegex(ValueError, "unsupported .* format"):
+            StageEditDynamicCropCheckpointMetadataV3.from_dict(legacy)
+        missing = {key: value for key, value in payload.items() if key != "affine_head_representation"}
+        with self.assertRaisesRegex(ValueError, "checkpoint contract is invalid"):
+            StageEditDynamicCropCheckpointMetadataV3.from_dict(missing)
+
+    def test_checkpoint_rejects_missing_or_invalid_fixed_center_before_model_allocation(self) -> None:
+        with mx.stream(mx.cpu), tempfile.TemporaryDirectory() as directory:
+            model = StageEditTransformerDynamicCropV3(self.config)
+            metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
+                "center-corruption", SCHEMA, self.config, training_steps=1, weights_trained=True
+            )
+            root = Path(directory)
+            saved = save_stage_edit_dynamic_crop_checkpoint_v3(root, model, metadata)
+            path = root / DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME
+            original = mx.load(str(path))
+            mx.eval(*original.values())
+            key = "dynamic_crop_source_head.input_center"
+            variants = (
+                {name: value for name, value in original.items() if name != key},
+                dict(original, **{key: mx.zeros((self.config.model_dimension + 1,))}),
+                dict(original, **{key: mx.full((self.config.model_dimension,), float("inf"))}),
+            )
+            for weights in variants:
+                mx.save_safetensors(str(path), weights)
+                payload = saved.to_dict()
+                payload["weight_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                (root / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME).write_text(json.dumps(payload))
+                with mock.patch("crosscut.stage_edit_dynamic_crop_head_v3.StageEditTransformerDynamicCropV3") as constructor:
+                    with self.assertRaisesRegex(ValueError, "fixed affine center is (missing|invalid)"):
+                        load_stage_edit_dynamic_crop_checkpoint_v3(root)
+                    constructor.assert_not_called()
+
     def test_evaluator_reports_source_count_motion_curve_prior_and_renderer(self) -> None:
         batch, base, dynamic = self._batches(_trajectory())
         with mx.stream(mx.cpu):
@@ -460,9 +560,16 @@ class StageEditDynamicCropHeadV3Tests(unittest.TestCase):
         batch, _, _ = self._batches(_trajectory())
         with mx.stream(mx.cpu):
             model = StageEditTransformerDynamicCropV3(self.config)
+            mx.random.seed(423)
+            for name in ("dynamic_crop_context_head", "dynamic_crop_source_head"):
+                head = getattr(model, name)
+                head.weight = .01 * mx.random.normal(head.weight.shape)
+                head.set_input_center(np.linspace(-3., 2., self.config.model_dimension, dtype=np.float32))
             model.eval()
-            expected = model(batch).dynamic_crop_values
-            mx.eval(expected)
+            names = ("dynamic_crop_values", "dynamic_crop_count_logits",
+                     "dynamic_crop_time_interval_logits", "dynamic_crop_motion_logits")
+            output = model(batch)
+            expected = {name: np.array(getattr(output, name)) for name in names}
             metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
                 "crop-v3-smoke",
                 SCHEMA,
@@ -480,8 +587,7 @@ class StageEditDynamicCropHeadV3Tests(unittest.TestCase):
                     root, expected_schema=SCHEMA
                 )
                 loaded.eval()
-                actual = loaded(batch).dynamic_crop_values
-                mx.eval(actual)
+                actual = loaded(batch)
 
                 self.assertTrue(
                     (root / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME).is_file()
@@ -496,9 +602,11 @@ class StageEditDynamicCropHeadV3Tests(unittest.TestCase):
                     saved.contract_fingerprint_sha256,
                     restored.contract_fingerprint_sha256,
                 )
-                np.testing.assert_allclose(
-                    np.asarray(actual), np.asarray(expected), rtol=0.0, atol=0.0
-                )
+                for name in names:
+                    np.testing.assert_array_equal(np.asarray(getattr(actual, name)), expected[name])
+                for name in ("dynamic_crop_context_head", "dynamic_crop_source_head"):
+                    np.testing.assert_array_equal(np.asarray(getattr(loaded, name).input_center),
+                                                  np.asarray(getattr(model, name).input_center))
 
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

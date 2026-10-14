@@ -361,7 +361,9 @@ def run_diagnostic(fixture, out):
         balance = production._dynamic_crop_v3_prior_class_balance_evidence(inventory)
         report["class_balance"] = balance
         initial_head = dict(context_weight=model.dynamic_crop_context_head.weight,
-            context_bias=model.dynamic_crop_context_head.bias, source_weight=model.dynamic_crop_source_head.weight)
+            context_bias=model.dynamic_crop_context_head.bias, source_weight=model.dynamic_crop_source_head.weight,
+            context_center=model.dynamic_crop_context_head.input_center,
+            source_center=model.dynamic_crop_source_head.input_center)
         adapter = production._DynamicCropV3StructuredPriorAdapterModule(16)
         optimizer = optim.AdamW(learning_rate=.01,weight_decay=0.)
         sampler = production._HierarchicalDynamicCropV3PriorSampler(inventory.tracks,seed=1731)
@@ -380,7 +382,8 @@ def run_diagnostic(fixture, out):
             update(loss,gradients,optimizer,adapter,"detached_prior",step,adapter=True)
         merged = production._dynamic_crop_v3_structured_prior_head_snapshot(adapter,initial_head,*projections,normalizer)
         merged_module=production._DynamicCropV3PriorHeadModule(
-            merged["context_weight"],merged["context_bias"],merged["source_weight"])
+            merged["context_weight"],merged["context_bias"],merged["source_weight"],
+            context_center=merged["context_center"],source_center=merged["source_center"])
         mx.savez(str(out/"prior-affine-state.npz"),
             **{f"initial_{k}":v for k,v in initial_head.items()},
             adapter_context_weight=adapter.context_adapter.weight,adapter_context_bias=adapter.context_adapter.bias,
@@ -413,7 +416,9 @@ def run_diagnostic(fixture, out):
         features = {k:v for k,v in model.base.parameters().items() if k in production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES}
         feature_hash = production._parameter_tree_sha256(features)
         head = dict(context_weight=model.dynamic_crop_context_head.weight,
-            context_bias=model.dynamic_crop_context_head.bias,source_weight=model.dynamic_crop_source_head.weight)
+            context_bias=model.dynamic_crop_context_head.bias,source_weight=model.dynamic_crop_source_head.weight,
+            context_center=model.dynamic_crop_context_head.input_center,
+            source_center=model.dynamic_crop_source_head.input_center)
         head_hash = production._parameter_tree_sha256(head)
         sentinel_batch=prefix_batch(tracks[-1])
         raw_before=np.array(raw_at(sentinel_batch,tracks[-1])[0])
@@ -462,7 +467,9 @@ def run_diagnostic(fixture, out):
                 {k:model.base.parameters()[k] for k in features}),
             heads_changed=head_hash != production._parameter_tree_sha256(dict(
                 context_weight=model.dynamic_crop_context_head.weight,
-                context_bias=model.dynamic_crop_context_head.bias,source_weight=model.dynamic_crop_source_head.weight)))
+                context_bias=model.dynamic_crop_context_head.bias,source_weight=model.dynamic_crop_source_head.weight,
+                context_center=model.dynamic_crop_context_head.input_center,
+                source_center=model.dynamic_crop_source_head.input_center)))
         if reset_count!=1 or report["release"]["final_optimizer_step"]!=28 or not all(
                 report["release"][key] for key in ("features_changed","heads_changed")):
             raise RuntimeError("genuine post-retention joint release failed")

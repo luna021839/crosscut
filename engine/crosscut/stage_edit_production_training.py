@@ -62,6 +62,7 @@ from .stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_TARGET_CONTRACT,
     DYNAMIC_CROP_V3_MAX_KEYFRAMES,
     DYNAMIC_CROP_V3_TIME_LOGIT_COUNT,
+    _FixedCenteredLinear,
     DynamicCropV3LossContract,
     StageEditTransformerDynamicCropV3,
     dynamic_crop_v3_times_by_count,
@@ -2186,12 +2187,15 @@ class _DynamicCropV3PriorHeadModule(_DynamicCropV3PriorModuleBase):
         context_weight: Any,
         context_bias: Any,
         source_weight: Any,
+        *,
+        context_center: Any | None = None,
+        source_center: Any | None = None,
     ) -> None:
         _require_mlx()
         super().__init__()
         dimension = int(context_weight.shape[-1])
-        self.context_head = nn.Linear(dimension, DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION)
-        self.source_head = nn.Linear(
+        self.context_head = _FixedCenteredLinear(dimension, DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION)
+        self.source_head = _FixedCenteredLinear(
             dimension,
             DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION,
             bias=False,
@@ -2199,6 +2203,10 @@ class _DynamicCropV3PriorHeadModule(_DynamicCropV3PriorModuleBase):
         self.context_head.weight = mx.array(context_weight)
         self.context_head.bias = mx.array(context_bias)
         self.source_head.weight = mx.array(source_weight)
+        if context_center is not None:
+            self.context_head.set_input_center(context_center)
+        if source_center is not None:
+            self.source_head.set_input_center(source_center)
 
     def __call__(self, context_embedding: Any, source_embedding: Any) -> Any:
         return self.context_head(context_embedding) + self.source_head(
@@ -2283,6 +2291,8 @@ class _DynamicCropV3PriorProjectionNormalizer:
     context_scale: Any
     source_mean: Any
     source_scale: Any
+    context_center: Any
+    source_center: Any
     evidence: Mapping[str, Any]
 
 
@@ -2342,6 +2352,9 @@ def _dynamic_crop_v3_structured_prior_projection_normalizer(
     context_scale = mx.array(context_scale_np)
     source_mean = mx.array(source_mean_np)
     source_scale = mx.array(source_scale_np)
+    # Shared train-only raw-feature centers, not source-slot-specific state.
+    context_center = mx.array(context_embeddings.mean(axis=0).astype(np.float32))
+    source_center = mx.array(source_embeddings.mean(axis=0).astype(np.float32))
     mx.eval(context_mean, context_scale, source_mean, source_scale)
     evidence = {
         "contract": "training_track_projection_zscore_floor_1e_3_v1",
@@ -2364,12 +2377,17 @@ def _dynamic_crop_v3_structured_prior_projection_normalizer(
         "source_scale_max": float(source_scale_np.max()),
         "validation_labels_consumed": False,
         "heldout_labels_consumed": False,
+        "fixed_input_center_contract": "shared_train_raw_feature_mean_float32_v1",
+        "context_center_sha256": _parameter_tree_sha256({"center": context_center}),
+        "source_center_sha256": _parameter_tree_sha256({"center": source_center}),
     }
     return _DynamicCropV3PriorProjectionNormalizer(
         context_mean=context_mean,
         context_scale=context_scale,
         source_mean=source_mean,
         source_scale=source_scale,
+        context_center=context_center,
+        source_center=source_center,
         evidence=evidence,
     )
 
@@ -2384,9 +2402,9 @@ def _dynamic_crop_v3_structured_prior_raw(
     source_embedding: Any,
 ) -> Any:
     base_raw = (
-        mx.matmul(initial_snapshot["context_weight"], context_embedding)
+        mx.matmul(initial_snapshot["context_weight"], context_embedding - initial_snapshot["context_center"])
         + initial_snapshot["context_bias"]
-        + mx.matmul(initial_snapshot["source_weight"], source_embedding)
+        + mx.matmul(initial_snapshot["source_weight"], source_embedding - initial_snapshot["source_center"])
     )
     context_projection = (
         mx.matmul(context_projection_matrix, context_embedding)
@@ -2410,13 +2428,14 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
     source_projection_matrix: Any,
     projection_normalizer: _DynamicCropV3PriorProjectionNormalizer,
 ) -> dict[str, Any]:
-    """Merge all low-rank trajectory rows into the original renderer heads."""
+    """Function-preserving full-rank merge around fixed shared train centers."""
 
     # This is a one-time affine conversion, NOT a model forward. Narrow real
     # feature variance can amplify coefficients by 1e3. Accumulating the
     # coefficient and offset products in float32 loses avoidable digits before
     # the merged float32 head ever runs. Compute in CPU float64, quantize once;
-    # keep the deployed model, decoder, loss and acceptance tolerances unchanged.
+    # preserve full-rank capacity, decoder, loss and acceptance tolerances. The
+    # deployed affine expression now explicitly persists the fixed centers.
     def double(value: Any) -> np.ndarray:
         return np.asarray(value, dtype=np.float64)
 
@@ -2428,25 +2447,37 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
     source_delta = np.einsum("ij,jk->ik",
         source_weight / double(projection_normalizer.source_scale)[None, :],
         double(source_projection_matrix), optimize=False)
-    structured_bias_delta = (
-        double(module.context_adapter.bias)
-        - np.einsum("ij,j->i", context_weight, (
-            double(projection_normalizer.context_mean)
-            / double(projection_normalizer.context_scale)
-        ), optimize=False)
-        - np.einsum("ij,j->i", source_weight, (
-            double(projection_normalizer.source_mean)
-            / double(projection_normalizer.source_scale)
-        ), optimize=False)
+    # Stored float32 center values are authoritative. Evaluating the original
+    # factorized function there in FP64 avoids a large W*h / bias cancellation
+    # in every deployed float32 forward. Full-rank W and encoder gradients are
+    # preserved; this is not a detached inference branch or a smaller head.
+    context_center = np.asarray(projection_normalizer.context_center, dtype=np.float32)
+    source_center = np.asarray(projection_normalizer.source_center, dtype=np.float32)
+    hc, es = double(context_center), double(source_center)
+    center_bias = (
+        double(initial_snapshot["context_bias"])
+        + np.einsum("ij,j->i", double(initial_snapshot["context_weight"]),
+            hc - double(initial_snapshot["context_center"]), optimize=False)
+        + np.einsum("ij,j->i", double(initial_snapshot["source_weight"]),
+            es - double(initial_snapshot["source_center"]), optimize=False)
+        + double(module.context_adapter.bias)
+        + np.einsum("ij,j->i", context_weight,
+            (np.einsum("ij,j->i", double(context_projection_matrix), hc, optimize=False)
+             - double(projection_normalizer.context_mean)) / double(projection_normalizer.context_scale), optimize=False)
+        + np.einsum("ij,j->i", source_weight,
+            (np.einsum("ij,j->i", double(source_projection_matrix), es, optimize=False)
+             - double(projection_normalizer.source_mean)) / double(projection_normalizer.source_scale), optimize=False)
     )
     if not all(np.isfinite(value).all() for value in (
-        context_delta, source_delta, structured_bias_delta,
+        context_delta, source_delta, center_bias, context_center, source_center,
     )):
         raise ValueError("Dynamic Crop v3 affine merge is nonfinite")
     snapshot = {
         "context_weight": mx.array((double(initial_snapshot["context_weight"]) + context_delta).astype(np.float32)),
-        "context_bias": mx.array((double(initial_snapshot["context_bias"]) + structured_bias_delta).astype(np.float32)),
+        "context_bias": mx.array(center_bias.astype(np.float32)),
         "source_weight": mx.array((double(initial_snapshot["source_weight"]) + source_delta).astype(np.float32)),
+        "context_center": mx.array(context_center),
+        "source_center": mx.array(source_center),
     }
     mx.eval(*snapshot.values())
     return snapshot
@@ -2557,6 +2588,8 @@ def _dynamic_crop_v3_prior_head_snapshot(
         "source_weight": mx.array(
             np.array(module.source_head.weight, copy=True)
         ),
+        "context_center": mx.array(np.array(module.context_head.input_center, copy=True)),
+        "source_center": mx.array(np.array(module.source_head.input_center, copy=True)),
     }
     mx.eval(*snapshot.values())
     return snapshot
@@ -2566,9 +2599,28 @@ def _assign_dynamic_crop_v3_prior_head_snapshot(
     model: StageEditTransformerDynamicCropV3,
     snapshot: Mapping[str, Any],
 ) -> None:
-    model.dynamic_crop_context_head.weight = mx.array(snapshot["context_weight"])
-    model.dynamic_crop_context_head.bias = mx.array(snapshot["context_bias"])
-    model.dynamic_crop_source_head.weight = mx.array(snapshot["source_weight"])
+    if not {"context_center", "source_center"} <= snapshot.keys():
+        raise ValueError("Dynamic Crop v3 prior snapshot fixed centers are missing")
+    # Validate the complete candidate before changing any head or fixed buffer.
+    shapes = {
+        "context_weight": model.dynamic_crop_context_head.weight.shape,
+        "context_bias": model.dynamic_crop_context_head.bias.shape,
+        "source_weight": model.dynamic_crop_source_head.weight.shape,
+        "context_center": model.dynamic_crop_context_head.input_center.shape,
+        "source_center": model.dynamic_crop_source_head.input_center.shape,
+    }
+    prepared = {}
+    for name, shape in shapes.items():
+        value = np.array(snapshot[name], dtype=np.float32, copy=True)
+        if value.shape != tuple(shape) or not np.isfinite(value).all():
+            raise ValueError(f"Dynamic Crop v3 prior snapshot {name} is invalid")
+        prepared[name] = mx.array(value)
+    mx.eval(*prepared.values())
+    model.dynamic_crop_context_head.set_input_center(prepared["context_center"])
+    model.dynamic_crop_source_head.set_input_center(prepared["source_center"])
+    model.dynamic_crop_context_head.weight = prepared["context_weight"]
+    model.dynamic_crop_context_head.bias = prepared["context_bias"]
+    model.dynamic_crop_source_head.weight = prepared["source_weight"]
     mx.eval(
         model.dynamic_crop_context_head.weight,
         model.dynamic_crop_context_head.bias,
@@ -2719,7 +2771,15 @@ def _dynamic_crop_v3_prior_parameter_digests(
                 "context_weight": model.dynamic_crop_context_head.weight,
                 "context_bias": model.dynamic_crop_context_head.bias,
                 "source_weight": model.dynamic_crop_source_head.weight,
+                "context_center": model.dynamic_crop_context_head.input_center,
+                "source_center": model.dynamic_crop_source_head.input_center,
             }
+        ),
+        "context_center_sha256": _parameter_tree_sha256(
+            {"center": model.dynamic_crop_context_head.input_center}
+        ),
+        "source_center_sha256": _parameter_tree_sha256(
+            {"center": model.dynamic_crop_source_head.input_center}
         ),
         "context_bias_sha256": _parameter_tree_sha256({"bias": bias}),
         "context_non_value_bias_sha256": _parameter_tree_sha256(
@@ -3650,6 +3710,8 @@ def train_production_stage_edit(
                 model.dynamic_crop_context_head.weight,
                 model.dynamic_crop_context_head.bias,
                 model.dynamic_crop_source_head.weight,
+                context_center=model.dynamic_crop_context_head.input_center,
+                source_center=model.dynamic_crop_source_head.input_center,
             )
             dynamic_crop_v3_prior_initial_snapshot = (
                 _dynamic_crop_v3_prior_head_snapshot(initial_head_module)

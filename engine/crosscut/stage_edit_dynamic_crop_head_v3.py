@@ -91,7 +91,8 @@ DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION = (
 DYNAMIC_CROP_V3_LOSS_CONTRACT = (
     "renderer_range_normalized_values_count_times_motion_loss_v3"
 )
-DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION = 1
+DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION = 2
+DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION = "fixed_train_centered_affine_full_rank_v1"
 DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME = "dynamic-crop-v3-metadata.json"
 DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME = "dynamic-crop-v3-model.safetensors"
 
@@ -557,6 +558,34 @@ class StageEditDynamicCropModelOutputV3:
 
 
 _ModuleBase = nn.Module if nn is not None else object
+_LinearBase = nn.Linear if nn is not None else object
+
+
+class _FixedCenteredLinear(_LinearBase):
+    """Full-rank trainable affine head with a non-optimizer input center.
+
+    Private MLX state is absent from parameters()/trainable_parameters(), so
+    neither gradients, global unfreeze nor AdamW can alter the fixed center.
+    The v2 checkpoint writer explicitly persists these two constant buffers.
+    """
+
+    def __init__(self, input_dims: int, output_dims: int, *, bias: bool = True):
+        _require_mlx()
+        super().__init__(input_dims, output_dims, bias=bias)
+        self._input_center = mx.zeros((input_dims,), dtype=mx.float32)
+
+    @property
+    def input_center(self):
+        return self._input_center
+
+    def set_input_center(self, value):
+        values = np.asarray(value, dtype=np.float32)
+        if values.shape != (self.weight.shape[-1],) or not np.isfinite(values).all():
+            raise ValueError("Dynamic Crop v3 fixed affine center is invalid")
+        self._input_center = mx.array(np.array(values, copy=True))
+
+    def __call__(self, x):
+        return super().__call__(x - self._input_center)
 
 
 class StageEditTransformerDynamicCropV3(_ModuleBase):
@@ -574,8 +603,8 @@ class StageEditTransformerDynamicCropV3(_ModuleBase):
         self.base = StageEditTransformer(base_config)
         dimension = base_config.model_dimension
         outputs = DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
-        self.dynamic_crop_context_head = nn.Linear(dimension, outputs)
-        self.dynamic_crop_source_head = nn.Linear(dimension, outputs, bias=False)
+        self.dynamic_crop_context_head = _FixedCenteredLinear(dimension, outputs)
+        self.dynamic_crop_source_head = _FixedCenteredLinear(dimension, outputs, bias=False)
         self.dynamic_crop_context_head.weight = mx.zeros_like(
             self.dynamic_crop_context_head.weight
         )
@@ -598,6 +627,7 @@ class StageEditTransformerDynamicCropV3(_ModuleBase):
             "source_conditioning": DYNAMIC_CROP_V3_SOURCE_CONDITIONING,
             "time_parameterization": DYNAMIC_CROP_V3_TIME_PARAMETERIZATION,
             "value_parameterization": DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION,
+            "affine_head_representation": DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION,
             "legacy_v2_checkpoint_compatible": False,
             "production_activation_authorized": False,
         }
@@ -1216,6 +1246,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
     source_conditioning: str = DYNAMIC_CROP_V3_SOURCE_CONDITIONING
     time_parameterization: str = DYNAMIC_CROP_V3_TIME_PARAMETERIZATION
     value_parameterization: str = DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION
+    affine_head_representation: str = DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION
     production_activation_authorized: bool = False
 
     def __post_init__(self) -> None:
@@ -1239,6 +1270,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
             (self.source_conditioning, DYNAMIC_CROP_V3_SOURCE_CONDITIONING),
             (self.time_parameterization, DYNAMIC_CROP_V3_TIME_PARAMETERIZATION),
             (self.value_parameterization, DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION),
+            (self.affine_head_representation, DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION),
         )
         if any(value != expected for value, expected in required):
             raise ValueError("Dynamic Crop v3 checkpoint contract is invalid")
@@ -1257,6 +1289,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
                 "source_conditioning": self.source_conditioning,
                 "time_parameterization": self.time_parameterization,
                 "value_parameterization": self.value_parameterization,
+                "affine_head_representation": self.affine_head_representation,
                 "token_schema_fingerprint": self.token_schema.fingerprint,
                 "base_model_config": self.base_model_config.to_dict(),
                 "dynamic_crop_config": self.dynamic_crop_config.to_dict(),
@@ -1283,6 +1316,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
             "source_conditioning": self.source_conditioning,
             "time_parameterization": self.time_parameterization,
             "value_parameterization": self.value_parameterization,
+            "affine_head_representation": self.affine_head_representation,
             "contract_fingerprint_sha256": self.contract_fingerprint_sha256,
             "production_activation_authorized": False,
         }
@@ -1322,6 +1356,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
             source_conditioning=str(payload.get("source_conditioning", "")),
             time_parameterization=str(payload.get("time_parameterization", "")),
             value_parameterization=str(payload.get("value_parameterization", "")),
+            affine_head_representation=str(payload.get("affine_head_representation", "")),
             production_activation_authorized=bool(
                 payload.get("production_activation_authorized", False)
             ),
@@ -1375,7 +1410,16 @@ def save_stage_edit_dynamic_crop_checkpoint_v3(
     destination = Path(directory)
     destination.mkdir(parents=True, exist_ok=True)
     weight_path = destination / metadata.weight_filename
-    model.save_weights(str(weight_path))
+    from mlx.utils import tree_flatten
+
+    weights = dict(tree_flatten(model.parameters()))
+    for name in ("dynamic_crop_context_head", "dynamic_crop_source_head"):
+        head = getattr(model, name)
+        if not isinstance(head, _FixedCenteredLinear):
+            raise ValueError("Dynamic Crop v3 checkpoint requires fixed-centered affine heads")
+        head.set_input_center(head.input_center)
+        weights[f"{name}.input_center"] = head.input_center
+    mx.save_safetensors(str(weight_path), weights)
     mx.eval(model.parameters())
     saved = replace(metadata, weight_sha256=_sha256_file(weight_path))
     (destination / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME).write_text(
@@ -1413,10 +1457,23 @@ def load_stage_edit_dynamic_crop_checkpoint_v3(
         raise FileNotFoundError(weight_path)
     if metadata.weight_sha256 is None or _sha256_file(weight_path) != metadata.weight_sha256:
         raise ValueError("Dynamic Crop v3 checkpoint weight digest is missing or invalid")
+    weights = mx.load(str(weight_path))
+    centers = {}
+    for name in ("dynamic_crop_context_head", "dynamic_crop_source_head"):
+        key = f"{name}.input_center"
+        if key not in weights:
+            raise ValueError("Dynamic Crop v3 checkpoint fixed affine center is missing")
+        center = np.array(weights.pop(key), dtype=np.float32, copy=True)
+        if (center.shape != (metadata.base_model_config.model_dimension,)
+                or not np.isfinite(center).all()):
+            raise ValueError("Dynamic Crop v3 checkpoint fixed affine center is invalid")
+        centers[name] = center
     model = StageEditTransformerDynamicCropV3(
         metadata.base_model_config, metadata.dynamic_crop_config
     )
-    model.load_weights(str(weight_path), strict=True)
+    model.load_weights(list(weights.items()), strict=True)
+    for name, value in centers.items():
+        getattr(model, name).set_input_center(value)
     mx.eval(model.parameters())
     return model, metadata
 
@@ -1438,6 +1495,7 @@ __all__ = [
     "DYNAMIC_CROP_V3_TIME_PARAMETERIZATION",
     "DYNAMIC_CROP_V3_TIME_SIMPLEX_EPSILON",
     "DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION",
+    "DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION",
     "DynamicCropHeadV3Config",
     "DynamicCropV3LossContract",
     "StageEditDynamicCropCheckpointMetadataV3",

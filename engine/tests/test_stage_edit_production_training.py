@@ -1010,6 +1010,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
         dimension = 16
         values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
         initial = {
+            "context_center": mx.zeros((dimension,)),
+            "source_center": mx.zeros((dimension,)),
             "context_weight": mx.arange(
                 DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION * dimension,
                 dtype=mx.float32,
@@ -1047,6 +1049,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             context_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
             source_mean=mx.zeros((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
             source_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            context_center=mx.zeros((dimension,)),
+            source_center=mx.zeros((dimension,)),
             evidence={},
         )
         snapshot = _dynamic_crop_v3_structured_prior_head_snapshot(
