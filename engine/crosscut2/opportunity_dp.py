@@ -10,7 +10,8 @@ from .stage_mix import native_event_cost
 
 
 def choose_opportunities(nodes, *, fps, unary, ports, state_sources, source_events,
-                         same_show, through, check=lambda:None, minimum_hold=.9):
+                         same_show, through, check=lambda:None, minimum_hold=.9,
+                         event_seconds=False,native_cost=None):
     nodes,state_sources = np.asarray(nodes),np.asarray(state_sources,int)
     q,sources = len(state_sources),len(source_events)
     N = len(nodes)
@@ -19,7 +20,7 @@ def choose_opportunities(nodes, *, fps, unary, ports, state_sources, source_even
             or not math.isfinite(minimum_hold) or minimum_hold<=0
             or unary.shape != (q,N-1) or through.shape != (q,N) or same_show.shape != (q,q)
             or not all(np.isfinite(v).all() for v in (unary,through,same_show))
-            or np.any(through<0) or np.any(same_show<0)
+            or (not event_seconds and np.any(through<0)) or np.any(same_show<0)
             or np.any(state_sources<0) or np.any(state_sources>=sources)
             or any(np.asarray(v).ndim!=1 or not np.isfinite(v).all()
                    or np.any(np.diff(v)<=0) or np.any(v<0) or np.any(v>nodes[-1]) for v in source_events)):
@@ -65,15 +66,16 @@ def choose_opportunities(nodes, *, fps, unary, ports, state_sources, source_even
             duration = (nodes[end]-nodes[start])/fps
             if duration < minimum_hold and end != N-1:continue
             hold = (prefix[:,end]-prefix[:,start]+crossing[:,end]-crossing[:,start+1]
-                    +2.*max(0.,minimum_hold-duration))
-            event = np.array([native_event_cost(nodes[start],nodes[end],v,fps) for v in source_events])
+                    +(1. if event_seconds else 2.)*max(0.,minimum_hold-duration))
+            event = np.array([native_event_cost(nodes[start],nodes[end],v,fps) for v in source_events]) if native_cost is None else np.asarray(native_cost(start,end),float)
+            if event.shape!=(sources,) or not np.isfinite(event).all():raise ValueError('finite per-source native hold costs required')
             hold += event[state_sources]
             if start == 0:
                 primary[end,:,sources] = hold;secondary[end,:,sources] = 0.
                 for state in range(q):previous[end,state,sources] = (0,-1,-1)
                 continue
             p,d,old,prior = incoming(start,duration<3.)
-            candidate = p+hold[:,None]+.35
+            candidate = p+hold[:,None]+(1./fps if event_seconds else .35)
             current = primary[end,:,:sources]
             better = (candidate<current)|((candidate==current)&(d<secondary[end,:,:sources]))
             primary[end,:,:sources][better] = candidate[better]

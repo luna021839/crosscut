@@ -161,11 +161,11 @@ def clamped_camera(head, cap, support, *, alignment_target=None, alignment_posit
 
 
 def _curve_at(ticks, values, query):
-    return np.array([np.interp(query, ticks, values[:, i]) for i in range(3)]).T
+    return np.stack([np.interp(query, ticks, values[:, i]) for i in range(3)],axis=-1)
 
 
 def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=None, native_ports=None,
-                boundary_readability=False, check=lambda:None):
+                boundary_readability=False, check=lambda:None, camera_families=None):
     """Freeze source-local actor paths, camera curves and whole-hold costs."""
     states, data, cluster_counts = [], [], []
     if native_ports is not None and len(native_ports)!=len(banks):
@@ -186,7 +186,10 @@ def make_states(nodes, banks, poses, *, fps, source_events=None, body_states=Non
         salience = source_local_salience(bank,labels,nodes,events,fps=fps)
         # Alignment cannot require surrendering an observed local actor to
         # NULL/head-0 ownership. Freeze the same alternatives for every owner.
-        families = ('native', 'action_fit', 'align_medium', 'align_close')
+        families = ('native', 'action_fit', 'align_medium', 'align_close') if camera_families is None else tuple(camera_families)
+        if not families or len(set(families))!=len(families) or any(f not in
+                ('native','action_fit','align_medium','align_close') for f in families):
+            raise ValueError('explicit distinct fixed camera families required')
         for actor, family in [(a, f) for a in (None, *range(count)) for f in families]:
             check()
             heads = np.zeros((len(nodes), 2, 4), float)
