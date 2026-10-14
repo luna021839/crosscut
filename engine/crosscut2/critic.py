@@ -145,22 +145,30 @@ class PixelFaces:
         self.detector=cv2.FaceDetectorYN.create(str(detector_path),'',(960,540),.75,.3,5000)
         self.appearance=cv2.FaceRecognizerSF.create(str(appearance_path),'')
 
-    def read(self,pixels):
+    def read(self,pixels,*,expected_focal=None):
         h,w=pixels.shape[:2];image=cv2.resize(pixels,(960,540),interpolation=cv2.INTER_AREA)
-        _,found=self.detector.detect(image);result=[];dominant_vector=None
-        if found is None:return (),None
+        _,found=self.detector.detect(image);result=[];raw=[];dominant_vector=None
+        if found is None:found=[]
         for face in sorted(found,key=lambda f:float(f[3]),reverse=True)[:8]:
             if face[3]/540<.02:continue
             result.append(dict(height=float(face[3]/540),
                 center=(float((face[0]+face[2]/2)/960),float((face[1]+face[3]/2)/540)),
                 confidence=float(face[-1])))
-            if len(result)==1 and face[3]*h/540>=60:
-                native=face.copy();native[:14:2]*=w/960;native[1:14:2]*=h/540
-                aligned=self.appearance.alignCrop(pixels,native)
-                vector=self.appearance.feature(aligned).ravel().astype(float)
-                norm=float(np.linalg.norm(vector))
-                if math.isfinite(norm) and norm>1e-9:dominant_vector=vector/norm
-        return tuple(result),dominant_vector
+            raw.append(face)
+        chosen=0 if result else None
+        self.last_focal_receipt=dict(policy='largest_detected_face_output_only',candidates=list(result),
+            selected_output_face_index=chosen,matched=False,ownership_certified=False)
+        if expected_focal is not None:
+            from .focal_output_correspondence import match
+            chosen,self.last_focal_receipt=match(result,expected_focal)
+        if chosen is not None and raw[chosen][3]*h/540>=60:
+            native=raw[chosen].copy();native[:14:2]*=w/960;native[1:14:2]*=h/540
+            aligned=self.appearance.alignCrop(pixels,native)
+            vector=self.appearance.feature(aligned).ravel().astype(float)
+            norm=float(np.linalg.norm(vector))
+            if math.isfinite(norm) and norm>1e-9:dominant_vector=vector/norm
+        selected=tuple(result) if expected_focal is None else (() if chosen is None else (result[chosen],))
+        return selected,dominant_vector
 
 
 def evaluate(path,*,detector_path,appearance_path,maximum_seconds=240.,threshold=.40,cut_detector='adaptive'):

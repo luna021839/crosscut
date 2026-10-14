@@ -23,6 +23,7 @@ from .critic import PixelFaces, pair_features, scan_cuts
 from .grid_perception import file_identity
 from .pose_grid import PoseSensor
 from .source_cuts import census
+from .focal_output_correspondence import predictions_by_tick
 
 
 def boundary_union(authored, native, detected, *, frame_count):
@@ -139,6 +140,7 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
     cap = cv2.VideoCapture(str(movie))
     observed, rows = {}, []
     seam_intents = {row['output_frame']: row['role'] for row in record['seams']}
+    predicted_focal=predictions_by_tick(record['seams'],count)
     def at(tick):
         live()
         tick = max(0, min(count - 1, tick))
@@ -148,7 +150,8 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
             ok, pixels = cap.read()
             if not ok or round(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1 != tick:
                 raise OSError('critic did not receive the requested actual output frame')
-            faces, vector = face.read(pixels)
+            expected=predicted_focal.get(tick)
+            faces, vector = face.read(pixels) if expected is None else face.read(pixels,expected_focal=expected)
             joints, state = np.zeros((8, 3), np.float32), 0
             if pose is not None:
                 heads = np.zeros((3, 4), np.float32)
@@ -156,15 +159,15 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
                     heads[i] = (*person['center'], person['height'], person['confidence'])
                 result, statuses = pose.observe(pixels, heads)
                 joints, state = result[0], int(statuses[0])
-            observed[tick] = faces, vector, joints, state
+            observed[tick] = faces, vector, joints, state,dict(face.last_focal_receipt)
         return observed[tick]
     try:
         for event in events:
             frame = event['frame']
             ticks = tuple(max(0, min(count - 1, frame + offset)) for offset in (-7, -1, 0, 6))
             windows = [at(tick) for tick in ticks]
-            left, lv, _, _ = windows[1]
-            right, rv, _, _ = windows[2]
+            left,lv=windows[1][:2]
+            right,rv=windows[2][:2]
             similarity = None if lv is None or rv is None else float(np.clip(lv @ rv, -1., 1.))
             a, b = np.asarray([w[2] for w in windows[:2]]), np.asarray([w[2] for w in windows[2:]])
             action = compare_action(a, b, seconds=6 / fps)
@@ -178,6 +181,8 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
                 conditional_primary_action_basis=action.measurement_basis,
                 conditional_primary_comparable_joints=action.common_joints,
                 conditional_primary_action_measured=action.phase_loss is not None,
+                focal_correspondence=[w[4] for w in windows],
+                unassociated_output_geometry=pair_features(windows[1][4]['candidates'],windows[2][4]['candidates']),
                 realized_screen_motion=motion,
                 **pair_features(left, right, appearance_cosine=similarity)))
             if len(rows) % 8 == 0:
@@ -199,7 +204,10 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
         source_mapping_seconds=mapping_seconds, observed_output_frames=len(observed),
         neural_pose_calls=0 if pose is None else pose.calls,
         conditional_primary_body_measured_cuts=sum(r['conditional_primary_action_measured'] for r in rows),
-        body_target_definition='largest detected visible head per actual frame; not source-local actor certification',
+        body_target_definition=('planned physical focal when geometrically matched; UNKNOWN on miss; output-only largest at unpredicted frames'
+            if predicted_focal else 'largest detected visible head per actual frame; not source-local actor certification'),
+        predicted_focal_output_frames=len(predicted_focal),
+        matched_predicted_focal_output_frames=sum(v[4].get('matched',False) for v in observed.values()),
         body_action_complete=False, learned_quality_critic=False, held_out_quality_validated=False,
         private_gallery_accessed=False, private_vectors_serialized=False,
         professional_quality_approved=False, normal_speed_audio_playback_performed=False,

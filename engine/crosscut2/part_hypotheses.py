@@ -29,7 +29,7 @@ def reliabilities(support,disagrees,*,scope):
 
 def retain_model_hypotheses(*,rows,states,sources,cache):
     """Consume ONLY the exact raw producer's completed source snapshots."""
-    implementation=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+Path(part_support_bank.__file__).read_bytes()).hexdigest()
+    implementation=part_support_bank.cache_implementation()
     physical={};found_sources=set()
     for path in sorted(Path(cache).glob('*.npz')):
         # ExFAT macOS AppleDouble ._ sidecars are not serialized observations.

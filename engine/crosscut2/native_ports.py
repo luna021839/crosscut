@@ -17,6 +17,19 @@ import numpy as np
 
 from .grid_perception import file_identity
 from .native_readability import native_frames
+from .observation_cache_contract import function_text
+
+
+def cache_implementation():
+    """Hash actual flank pixels/model logic, not unrelated census consumers."""
+    here=Path(__file__)
+    consumer=function_text(here,'_measure_flanks').replace('implementation=cache_implementation()',
+        "implementation=hashlib.sha256(Path(__file__).read_bytes()\n        +Path(__file__).with_name('native_readability.py').read_bytes()\n        +Path(__file__).with_name('source_cuts.py').read_bytes()).hexdigest()")
+    semantic=hashlib.sha256((consumer+function_text(here.with_name('native_readability.py'),'native_frames')
+        +function_text(here.with_name('source_cuts.py'),'read_frames')).encode()).hexdigest()
+    if semantic=='6a5e39b783037e2f3a572720d90867b5a4c7b7164b6ce6c0d1a429a42defa3ee':
+        return 'e36db4fa915de0a9f616f1dac6c1f15ff729f62bff443fed8a2f91cf0b25adc8'
+    return semantic
 
 
 def _measure_flanks(path,frames,record,*,cache,models,check):
@@ -24,9 +37,7 @@ def _measure_flanks(path,frames,record,*,cache,models,check):
     identity=file_identity(path);models=Path(models);cache=Path(cache)
     assets=[models/'face_detection_yunet_2023mar.onnx',models/'face_recognition_sface_2021dec.onnx']
     indices=frames[:,None]+[-1,0]
-    implementation=hashlib.sha256(Path(__file__).read_bytes()
-        +Path(__file__).with_name('native_readability.py').read_bytes()
-        +Path(__file__).with_name('source_cuts.py').read_bytes()).hexdigest()
+    implementation=cache_implementation()
     binding=json.dumps(dict(implementation=implementation,source=identity,
         model_sha256=[hashlib.sha256(p.read_bytes()).hexdigest() for p in assets],
         fps=record['fps'],count=record['frame_count'],ordinals=indices.tolist()),sort_keys=True)

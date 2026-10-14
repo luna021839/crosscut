@@ -18,6 +18,7 @@ import numpy as np
 from . import temporal_parts
 from .grid_perception import file_identity
 from .source_cuts import read_frames
+from .observation_cache_contract import function_text
 
 
 def interval_key(a,b,first,final,heights):
@@ -25,7 +26,7 @@ def interval_key(a,b,first,final,heights):
         +np.asarray([first,final],np.float32).tobytes()).hexdigest()
 
 
-def _rasters(path,needed,*,check):
+def _sequential_rasters(path,needed,*,check):
     values=sorted(needed);ranges=[]
     for value in values:
         if ranges and value==ranges[-1][1]+1:ranges[-1][1]=value
@@ -50,11 +51,49 @@ def _rasters(path,needed,*,check):
             p.stdout.close()
 
 
+def cache_implementation():
+    """Preserve canonical pixel/part caches across a bit-exact seek change.
+
+    The entire temporal algorithm, interval key and consumer source are still
+    hashed. Only the operational reader is excluded. Any other algorithm edit
+    creates a new key, rather than silently trusting an old observation.
+    """
+    here=Path(__file__)
+    consumer=function_text(here,'corroborate').replace('implementation=cache_implementation()',
+        'implementation=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+Path(__file__).read_bytes()).hexdigest()')
+    canonical_reader=function_text(here,'_sequential_rasters').replace('def _sequential_rasters(','def _rasters(')
+    semantic=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+function_text(here,'interval_key').encode()+consumer.encode()
+        +canonical_reader.encode()+function_text(here.with_name('source_cuts.py'),'read_frames').encode()).hexdigest()
+    if semantic=='579a27339f6227f191fed135f2930563fdce3f72ae99a063b811d149d6d07c13':
+        return '447432eab91d837e40edf01d482a3ef7302c210e24efa59a189266c55aba4abb'
+    return semantic
+
+
+def _rasters(path,needed,*,check,maximum_seconds=120.,allow_sequential_fallback=True,receipt=None):
+    """Verified sparse native frames; strict queues cannot hide a full scan."""
+    from . import sparse_native_frames
+    values=sorted(needed)
+    if not values:return
+    report={} if receipt is None else receipt
+    try:
+        clock=sparse_native_frames.probe(path,check=check)
+        sparse_native_frames.windows(values,clock)
+    except sparse_native_frames.UnsupportedSeek as error:
+        report.update(strategy='explicit_legacy_sequential_fallback',sparse_unavailable_reason=str(error),
+            whole_source_sequential_strategy_requested=True)
+        if not allow_sequential_fallback:
+            raise sparse_native_frames.UnsupportedSeek('bounded part queue refuses full-source fallback: '+str(error)) from error
+        yield from _sequential_rasters(path,values,check=check)
+    else:
+        yield from sparse_native_frames.frames(path,values,clock=clock,check=check,
+            maximum_seconds=maximum_seconds,receipt=report)
+
+
 def corroborate(*,sources,states,data,census,cache,check,maximum_seconds=180.,maximum_new_intervals=6000):
     if not 1<=maximum_seconds<=600 or not 0<=maximum_new_intervals<=12000:
         raise ValueError('finite additive native part support allowance required')
     started=monotonic();last=started;cache=Path(cache);rows=[dict(d) for d in data];receipts=[];spent=0
-    implementation=hashlib.sha256(Path(temporal_parts.__file__).read_bytes()+Path(__file__).read_bytes()).hexdigest()
+    implementation=cache_implementation()
     def live():
         nonlocal last
         now=monotonic()

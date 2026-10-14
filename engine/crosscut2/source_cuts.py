@@ -25,6 +25,7 @@ from scenedetect.detectors import AdaptiveDetector
 
 from .critic import looks_like_flash, signature
 from .grid_perception import file_identity
+from .observation_cache_contract import function_text
 
 
 def read_frames(stream, *, check, width=320, height=180):
@@ -47,6 +48,23 @@ def read_frames(stream, *, check, width=320, height=180):
             pending = bytearray()
 
 
+def cache_implementation():
+    """Output face-QA edits cannot invalidate unchanged source-cut evidence.
+
+    Keep the historical key only for the exact canonical cut consumer, pipe
+    reader, image signature and flash rule. Changes to those still get a new
+    implementation hash. No Git invocation or arbitrary old-cache adoption.
+    """
+    here=Path(__file__)
+    consumer=function_text(here,'census').replace('implementation = cache_implementation()',
+        "implementation = hashlib.sha256(Path(__file__).read_bytes()\n        + Path(__file__).with_name('critic.py').read_bytes()).hexdigest()")
+    semantic=hashlib.sha256((function_text(here,'read_frames')+consumer+function_text(here.with_name('critic.py'),'signature')
+        +function_text(here.with_name('critic.py'),'looks_like_flash')).encode()).hexdigest()
+    if semantic=='5a62e2698d75acc1240ee76c97306f10c66318e93dc1dcf031594cefbdb2f0af':
+        return 'ae6a48d0d9abad25ab659487877fff6988a4bd615e26e2e3c1f5e2c24cfb9a9e'
+    return semantic
+
+
 def census(sources, *, cache, check, maximum_seconds=600.):
     if not math.isfinite(maximum_seconds) or not 1 <= maximum_seconds <= 1200:
         raise ValueError('one finite camera-census time allowance required')
@@ -55,8 +73,7 @@ def census(sources, *, cache, check, maximum_seconds=600.):
         check()
         if monotonic() - started >= maximum_seconds:
             raise TimeoutError('bounded camera census exhausted; complete caches retained')
-    implementation = hashlib.sha256(Path(__file__).read_bytes()
-        + Path(__file__).with_name('critic.py').read_bytes()).hexdigest()
+    implementation = cache_implementation()
     decoder = shutil.which('ffmpeg')
     if decoder is None:
         raise OSError('streaming camera census requires the existing FFmpeg decoder')
