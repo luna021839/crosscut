@@ -29,6 +29,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .stage_edit_training_preflight import (
+    hierarchical_prior_class_balance, require_trajectory_selection_coverage,
+    require_releasable_training_plan,
+)
+
 from .stage_edit_training_progress import (
     training_step_completed, training_epoch_evaluated,
 )
@@ -2800,36 +2805,8 @@ def _dynamic_crop_v3_prior_component_scale_evidence(
 def _dynamic_crop_v3_prior_class_balance_evidence(
     inventory: _DynamicCropV3PriorInventory,
 ) -> dict[str, Any]:
-    """Derive train-only inverse-frequency weights for structured labels."""
-
-    count_histogram = [0] * DYNAMIC_CROP_V3_MAX_KEYFRAMES
-    motion_histogram = [0, 0]
-    for track in inventory.tracks:
-        count_histogram[len(track.values) - 1] += 1
-        if not track.motion_label_loss_masked:
-            motion_histogram[int(track.motion_label == "dynamic")] += 1
-
-    def inverse_frequency(histogram: Sequence[int]) -> list[float]:
-        total = sum(histogram)
-        observed = sum(value > 0 for value in histogram)
-        if total < 1 or observed < 1:
-            raise ValueError("Dynamic Crop v3 prior class labels are empty")
-        return [
-            float(total / (observed * value)) if value > 0 else 0.0
-            for value in histogram
-        ]
-
-    return {
-        "contract": "training_only_inverse_frequency_expected_weight_one_v1",
-        "count_histogram_1_to_8": count_histogram,
-        "count_class_weights_1_to_8": inverse_frequency(count_histogram),
-        "motion_histogram_static_dynamic": motion_histogram,
-        "motion_class_weights_static_dynamic": inverse_frequency(
-            motion_histogram
-        ),
-        "validation_labels_consumed": False,
-        "heldout_labels_consumed": False,
-    }
+    """Balance actual song/reference/track exposure, not raw corpus counts."""
+    return hierarchical_prior_class_balance(inventory.tracks)
 
 
 def _cut_only_pretraining_loss_contract(
@@ -3005,6 +2982,7 @@ def train_production_stage_edit(
     minimum_learning_rate_ratio: float = 0.10,
     minimum_finetune_optimizer_steps: int = 120,
     minimum_checkpoint_selection_finetune_steps: int = 60,
+    minimum_joint_optimizer_steps_after_prior_release: int = 1,
     seed: int = 20260824,
     device: Any = None,
     loss_contract: StageEditLossContract = StageEditLossContract(),
@@ -3140,6 +3118,11 @@ def train_production_stage_edit(
             f"floor: planned={finetune_steps_planned}, "
             f"minimum={minimum_finetune_optimizer_steps}"
         )
+    releasable_plan=require_releasable_training_plan(epochs=epochs,batches_per_epoch=finetune_batches_per_epoch,
+        minimum_finetune_steps=minimum_finetune_optimizer_steps,
+        checkpoint_burn_in_steps=minimum_checkpoint_selection_finetune_steps,
+        prior_may_be_retained=bool(dynamic_crop_v3_enabled and dynamic_crop_v3_prior_pretrain_steps),
+        minimum_joint_steps_after_release=minimum_joint_optimizer_steps_after_prior_release)
     training_cut_positive_count = sum(
         target.cut == 1.0
         for example in split.train
@@ -3260,6 +3243,16 @@ def train_production_stage_edit(
             dynamic_crop_corpus.sequence_for(example.sequence.sequence_id)
             for example in examples
         )
+
+    dynamic_crop_v3_label_admission={}
+    if dynamic_crop_v3_enabled:
+        for partition,examples in (('train',split.train),('validation',split.validation)):
+            try:
+                inventory=_dynamic_crop_v3_prior_inventory(examples,dynamic_crop_corpus)
+                dynamic_crop_v3_label_admission[partition]=require_trajectory_selection_coverage(
+                    inventory.tracks,partition=partition)
+            except ValueError as error:
+                raise ValueError(f'data_contract_unsatisfiable: partition={partition}: {error}') from error
 
     checkpoint_root = Path(checkpoint_directory).expanduser().resolve()
     _require_unambiguous_checkpoint_namespace(
@@ -4936,7 +4929,9 @@ def train_production_stage_edit(
                 )
                 finetune_steps_without_improvement += eligible_epoch_steps
             if (
-                finetune_optimizer_steps >= minimum_finetune_optimizer_steps
+                finetune_optimizer_steps >= max(minimum_finetune_optimizer_steps,
+                    dynamic_crop_v3_prior_retention_finetune_steps+minimum_joint_optimizer_steps_after_prior_release
+                    if dynamic_crop_v3_prior_retention_finetune_steps else 0)
                 and finetune_steps_without_improvement
                 >= early_stopping_patience
                 and finetune_optimizer_steps < finetune_steps_planned
@@ -5686,6 +5681,9 @@ def train_production_stage_edit(
             "minimum_checkpoint_selection_finetune_steps": (
                 minimum_checkpoint_selection_finetune_steps
             ),
+            "minimum_joint_optimizer_steps_after_prior_release": minimum_joint_optimizer_steps_after_prior_release,
+            "releasable_training_plan": releasable_plan,
+            "dynamic_crop_v3_fixed_label_admission": dynamic_crop_v3_label_admission,
             "finetune_optimizer_initial_step": (
                 finetune_optimizer_initial_step
             ),
