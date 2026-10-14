@@ -86,12 +86,13 @@ class ConnectionPrior:
         self.hold_weight=np.array([self.weights.get(int(t),0.) for t in p.nodes])
         self.cut_weight=np.array([self.weights.get(int(t),physical_weights(events|{int(t)},
             final=int(p.nodes[-1]),fps=p.fps).get(int(t),0.)) for t in p.nodes])
-        from . import preference_features
+        from . import preference_features,connection_observations
         physical=sorted(set(_physical_ids(p))) if hasattr(p,'data') else []
         return dict(physical_event_frames=sorted(self.weights),physical_event_weight_seconds=self.weights,
             grid_sha256=hashlib.sha256(p.nodes.tobytes()).hexdigest(),
             physical_camera_domain_sha256=hashlib.sha256(json.dumps(physical).encode()).hexdigest(),
             raw_feature_implementation_sha256=hashlib.sha256(Path(preference_features.__file__).read_bytes()).hexdigest(),
+            exact_projection_implementation_sha256=hashlib.sha256(Path(connection_observations.__file__).read_bytes()).hexdigest(),
             neutral_authoring_nodes=int(np.sum(self.hold_weight[1:-1]==0)),
             same_event_support_shared_by_all_options=True,handcrafted_not_preference_fitted=True)
 
@@ -114,7 +115,18 @@ class ConnectionPrior:
         return scores
 
     def losses_at(self,p,n,features):
-        scores=self.scores_at(p,n,features);q=len(p.states)
+        return self._losses(p,n,self.scores_at(p,n,features))
+
+    def scores_from_ports(self,p,n):
+        from .connection_observations import extract
+        values=extract(p,n);own,connection=activity(p,n)
+        return quality(**values,own=own,connection=connection,music=p.strength[n])
+
+    def losses_from_ports(self,p,n):
+        return self._losses(p,n,self.scores_from_ports(p,n))
+
+    def _losses(self,p,n,scores):
+        q=len(p.states)
         sources=np.asarray([s.source for s in p.states]);allowed=(sources[:,None]!=sources[None,:])|np.eye(q,dtype=bool)
         best=float(scores[allowed].max());loss=np.maximum(0.,best-scores)
         return np.diag(loss)*self.hold_weight[n],loss*self.cut_weight[n]

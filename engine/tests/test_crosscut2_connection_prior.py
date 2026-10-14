@@ -104,3 +104,19 @@ def test_real_identical_state_copy_cannot_create_preference_or_style_reward():
     b=ConnectionPrior();b.bind(cloned,native_ports=native,source_events=events)
     hh,kk=b.losses_at(cloned,1,cloned.preference_features(1))
     np.testing.assert_array_equal(hh,h[idx]);np.testing.assert_array_equal(kk,k[idx][:,idx])
+
+
+@pytest.mark.parametrize('condition',['ordinary','opposed','missing','uncertain_path','central_cut','contradicted'])
+def test_fast_projection_is_bit_exact_to_all59channel_prior_on_real_producer(condition):
+    p,a,b=setup(opposed=condition=='opposed');prior=ConnectionPrior()
+    if condition=='missing':p.body[:,1,:,[1,3,5,6,7],2]=0.
+    if condition in ('uncertain_path','central_cut'):p.continuous[[a,b],1]=False
+    if condition=='central_cut':
+        p.data[a]['known_center_native_cut'][1]=True;p.head[a,1,1,0]+=.2
+    if condition=='contradicted':
+        p.phase_certainty[:]=.5;p.motion_certainty[:]=.5
+        p.phase_certainty[a,1,1,0]=0.;p.motion_certainty[b,1,0,1]=0.
+        p.member_hint[b,1]=4;p.member_hint[a,1]=2
+    for n in (1,2):
+        reference=prior.scores_at(p,n,p.preference_features(n))
+        np.testing.assert_array_equal(prior.scores_from_ports(p,n),reference)
