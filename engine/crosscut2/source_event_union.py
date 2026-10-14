@@ -30,9 +30,13 @@ def nearest_indices(warp,*,master_start,fps,final_frame,native_fps,native_count)
     return values
 
 
-def combine(*,sources,manifest,census,warps,master_start,fps,final_frame,check=lambda:None):
+def combine(*,sources,manifest,census,warps,master_start,fps,final_frame,check=lambda:None,supplemental_cut_cache=None):
     records=manifest['scene_analysis']
     if not len(sources)==len(records)==len(census)==len(warps):raise ValueError('source cut evidence domains differ')
+    extra=[[] for _ in sources]
+    if supplemental_cut_cache is not None:
+        from .source_cut_refinement import observed_native_cuts
+        extra=observed_native_cuts(sources,supplemental_cut_cache)
     events=[];bound=[];receipts=[]
     for s,(path,record,clock,warp) in enumerate(zip(sources,records,census,warps)):
         check();identity=file_identity(path)
@@ -53,6 +57,8 @@ def combine(*,sources,manifest,census,warps,master_start,fps,final_frame,check=l
             if type(f) is not int:raise ValueError('first incoming native frame must be an integer')
             frames.append(f)
         union=merge_frames(clock['frames'],frames,count=clock['frame_count'])
+        if any(not 0<f<clock['frame_count'] for f in extra[s]):raise ValueError('supplemental native cut escapes source clock')
+        union=np.unique(np.r_[union,np.asarray(extra[s],int)])
         schedule=nearest_indices(warp,master_start=master_start,fps=fps,final_frame=final_frame,
             native_fps=clock['fps'],native_count=clock['frame_count'])
         mapped=np.searchsorted(schedule,union,side='left');keep=(mapped>0)&(mapped<final_frame)
@@ -63,9 +69,12 @@ def combine(*,sources,manifest,census,warps,master_start,fps,final_frame,check=l
             native_event_rows=[dict(output_frame=int(tick),source_native_first_incoming=int(f),
                 exposed_native_ordinals=[int(schedule[tick-1]),int(schedule[tick])])
                 for f,tick in zip(union[keep],mapped[keep])],
-            contract='bound_transnet_adaptive_first_incoming_union_v1',complete_semantic_cut_recall_claimed=False))
+            contract=('bound_source_cut_union_with_confirmed_output_observations_v2' if extra[s]
+                else 'bound_transnet_adaptive_first_incoming_union_v1'),
+            supplemental_confirmed_native_cuts=extra[s],complete_semantic_cut_recall_claimed=False))
         receipts.append(dict(source=s,source_sha256_verified=True,adaptive_count=len(clock['frames']),
             retained_transnet_count=len(frames),union_count=len(union),mapped_output_events=len(output),
+            supplemental_confirmed_native_cuts=len(extra[s]),
             new_neural_calls=0,new_source_decoded_frames=0,base_face_body_cache_invalidated=False,
             cut_mapping='first_output_tick_whose_nearest_native_ordinal_reaches_first_incoming',
             near_adaptive_events_deferred_to_transnet_first_incoming=True))

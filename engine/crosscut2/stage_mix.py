@@ -316,6 +316,8 @@ def main():
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
         help='measure exact native-cut flanks without invalidating the song/body grids')
+    parser.add_argument('--supplement-native-cut-flanks',action='store_true',
+        help='Bounded additive exact flanks missing from the native event union; no full-source fallback')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--resume-render', action='store_true',
         help='Render the existing exact source-bound plan without re-observation or selection')
@@ -341,6 +343,8 @@ def main():
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
+    if args.supplement_native_cut_flanks and not args.joint_motion_event_seconds:
+        raise ValueError('missing native flanks require the explicit physical native event registry')
     if args.experimental_preference_model is not None and not args.native_part_pixel_support:
         raise ValueError('experimental preference requires the explicit partial-evidence event consumer')
     if args.fixed_connection_prior and (not args.native_part_pixel_support or args.experimental_preference_model is not None):
@@ -470,12 +474,19 @@ def main():
             from .source_event_union import combine,attach_existing_ports
             source_events,bound_source_cut_events,union_receipts=combine(sources=original.sources,manifest=manifest,
                 census=camera_census,warps=warps,master_start=original.master_audio_start,fps=original.fps,
-                final_frame=original.output_frame_count,check=check)
+                final_frame=original.output_frame_count,check=check,
+                supplemental_cut_cache=args.cache.parent/'crosscut2-confirmed-native-cuts-v1')
             for bank,record in zip(banks,bound_source_cut_events):
                 bank['native_cut_frames']=np.asarray(record['frames'],int)
             native_ports,registry_receipts=attach_existing_ports(bound=bound_source_cut_events,census=camera_census,
                 ports=native_ports,warps=warps,master_start=original.master_audio_start,fps=original.fps,
                 final_frame=original.output_frame_count)
+            supplementary_flank_receipts=[]
+            if args.supplement_native_cut_flanks:
+                from .native_flank_supplement import augment_missing_native_flanks
+                native_ports,supplementary_flank_receipts=augment_missing_native_flanks(sources=original.sources,
+                    bound=bound_source_cut_events,registry=native_ports,cache=args.cache.parent/'crosscut2-native-flank-supplement-v1',
+                    models=args.models,check=check,maximum_new_face_frames=256,maximum_seconds=120.)
             style,style_receipts=observe(sources=original.sources,banks=banks,
                 cache=args.cache.parent/'crosscut2-native-style-v1',check=check,maximum_seconds=180.)
             identity_hints=None;identity_receipts=[]
@@ -503,6 +514,7 @@ def main():
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts
             fixed_receipt['native_event_registry']=registry_receipts
+            fixed_receipt['supplementary_native_flanks']=supplementary_flank_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,
                 native_ports=native_ports,check=check)

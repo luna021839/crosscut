@@ -43,3 +43,25 @@ def test_digest_bound_cut_union_needs_no_source_decode_or_neural_producer(tmp_pa
 def test_unknown_legacy_frame_domain_is_not_silently_treated_as_native(tmp_path):
     args=fixture(tmp_path);args['manifest']['scene_analysis'][0]['detection_policy']['contract']='timestamps-only'
     with pytest.raises(ValueError,match='unrecognized'):combine(**args)
+
+
+def test_confirmed_raw_cut_enters_the_same_union_and_prevents_new_micro_fragment(tmp_path,monkeypatch):
+    from crosscut2 import source_cut_refinement
+    from crosscut2.played_event_support import PlayedEventSupport
+    from crosscut2.native_fragment_integrity import NativeFragmentIntegrity
+    monkeypatch.setattr(source_cut_refinement,'observed_native_cuts',lambda sources,cache:[[53]])
+    args=fixture(tmp_path)
+    events,bound,receipts=combine(**args,supplemental_cut_cache=tmp_path/'confirmed')
+    assert bound[0]['frames']==[20,50,53]
+    assert bound[0]['contract']=='bound_source_cut_union_with_confirmed_output_observations_v2'
+    assert bound[0]['supplemental_confirmed_native_cuts']==[53]
+    assert receipts[0]['new_neural_calls']==receipts[0]['new_source_decoded_frames']==0
+    integrity=NativeFragmentIntegrity(PlayedEventSupport(events,final=90,fps=30.),minimum_frames=12)
+    assert not integrity.allowed(51,90,np.array([0]))[0]
+
+
+def test_supplemental_observation_does_not_override_source_pixel_binding(tmp_path,monkeypatch):
+    from crosscut2 import source_cut_refinement
+    monkeypatch.setattr(source_cut_refinement,'observed_native_cuts',lambda sources,cache:[[53]])
+    args=fixture(tmp_path);args['sources'][0].write_bytes(b'changed original')
+    with pytest.raises(OSError,match='current source pixels'):combine(**args,supplemental_cut_cache=tmp_path/'confirmed')

@@ -94,7 +94,8 @@ def bound_source_cuts(records,union,source_bindings):
     merged=[]
     for s,(base,value) in enumerate(zip(records,union)):
         frames=value.get('frames')
-        if (value.get('contract')!='bound_transnet_adaptive_first_incoming_union_v1'
+        if (value.get('contract') not in ('bound_transnet_adaptive_first_incoming_union_v1',
+                'bound_source_cut_union_with_confirmed_output_observations_v2')
                 or value.get('source')!=s or tuple(value.get('source_file_identity',()))!=source_bindings[s]
                 or value.get('frame_count')!=base['frame_count'] or value.get('fps')!=base['fps']
                 or not isinstance(frames,list) or any(type(f) is not int or not 0<f<base['frame_count'] for f in frames)
