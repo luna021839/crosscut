@@ -252,6 +252,12 @@ def run_diagnostic(fixture, out, *, budget):
     from crosscut import stage_edit_dynamic_crop_head_v3 as h3
     from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import DynamicCropHeadPredictionV3
     from crosscut.stage_edit_decoded_curve_metrics import decoded_observation_error, summarize_decoded_observations
+    from crosscut.stage_edit_adoption_checks import native_source_raw,adopt_and_verify,verify_public_outputs
+    from crosscut.stage_edit_gradient_checks import (separated_loss_gradients,head_row_norms,row_supervision,
+        measured_feature_delta,require_actual_feature_update)
+    from crosscut.stage_edit_train_fit_checks import label_fit_checks
+    from crosscut.stage_edit_release_checks import (LIMITS as release_limits,capture_sources,
+        compare_drift,snapshot_transaction,restore_transaction)
     from crosscut.stage_edit_transformer import (
         DEFAULT_STAGE_EDIT_SCHEMA as schema, StageEditLossContract,
         StageEditTargetSequence, tensorize_stage_edit_batch, tensorize_stage_edit_supervision,
@@ -266,6 +272,7 @@ def run_diagnostic(fixture, out, *, budget):
         max_optimizer_updates=80, limits=dict(seconds=budget.seconds,
         rss_bytes=budget.rss_bytes, mlx_bytes=budget.mlx_bytes),
         native_affine_tolerance=dict(atol=2e-4, rtol=2e-5),
+        release_step_drift_limits=dict(release_limits),
         model_config=config.to_dict(), steps=[], evaluations={})
     examples = {e.sequence.sequence_id: e for e in corpus.examples}
     tracks = inventory.tracks
@@ -288,17 +295,7 @@ def run_diagnostic(fixture, out, *, budget):
         return base, dynamic
 
     def raw_at(batch, track):
-        hidden, _, source, mask = model.base._hidden_and_sources(batch)
-        slot = batch.source_ids[0][track.token_index].index(track.source_id)
-        mx.eval(mask)
-        if not bool(mask[0,track.token_index,slot].item()):
-            raise RuntimeError("diagnostic target source lost its native hard gate")
-        # Use the actual Linear/addmm operators and tensor ranks of __call__.
-        raw = model.dynamic_crop_context_head(hidden)[0,track.token_index] + model.dynamic_crop_source_head(
-            source)[0,track.token_index,slot]
-        mx.eval(raw)
-        if not np.isfinite(np.asarray(raw)).all():
-            raise RuntimeError("nonfinite raw76 output")
+        raw,_,_,slot=native_source_raw(model,batch,track.token_index,track.source_id)
         return raw, slot
 
     def evaluate(name):
@@ -322,30 +319,43 @@ def run_diagnostic(fixture, out, *, budget):
             outputs.append(dict(source_id=track.source_id, original_token_index=track.token_index,
                 predicted_count=decoded.predicted_keyframe_count,
                 motion_logit=float(raw_np[75]), raw76=raw_np.tolist(),
-                decoded_times=[point.time_seconds for point in decoded.track.keyframes]))
+                teacher_forced_count_times=np.asarray(h3.dynamic_crop_v3_times_by_count(raw[40:75]))[len(track.values)-1,:len(track.values)].tolist(),
+                decoded_normalized_times=[] if decoded.track is None else
+                    [point.time_seconds/target.shot_duration_seconds for point in decoded.track.keyframes],
+                decoded_times=[] if decoded.track is None else [point.time_seconds for point in decoded.track.keyframes],
+                decoded_values=[] if decoded.track is None else
+                    [[p.zoom,p.center_x,p.center_y,p.roll_degrees] for p in decoded.track.keyframes],
+                decode_eligible=bool(decoded.eligible),renderer_projection_count=decoded.minimum_safe_zoom_projection_count))
         metric = summarize_decoded_observations(rows, expected_tracks=len(rows), source_mismatches=0)
         metric["dynamic_subset"] = summarize_decoded_observations(dynamic_rows,
             expected_tracks=len(dynamic_rows), source_mismatches=0)
         metric["predictions"] = outputs
+        metric['label_and_decode_fit']=label_fit_checks(tracks,outputs)
         report["evaluations"][name] = metric
         write_report()
         print(json.dumps(dict(phase=name, mae=metric["normalized_mae"], **budget.check())), flush=True)
         return metric
 
     def update(loss, gradients, optimizer, trained, phase, local_step, *, adapter=False):
+        from mlx.utils import tree_map
         budget.check()
         evidence = gradient_evidence(gradients, adapter=adapter)
         keys = ("context_adapter","source_adapter") if adapter else (
             "dynamic_crop_context_head","dynamic_crop_source_head")
         before = {key:dict(getattr(trained,key).parameters()) for key in keys}
+        before_base=None if adapter else {name:tree_map(lambda value:value,trained.base.parameters()[name])
+            for name in ('encoder','source_projection')}
         gradients, norm = optim.clip_grad_norm(gradients, 1.)
+        report['optimizer_update_attempt_count']=report.get('optimizer_update_attempt_count',0)+1
+        report['last_attempt']=dict(phase=phase,phase_step=local_step)
+        write_report()
         optimizer.update(trained, gradients)
         mx.eval(loss, norm, trained.parameters(), optimizer.state)
         deltas = {key:{leaf:values-before[key][leaf]
             for leaf,values in getattr(trained,key).parameters().items()} for key in keys}
         # Retention is measured again after its byte-for-byte restoration below.
         if not adapter:
-            deltas["base"]={"encoder":{},"source_projection":{}}
+            deltas["base"]=measured_feature_delta(trained,before_base)
         parameter_deltas=gradient_evidence(deltas,adapter=adapter)
         loss_value = float(loss.item())
         if not np.isfinite(loss_value):
@@ -353,10 +363,12 @@ def run_diagnostic(fixture, out, *, budget):
         report["steps"].append(dict(phase=phase, phase_step=local_step,
             optimizer_step=int(optimizer.state["step"].item()), loss=loss_value,
             gradient_norms=evidence, head_parameter_delta_l2=parameter_deltas,
+            encoder_and_source_delta_measured=not adapter,
             head_delta_before_retention_restore=phase=="retention",
             learning_rate=float(optimizer.learning_rate.item()),
             **budget.check()))
         write_report()
+        if phase=='released_joint':require_actual_feature_update(evidence,parameter_deltas)
         if local_step == 1 or local_step % 4 == 0:
             print(json.dumps(report["steps"][-1]), flush=True)
 
@@ -427,15 +439,36 @@ def run_diagnostic(fixture, out, *, budget):
             source_mean=normalizer.source_mean,source_scale=normalizer.source_scale,
             contexts=mx.array(np.stack([t.context_embedding for t in inventory.tracks])),
             sources=mx.array(np.stack([t.source_embedding for t in inventory.tracks])))
-        max_error = 0.
+        max_error = 0.;merge_rows=[];adoption_probes=[]
+        model.eval()
         for track in inventory.tracks:
+            budget.check()
             context, source = mx.array(track.context_embedding),mx.array(track.source_embedding)
             expected = production._dynamic_crop_v3_structured_prior_raw(adapter,initial_head,*projections,
                 normalizer,context,source)
             actual = merged_module(context,source)
             mx.eval(expected,actual)
-            np.testing.assert_allclose(np.asarray(actual),np.asarray(expected),atol=2e-4,rtol=2e-5)
             max_error=max(max_error,float(mx.max(mx.abs(actual-expected)).item()))
+            batch=prefix_batch(track)
+            _,prefix_context,prefix_source,_=native_source_raw(model,batch,track.token_index,track.source_id)
+            prefix_expected=production._dynamic_crop_v3_structured_prior_raw(adapter,initial_head,*projections,
+                normalizer,prefix_context,prefix_source)
+            mx.eval(prefix_expected)
+            cached,prefix=np.asarray(expected),np.asarray(prefix_expected)
+            merge_rows.append(dict(source_id=track.source_id,original_token_index=track.token_index,
+                standalone_passed=bool(np.allclose(np.asarray(actual),cached,atol=2e-4,rtol=2e-5)),
+                cached_to_prefix_passed=bool(np.allclose(prefix,cached,atol=2e-4,rtol=2e-5)),
+                cached_to_prefix_raw76_max_error=float(np.max(np.abs(prefix-cached))),
+                context_feature_max_error=float(np.max(np.abs(np.asarray(prefix_context)-track.context_embedding))),
+                source_feature_max_error=float(np.max(np.abs(np.asarray(prefix_source)-track.source_embedding)))))
+            target=v3.sequence_for(track.sequence_id).targets[track.token_index]
+            adoption_probes.append(dict(batch=batch,token_index=track.token_index,source_id=track.source_id,
+                expected_raw=np.array(prefix,copy=True),duration_seconds=target.shot_duration_seconds,
+                observed_times=tuple(k.time_seconds for k in target.original_observed_keyframes)))
+        report['native_affine_prefix_checks']=merge_rows
+        write_report()
+        if not all(r['standalone_passed'] and r['cached_to_prefix_passed'] for r in merge_rows):
+            raise AssertionError('native affine cached/prefix comparison failed; complete rows saved')
         if before_base != production._parameter_tree_sha256(model.base.parameters()):
             raise RuntimeError("detached prior changed the base model")
         if projection_hash != production._parameter_tree_sha256(dict(context=projections[0],source=projections[1])):
@@ -443,9 +476,11 @@ def run_diagnostic(fixture, out, *, budget):
         report["detached_prior"] = dict(base_unchanged=True, projections_unchanged=True,
             base_sha256=before_base, projection_sha256=projection_hash, merge_max_raw76_error=max_error,
             per_song_sampled_counts=sampler.per_song_sampled_counts)
-        production._assign_dynamic_crop_v3_prior_head_snapshot(model,merged)
+        def record_adoption(evidence):
+            report['actual_public_adoption']=evidence;write_report()
+        adopt_and_verify(model,merged,adoption_probes,check=budget.check,record=record_adoption)
         evaluate("after_prior")
-        del optimizer, grad_fn, adapter, gradients, initial_head, merged
+        del optimizer, grad_fn, adapter, gradients, initial_head, merged, adoption_probes
         gc.collect(); mx.clear_cache()
         features = {k:v for k,v in model.base.parameters().items() if k in production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES}
         feature_hash = production._parameter_tree_sha256(features)
@@ -460,6 +495,7 @@ def run_diagnostic(fixture, out, *, budget):
             minimum_learning_rate_ratio=.1)
         optimizer=optim.AdamW(learning_rate=schedule,weight_decay=.01)
         grad_fn=nn.value_and_grad(model,lambda m,b,s,d: h3.stage_edit_dynamic_crop_v3_loss(m,b,s,d,crop_contract)[0])
+        release_probes=[dict(batch=prefix_batch(t),token_index=t.token_index,source_id=t.source_id) for t in tracks]
         reset_count=0
         for step in range(1,33):
             budget.check()
@@ -472,11 +508,43 @@ def run_diagnostic(fixture, out, *, budget):
                 reset_count+=1
             track=tracks[(step-1)%len(tracks)]
             batch=prefix_batch(track); base,dynamic=target_supervision(track,batch)
+            transaction=None;before_release=None
+            if step in (5,6):
+                model.eval()
+                before_release=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                if step==5:
+                    repeated=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                    repeat=compare_drift(before_release,repeated)
+                    if any(row['raw76_step_drift']!=0 for row in repeat['tracks']):
+                        raise AssertionError('eval/eval release repeat is not deterministic')
+                    rng=[mx.array(np.array(k,copy=True)) for k in mx.random.state]
+                    model.train()
+                    stochastic=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                    mx.random.state=rng
+                    report['release_dropout_no_update']=dict(eval_repeat=repeat,
+                        dropout_only=compare_drift(before_release,stochastic),optimizer_updates=0,
+                        stochastic_drift_is_advisory_not_serving_output=True)
+                    write_report()
+                transaction=snapshot_transaction(model,optimizer)
             model.train()
+            if step==5:model.eval()  # first real joint update WITHOUT dropout
             if step<=4:
                 for name in (*production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES,"input_dropout"):
                     getattr(model.base,name).eval()
-            loss,gradients=grad_fn(model,batch,base,dynamic)
+            if step in (5,6):
+                def attribution(evidence):
+                    report.setdefault('released_loss_attribution',[]).append(dict(
+                        phase_step=step-4,dropout_active=step==6,evidence=evidence));write_report()
+                loss,gradients,_=separated_loss_gradients(model,batch,base,dynamic,crop_contract,
+                    check=budget.check,record=attribution)
+            else:loss,gradients=grad_fn(model,batch,base,dynamic)
+            if step>=5:
+                rows=head_row_norms(gradients);supported=row_supervision(len(track.values),motion_masked=track.motion_label_loss_masked)
+                report.setdefault('released_row_gradients',[]).append(dict(phase_step=step-4,
+                    count_target=len(track.values),supervised_rows=np.flatnonzero(supported).tolist(),
+                    row_l2=rows.tolist(),unsupported_nonzero_rows=np.flatnonzero((~supported)&(rows>0)).tolist()))
+                write_report()
+                if np.any(rows[~supported]>0):raise AssertionError('gradient in unsupervised trajectory rows')
             if step<=4:
                 gradients=dict(gradients)
                 for name in ("dynamic_crop_context_head","dynamic_crop_source_head"):
@@ -485,6 +553,25 @@ def run_diagnostic(fixture, out, *, budget):
                 for name in production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES:
                     gradients["base"][name]=production._zero_gradient_tree(gradients["base"][name])
             update(loss,gradients,optimizer,model,"retention" if step<=4 else "released_joint",step if step<=4 else step-4)
+            if transaction is not None:
+                model.eval()
+                after_release=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                drift=compare_drift(before_release,after_release)
+                result=dict(phase_step=step-4,dropout_during_update=step==6,deterministic_serving_drift=drift,
+                    rollback_performed=False)
+                report.setdefault('release_step_probes',[]).append(result)
+                if not drift['passed']:
+                    restore_transaction(model,optimizer,transaction)
+                    restored=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                    restored_drift=compare_drift(before_release,restored)
+                    if any(r['raw76_step_drift']!=0 for r in restored_drift['tracks']):
+                        raise AssertionError('serving outputs not restored after rollback')
+                    result.update(rollback_performed=True,optimizer_state_restored=True,
+                        restored_serving_raw76_bit_identical=True)
+                    report['steps'][-1]['rolled_back']=True
+                    write_report()
+                    raise AssertionError('predeclared release step drift exceeded; rolled back and stopped')
+                write_report();del transaction,before_release,after_release
             if step<=4:
                 model.base.update(features)
                 production._assign_dynamic_crop_v3_prior_head_snapshot(model,head)
@@ -515,11 +602,27 @@ def run_diagnostic(fixture, out, *, budget):
             training_steps=80,weights_trained=True,training_data_id=v3.data_id)
         h3.save_stage_edit_dynamic_crop_checkpoint_v3(out/"unqualified-checkpoint",model,metadata)
         model.eval(); expected=np.asarray(raw_at(sentinel_batch,tracks[-1])[0]).copy()
+        reload_probes=[]
+        for track in tracks:
+            budget.check();batch=prefix_batch(track)
+            target=v3.sequence_for(track.sequence_id).targets[track.token_index]
+            reload_probes.append(dict(batch=batch,token_index=track.token_index,source_id=track.source_id,
+                expected_raw=np.array(raw_at(batch,track)[0]),duration_seconds=target.shot_duration_seconds,
+                observed_times=tuple(k.time_seconds for k in target.original_observed_keyframes)))
         del model; gc.collect(); mx.clear_cache()
         model,_=h3.load_stage_edit_dynamic_crop_checkpoint_v3(out/"unqualified-checkpoint",expected_schema=schema)
         model.eval(); actual=np.asarray(raw_at(sentinel_batch,tracks[-1])[0])
         np.testing.assert_array_equal(expected,actual)
         report["reload_raw76_bit_identical"]=True
+        report['actual_public_reload']=verify_public_outputs(model,reload_probes,check=budget.check)
+        for probe in reload_probes:
+            budget.check()
+            restored_raw,*_=native_source_raw(model,probe['batch'],probe['token_index'],probe['source_id'])
+            np.testing.assert_array_equal(np.asarray(restored_raw),probe['expected_raw'])
+        report['reload_all_raw76_bit_identical']=True
+        write_report()
+        if not report['actual_public_reload']['passed']:
+            raise AssertionError('full public-output reload failed')
         sequence=sequences[tracks[-1].sequence_id]
         permuted=replace(sequence,tokens=tuple(replace(t,source_candidates=tuple(reversed(t.source_candidates)))
             for t in sequence.tokens[:tracks[-1].token_index+1]))
@@ -528,12 +631,33 @@ def run_diagnostic(fixture, out, *, budget):
         np.testing.assert_allclose(actual,permuted_raw,atol=2e-4,rtol=2e-5)
         if bool(np.asarray(sentinel_batch.source_candidate_mask[:,:,-1]).any()):
             raise RuntimeError("masked-source probe has no genuinely masked padding slot")
-        perturbed=replace(sentinel_batch,source_features=sentinel_batch.source_features.at[:,:,-1,:].set(12345.),
-            temporal_source_features=sentinel_batch.temporal_source_features.at[:,:,-1,:].set(12345.))
+        padding=~sentinel_batch.source_candidate_mask
+        def perturb(batch,mask):
+            return replace(batch,source_features=mx.where(mask[...,None],12345.,batch.source_features),
+                temporal_source_features=None if batch.temporal_source_features is None else
+                    mx.where(mask[...,None],12345.,batch.temporal_source_features))
+        perturbed=perturb(sentinel_batch,padding)
         isolated=np.asarray(raw_at(perturbed,tracks[-1])[0])
         np.testing.assert_array_equal(actual,isolated)
+        gated=sentinel_batch.source_candidate_mask & ~sentinel_batch.hard_source_gate_mask
+        if not bool(mx.any(gated).item()):
+            # Real present distractor, explicitly hard-gated in BOTH controls.
+            # Do not compare against the original differently eligible set.
+            mask=np.zeros(sentinel_batch.source_candidate_mask.shape,bool)
+            for token in range(mask.shape[1]):
+                choices=[i for i,s in enumerate(sentinel_batch.source_ids[0][token])
+                    if s is not None and s!=tracks[-1].source_id and bool(sentinel_batch.source_candidate_mask[0,token,i].item())]
+                if choices:mask[0,token,choices[0]]=True
+            gated=mx.array(mask)
+            sentinel_control=replace(sentinel_batch,hard_source_gate_mask=sentinel_batch.hard_source_gate_mask & ~gated)
+        else:sentinel_control=sentinel_batch
+        if not bool(mx.any(gated).item()):
+            raise AssertionError('no present distractor for hard-gated-source probe')
+        gated_before=np.asarray(raw_at(sentinel_control,tracks[-1])[0])
+        gated_after=np.asarray(raw_at(perturb(sentinel_control,gated),tracks[-1])[0])
+        np.testing.assert_array_equal(gated_before,gated_after)
         report["source_invariance"]=dict(permutation_max_raw76_error=float(np.max(np.abs(actual-permuted_raw))),
-            masked_source_raw76_bit_identical=True)
+            masked_source_raw76_bit_identical=True,present_hard_gated_source_raw76_bit_identical=True)
         released=[row for row in report["steps"] if row["phase"]=="released_joint"]
         prior=[row for row in report["steps"] if row["phase"]=="detached_prior"]
         for phase_rows,groups in ((prior,("values","count","time","motion")),
@@ -552,7 +676,8 @@ def run_diagnostic(fixture, out, *, budget):
             dynamic_beats_static=final["dynamic_subset"]["improvement_over_static_prior"]>0,
             predicted_count_classes=sorted(count_classes),predicted_motion_classes=sorted(motion_classes))
         report["status"]="diagnostic_pass" if reduction>=.2 and report["train_fit"]["dynamic_beats_static"] \
-            and len(count_classes)>1 and len(motion_classes)>1 else "stop_investigate_no_long_rerun"
+            and len(count_classes)>1 and len(motion_classes)>1 and final['label_and_decode_fit']['passed'] \
+            else "stop_investigate_no_long_rerun"
         report["resources"]=budget.check()
         report["optimizer_update_count"]=len(report["steps"])
         if report["optimizer_update_count"]!=80:
@@ -561,6 +686,7 @@ def run_diagnostic(fixture, out, *, budget):
         print(json.dumps(dict(status=report["status"],train_fit=report["train_fit"],**report["resources"])),flush=True)
     except Exception as exc:
         report["status"]="diagnostic_failed"
+        report['optimizer_update_count']=len(report['steps'])
         report["error"]=f"{type(exc).__name__}: {exc}"
         write_report()
         raise
