@@ -28,7 +28,7 @@ class PlayedPosePortPrior:
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
-            'featured_member_state.py']
+            'featured_member_state.py','terminal_stencil.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -50,6 +50,8 @@ class PlayedPosePortPrior:
             change_density_uses='weakest_observed(evidence_cap*min(same_clock_arm_configuration,motion),anonymous_appearance,Hellinger_style_change,native_quality,played_seam_shape)',
             change_cues_are_not_multiplied_as_independent_probabilities=True,
             known_different_member_gets_no_same_actor_change_credit=True,
+            ending_pixel_constraint='only_final_hold; measured_new_opaque_stencil_avoided_if_an_observed_clean_tail_exists',
+            unmeasured_tail_never_excludes_source=True,all_questionable_tails_preserve_coverage=True,
             paired_credit_requires_its_actual_outgoing_proposal=True,unmeasured_or_static_change_credit=0.,
             change_credit_is_unfitted_engineering_not_human_preference_calibration=True,
             recurrent_member_hints_are_soft_not_certified=True,featured_state_uses_original_native_views_not_proposed_crops=True,
@@ -89,6 +91,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     paths,camera_receipt=make_paths(nodes,banks,source_events,check=live)
     receipt=dict(source_local_appearance_clusters=counts,raw_actor_states_prepared_once=len(states),
         native_part_corroboration=part_receipts,camera_domain=camera_receipt,
+        terminal_stencil_observations=[b.get('terminal_stencil_observation') for b in banks],
         unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
     cats=[]
     face_members=[None]*len(banks);featured=[None]*len(banks)

@@ -9,6 +9,7 @@ from .connection_prior import physical_weights
 from .native_fragment_integrity import NativeFragmentIntegrity
 from .played_partial_pose import face_geometry
 from .focal_appearance import discrepancy as appearance_discrepancy
+from .terminal_stencil import eligible as ending_eligible
 
 
 def _hermite(a,b,da,db,length):
@@ -194,6 +195,7 @@ class ArcCosts:
         self.check();self.calls+=1;first,final=map(int,self.nodes[[i,j]]);L=final-first
         shape=(len(self.entries[i]),len(self.exits[j]));cost=np.zeros(shape);allowed=np.zeros(shape,bool);codes=np.full(shape,-1,np.int8)
         fragments=np.asarray(self.fragments(i,j));valid_source=self.integrity.allowed(first,final,np.arange(len(self.cats)))
+        if final==self.nodes[-1]:valid_source&=ending_eligible([c.bank for c in self.cats])
         for s in range(len(self.cats)):
             if not valid_source[s]:continue
             p=np.array([k for k,v in enumerate(self.entries[i]) if v.source==s],int)

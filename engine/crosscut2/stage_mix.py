@@ -488,6 +488,10 @@ def main():
                 supplemental_cut_cache=args.cache.parent/'crosscut2-confirmed-native-cuts-v1')
             for bank,record in zip(banks,bound_source_cut_events):
                 bank['native_cut_frames']=np.asarray(record['frames'],int)
+            if args.played_pose_port_camera_prior:
+                from .terminal_stencil import observe as observe_terminal_stencils
+                endings=observe_terminal_stencils(original.sources,banks,camera_census,check=check)
+                for bank,ending in zip(banks,endings):bank['terminal_stencil_observation']=ending
             native_ports,registry_receipts=attach_existing_ports(bound=bound_source_cut_events,census=camera_census,
                 ports=native_ports,warps=warps,master_start=original.master_audio_start,fps=original.fps,
                 final_frame=original.output_frame_count)
