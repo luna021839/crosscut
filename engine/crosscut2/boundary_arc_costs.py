@@ -69,7 +69,7 @@ def whole_viewports(entry,exit,*,length,cap):
 
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
-                 person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False):
+                 person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -77,6 +77,11 @@ class ArcCosts:
         self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
+        self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
+        if readout_tau is not None:
+            from .scene_readout import SceneReadout
+            self.readouts=[SceneReadout(cat,native_ports[s],support.events[s],dense[s],tau=readout_tau)
+                for s,cat in enumerate(catalogues)]
         self.whole_viewport_paths_scored=0
         for s,paths in enumerate(dense):
             check();frames=np.arange(int(nodes[-1]));values=np.asarray(paths)
@@ -93,6 +98,10 @@ class ArcCosts:
         for n,tick in enumerate(nodes):
             check();left=np.zeros((len(entries[n]),4));right=np.zeros((len(exits[n]),4))
             left_ok=np.zeros_like(left,bool);right_ok=np.zeros_like(right,bool)
+            if self.readouts is not None:
+                from .scene_readout import IDENTITY
+                rl=np.broadcast_to(IDENTITY,(len(entries[n]),4,4)).copy()
+                rr=np.broadcast_to(IDENTITY,(len(exits[n]),4,4)).copy()
             if tick+38<=nodes[-1]:
                 for s in range(len(catalogues)):
                     ids=np.array([i for i,p in enumerate(entries[n]) if p.source==s],int)
@@ -105,6 +114,9 @@ class ArcCosts:
                         new=np.where(ok[:,None,None],new,old)
                         left[ids,g]=self.patch_delta(s,used,new,old,first=int(tick),final=int(nodes[-1]))
                         left_ok[ids,g]=ok
+                        if self.readouts is not None:
+                            safe=np.where(ok[:,None,None],path,base[None])
+                            rl[ids,g]=self.readouts[s].summary(int(tick),safe,hold_first=int(tick),baseline=dense[s][g])
             if tick>=38:
                 for s in range(len(catalogues)):
                     ids=np.array([i for i,p in enumerate(exits[n]) if p.source==s],int)
@@ -117,7 +129,11 @@ class ArcCosts:
                         new=np.where(ok[:,None,None],new,old)
                         right[ids,g]=self.patch_delta(s,used,new,old,first=0,final=int(tick))
                         right_ok[ids,g]=ok
+                        if self.readouts is not None:
+                            safe=np.where(ok[:,None,None],path,base[None])
+                            rr[ids,g]=self.readouts[s].summary(int(tick)-38,safe,hold_first=0,baseline=dense[s][g])
             self.left.append((left,left_ok));self.right.append((right,right_ok))
+            if self.readouts is not None:self.readout_left.append(rl);self.readout_right.append(rr)
 
     def movement(self,s,frames,values):
         """Quadratic digital velocity integral; native source jumps are not pans."""
@@ -231,6 +247,10 @@ class ArcCosts:
     def __call__(self,i,j):
         self.check();self.calls+=1;first,final=map(int,self.nodes[[i,j]]);L=final-first
         shape=(len(self.entries[i]),len(self.exits[j]));cost=np.zeros(shape);allowed=np.zeros(shape,bool);codes=np.full(shape,-1,np.int8)
+        if self.readouts is not None:
+            from .scene_readout import IDENTITY,then
+            alternatives=np.zeros(shape+(6,));alternative_ok=np.zeros_like(alternatives,bool)
+            transfers=np.broadcast_to(IDENTITY,shape+(6,4)).copy()
         fragments=np.asarray(self.fragments(i,j));valid_source=self.integrity.allowed(first,final,np.arange(len(self.cats)))
         if final==self.nodes[-1]:valid_source&=ending_eligible([c.bank for c in self.cats])
         for s in range(len(self.cats)):
@@ -243,10 +263,13 @@ class ArcCosts:
                 [self.entries[i][k] for k in p],[self.exits[j][k] for k in q],fps=self.fps)
             if not clock_ok.any():continue
             base=self.baseline_cost(s,first,final)
+            if self.readouts is not None:
+                ac=np.zeros((len(p),len(q),6));av=np.zeros_like(ac,bool)
             if L>=38:
                 left,lv=self.left[i];right,rv=self.right[j]
                 values=base[None,None,:]+left[p,None,:]+right[None,q,:]
                 valid=lv[p,None,:]&rv[None,q,:]
+                if self.readouts is not None:ac[:,:,:4]=values;av[:,:,:4]=valid
                 g=np.argmin(np.where(valid,values,np.inf),axis=-1);ok=valid.any(-1)
                 v=np.take_along_axis(values,g[...,None],axis=-1).squeeze(-1)
                 self.long_combinations+=len(p)*len(q)*4
@@ -255,11 +278,13 @@ class ArcCosts:
                 path,valid=cameras(entry,exit,self.dense[s][0][first:final],cap=self.cats[s].bank['zoom_cap'],bridge_only=True)
                 path=np.where(valid[:,None,None],path,self.dense[s][0][None,first:final])
                 v=self.direct_cost(s,first,path).reshape(len(p),len(q));ok=valid.reshape(v.shape);g=np.full(v.shape,4,np.int8)
+                if self.readouts is not None:ac[:,:,4]=v;av[:,:,4]=ok
                 self.short_paths+=len(path)
                 for family in range(4):
                     curve=self.dense[s][family][first:final];k=min(7,L)
                     compatible=np.isclose(entry[:,:k],curve[:k],rtol=0.,atol=1e-12).all((1,2))&np.isclose(exit[:,-k:],curve[-k:],rtol=0.,atol=1e-12).all((1,2))
                     compatible=compatible.reshape(v.shape)
+                    if self.readouts is not None:ac[:,:,family]=base[family];av[:,:,family]=compatible
                     better=compatible&(~ok|(base[family]<v));v=np.where(better,base[family],v);g=np.where(better,family,g);ok|=compatible
             # Add the non-baseline family only on the adjacent-opportunity
             # DAG, not all quadratic long holds. Long baseline alternatives
@@ -273,12 +298,39 @@ class ArcCosts:
                 path,valid=whole_viewports(entry,exit,length=L,cap=self.cats[s].bank['zoom_cap'])
                 safe=np.where(valid[:,None,None],path,self.dense[s][0][None,first:final])
                 actual=self.direct_cost(s,first,safe).reshape(len(p),len(q));valid=valid.reshape(v.shape)
+                if self.readouts is not None:
+                    ac[:,:,5]=actual;av[:,:,5]=valid
+                    transfers[np.ix_(p,q,[5])]=self.readouts[s].summary(first,safe,hold_first=first).reshape(len(p),len(q),1,4)
                 better=valid&(~ok|(actual<v));v=np.where(better,actual,v);g=np.where(better,5,g);ok|=valid
                 self.whole_viewport_paths_scored+=len(path)
                 self.peak_batch_bytes=max(self.peak_batch_bytes,path.nbytes+safe.nbytes)
             ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok&clock_ok;codes[ix]=g
+            if self.readouts is not None:
+                alternatives[ix]=ac+fragments[s];alternative_ok[ix]=av&clock_ok[:,:,None]
+                if L>=76:
+                    middle=self.readouts[s].base(first+38,final-38)
+                    transfer=then(then(self.readout_left[i][p,None],middle[None,None]),self.readout_right[j][None,q])
+                    transfers[np.ix_(p,q,np.arange(4))]=transfer
+                else:
+                    ps,qs=np.meshgrid(p,q,indexing='ij')
+                    entry=np.asarray([self.entries[i][k].strip for k in ps.ravel()])
+                    exit=np.asarray([self.exits[j][k].strip for k in qs.ravel()])
+                    for family in range(5):
+                        if not av[:,:,family].any():continue
+                        baseline=self.dense[s][0 if family==4 else family]
+                        if L<38 and family<4:path=np.broadcast_to(baseline[first:final],(len(entry),L,3))
+                        else:path,_=cameras(entry,exit,baseline[first:final],cap=self.cats[s].bank['zoom_cap'],bridge_only=family==4)
+                        summary=self.readouts[s].summary(first,path,hold_first=first,baseline=baseline)
+                        transfers[np.ix_(p,q,[family])]=summary.reshape(len(p),len(q),1,4)
         self.last_codes=(i,j,codes)
+        if self.readouts is not None:self.last_alternatives=(alternatives,alternative_ok,transfers)
         return cost,allowed,codes
+
+    def alternatives(self,i,j):
+        """Preserve all finite camera codes before future burden is known."""
+        if self.readouts is None:raise ValueError('SceneReadout must be enabled before scoring')
+        self(i,j)
+        return self.last_alternatives
 
     def replay(self,i,j,p,q,code):
         first,final=map(int,self.nodes[[i,j]]);source=self.entries[i][p].source

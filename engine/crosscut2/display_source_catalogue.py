@@ -54,6 +54,8 @@ class SourceCatalogue:
             q=np.minimum(1.,height/120.)*np.minimum(1.,edge/.5)*np.minimum(1.,contrast/.075)*(1.-clipped)
             self.quality=np.where(bank['native_readability_valid'],q,self.quality)
         self.black=np.clip((style['presence'][...,0]-.8)/.2,0,1)
+        from .scene_readout import roi_readability
+        self.roi_readability,self.roi_readability_valid=roi_readability(bank)
         # Explicit numerical integration domain; never used as native K proof.
         ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
         order=np.argsort(ticks,kind='stable');ordered=ticks[order]
@@ -184,13 +186,13 @@ class SourceCatalogue:
         projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
         crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
         if self.editorial_content:
-            # Once the original pixels are readable, small quality differences
-            # do not accrue a perpetual source reward. Digital enlargement
-            # cannot create native detail. The native .12 close-up sampling
-            # size and half-quality convention are explicit engineering units,
-            # not a fitted professional-quality threshold.
-            readable=np.minimum(1.,np.sqrt(quality)/.5)*np.minimum(1.,h[...,2]/.12)
-            shown=np.where(scores.max(-1)>0,readable*fraction*(1.-self.black[n,side]),0.)
+            # Native ROI deficits remain explicit; digital enlargement cannot
+            # create detail. The native .12 sampling size and item-wise units
+            # are engineering conventions, not fitted aesthetic thresholds.
+            # ROI deficits and UNKNOWN stay distinct. Global black background
+            # is style, not a recurring defect in an equally readable face.
+            readable=self.roi_readability[n,side,index]*np.minimum(1.,h[...,2]/.12)
+            shown=np.where(scores.max(-1)>0,readable*fraction,0.)
             role=1.-self.featured_factor[n,side,index]
             # Reuse joint_cameras' oversized-head effort, applying it only to
             # EXTRA enlargement. An original tight shot is not called missing.

@@ -24,13 +24,16 @@ from .focal_appearance import cosine as focal_appearance_cosine
 
 class PlayedPosePortPrior:
     port_camera_prior=True
-    def __init__(self,*,person_extents=False,editorial_opportunities=False):
+    def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False):
+        if scene_readout and not editorial_opportunities:
+            raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
             'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py','editorial_opportunities.py',
-            'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py','editorial_roles.py']
+            'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py','editorial_roles.py',
+            'scene_readout.py','readout_port_dp.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -70,13 +73,21 @@ class PlayedPosePortPrior:
         if editorial_opportunities:
             self.artifact.update(contract='fixed_episode_typed_scene_point_boundary_port_E4_v2',
                 matched_action_change_credit='once_per_fixed_music_episode * actually_observed_incoming_exposure',
-                content_integration='readability_deficit_plateau_native_detail_role_crop_no_own_activity_reward',
+                content_integration='target_ROI_component_deficits_UNKNOWN_.5_role_crop_no_background_black_reward',
                 transition_integration='six_frame_instantaneous_geometry_appearance_plus_observed_window_pose',
                 role_handoff='original_family_pre_camera_soft_interpretation_shared_with_native',
                 ordinary_scene_changes='unpaired_paths_pay_finite_full_discrepancy_without_claiming_face_match',
                 maximum_measured_face_height_ratio=None,maximum_measured_displacement_in_face_heights=None,
                 paired_match_face_height_ratio_gate=1.5,paired_match_displacement_in_face_heights_gate=1.,
                 opportunity_units_are_unfitted_engineering=True)
+        self.artifact['scene_readout']=bool(scene_readout)
+        if scene_readout:
+            self.artifact.update(contract='scene_readout_residual_burden_boundary_port_E5_v1',
+                readout_state='cost_and_residual_debt_frontier_per_port_and_paid_bit',
+                exact_global_optimum_claimed=False,readout_label_limit=8,
+                tau='fixed_median_preselection_music_episode_seconds_not_human_cognition',
+                raw_head_observations_not_dense_track_or_camera_cause=True,
+                unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
 
@@ -92,6 +103,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
+    readout=bool(prior.artifact.get('scene_readout',False))
     def live():
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
@@ -160,8 +172,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
         person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
-        roles=roles,point_geometry=editorial)
-    cut_cache={};cut_statistics=[];entry_density={}
+        roles=roles,point_geometry=editorial,
+        readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps))
+    cut_cache={};cut_statistics=[];entry_density={};cut_transfers={}
     beat_frames=np.asarray(nodes)[music>0]
     exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
     def cut(n):
@@ -193,6 +206,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                             a[left_index],port.source,detail['matched_action_change_density'][left_index,right_index]))
             entry_density[n]=density
             cut_cache[n]=(event_energy(detail,weights,fps=fps,point_geometry=editorial),admitted)
+            if readout:
+                from .scene_readout import change
+                cut_transfers[n]=change(detail['face_rate'],unit=6./fps)
             cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
                 visible_person_extent_comparable_port_pairs=int((detail['person_extent_measured']&(a[:,None]!=b[None,:])).sum()),
                 unknown_face_port_pairs_with_person_extent=int((detail['person_extent_measured']&~detail['measured_face']&(a[:,None]!=b[None,:])).sum())))
@@ -201,12 +217,13 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     # removes exact common content prefix cancellation and does not add edits.
     potential=np.min(np.concatenate(arcs.prefix,axis=0),axis=0)[np.asarray(nodes,int)]
     def holds(i,j):
-        costs,allowed,codes=arcs(i,j)
+        if readout:costs,allowed,transfer=arcs.alternatives(i,j)
+        else:costs,allowed,codes=arcs(i,j)
         if i and i not in entry_density:cut(i)
         density=entry_density.get(i,np.zeros(len(entries[i])))
         reward=(min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
             if opportunities is None else 0.)
-        return costs-reward-(potential[j]-potential[i]),allowed,codes
+        return costs-reward-(potential[j]-potential[i]),allowed,transfer if readout else codes
     observed_exposure={}
     def credit(i,j):
         if not i:return np.zeros(len(entries[0]))
@@ -216,12 +233,18 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         exposure=np.minimum(observed_exposure[i],float(nodes[j]-nodes[i])/fps)
         return opportunities.credit(i,entry_density[i],exposure)
     live();prepared=monotonic();phase='selection';selection_start=prepared
-    port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
-        start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live,
-        opportunity_episodes=None if opportunities is None else opportunities.episodes,
-        hold_credit=None if opportunities is None else credit)
+    if readout:
+        from .readout_port_dp import solve as readout_solve
+        port_runs,objective,dp=readout_solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
+            start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,cut_transfer=lambda n:cut_transfers[n],
+            minimum_frames=12,check=live,episodes=opportunities.episodes,credit=credit)
+    else:
+        port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
+            start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live,
+            opportunity_episodes=None if opportunities is None else opportunities.episodes,
+            hold_credit=None if opportunities is None else credit)
     score=float(objective[0]+potential[-1]-potential[0]);selected=SelectedPorts(nodes,fps)
-    runs=[];chosen_states=[];chosen_rows=[];parts=[];frozen=[];cumulative=0.
+    runs=[];chosen_states=[];chosen_rows=[];parts=[];frozen=[];cumulative=0.;debt=0.
     for k,((i,j,p,q),code) in enumerate(zip(port_runs,dp['selected_arc_codes'])):
         live();source=entries[i][p].source;first,final=map(int,np.asarray(nodes)[[i,j]])
         # Replay ONLY the code saved at the actual DP improvement. No argmin,
@@ -232,7 +255,18 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         change_credit=(min(float(final-first)/fps,exposure_seconds)*float(density[p]) if opportunities is None
             else dp['opportunity_claims'][k]['credit'])
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
-        cumulative+=cost-change_credit+incoming
+        sequence_cost=0.
+        if readout:
+            from .scene_readout import apply
+            if k:
+                debt,extra=apply(cut_transfers[i][port_runs[k-1][3],p],debt);sequence_cost+=float(extra)
+            if not math.isclose(debt,dp['selected_readout_states'][k]['entry_debt'],rel_tol=1e-8,abs_tol=1e-8):
+                raise AssertionError('selected readout entry state differs from actual sequence')
+            transfer=arcs.readouts[source].summary(first,curve[None],hold_first=first)[0]
+            debt,extra=apply(transfer,debt);sequence_cost+=float(extra)
+            if not math.isclose(debt,dp['selected_readout_states'][k]['exit_debt'],rel_tol=1e-8,abs_tol=1e-8):
+                raise AssertionError('selected readout exit state differs from exact camera replay')
+        cumulative+=cost-change_credit+incoming+sequence_cost
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
         heads,indices,ambiguity,scene=focal_metadata(banks[source]['heads'],grid_camera)
         chosen_states.append(State(source,None,'boundary_arc_'+str(code)))
@@ -258,7 +292,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             camera_arc_code=int(code),camera_path_sha256=digest,per_frame_camera_count=len(curve)))
         parts.append(dict(first_frame=first,final_frame=final,source=source,
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
-                measured_matched_action_change_credit=-change_credit),cumulative_cost=cumulative))
+                measured_matched_action_change_credit=-change_credit,
+                residual_readout_interaction=sequence_cost),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
             detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
@@ -309,6 +344,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if not math.isclose(cumulative,score,rel_tol=1e-8,abs_tol=1e-7):
         raise AssertionError('E selected actual camera/pose decomposition differs from DP: '+str((cumulative,score)))
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
+        scene_readout_consumed=readout,
+        scene_readout_observations=[] if not readout else [r.receipt() for r in arcs.readouts],
+        pre_DP_scalar_camera_argmin_used=not readout,
         original_feature_roles=None if roles is None else roles.receipt(),
         instantaneous_geometry_support_not_shortened_by_adjacent_native_cuts=editorial,
         editorial_opportunities=None if opportunities is None else opportunities.receipt(),
