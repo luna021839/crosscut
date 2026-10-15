@@ -69,23 +69,25 @@ def whole_viewports(entry,exit,*,length,cap):
 
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
-                 person_extents=False,opportunity_episodes=None):
+                 person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
         self.prefix=[];self.native_tables=[];self.left=[];self.right=[];self.calls=0;self.last_codes=None
         self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
+        self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
         self.whole_viewport_paths_scored=0
         for s,paths in enumerate(dense):
             check();frames=np.arange(int(nodes[-1]));values=np.asarray(paths)
             rates=catalogues[s].rates(frames,values)/fps
             movement=self.movement(s,frames,values)
             self.prefix.append(np.pad(np.cumsum(rates,axis=1),((0,0),(1,0)))+np.pad(np.cumsum(movement,axis=1),((0,0),(2,0))))
-            xs=support.events[s];rates_native=self.native_rates(s,xs,values[:,np.maximum(0,xs-1)],values[:,xs])
+            xs=support.events[s];rates_native,points=self.native_rates(s,xs,values[:,np.maximum(0,xs-1)],values[:,xs],components=True)
             weights=physical_weights(xs,final=support.final,fps=fps)
             w=np.array([weights[int(t)] for t in xs])
             self.native_tables.append((xs,rates_native,w,np.pad(np.cumsum(rates_native*w,axis=1),((0,0),(1,0)))))
+            self.native_points.append((points,np.pad(np.cumsum(points,axis=1),((0,0),(1,0)))))
         # Prefix movement edge ending at first is not in a newly cut hold.
         self._baseline_edge=[self.movement(s,np.arange(int(nodes[-1])),np.asarray(paths)) for s,paths in enumerate(dense)]
         for n,tick in enumerate(nodes):
@@ -125,9 +127,11 @@ class ArcCosts:
         if len(frames)>1:result[...,np.isin(frames[1:],self.support.events[s])]=0.
         return result
 
-    def native_rates(self,s,xs,before,after):
+    def native_rates(self,s,xs,before,after,*,components=False):
         B=len(before);E=len(xs)
-        if not E:return np.zeros((B,0))
+        if not E:
+            value=np.zeros((B,0))
+            return (value,value.copy()) if components else value
         bank=self.native[s];lookup={int(x):i for i,x in enumerate(bank['frames'])}
         heads=np.zeros((E,2,8,4));seen=np.zeros(E,bool)
         for e,x in enumerate(xs):
@@ -158,7 +162,8 @@ class ArcCosts:
         appearance,_=appearance_discrepancy(own[:,:,0],own[:,:,1],member_a=member[:,:,0],member_b=member[:,:,1])
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
         valid=(scores.max(-1)>0).all(-1)
-        face,_,_=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)
+        face,displacement,scale=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)
+        face_rate=face.copy()
         if getattr(self,'person_extents',False):
             from .person_extent import height_interval,interval_gap,used_face_risk
             pairs=bank.get('person_rectangles',{})
@@ -171,7 +176,17 @@ class ArcCosts:
         # body windows. Use the SAME missing-pose convention as authored K.
         # A known bad native event stays finite and playable; it is not gated
         # out or laundered through a near-constant confidence-like1-Q rate.
-        return face+.5+appearance
+        detail=dict(geometry_rate=face,face_rate=face_rate,pose_rate=np.full_like(face,.5),appearance_rate=appearance,
+            face_log_scale=scale,screen_displacement=np.linalg.norm((c[:,:,0]-c[:,:,1])*[16/9,1.],axis=-1),
+            measured_face=valid,motion_flow_rate=np.full_like(face,.5),allowed=np.ones_like(valid))
+        if getattr(self,'roles',None) is not None:
+            from .editorial_roles import apply
+            detail=apply(detail,self.roles.at(np.asarray(xs)[None,:],member[:,:,0],member[:,:,1]))
+        rate=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']
+        if not components:return rate
+        if getattr(self,'point_geometry',False):
+            return detail['pose_rate'],6./self.fps*(detail['geometry_rate']+detail['appearance_rate'])
+        return rate,np.zeros_like(rate)
 
     def native_weights(self,s,first,final,xs):
         all_xs,_,weights,_=self.native_tables[s]
@@ -186,8 +201,9 @@ class ArcCosts:
         xs=self.support.events[s];xs=xs[(xs>frames[0])&(xs<=frames[-1])&(xs>first)&(xs<final)]
         if len(xs):
             at=xs-frames[0]
-            changed=self.native_rates(s,xs,new[:,at-1],new[:,at])-self.native_rates(s,xs,old[:,at-1],old[:,at])
-            value+=changed@self.native_weights(s,first,final,xs)
+            new_rate,new_point=self.native_rates(s,xs,new[:,at-1],new[:,at],components=True)
+            old_rate,old_point=self.native_rates(s,xs,old[:,at-1],old[:,at],components=True)
+            value+=(new_rate-old_rate)@self.native_weights(s,first,final,xs)+(new_point-old_point).sum(-1)
         self.peak_batch_bytes=max(self.peak_batch_bytes,new.nbytes+old.nbytes)
         return value
 
@@ -198,6 +214,8 @@ class ArcCosts:
         if a<b:
             weights=self.native_weights(s,first,final,xs[a:b])
             result+=prefix[:,b]-prefix[:,a]+rates[:,a:b]@(weights-w[a:b])
+            _,point_prefix=self.native_points[s]
+            result+=point_prefix[:,b]-point_prefix[:,a]
         return result
 
     def direct_cost(self,s,first,path):
@@ -206,7 +224,8 @@ class ArcCosts:
         xs=self.support.events[s];xs=xs[(xs>first)&(xs<final)]
         if len(xs):
             at=xs-first
-            result+=self.native_rates(s,xs,path[:,at-1],path[:,at])@self.native_weights(s,first,final,xs)
+            rates,points=self.native_rates(s,xs,path[:,at-1],path[:,at],components=True)
+            result+=rates@self.native_weights(s,first,final,xs)+points.sum(-1)
         return result
 
     def __call__(self,i,j):

@@ -185,6 +185,8 @@ def matrix(left, right, *, details=False):
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
+        screen_displacement=np.linalg.norm(left['center'][:,None]-right['center'][None,:],axis=-1),
+        motion_flow_rate=np.stack([velocity[...,list(c)].mean(-1) for c in CHANNELS],axis=-1).mean(-1),
         fixed_semantic_channel_rates=channels,
         played_body_placement_channels=(played_phase+played_bridge)/2.,
         common_clock_action_channels=context,

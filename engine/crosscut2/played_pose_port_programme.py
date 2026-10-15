@@ -30,7 +30,7 @@ class PlayedPosePortPrior:
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
             'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py','editorial_opportunities.py',
-            'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py']
+            'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py','editorial_roles.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -68,9 +68,14 @@ class PlayedPosePortPrior:
             professional_quality_approved=False,normal_app_activation_approved=False)
         self.artifact['fixed_editorial_opportunities']=bool(editorial_opportunities)
         if editorial_opportunities:
-            self.artifact.update(contract='fixed_episode_supported_exposure_boundary_port_E4_v1',
+            self.artifact.update(contract='fixed_episode_typed_scene_point_boundary_port_E4_v2',
                 matched_action_change_credit='once_per_fixed_music_episode * actually_observed_incoming_exposure',
                 content_integration='readability_deficit_plateau_native_detail_role_crop_no_own_activity_reward',
+                transition_integration='six_frame_instantaneous_geometry_appearance_plus_observed_window_pose',
+                role_handoff='original_family_pre_camera_soft_interpretation_shared_with_native',
+                ordinary_scene_changes='unpaired_paths_pay_finite_full_discrepancy_without_claiming_face_match',
+                maximum_measured_face_height_ratio=None,maximum_measured_displacement_in_face_heights=None,
+                paired_match_face_height_ratio_gate=1.5,paired_match_displacement_in_face_heights_gate=1.,
                 opportunity_units_are_unfitted_engineering=True)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
@@ -107,11 +112,14 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
     cats=[]
     if subjects is not None and len(subjects)!=len(banks):raise ValueError('one dense subject binding per physical source required')
-    face_members=[None]*len(banks);featured=[None]*len(banks)
+    face_members=[None]*len(banks);featured=[None]*len(banks);roles=None
     if identity_hints is not None:
         from .featured_member_state import bind_hints,consensus
         face_members,native_ports=bind_hints(banks,identity_hints,native_ports)
-        featured,featured_receipt=consensus(banks,face_members)
+        featured,featured_receipt,role_evidence=consensus(banks,face_members,return_evidence=True)
+        if editorial:
+            from .editorial_roles import FeatureRoles
+            roles=FeatureRoles(nodes,role_evidence)
         receipt.update(source_local_member_hints_consumed=True,featured_member_state=featured_receipt)
     framing=None
     if editorial:
@@ -131,7 +139,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
-    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities)
+    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -140,7 +148,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
-        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities)
+        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -151,7 +159,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
-        person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes)
+        person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
+        roles=roles,point_geometry=editorial)
     cut_cache={};cut_statistics=[];entry_density={}
     beat_frames=np.asarray(nodes)[music>0]
     exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
@@ -161,8 +170,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents)
             right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents)
             detail=matrix(left,right,details=True)
-            rates=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate'];admitted=detail['allowed']
             a=np.array([p.source for p in exits[n]]);b=np.array([p.source for p in entries[n]])
+            from .editorial_roles import apply,event_energy,ordinary_pairs
+            if roles is not None:
+                detail=apply(detail,roles.at(int(nodes[n]),left['member_hints'][:,None],right['member_hints'][None,:]))
+            admitted=detail['allowed'].copy()
+            if editorial:admitted|=ordinary_pairs(exits[n],entries[n])
             weights=support.cut_weights(int(nodes[n]),np.arange(len(cats)))[a[:,None],b[None,:]]
             admitted&=a[:,None]!=b[None,:]
             density=np.zeros(len(b))
@@ -179,7 +192,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                         opportunities.density(n,exits[n][left_index].observation,port.observation,
                             a[left_index],port.source,detail['matched_action_change_density'][left_index,right_index]))
             entry_density[n]=density
-            cut_cache[n]=(rates*weights,admitted)
+            cut_cache[n]=(event_energy(detail,weights,fps=fps,point_geometry=editorial),admitted)
             cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
                 visible_person_extent_comparable_port_pairs=int((detail['person_extent_measured']&(a[:,None]!=b[None,:])).sum()),
                 unknown_face_port_pairs_with_person_extent=int((detail['person_extent_measured']&~detail['measured_face']&(a[:,None]!=b[None,:])).sum())))
@@ -250,7 +263,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
             detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
                 features([b.observation],fps=fps,person_extents=person_extents),details=True)
-            if not detail['allowed'][0,0]:raise AssertionError('selected cut violates unchanged D face gate')
+            if roles is not None:
+                from .editorial_roles import apply
+                detail=apply(detail,roles.at(int(nodes[i]),a.observation['recurrent_member_hint'],b.observation['recurrent_member_hint']))
+            if not cut(i)[1][previous[3],p]:raise AssertionError('selected cut violates its declared transition admission')
+            from .editorial_roles import ordinary_pairs
+            ordinary=bool(editorial and ordinary_pairs([a],[b])[0,0])
             observed=[a.observation,b.observation]
             predicted=[]
             for side,obs in enumerate(observed):
@@ -263,6 +281,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 appearance_used_in_objective=True,anonymous_appearance_is_not_member_identity=True,
                 anonymous_appearance_rate=float(detail['appearance_rate'][0,0]),
                 anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),
+                feature_handoff_strength=float(detail.get('feature_handoff_strength',np.zeros((1,1)))[0,0]),
+                editorial_transition_kind='SCENE_CHANGE' if ordinary else 'MATCH_ACTION_CANDIDATE',
+                successful_face_match_claimed=not ordinary and bool(detail['allowed'][0,0]),
                 recurrent_member_hints=[int(o['recurrent_member_hint']) for o in (a.observation,b.observation)],
                 same_clock_source_action_used=bool(detail['same_clock_source_action_used'][0,0]),
                 contemporary_dense_action_used=bool(detail['contemporary_dense_action_used'][0,0]),
@@ -287,6 +308,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if not math.isclose(cumulative,score,rel_tol=1e-8,abs_tol=1e-7):
         raise AssertionError('E selected actual camera/pose decomposition differs from DP: '+str((cumulative,score)))
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
+        original_feature_roles=None if roles is None else roles.receipt(),
+        instantaneous_geometry_support_not_shortened_by_adjacent_native_cuts=editorial,
         editorial_opportunities=None if opportunities is None else opportunities.receipt(),
         actual_opportunity_supported_entry_ports=sum(int((observed_exposure[n]>0).sum()) for n in observed_exposure),
         actual_opportunity_useful_supported_entry_ports=sum(int(((observed_exposure[n]>0)&(entry_density[n]>0)).sum())

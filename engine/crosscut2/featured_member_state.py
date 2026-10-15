@@ -42,7 +42,7 @@ def bind_hints(banks,hints,native_ports):
     return faces,native
 
 
-def consensus(banks,members):
+def consensus(banks,members,*,return_evidence=False):
     shape=banks[0]['heads'].shape[:2]
     families=[bank.get('consensus_family',('unverified_source',s)) for s,bank in enumerate(banks)]
     groups={key:i for i,key in enumerate(dict.fromkeys(families))}
@@ -76,7 +76,10 @@ def consensus(banks,members):
         selected=np.take_along_axis(posterior,np.maximum(0,names),axis=2)
         probability=np.where(names>=0,selected,1./6.)
         factors.append(1.-confidence[...,None]+confidence[...,None]*probability/maximum[...,None])
-    return factors,dict(source_families=len(groups),framing_consensus_nodes=int((confidence>0).sum()),
+    receipt=dict(source_families=len(groups),framing_consensus_nodes=int((confidence>0).sum()),
         mean_confidence=float(confidence.mean()),maximum_confidence=float(confidence.max()),
         inferred_featured_not_verified_active_singer=True,named_identity_certified=False,
         unknown_is_not_forced_to_a_member=True,source_exclusion=False)
+    if return_evidence:
+        return factors,receipt,dict(posterior=posterior,confidence=confidence,family_votes=votes)
+    return factors,receipt

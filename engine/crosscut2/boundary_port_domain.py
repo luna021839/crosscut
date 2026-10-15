@@ -17,7 +17,7 @@ class BoundaryPort:
     geometry_hash: str
 
 
-def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None):
+def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
@@ -73,6 +73,12 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             native_pair=matrix(features(native_left,fps=fps),features(native_right,fps=fps),details=True)
             if opportunities is not None:
                 opportunities.observe(n,native_left,native_right,native_pair,left_sources,right_sources)
+            role_strength=np.zeros(native_pair['pose_rate'].shape)
+            if roles is not None:
+                from .editorial_roles import apply
+                role_strength=roles.at(tick,np.asarray([o['recurrent_member_hint'] for o in native_left])[:,None],
+                    np.asarray([o['recurrent_member_hint'] for o in native_right])[None,:])
+                native_pair=apply(native_pair,role_strength)
             pose=native_pair['pose_rate'];appearance=native_pair['appearance_rate']
             candidates={}
             for ai,left_obs in enumerate(native_left):
@@ -82,11 +88,22 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     if a==b:continue
                     actor_pairs_considered+=1
                     quality=min(left_obs['displayed_native_quality_proxy'],right_obs['displayed_native_quality_proxy'])
-                    for k,(ca,cb) in enumerate(pair_proposals(fa,fb,caps=(catalogues[a].bank['zoom_cap'],catalogues[b].bank['zoom_cap']))):
+                    options=list(pair_proposals(fa,fb,caps=(catalogues[a].bank['zoom_cap'],catalogues[b].bank['zoom_cap'])))
+                    if role_strength[ai,bi]>0:
+                        # A genuine role change must not be represented ONLY
+                        # by common-face-size zooms. Native framing is still
+                        # subject-pinned and competes in the same global8.
+                        from .paired_geometry import Camera
+                        options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
+                    for k,(ca,cb) in enumerate(options):
                         left=np.array([ca.zoom,ca.x,ca.y]);right=np.array([cb.zoom,cb.x,cb.y])
                         pa=.5+left[0]*(fa[:2]-left[1:]);pb=.5+right[0]*(fb[:2]-right[1:])
                         ha,hb=fa[2]*left[0],fb[2]*right[0]
                         error=max(abs(math.log(ha/hb))/math.log(1.5),np.linalg.norm((pa-pb)*[16/9,1.])/max(.005,(ha+hb)/2.))
+                        if role_strength[ai,bi]>0:
+                            scale=abs(math.log(ha/hb))/math.log(1.5)
+                            framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
+                            error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
                         score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(math.log(left[0])+math.log(right[0]))
                         if opportunities is not None:
                             score-=opportunities.density(n,left_obs,right_obs,a,b,
@@ -124,5 +141,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         physical_actor_pairs_compared_before_camera=actor_pairs_considered,
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
         raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
+        original_feature_role_used_before_global_pruning=roles is not None,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)
