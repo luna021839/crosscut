@@ -75,10 +75,15 @@ class SourceCatalogue:
         body=np.zeros((2,8,3),np.float32) if not 0<=h<3 else self.body[n,sl,h]
         evidence=np.zeros((2,8),np.uint8) if not 0<=h<3 else self.evidence[n,sl,h]
         ownership=np.zeros((2,8),bool) if not 0<=h<3 else self.ambiguity[n,sl,h]
+        appearance=np.zeros(128,np.float32)
+        if 0<=h<3 and 'vectors' in self.bank:
+            appearance=np.asarray(self.bank['vectors'][n,side,h],np.float32).copy()
+        appearance.setflags(write=False)
         return dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
             ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
             native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
-            focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]))
+            focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]),
+            appearance_vector=appearance,appearance_is_not_named_identity=True)
 
     def rates(self,frames,cameras):
         """Vectorized (...,len(frames),3) replay camera content rates."""

@@ -19,6 +19,7 @@ from .boundary_arc_costs import ArcCosts
 from .boundary_port_dp import solve
 from .played_event_support import PlayedEventSupport
 from .played_partial_pose import features,matrix
+from .focal_appearance import cosine as focal_appearance_cosine
 
 
 class PlayedPosePortPrior:
@@ -26,7 +27,7 @@ class PlayedPosePortPrior:
     def __init__(self):
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
-            'boundary_port_dp.py','boundary_camera_arc.py']
+            'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract='played_partial_pose_physical_focal_boundary_port_E2_v2',
             source_code_sha256=implementation,supervision_kinds=[],new_fit=False,weak_models_used=False,
@@ -39,6 +40,7 @@ class PlayedPosePortPrior:
             unknown_pose_residual=.5,model_only_shrinkage=.5,shrinkage_is_not_anatomical_probability=True,
             measured_body_action_cost_used=True,pair_conditioned_cameras_added=True,
             physical_GROUP_focal_owns_content_and_pose=True,anatomical_ownership_certified=False,
+            actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=False,
             paired_proposal_global_limit_per_node=8,roll_degrees=0.,
             digital_camera_cannot_create_own_motion=True,
             content_integration='nearest cached face/body within6 outputframes and same native shot; not a dense track',
@@ -145,7 +147,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                     c=cam[at];center=.5+c[0]*(head[:2]-c[1:])
                     predicted.append(dict(center=list(map(float,center)),height=float(head[2]*c[0]),confidence=float(head[3]),
                         source_face_index=obs['head_index'],face_native_sample_is_actual_endpoint=at==(-1 if side==0 else 0)))
-            selected.details[i,k-1,k]=dict(cost=incoming,appearance_cosine=float('nan'),
+            selected.details[i,k-1,k]=dict(cost=incoming,appearance_cosine=focal_appearance_cosine(a.observation,b.observation),
+                appearance_used_in_objective=False,anonymous_appearance_is_not_member_identity=True,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
                 fixed_semantic_pose_rates=detail['fixed_semantic_channel_rates'][0,0].tolist(),
                 played_face_measured=bool(detail['measured_face'][0,0]),
