@@ -51,3 +51,14 @@ def test_original_formation_evidence_requires_people_actually_inside_viewport():
     cat=catalogue();cat.editorial_content=True;cat.framing_evidence=framing;cat.bank['heads']=banks[0]['heads'].copy()
     frames=np.array([19,20]);native=np.tile([1.,.5,.5],(2,1));crop=np.tile([2.,.5,.5],(2,1))
     assert (cat.rates(frames,crop)>cat.rates(frames,native)).all()
+
+
+def test_observed_no_face_cannot_dodge_the_required_closeup_deficit():
+    cat=catalogue();cat.editorial_content=True
+    cat.framing_evidence=evidence([native_bank(.22,'a'),native_bank(.24,'b'),native_bank(.26,'c')])[0]
+    frames=np.array([19,20]);camera=np.tile([1.,.5,.5],(2,1))
+    cat.bank['heads'][:]=0.;cat.content_scope[:]=True
+    known_empty=cat.rates(frames,camera)
+    cat.content_scope[:]=False;unsupported_gap=cat.rates(frames,camera)
+    assert (known_empty>unsupported_gap).all()
+    assert np.isfinite(known_empty).all() and np.isfinite(unsupported_gap).all()

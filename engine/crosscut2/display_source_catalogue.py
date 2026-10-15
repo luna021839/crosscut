@@ -199,7 +199,11 @@ class SourceCatalogue:
             if self.framing_evidence is not None:
                 evidence=self.framing_evidence
                 target=evidence['height'][n,side];confidence=evidence['confidence'][n,side]
-                known=self.content_scope[frames]&(scores.max(-1)>0)
+                # A detector-observed EMPTY/occluded viewport is not an
+                # unobserved frame. It must not receive a free role-deficit
+                # exemption that makes legs-only footage beat readable faces.
+                # Unsupported temporal gaps remain unknown; no source ban.
+                known=self.content_scope[frames]
                 size_deficit=np.maximum(0.,np.log(np.maximum(.019,target)/np.maximum(.019,displayed_height)))/np.log(1.5)
                 # Formation evidence asks for people actually inside THIS
                 # viewport. It is not a hard requirement to show all6 always.
