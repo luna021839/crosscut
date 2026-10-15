@@ -184,7 +184,10 @@ def from_boundary_observation(observation, *, frame, source_binding):
         native = observation.get('source_clock_native_indices')
         if native is None:
             raise ValueError('sparse target needs all four actual native ordinals')
-        track = 'sparse-associated-boundary-'+str(frame)+'-head-'+str(observation['head_index'])
+        subject_key = observation.get('source_clock_subject_key')
+        if subject_key is None:
+            raise ValueError('sparse context needs its actual endpoint subject association')
+        track = 'sparse-associated-boundary-'+repr(subject_key)
         original = np.asarray(observation.get('source_clock_original_heads', np.zeros((4, 8, 4))))
         original_known = (original[..., 2] > .019) & (original[..., 3] >= .75)
         quality = np.asarray(observation.get('source_clock_native_roi_readability', np.full(4, .5)))[:, None]
@@ -256,7 +259,12 @@ def from_original_view(catalogue, n, side, *, source_binding):
             raise ValueError('formation observations disagree on the physical clock')
         target_fields = ('heads', 'head_observed', 'body', 'body_evidence', 'body_ambiguity',
             'roi_readability', 'roi_measured')
-        return TargetScene(source_binding, 'original-observed-set-'+str(frame)+'-'+str(side),
+        # An observed set is unordered. Actual endpoint correspondence keys
+        # can establish the SAME set despite detector-order changes; a side
+        # label alone must not make those observations conflict. Missing
+        # associations still yield distinct hypotheses, not forced matches.
+        set_key = tuple(sorted(s.track for s in scenes))
+        return TargetScene(source_binding, 'original-observed-set-'+repr(set_key),
             first.frames, first.native_indices, FORMATION if kind == 2 else UNKNOWN,
             **{name: np.concatenate([getattr(s, name) for s in scenes], axis=1) for name in target_fields},
             original_heads=first.original_heads, original_observed=first.original_observed)

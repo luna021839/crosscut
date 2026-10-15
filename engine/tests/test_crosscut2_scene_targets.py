@@ -185,3 +185,27 @@ def test_original_unknown_face_free_source_retains_its_actual_clock():
     incoming=from_original_view(cat,1,1,source_binding='hash')
     assert incoming.role==UNKNOWN and not incoming.head_observed.any()
     assert incoming.original_observed[incoming.frames==59,0].all()
+
+
+def test_sparse_endpoint_detector_reordering_preserves_the_same_association_key():
+    from test_crosscut2_source_clock_action import catalogue as action_catalogue
+    cat=action_catalogue(swap=True);camera=np.tile([1.,.5,.5],(7,1))
+    left=from_boundary_observation(cat.observation(1,0,camera,target_head_index=0),frame=20,source_binding='hash')
+    right=from_boundary_observation(cat.observation(1,1,camera,target_head_index=1),frame=20,source_binding='hash')
+    assert left.track==right.track
+    np.testing.assert_array_equal(left.heads,right.heads)
+
+
+def test_formation_set_scope_uses_actual_correspondence_not_side_or_detector_order():
+    cat=catalogue(np.array([0,60,120]));cat.bank['vectors'][:]=0
+    for h,x in enumerate((.2,.5,.8)):
+        cat.bank['heads'][:,:,h]=[x,.35,.08,.99];cat.bank['vectors'][:,:,h,h]=1.
+    cat.bank['heads'][:,1,:3]=cat.bank['heads'][:,1,:3][:,::-1].copy()
+    cat.bank['vectors'][:,1,:3]=cat.bank['vectors'][:,1,:3][:,::-1].copy()
+    # Build the actual producer AFTER preparing its immutable input bank.
+    # A catalogue's endpoint association must not be left stale by fixture edits.
+    from crosscut2.display_source_catalogue import SourceCatalogue
+    cat=SourceCatalogue(cat.nodes,cat.bank,None,[],cat.style,[],fps=cat.fps,editorial_content=True)
+    a=from_original_view(cat,1,0,source_binding='hash')
+    b=from_original_view(cat,1,1,source_binding='hash')
+    assert a.role==b.role==FORMATION and a.track==b.track
