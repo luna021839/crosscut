@@ -25,7 +25,8 @@ def focal_metadata(heads, cameras):
     ambiguity = ordered[..., -2] / np.maximum(1e-12, ordered[..., -1]) if scores.shape[-1] > 1 else np.zeros(indices.shape)
     count = np.sum(scores > 0., axis=-1)
     sorted_sizes = np.sort(np.where(scores > 0., size, 0.), axis=-1)
-    formation = (count >= 3) & (sorted_sizes[..., -1] < 1.6 * sorted_sizes[..., -2])
+    formation = ((count >= 3) & (sorted_sizes[..., -1] < 1.6 * sorted_sizes[..., -2])
+        if scores.shape[-1]>1 else np.zeros(indices.shape,bool))
     scene = np.where(indices < 0, 0, np.where(formation, 2, np.where(ambiguity >= .8, 3, 1))).astype(np.uint8)
     # No zero-head value can produce KNOWN_LOWER_BODY_ONLY.
     return chosen, indices, ambiguity, scene

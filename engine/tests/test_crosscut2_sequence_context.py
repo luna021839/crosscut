@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from crosscut2.scene_targets import from_original_view,UNKNOWN
 from crosscut2.sequence_context import (Evidence,PRIMITIVES,SUMMARIES,FEATURE_NAMES,
-    SCHEMA_SHA256,project,merge,windows,integrate)
+    SCHEMA_SHA256,project,merge,windows,integrate,batched_window_features)
 from test_crosscut2_scene_targets import scene
 from test_crosscut2_scene_readout import catalogue
 
@@ -123,6 +123,7 @@ def test_empty_observation_context_is_explicitly_unknown_and_finite():
     channels=report['features'].reshape(-1,len(PRIMITIVES),len(SUMMARIES))
     assert not channels[:,:,:5].any()
     assert (channels[:,:,5]==1.).all()
+    assert not channels[:,:,6:].any()
 
 
 def test_wrong_schema_old_same_event_weights_or_nonfinite_scores_cannot_sneak_in():
@@ -150,3 +151,68 @@ def test_evidence_arrays_do_not_mutate_the_shared_physical_inputs():
     unsigned=Evidence(np.array([],dtype=np.uint64),np.zeros((0,len(PRIMITIVES))),np.zeros((0,len(PRIMITIVES)),bool))
     assert unsigned.frames.dtype==np.int64
     assert np.isfinite(windows(unsigned,final_frame=1,fps=30.)['features']).all()
+
+
+def test_global_interval_subset_is_identical_including_partial_final_interval_and_empty_request():
+    evidence=rows(np.arange(43),value=.37);whole=windows(evidence,final_frame=43,fps=29.97)
+    for first,last in ((0,12),(12,39),(39,43),(43,43),(5,5)):
+        subset=windows(evidence,final_frame=43,fps=29.97,score_after_frame=first,score_until_frame=last)
+        mask=(whole['interval_final']>first)&(whole['interval_final']<=last)
+        for name in ('features','interval_first','interval_final','interval_seconds'):
+            np.testing.assert_array_equal(subset[name],whole[name][mask])
+    assert whole['interval_seconds'][-1]==pytest.approx(1/29.97)
+
+
+def test_disjoint_fast_merge_matches_duplicate_reduction_with_all_masks_scopes_and_conflicts():
+    rng=np.random.default_rng(63);parts=[]
+    for frames in (np.arange(20,40),np.arange(0,10),np.arange(10,20)):
+        values=rng.normal(size=(len(frames),len(PRIMITIVES)))
+        known=rng.uniform(size=values.shape)>.2;bad=(rng.uniform(size=known.shape)>.8)&~known
+        parts.append(Evidence(frames,values,known,tuple('owner-'+str(k) for k in frames),bad))
+    fast=merge(parts);slow=merge(parts*2)
+    for name in ('frames','values','observed','conflicted'):
+        np.testing.assert_array_equal(getattr(fast,name),getattr(slow,name))
+    assert fast.target_scopes==slow.target_scopes
+    for a,b in ((merge([fast]),fast),(merge([parts[0]]),merge([parts[0],parts[0]]))):
+        for name in ('frames','values','observed','conflicted'):
+            np.testing.assert_array_equal(getattr(a,name),getattr(b,name))
+
+
+def test_repeated_camera_oscillation_is_not_aliased_by_equal_means_ranges_and_latest_values():
+    frames=np.arange(8);values=np.zeros((8,len(PRIMITIVES)));known=np.zeros(values.shape,bool)
+    k=PRIMITIVES.index('additional_log_zoom');known[:,k]=True
+    values[:,k]=[0.,0.,0.,0.,.1,.1,.1,.1]
+    smooth=windows(Evidence(frames,values,known),final_frame=8,fps=30.,interval_frames=8)
+    values[:,k]=[0.,.1,0.,.1,0.,.1,0.,.1]
+    repeated=windows(Evidence(frames,values,known),final_frame=8,fps=30.,interval_frames=8)
+    for name in ('observed_mean','observed_minimum','observed_maximum',
+                 'observed_frame_fraction','latest_observed_value','latest_age_fraction'):
+        np.testing.assert_allclose(column(smooth,'additional_log_zoom',name),column(repeated,'additional_log_zoom',name))
+    assert not np.array_equal(smooth['features'],repeated['features'])
+    assert column(repeated,'additional_log_zoom','observed_adjacent_mean_rate')[0]==pytest.approx(3.)
+    assert column(smooth,'additional_log_zoom','observed_adjacent_mean_rate')[0]==pytest.approx(3/7.)
+
+
+def test_temporal_rates_do_not_bridge_missing_or_conflicting_observations():
+    frames=np.array([0,1,10]);values=np.zeros((3,len(PRIMITIVES)));known=np.zeros(values.shape,bool)
+    k=PRIMITIVES.index('additional_log_zoom');known[:,k]=True;values[:,k]=[0.,.1,2.]
+    report=windows(Evidence(frames,values,known),final_frame=11,fps=30.,interval_frames=11)
+    assert column(report,'additional_log_zoom','observed_adjacent_mean_rate')[0]==pytest.approx(3.)
+    assert column(report,'additional_log_zoom','observed_adjacent_maximum_rate')[0]==pytest.approx(3.)
+    assert column(report,'additional_log_zoom','observed_adjacent_pair_fraction')[0]==pytest.approx(.1)
+    known[1,k]=False;bad=np.zeros(known.shape,bool);bad[1,k]=True
+    report=windows(Evidence(frames,values,known,conflicted=bad),final_frame=11,fps=30.,interval_frames=11)
+    for name in ('observed_adjacent_mean_rate','observed_adjacent_maximum_rate','observed_adjacent_pair_fraction'):
+        assert column(report,'additional_log_zoom',name)[0]==0.
+
+
+@pytest.mark.parametrize('frames',[np.arange(191),np.array([0,3,8,12,54,72,170,185]),np.zeros(0,int)])
+def test_batched_actual_prefix_kernel_equals_independent_single_stream_with_sparse_gaps(frames):
+    rng=np.random.default_rng(89);values=rng.normal(size=(5,len(frames),len(PRIMITIVES)))
+    known=rng.uniform(size=values.shape)>.15;ends=np.r_[np.arange(6,191,6),191]
+    actual=batched_window_features(frames,values,known,ends,fps=29.97,context_frames=120)
+    for b in range(len(values)):
+        full=windows(Evidence(frames,values[b],known[b]),final_frame=191,fps=29.97)
+        np.testing.assert_allclose(actual[b],full['features'],rtol=1e-13,atol=1e-13)
+    assert batched_window_features(frames,values,known,np.zeros(0,int),fps=29.97,
+        context_frames=120).shape==(5,0,len(FEATURE_NAMES))

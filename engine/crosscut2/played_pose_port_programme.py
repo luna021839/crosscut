@@ -33,7 +33,8 @@ class PlayedPosePortPrior:
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
             'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py','editorial_opportunities.py',
             'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py','editorial_roles.py',
-            'scene_readout.py','readout_port_dp.py']
+            'scene_readout.py','readout_port_dp.py','scene_targets.py','sequence_context.py',
+            'sequence_preference_model.py','played_context.py','context_port_dp.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -102,12 +103,24 @@ class SelectedPorts:
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
            identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
-           check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
+           check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.,
+           sequence_preference_model=None,sequence_source_bindings=None):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
+    sequence=sequence_preference_model is not None
+    if sequence:
+        from .sequence_preference_model import Model as SequenceModel
+        if not isinstance(sequence_preference_model,SequenceModel):
+            raise ValueError('an explicit new fixed-time sequence model is required; no same-event checkpoint')
+        if not editorial or readout:
+            raise ValueError('sequence model replaces rejected E5 and requires the E4 ROI/action base')
+        sequence_preference_model.verify()
+        if sequence_source_bindings is None:raise ValueError('sequence model needs actual physical source bindings')
+    elif sequence_source_bindings is not None:
+        raise ValueError('source sequence bindings supplied without a sequence model')
     def live():
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
@@ -155,7 +168,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
-    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles)
+    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
+        coalesce_static_ports=sequence)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -164,7 +178,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
-        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles)
+        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
+            coalesce_static_ports=sequence)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -177,7 +192,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
         person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
         roles=roles,point_geometry=editorial,
-        readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps))
+        readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps),
+        preserve_camera_alternatives=sequence)
+    contextual=None
+    if sequence:
+        contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
+            native_ports=native_ports,fps=fps,source_bindings=sequence_source_bindings,check=live)
     cut_cache={};cut_statistics=[];entry_density={};cut_transfers={}
     beat_frames=np.asarray(nodes)[music>0]
     exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
@@ -221,12 +241,14 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     # removes exact common content prefix cancellation and does not add edits.
     potential=np.min(np.concatenate(arcs.prefix,axis=0),axis=0)[np.asarray(nodes,int)]
     def holds(i,j):
-        if readout:costs,allowed,transfer=arcs.alternatives(i,j)
+        if sequence:costs,allowed=arcs.camera_alternatives(i,j)
+        elif readout:costs,allowed,transfer=arcs.alternatives(i,j)
         else:costs,allowed,codes=arcs(i,j)
         if i and i not in entry_density:cut(i)
         density=entry_density.get(i,np.zeros(len(entries[i])))
         reward=(min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
             if opportunities is None else 0.)
+        if sequence:return costs-(potential[j]-potential[i]),allowed
         return costs-reward-(potential[j]-potential[i]),allowed,transfer if readout else codes
     observed_exposure={}
     def credit(i,j):
@@ -237,7 +259,14 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         exposure=np.minimum(observed_exposure[i],float(nodes[j]-nodes[i])/fps)
         return opportunities.credit(i,entry_density[i],exposure)
     live();prepared=monotonic();phase='selection';selection_start=prepared
-    if readout:
+    if sequence:
+        from .context_port_dp import solve as context_solve
+        port_runs,objective,dp=context_solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
+            start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,context_cost=contextual.incremental,
+            history_key=contextual.equivalent_key,history_frames=contextual.history_frames,minimum_frames=12,check=live,
+            context_lower_bound=lambda ref:0.,  # Model's softplus loss rate is nonnegative.
+            episodes=opportunities.episodes,credit=credit,workspace_limit_bytes=200*2**20-contextual.workspace_reserved_bytes)
+    elif readout:
         from .readout_port_dp import solve as readout_solve
         port_runs,objective,dp=readout_solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
             start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,cut_transfer=lambda n:cut_transfers[n],
@@ -248,6 +277,15 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             opportunity_episodes=None if opportunities is None else opportunities.episodes,
             hold_credit=None if opportunities is None else credit)
     score=float(objective[0]+potential[-1]-potential[0]);selected=SelectedPorts(nodes,fps)
+    context_parts=None
+    if contextual is not None:
+        from .context_port_dp import ArcRef
+        references=[ArcRef(*run,int(code)) for run,code in zip(port_runs,dp['selected_arc_codes'])]
+        context_parts,full_context=contextual.replay(references)
+        if not np.allclose(context_parts,dp['selected_context_costs'],rtol=1e-9,atol=1e-9):
+            raise AssertionError('selected fixed-time context differs from independent whole-film replay')
+        if not math.isclose(sum(context_parts),full_context,rel_tol=1e-9,abs_tol=1e-9):
+            raise AssertionError('fixed-time context windows were lost or paid twice at cuts')
     runs=[];chosen_states=[];chosen_rows=[];parts=[];frozen=[];cumulative=0.;debt=0.
     for k,((i,j,p,q),code) in enumerate(zip(port_runs,dp['selected_arc_codes'])):
         live();source=entries[i][p].source;first,final=map(int,np.asarray(nodes)[[i,j]])
@@ -259,7 +297,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         change_credit=(min(float(final-first)/fps,exposure_seconds)*float(density[p]) if opportunities is None
             else dp['opportunity_claims'][k]['credit'])
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
-        sequence_cost=0.
+        sequence_cost=0. if context_parts is None else context_parts[k]
         if readout:
             from .scene_readout import apply
             if k:
@@ -297,7 +335,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         parts.append(dict(first_frame=first,final_frame=final,source=source,
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
                 measured_matched_action_change_credit=-change_credit,
-                residual_readout_interaction=sequence_cost),cumulative_cost=cumulative))
+                residual_readout_interaction=sequence_cost if readout else 0.,
+                fixed_time_sequence_preference=sequence_cost if sequence else 0.),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
             detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
@@ -350,7 +389,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
         scene_readout_consumed=readout,
         scene_readout_observations=[] if not readout else [r.receipt() for r in arcs.readouts],
-        pre_DP_scalar_camera_argmin_used=not readout,
+        pre_DP_scalar_camera_argmin_used=not (readout or sequence),
+        sequence_preference_consumed=sequence,
+        sequence_preference_model_sha256=None if not sequence else sequence_preference_model.artifact['content_sha256'],
+        sequence_preference_context=None if contextual is None else contextual.receipt(),
         original_feature_roles=None if roles is None else roles.receipt(),
         instantaneous_geometry_support_not_shortened_by_adjacent_native_cuts=editorial,
         editorial_opportunities=None if opportunities is None else opportunities.receipt(),
@@ -364,7 +406,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         boundary_port_domain=domain,boundary_port_DP=dp,
         change_credit_exposure_seconds=exposure_seconds,
         event_preference=dict(fixed_connection_prior=prior.artifact,model_sha256=prior.artifact['content_sha256'],
-            supervision_kinds=[],objective_vector=[score,int(objective[1])]),
+            supervision_kinds=[] if not sequence else ['human_av_context_preference'],
+            sequence_model=None if not sequence else sequence_preference_model.artifact,
+            objective_vector=[score,int(objective[1])]),
         port_pair_statistics=cut_statistics,authored_cuts=int(objective[1]),
         long_prefix_combinations=arcs.long_combinations,short_direct_paths=arcs.short_paths,
         whole_viewport_paths_scored_before_source_selection=arcs.whole_viewport_paths_scored,

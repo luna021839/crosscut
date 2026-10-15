@@ -90,6 +90,17 @@ def test_dense_adapter_keeps_exact_subject_clock_and_actual_contemporary_body():
         from_boundary_observation(observed,frame=21,source_binding='0')
 
 
+def test_dense_adapter_truncates_outside_output_without_clipping_or_duplicating_native_samples():
+    cat,window,_=prepared(0,bump=.08)
+    observed=cat.observation(1,1,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    observed=dict(observed,source_clock_canonical_frame=0,source_clock_final_frame=5)
+    result=from_boundary_observation(observed,frame=0,source_binding='0')
+    np.testing.assert_array_equal(result.frames,np.arange(5))
+    np.testing.assert_array_equal(result.native_indices,np.arange(100,105))
+    np.testing.assert_array_equal(result.body[:,0],window.body[14:19])
+    assert result.head_observed.all() and len(result.frames)==5
+
+
 def test_dense_native_cut_keeps_available_post_samples_without_inventing_pre_track():
     cat,_,_=prepared(0,bump=.08,cut=(100,))
     observed=cat.observation(1,1,np.tile([1.,.5,.5],(7,1)),target_head_index=0)

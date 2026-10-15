@@ -304,6 +304,8 @@ def main():
         help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
     parser.add_argument('--experimental-preference-model',type=Path,
         help='Explicit fitted same-event experimental model; not normal app or professional-quality approval')
+    parser.add_argument('--experimental-sequence-preference-model',type=Path,
+        help='Explicit fitted fixed-time four-second context model; E4 only, no same-event model or default weights')
     parser.add_argument('--fixed-connection-prior',action='store_true',
         help='One declared untrained monotone face/action B prior; no weak imitation checkpoint')
     parser.add_argument('--common-evidence-connection-prior',action='store_true',
@@ -378,16 +380,24 @@ def main():
         raise ValueError('one finite declared perception allowance required')
     if args.editorial_opportunity_exposure and not args.played_pose_port_camera_prior:
         raise ValueError('editorial opportunity exposure requires the actual played port-camera consumer')
+    if args.experimental_sequence_preference_model is not None and (
+            not args.editorial_opportunity_exposure or not args.played_pose_port_camera_prior
+            or args.experimental_preference_model is not None):
+        raise ValueError('new sequence preference requires E4 played ports and no same-event checkpoint')
     if args.opportunity_subject_spec is not None and (not args.editorial_opportunity_exposure or args.reuse_subject_observations is None):
         raise ValueError('bounded subject opportunity probe requires explicit E4 and bound existing subject observations')
     started = monotonic()
     preference_model=None
+    sequence_preference_model=None
     connection_prior=None
     if args.experimental_preference_model is not None:
         from .preference_model import Model
         preference_model=Model(json.loads(args.experimental_preference_model.read_text()))
         if preference_model.artifact['supervision_kinds']==['reference_editor_choice_weak_imitation']:
             raise ValueError('weak source-choice checkpoints are diagnostic, not primary connection quality')
+    if args.experimental_sequence_preference_model is not None:
+        from .sequence_preference_model import Model as SequenceModel
+        sequence_preference_model=SequenceModel(json.loads(args.experimental_sequence_preference_model.read_text()))
     if args.fixed_connection_prior:
         from .connection_prior import ConnectionPrior
         connection_prior=ConnectionPrior()
@@ -561,7 +571,10 @@ def main():
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
-                person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer)
+                person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer,
+                sequence_preference_model=sequence_preference_model,
+                sequence_source_bindings=None if sequence_preference_model is None else
+                    [v['source_sha256'] for v in bound_source_cut_events])
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts
@@ -624,6 +637,9 @@ def main():
                 'reference_editor_choice_weak_imitation' in preference_model.artifact['supervision_kinds']),
             old_or_manual_editorial_timeline_directly_copied=False,
             preference_model_supervision=[] if preference_model is None else preference_model.artifact['supervision_kinds'],
+            fixed_time_sequence_preference_used=sequence_preference_model is not None,
+            sequence_preference_model_sha256=None if sequence_preference_model is None else
+                sequence_preference_model.artifact['content_sha256'],
             fixed_connection_prior_used=connection_prior is not None,
             common_evidence_connection_prior_used=args.common_evidence_connection_prior,
             played_face_connection_prior_used=args.played_face_connection_prior,

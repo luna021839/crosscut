@@ -21,7 +21,7 @@ def test_batch_geometry_matches_independent_opus_scalar_and_actual_strips(length
     np.testing.assert_array_equal(batch[0,-k:],b[-k:])
 
 
-def arc_fixture(with_native):
+def arc_fixture(with_native,**kwargs):
     nodes,cats,paths=prepared()
     entry,exit,dense,_=make(nodes,cats,paths,fps=30.)
     events=[np.array([10,25,40],int),np.array([15,30],int)] if with_native else [np.array([],int)]*2
@@ -32,7 +32,7 @@ def arc_fixture(with_native):
         native.append(dict(frames=xs,heads=heads,observed=np.ones(len(xs),bool)))
     support=PlayedEventSupport(events,final=54,fps=30.)
     fragments=fragment_costs(nodes,events,fps=30.,support_seconds=12/30.)
-    return nodes,entry,exit,ArcCosts(nodes,entry,exit,cats,dense,native,support,fragments,fps=30.),fragments
+    return nodes,entry,exit,ArcCosts(nodes,entry,exit,cats,dense,native,support,fragments,fps=30.,**kwargs),fragments
 
 
 @pytest.mark.parametrize('with_native',[False,True])
@@ -79,3 +79,27 @@ def test_adjacent_opportunity_whole_camera_is_scored_before_DP_and_replayed_exac
                 assert cost[p,q]==pytest.approx(arcs.direct_cost(source,int(nodes[i]),path[None])[0]+fragments(i,j)[source])
                 total+=int(codes[p,q]==5)
     assert arcs.whole_viewport_paths_scored>0
+
+
+@pytest.mark.parametrize('with_native',[False,True])
+def test_all_context_camera_codes_equal_actual_replay_without_rejected_debt(with_native):
+    nodes,entry,exit,arcs,fragments=arc_fixture(with_native,preserve_camera_alternatives=True)
+    arcs.opportunity_episodes=np.array([0,0,1,2]);compared=0
+    assert arcs.readouts is None
+    for i in range(len(nodes)-1):
+        for j in range(i+1,len(nodes)):
+            values,valid=arcs.camera_alternatives(i,j)
+            best,allowed,codes=arcs(i,j)
+            assert np.isfinite(values).all() and values.shape==valid.shape==best.shape+(6,)
+            np.testing.assert_array_equal(valid.any(-1),allowed)
+            for p,q in zip(*np.nonzero(allowed)):
+                assert best[p,q]==pytest.approx(values[p,q][valid[p,q]].min())
+            for p,q,code in zip(*np.nonzero(valid)):
+                path=arcs.replay(i,j,p,q,int(code));source=entry[i][p].source
+                actual=arcs.direct_cost(source,int(nodes[i]),path[None])[0]+fragments(i,j)[source]
+                assert values[p,q,code]==pytest.approx(actual,rel=1e-10,abs=1e-10)
+                frames=np.arange(nodes[i],nodes[j])
+                # Bit exactness matters for points exactly on the viewport.
+                np.testing.assert_array_equal(arcs.sample_camera(i,j,p,q,int(code),frames),path)
+                compared+=1
+    assert compared>0

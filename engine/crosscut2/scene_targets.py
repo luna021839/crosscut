@@ -57,7 +57,7 @@ class TargetScene:
                 or native.shape != frames.shape or native.dtype.kind not in 'iu'
                 or native.min() < 0 or np.any(np.diff(native) < 0)
                 or heads.ndim != 3 or heads.shape[0] != len(frames) or heads.shape[2] != 4
-                or not 1 <= heads.shape[1] <= 8
+                or heads.shape[1] < 1
                 or (self.role == FEATURE and heads.shape[1] != 1)):
             raise ValueError('pre-camera role/targets and chronological physical clocks required')
         shape = heads.shape[:2]
@@ -193,8 +193,15 @@ def from_boundary_observation(observation, *, frame, source_binding):
         quality = np.asarray(observation.get('source_clock_native_roi_readability', np.full(4, .5)))[:, None]
         quality_known = np.asarray(observation.get('source_clock_native_roi_measured', np.zeros(4, bool)))[:, None]
         quality_known = quality_known & head_known
-    if np.any(frames < 0):
-        raise ValueError('boundary context crosses the output origin')
+    final_frame=observation.get('source_clock_final_frame')
+    if type(final_frame) is not int or final_frame<1:
+        raise ValueError('actual output domain required for target samples')
+    inside=(frames>=0)&(frames<final_frame)
+    if not inside.all():
+        frames=frames[inside];native=np.asarray(native)[inside]
+        heads,head_known,body,kinds,ambiguity,original,original_known,quality,quality_known=(v[inside]
+            for v in (heads,head_known,body,kinds,ambiguity,original,original_known,quality,quality_known))
+    if not len(frames):raise ValueError('target has no observations inside the actual output domain')
     # Clipped endpoint schedules may repeat an output sample. Keep exactly
     # one physical observation. Conflicting duplicate measurements become
     # unknown, not several independent samples or a convenient winner.

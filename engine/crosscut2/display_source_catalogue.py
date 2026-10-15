@@ -174,6 +174,7 @@ class SourceCatalogue:
             source_clock_endpoint_head_proxies=common_heads,
             source_clock_observed_sample_mask=sample_mask,
             source_clock_canonical_frame=int(self.nodes[n]),
+            source_clock_final_frame=self.final,
             source_clock_subject_key=(int(self.nodes[n]),int(before),int(after)),
             source_clock_output_frames=np.clip(int(self.nodes[n])+np.array([-7,-1,0,6]),0,self.final-1),
             source_clock_native_indices=self.native[n].copy(),

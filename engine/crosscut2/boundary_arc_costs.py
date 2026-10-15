@@ -20,6 +20,53 @@ def _hermite(a,b,da,db,length):
         +(t**3-t**2)[None,:,None]*(length-1)*db[:,None])
 
 
+def _hermite_samples(a,b,da,db,length,at):
+    # Index the SAME linspace and retain operation order. Merely dividing by
+    # length-1 can differ by an ULP and flip a body point exactly on a border.
+    t=np.linspace(0.,1.,length)[at]
+    return ((2*t**3-3*t**2+1)[:,None]*a
+        +(t**3-2*t**2+t)[:,None]*(length-1)*da
+        +(-2*t**3+3*t**2)[:,None]*b+(t**3-t**2)[:,None]*(length-1)*db)
+
+
+def camera_samples(entry,exit,baseline,offsets,*,code):
+    """Exact sampled values of an ALREADY admissible frozen camera code.
+
+    This neither changes its legality nor fits a new path. It avoids copying
+    an entire long hold for each four-second history/fingerprint evaluation.
+    """
+    entry=np.asarray(entry,float);exit=np.asarray(exit,float);baseline=np.asarray(baseline,float)
+    at=np.asarray(offsets);L=len(baseline)
+    if (entry.shape!=(7,3) or exit.shape!=entry.shape or baseline.shape!=(L,3) or L<1
+            or at.ndim!=1 or at.dtype.kind not in 'iu' or np.any((at<0)|(at>=L))
+            or type(code) is not int or not 0<=code<=5):
+        raise ValueError('actual source arc, camera code and in-range integer samples required')
+    result=baseline[at].copy()
+    if code<4 and L<38:return result
+    if code==5:
+        if L<14:raise ValueError('whole viewport needs two nonoverlapping strips')
+        a=entry.copy();b=exit.copy();a[:,0]=1/a[:,0];b[:,0]=1/b[:,0]
+        middle=(at>=7)&(at<L-7)
+        value=_hermite_samples(a[-1],b[0],a[-1]-a[-2],b[1]-b[0],L-12,at[middle]-6)
+        if np.any(value[:,0]<=0):raise ValueError('inadmissible inverse-zoom arc')
+        value[:,0]=1/value[:,0];result[middle]=value
+    elif L>=14:
+        din=entry[-1]-baseline[6];dout=exit[0]-baseline[-7]
+        vin=entry[-1]-entry[-2]-(baseline[6]-baseline[5])
+        vout=exit[1]-exit[0]-(baseline[-6]-baseline[-7])
+        if L<38 or code==4:
+            middle=(at>=7)&(at<L-7)
+            result[middle]+=_hermite_samples(din,dout,vin,vout,L-12,at[middle]-6)
+        else:
+            first=(at>=7)&(at<18);last=(at>=L-18)&(at<L-7);zero=np.zeros(3)
+            result[first]+=_hermite_samples(din,zero,vin,zero,13,at[first]-6)
+            result[last]+=_hermite_samples(zero,dout,zero,vout,13,at[last]-(L-19))
+    k=min(7,L);first=at<k;last=at>=L-k
+    result[first]=entry[at[first]]
+    result[last]=exit[at[last]-(L-k)+7-k]
+    return result
+
+
 def cameras(entry,exit,baseline,*,cap,bridge_only=False):
     """Batch (... flattened B) integer replay paths, plus feasibility mask."""
     entry=np.asarray(entry,float);exit=np.asarray(exit,float);baseline=np.asarray(baseline,float)
@@ -69,7 +116,8 @@ def whole_viewports(entry,exit,*,length,cap):
 
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
-                 person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None):
+                 person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
+                 preserve_camera_alternatives=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -78,6 +126,8 @@ class ArcCosts:
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
+        self.preserve_camera_alternatives=bool(preserve_camera_alternatives or readout_tau is not None)
+        self.last_camera_alternatives=None
         if readout_tau is not None:
             from .scene_readout import SceneReadout
             self.readouts=[SceneReadout(cat,native_ports[s],support.events[s],dense[s],tau=readout_tau)
@@ -257,9 +307,10 @@ class ArcCosts:
     def __call__(self,i,j):
         self.check();self.calls+=1;first,final=map(int,self.nodes[[i,j]]);L=final-first
         shape=(len(self.entries[i]),len(self.exits[j]));cost=np.zeros(shape);allowed=np.zeros(shape,bool);codes=np.full(shape,-1,np.int8)
+        if self.preserve_camera_alternatives:
+            alternatives=np.zeros(shape+(6,));alternative_ok=np.zeros_like(alternatives,bool)
         if self.readouts is not None:
             from .scene_readout import IDENTITY,then
-            alternatives=np.zeros(shape+(6,));alternative_ok=np.zeros_like(alternatives,bool)
             transfers=np.broadcast_to(IDENTITY,shape+(6,4)).copy()
         fragments=np.asarray(self.fragments(i,j));valid_source=self.integrity.allowed(first,final,np.arange(len(self.cats)))
         if final==self.nodes[-1]:valid_source&=ending_eligible([c.bank for c in self.cats])
@@ -273,13 +324,13 @@ class ArcCosts:
                 [self.entries[i][k] for k in p],[self.exits[j][k] for k in q],fps=self.fps)
             if not clock_ok.any():continue
             base=self.baseline_cost(s,first,final)
-            if self.readouts is not None:
+            if self.preserve_camera_alternatives:
                 ac=np.zeros((len(p),len(q),6));av=np.zeros_like(ac,bool)
             if L>=38:
                 left,lv=self.left[i];right,rv=self.right[j]
                 values=base[None,None,:]+left[p,None,:]+right[None,q,:]
                 valid=lv[p,None,:]&rv[None,q,:]
-                if self.readouts is not None:ac[:,:,:4]=values;av[:,:,:4]=valid
+                if self.preserve_camera_alternatives:ac[:,:,:4]=values;av[:,:,:4]=valid
                 g=np.argmin(np.where(valid,values,np.inf),axis=-1);ok=valid.any(-1)
                 v=np.take_along_axis(values,g[...,None],axis=-1).squeeze(-1)
                 self.long_combinations+=len(p)*len(q)*4
@@ -290,15 +341,16 @@ class ArcCosts:
                 if self.readouts is not None:direct,bridge_transfer=self.direct_cost(s,first,path,with_readout=True)
                 else:direct=self.direct_cost(s,first,path)
                 v=direct.reshape(len(p),len(q));ok=valid.reshape(v.shape);g=np.full(v.shape,4,np.int8)
-                if self.readouts is not None:
+                if self.preserve_camera_alternatives:
                     ac[:,:,4]=v;av[:,:,4]=ok
+                if self.readouts is not None:
                     transfers[np.ix_(p,q,[4])]=bridge_transfer.reshape(len(p),len(q),1,4)
                 self.short_paths+=len(path)
                 for family in range(4):
                     curve=self.dense[s][family][first:final];k=min(7,L)
                     compatible=np.isclose(entry[:,:k],curve[:k],rtol=0.,atol=1e-12).all((1,2))&np.isclose(exit[:,-k:],curve[-k:],rtol=0.,atol=1e-12).all((1,2))
                     compatible=compatible.reshape(v.shape)
-                    if self.readouts is not None:ac[:,:,family]=base[family];av[:,:,family]=compatible
+                    if self.preserve_camera_alternatives:ac[:,:,family]=base[family];av[:,:,family]=compatible
                     better=compatible&(~ok|(base[family]<v));v=np.where(better,base[family],v);g=np.where(better,family,g);ok|=compatible
             # Add the non-baseline family only on the adjacent-opportunity
             # DAG, not all quadratic long holds. Long baseline alternatives
@@ -314,15 +366,17 @@ class ArcCosts:
                 if self.readouts is not None:direct,whole_transfer=self.direct_cost(s,first,safe,with_readout=True)
                 else:direct=self.direct_cost(s,first,safe)
                 actual=direct.reshape(len(p),len(q));valid=valid.reshape(v.shape)
-                if self.readouts is not None:
+                if self.preserve_camera_alternatives:
                     ac[:,:,5]=actual;av[:,:,5]=valid
+                if self.readouts is not None:
                     transfers[np.ix_(p,q,[5])]=whole_transfer.reshape(len(p),len(q),1,4)
                 better=valid&(~ok|(actual<v));v=np.where(better,actual,v);g=np.where(better,5,g);ok|=valid
                 self.whole_viewport_paths_scored+=len(path)
                 self.peak_batch_bytes=max(self.peak_batch_bytes,path.nbytes+safe.nbytes)
             ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok&clock_ok;codes[ix]=g
-            if self.readouts is not None:
+            if self.preserve_camera_alternatives:
                 alternatives[ix]=ac+fragments[s];alternative_ok[ix]=av&clock_ok[:,:,None]
+            if self.readouts is not None:
                 context=self.readouts[s].context_frames
                 if L>=2*context:
                     middle=self.readouts[s].base(first+context,final-context)
@@ -343,8 +397,27 @@ class ArcCosts:
                         summary=self.readouts[s].summary(first,path,hold_first=first,baseline=baseline)
                         transfers[np.ix_(p,q,[family])]=summary.reshape(len(p),len(q),1,4)
         self.last_codes=(i,j,codes)
+        if self.preserve_camera_alternatives:self.last_camera_alternatives=(i,j,alternatives,alternative_ok)
         if self.readouts is not None:self.last_alternatives=(alternatives,alternative_ok,transfers)
         return cost,allowed,codes
+
+    def camera_alternatives(self,i,j):
+        """Retain all legal camera codes without enabling rejected E5 debt.
+
+        The normal scalar E4 interface is unchanged. A contextual consumer
+        must choose its camera jointly with prefix context, not inherit the
+        cheapest isolated-hold argmin. Native/content/clock costs are shared.
+        """
+        if not self.preserve_camera_alternatives:
+            raise ValueError('explicit preserved camera domain required')
+        self(i,j)
+        return self.last_camera_alternatives[2:]
+
+    def sample_camera(self,i,j,p,q,code,frames):
+        first,final=map(int,self.nodes[[i,j]]);source=self.entries[i][p].source
+        baseline=self.dense[source][0 if code in (4,5) else code][first:final]
+        return camera_samples(self.entries[i][p].strip,self.exits[j][q].strip,baseline,
+            np.asarray(frames)-first,code=int(code))
 
     def alternatives(self,i,j):
         """Preserve all finite camera codes before future burden is known."""

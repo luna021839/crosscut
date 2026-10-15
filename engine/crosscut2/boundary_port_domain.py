@@ -17,7 +17,8 @@ class BoundaryPort:
     geometry_hash: str
 
 
-def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None):
+def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
+         coalesce_static_ports=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
@@ -26,14 +27,18 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         observation=catalogues[source].observation(n,side,strip,target_head_index=target_head_index)
         digest=hashlib.sha256(strip.tobytes()).hexdigest()
         return BoundaryPort(source,strip,observation,tuple(ids),digest)
+    static_aliases=0
     def add(items,value):
+        nonlocal static_aliases
         for i,old in enumerate(items):
+            same_static=(coalesce_static_ports and all(x[0]=='static' for x in old.proposal_ids+value.proposal_ids))
             if (old.source==value.source and np.array_equal(old.strip,value.strip)
                     and old.observation['head_index']==value.observation['head_index']
-                    and old.proposal_ids==value.proposal_ids):
+                    and (old.proposal_ids==value.proposal_ids or same_static)):
                 observation=value.observation if value.observation['target_pinned_before_camera'] else old.observation
                 items[i]=BoundaryPort(old.source,old.strip,observation,
                     old.proposal_ids+tuple(x for x in value.proposal_ids if x not in old.proposal_ids),old.geometry_hash)
+                static_aliases+=int(same_static and old.proposal_ids!=value.proposal_ids)
                 return
         items.append(value)
     rejected_reassignments=0;actor_pairs_considered=0;non_native_focal_pairs=0
@@ -142,5 +147,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
         raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
         original_feature_role_used_before_global_pruning=roles is not None,
+        identical_static_port_aliases_coalesced=static_aliases,
+        all_baseline_interior_camera_families_retained=True,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

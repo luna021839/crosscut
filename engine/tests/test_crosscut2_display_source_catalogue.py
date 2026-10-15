@@ -44,6 +44,23 @@ def test_proposal_pairs_retained_and_finite_global_domain_bound():
     assert np.asarray(dense).shape==(2,4,54,3)
 
 
+def test_identical_static_ports_can_share_one_boundary_without_dropping_camera_interiors_or_pairs():
+    nodes,catalogues,paths=prepared()
+    a,b,dense,old=make(nodes,catalogues,paths,fps=30.)
+    c,d,other,new=make(nodes,catalogues,paths,fps=30.,coalesce_static_ports=True)
+    assert new['identical_static_port_aliases_coalesced']>0
+    np.testing.assert_array_equal(dense,other)
+    for before,after in ((a,c),(b,d)):
+        for original,merged in zip(before,after):
+            physical=lambda ports:{(p.source,p.geometry_hash,p.observation['head_index'],
+                p.observation['target_pinned_before_camera']) for p in ports}
+            assert physical(original)==physical(merged)
+            assert {i for p in original for i in p.proposal_ids if i[0]=='paired'}=={
+                i for p in merged for i in p.proposal_ids if i[0]=='paired'}
+            assert len(merged)<=len(original)
+    assert old['global_paired_proposal_limit_per_node']==new['global_paired_proposal_limit_per_node']==8
+
+
 def test_pinned_fourth_face_cannot_borrow_another_face_body_or_descriptor():
     _,catalogues,_=prepared();cat=catalogues[0]
     cat.bank['heads'][1,0,3]=[.5,.3,.12,.99]
