@@ -82,6 +82,8 @@ def features(observations, *, fps, person_extents=False):
     result['source_colour']=np.asarray([o.get('source_colour_histogram',np.zeros((2,40))) for o in observations],float)
     result['source_colour_valid']=np.asarray([o.get('source_colour_valid',False) for o in observations],bool)
     result['visible_quality']=np.asarray([o.get('displayed_native_quality_proxy',0.) for o in observations],float)
+    result['visible_quality_measured']=np.asarray([o.get('displayed_native_quality_measured',False)
+        for o in observations],bool)
     result['member_hints']=np.asarray([o.get('recurrent_member_hint',-1) for o in observations],int)
     if person_extents:
         from .person_extent import height_interval
@@ -200,6 +202,7 @@ def matrix(left, right, *, details=False):
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,measured_style_change=novelty,
+        native_ROI_quality_measured=left['visible_quality_measured'][:,None]&right['visible_quality_measured'][None,:],
         actual_played_match_advantage=played_match_advantage,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,

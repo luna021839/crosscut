@@ -74,6 +74,8 @@ class PlayedPosePortPrior:
             self.artifact.update(contract='fixed_episode_typed_scene_point_boundary_port_E4_v2',
                 matched_action_change_credit='once_per_fixed_music_episode * actually_observed_incoming_exposure',
                 content_integration='target_ROI_component_deficits_UNKNOWN_.5_role_crop_no_background_black_reward',
+                proposal_quality_contract='same_target_ROI_native_detail_visibility_role_no_background_v1',
+                quality_validity_preserved_separately=True,digital_zoom_creates_no_native_ROI_quality=True,
                 transition_integration='six_frame_instantaneous_geometry_appearance_plus_observed_window_pose',
                 role_handoff='original_family_pre_camera_soft_interpretation_shared_with_native',
                 ordinary_scene_changes='unpaired_paths_pay_finite_full_discrepancy_without_claiming_face_match',

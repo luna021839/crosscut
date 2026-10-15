@@ -44,6 +44,36 @@ def test_T1_actual_readable_ROI_cannot_purchase_3_7x_jump_with_background_blackn
     assert roi_readability(good.bank)[0][1,0,0]<1.  # real target exposure deficit retained
 
 
+def test_corrected_ROI_is_also_used_before_global_paired_proposal_pruning():
+    from crosscut2.boundary_port_domain import make
+    nodes=np.array([0,60,120]);memberships=[];quality=[]
+    paths=[[(nodes,np.tile([1.,.5,.5],(3,1))) for _ in range(4)] for _ in range(5)]
+    for black in (.8,.81):
+        cats=[catalogue(nodes,black=black if s==0 else .8) for s in range(5)]
+        entries,_,_,receipt=make(nodes,cats,paths,fps=30.)
+        pairs=sorted({v for port in entries[1] for v in port.proposal_ids if v[0]=='paired'})
+        memberships.append(pairs)
+        quality.append(cats[0].observation(1,1,np.tile([1.,.5,.5],(7,1)))['displayed_native_quality_proxy'])
+        assert receipt['global_paired_proposal_limit_per_node']==8
+        assert len(pairs)==8
+    assert memberships[0]==memberships[1]
+    assert quality[0]==quality[1]==pytest.approx(1.)
+
+
+def test_proposal_ROI_deficits_UNKNOWN_and_digital_magnification_remain_distinct():
+    nodes=np.array([0,30,60]);strip=np.tile([1.,.5,.5],(7,1))
+    cats=[catalogue(nodes),catalogue(nodes,edge=.125),catalogue(nodes,known=False)]
+    observed=[cat.observation(1,1,strip) for cat in cats]
+    q=[row['displayed_native_quality_proxy'] for row in observed]
+    assert q[1]<q[2]<q[0]
+    assert [row['displayed_native_quality_measured'] for row in observed]==[True,True,False]
+    enlarged=strip.copy();enlarged[:,0]=1.3
+    assert cats[0].observation(1,1,enlarged)['displayed_native_quality_proxy']==pytest.approx(q[0])
+    # Role is original evidence, not a new target selected by a crop.
+    cats[0].featured_factor[1,1,0]=.25
+    assert cats[0].observation(1,1,strip)['displayed_native_quality_proxy']==pytest.approx(.25*q[0])
+
+
 def test_T3_transfer_composition_recovery_and_UNKNOWN_do_not_reset_at_virtual_splits():
     first=change(2.,unit=.2);last=change(2.,unit=.2)
     fast=then(then(first,recovery(.5,tau=2.)),last)

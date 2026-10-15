@@ -79,6 +79,15 @@ class SourceCatalogue:
                         physical_window_valid=bool(self.physical[n,side]),native_indices=self.native[n,sl])
                     self.own[n,side,h]=source_activity(observation,fps=fps)
 
+    def target_readability(self,n,side,head_index):
+        """Same original-detail ROI units for content and proposal quality.
+
+        UNKNOWN retains its explicit neutral.5 and separate validity mask.
+        Neither added zoom nor global background brightness creates detail.
+        """
+        height=self.bank['heads'][n,side,head_index,2]
+        return self.roi_readability[n,side,head_index]*np.minimum(1.,height/.12)
+
     def observation(self,n,side,camera_strip,*,target_head_index=None):
         camera_strip=np.asarray(camera_strip,float)
         camera=camera_strip[-1 if side==0 else 0]
@@ -135,8 +144,11 @@ class SourceCatalogue:
             half=head[2]*camera[0]*np.array([.45*9/16,.5])
             extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
             fraction=float(np.prod(extent/np.maximum(1e-9,2*half)))
-            visible_quality=float(np.sqrt(self.quality[n,side,h])*min(1.,head[2]*camera[0]/.22)
-                *np.sqrt(self.salience[n,side,h])*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,h])
+            if self.editorial_content:
+                visible_quality=float(self.target_readability(n,side,h)*fraction*self.featured_factor[n,side,h])
+            else:
+                visible_quality=float(np.sqrt(self.quality[n,side,h])*min(1.,head[2]*camera[0]/.22)
+                    *np.sqrt(self.salience[n,side,h])*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,h])
         result=dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
             ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
             native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
@@ -150,6 +162,9 @@ class SourceCatalogue:
             source_clock_observed_sample_mask=sample_mask,
             source_colour_histogram=colour,source_colour_valid=style_valid,
             displayed_native_quality_proxy=visible_quality,
+            displayed_native_quality_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
+            displayed_native_quality_contract=('target_ROI_native_detail_visibility_original_role_v1'
+                if self.editorial_content else 'legacy_display_quality_v1'),
             recurrent_member_hint=-1 if h<0 else int(self.member_hints[n,side,h]),
             source_clock_context_is_sparse_model_hypothesis=True,
             appearance_vector=appearance,appearance_is_not_named_identity=True,
@@ -191,7 +206,7 @@ class SourceCatalogue:
             # are engineering conventions, not fitted aesthetic thresholds.
             # ROI deficits and UNKNOWN stay distinct. Global black background
             # is style, not a recurring defect in an equally readable face.
-            readable=self.roi_readability[n,side,index]*np.minimum(1.,h[...,2]/.12)
+            readable=self.target_readability(n,side,index)
             shown=np.where(scores.max(-1)>0,readable*fraction,0.)
             role=1.-self.featured_factor[n,side,index]
             # Reuse joint_cameras' oversized-head effort, applying it only to
