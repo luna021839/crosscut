@@ -8,7 +8,10 @@ from urllib.parse import unquote,urlsplit
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('packet',type=Path);parser.add_argument('--device',type=int,required=True)
-    args=parser.parse_args();root=args.packet.resolve(strict=True)
+    parser.add_argument('--port',type=int,default=0,help='Fixed localhost port; 0 chooses an available port')
+    args=parser.parse_args()
+    if not 0<=args.port<=65535:parser.error('--port must be between 0 and 65535')
+    root=args.packet.resolve(strict=True)
     if not root.is_relative_to(Path('/Volumes/CrossCutMedia/CrossCut-Validation')) or root.stat().st_dev!=args.device:
         raise ValueError('explicit authorized SSD packet required')
     manifest=json.loads((root/'manifest.json').read_text())
@@ -34,7 +37,7 @@ def main():
             super().do_GET()
         do_HEAD=do_GET
         def log_message(self,*a):pass
-    server=ThreadingHTTPServer(('127.0.0.1',0),partial(Handler,directory=str(root)))
+    server=ThreadingHTTPServer(('127.0.0.1',args.port),partial(Handler,directory=str(root)))
     print(json.dumps(dict(url=f'http://127.0.0.1:{server.server_port}/',pid=os.getpid(),
         packet=root.name,allowed_paths=len(allowed),external_network_exposure=False)),flush=True)
     try:server.serve_forever()
