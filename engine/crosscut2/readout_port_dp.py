@@ -131,7 +131,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,cut_transfer,episo
     order=np.lexsort((outgoing[-1][1].ravel(),outgoing[-1][2].ravel(),endcost.ravel()))
     at=int(order[0]);objective=float(endcost.ravel()[at])
     if not np.isfinite(objective):raise ValueError('no complete readout programme')
-    q,bit,slot=np.unravel_index(at,endcost.shape);cuts=int(outgoing[-1][2][q,bit,slot]);j=N-1
+    q,bit,slot=map(int,np.unravel_index(at,endcost.shape));cuts=int(outgoing[-1][2][q,bit,slot]);j=N-1
     runs=[];codes=[];claims=[];readout=[]
     while True:
         code=int(outgoing[j][4][q,bit,slot]);amount=float(outgoing[j][5][q,bit,slot])

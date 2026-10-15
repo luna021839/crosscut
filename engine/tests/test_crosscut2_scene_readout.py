@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pytest
 from crosscut2.scene_readout import IDENTITY,roi_readability,then,change,recovery,apply,TransferTree,SceneReadout
@@ -155,3 +156,4 @@ def test_T4_all_camera_alternatives_transfer_and_cost_equal_exact_replay():
     assert receipt['selected_hold_cost_decomposition'][-1]['cumulative_cost']==pytest.approx(score)
     assert len(runs)==len(rows) and all(row['scored_camera_values'].shape[1]==3 for row in rows)
     assert receipt['source_NN_and_analysis_decode_during_new_selection']==0
+    json.dumps(receipt,allow_nan=False)  # actual programme persistence boundary
