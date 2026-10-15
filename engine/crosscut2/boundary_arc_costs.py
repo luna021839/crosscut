@@ -8,6 +8,7 @@ import numpy as np
 from .connection_prior import physical_weights
 from .native_fragment_integrity import NativeFragmentIntegrity
 from .played_partial_pose import face_geometry
+from .focal_appearance import discrepancy as appearance_discrepancy
 
 
 def _hermite(a,b,da,db,length):
@@ -122,6 +123,20 @@ class ArcCosts:
         scores=np.where((heads[...,2]>.019)&(heads[...,3]>=.75)&seen[:,None,None],scores,0.)
         at=scores.argmax(-1);idx=np.broadcast_to(at[...,None,None],(B,E,2,1,4))
         head=np.take_along_axis(np.broadcast_to(heads,(B,)+heads.shape),idx,axis=3).squeeze(3)
+        vectors=np.zeros((E,2,3,128),np.float32)
+        for e,x in enumerate(xs):
+            if int(x) in lookup and 'vectors' in bank:vectors[e]=bank['vectors'][lookup[int(x)]]
+        own=np.take_along_axis(np.broadcast_to(vectors,(B,)+vectors.shape),
+            np.broadcast_to(np.minimum(at,2)[...,None,None],(B,E,2,1,128)),axis=3).squeeze(3)
+        own=np.where((at<3)[...,None]&seen[None,:,None,None],own,0.)
+        member=np.full((B,E,2),-1,int)
+        if 'member_hints' in bank:
+            all_hints=np.full((E,2,8),-1,int)
+            for e,x in enumerate(xs):
+                if int(x) in lookup:all_hints[e]=bank['member_hints'][lookup[int(x)]]
+            member=np.take_along_axis(np.broadcast_to(all_hints,(B,)+all_hints.shape),at[...,None],axis=3)[...,0]
+            member=np.where(seen[None,:,None],member,-1)
+        appearance,_=appearance_discrepancy(own[:,:,0],own[:,:,1],member_a=member[:,:,0],member_b=member[:,:,1])
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
         valid=(scores.max(-1)>0).all(-1)
         face,_,_=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)
@@ -137,7 +152,7 @@ class ArcCosts:
         # body windows. Use the SAME missing-pose convention as authored K.
         # A known bad native event stays finite and playable; it is not gated
         # out or laundered through a near-constant confidence-like1-Q rate.
-        return face+.5
+        return face+.5+appearance
 
     def native_weights(self,s,first,final,xs):
         all_xs,_,weights,_=self.native_tables[s]

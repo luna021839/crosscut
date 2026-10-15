@@ -461,6 +461,8 @@ def main():
     slots = manifest.get('group_broadcast_diversity', {}).get('source_broadcast_slots')
     if slots is not None and len(slots) != len(banks):
         raise ValueError('broadcast slot domain differs from observed sources')
+    if slots is not None:
+        for bank,slot in zip(banks,slots):bank['consensus_family']=str(slot)
     fixed_receipt = None
     bound_source_cut_events=None
     if args.fixed_actor_camera_holds:

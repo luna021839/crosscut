@@ -1,4 +1,4 @@
-"""Actual played A[-7,-1] to B[0,+6] partial pose, finite tentative ranking.
+"""Actual played seam plus contemporary source-clock action context.
 
 Evidence-kind is NOT a probability. Unknown/contradicted = .5; model-only
 shrinks raw residual halfway toward .5. Pixel support cannot remove ambiguous
@@ -7,6 +7,8 @@ ownership. Missing semantic channels are not dropped from the denominator.
 import math
 import numpy as np
 from .physical_display_observations import UNMEASURED, MODEL_ONLY, PIXEL_SUPPORTED, CONTRADICTED
+from .focal_appearance import discrepancy as appearance_discrepancy
+from . import source_clock_action
 
 PAIRS = np.array(((0, 2), (2, 4), (0, 4), (1, 3), (3, 5), (1, 5), (0, 1), (0, 6), (1, 7), (6, 7)))
 CHANNELS = ((0, 1, 2), (3, 4, 5), (6, 7, 8, 9))
@@ -72,7 +74,13 @@ def features(observations, *, fps, person_extents=False):
     clocks = np.asarray([o['native_indices'] for o in observations], int)
     physical &= clocks[:, 1] > clocks[:, 0]
     result=dict(heads=heads, center=center, height=height, seen=seen, xy=xy, unit=unit,
-        endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps)
+        endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps,
+        appearance_vectors=np.asarray([o.get('appearance_vector',np.zeros(128)) for o in observations],float))
+    result['source_clock_action']=source_clock_action.describe(observations,PAIRS,fps=fps)
+    result['source_colour']=np.asarray([o.get('source_colour_histogram',np.zeros((2,40))) for o in observations],float)
+    result['source_colour_valid']=np.asarray([o.get('source_colour_valid',False) for o in observations],bool)
+    result['visible_quality']=np.asarray([o.get('displayed_native_quality_proxy',0.) for o in observations],float)
+    result['member_hints']=np.asarray([o.get('recurrent_member_hint',-1) for o in observations],int)
     if person_extents:
         from .person_extent import height_interval
         intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
@@ -81,7 +89,11 @@ def features(observations, *, fps, person_extents=False):
 
 
 def matrix(left, right, *, details=False):
-    """Both feature sets contain ONLY exposed windows; no counterfactual H."""
+    """Score the exposed seam and original same-music source observations.
+
+    Unplayed source context is compared on its actual common clock; it does
+    not invent an alternate output, offset, camera fit or anatomical track.
+    """
     if left['fps'] != right['fps']:raise ValueError('same played fps required')
     la, rb = left['endpoint'], right['endpoint']; ai = np.arange(len(la)); bi = np.arange(len(rb))
     h = np.maximum(.005, (left['height'][:, None] + right['height'][None, :]) / 2.)
@@ -133,15 +145,45 @@ def matrix(left, right, *, details=False):
     velocity = tentative(velocity_raw, motion_kind, motion_ambiguous)
     primitives = (phase + bridge + velocity) / 3.
     channels = np.stack([primitives[..., list(c)].mean(-1) for c in CHANNELS], axis=-1)
+    same_clock,same_clock_available,change_basis=source_clock_action.paired(left['source_clock_action'],right['source_clock_action'],
+        channels=CHANNELS,tentative=tentative)
+    context_supplied=left['source_clock_action']['available'][:,None]&right['source_clock_action']['available'][None,:]
+    # With no shared interval, opposite played-side velocities do not prove
+    # opposition. Preserve actual endpoint phase and finite UNKNOWN motion.
+    phase_only=np.stack([((phase+1.)/3.)[...,list(c)].mean(-1) for c in CHANNELS],axis=-1)
+    channels=np.where(context_supplied[...,None],phase_only,channels)
+    channels=np.where(same_clock_available[...,None],same_clock,channels)
     pose = channels.mean(-1)
+    appearance,appearance_measured=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
+        member_a=left['member_hints'][:,None],member_b=right['member_hints'][None,:])
+    # Actual normalized chest/background histograms. Hellinger affinity uses
+    # sqrt(p*q), not a plain dot product that calls identical broad histograms
+    # "novel". Missing appearance/style/action earns NO change credit.
+    affinity=np.sqrt(np.maximum(0.,left['source_colour'][:,None]*right['source_colour'][None,:])).sum(-1)
+    novelty=np.sqrt(np.maximum(0.,1.-np.minimum(1.,affinity))).mean(-1)
+    known_style=left['source_colour_valid'][:,None]&right['source_colour_valid'][None,:]
+    quality=np.minimum(left['visible_quality'][:,None],right['visible_quality'][None,:])
+    seam_shape=np.maximum(0.,1.-phase_raw[...,:6].max(-1))
+    # All inputs share a bounded preference scale, not calibrated independent
+    # probabilities. A bottleneck preserves every requirement without the
+    # artificial fivefold multiplication that makes a valid match disappear.
+    # Known different member hints remove only this same-actor connection
+    # credit, never the source, feasible cut, or ordinary scene-change option.
+    incompatible=(left['member_hints'][:,None]>=0)&(right['member_hints'][None,:]>=0)&(
+        left['member_hints'][:,None]!=right['member_hints'][None,:])
+    change_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape])
+    change_density=np.where(known_style&appearance_measured&~incompatible,change_density,0.)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
         fixed_semantic_channel_rates=channels,
+        appearance_rate=appearance,appearance_measured=appearance_measured,
+        same_clock_source_action_used=same_clock_available,
+        matched_action_change_density=change_density,measured_style_change=novelty,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,
         ownership_ambiguity=ambiguous, shrinkage=.5, anatomical_ownership_certified=False)
-    return result if details else (geometry + pose, allowed)
+    return result if details else (geometry + pose + appearance, allowed)
 
 
 def source_activity(observation, *, fps):

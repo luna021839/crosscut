@@ -27,21 +27,32 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False):
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
-            'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py']
+            'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
+            'featured_member_state.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
             source_code_sha256=implementation,supervision_kinds=[],new_fit=False,weak_models_used=False,
-            authored_cost='played_pair_support*(D_face_rate+mean_fixed_semantic_played_pose_channels)',
-            native_cost='physical_support*(same_uncapped_played_face_geometry+unmeasured_partial_pose_.5)',
+            authored_cost='played_pair_support*(D_face_rate+mean_fixed_semantic_played_pose_channels+anonymous_appearance_risk)',
+            native_cost='physical_support*(same_uncapped_played_face_geometry+unmeasured_partial_pose_.5+same_anonymous_appearance_risk)',
             native_geometry_not_flattened_or_visibility_attenuated=True,
             native_missing_pose_not_fabricated_as_measured=True,
             own_activity_bound_to_same_displayed_face_sample=True,
             maximum_measured_face_height_ratio=1.5,maximum_measured_displacement_in_face_heights=1.,
             unknown_pose_residual=.5,model_only_shrinkage=.5,shrinkage_is_not_anatomical_probability=True,
             measured_body_action_cost_used=True,pair_conditioned_cameras_added=True,
+            paired_subject_pinned_before_camera=True,camera_cannot_silently_reassign_pair_subject=True,
             physical_GROUP_focal_owns_content_and_pose=True,anatomical_ownership_certified=False,
-            actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=False,
+            actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=True,
+            appearance_is_soft_risk_not_identity_gate=True,unknown_appearance_risk=.5,
+            sparse_same_clock_source_action_consumed=True,same_clock_context_is_not_dense_actor_certification=True,
+            matched_action_change_credit='realized_incoming_hold_seconds_up_to_two_observed_beats * measured_change_density',
+            change_density_uses='weakest_observed(evidence_cap*min(same_clock_arm_configuration,motion),anonymous_appearance,Hellinger_style_change,native_quality,played_seam_shape)',
+            change_cues_are_not_multiplied_as_independent_probabilities=True,
+            known_different_member_gets_no_same_actor_change_credit=True,
+            paired_credit_requires_its_actual_outgoing_proposal=True,unmeasured_or_static_change_credit=0.,
+            change_credit_is_unfitted_engineering_not_human_preference_calibration=True,
+            recurrent_member_hints_are_soft_not_certified=True,featured_state_uses_original_native_views_not_proposed_crops=True,
             person_visible_extent_fallback_used=bool(person_extents),
             person_extent_is_not_face_size_identity_or_camera_cause=True,
             paired_proposal_global_limit_per_node=8,roll_degrees=0.,
@@ -80,9 +91,16 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         native_part_corroboration=part_receipts,camera_domain=camera_receipt,
         unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
     cats=[]
+    face_members=[None]*len(banks);featured=[None]*len(banks)
+    if identity_hints is not None:
+        from .featured_member_state import bind_hints,consensus
+        face_members,native_ports=bind_hints(banks,identity_hints,native_ports)
+        featured,featured_receipt=consensus(banks,face_members)
+        receipt.update(source_local_member_hints_consumed=True,featured_member_state=featured_receipt)
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
-        cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps))
+        cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
+            member_hints=face_members[s],featured_factor=featured[s]))
     del states,rows,raw
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live)
     if person_observer is not None:
@@ -96,16 +114,34 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
         person_extents=person_extents)
-    cut_cache={};cut_statistics=[]
+    cut_cache={};cut_statistics=[];entry_density={}
+    music=np.zeros(len(nodes)) if music is None else np.asarray(music,float)
+    if music.shape!=(len(nodes),) or not np.isfinite(music).all() or np.any((music<0)|(music>1)):
+        raise ValueError('observed per-node musical strengths required')
+    beat_frames=np.asarray(nodes)[music>0]
+    exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
     def cut(n):
         live()
         if n not in cut_cache:
             left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents)
             right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents)
-            detail=matrix(left,right,details=True);rates=detail['geometry_rate']+detail['pose_rate'];admitted=detail['allowed']
+            detail=matrix(left,right,details=True)
+            rates=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate'];admitted=detail['allowed']
             a=np.array([p.source for p in exits[n]]);b=np.array([p.source for p in entries[n]])
             weights=support.cut_weights(int(nodes[n]),np.arange(len(cats)))[a[:,None],b[None,:]]
             admitted&=a[:,None]!=b[None,:]
+            density=np.zeros(len(b))
+            for right_index,port in enumerate(entries[n]):
+                ids={p for p in port.proposal_ids if p[0]=='paired'}
+                if not ids:continue
+                matching=np.array([bool(ids.intersection(left_port.proposal_ids)) for left_port in exits[n]])
+                # A duration-dependent novelty benefit belongs to this actual
+                # actor/camera pair, never to an unrelated preceding source.
+                admitted[:,right_index]&=matching
+                for left_index in np.flatnonzero(matching&admitted[:,right_index]):
+                    density[right_index]=max(density[right_index],
+                        float(detail['matched_action_change_density'][left_index,right_index]*music[n]))
+            entry_density[n]=density
             cut_cache[n]=(rates*weights,admitted)
             cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
                 visible_person_extent_comparable_port_pairs=int((detail['person_extent_measured']&(a[:,None]!=b[None,:])).sum()),
@@ -116,7 +152,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     potential=np.min(np.concatenate(arcs.prefix,axis=0),axis=0)[np.asarray(nodes,int)]
     def holds(i,j):
         costs,allowed,codes=arcs(i,j)
-        return costs-(potential[j]-potential[i]),allowed,codes
+        if i and i not in entry_density:cut(i)
+        density=entry_density.get(i,np.zeros(len(entries[i])))
+        reward=min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
+        return costs-reward-(potential[j]-potential[i]),allowed,codes
     live();prepared=monotonic();phase='selection';selection_start=prepared
     port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
         start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live)
@@ -128,8 +167,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         # camera refit, boundary shift or source choice is performed here.
         curve=arcs.replay(i,j,p,q,code);ticks=np.arange(first,final)
         cost=float(arcs.direct_cost(source,first,curve[None])[0]+fragments(i,j)[source])
+        density=entry_density.get(i,np.zeros(len(entries[i])))
+        change_credit=min(float(final-first)/fps,exposure_seconds)*float(density[p])
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
-        cumulative+=cost+incoming
+        cumulative+=cost-change_credit+incoming
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
         heads,indices,ambiguity,scene=focal_metadata(banks[source]['heads'],grid_camera)
         chosen_states.append(State(source,None,'boundary_arc_'+str(code)))
@@ -147,7 +188,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             entry_geometry_hash=entries[i][p].geometry_hash,exit_geometry_hash=exits[j][q].geometry_hash,
             camera_arc_code=int(code),camera_path_sha256=digest,per_frame_camera_count=len(curve)))
         parts.append(dict(first_frame=first,final_frame=final,source=source,
-            components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming),cumulative_cost=cumulative))
+            components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
+                measured_matched_action_change_credit=-change_credit),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
             detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
@@ -162,7 +204,13 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                     predicted.append(dict(center=list(map(float,center)),height=float(head[2]*c[0]),confidence=float(head[3]),
                         source_face_index=obs['head_index'],face_native_sample_is_actual_endpoint=at==(-1 if side==0 else 0)))
             selected.details[i,k-1,k]=dict(cost=incoming,appearance_cosine=focal_appearance_cosine(a.observation,b.observation),
-                appearance_used_in_objective=False,anonymous_appearance_is_not_member_identity=True,
+                appearance_used_in_objective=True,anonymous_appearance_is_not_member_identity=True,
+                anonymous_appearance_rate=float(detail['appearance_rate'][0,0]),
+                anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),
+                recurrent_member_hints=[int(o['recurrent_member_hint']) for o in (a.observation,b.observation)],
+                same_clock_source_action_used=bool(detail['same_clock_source_action_used'][0,0]),
+                matched_action_change_density=float(detail['matched_action_change_density'][0,0]),
+                realized_incoming_change_credit=change_credit,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
                 played_geometry_rate=float(detail['geometry_rate'][0,0]),
                 person_visible_extent_gap=float(detail['person_visible_extent_gap'][0,0]),
@@ -183,6 +231,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         selected_hold_cost_decomposition=parts,frozen_selected_camera_arcs=frozen,
         preparation_seconds=prepared-started,selection_seconds=monotonic()-prepared,
         boundary_port_domain=domain,boundary_port_DP=dp,
+        change_credit_exposure_seconds=exposure_seconds,
         event_preference=dict(fixed_connection_prior=prior.artifact,model_sha256=prior.artifact['content_sha256'],
             supervision_kinds=[],objective_vector=[score,int(objective[1])]),
         port_pair_statistics=cut_statistics,authored_cuts=int(objective[1]),

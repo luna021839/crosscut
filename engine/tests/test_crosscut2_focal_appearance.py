@@ -49,10 +49,11 @@ def test_reordered_head_and_descriptor_remain_the_same_physical_face():
     assert old['head_index']==1 and new['head_index']==0 and cosine(old,new)==pytest.approx(1.)
 
 
-def test_new_diagnostic_does_not_change_existing_E_risk_or_admission():
+def test_anonymous_appearance_now_changes_risk_but_not_geometry_admission():
     c=catalogue();a,b=sample(c,0,[1.,.5,.5]),sample(c,1,[1.,.5,.5])
     before=matrix(features([a],fps=30.),features([b],fps=30.))
     b['appearance_vector']=np.eye(128,dtype=np.float32)[1]
     after=matrix(features([a],fps=30.),features([b],fps=30.))
     assert cosine(a,b)==0.
-    for first,last in zip(before,after):assert np.array_equal(first,last)
+    np.testing.assert_allclose(after[0]-before[0],.5)
+    np.testing.assert_array_equal(before[1],after[1])

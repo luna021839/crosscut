@@ -108,10 +108,9 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
     same_shot=np.ones(len(ticks),bool)
     # A seed track is not propagated across an original camera cut. The
     # producer already splits it; this explicit check also guards imports.
-    for window,at in ((left,a),(right,b)):
-        low,high=window.ordinals[at].min(),window.ordinals[at].max()
-        if any(low<cut<=high for cut in window.native_cuts):
-            same_shot[:]=False
+    for window,at,endpoint in ((left,a,la),(right,b,rb)):
+        shots=np.searchsorted(window.native_cuts,window.ordinals[at],side='right')
+        same_shot &= shots==shots[endpoint]
     common &= same_shot[:,None]
     xy_a=left.body[a,:,:2]*[16/9,1.];xy_b=right.body[b,:,:2]*[16/9,1.]
     def normalized(xy,heads,valid):
@@ -141,7 +140,7 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
     motion=float(np.mean(motion_terms)) if motion_terms else None
     activity=float(np.mean(activity_terms)) if activity_terms else None
     av,bv=left.vectors[a],right.vectors[b]
-    appearances=(np.linalg.norm(av,axis=1)>.5)&(np.linalg.norm(bv,axis=1)>.5)&left.associated[a]&right.associated[b]
+    appearances=(np.linalg.norm(av,axis=1)>.5)&(np.linalg.norm(bv,axis=1)>.5)&left.associated[a]&right.associated[b]&same_shot
     cosine=float(np.median(np.sum(av[appearances]*bv[appearances],axis=1))) if appearances.any() else None
     enough=int((common.sum(-1)>=2).sum())>=5 and sum(v>=2 for v in interval_counts.values())>=3
     evidence=bool(enough and int(appearances.sum())>=3)
@@ -162,6 +161,7 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         clock_hypothesis_frames=right_clock.phase_frames,clock_A=left_clock.schedule_sha256,
         clock_B=right_clock.schedule_sha256,native_A=left_clock.native_indices.tolist(),native_B=right_clock.native_indices.tolist(),
         incoming_camera=cb.tolist(),outgoing_camera=ca.tolist(),common_joints_per_sample=common.sum(-1).tolist(),
+        common_source_shot_sample_mask=same_shot.tolist(),
         comparable_motion_pairs=len(motion_terms),measured_motion_intervals=len(interval_counts),
         phase_residual=phase,motion_residual=motion,
         screen_residual=screen,face_residual=face,appearance_cosine=cosine,source_activity=activity,

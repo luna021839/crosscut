@@ -36,7 +36,7 @@ def test_unknown_native_authored_same_extent_risk_without_new_admission_gate():
     assert d['allowed'][0,0] and not d['measured_face'][0,0]
     assert d['face_rate'][0,0]==1. and d['pose_rate'][0,0]==.5
     assert d['person_extent_measured'][0,0] and d['geometry_rate'][0,0]>3.
-    assert native()==pytest.approx(d['geometry_rate'][0,0]+.5)
+    assert native()==pytest.approx(sum(d[k][0,0] for k in ('geometry_rate','pose_rate','appearance_rate')))
 
 
 @pytest.mark.parametrize('known',[False,True])
@@ -52,7 +52,7 @@ def test_known_face_and_missing_extent_preserve_original_contract(known,right_bo
 
 def test_actual_endpoint_camera_changes_same_shared_risk_not_pose_evidence():
     d=authored(left_zoom=1.35)
-    assert native(left_zoom=1.35)==pytest.approx(d['geometry_rate'][0,0]+.5)
+    assert native(left_zoom=1.35)==pytest.approx(sum(d[k][0,0] for k in ('geometry_rate','pose_rate','appearance_rate')))
     assert d['pose_rate'][0,0]==.5 and d['allowed'][0,0]
     assert not (d['phase_evidence_kind']>0).any()
 

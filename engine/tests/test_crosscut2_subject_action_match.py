@@ -104,11 +104,27 @@ def test_exact_independent_pro_focal_reassignment_counterexample_through_real_mo
             zoom_cap=2.,vectors=np.zeros((3,2,3,128)))
         catalogues.append(SourceCatalogue(nodes,bank,None,[],dict(presence=np.zeros((3,2,1))),[],fps=30.))
         paths.append([(np.array([0,39]),np.array([[1.,.5,.5],[1.,.5,.5]])) for _ in range(4)])
-    entries,exits,_,_=make(nodes,catalogues,paths,fps=30.)
-    identity=('paired',1,0,1,1)
-    left=next(p for p in exits[1] if identity in p.proposal_ids)
-    right=next(p for p in entries[1] if identity in p.proposal_ids)
-    assert [left.observation['head_index'],right.observation['head_index']]==[0,1]
+    # Reproduce the old unbound evaluation first: camera k1 changes B's
+    # dominant face from the proposed face0 to face1.
+    ca=np.array([1.4480584975413202,.5535177790481345,.5743228671530826])
+    cb=np.array([1.527393616846104,.45031925678264184,.40181749021274227])
+    assert catalogues[0].observation(1,0,np.tile(ca,(7,1)))['head_index']==0
+    assert catalogues[1].observation(1,1,np.tile(cb,(7,1)))['head_index']==1
+    pinned=catalogues[1].observation(1,1,np.tile(cb,(7,1)),target_head_index=0)
+    assert pinned['head_index']==0 and not pinned['target_is_displayed_focal']
+    entries,exits,_,domain=make(nodes,catalogues,paths,fps=30.)
+    # A different actor can now be retrieved before camera construction.
+    # Regardless of its rank, the old face0->camera->face1 substitution may
+    # not survive with that frozen target/camera combination.
+    assert not any(p.source==1 and p.observation['head_index']==0
+        and np.allclose(p.strip,np.tile(cb,(7,1))) for p in entries[1])
+    assert domain['physical_actor_pairs_compared_before_camera']==18
+    assert all(p.observation['target_is_displayed_focal']
+        for side in (entries[1],exits[1]) for p in side
+        if any(i[0]=='paired' for i in p.proposal_ids))
+    assert all(p.observation['head_index']==identity[4 if side==0 else 5]
+        for side,items in enumerate((exits[1],entries[1])) for p in items
+        for identity in p.proposal_ids if identity[0]=='paired')
     # The replacement retrieves/pins face0 FIRST. Camera evaluation cannot
     # turn its cached body into face1's body even though old admission did.
     a,b=window(0),window(1)
@@ -116,7 +132,7 @@ def test_exact_independent_pro_focal_reassignment_counterexample_through_real_mo
         competitors=tuple(faces[0][1:] for _ in a.ordinals))
     b=replace(b,heads=np.tile(faces[1][0],(len(b.ordinals),1)),
         competitors=tuple(faces[1][1:] for _ in b.ordinals))
-    result=compare(a,b,hypothesis(a),hypothesis(b),left_cameras=np.tile(left.strip[-1],(25,1)),incoming_cap=2.)
+    result=compare(a,b,hypothesis(a),hypothesis(b),left_cameras=np.tile(ca,(25,1)),incoming_cap=2.)
     assert result['track_B']==b.track and not result['target_reselected_after_camera']
     assert result['face_residual']<1e-10
 
@@ -180,7 +196,9 @@ def test_followup_native_cut_and_missing_four_seconds_never_claim_preview_approv
     good=matched(window(0),window(1))
     assert not good['preview_eligible'] and not good['following_four_seconds_verified']
     cut=matched(window(0),window(1,cut=(100,)))
-    assert cut['status']=='NO_SUPPORTED_MATCH' and cut['rank_score'] is None
+    assert cut['status']=='SUPPORTED_CANDIDATE'
+    assert not any(cut['common_source_shot_sample_mask'][:12])
+    assert all(cut['common_source_shot_sample_mask'][12:])
     assert not cut['professional_quality_approved'] and not cut['normal_app_activation_approved']
 
 

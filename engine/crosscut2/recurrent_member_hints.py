@@ -67,10 +67,46 @@ def valid_query_geometry(box,points):
     return True
 
 
-def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds=240.,maximum_calls=288):
+def recover_query_snapshots(cache,binding,*,exclude=None):
+    """Read existing normalized queries without pretending to rerun their ORT.
+
+    Source bytes, model, raster, adapter and association semantics must match.
+    Old producer runtime metadata remains attached to each parent; recovered
+    vectors are never rewritten under a new runtime's cache binding.
+    """
+    stable=tuple(k for k in binding if k not in ('ort','opencv'))
+    values={};conflicts=set();parents=[];total_bytes=0
+    candidates=sorted(p for p in Path(cache).glob('*.npz')
+        if not p.name.startswith('.') and not p.is_symlink() and p!=exclude)
+    if len(candidates)>128:raise ValueError('member query snapshot inventory exceeds bounded recovery')
+    for path in candidates:
+        if path.stat().st_size>8*1024**2:raise ValueError('member query snapshot exceeds bounded size')
+        with np.load(path,allow_pickle=False) as saved:
+            old=json.loads(str(saved['binding']))
+            if any(old.get(k)!=binding[k] for k in stable):continue
+            keys,vectors,valid=(saved[k] for k in ('keys','vectors','valid'))
+        if (keys.ndim!=1 or keys.dtype.kind!='U' or len(set(keys))!=len(keys) or len(keys)>1024
+                or vectors.shape!=(len(keys),512) or valid.shape!=(len(keys),) or valid.dtype!=bool
+                or not np.isfinite(vectors).all()):raise ValueError('historical member query snapshot malformed')
+        total_bytes+=path.stat().st_size
+        if total_bytes>64*1024**2 or len(parents)>=32:raise ValueError('member query recovery workspace exceeded')
+        for key,vector,ok in zip(map(str,keys),vectors,valid):
+            if key in values and (not np.array_equal(values[key][0],vector) or values[key][1]!=bool(ok)):
+                conflicts.add(key)
+            else:values[key]=(vector.copy(),bool(ok))
+        parents.append(dict(file=str(path),producer_ort=old.get('ort'),producer_opencv=old.get('opencv')))
+    for key in conflicts:values.pop(key,None)
+    if len(values)>1024:raise ValueError('recovered query key domain exceeds bounded source cache')
+    return values,dict(parent_snapshots=parents,ambiguous_query_inputs=len(conflicts),
+                       historical_producer_metadata_preserved=True,new_inference_performed=False)
+
+
+def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds=240.,maximum_calls=288,
+            cache_only_partial=False):
     if not len(sources)==len(banks)==len(census) or not 1<=maximum_seconds<=600 or not 0<=maximum_calls<=1024:
         raise ValueError('bounded source-local member-hint observation allowance required')
     started=monotonic();photo_tool=Path(photo_tool);models=Path(models);cache=Path(cache)
+    if cache_only_partial and maximum_calls!=0:raise ValueError('partial cached hints cannot authorize new inference')
     gallery=LocalIVEArcFaceGallery.from_existing_photo_banks(photo_tool/'face_models/user_member_arcface_embeddings.json',
         photo_tool/'face_models/yujin_arcface_embeddings.json')
     model_path=photo_tool/'insightface_models/buffalo_l/w600k_r50.onnx'
@@ -93,7 +129,7 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             association=hashlib.sha256(inspect.getsource(associate).encode()).hexdigest(),
             ort=version('onnxruntime'),opencv=cv2.__version__,native_fps=clock['fps'],native_count=clock['frame_count']),sort_keys=True)
         cache.mkdir(parents=True,exist_ok=True);target=cache/(hashlib.sha256(binding.encode()).hexdigest()+'.npz')
-        values={};dirty=False
+        values={};dirty=False;current_keys=set()
         if target.is_file():
             with np.load(target,allow_pickle=False) as saved:
                 if str(saved['binding'])!=binding:raise ValueError('local member query cache binding differs')
@@ -102,11 +138,18 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
                     or valid.shape!=(len(keys),) or valid.dtype!=bool or not np.isfinite(vectors).all() or len(keys)>1024):
                 raise ValueError('local member query snapshot domain differs')
             values={str(k):(v.copy(),bool(ok)) for k,v,ok in zip(keys,vectors,valid)}
+            current_keys=set(values)
+        recovered,recovery=recover_query_snapshots(cache,json.loads(binding),exclude=target)
+        recovered_keys=set(recovered)-set(values)
+        for key,value in recovered.items():values.setdefault(key,value)
+        preexisting_keys=set(values)
         keys=[];needed={};source_calls=source_detectors=0
         for native,head in requests:
             key=hashlib.sha256(np.array([native,*head],np.float64).tobytes()).hexdigest();keys.append(key)
             if key not in values:needed.setdefault(native,{})[key]=head
-        if sum(map(len,needed.values()))>maximum_calls-calls:
+        unobserved_keys={key for batch in needed.values() for key in batch}
+        if cache_only_partial:needed={}
+        elif sum(map(len,needed.values()))>maximum_calls-calls:
             raise ValueError('recurrent member query allowance exceeded before neural inference')
         def checkpoint():
             nonlocal dirty
@@ -117,7 +160,7 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             if file_identity(path)!=identity:raise OSError('source changed during member query observations')
             descriptor,temporary=tempfile.mkstemp(prefix='.member-query-',suffix='.npz',dir=cache)
             try:
-                ordered=sorted(values)
+                ordered=sorted(current_keys)
                 with os.fdopen(descriptor,'wb') as stream:
                     np.savez_compressed(stream,binding=binding,keys=np.array(ordered,dtype='U64'),
                         vectors=np.asarray([values[k][0] for k in ordered],np.float32),valid=np.asarray([values[k][1] for k in ordered],bool))
@@ -140,7 +183,7 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
                             if ok:
                                 vector=np.array(arc.embedding(pixels,bbox_xywh=box,landmarks_xy=points),np.float32)
                                 calls+=1;source_calls+=1
-                        values[key]=(vector,ok);dirty=True
+                        values[key]=(vector,ok);current_keys.add(key);dirty=True
                         if (source_calls+source_detectors)%8==0:checkpoint()
             checkpoint()
         finally:
@@ -149,15 +192,19 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
         for indices in groups:
             votes=[]
             for index in indices:
-                vector,valid=values[keys[index]]
+                vector,valid=values.get(keys[index],(np.zeros(512,np.float32),False))
                 votes.append(gallery.classify(tuple(map(float,vector)) if valid else None,descriptor_space=space))
             hints.append(consensus(votes))
         if file_identity(path)!=identity:raise OSError('source changed before member-hint result')
         result.append(np.asarray(hints,np.int16))
         receipt=dict(source=s,anonymous_source_clusters=count,preselected_faces=len(requests),
             labelled_by_recurrent_consensus=sum(h>=0 for h in hints),new_arcface_calls=source_calls,
-            new_supplementary_detector_calls=source_detectors,reused_query_inputs=len(keys)-sum(map(len,needed.values())),
+            new_supplementary_detector_calls=source_detectors,reused_query_inputs=sum(k in preexisting_keys for k in keys),
             raw_query_cache_bytes=0 if not target.exists() else target.stat().st_size,
+            reused_historical_runtime_query_inputs=sum(k in recovered_keys for k in keys),
+            unobserved_query_inputs=len(unobserved_keys) if cache_only_partial else 0,
+            missing_query_is_unknown_not_a_source_exclusion=bool(cache_only_partial),
+            query_snapshot_recovery=recovery,
             base_face_body_cache_invalidated=False,private_references_copied_or_exported=False,
             stage_video_hint_accuracy_calibrated=False,named_identity_certified=False,elapsed_seconds=monotonic()-started)
         receipts.append(receipt);print(json.dumps(dict(phase='source_recurrent_member_hints',**receipt)),flush=True)
