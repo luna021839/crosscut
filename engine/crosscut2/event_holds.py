@@ -68,14 +68,16 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
            maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
-           preference_model=None,preference_workspace=None,connection_prior=None):
+           preference_model=None,preference_workspace=None,connection_prior=None,person_observer=None):
     if getattr(connection_prior,'port_camera_prior',False):
         if preference_model is not None:raise ValueError('E port-camera prior cannot use a preference checkpoint')
         from .played_pose_port_programme import select as choose_ports
         return choose_ports(nodes,banks,poses,styles,fps=fps,source_events=source_events,body_states=body_states,
             native_ports=native_ports,music=music,prior=connection_prior,identity_hints=identity_hints,
-            part_observer=part_observer,check=check,maximum_preparation_seconds=maximum_preparation_seconds,
+            part_observer=part_observer,person_observer=person_observer,check=check,maximum_preparation_seconds=maximum_preparation_seconds,
             maximum_seconds=maximum_seconds)
+    if person_observer is not None:
+        raise ValueError('person rectangle evidence requires the actual played port-camera domain')
     if connection_prior is not None and preference_model is not None:
         raise ValueError('weak/preference model and declared connection prior cannot be combined')
     if preference_model is not None and preference_model.artifact.get('supervision_kinds')==['reference_editor_choice_weak_imitation']:
@@ -243,7 +245,7 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
         return dict(all_source_clocks_verified=False,source_observation_ordinals_exact=False,
             maximum_native_ordinal_difference=None,post_selection_retimed=False)
     differences=[];exposed=[];total=0;pose_total=0;camera_total=0;camera_error=0.
-    native_events=0;native_inputs=0
+    native_events=0;native_inputs=0;person_native_inputs=0
     native_domain=native_ports is not None and all('native_event_keys' in bank for bank in native_ports)
     for segment,(first,end,index) in zip(plan.segments,runs):
         check();source=states[index].source;clock=clocks[source];size=int(nodes[end]-nodes[first])
@@ -272,6 +274,11 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
                     for error in actual-wanted:
                         if error:differences.append(dict(source=source,output_frame=int(tick),delta=int(error),
                             kind='measured_retained_native_flank',actual_native_ordinals=actual.tolist()))
+                if bank.get('person_native_pair_measured',np.zeros(len(bank['frames']),bool))[at]:
+                    wanted=np.asarray(bank['person_native_ordinals'][at],int);person_native_inputs+=2
+                    for error in actual-wanted:
+                        if error:differences.append(dict(source=source,output_frame=int(tick),delta=int(error),
+                            kind='person_retained_native_flank',actual_native_ordinals=actual.tolist()))
         expected=banks[source]['native_indices']
         for n in range(first,end+1):
             for side,offset in ((0,-1),(1,0)):
@@ -300,7 +307,8 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
         measured_grid_inputs_checked=total,played_pose_native_inputs_checked=pose_total,
         selected_scored_camera_frames_checked=camera_total,maximum_camera_transform_difference=camera_error,
         retained_native_events_clock_checked=native_events,measured_retained_native_inputs_checked=native_inputs,
+        measured_person_retained_native_inputs_checked=person_native_inputs,
         retained_native_clock_domain_provided=native_domain,
-        retained_native_clock_verified=native_domain and not any(d.get('kind','').startswith(('native_','measured_retained_')) for d in differences),
+        retained_native_clock_verified=native_domain and not any(d.get('kind','').startswith(('native_','measured_retained_','person_retained_')) for d in differences),
         camera_transform_replay_exact_within_roundoff=camera_error<=1e-12,
         differing_inputs=differences,post_selection_retimed=False)

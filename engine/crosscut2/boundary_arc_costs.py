@@ -50,12 +50,13 @@ def cameras(entry,exit,baseline,*,cap,bridge_only=False):
 
 
 class ArcCosts:
-    def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None):
+    def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
+                 person_extents=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
         self.prefix=[];self.native_tables=[];self.left=[];self.right=[];self.calls=0;self.last_codes=None
-        self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0
+        self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
         for s,paths in enumerate(dense):
             check();frames=np.arange(int(nodes[-1]));values=np.asarray(paths)
             rates=catalogues[s].rates(frames,values)/fps
@@ -124,6 +125,14 @@ class ArcCosts:
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
         valid=(scores.max(-1)>0).all(-1)
         face,_,_=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)
+        if getattr(self,'person_extents',False):
+            from .person_extent import height_interval,interval_gap,used_face_risk
+            pairs=bank.get('person_rectangles',{})
+            for e,x in enumerate(xs):
+                pair=pairs.get(int(x))
+                if pair is None or valid[:,e].all():continue
+                gap,known=interval_gap(height_interval(pair[0],before[:,e]),height_interval(pair[1],after[:,e]))
+                face[:,e]=used_face_risk(face[:,e],valid[:,e],gap,known)
         # Existing native ports contain exact endpoint faces, not the exposed
         # body windows. Use the SAME missing-pose convention as authored K.
         # A known bad native event stays finite and playable; it is not gated

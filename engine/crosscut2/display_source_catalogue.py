@@ -79,11 +79,14 @@ class SourceCatalogue:
         if 0<=h<3 and 'vectors' in self.bank:
             appearance=np.asarray(self.bank['vectors'][n,side,h],np.float32).copy()
         appearance.setflags(write=False)
+        endpoint_native=int(self.native[n,1 if side==0 else 2])
         return dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
             ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
             native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
             focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]),
-            appearance_vector=appearance,appearance_is_not_named_identity=True)
+            appearance_vector=appearance,appearance_is_not_named_identity=True,
+            person_native_ordinal=endpoint_native,
+            person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
 
     def rates(self,frames,cameras):
         """Vectorized (...,len(frames),3) replay camera content rates."""

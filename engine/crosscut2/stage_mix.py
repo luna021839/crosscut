@@ -318,6 +318,10 @@ def main():
         help='measure exact native-cut flanks without invalidating the song/body grids')
     parser.add_argument('--supplement-native-cut-flanks',action='store_true',
         help='Bounded additive exact flanks missing from the native event union; no full-source fallback')
+    parser.add_argument('--person-rectangle-model',type=Path,
+        help='Explicit pinned existing YOLO11l asset for experimental visible-height interval fallback; not identity')
+    parser.add_argument('--maximum-new-person-frames',type=int,default=256,
+        help='Pair-closed raw pre-selection forward limit0..256;0 means cache-only')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--resume-render', action='store_true',
         help='Render the existing exact source-bound plan without re-observation or selection')
@@ -345,6 +349,10 @@ def main():
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if args.supplement_native_cut_flanks and not args.joint_motion_event_seconds:
         raise ValueError('missing native flanks require the explicit physical native event registry')
+    if args.person_rectangle_model is not None and not args.played_pose_port_camera_prior:
+        raise ValueError('person extent experiment requires the actual played port-camera prior')
+    if not 0<=args.maximum_new_person_frames<=256:
+        raise ValueError('new person observation allowance must stay in0..256')
     if args.experimental_preference_model is not None and not args.native_part_pixel_support:
         raise ValueError('experimental preference requires the explicit partial-evidence event consumer')
     if args.fixed_connection_prior and (not args.native_part_pixel_support or args.experimental_preference_model is not None):
@@ -379,7 +387,7 @@ def main():
         connection_prior=PlayedFacePrior()
     if args.played_pose_port_camera_prior:
         from .played_pose_port_programme import PlayedPosePortPrior
-        connection_prior=PlayedPosePortPrior()
+        connection_prior=PlayedPosePortPrior(person_extents=args.person_rectangle_model is not None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -497,6 +505,12 @@ def main():
                     cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
                     maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288)
             part_observer=None
+            person_observer=None
+            if args.person_rectangle_model is not None:
+                from .person_pair_observer import prepare_pair_observer
+                person_observer=prepare_pair_observer(sources=original.sources,bound=bound_source_cut_events,
+                    cache=args.cache.parent/'crosscut2-person-rectangles-v1',model=args.person_rectangle_model,
+                    maximum_new_frames=args.maximum_new_person_frames,maximum_seconds=120.)
             if args.native_part_pixel_support:
                 from .part_support_bank import corroborate
                 from .part_hypotheses import retain_model_hypotheses
@@ -509,7 +523,8 @@ def main():
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
-                preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior)
+                preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
+                person_observer=person_observer)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts
@@ -558,6 +573,7 @@ def main():
             supplementary_wholebody_perception=supplementary_receipts,
             body_observations_loaded=poses is not None,
             played_pose_cost_used=args.played_pose_port_camera_prior,
+            person_visible_extent_fallback_used=args.person_rectangle_model is not None,
             ownership_certified=False,
             conditional_body_action_costs_enabled=poses is not None and not args.played_face_connection_prior,
             fixed_actor_camera_hold_receipt=fixed_receipt,

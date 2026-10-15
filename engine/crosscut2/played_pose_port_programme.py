@@ -24,12 +24,13 @@ from .focal_appearance import cosine as focal_appearance_cosine
 
 class PlayedPosePortPrior:
     port_camera_prior=True
-    def __init__(self):
+    def __init__(self,*,person_extents=False):
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
-            'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py']
+            'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
-        self.artifact=dict(contract='played_partial_pose_physical_focal_boundary_port_E2_v2',
+        self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
+            else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
             source_code_sha256=implementation,supervision_kinds=[],new_fit=False,weak_models_used=False,
             authored_cost='played_pair_support*(D_face_rate+mean_fixed_semantic_played_pose_channels)',
             native_cost='physical_support*(same_uncapped_played_face_geometry+unmeasured_partial_pose_.5)',
@@ -41,6 +42,8 @@ class PlayedPosePortPrior:
             measured_body_action_cost_used=True,pair_conditioned_cameras_added=True,
             physical_GROUP_focal_owns_content_and_pose=True,anatomical_ownership_certified=False,
             actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=False,
+            person_visible_extent_fallback_used=bool(person_extents),
+            person_extent_is_not_face_size_identity_or_camera_cause=True,
             paired_proposal_global_limit_per_node=8,roll_degrees=0.,
             digital_camera_cannot_create_own_motion=True,
             content_integration='nearest cached face/body within6 outputframes and same native shot; not a dense track',
@@ -55,9 +58,10 @@ class SelectedPorts:
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
-           identity_hints=None,part_observer=None,check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
+           identity_hints=None,part_observer=None,person_observer=None,check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
+    person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     def live():
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
@@ -81,22 +85,31 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps))
     del states,rows,raw
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live)
+    if person_observer is not None:
+        # Freeze additive raw evidence BEFORE any DP cost is constructed.
+        # The callback may not alter the finite camera/port domain or fit
+        # utility. Selection below consumes only the resulting numeric bank.
+        receipt['person_rectangle_observations']=person_observer(nodes=nodes,catalogues=cats,
+            entries=entries,exits=exits,dense=dense,native_ports=native_ports,check=live)
     events=[sorted(set(map(int,xs))|set(map(int,bank['frames']))) for xs,bank in zip(source_events,native_ports)]
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
-    arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live)
+    arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
+        person_extents=person_extents)
     cut_cache={};cut_statistics=[]
     def cut(n):
         live()
         if n not in cut_cache:
-            left=features([p.observation for p in exits[n]],fps=fps)
-            right=features([p.observation for p in entries[n]],fps=fps)
-            rates,admitted=matrix(left,right)
+            left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents)
+            right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents)
+            detail=matrix(left,right,details=True);rates=detail['geometry_rate']+detail['pose_rate'];admitted=detail['allowed']
             a=np.array([p.source for p in exits[n]]);b=np.array([p.source for p in entries[n]])
             weights=support.cut_weights(int(nodes[n]),np.arange(len(cats)))[a[:,None],b[None,:]]
             admitted&=a[:,None]!=b[None,:]
             cut_cache[n]=(rates*weights,admitted)
-            cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum())))
+            cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
+                visible_person_extent_comparable_port_pairs=int((detail['person_extent_measured']&(a[:,None]!=b[None,:])).sum()),
+                unknown_face_port_pairs_with_person_extent=int((detail['person_extent_measured']&~detail['measured_face']&(a[:,None]!=b[None,:])).sum())))
         return cut_cache[n]
     # This node-only potential changes no complete-programme objective. It
     # removes exact common content prefix cancellation and does not add edits.
@@ -137,7 +150,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
-            detail=matrix(features([a.observation],fps=fps),features([b.observation],fps=fps),details=True)
+            detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
+                features([b.observation],fps=fps,person_extents=person_extents),details=True)
             if not detail['allowed'][0,0]:raise AssertionError('selected cut violates unchanged D face gate')
             observed=[a.observation,b.observation]
             predicted=[]
@@ -150,6 +164,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             selected.details[i,k-1,k]=dict(cost=incoming,appearance_cosine=focal_appearance_cosine(a.observation,b.observation),
                 appearance_used_in_objective=False,anonymous_appearance_is_not_member_identity=True,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
+                played_geometry_rate=float(detail['geometry_rate'][0,0]),
+                person_visible_extent_gap=float(detail['person_visible_extent_gap'][0,0]),
+                person_visible_extent_measured=bool(detail['person_extent_measured'][0,0]),
+                person_extent_fallback_used=bool(person_extents and not detail['measured_face'][0,0]
+                    and detail['person_extent_measured'][0,0]),
+                person_extent_is_not_face_size_or_identity=True,
                 fixed_semantic_pose_rates=detail['fixed_semantic_channel_rates'][0,0].tolist(),
                 played_face_measured=bool(detail['measured_face'][0,0]),
                 actual_pose_native_input_frames=[int(v) for o in observed for v in o['native_indices']],

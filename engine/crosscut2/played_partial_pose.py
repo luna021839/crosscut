@@ -37,7 +37,7 @@ def face_geometry(center_a,height_a,center_b,height_b,measured):
     return np.where(measured,raw,1.),displacement,log_scale
 
 
-def features(observations, *, fps):
+def features(observations, *, fps, person_extents=False):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
     heads = np.asarray([o['head'] for o in observations], float)
@@ -71,8 +71,13 @@ def features(observations, *, fps):
     physical = np.asarray([o['physical_window_valid'] for o in observations], bool)
     clocks = np.asarray([o['native_indices'] for o in observations], int)
     physical &= clocks[:, 1] > clocks[:, 0]
-    return dict(heads=heads, center=center, height=height, seen=seen, xy=xy, unit=unit,
+    result=dict(heads=heads, center=center, height=height, seen=seen, xy=xy, unit=unit,
         endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps)
+    if person_extents:
+        from .person_extent import height_interval
+        intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
+        result['person_extent_interval']=tuple(np.asarray([v[k] for v in intervals]) for k in range(3))
+    return result
 
 
 def matrix(left, right, *, details=False):
@@ -85,6 +90,13 @@ def matrix(left, right, *, details=False):
         right['center'][None,:],right['height'][None,:],face_seen)
     allowed = ~face_seen | (face_error <= 1.)
     face = face_error  # risk stays origin-blind; admission is separate
+    geometry=face
+    extent_gap=np.zeros_like(face);extent_known=np.zeros_like(face_seen)
+    if 'person_extent_interval' in left and 'person_extent_interval' in right:
+        from .person_extent import interval_gap,used_face_risk
+        extent_gap,extent_known=interval_gap(tuple(v[:,None] for v in left['person_extent_interval']),
+            tuple(v[None,:] for v in right['person_extent_interval']))
+        geometry=used_face_risk(face,face_seen,extent_gap,extent_known)
     # [source point coordinates] -> [actual per-side rendered coordinates].
     pa = left['xy'][ai, la][:, PAIRS[:, 1]]; pb = right['xy'][bi, rb][:, PAIRS[:, 1]]
     ua = left['unit'][ai, la]; ub = right['unit'][bi, rb]
@@ -122,13 +134,14 @@ def matrix(left, right, *, details=False):
     primitives = (phase + bridge + velocity) / 3.
     channels = np.stack([primitives[..., list(c)].mean(-1) for c in CHANNELS], axis=-1)
     pose = channels.mean(-1)
-    result = dict(face_rate=face, pose_rate=pose, allowed=allowed, measured_face=face_seen,
+    result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
+        person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
         fixed_semantic_channel_rates=channels,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,
         ownership_ambiguity=ambiguous, shrinkage=.5, anatomical_ownership_certified=False)
-    return result if details else (face + pose, allowed)
+    return result if details else (geometry + pose, allowed)
 
 
 def source_activity(observation, *, fps):
