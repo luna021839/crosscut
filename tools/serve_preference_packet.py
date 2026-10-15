@@ -12,14 +12,17 @@ def main():
     if not root.is_relative_to(Path('/Volumes/CrossCutMedia/CrossCut-Validation')) or root.stat().st_dev!=args.device:
         raise ValueError('explicit authorized SSD packet required')
     manifest=json.loads((root/'manifest.json').read_text())
-    if manifest['contract']!='unlabelled_same_event_av_triplets_v1':raise ValueError('wrong packet')
+    templates={'unlabelled_same_event_av_triplets_v1':'same_event_preference_review.html',
+               'unlabelled_same_event_hk_av_pairs_v2':'same_event_hk_pair_review.html'}
+    if manifest['contract'] not in templates:raise ValueError('wrong packet')
+    if manifest.get('actual_human_preferences_obtained') is not False:raise ValueError('unlabelled packet required')
     allowed={'/','/index.html','/manifest.json'}
     for row in manifest['events']:
         for name in row['clips'].values():
             if Path(name).name!=name or not (root/name).is_file() or (root/name).is_symlink():
                 raise ValueError('only named regular packet movies may be served')
             allowed.add('/'+name)
-    template=Path(__file__).parent/'templates/same_event_preference_review.html';target=root/'index.html'
+    template=Path(__file__).parent/'templates'/templates[manifest['contract']];target=root/'index.html'
     if target.exists() and target.read_bytes()!=template.read_bytes():raise FileExistsError('existing review page differs; do not overwrite')
     if not target.exists():target.write_bytes(template.read_bytes())
     class Handler(SimpleHTTPRequestHandler):

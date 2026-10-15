@@ -166,6 +166,26 @@ def _save(target, *, stable, **arrays):
         raise
 
 
+def _supported_batches(natives, clock, width, height):
+    """Partition metadata BEFORE decode; one unsupported seek is not a source veto.
+
+    Splitting a planned window runs no decoder/model and changes no raster.
+    Even a combined window exceeding preroll may contain valid individual
+    windows. An unsupported singleton stays UNKNOWN, never a scan fallback.
+    """
+    limit=min(32,(64*1024**2)//(width*height*3));batches=[];unsupported=[]
+    def partition(group):
+        try:
+            sparse.windows(group,clock,maximum_selected_frames=limit)
+            batches.append(group)
+        except sparse.UnsupportedSeek:
+            if len(group)==1:unsupported.extend(group)
+            else:
+                mid=len(group)//2;partition(group[:mid]);partition(group[mid:])
+    partition(sorted(natives))
+    return batches,set(unsupported)
+
+
 def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
                               maximum_new_frames=256, maximum_seconds=180.):
     """Return per-source {physical ordinal: rectangles} and honest receipts.
@@ -243,6 +263,7 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
     detector = None; clocks = {}; rasters = {}; out_of_time = False
     for (_, s), pending in sorted(groups.items()):
         receipt, record, path = receipts[s], bound[s], sources[s]
+        unsupported=set()
         if out_of_time or monotonic() - started >= maximum_seconds:
             out_of_time = True
             receipt['deferred_time_budget'] += len(pending)
@@ -259,32 +280,36 @@ def observe_person_rectangles(*, sources, bound, requests, cache, model, check,
                 if count != clock.count or min(width, height) < 1 or width * height * 3 > 64 * 1024 ** 2:
                     raise sparse.UnsupportedSeek('person original raster exceeds sparse bound')
                 clocks[s], rasters[s] = clock, np.array([width, height], np.int64)
-            if detector is None:
-                detector = _detector(model)
             width, height = map(int, rasters[s])
-            execution = {}; receipt['raster_executions'].append(execution)
-            receipt['sparse_decode_calls'] += 1
-            for f, pixels in sparse.frames(path, sorted(pending), clock=clocks[s], check=live,
-                    width=width, height=height, receipt=execution,
-                    maximum_seconds=max(.001, maximum_seconds - (monotonic() - started))):
-                live()
-                if f not in pending or f in output[s] or pixels.shape != (height, width, 3) or pixels.dtype != np.uint8:
-                    raise OSError('person reader returned an undeclared or different original raster')
-                receipt['decoded_native_rasters'] += 1
-                receipt['new_person_forwards'] += 1
-                rectangles = _measure(pixels, detector, rasters[s])
-                binding, target = pending[f]
-                measurement = json.dumps(dict(verified_original_pts_raster=True,
-                    packet_grid_sha256=clocks[s].packet_digest, person_model_forwards=1,
-                    cast_or_anatomy_certified=False, empty_means_no_detection_not_absence=True))
-                _save(target, stable=live, binding=binding, rectangles=rectangles,
-                    raster=rasters[s], measurement=measurement)
-                output[s][f] = rectangles
-                receipt['measured_frames'] += 1
-            if any(f not in output[s] for f in pending):
+            batches,unsupported=_supported_batches(pending,clocks[s],width,height)
+            if unsupported:
+                receipt['failed_frames']+=len(unsupported)
+                receipt['errors'].append('UnsupportedSeek: individual native ordinals exceed verified preroll bound: '+str(sorted(unsupported)))
+            if batches and detector is None:detector=_detector(model)
+            for batch in batches:
+                execution = {}; receipt['raster_executions'].append(execution)
+                receipt['sparse_decode_calls'] += 1
+                for f, pixels in sparse.frames(path, batch, clock=clocks[s], check=live,
+                        width=width, height=height, receipt=execution,
+                        maximum_seconds=max(.001, maximum_seconds - (monotonic() - started))):
+                    live()
+                    if f not in pending or f in output[s] or pixels.shape != (height, width, 3) or pixels.dtype != np.uint8:
+                        raise OSError('person reader returned an undeclared or different original raster')
+                    receipt['decoded_native_rasters'] += 1
+                    receipt['new_person_forwards'] += 1
+                    rectangles = _measure(pixels, detector, rasters[s])
+                    binding, target = pending[f]
+                    measurement = json.dumps(dict(verified_original_pts_raster=True,
+                        packet_grid_sha256=clocks[s].packet_digest, person_model_forwards=1,
+                        cast_or_anatomy_certified=False, empty_means_no_detection_not_absence=True))
+                    _save(target, stable=live, binding=binding, rectangles=rectangles,
+                        raster=rasters[s], measurement=measurement)
+                    output[s][f] = rectangles
+                    receipt['measured_frames'] += 1
+            if any(f not in output[s] and f not in unsupported for f in pending):
                 raise OSError('person sparse reader omitted declared ordinals')
         except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
-            missing = sum(f not in output[s] for f in pending)
+            missing = sum(f not in output[s] and f not in unsupported for f in pending)
             receipt['errors'].append(f'{type(error).__name__}: {error}')
             # A single reader-window deadline is a local failure. Only an
             # actually spent GLOBAL allowance defers later native sources.

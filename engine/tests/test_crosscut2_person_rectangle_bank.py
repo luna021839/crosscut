@@ -281,3 +281,29 @@ def test_legacy_bridge_cannot_hide_changed_model_or_reader_seals(tmp_path, monke
     output, receipts = run(w, [{20: 1}], maximum_new_frames=0)
     assert output == [{}] and receipts[0]['reused_frames'] == 0
     assert receipts[0]['deferred_frame_budget'] == 1
+
+
+def test_one_unseekable_window_cannot_drop_other_supported_source_frames(tmp_path,monkeypatch):
+    w=world(tmp_path,monkeypatch);original=people.sparse.frames
+    def real_planning(path,natives,**kw):
+        people.sparse.windows(natives,kw['clock'])
+        yield from original(path,natives,**kw)
+    monkeypatch.setattr(people.sparse,'frames',real_planning)
+    output,receipts=run(w,[{20:0,240:0,270:0}])
+    assert set(output[0])=={20}
+    assert receipts[0]['failed_frames']==2 and receipts[0]['new_person_forwards']==1
+    assert receipts[0]['status']=='partial' and not receipts[0]['whole_source_scan_fallback']
+
+
+def test_combined_preroll_limit_can_split_before_any_decode_or_model_retry(tmp_path,monkeypatch):
+    from dataclasses import replace
+    w=world(tmp_path,monkeypatch);probe=people.sparse.probe;frames=people.sparse.frames
+    monkeypatch.setattr(people.sparse,'probe',lambda *a,**kw:replace(probe(*a,**kw),keyframes=(0,220)))
+    def real_planning(path,natives,**kw):
+        people.sparse.windows(natives,kw['clock'])
+        yield from frames(path,natives,**kw)
+    monkeypatch.setattr(people.sparse,'frames',real_planning)
+    output,receipts=run(w,[{200:0,250:0}],maximum_new_frames=2)
+    assert set(output[0])=={200,250}
+    assert receipts[0]['new_person_forwards']==2 and receipts[0]['failed_frames']==0
+    assert w.log['infer']==[200,250] and receipts[0]['status']=='complete'
