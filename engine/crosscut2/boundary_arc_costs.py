@@ -51,14 +51,32 @@ def cameras(entry,exit,baseline,*,cap,bridge_only=False):
     return values,valid
 
 
+def whole_viewports(entry,exit,*,length,cap):
+    """Batch of exact inverse-zoom whole-hold bridges; no neutral rewind."""
+    entry=np.asarray(entry,float);exit=np.asarray(exit,float);B=len(entry)
+    if entry.shape!=(B,7,3) or exit.shape!=entry.shape or length<14:
+        raise ValueError('whole viewport requires two actual7frame strips')
+    a=entry.copy();b=exit.copy();a[:,:,0]=1/a[:,:,0];b[:,:,0]=1/b[:,:,0]
+    middle=_hermite(a[:,-1],b[:,0],a[:,-1]-a[:,-2],b[:,1]-b[:,0],length-12)[:,1:-1]
+    positive=(middle[:,:,0]>0).all(1);middle[:,:,0]=1/np.where(middle[:,:,0]>0,middle[:,:,0],1.)
+    path=np.concatenate((entry,middle,exit),axis=1)
+    z=path[:,:,0];center=path[:,:,1:]
+    valid=positive&np.isfinite(path).all((1,2))&(z>=1.-1e-9).all(1)&(z<=cap+1e-9).all(1)
+    valid&=(np.linalg.norm(center-.5,axis=-1)<=.25+1e-9).all(1)
+    valid&=(center>=.5/z[:,:,None]-1e-9).all((1,2))&(center<=1.-.5/z[:,:,None]+1e-9).all((1,2))
+    return path,valid
+
+
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
-                 person_extents=False):
+                 person_extents=False,opportunity_episodes=None):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
         self.prefix=[];self.native_tables=[];self.left=[];self.right=[];self.calls=0;self.last_codes=None
         self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
+        self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
+        self.whole_viewport_paths_scored=0
         for s,paths in enumerate(dense):
             check();frames=np.arange(int(nodes[-1]));values=np.asarray(paths)
             rates=catalogues[s].rates(frames,values)/fps
@@ -201,6 +219,10 @@ class ArcCosts:
             p=np.array([k for k,v in enumerate(self.entries[i]) if v.source==s],int)
             q=np.array([k for k,v in enumerate(self.exits[j]) if v.source==s],int)
             if not len(p) or not len(q):continue
+            from .programme_source_clock import admit as clock_admit
+            clock_ok=clock_admit(self.cats[s].bank,self.nodes,i,j,
+                [self.entries[i][k] for k in p],[self.exits[j][k] for k in q],fps=self.fps)
+            if not clock_ok.any():continue
             base=self.baseline_cost(s,first,final)
             if L>=38:
                 left,lv=self.left[i];right,rv=self.right[j]
@@ -220,13 +242,37 @@ class ArcCosts:
                     compatible=np.isclose(entry[:,:k],curve[:k],rtol=0.,atol=1e-12).all((1,2))&np.isclose(exit[:,-k:],curve[-k:],rtol=0.,atol=1e-12).all((1,2))
                     compatible=compatible.reshape(v.shape)
                     better=compatible&(~ok|(base[family]<v));v=np.where(better,base[family],v);g=np.where(better,family,g);ok|=compatible
-            ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok;codes[ix]=g
+            # Add the non-baseline family only on the adjacent-opportunity
+            # DAG, not all quadratic long holds. Long baseline alternatives
+            # remain legal: this is NOT a maximum duration or cut quota.
+            adjacent=(self.opportunity_episodes is not None and
+                self.opportunity_episodes[j]-self.opportunity_episodes[i]<=2)
+            if adjacent and L>=14 and not np.any((self.support.events[s]>first)&(self.support.events[s]<final)):
+                ps,qs=np.meshgrid(p,q,indexing='ij')
+                entry=np.asarray([self.entries[i][k].strip for k in ps.ravel()])
+                exit=np.asarray([self.exits[j][k].strip for k in qs.ravel()])
+                path,valid=whole_viewports(entry,exit,length=L,cap=self.cats[s].bank['zoom_cap'])
+                safe=np.where(valid[:,None,None],path,self.dense[s][0][None,first:final])
+                actual=self.direct_cost(s,first,safe).reshape(len(p),len(q));valid=valid.reshape(v.shape)
+                better=valid&(~ok|(actual<v));v=np.where(better,actual,v);g=np.where(better,5,g);ok|=valid
+                self.whole_viewport_paths_scored+=len(path)
+                self.peak_batch_bytes=max(self.peak_batch_bytes,path.nbytes+safe.nbytes)
+            ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok&clock_ok;codes[ix]=g
         self.last_codes=(i,j,codes)
         return cost,allowed,codes
 
     def replay(self,i,j,p,q,code):
         first,final=map(int,self.nodes[[i,j]]);source=self.entries[i][p].source
         entry=self.entries[i][p].strip;exit=self.exits[j][q].strip
+        if code==5:
+            path,valid=whole_viewports(entry[None],exit[None],length=final-first,cap=self.cats[source].bank['zoom_cap'])
+            if not valid[0]:raise AssertionError('selected whole viewport is infeasible')
+            from .subject_moment_sequence import hold_curve
+            reference=hold_curve(first,final,([first,final-1],[[1.,.5,.5]]*2),entry,exit,
+                cap=self.cats[source].bank['zoom_cap'],family='whole_viewport')
+            if reference is None or not np.allclose(reference.values,path[0],rtol=0.,atol=2e-14):
+                raise AssertionError('selected whole viewport differs from scored scalar replay')
+            return path[0]
         base=self.dense[source][0 if code==4 else code][first:final]
         if final-first<38 and code<4:path=base[None].copy();valid=np.array([True])
         else:path,valid=cameras(entry[None],exit[None],base,cap=self.cats[source].bank['zoom_cap'],bridge_only=code==4)

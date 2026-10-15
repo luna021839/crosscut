@@ -24,12 +24,13 @@ from .focal_appearance import cosine as focal_appearance_cosine
 
 class PlayedPosePortPrior:
     port_camera_prior=True
-    def __init__(self,*,person_extents=False):
+    def __init__(self,*,person_extents=False,editorial_opportunities=False):
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
-            'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py']
+            'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py','editorial_opportunities.py',
+            'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -65,6 +66,12 @@ class PlayedPosePortPrior:
             content_integration='nearest cached face/body within6 outputframes and same native shot; not a dense track',
             new_source_neural_calls=0,new_source_analysis_decode=0,
             professional_quality_approved=False,normal_app_activation_approved=False)
+        self.artifact['fixed_editorial_opportunities']=bool(editorial_opportunities)
+        if editorial_opportunities:
+            self.artifact.update(contract='fixed_episode_supported_exposure_boundary_port_E4_v1',
+                matched_action_change_credit='once_per_fixed_music_episode * actually_observed_incoming_exposure',
+                content_integration='readability_deficit_plateau_native_detail_role_crop_no_own_activity_reward',
+                opportunity_units_are_unfitted_engineering=True)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
 
@@ -74,10 +81,12 @@ class SelectedPorts:
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
-           identity_hints=None,part_observer=None,person_observer=None,subjects=None,check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
+           identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
+           check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
+    editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     def live():
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
@@ -104,12 +113,34 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         face_members,native_ports=bind_hints(banks,identity_hints,native_ports)
         featured,featured_receipt=consensus(banks,face_members)
         receipt.update(source_local_member_hints_consumed=True,featured_member_state=featured_receipt)
+    framing=None
+    if editorial:
+        from .programme_framing import evidence as framing_evidence
+        framing,receipt['original_programme_framing']=framing_evidence(banks)
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
-            member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s]))
+            member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s],
+            editorial_content=editorial,framing_evidence=framing))
     del states,rows,raw
-    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live)
+    music=np.zeros(len(nodes)) if music is None else np.asarray(music,float)
+    if music.shape!=(len(nodes),) or not np.isfinite(music).all() or np.any((music<0)|(music>1)):
+        raise ValueError('observed per-node musical strengths required')
+    opportunities=None
+    if editorial:
+        from .editorial_opportunities import Opportunities
+        opportunities=Opportunities(nodes,music,fps=fps,
+            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
+    entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities)
+    if opportunity_observer is not None:
+        if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
+        receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
+        # The final camera/actor pruning must see the NEW raw observations.
+        # Nothing has been selected yet; do not patch an old chosen movie.
+        from .editorial_opportunities import Opportunities
+        opportunities=Opportunities(nodes,music,fps=fps,
+            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
+        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -120,11 +151,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
-        person_extents=person_extents)
+        person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes)
     cut_cache={};cut_statistics=[];entry_density={}
-    music=np.zeros(len(nodes)) if music is None else np.asarray(music,float)
-    if music.shape!=(len(nodes),) or not np.isfinite(music).all() or np.any((music<0)|(music>1)):
-        raise ValueError('observed per-node musical strengths required')
     beat_frames=np.asarray(nodes)[music>0]
     exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
     def cut(n):
@@ -147,7 +175,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 admitted[:,right_index]&=matching
                 for left_index in np.flatnonzero(matching&admitted[:,right_index]):
                     density[right_index]=max(density[right_index],
-                        float(detail['matched_action_change_density'][left_index,right_index]*music[n]))
+                        float(detail['matched_action_change_density'][left_index,right_index]*music[n]) if opportunities is None else
+                        opportunities.density(n,exits[n][left_index].observation,port.observation,
+                            a[left_index],port.source,detail['matched_action_change_density'][left_index,right_index]))
             entry_density[n]=density
             cut_cache[n]=(rates*weights,admitted)
             cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
@@ -161,11 +191,22 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         costs,allowed,codes=arcs(i,j)
         if i and i not in entry_density:cut(i)
         density=entry_density.get(i,np.zeros(len(entries[i])))
-        reward=min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
+        reward=(min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
+            if opportunities is None else 0.)
         return costs-reward-(potential[j]-potential[i]),allowed,codes
+    observed_exposure={}
+    def credit(i,j):
+        if not i:return np.zeros(len(entries[0]))
+        if i not in entry_density:cut(i)
+        if i not in observed_exposure:
+            observed_exposure[i]=np.asarray([opportunities.exposure(i,p.observation) for p in entries[i]])
+        exposure=np.minimum(observed_exposure[i],float(nodes[j]-nodes[i])/fps)
+        return opportunities.credit(i,entry_density[i],exposure)
     live();prepared=monotonic();phase='selection';selection_start=prepared
     port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
-        start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live)
+        start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live,
+        opportunity_episodes=None if opportunities is None else opportunities.episodes,
+        hold_credit=None if opportunities is None else credit)
     score=float(objective[0]+potential[-1]-potential[0]);selected=SelectedPorts(nodes,fps)
     runs=[];chosen_states=[];chosen_rows=[];parts=[];frozen=[];cumulative=0.
     for k,((i,j,p,q),code) in enumerate(zip(port_runs,dp['selected_arc_codes'])):
@@ -175,7 +216,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         curve=arcs.replay(i,j,p,q,code);ticks=np.arange(first,final)
         cost=float(arcs.direct_cost(source,first,curve[None])[0]+fragments(i,j)[source])
         density=entry_density.get(i,np.zeros(len(entries[i])))
-        change_credit=min(float(final-first)/fps,exposure_seconds)*float(density[p])
+        change_credit=(min(float(final-first)/fps,exposure_seconds)*float(density[p]) if opportunities is None
+            else dp['opportunity_claims'][k]['credit'])
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
         cumulative+=cost-change_credit+incoming
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
@@ -245,6 +287,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if not math.isclose(cumulative,score,rel_tol=1e-8,abs_tol=1e-7):
         raise AssertionError('E selected actual camera/pose decomposition differs from DP: '+str((cumulative,score)))
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
+        editorial_opportunities=None if opportunities is None else opportunities.receipt(),
+        actual_opportunity_supported_entry_ports=sum(int((observed_exposure[n]>0).sum()) for n in observed_exposure),
+        actual_opportunity_useful_supported_entry_ports=sum(int(((observed_exposure[n]>0)&(entry_density[n]>0)).sum())
+            for n in observed_exposure),
         dense_subject_observations=[] if subjects is None else [s.receipt() for s in subjects],
         physical_group_focal_bound=True,actor_alias_changes_cost=False,
         selected_hold_cost_decomposition=parts,frozen_selected_camera_arcs=frozen,
@@ -255,6 +301,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             supervision_kinds=[],objective_vector=[score,int(objective[1])]),
         port_pair_statistics=cut_statistics,authored_cuts=int(objective[1]),
         long_prefix_combinations=arcs.long_combinations,short_direct_paths=arcs.short_paths,
+        whole_viewport_paths_scored_before_source_selection=arcs.whole_viewport_paths_scored,
         camera_patch_batch_bytes_lower_bound=arcs.peak_batch_bytes,
         content_observation_scope='nearest cached sample <=6 frames same native shot; no dense tracking claim',
         source_NN_and_analysis_decode_during_new_selection=0,body_observations_loaded=poses is not None,

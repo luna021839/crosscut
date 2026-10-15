@@ -48,11 +48,11 @@ def paired(left,right,*,rates,available,basis):
             if not value['seam_action_supported']:continue
             dense_motion,activity=motion(a,b,value['seam_arm_joints'])
             if dense_motion is None:continue
-            # Four bounded measurements in the same model-evidence convention
-            # as the original cost; incomplete semantic channels stay UNKNOWN.
-            raw=np.mean([value['seam_arm_direction_residual'],
-                *[value[k]/(1.+value[k]) for k in ('seam_pose_residual','seam_screen_residual')],
-                dense_motion/(1.+dense_motion)])
+            # Source context is root-relative pose + contemporary motion.
+            # Played screen/body placement is scored separately in matrix();
+            # it must neither disappear nor be counted twice as this context.
+            raw=np.mean([value['seam_pose_residual']/(1.+value['seam_pose_residual']),
+                         dense_motion/(1.+dense_motion)])
             risk=.5+.5*(raw-.5)
             for channel,wrist in ((0,4),(1,5)):
                 if wrist in value['seam_arm_joints']:rates[i,j,channel]=risk

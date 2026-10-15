@@ -119,15 +119,20 @@ def load_reused(reference,*,sources,source_hashes,banks,nodes,warps,clocks,maste
     """
     from .grid_perception import file_identity
     from .subject_window_bank import load
-    check();root=Path(authorized_root).resolve(strict=True);reference=Path(reference)
-    if not reference.resolve(strict=True).is_relative_to(root):raise ValueError('subject evidence outside authorized project')
-    record=json.loads(reference.read_text());plan=record['render_plan']
-    if (list(map(str,sources))!=plan['sources'] or list(source_hashes)!=record['source_sha256']
-            or [list(file_identity(p)) for p in sources]!=record['source_file_identities']):
-        raise ValueError('subject evidence physical source domain changed')
-    if float(plan['fps'])!=fps or float(plan['master_audio_start'])!=master_start:
-        raise ValueError('subject evidence music clock changed')
-    paths=record['subject_moment_refinement_receipt']['window_receipts'];groups=[[] for _ in sources];seen=set()
+    check();root=Path(authorized_root).resolve(strict=True)
+    references=reference if isinstance(reference,(list,tuple)) else [reference];paths=[]
+    for reference in references:
+        reference=Path(reference)
+        if not reference.resolve(strict=True).is_relative_to(root):raise ValueError('subject evidence outside authorized project')
+        record=json.loads(reference.read_text());plan=record['render_plan']
+        if (list(map(str,sources))!=plan['sources'] or list(source_hashes)!=record['source_sha256']
+                or [list(file_identity(p)) for p in sources]!=record['source_file_identities']):
+            raise ValueError('subject evidence physical source domain changed')
+        if float(plan['fps'])!=fps or float(plan['master_audio_start'])!=master_start:
+            raise ValueError('subject evidence music clock changed')
+        paths.extend(record.get('subject_moment_refinement_receipt',{}).get('window_receipts',[]))
+        paths.extend(record.get('fixed_actor_camera_hold_receipt',{}).get('opportunity_subject_observations',{}).get('window_receipts',[]))
+    groups=[[] for _ in sources];seen=set()
     for receipt in paths:
         check()
         if 'path' not in receipt:continue  # an explicitly unsupported seed

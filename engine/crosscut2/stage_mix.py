@@ -314,6 +314,10 @@ def main():
         help='Explicit untrained GROUP E: physical focal played partial pose and immutable two-ended camera port DAG')
     parser.add_argument('--reuse-subject-observations',type=Path,
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
+    parser.add_argument('--editorial-opportunity-exposure',action='store_true',
+        help='Explicit E4 trial: once-per-musical-episode actual subject exposure and readable framing deficit')
+    parser.add_argument('--opportunity-subject-spec',type=Path,
+        help='Explicit local source/model JSON for bounded raw observations BEFORE E4 final selection')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -372,6 +376,10 @@ def main():
         raise ValueError('played-pose port prior requires partial event consumer and no other prior/checkpoint')
     if not math.isfinite(args.maximum_perception_seconds) or not 1 <= args.maximum_perception_seconds <= 1800:
         raise ValueError('one finite declared perception allowance required')
+    if args.editorial_opportunity_exposure and not args.played_pose_port_camera_prior:
+        raise ValueError('editorial opportunity exposure requires the actual played port-camera consumer')
+    if args.opportunity_subject_spec is not None and (not args.editorial_opportunity_exposure or args.reuse_subject_observations is None):
+        raise ValueError('bounded subject opportunity probe requires explicit E4 and bound existing subject observations')
     started = monotonic()
     preference_model=None
     connection_prior=None
@@ -391,7 +399,8 @@ def main():
         connection_prior=PlayedFacePrior()
     if args.played_pose_port_camera_prior:
         from .played_pose_port_programme import PlayedPosePortPrior
-        connection_prior=PlayedPosePortPrior(person_extents=args.person_rectangle_model is not None)
+        connection_prior=PlayedPosePortPrior(person_extents=args.person_rectangle_model is not None,
+            editorial_opportunities=args.editorial_opportunity_exposure)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -493,6 +502,9 @@ def main():
             for bank,record in zip(banks,bound_source_cut_events):
                 bank['native_cut_frames']=np.asarray(record['frames'],int)
             if args.played_pose_port_camera_prior:
+                from .programme_source_clock import attach as attach_programme_clock
+                attach_programme_clock(banks,warps,camera_census,nodes,
+                    master_start=original.master_audio_start,fps=original.fps)
                 from .terminal_stencil import observe as observe_terminal_stencils
                 endings=observe_terminal_stencils(original.sources,banks,camera_census,check=check)
                 for bank,ending in zip(banks,endings):bank['terminal_stencil_observation']=ending
@@ -537,11 +549,19 @@ def main():
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,nodes=nodes,
                     warps=warps,clocks=camera_census,master_start=original.master_audio_start,fps=original.fps,
                     authorized_root=args.cache.parent.parent,check=check)
+            opportunity_observer=None
+            if args.opportunity_subject_spec is not None:
+                from .subject_opportunity_probe import observer
+                opportunity_observer=observer(args.opportunity_subject_spec,sources=original.sources,
+                    source_hashes=[v['source_sha256'] for v in bound_source_cut_events],
+                    identities=[file_identity(p) for p in original.sources],
+                    cache=args.cache.parent/'crosscut2-subject-opportunities-v1',
+                    authorized_root=args.cache.parent.parent,device=expected)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
-                person_observer=person_observer,subjects=subjects)
+                person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts

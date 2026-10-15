@@ -46,6 +46,32 @@ def coverage(authored, native, detected):
         detector_authored_set_exact=a <= d)
 
 
+def cadence_profile(authored,native,*,frame_count,fps,window_seconds=2.):
+    """Actual planned camera boundaries, not strobe detector count or a gate.
+
+    An isolated fast action match and a cluster of unrelated views are not
+    judged equivalent here. This only locates clusters for following-flow
+    review; it never forces a minimum shot length or declares quality passed.
+    """
+    if fps<=0 or frame_count<1 or window_seconds<=0:raise ValueError('finite positive programme clock required')
+    events=boundary_union(authored,native,[],frame_count=frame_count)
+    ticks=np.asarray([v['frame'] for v in events],int)
+    bounds=np.r_[0,ticks,frame_count];lengths=np.diff(bounds)/fps
+    spans=[]
+    for i,tick in enumerate(ticks):
+        end=int(np.searchsorted(ticks,tick+window_seconds*fps,side='left'));count=end-i
+        if count>=3:
+            spans.append(dict(first_frame=int(tick),last_frame=int(ticks[end-1]),
+                seconds=[float(tick/fps),float(ticks[end-1]/fps)],boundary_count=count))
+    maximum=max((int(np.searchsorted(ticks,t+window_seconds*fps,side='left'))-i for i,t in enumerate(ticks)),default=0)
+    return dict(all_authored_and_retained_native_boundaries=len(ticks),window_seconds=window_seconds,
+        maximum_boundaries_in_window=maximum,three_or_more_boundary_windows=spans,
+        subsecond_holds=[dict(first_frame=int(bounds[i]),final_frame=int(bounds[i+1]),seconds=float(length))
+            for i,length in enumerate(lengths) if length<1.],
+        median_hold_seconds=float(np.median(lengths)),maximum_hold_seconds=float(lengths.max()),
+        density_is_not_an_editing_quality_verdict=True,normal_speed_audio_playback_performed=False)
+
+
 def programme_schedules(plan, source_clocks, source_cut_frames):
     schedules, native, authored = [], [], []
     expected = 0
@@ -198,6 +224,7 @@ def evaluate_programme(movie, *, record, models, body_model, cut_cache, check, m
     if not set(authored) <= evaluated or not set(native) <= evaluated:
         raise AssertionError('an expected authored/native boundary escaped actual-pixel evaluation')
     return dict(contract='selected_programme_pixel_critic_v1', movie=movie.name,
+        cadence_profile=cadence_profile(authored,native,frame_count=count,fps=fps),
         output_frame_count=count, fps=fps, source_file_identity=binding,
         boundary_coverage=coverage(authored, native, detected), evaluated_boundary_count=len(rows),
         all_authored_boundaries_evaluated=set(authored) <= evaluated,

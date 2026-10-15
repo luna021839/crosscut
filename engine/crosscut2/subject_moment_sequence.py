@@ -7,16 +7,87 @@ cut, camera clamp, post-selection fit, or quality approval is introduced.
 import hashlib
 import math
 import numpy as np
-from .boundary_camera_arc import build
+from .boundary_camera_arc import build,CameraArc,realizable,_hermite
 from .fixed_holds import _curve_at
 
 
-def hold_curve(first, final, interior, entry, exit, *, cap):
+def hold_curve(first, final, interior, entry, exit, *, cap,family='connectors'):
     first,final=int(first),int(final)
     if final-first<12:return None
     ticks,values=interior
     base=_curve_at(np.asarray(ticks),np.asarray(values),np.arange(first,final))
-    return build(np.asarray(entry),np.asarray(exit),base,cap=cap)
+    if family=='connectors':return build(np.asarray(entry),np.asarray(exit),base,cap=cap)
+    if family not in ('whole_viewport','whole_open'):raise ValueError('declared finite camera family required')
+    entry=np.asarray(entry,float);exit=np.asarray(exit,float);length=len(base)
+    if length<14:return build(entry,exit,base,cap=cap)
+    if entry.shape!=(7,3) or exit.shape!=(7,3) or not realizable(entry,cap) or not realizable(exit,cap):return None
+    # Inverse zoom is viewport width. Padding bounds are linear in this
+    # coordinate, so zero-slope Hermite endpoints form a feasible convex path.
+    # Nonzero strip velocities may be infeasible; reject, never clamp them.
+    a=entry.copy();b=exit.copy();a[:,0]=1/a[:,0];b[:,0]=1/b[:,0]
+    mid=(length-1)//2
+    if family=='whole_open' and 7<mid<length-8:
+        center=base[mid].copy()
+        if not realizable(center[None],cap):return None
+        center[0]=1/center[0];zero=np.zeros(3)
+        before=_hermite(a[-1],a[-1]-a[-2],center,zero,mid-6)
+        after=_hermite(center,zero,b[0],b[1]-b[0],length-7-mid)
+        middle=np.concatenate((before,center[None],after))
+    else:middle=_hermite(a[-1],a[-1]-a[-2],b[0],b[1]-b[0],length-13)
+    if np.any(middle[:,0]<=0):return None
+    middle[:,0]=1/middle[:,0]
+    path=np.concatenate((entry,middle,exit))
+    if len(path)!=length or not realizable(path,cap):return None
+    changed=np.any(path!=base,axis=1)
+    bends=np.flatnonzero(np.any(np.diff(path,2,axis=0)!=0.,axis=1))+1
+    path.setflags(write=False);changed.setflags(write=False)
+    return CameraArc(path,changed,tuple(sorted({0,length-1,*map(int,bends)})),family)
+
+
+def observed_view_cost(values,native_indices,windows,*,fps):
+    """Integrate only actual played-window head/body/crop evidence.
+
+    Unobserved interiors are not certified. No source/camera fit or inferred
+    performer motion appears here; overlapping observations are averaged.
+    """
+    values=np.asarray(values,float);native=np.asarray(native_indices,int)
+    if values.shape!=(len(native),3) or not np.isfinite(values).all() or fps<=0:
+        raise ValueError('one actual whole-hold camera/native schedule required')
+    loss=np.zeros(len(native));count=np.zeros(len(native))
+    for window in windows:
+        at=native-int(window.ordinals[0]);inside=(at>=0)&(at<len(window.ordinals))
+        ids=np.flatnonzero(inside)
+        ids=ids[window.associated[at[ids]]]
+        if not len(ids):continue
+        at=at[ids];heads=window.heads[at];camera=values[ids]
+        maximum=max(len(window.competitors[k]) for k in at)+1
+        rows=np.zeros((len(ids),maximum,4));rows[:,0]=heads
+        for j,k in enumerate(at):rows[j,1:1+len(window.competitors[k])]=window.competitors[k]
+        centers=.5+camera[:,None,:1]*(rows[...,:2]-camera[:,None,1:]);height=rows[...,2]*camera[:,None,0]
+        half=height[...,None]*[.45*9/16,.5]
+        extent=np.maximum(0.,np.minimum(1.,centers+half)-np.maximum(0.,centers-half))
+        scores=extent.prod(-1)*np.exp(-((centers[...,0]-.5)/.4)**2)
+        scores=np.where((rows[...,2]>.019)&(rows[...,3]>=.75),scores,0.)
+        # Ratios are mathematically in[0,1]; rounding of extent subtraction
+        # must not turn a fully visible target into a negative content cost.
+        # Only the scalar measurement is bounded, never the replayed camera.
+        fraction=np.clip(np.prod(extent[:,0]/np.maximum(1e-12,2*half[:,0]),axis=-1),0.,1.)
+        attention=np.clip(scores[:,0]/np.maximum(1e-12,scores.max(-1)),0.,1.)
+        body=.5+camera[:,None,:1]*(window.body[at,:,:2]-camera[:,None,1:])
+        supported=window.support[at]
+        clipped=(supported&((body<0).any(-1)|(body>1).any(-1))).sum(-1)/np.maximum(1,supported.sum(-1))
+        # Same oversized-head effort as joint_cameras. Matching at a seam is
+        # not a reason to keep enlarging a readable face throughout the shot.
+        tight=6.*np.maximum(0.,height[:,0]-np.maximum(.24,heads[:,2]))
+        loss[ids]+=1.-fraction+1.-attention+clipped+tight;count[ids]+=1
+    known=count>0
+    visibility=float((loss/np.maximum(1,count)).sum()/fps)
+    # Same played digital-zoom regularizer as SourceCatalogue.rates; not a
+    # newly tuned reward or a blanket1.15x limit. Actual match crops stay legal.
+    zoom=float((.1*np.log(np.maximum(1.,values[:,0]))/np.log(2.)).sum()/fps)
+    return dict(observed_crop_cost=visibility,digital_zoom_cost=zoom,
+        observed_output_frames=int(known.sum()),unobserved_output_frames=int((~known).sum()),
+        full_hold_subject_visibility_certified=False)
 
 
 def curve_digest(curve):return hashlib.sha256(np.asarray(curve,dtype=np.float64).tobytes()).hexdigest()
@@ -35,7 +106,7 @@ def camera_motion(values, native_indices, native_cuts, *, fps):
 
 
 def choose(levels, hold, *, check=lambda:None):
-    """Exact chain DP: articulated configuration, then connection/camera cost.
+    """Exact chain DP over one finite pose/connection/camera sum.
 
     A level contains observed alternatives for ONE existing cut, or its sole
     unchanged anchor when observation was inconclusive. Those two kinds must
@@ -53,26 +124,27 @@ def choose(levels, hold, *, check=lambda:None):
             costs=(value['configuration_cost'],value['connection_cost'])
             if type(value['frame']) is not int or not all(math.isfinite(c) and c>=0 for c in costs):
                 raise ValueError('finite nonnegative, actual output-clock candidates required')
-    costs=[(0.,0.)]*len(levels[0]);parents=[];edges=[];evaluated=0
+    costs=[0.]*len(levels[0]);parents=[];edges=[];evaluated=0
     for i,values in enumerate(levels[1:]):
-        check();best=[(math.inf,math.inf)]*len(values);back=[None]*len(values);proofs=[None]*len(values)
+        check();best=[math.inf]*len(values);back=[None]*len(values);proofs=[None]*len(values)
         for q,b in enumerate(values):
             for p,a in enumerate(levels[i]):
-                if not math.isfinite(costs[p][0]) or b['frame']-a['frame']<12:continue
+                if not math.isfinite(costs[p]) or b['frame']-a['frame']<12:continue
                 edge=hold(i,a,b);evaluated+=1
                 if edge is None:continue
                 motion=float(edge['camera_cost'])
                 if not math.isfinite(motion) or motion<0:raise ValueError('finite scored camera motion required')
-                score=(costs[p][0]+b['configuration_cost'],
-                       costs[p][1]+b['connection_cost']+motion)
+                score=costs[p]+b['configuration_cost']+b['connection_cost']+motion
                 if score<best[q]:best[q]=score;back[q]=p;proofs[q]=edge
         parents.append(back);edges.append(proofs);costs=best
     q=min(range(len(costs)),key=lambda k:costs[k]);objective=costs[q]
-    if not math.isfinite(objective[0]):raise ValueError('no realizable common-clock refinement sequence')
+    if not math.isfinite(objective):raise ValueError('no realizable common-clock refinement sequence')
     selected=[q];chosen=[]
     for i in range(len(parents)-1,-1,-1):
         chosen.append(edges[i][q]);q=parents[i][q];selected.append(q)
-    return selected[::-1],chosen[::-1],dict(objective=list(objective),evaluated_arcs=evaluated,
+    return selected[::-1],chosen[::-1],dict(objective=objective,evaluated_arcs=evaluated,
+        objective_contract='finite_sum_articulated_configuration_connection_whole_camera_v2',
+        lexicographic_infinite_pose_priority=False,weights_fitted=False,
         source_sequence_changed=False,independent_source_phase_search=False,
         authored_cut_count_changed=False,post_selection_camera_fit=False,
         professional_quality_approved=False)

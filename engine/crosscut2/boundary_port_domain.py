@@ -17,7 +17,7 @@ class BoundaryPort:
     geometry_hash: str
 
 
-def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8):
+def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
@@ -71,6 +71,8 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(0)
                 continue
             native_pair=matrix(features(native_left,fps=fps),features(native_right,fps=fps),details=True)
+            if opportunities is not None:
+                opportunities.observe(n,native_left,native_right,native_pair,left_sources,right_sources)
             pose=native_pair['pose_rate'];appearance=native_pair['appearance_rate']
             candidates={}
             for ai,left_obs in enumerate(native_left):
@@ -86,6 +88,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         ha,hb=fa[2]*left[0],fb[2]*right[0]
                         error=max(abs(math.log(ha/hb))/math.log(1.5),np.linalg.norm((pa-pb)*[16/9,1.])/max(.005,(ha+hb)/2.))
                         score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(math.log(left[0])+math.log(right[0]))
+                        if opportunities is not None:
+                            score-=opportunities.density(n,left_obs,right_obs,a,b,
+                                native_pair['matched_action_change_density'][ai,bi])
                         candidates.setdefault((a,b),[]).append((float(score),a,b,ha_index,hb_index,k,left,right))
             for a in range(S):
                 for b in range(S):
@@ -118,5 +123,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         paired_subject_pinned_before_camera=True,rejected_camera_focal_reassignments=rejected_reassignments,
         physical_actor_pairs_compared_before_camera=actor_pairs_considered,
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
+        raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

@@ -5,7 +5,16 @@ from fractions import Fraction
 from crosscut.render import AspectRatio, RenderPlan, RenderSegment
 from crosscut.render_frame_schedule import VerifiedRenderFrameClock
 from crosscut2.action_geometry import compare_screen_motion
-from crosscut2.programme_critic import boundary_union, coverage, programme_schedules, rendered_source_frame,bound_source_cuts
+from crosscut2.programme_critic import boundary_union, coverage, programme_schedules, rendered_source_frame,bound_source_cuts,cadence_profile
+
+
+def test_cadence_covers_retained_native_bursts_but_not_strobe_detector_false_cuts():
+    result=cadence_profile([30,48],[60],frame_count=180,fps=30.)
+    assert result['maximum_boundaries_in_window']==3
+    assert result['three_or_more_boundary_windows'][0]['seconds']==[1.,2.]
+    assert len(result['subsecond_holds'])==2
+    assert result['density_is_not_an_editing_quality_verdict']
+    assert cadence_profile([],[],frame_count=180,fps=30.)['maximum_boundaries_in_window']==0
 
 
 def test_equal_counts_with_different_boundaries_do_not_prove_coverage():

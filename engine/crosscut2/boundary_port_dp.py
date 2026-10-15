@@ -86,7 +86,8 @@ def _lexmin(primary, cuts):
 
 def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost,
           start_allowed=None, final_cost=None, final_allowed=None, minimum_frames=12,
-          check=lambda: None, workspace_limit_bytes=200 * 2**20):
+          check=lambda: None, workspace_limit_bytes=200 * 2**20,
+          opportunity_episodes=None, hold_credit=None):
     '''Return (runs, (primary, cuts), receipt).
 
     Each run is (start_node, end_node, entry_port_index, exit_port_index).  A
@@ -94,6 +95,11 @@ def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost
     final node.  Raises ValueError for malformed input or callbacks, an
     exceeded workspace bound, or when no complete programme exists.
     '''
+    if opportunity_episodes is not None or hold_credit is not None:
+        return _opportunity_solve(nodes,entry_sources,exit_sources,start_cost=start_cost,
+            hold_cost=hold_cost,cut_cost=cut_cost,start_allowed=start_allowed,final_cost=final_cost,
+            final_allowed=final_allowed,minimum_frames=minimum_frames,check=check,
+            workspace_limit_bytes=workspace_limit_bytes,episodes=opportunity_episodes,credit=hold_credit)
     nodes = np.asarray(nodes)
     if (nodes.ndim != 1 or len(nodes) < 2 or nodes.dtype.kind not in 'iu'
             or np.any(np.diff(nodes) <= 0)):
@@ -194,3 +200,72 @@ def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost
         end, exit_port = first, int(in_back[first][entry_port])
     receipt['selected_arc_codes']=list(reversed(camera_codes))
     return tuple(reversed(runs)), (float(low[0]), int(fewest[0])), receipt
+
+
+def _opportunity_solve(nodes,entries,exits,*,episodes,credit,**kw):
+    """One paid bit for the CURRENT nonoverlapping opportunity episode.
+
+    Claims are optional, so a weak early view does not consume a better later
+    one. A hold crossing an episode end forgets only that finished episode.
+    Re-entry, A/B/A loops, and cloned source families cannot claim it twice.
+    No all-history subset, cut quota, maximum hold, or source ban is added.
+    """
+    nodes=np.asarray(nodes);episodes=np.asarray(episodes)
+    if (episodes.shape!=nodes.shape or episodes.dtype.kind not in 'iu'
+            or np.any(np.diff(episodes)<0) or not callable(credit)):
+        raise ValueError('ordered fixed opportunity episodes and actual exposure credit required')
+    original_hold=kw.pop('hold_cost');original_cut=kw.pop('cut_cost')
+    entries=_ports(entries,len(nodes),'entry');exits=_ports(exits,len(nodes),'exit')
+    start=_vector(kw.pop('start_cost'),len(entries[0]),'start_cost')
+    allowed=kw.pop('start_allowed');finish=kw.pop('final_allowed');final=kw.pop('final_cost')
+    start_mask=_mask(allowed,len(entries[0]),'start_allowed')
+    if final is not None:final=_vector(final,len(exits[-1]),'final_cost')
+    if finish is not None:finish=_mask(finish,len(exits[-1]),'final_allowed')
+    # At the beginning no event has been paid. The other bit is unreachable,
+    # not a fake extra source/actor or a zero-cost quality measurement.
+    expanded_start=np.repeat(start,2)
+    expanded_allowed=np.column_stack((start_mask,np.zeros(len(start_mask),bool))).ravel()
+    def hold(i,j):
+        value=original_hold(i,j)
+        base,valid=_matrix(value[:2],(len(entries[i]),len(exits[j])),'hold')
+        benefit=np.asarray(credit(i,j),float)
+        if benefit.shape==(len(entries[i]),):benefit=np.broadcast_to(benefit[:,None],base.shape)
+        if benefit.shape!=base.shape or not np.isfinite(benefit).all() or np.any(benefit<0):
+            raise ValueError('finite nonnegative supported opportunity exposure required')
+        shape=(len(entries[i]),2,len(exits[j]),2)
+        cost=np.zeros(shape);mask=np.zeros(shape,bool)
+        same=bool(episodes[i]==episodes[j])
+        # Unpaid -> unpaid may defer the claim; unpaid -> paid may take it.
+        cost[:,0,:,0]=base;mask[:,0,:,0]=valid
+        if same:
+            cost[:,0,:,1]=base-benefit;mask[:,0,:,1]=valid&(benefit>0)
+            cost[:,1,:,1]=base;mask[:,1,:,1]=valid
+        else:
+            cost[:,0,:,0]=base-benefit
+            cost[:,1,:,0]=base;mask[:,1,:,0]=valid
+        result=(cost.reshape(shape[0]*2,shape[2]*2),mask.reshape(shape[0]*2,shape[2]*2))
+        if len(value)==3:
+            codes=np.repeat(np.repeat(np.asarray(value[2]),2,axis=0),2,axis=1)
+            result=(*result,codes)
+        return result
+    def cut(n):
+        base,valid=_matrix(original_cut(n),(len(exits[n]),len(entries[n])),'cut')
+        shape=(len(exits[n]),2,len(entries[n]),2)
+        cost=np.broadcast_to(base[:,None,:,None],shape).reshape(shape[0]*2,shape[2]*2)
+        mask=np.zeros(shape,bool);mask[:,0,:,0]=valid;mask[:,1,:,1]=valid
+        return cost,mask.reshape(shape[0]*2,shape[2]*2)
+    runs,objective,receipt=solve(nodes,[np.repeat(v,2) for v in entries],[np.repeat(v,2) for v in exits],
+        start_cost=expanded_start,start_allowed=expanded_allowed,hold_cost=hold,cut_cost=cut,
+        final_cost=None if final is None else np.repeat(final,2),
+        final_allowed=None if finish is None else np.repeat(finish,2),**kw)
+    paid=[]
+    for i,j,p,q in runs:
+        benefit=np.asarray(credit(i,j),float)
+        amount=float(benefit[p//2] if benefit.ndim==1 else benefit[p//2,q//2])
+        claim=p%2==0 and (episodes[i]!=episodes[j] or q%2==1) and amount>0
+        paid.append(dict(episode=int(episodes[i]),credit=amount if claim else 0.,claimed=bool(claim)))
+    claimed=[p['episode'] for p in paid if p['claimed']]
+    if len(set(claimed))!=len(claimed):raise AssertionError('one editorial opportunity paid twice')
+    receipt.update(opportunity_claims=paid,current_event_paid_bit=True,all_history_subsets_stored=False,
+        fixed_opportunity_episodes=len(np.unique(episodes)),opportunity_credit_once_only=True)
+    return tuple((i,j,p//2,q//2) for i,j,p,q in runs),objective,receipt

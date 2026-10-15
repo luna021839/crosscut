@@ -153,12 +153,15 @@ def matrix(left, right, *, details=False):
     same_clock,same_clock_available,change_basis,dense_observed,dense_used=dense_paired(left,right,
         rates=same_clock,available=same_clock_available,basis=change_basis)
     context_supplied=left['source_clock_action']['available'][:,None]&right['source_clock_action']['available'][None,:]
-    # With no shared interval, opposite played-side velocities do not prove
-    # opposition. Preserve actual endpoint phase and finite UNKNOWN motion.
-    phase_only=np.stack([((phase+1.)/3.)[...,list(c)].mean(-1) for c in CHANNELS],axis=-1)
-    channels=np.where(context_supplied[...,None],phase_only,channels)
-    channels=np.where(dense_observed[...,None],same_clock,channels)
-    channels=np.where(same_clock_available[...,None],same_clock,channels)
+    # Common-clock bone motion cannot REPLACE actual body placement at the
+    # exposed seam. Keep played phase and bridge; replace only the unrelated
+    # cross-seam velocity comparison (which misreads choreography reversals).
+    played_phase=np.stack([phase[...,list(c)].mean(-1) for c in CHANNELS],axis=-1)
+    played_bridge=np.stack([bridge[...,list(c)].mean(-1) for c in CHANNELS],axis=-1)
+    supplied=context_supplied|dense_observed
+    context=np.where(same_clock_available[...,None],same_clock,.5)
+    combined=(played_phase+played_bridge+context)/3.
+    channels=np.where(supplied[...,None],combined,channels)
     pose = channels.mean(-1)
     appearance,appearance_measured=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
         member_a=left['member_hints'][:,None],member_b=right['member_hints'][None,:])
@@ -183,6 +186,8 @@ def matrix(left, right, *, details=False):
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
         fixed_semantic_channel_rates=channels,
+        played_body_placement_channels=(played_phase+played_bridge)/2.,
+        common_clock_action_channels=context,
         appearance_rate=appearance,appearance_measured=appearance_measured,
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,

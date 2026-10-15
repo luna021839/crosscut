@@ -12,9 +12,12 @@ from .source_clock_action import endpoint_correspondence
 
 
 class SourceCatalogue:
-    def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None):
+    def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
+                 editorial_content=False,framing_evidence=None):
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
         self.subjects=subjects
+        self.editorial_content=bool(editorial_content)
+        self.framing_evidence=framing_evidence
         N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
         self.member_hints=np.full(bank['heads'].shape[:3],-1,int) if member_hints is None else np.asarray(member_hints,int)
         self.featured_factor=np.ones(bank['heads'].shape[:3]) if featured_factor is None else np.asarray(featured_factor,float)
@@ -180,4 +183,30 @@ class SourceCatalogue:
         valid&=(index<3)[...,None]&self.content_scope[frames,None]
         projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
         crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
+        if self.editorial_content:
+            # Once the original pixels are readable, small quality differences
+            # do not accrue a perpetual source reward. Digital enlargement
+            # cannot create native detail. The native .12 close-up sampling
+            # size and half-quality convention are explicit engineering units,
+            # not a fitted professional-quality threshold.
+            readable=np.minimum(1.,np.sqrt(quality)/.5)*np.minimum(1.,h[...,2]/.12)
+            shown=np.where(scores.max(-1)>0,readable*fraction*(1.-self.black[n,side]),0.)
+            role=1.-self.featured_factor[n,side,index]
+            # Reuse joint_cameras' oversized-head effort, applying it only to
+            # EXTRA enlargement. An original tight shot is not called missing.
+            tight=6.*np.maximum(0.,displayed_height-np.maximum(.24,h[...,2]))
+            framing=0.
+            if self.framing_evidence is not None:
+                evidence=self.framing_evidence
+                target=evidence['height'][n,side];confidence=evidence['confidence'][n,side]
+                known=self.content_scope[frames]&(scores.max(-1)>0)
+                size_deficit=np.maximum(0.,np.log(np.maximum(.019,target)/np.maximum(.019,displayed_height)))/np.log(1.5)
+                # Formation evidence asks for people actually inside THIS
+                # viewport. It is not a hard requirement to show all6 always.
+                in_view=seen&(center[...,0]>=0)&(center[...,0]<=1)&(center[...,1]>=0)&(center[...,1]<=1)
+                count=(in_view&(size>=.5*np.maximum(.019,displayed_height)[...,None])).sum(-1)
+                wanted=evidence['people'][n,side]
+                coverage=np.maximum(0.,wanted-count)/np.maximum(1.,wanted)
+                framing=np.where(known,confidence*np.where(evidence['formation'][n,side],coverage,size_deficit),0.)
+            return 1.-shown+crop+shown*role+tight+framing+.1*np.log(camera[...,0])/np.log(2.)
         return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[n,side,index]

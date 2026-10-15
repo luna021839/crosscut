@@ -90,6 +90,20 @@ def test_real_synchronous_choreography_reversal_is_not_a_motion_failure():
     assert all(r['seam_motion_residual'] < 1e-12 for r in result['supported'])
 
 
+def test_new_cut_moment_checks_both_subjects_not_only_incoming_attention():
+    a,b=window(0),window(1)
+    others=list(a.competitors);others[int(np.flatnonzero(a.ordinals==100)[0])]=np.array([[.5,.3,.5,.99]])
+    a=replace(a,competitors=tuple(others))
+    result=search(a,b,hypothesis(a),hypothesis(b),candidate_frames=[0,1],outgoing_cap=2.,incoming_cap=2.)
+    rows={v['cut_offset_frames']:v for v in result['candidates']}
+    assert rows[0]['status']=='SUPPORTED_CANDIDATE'
+    assert rows[1]['outgoing_target_attention_ratio']==pytest.approx(.16)
+    assert rows[1]['target_attention_ratio']==1.
+    assert rows[1]['status']=='TARGET_OCCLUDED_OR_NOT_ATTENDED'
+    assert rows[1]['cut_moment_score'] is None
+    assert [v['cut_offset_frames'] for v in result['supported']]==[0]
+
+
 def test_original_camera_cut_inside_context_is_not_a_subject_continuation():
     a, b = window(0), window(1, cut=(100,))
     result = run(a, b)

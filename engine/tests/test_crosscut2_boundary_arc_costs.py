@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from crosscut2.boundary_camera_arc import build as scalar
 from crosscut2.boundary_arc_costs import cameras,ArcCosts
+from crosscut2.boundary_arc_costs import whole_viewports
 from crosscut2.played_event_support import PlayedEventSupport
 from crosscut2.event_holds import fragment_costs
 from crosscut2.boundary_port_domain import make
@@ -54,3 +55,27 @@ def test_incompatible_twelve_frame_overlap_is_masked_not_silently_clamped():
     base=np.tile([1.2,.5,.5],(12,1));a=base[:7].copy();b=base[-7:].copy();b[:,0]=1.3
     _,valid=cameras(a[None],b[None],base,cap=1.5)
     assert not valid[0]
+
+
+@pytest.mark.parametrize('length',[14,20,38,74])
+def test_whole_viewport_batch_matches_scalar_without_forced_zoom_pulse(length):
+    from crosscut2.subject_moment_sequence import hold_curve
+    a=np.tile([1.35,.52,.5],(7,1));b=np.tile([1.2,.5,.5],(7,1))
+    result,valid=whole_viewports(a[None],b[None],length=length,cap=1.35)
+    one=hold_curve(0,length,([0,length-1],[[1.,.5,.5]]*2),a,b,cap=1.35,family='whole_viewport')
+    assert valid[0] and one is not None
+    np.testing.assert_allclose(result[0],one.values,rtol=0.,atol=2e-14)
+
+
+def test_adjacent_opportunity_whole_camera_is_scored_before_DP_and_replayed_exactly():
+    nodes,entry,exit,arcs,fragments=arc_fixture(False)
+    arcs.opportunity_episodes=np.array([0,0,1,2])
+    total=0
+    for i in range(len(nodes)-1):
+        for j in range(i+1,len(nodes)):
+            cost,allowed,codes=arcs(i,j)
+            for p,q in zip(*np.nonzero(allowed)):
+                path=arcs.replay(i,j,p,q,int(codes[p,q]));source=entry[i][p].source
+                assert cost[p,q]==pytest.approx(arcs.direct_cost(source,int(nodes[i]),path[None])[0]+fragments(i,j)[source])
+                total+=int(codes[p,q]==5)
+    assert arcs.whole_viewport_paths_scored>0

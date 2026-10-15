@@ -153,9 +153,11 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
     center_a=.5+ca[0]*(left.heads[a[la],:2]-ca[1:]);center_b=.5+cb[0]*(right.heads[b[rb],:2]-cb[1:])
     face=max(abs(math.log(max(.001,ha)/max(.001,hb)))/math.log(1.5),
         float(np.linalg.norm((center_a-center_b)*[16/9,1.]))/max(.02,(ha+hb)/2.))
+    outgoing_visible,outgoing_attention=_visibility(left.heads[a[la]],ca,left.competitors[a[la]])
     visible,attention=_visibility(right.heads[b[rb]],cb,right.competitors[b[rb]])
     status='SUPPORTED_CANDIDATE' if evidence else 'NO_SUPPORTED_MATCH'
-    if visible<.6 or attention<.6:status='TARGET_OCCLUDED_OR_NOT_ATTENDED'
+    if min(visible,outgoing_visible)<.6 or min(attention,outgoing_attention)<.6:
+        status='TARGET_OCCLUDED_OR_NOT_ATTENDED'
     score=None if not evidence else float(phase+motion+screen+face+(1.-cosine))
     return dict(status=status,source_A=left.source,track_A=left.track,source_B=right.source,track_B=right.track,
         clock_hypothesis_frames=right_clock.phase_frames,clock_A=left_clock.schedule_sha256,
@@ -166,6 +168,7 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         phase_residual=phase,motion_residual=motion,
         screen_residual=screen,face_residual=face,appearance_cosine=cosine,source_activity=activity,
         target_visible_fraction=visible,target_attention_ratio=attention,rank_score=score,
+        outgoing_target_visible_fraction=outgoing_visible,outgoing_target_attention_ratio=outgoing_attention,
         outgoing_camera_locked=bool(outgoing_locked),new_joint_camera_before_selection=not outgoing_locked,
         candidate_has_measured_action=evidence,matched_identity_certified=False,anatomical_ownership_certified=False,
         target_reselected_after_camera=False,following_four_seconds_verified=following_four_seconds_verified,

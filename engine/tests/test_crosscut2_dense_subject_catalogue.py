@@ -63,7 +63,7 @@ def test_missing_dense_arms_do_not_recover_old_falsely_supported_pose():
     value=detail(a,b)
     assert value['contemporary_dense_action_observed'][0,0]
     assert not value['contemporary_dense_action_used'][0,0]
-    assert value['pose_rate'][0,0]==.5
+    np.testing.assert_array_equal(value['fixed_semantic_channel_rates'][0,0,:2],[.5,.5])
     assert value['matched_action_change_density'][0,0]==0.
 
 
