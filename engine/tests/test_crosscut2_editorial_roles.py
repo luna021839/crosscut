@@ -166,3 +166,22 @@ def test_actual_producer_keeps_ordinary_change_playable_without_claiming_a_face_
     assert any(s['editorial_transition_kind']=='SCENE_CHANGE' and s['played_face_rate']>1. for s in changes)
     assert all(not s['successful_face_match_claimed'] for s in changes if s['editorial_transition_kind']=='SCENE_CHANGE')
     assert receipt['event_preference']['fixed_connection_prior']['maximum_measured_face_height_ratio'] is None
+
+
+def test_costume_change_cannot_pay_for_a_played_pose_no_better_than_unknown(monkeypatch):
+    from crosscut2 import source_clock_action
+    from test_crosscut2_source_clock_action import set_style
+    a,b=catalogue(),catalogue();set_style(a,0);set_style(b,1)
+    left,right=features([obs(a,0)],fps=30.),features([obs(b,1)],fps=30.)
+    good=matrix(left,right,details=True)
+    assert good['matched_action_change_density'][0,0]>0
+    # A contradictory contextual rate can coexist with a positive raw
+    # novelty/activity basis. The final played-pose residual must decide
+    # whether this is a useful MATCH, rather than pay for a flashy costume.
+    monkeypatch.setattr(source_clock_action,'paired',lambda *a,**kw:(
+        np.ones((1,1,3)),np.ones((1,1),bool),np.ones((1,1))))
+    bad=matrix(left,right,details=True)
+    assert bad['pose_rate'][0,0]>=.5
+    assert bad['actual_played_match_advantage'][0,0]==0
+    assert bad['matched_action_change_density'][0,0]==0
+    assert bad['allowed'][0,0]  # an ordinary source change remains playable

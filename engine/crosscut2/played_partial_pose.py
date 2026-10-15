@@ -180,7 +180,13 @@ def matrix(left, right, *, details=False):
     # credit, never the source, feasible cut, or ordinary scene-change option.
     incompatible=(left['member_hints'][:,None]>=0)&(right['member_hints'][None,:]>=0)&(
         left['member_hints'][:,None]!=right['member_hints'][None,:])
-    change_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape])
+    # A bright costume/style change is not a matched-action benefit when
+    # the ACTUAL played body connection is no better than UNKNOWN (.5).
+    # Use advantage over that existing neutral residual, not a new fitted
+    # tolerance or an extra source/cut gate. Missing channels retain their
+    # fixed denominator; weak positive evidence earns only a weak benefit.
+    played_match_advantage=np.maximum(0.,1.-2.*pose)
+    change_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape,played_match_advantage])
     change_density=np.where(known_style&appearance_measured&~incompatible,change_density,0.)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
@@ -194,6 +200,7 @@ def matrix(left, right, *, details=False):
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,measured_style_change=novelty,
+        actual_played_match_advantage=played_match_advantage,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,
         ownership_ambiguity=ambiguous, shrinkage=.5, anatomical_ownership_certified=False)
