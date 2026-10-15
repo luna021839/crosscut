@@ -82,11 +82,13 @@ class PlayedPosePortPrior:
                 opportunity_units_are_unfitted_engineering=True)
         self.artifact['scene_readout']=bool(scene_readout)
         if scene_readout:
-            self.artifact.update(contract='scene_readout_residual_burden_boundary_port_E5_v1',
+            self.artifact.update(contract='scene_readout_observed_net_burden_boundary_port_E5_v2',
                 readout_state='cost_and_residual_debt_frontier_per_port_and_paid_bit',
                 exact_global_optimum_claimed=False,readout_label_limit=8,
                 tau='fixed_median_preselection_music_episode_seconds_not_human_cognition',
                 raw_head_observations_not_dense_track_or_camera_cause=True,
+                observed_net_changes_not_discarded_for_wide_sample_spacing=True,
+                known_original_faces_clipped_by_view_are_not_missing_sensor_evidence=True,
                 unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 

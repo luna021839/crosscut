@@ -117,6 +117,19 @@ def test_T2_original_head_reframing_not_arm_motion_or_invented_dense_recovery():
         features([cat.observation(n,1,strip)],fps=30.),details=True)
     expected=then(change(detail['face_rate'][0,0],unit=.2),recovery(1/30.,tau=2.))
     np.testing.assert_allclose(native.steps(60,paths[:1,:1],hold_first=0,baseline=paths[0])[0,0],expected)
+    # Typical actual programme intervals exceed12 frames. Their observed NET
+    # change must not disappear; no interior trajectory is invented.
+    sparse=np.arange(0,181,18);cat=catalogue(sparse);pattern=np.arange(len(sparse))%2
+    cat.bank['heads'][:,:,0,0]=(.3+.4*pattern)[:,None]
+    cat.bank['heads'][:,:,0,2]=(.12+.2*pattern)[:,None]
+    paths=np.tile([1.,.5,.5],(4,180,1));raw=dict(frames=np.array([],int),heads=np.zeros((0,2,8,4)))
+    field=SceneReadout(cat,raw,[],paths,tau=2.)
+    assert field.summary(0,paths[:1],hold_first=0)[0,1]>0
+    assert field.receipt()['sparse_net_change_at_later_observation_not_interpolated_trajectory']
+    cat=catalogue(np.arange(0,181,6));cat.bank['heads'][:,:,0,0]=.9
+    paths[:,60:,0]=2.;field=SceneReadout(cat,raw,[],paths,tau=2.)
+    assert field.summary(0,paths[:1],hold_first=0)[0,1]>0
+    assert field.receipt()['known_original_face_outside_view_is_not_unobserved']
 
 
 def test_T4_all_camera_alternatives_transfer_and_cost_equal_exact_replay():

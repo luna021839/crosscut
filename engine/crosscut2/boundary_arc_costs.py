@@ -115,8 +115,12 @@ class ArcCosts:
                         left[ids,g]=self.patch_delta(s,used,new,old,first=int(tick),final=int(nodes[-1]))
                         left_ok[ids,g]=ok
                         if self.readouts is not None:
-                            safe=np.where(ok[:,None,None],path,base[None])
-                            rl[ids,g]=self.readouts[s].summary(int(tick),safe,hold_first=int(tick),baseline=dense[s][g])
+                            context=self.readouts[s].context_frames
+                            if tick+context<=nodes[-1]:
+                                rb=dense[s][g][tick:tick+context]
+                                rp,rok=cameras(strips,np.broadcast_to(rb[-7:],strips.shape),rb,cap=catalogues[s].bank['zoom_cap'])
+                                safe=np.where(rok[:,None,None],rp,rb[None])
+                                rl[ids,g]=self.readouts[s].summary(int(tick),safe,hold_first=int(tick),baseline=dense[s][g])
             if tick>=38:
                 for s in range(len(catalogues)):
                     ids=np.array([i for i,p in enumerate(exits[n]) if p.source==s],int)
@@ -130,8 +134,12 @@ class ArcCosts:
                         right[ids,g]=self.patch_delta(s,used,new,old,first=0,final=int(tick))
                         right_ok[ids,g]=ok
                         if self.readouts is not None:
-                            safe=np.where(ok[:,None,None],path,base[None])
-                            rr[ids,g]=self.readouts[s].summary(int(tick)-38,safe,hold_first=0,baseline=dense[s][g])
+                            context=self.readouts[s].context_frames
+                            if tick>=context:
+                                rb=dense[s][g][tick-context:tick]
+                                rp,rok=cameras(np.broadcast_to(rb[:7],strips.shape),strips,rb,cap=catalogues[s].bank['zoom_cap'])
+                                safe=np.where(rok[:,None,None],rp,rb[None])
+                                rr[ids,g]=self.readouts[s].summary(int(tick)-context,safe,hold_first=0,baseline=dense[s][g])
             self.left.append((left,left_ok));self.right.append((right,right_ok))
             if self.readouts is not None:self.readout_left.append(rl);self.readout_right.append(rr)
 
@@ -315,8 +323,9 @@ class ArcCosts:
             ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok&clock_ok;codes[ix]=g
             if self.readouts is not None:
                 alternatives[ix]=ac+fragments[s];alternative_ok[ix]=av&clock_ok[:,:,None]
-                if L>=76:
-                    middle=self.readouts[s].base(first+38,final-38)
+                context=self.readouts[s].context_frames
+                if L>=2*context:
+                    middle=self.readouts[s].base(first+context,final-context)
                     transfer=then(then(self.readout_left[i][p,None],middle[None,None]),self.readout_right[j][None,q])
                     transfers[np.ix_(p,q,np.arange(4))]=transfer
                 else:

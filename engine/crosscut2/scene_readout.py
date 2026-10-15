@@ -106,7 +106,7 @@ class SceneReadout:
     """Exact observed head samples, not interpolated dense camera/actor tracks.
 
     Grid/native flanks are physical observations. Within-shot changes between
-    two samples at most12 output frames apart are sparse ATTENTION-reframing
+    two actual samples are NET sparse ATTENTION-reframing
     impulses, not inferred camera velocities or one person's trajectory.
     UNKNOWN neither certifies stillness nor provides recovery exposure. The
     background-only motion case is deliberately not certified by this field.
@@ -134,6 +134,11 @@ class SceneReadout:
         self.events=np.asarray(events,int)
         actual=np.flatnonzero(self.valid);self.previous=np.full(self.final,-1,int)
         self.previous[actual[1:]]=actual[:-1]
+        self.maximum_sample_gap=int(np.diff(actual).max(initial=0))
+        # A changed endpoint camera can affect the NEXT actual head sample,
+        # even when it falls beyond the old19-frame camera patch. Derive the
+        # dependency halo from the input schedule, never an artistic cutoff.
+        self.context_frames=min(self.final,max(38,19+self.maximum_sample_gap))
         self.dense=np.asarray(dense);self.tree=TransferTree(self.steps(0,self.dense,hold_first=0))
 
     def view(self,frames,cameras):
@@ -144,11 +149,18 @@ class SceneReadout:
         extent=np.maximum(0.,np.minimum(1.,centers+half)-np.maximum(0.,centers-half))
         scores=extent.prod(-1)*np.exp(-((centers[...,0]-.5)/.4)**2)
         seen=(heads[...,2]>.019)&(heads[...,3]>=.75)&self.valid[frames,None]
-        scores=np.where(seen,scores,0.);index=scores.argmax(-1)
+        scores=np.where(seen,scores,0.);visible=scores.max(-1)>0
+        # KNOWN original faces outside this proposed viewport are not absent
+        # sensor evidence. Keep their projected geometry so hiding the face
+        # cannot erase the cost of that very crop/reframe. No face elsewhere
+        # in the original means UNKNOWN, not a fabricated offscreen person.
+        native_score=np.where(seen,heads[...,2]**2*np.exp(-((heads[...,0]-.5)/.4)**2),0.)
+        index=np.where(visible,scores.argmax(-1),native_score.argmax(-1))
         center=np.take_along_axis(centers,index[...,None,None],axis=-2)[...,0,:]*[16/9,1.]
         height=np.take_along_axis(heights,index[...,None],axis=-1)[...,0]
         known=np.take_along_axis(np.broadcast_to(self.roi_known[frames],scores.shape),index[...,None],axis=-1)[...,0]
-        return center,height,scores.max(-1)>0,known
+        geometry_known=np.broadcast_to(seen.any(-1),index.shape)
+        return center,height,visible,known,geometry_known
 
     def steps(self,first,paths,*,hold_first,baseline=None,observation_offsets=None,content_rates=None):
         paths=np.asarray(paths,float);L=paths.shape[-2]
@@ -156,10 +168,10 @@ class SceneReadout:
         frames=first+offsets;cameras=paths[:,offsets]
         if paths.ndim!=3 or paths.shape[-1]!=3 or first<0 or first+L>self.final:
             raise ValueError('actual batch camera paths inside source clock required')
-        center,height,seen,known=self.view(frames,cameras)
+        center,height,seen,known,geometry_known=self.view(frames,cameras)
         prior=self.previous[frames].copy();native=np.isin(frames,self.events)
         prior=np.where(native,frames-1,prior)
-        usable=(prior>=hold_first)&(prior>=0)&(frames-prior<=12)
+        usable=(prior>=hold_first)&(prior>=0)
         # A sparse pair crossing an original cut is NOT a smooth head motion.
         usable&=native|(np.searchsorted(self.events,np.maximum(0,prior),side='right')==
             np.searchsorted(self.events,frames,side='right'))
@@ -167,12 +179,12 @@ class SceneReadout:
         previous_camera=paths[:,np.clip(safe-first,0,L-1)].copy()
         if baseline is not None:previous_camera[:,~inside]=np.asarray(baseline)[safe[~inside]]
         usable&=inside if baseline is None else True
-        previous_center,previous_height,previous_seen,_=self.view(safe,previous_camera)
+        previous_center,previous_height,previous_seen,_,previous_known=self.view(safe,previous_camera)
         from .played_partial_pose import face_geometry
-        geometry=face_geometry(previous_center,previous_height,center,height,previous_seen&seen)[0]
+        geometry=face_geometry(previous_center,previous_height,center,height,previous_known&geometry_known)[0]
         # Native UNKNOWN uses the SAME explicit finite1 convention as its
         # existing point geometry; sparse missing evidence emits no observation.
-        geometry=np.where(usable&(native[None]|(previous_seen&seen)),geometry,0.)
+        geometry=np.where(usable&(native[None]|(previous_known&geometry_known)),geometry,0.)
         rates=self.cat.rates(frames,cameras) if content_rates is None else np.asarray(content_rates)[:,offsets]
         exposure=np.clip(1.-rates,0.,1.)*known*seen
         return then(change(geometry,unit=6./self.fps),recovery(exposure/self.fps,tau=self.tau))
@@ -200,7 +212,10 @@ class SceneReadout:
 
     def receipt(self):
         return dict(observed_head_frames=int(self.valid.sum()),conflicting_grid_samples=len(self.conflicted),
-            sparse_pair_maximum_output_frames=12,recovery_requires_measured_ROI=True,
+            sparse_pair_maximum_output_frames=None,maximum_observed_sample_gap=self.maximum_sample_gap,
+            endpoint_dependency_context_frames=self.context_frames,
+            sparse_net_change_at_later_observation_not_interpolated_trajectory=True,
+            known_original_face_outside_view_is_not_unobserved=True,recovery_requires_measured_ROI=True,
             dense_head_track_or_true_camera_cause_certified=False,
             target_changes_are_attention_impulses_not_actor_velocity=True,
             background_only_pan_observed=False,tau_seconds=self.tau,
