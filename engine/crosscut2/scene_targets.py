@@ -220,3 +220,56 @@ def from_boundary_observation(observation, *, frame, source_binding):
             for v in (heads, head_known, body, kinds, ambiguity, original, original_known, quality, quality_known))
     return TargetScene(source_binding, track, frames, np.asarray(native), FEATURE,
         heads, head_known, body, kinds, ambiguity, quality, quality_known & head_known, original, original_known)
+
+
+def from_original_view(catalogue, n, side, *, source_binding):
+    """Freeze original FEATURE/FORMATION/UNKNOWN before candidate cameras.
+
+    Reuse the existing native-view scene interpretation, including ambiguous
+    detections. An UNKNOWN two-person view is not resolved by a tiny face-size
+    tie or by the crop later deleting a competitor. This is not singer truth.
+    A paired match may instead explicitly bind its proposed physical subject
+    with from_boundary_observation; the two origins must not be conflated.
+    """
+    if (type(n) is not int or not 0 <= n < len(catalogue.nodes)
+            or type(side) is not int or side not in (0, 1)):
+        raise ValueError('actual original grid node and side required')
+    from .physical_display_observations import focal_metadata
+    raw = catalogue.bank['heads'][n:n+1, side:side+1]
+    _, indices, _, kinds = focal_metadata(raw, np.array([[[1., .5, .5]]]))
+    kind = int(kinds[0, 0])
+    frame = int(catalogue.nodes[n])
+    camera = np.tile([1., .5, .5], (7, 1))
+    if kind == 1:
+        observed = catalogue.observation(n, side, camera, target_head_index=int(indices[0, 0]))
+        return from_boundary_observation(observed, frame=frame, source_binding=source_binding)
+    found = np.flatnonzero((raw[0, 0, :, 2] > .019) & (raw[0, 0, :, 3] >= .75))
+    if len(found):
+        # Every anchor's own sparse common-clock association is retained.
+        # Do not join dense windows with different clocks by array position.
+        scenes = [from_boundary_observation(catalogue.observation(n, side, camera,
+            target_head_index=int(h), include_subjects=False), frame=frame, source_binding=source_binding)
+            for h in found]
+        first = scenes[0]
+        if any(not np.array_equal(first.frames, s.frames)
+                or not np.array_equal(first.native_indices, s.native_indices) for s in scenes[1:]):
+            raise ValueError('formation observations disagree on the physical clock')
+        target_fields = ('heads', 'head_observed', 'body', 'body_evidence', 'body_ambiguity',
+            'roi_readability', 'roi_measured')
+        return TargetScene(source_binding, 'original-observed-set-'+str(frame)+'-'+str(side),
+            first.frames, first.native_indices, FORMATION if kind == 2 else UNKNOWN,
+            **{name: np.concatenate([getattr(s, name) for s in scenes], axis=1) for name in target_fields},
+            original_heads=first.original_heads, original_observed=first.original_observed)
+    # A physically observed source without detected faces remains UNKNOWN;
+    # it is not a missing source, an empty film, or a fabricated lower-body shot.
+    frames = np.clip(frame+np.array([-7, -1, 0, 6]), 0, catalogue.final-1)
+    unique, at = np.unique(frames, return_index=True)
+    t = len(unique)
+    original = np.zeros((4, 8, 4))
+    original[[1, 2]] = catalogue.bank['heads'][n]
+    original = original[at]
+    return TargetScene(source_binding, 'original-unknown-'+str(frame)+'-'+str(side), unique,
+        catalogue.native[n, at], UNKNOWN, np.zeros((t, 1, 4)), np.zeros((t, 1), bool),
+        np.zeros((t, 1, 8, 3)), np.zeros((t, 1, 8), np.uint8), np.zeros((t, 1, 8), bool),
+        np.full((t, 1), .5), np.zeros((t, 1), bool), original,
+        (original[..., 2] > .019) & (original[..., 3] >= .75))

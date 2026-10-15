@@ -1,7 +1,8 @@
 from dataclasses import replace
 import numpy as np
 import pytest
-from crosscut2.scene_targets import TargetScene, FEATURE, FORMATION, UNKNOWN, from_boundary_observation
+from crosscut2.scene_targets import (TargetScene, FEATURE, FORMATION, UNKNOWN,
+    from_boundary_observation, from_original_view)
 from crosscut2.scene_readout import SceneReadout
 from test_crosscut2_scene_readout import catalogue
 from test_crosscut2_dense_subject_catalogue import prepared
@@ -146,3 +147,41 @@ def test_clipped_duplicate_sample_is_not_independent_exposure_or_a_fabricated_tr
     np.testing.assert_array_equal(result.native_indices,[0,6])
     with pytest.raises(ValueError,match='camera paths'):
         result.project(np.array(1.))
+
+
+def test_native_view_ambiguity_is_not_solved_by_size_ties_or_competitor_crop():
+    cat=catalogue(np.array([0,60,120]))
+    cat.bank['heads'][:,:,0]=[.3,.35,.12,.99]
+    cat.bank['heads'][:,:,1]=[.7,.35,.12001,.99]
+    target=from_original_view(cat,1,1,source_binding='hash')
+    assert target.role==UNKNOWN and target.heads.shape[1]==2
+    native=target.project(np.tile([1.,.5,.5],(len(target.frames),1)))
+    crop=target.project(np.tile([2.,.7,.5],(len(target.frames),1)))
+    np.testing.assert_array_equal(native['head_observed'],crop['head_observed'])
+    np.testing.assert_array_equal(native['original_observed'],crop['original_observed'])
+    assert crop['known_crop_out'][:,0].any() and not crop['known_crop_out'][:,1].any()
+    assert not crop['role_known']
+
+
+def test_native_single_feature_and_observed_formation_have_separate_roles():
+    cat=catalogue(np.array([0,60,120]))
+    feature=from_original_view(cat,1,1,source_binding='hash')
+    assert feature.role==FEATURE and feature.heads.shape[1]==1
+    for h,x in enumerate((.2,.5,.8)):
+        cat.bank['heads'][:,:,h]=[x,.35,.08,.99]
+    formation=from_original_view(cat,1,1,source_binding='hash')
+    assert formation.role==FORMATION and formation.heads.shape[1]==3
+    # No policy requiring the other three members appears in the projection.
+    assert formation.head_observed[formation.frames==60].sum()==3
+
+
+def test_original_unknown_face_free_source_retains_its_actual_clock():
+    cat=catalogue(np.array([0,60,120]));cat.bank['heads'][:]=0
+    unknown=from_original_view(cat,1,1,source_binding='hash')
+    assert unknown.role==UNKNOWN and unknown.frames.tolist()==[53,59,60,66]
+    assert not unknown.head_observed.any() and not unknown.roi_measured.any()
+    assert not unknown.original_observed.any()
+    cat.bank['heads'][1,0,0]=[.5,.35,.12,.99]
+    incoming=from_original_view(cat,1,1,source_binding='hash')
+    assert incoming.role==UNKNOWN and not incoming.head_observed.any()
+    assert incoming.original_observed[incoming.frames==59,0].all()

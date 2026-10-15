@@ -88,7 +88,7 @@ class SourceCatalogue:
         height=self.bank['heads'][n,side,head_index,2]
         return self.roi_readability[n,side,head_index]*np.minimum(1.,height/.12)
 
-    def observation(self,n,side,camera_strip,*,target_head_index=None):
+    def observation(self,n,side,camera_strip,*,target_head_index=None,include_subjects=True):
         camera_strip=np.asarray(camera_strip,float)
         camera=camera_strip[-1 if side==0 else 0]
         heads=self.bank['heads'][n:n+1,side:side+1]
@@ -189,7 +189,7 @@ class SourceCatalogue:
             appearance_vector=appearance,appearance_is_not_named_identity=True,
             person_native_ordinal=endpoint_native,
             person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
-        return result if self.subjects is None else self.subjects.augment(result,n,side,h)
+        return result if self.subjects is None or not include_subjects else self.subjects.augment(result,n,side,h)
 
     def rates(self,frames,cameras):
         """Vectorized (...,len(frames),3) replay camera content rates."""
