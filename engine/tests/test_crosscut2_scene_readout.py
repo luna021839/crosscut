@@ -95,6 +95,8 @@ def test_T2_original_head_reframing_not_arm_motion_or_invented_dense_recovery():
     native=dict(frames=np.array([],int),heads=np.zeros((0,2,8,4)))
     fields=[SceneReadout(c,native,[],paths,tau=2.) for c in (still,moving,arms)]
     summaries=[f.summary(0,paths[:1],hold_first=0)[0] for f in fields]
+    from crosscut2.scene_readout import compose_steps
+    np.testing.assert_allclose(summaries[1],compose_steps(fields[1].steps(0,paths[:1],hold_first=0))[0])
     assert summaries[0][1]==summaries[2][1]==0. and summaries[1][1]>0.
     unknown=catalogue(nodes,known=False);f=SceneReadout(unknown,native,[],paths,tau=2.)
     assert f.summary(0,paths[:1],hold_first=0)[0,0]==1.  # no measured recovery
@@ -103,6 +105,17 @@ def test_T2_original_head_reframing_not_arm_motion_or_invented_dense_recovery():
     # Split only the composition, NOT the physical programme/observation field.
     np.testing.assert_allclose(fields[1].base(0,120),
         then(fields[1].base(0,59),fields[1].base(59,120)),rtol=1e-12)
+    # Actual original-cut head flanks use the same impulse as an authored
+    # change, followed by that same one observed output frame of exposure.
+    cat=catalogue(nodes);ticks=np.clip(nodes[:,None]+[-1,0],0,119)
+    cat.bank['heads'][:,:,0,2]=np.where(ticks>=60,.24,.12)
+    n=int(np.where(nodes==60)[0][0]);strip=np.tile([1.,.5,.5],(7,1))
+    raw=dict(frames=np.array([60]),heads=cat.bank['heads'][n:n+1].copy(),observed=np.array([True]))
+    native=SceneReadout(cat,raw,[60],paths,tau=2.)
+    detail=matrix(features([cat.observation(n,0,strip)],fps=30.),
+        features([cat.observation(n,1,strip)],fps=30.),details=True)
+    expected=then(change(detail['face_rate'][0,0],unit=.2),recovery(1/30.,tau=2.))
+    np.testing.assert_allclose(native.steps(60,paths[:1,:1],hold_first=0,baseline=paths[0])[0,0],expected)
 
 
 def test_T4_all_camera_alternatives_transfer_and_cost_equal_exact_replay():
@@ -112,8 +125,10 @@ def test_T4_all_camera_alternatives_transfer_and_cost_equal_exact_replay():
     nodes=np.array([0,60,120,180]);cats=[catalogue(nodes),catalogue(nodes,height=.14)]
     paths=[[(nodes,np.tile([z,.5,.5],(4,1))) for z in (1.,1.1,1.2,1.3)] for c in cats]
     entries,exits,dense,_=make(nodes,cats,paths,fps=30.)
-    native=[dict(frames=np.array([],int),heads=np.zeros((0,2,8,4))) for c in cats]
-    support=PlayedEventSupport([[],[]],final=180,fps=30.)
+    native=[dict(frames=np.array([t]),heads=c.bank['heads'][1:2].copy(),observed=np.array([True]))
+        for t,c in zip((65,85),cats)]
+    for bank in native:bank['heads'][:,1,0,2]*=.8
+    support=PlayedEventSupport([[65],[85]],final=180,fps=30.)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native,support,lambda i,j:np.zeros(2),fps=30.,readout_tau=2.,
         opportunity_episodes=np.array([0,0,1,2]))
     tested=0;whole=0

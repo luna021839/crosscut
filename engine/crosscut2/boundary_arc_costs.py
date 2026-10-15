@@ -234,14 +234,16 @@ class ArcCosts:
             result+=point_prefix[:,b]-point_prefix[:,a]
         return result
 
-    def direct_cost(self,s,first,path):
+    def direct_cost(self,s,first,path,*,with_readout=False):
         B,L,_=path.shape;final=first+L;frames=np.arange(first,final)
-        result=self.cats[s].rates(frames,path).sum(-1)/self.fps+self.movement(s,frames,path).sum(-1)
+        content_rates=self.cats[s].rates(frames,path)
+        result=content_rates.sum(-1)/self.fps+self.movement(s,frames,path).sum(-1)
         xs=self.support.events[s];xs=xs[(xs>first)&(xs<final)]
         if len(xs):
             at=xs-first
             rates,points=self.native_rates(s,xs,path[:,at-1],path[:,at],components=True)
             result+=rates@self.native_weights(s,first,final,xs)+points.sum(-1)
+        if with_readout:return result,self.readouts[s].summary(first,path,hold_first=first,content_rates=content_rates)
         return result
 
     def __call__(self,i,j):
@@ -277,8 +279,12 @@ class ArcCosts:
                 ps,qs=np.meshgrid(p,q,indexing='ij');entry=np.asarray([self.entries[i][k].strip for k in ps.ravel()]);exit=np.asarray([self.exits[j][k].strip for k in qs.ravel()])
                 path,valid=cameras(entry,exit,self.dense[s][0][first:final],cap=self.cats[s].bank['zoom_cap'],bridge_only=True)
                 path=np.where(valid[:,None,None],path,self.dense[s][0][None,first:final])
-                v=self.direct_cost(s,first,path).reshape(len(p),len(q));ok=valid.reshape(v.shape);g=np.full(v.shape,4,np.int8)
-                if self.readouts is not None:ac[:,:,4]=v;av[:,:,4]=ok
+                if self.readouts is not None:direct,bridge_transfer=self.direct_cost(s,first,path,with_readout=True)
+                else:direct=self.direct_cost(s,first,path)
+                v=direct.reshape(len(p),len(q));ok=valid.reshape(v.shape);g=np.full(v.shape,4,np.int8)
+                if self.readouts is not None:
+                    ac[:,:,4]=v;av[:,:,4]=ok
+                    transfers[np.ix_(p,q,[4])]=bridge_transfer.reshape(len(p),len(q),1,4)
                 self.short_paths+=len(path)
                 for family in range(4):
                     curve=self.dense[s][family][first:final];k=min(7,L)
@@ -297,10 +303,12 @@ class ArcCosts:
                 exit=np.asarray([self.exits[j][k].strip for k in qs.ravel()])
                 path,valid=whole_viewports(entry,exit,length=L,cap=self.cats[s].bank['zoom_cap'])
                 safe=np.where(valid[:,None,None],path,self.dense[s][0][None,first:final])
-                actual=self.direct_cost(s,first,safe).reshape(len(p),len(q));valid=valid.reshape(v.shape)
+                if self.readouts is not None:direct,whole_transfer=self.direct_cost(s,first,safe,with_readout=True)
+                else:direct=self.direct_cost(s,first,safe)
+                actual=direct.reshape(len(p),len(q));valid=valid.reshape(v.shape)
                 if self.readouts is not None:
                     ac[:,:,5]=actual;av[:,:,5]=valid
-                    transfers[np.ix_(p,q,[5])]=self.readouts[s].summary(first,safe,hold_first=first).reshape(len(p),len(q),1,4)
+                    transfers[np.ix_(p,q,[5])]=whole_transfer.reshape(len(p),len(q),1,4)
                 better=valid&(~ok|(actual<v));v=np.where(better,actual,v);g=np.where(better,5,g);ok|=valid
                 self.whole_viewport_paths_scored+=len(path)
                 self.peak_batch_bytes=max(self.peak_batch_bytes,path.nbytes+safe.nbytes)
@@ -315,11 +323,14 @@ class ArcCosts:
                     ps,qs=np.meshgrid(p,q,indexing='ij')
                     entry=np.asarray([self.entries[i][k].strip for k in ps.ravel()])
                     exit=np.asarray([self.exits[j][k].strip for k in qs.ravel()])
-                    for family in range(5):
+                    baseline_transfers=self.readouts[s].base_hold(first,final) if L<38 else None
+                    for family in range(4):
                         if not av[:,:,family].any():continue
-                        baseline=self.dense[s][0 if family==4 else family]
-                        if L<38 and family<4:path=np.broadcast_to(baseline[first:final],(len(entry),L,3))
-                        else:path,_=cameras(entry,exit,baseline[first:final],cap=self.cats[s].bank['zoom_cap'],bridge_only=family==4)
+                        if L<38:
+                            transfers[np.ix_(p,q,[family])]=baseline_transfers[family]
+                            continue
+                        baseline=self.dense[s][family]
+                        path,_=cameras(entry,exit,baseline[first:final],cap=self.cats[s].bank['zoom_cap'])
                         summary=self.readouts[s].summary(first,path,hold_first=first,baseline=baseline)
                         transfers[np.ix_(p,q,[family])]=summary.reshape(len(p),len(q),1,4)
         self.last_codes=(i,j,codes)

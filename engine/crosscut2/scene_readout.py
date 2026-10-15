@@ -34,11 +34,10 @@ def roi_readability(bank):
 
 def then(first, second):
     """Apply first, then second. Associative, including nonzero incoming D."""
-    x, y = np.broadcast_arrays(np.asarray(first, float), np.asarray(second, float))
-    if x.shape[-1] != 4:
+    x,y=np.asarray(first,float),np.asarray(second,float)
+    if x.shape[-1]!=4 or y.shape[-1]!=4:
         raise ValueError('four affine transfer coefficients required')
-    a, b, c, d = np.moveaxis(x, -1, 0)
-    e, f, g, h = np.moveaxis(y, -1, 0)
+    a,b,c,d=(x[...,i] for i in range(4));e,f,g,h=(y[...,i] for i in range(4))
     return np.stack((e*a, e*b+f, c+g*a, d+g*b+h), axis=-1)
 
 
@@ -151,11 +150,13 @@ class SceneReadout:
         known=np.take_along_axis(np.broadcast_to(self.roi_known[frames],scores.shape),index[...,None],axis=-1)[...,0]
         return center,height,scores.max(-1)>0,known
 
-    def steps(self,first,paths,*,hold_first,baseline=None):
-        paths=np.asarray(paths,float);L=paths.shape[-2];frames=np.arange(first,first+L)
+    def steps(self,first,paths,*,hold_first,baseline=None,observation_offsets=None,content_rates=None):
+        paths=np.asarray(paths,float);L=paths.shape[-2]
+        offsets=np.arange(L) if observation_offsets is None else np.asarray(observation_offsets,int)
+        frames=first+offsets;cameras=paths[:,offsets]
         if paths.ndim!=3 or paths.shape[-1]!=3 or first<0 or first+L>self.final:
             raise ValueError('actual batch camera paths inside source clock required')
-        center,height,seen,known=self.view(frames,paths)
+        center,height,seen,known=self.view(frames,cameras)
         prior=self.previous[frames].copy();native=np.isin(frames,self.events)
         prior=np.where(native,frames-1,prior)
         usable=(prior>=hold_first)&(prior>=0)&(frames-prior<=12)
@@ -172,14 +173,30 @@ class SceneReadout:
         # Native UNKNOWN uses the SAME explicit finite1 convention as its
         # existing point geometry; sparse missing evidence emits no observation.
         geometry=np.where(usable&(native[None]|(previous_seen&seen)),geometry,0.)
-        exposure=np.clip(1.-self.cat.rates(frames,paths),0.,1.)*known*seen
+        rates=self.cat.rates(frames,cameras) if content_rates is None else np.asarray(content_rates)[:,offsets]
+        exposure=np.clip(1.-rates,0.,1.)*known*seen
         return then(change(geometry,unit=6./self.fps),recovery(exposure/self.fps,tau=self.tau))
 
-    def summary(self,first,paths,*,hold_first,baseline=None):
-        return compose_steps(self.steps(first,paths,hold_first=hold_first,baseline=baseline))
+    def summary(self,first,paths,*,hold_first,baseline=None,content_rates=None):
+        frames=np.arange(first,first+paths.shape[-2])
+        # Unobserved non-native frames are EXACT identity transfers, not
+        # comfort/recovery measurements. Omit their redundant arithmetic.
+        used=np.flatnonzero(self.valid[frames]|np.isin(frames,self.events))
+        if not len(used):return np.broadcast_to(IDENTITY,(len(paths),4)).copy()
+        return compose_steps(self.steps(first,paths,hold_first=hold_first,baseline=baseline,
+            observation_offsets=used,content_rates=content_rates))
 
     def base(self,first,final):
         return self.tree.query(first,final)
+
+    def base_hold(self,first,final):
+        """Baseline range with the first physical pair clipped to THIS hold."""
+        observed=np.flatnonzero(self.valid[first:final])
+        if not len(observed):return self.base(first,final)
+        tick=first+int(observed[0])
+        if self.previous[tick]>=first:return self.base(first,final)
+        corrected=self.summary(tick,self.dense[:,tick:tick+1],hold_first=first)
+        return then(then(self.base(first,tick),corrected),self.base(tick+1,final))
 
     def receipt(self):
         return dict(observed_head_frames=int(self.valid.sum()),conflicting_grid_samples=len(self.conflicted),
