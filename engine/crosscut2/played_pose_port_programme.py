@@ -27,7 +27,7 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
-        files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
+        files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',

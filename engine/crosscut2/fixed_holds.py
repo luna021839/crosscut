@@ -58,11 +58,19 @@ def local_actor_hypotheses(bank, *, maximum_clusters=12, minimum_cosine=.55, amb
                 scores = np.array([float(value @ prototype) for prototype in draft])
                 order = np.argsort(-scores)
                 owner = None
+                seed = False
                 if len(order) and scores[order[0]] >= minimum_cosine:
                     best = int(order[0])
                     ambiguous = len(order)>1 and scores[best]-scores[order[1]] < ambiguity_margin
                     if best not in used and not ambiguous: owner=best
-                elif len(draft) < max(128,maximum_clusters):
+                    # Two co-visible detections cannot both consume this
+                    # hypothesis. A similar second face needs its own draft
+                    # slot, not permanent UNKNOWN depending on detector order.
+                    # It still needs independent recurrence and an unambiguous
+                    # final assignment; this does not force an identity label.
+                    elif best in used and not ambiguous: seed=True
+                else: seed=True
+                if seed and len(draft) < max(128,maximum_clusters):
                     owner=len(draft)
                     draft.append(value.astype(float).copy())
                     supports.append([])

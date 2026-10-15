@@ -29,6 +29,35 @@ def test_source_actor_hypothesis_survives_detector_order_change_and_null_reacqui
     assert labels[3,0,0] == labels[0,0,0]
 
 
+def test_two_distinct_co_visible_recurrent_faces_do_not_steal_one_hypothesis_slot():
+    bank=bank_fixture(6)
+    # Similar, but separable descriptions: each face is a clear1.0 vs.7 match
+    # to its own recurring observations. Neither is an ambiguous identity tie.
+    bank['vectors'][:,:,1]=0.
+    bank['vectors'][:,:,1,0]=.7
+    bank['vectors'][:,:,1,1]=np.sqrt(1.-.7**2)
+    labels,count=local_actor_hypotheses(bank)
+    reverse=dict(bank,heads=bank['heads'][:,:,[1,0,2,3,4,5,6,7]],
+        vectors=bank['vectors'][:,:,[1,0,2]])
+    other,other_count=local_actor_hypotheses(reverse)
+    restored=other[:,:,[1,0,2]]
+    assert count==other_count==2
+    assert (labels[:,:,:2]>=0).all() and (restored[:,:,:2]>=0).all()
+    assert (labels[:,:,0]!=labels[:,:,1]).all()
+    for person in (0,1):
+        assert (labels[:,:,person]==labels[0,0,person]).all()
+        assert (restored[:,:,person]==restored[0,0,person]).all()
+
+
+def test_indistinguishable_co_visible_face_descriptions_are_not_forced_into_actor_labels():
+    bank=bank_fixture(6)
+    bank['vectors'][:,:,1]=bank['vectors'][:,:,0]
+    labels,_=local_actor_hypotheses(bank)
+    assert (labels[:,:,:2]==-1).all()
+    states,_,_=make_states(np.arange(6)*10,[bank],None,fps=10)
+    assert State(0,None,'native') in states
+
+
 def test_early_adjacent_frame_singletons_do_not_exhaust_persistent_actor_budget():
     bank = bank_fixture(6)
     bank['vectors'][:] = 0
