@@ -126,6 +126,7 @@ class SourceCatalogue:
         common=0<=h<3
         common_body=np.zeros((4,8,3),np.float32);common_evidence=np.zeros((4,8),np.uint8);common_ambiguity=np.zeros((4,8),bool)
         common_heads=np.zeros((4,4),np.float32);sample_mask=np.zeros(4,bool)
+        common_readability=np.full(4,.5);common_readability_valid=np.zeros(4,bool)
         if common:
             for source_side,target in enumerate((before,after)):
                 if not 0<=target<3:continue
@@ -136,8 +137,20 @@ class SourceCatalogue:
                     common_body[slot]=self.body[n,slot,target];common_evidence[slot]=self.evidence[n,slot,target]
                     common_ambiguity[slot]=self.ambiguity[n,slot,target]
                     common_heads[slot]=self.bank['heads'][n,source_side,target];sample_mask[slot]=True
+                common_readability[endpoint]=self.roi_readability[n,source_side,target]
+                common_readability_valid[endpoint]=self.roi_readability_valid[n,source_side,target]
+        elif h>=0:
+            # A fourth/later face has no cached body/appearance chain, but
+            # its actually pinned endpoint face is still observed. Do not
+            # discard that face or attach face0's body to fill the gap.
+            endpoint=1 if side==0 else 2
+            common_heads[endpoint]=self.bank['heads'][n,side,h];sample_mask[endpoint]=True
+            common_readability[endpoint]=self.roi_readability[n,side,h]
+            common_readability_valid[endpoint]=self.roi_readability_valid[n,side,h]
         style_valid=bool(h>=0 and 'colour_valid' in self.style and self.style['colour_valid'][n,side,h])
         colour=self.style['colour'][n,side,h].copy() if style_valid else np.zeros((2,40))
+        original_heads=np.zeros((4,8,4),np.float32)
+        original_heads[[1,2]]=self.bank['heads'][n]
         visible_quality=0.
         if h>=0:
             head=selected[0,0];center=.5+camera[0]*(head[:2]-camera[1:])
@@ -160,6 +173,12 @@ class SourceCatalogue:
             source_clock_ambiguity=common_ambiguity,source_clock_subject_associated=common,
             source_clock_endpoint_head_proxies=common_heads,
             source_clock_observed_sample_mask=sample_mask,
+            source_clock_canonical_frame=int(self.nodes[n]),
+            source_clock_output_frames=np.clip(int(self.nodes[n])+np.array([-7,-1,0,6]),0,self.final-1),
+            source_clock_native_indices=self.native[n].copy(),
+            source_clock_original_heads=original_heads,
+            source_clock_native_roi_readability=common_readability,
+            source_clock_native_roi_measured=common_readability_valid,
             source_colour_histogram=colour,source_colour_valid=style_valid,
             displayed_native_quality_proxy=visible_quality,
             displayed_native_quality_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
