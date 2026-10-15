@@ -43,6 +43,8 @@ def main():
     if args.output.exists() or args.output.with_suffix('.plan.json').exists():raise FileExistsError('recover the saved plan')
     parent_bytes=args.plan.read_bytes();parent=json.loads(parent_bytes)
     plan=render_plan_from_json(parent['render_plan']);spec=json.loads(args.source_spec.read_text())
+    if any(not p.resolve(strict=True).is_relative_to(root) for p in plan.sources):
+        raise ValueError('source media outside the explicitly authorized SSD project')
     if [str(p) for p in plan.sources]!=[s['path'] for s in spec['sources']] or plan.fps!=spec['fps']:
         raise ValueError('source/clock specification differs from the actual coarse programme')
     identities=[file_identity(p) for p in plan.sources]
@@ -209,7 +211,12 @@ def main():
         for i,v in enumerate(moments[1:-1],start=1)),observed_cuts=sum(v['observed'] for v in moments[1:-1]),
         cuts=len(seams),new_pose=sensor.calls,elapsed_seconds=monotonic()-started)),flush=True)
     if args.render:
-        render(refined,maximum_runtime_seconds=900.,video_bitrate='24M')
+        last=[-10.]
+        def progress(event):
+            check();elapsed=monotonic()-started
+            if elapsed-last[0]>=10. or event.get('phase')=='end':
+                print(json.dumps(dict(phase='render',elapsed_seconds=elapsed,event=event)),flush=True);last[0]=elapsed
+        render(refined,maximum_runtime_seconds=900.,video_bitrate='24M',progress_callback=progress)
         print(json.dumps(dict(phase='movie_ready',path=str(args.output),elapsed_seconds=monotonic()-started)),flush=True)
 
 
