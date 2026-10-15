@@ -75,6 +75,8 @@ def features(observations, *, fps, person_extents=False):
     physical &= clocks[:, 1] > clocks[:, 0]
     result=dict(heads=heads, center=center, height=height, seen=seen, xy=xy, unit=unit,
         endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps,
+        endpoint_cameras=endpoint_camera,
+        dense_subject_contexts=[o.get('dense_subject_context') for o in observations],
         appearance_vectors=np.asarray([o.get('appearance_vector',np.zeros(128)) for o in observations],float))
     result['source_clock_action']=source_clock_action.describe(observations,PAIRS,fps=fps)
     result['source_colour']=np.asarray([o.get('source_colour_histogram',np.zeros((2,40))) for o in observations],float)
@@ -147,11 +149,15 @@ def matrix(left, right, *, details=False):
     channels = np.stack([primitives[..., list(c)].mean(-1) for c in CHANNELS], axis=-1)
     same_clock,same_clock_available,change_basis=source_clock_action.paired(left['source_clock_action'],right['source_clock_action'],
         channels=CHANNELS,tentative=tentative)
+    from .dense_source_action import paired as dense_paired
+    same_clock,same_clock_available,change_basis,dense_observed,dense_used=dense_paired(left,right,
+        rates=same_clock,available=same_clock_available,basis=change_basis)
     context_supplied=left['source_clock_action']['available'][:,None]&right['source_clock_action']['available'][None,:]
     # With no shared interval, opposite played-side velocities do not prove
     # opposition. Preserve actual endpoint phase and finite UNKNOWN motion.
     phase_only=np.stack([((phase+1.)/3.)[...,list(c)].mean(-1) for c in CHANNELS],axis=-1)
     channels=np.where(context_supplied[...,None],phase_only,channels)
+    channels=np.where(dense_observed[...,None],same_clock,channels)
     channels=np.where(same_clock_available[...,None],same_clock,channels)
     pose = channels.mean(-1)
     appearance,appearance_measured=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
@@ -179,6 +185,7 @@ def matrix(left, right, *, details=False):
         fixed_semantic_channel_rates=channels,
         appearance_rate=appearance,appearance_measured=appearance_measured,
         same_clock_source_action_used=same_clock_available,
+        contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,measured_style_change=novelty,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,

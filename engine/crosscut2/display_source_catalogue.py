@@ -12,8 +12,9 @@ from .source_clock_action import endpoint_correspondence
 
 
 class SourceCatalogue:
-    def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None):
+    def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None):
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
+        self.subjects=subjects
         N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
         self.member_hints=np.full(bank['heads'].shape[:3],-1,int) if member_hints is None else np.asarray(member_hints,int)
         self.featured_factor=np.ones(bank['heads'].shape[:3]) if featured_factor is None else np.asarray(featured_factor,float)
@@ -131,7 +132,7 @@ class SourceCatalogue:
             fraction=float(np.prod(extent/np.maximum(1e-9,2*half)))
             visible_quality=float(np.sqrt(self.quality[n,side,h])*min(1.,head[2]*camera[0]/.22)
                 *np.sqrt(self.salience[n,side,h])*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,h])
-        return dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
+        result=dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
             ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
             native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
             focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]),
@@ -149,6 +150,7 @@ class SourceCatalogue:
             appearance_vector=appearance,appearance_is_not_named_identity=True,
             person_native_ordinal=endpoint_native,
             person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
+        return result if self.subjects is None else self.subjects.augment(result,n,side,h)
 
     def rates(self,frames,cameras):
         """Vectorized (...,len(frames),3) replay camera content rates."""

@@ -312,6 +312,8 @@ def main():
         help='Explicit untrained GROUP D: actual played focal geometry and authored/native fragment integrity')
     parser.add_argument('--played-pose-port-camera-prior',action='store_true',
         help='Explicit untrained GROUP E: physical focal played partial pose and immutable two-ended camera port DAG')
+    parser.add_argument('--reuse-subject-observations',type=Path,
+        help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -328,6 +330,8 @@ def main():
     parser.add_argument('--preview-height', type=int, choices=(540, 1080), default=540)
     parser.add_argument('--maximum-perception-seconds', type=float, default=900.)
     args = parser.parse_args()
+    if args.reuse_subject_observations is not None and not args.played_pose_port_camera_prior:
+        raise ValueError('dense subject observations require the explicit played port-camera consumer')
     if args.native_source_readability and not args.fixed_actor_camera_holds:
         raise ValueError('native readability requires the fixed hold consumer')
     if args.boundary_native_readability and not args.native_source_readability:
@@ -526,11 +530,18 @@ def main():
                         maximum_seconds=180.,maximum_new_intervals=6000,allow_sequential_fallback=False)
                     return retain_model_hypotheses(rows=rows,states=local_states,sources=original.sources,
                         cache=args.cache.parent/'crosscut2-native-part-support-v1'),receipts
+            subjects=None
+            if args.reuse_subject_observations is not None:
+                from .dense_subject_catalogue import load_reused
+                subjects=load_reused(args.reuse_subject_observations,sources=original.sources,
+                    source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,nodes=nodes,
+                    warps=warps,clocks=camera_census,master_start=original.master_audio_start,fps=original.fps,
+                    authorized_root=args.cache.parent.parent,check=check)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
-                person_observer=person_observer)
+                person_observer=person_observer,subjects=subjects)
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)
             fixed_receipt['native_style_observations']=style_receipts
             fixed_receipt['source_event_union']=union_receipts

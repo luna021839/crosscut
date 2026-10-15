@@ -28,7 +28,8 @@ class PlayedPosePortPrior:
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
-            'featured_member_state.py','terminal_stencil.py']
+            'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
+            'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -46,6 +47,8 @@ class PlayedPosePortPrior:
             actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=True,
             appearance_is_soft_risk_not_identity_gate=True,unknown_appearance_risk=.5,
             sparse_same_clock_source_action_consumed=True,same_clock_context_is_not_dense_actor_certification=True,
+            optional_contemporary_dense_subject_context_consumed_before_source_selection=True,
+            dense_context_missing_body_never_recovers_stale_normal_pose=True,
             matched_action_change_credit='realized_incoming_hold_seconds_up_to_two_observed_beats * measured_change_density',
             change_density_uses='weakest_observed(evidence_cap*min(same_clock_arm_configuration,motion),anonymous_appearance,Hellinger_style_change,native_quality,played_seam_shape)',
             change_cues_are_not_multiplied_as_independent_probabilities=True,
@@ -71,7 +74,7 @@ class SelectedPorts:
 
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
-           identity_hints=None,part_observer=None,person_observer=None,check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
+           identity_hints=None,part_observer=None,person_observer=None,subjects=None,check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
@@ -94,6 +97,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         terminal_stencil_observations=[b.get('terminal_stencil_observation') for b in banks],
         unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
     cats=[]
+    if subjects is not None and len(subjects)!=len(banks):raise ValueError('one dense subject binding per physical source required')
     face_members=[None]*len(banks);featured=[None]*len(banks)
     if identity_hints is not None:
         from .featured_member_state import bind_hints,consensus
@@ -103,7 +107,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
-            member_hints=face_members[s],featured_factor=featured[s]))
+            member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s]))
     del states,rows,raw
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live)
     if person_observer is not None:
@@ -177,6 +181,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
         heads,indices,ambiguity,scene=focal_metadata(banks[source]['heads'],grid_camera)
         chosen_states.append(State(source,None,'boundary_arc_'+str(code)))
+        boundary_contexts=[]
+        for n,port in ((i,entries[i][p]),(j,exits[j][q])):
+            context=port.observation.get('dense_subject_context')
+            if context is not None and 0<n<len(nodes)-1:
+                boundary_contexts.append(dict(output_frame=int(nodes[n]),
+                    offsets=context['clock'].output_frames.tolist(),native_indices=context['clock'].native_indices.tolist()))
         # Exact collinear-run removal, not an approximate camera re-fit.
         bends=np.flatnonzero(np.any(np.diff(curve,n=2,axis=0)!=0.,axis=1))+1
         knots=np.array(sorted({0,len(curve)-1,*map(int,bends)}),int)
@@ -184,6 +194,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             scored_camera_frames=ticks,scored_camera_values=curve,
             cameras=grid_camera,displayed_focal_heads=heads,displayed_focal_indices=indices,
             focal_ambiguity=ambiguity,scene_kind=scene,pose_cost_used=True,
+            dense_boundary_contexts=boundary_contexts,
             camera_path_reason='frozen_two_ended_port_arc_no_post_selection_fit'))
         runs.append((i,j,k))
         digest=hashlib.sha256(curve.tobytes()).hexdigest()
@@ -212,6 +223,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),
                 recurrent_member_hints=[int(o['recurrent_member_hint']) for o in (a.observation,b.observation)],
                 same_clock_source_action_used=bool(detail['same_clock_source_action_used'][0,0]),
+                contemporary_dense_action_used=bool(detail['contemporary_dense_action_used'][0,0]),
+                contemporary_dense_action_observed=bool(detail['contemporary_dense_action_observed'][0,0]),
                 matched_action_change_density=float(detail['matched_action_change_density'][0,0]),
                 realized_incoming_change_credit=change_credit,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
@@ -224,12 +237,15 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 fixed_semantic_pose_rates=detail['fixed_semantic_channel_rates'][0,0].tolist(),
                 played_face_measured=bool(detail['measured_face'][0,0]),
                 actual_pose_native_input_frames=[int(v) for o in observed for v in o['native_indices']],
+                actual_dense_context_native_inputs=[None if o.get('dense_subject_context') is None
+                    else o['dense_subject_context']['clock'].native_indices.tolist() for o in observed],
                 actual_camera_strips=[o['camera_strip'].tolist() for o in observed],
                 expected_output_focal=predicted,
                 partial_pose_cost_used=True,ownership_certified=False,unmeasured_pose_is_not_perfect=True)
     if not math.isclose(cumulative,score,rel_tol=1e-8,abs_tol=1e-7):
         raise AssertionError('E selected actual camera/pose decomposition differs from DP: '+str((cumulative,score)))
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
+        dense_subject_observations=[] if subjects is None else [s.receipt() for s in subjects],
         physical_group_focal_bound=True,actor_alias_changes_cost=False,
         selected_hold_cost_decomposition=parts,frozen_selected_camera_arcs=frozen,
         preparation_seconds=prepared-started,selection_seconds=monotonic()-prepared,

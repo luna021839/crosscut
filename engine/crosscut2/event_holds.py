@@ -68,14 +68,15 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
            maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
-           preference_model=None,preference_workspace=None,connection_prior=None,person_observer=None):
+           preference_model=None,preference_workspace=None,connection_prior=None,person_observer=None,subjects=None):
     if getattr(connection_prior,'port_camera_prior',False):
         if preference_model is not None:raise ValueError('E port-camera prior cannot use a preference checkpoint')
         from .played_pose_port_programme import select as choose_ports
         return choose_ports(nodes,banks,poses,styles,fps=fps,source_events=source_events,body_states=body_states,
             native_ports=native_ports,music=music,prior=connection_prior,identity_hints=identity_hints,
-            part_observer=part_observer,person_observer=person_observer,check=check,maximum_preparation_seconds=maximum_preparation_seconds,
+            part_observer=part_observer,person_observer=person_observer,subjects=subjects,check=check,maximum_preparation_seconds=maximum_preparation_seconds,
             maximum_seconds=maximum_seconds)
+    if subjects is not None:raise ValueError('dense subject evidence requires the actual played port-camera consumer')
     if person_observer is not None:
         raise ValueError('person rectangle evidence requires the actual played port-camera domain')
     if connection_prior is not None and preference_model is not None:
@@ -245,7 +246,7 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
         return dict(all_source_clocks_verified=False,source_observation_ordinals_exact=False,
             maximum_native_ordinal_difference=None,post_selection_retimed=False)
     differences=[];exposed=[];total=0;pose_total=0;camera_total=0;camera_error=0.
-    native_events=0;native_inputs=0;person_native_inputs=0
+    native_events=0;native_inputs=0;person_native_inputs=0;dense_inputs=0
     native_domain=native_ports is not None and all('native_event_keys' in bank for bank in native_ports)
     for segment,(first,end,index) in zip(plan.segments,runs):
         check();source=states[index].source;clock=clocks[source];size=int(nodes[end]-nodes[first])
@@ -296,6 +297,19 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
                     error=int(schedule.source_frame_indices[tick]-expected_pose[n,phase]);pose_total+=1
                     if error:differences.append(dict(source=source,output_frame=int(nodes[first]+tick),delta=error,kind='played_pose'))
             row=data[index];frames=row['scored_camera_frames'];values=row['scored_camera_values']
+            for context in row.get('dense_boundary_contexts',[]):
+                offsets=np.asarray(context['offsets'],int);wanted=np.asarray(context['native_indices'],int)
+                if not np.array_equal(offsets,np.arange(-7,7)) or wanted.shape!=(14,):
+                    raise ValueError('complete14 actual dense music-context samples required')
+                relative=int(context['output_frame'])-int(nodes[first])
+                extended=sampler_frame_schedule(source_start=segment.source_start+
+                    (relative+int(offsets[0]))/plan.fps*segment.source_playback_rate,
+                    source_playback_rate=segment.source_playback_rate,native_fps=float(clock.frame_rate),
+                    output_fps=plan.fps,frame_count=len(offsets),source_frame_count=clock.frame_count)
+                for offset,error in zip(offsets,np.asarray(extended.source_frame_indices)-wanted):
+                    dense_inputs+=1
+                    if error:differences.append(dict(source=source,output_frame=int(context['output_frame']+offset),
+                        delta=int(error),kind='dense_subject_source_context'))
             for frame,wanted in zip(frames,values):
                 at=(int(frame)-int(nodes[first]))/plan.fps
                 value=segment.editorial_transform.evaluate(at) if segment.editorial_transform is not None else None
@@ -305,6 +319,7 @@ def check_selected_clock(plan,nodes,runs,states,banks,*,data=None,native_ports=N
     return dict(all_source_clocks_verified=True,source_observation_ordinals_exact=not differences,
         maximum_native_ordinal_difference=maximum,maximum_exposed_ordinal_difference=max(exposed,default=0),
         measured_grid_inputs_checked=total,played_pose_native_inputs_checked=pose_total,
+        dense_source_context_native_inputs_checked=dense_inputs,
         selected_scored_camera_frames_checked=camera_total,maximum_camera_transform_difference=camera_error,
         retained_native_events_clock_checked=native_events,measured_retained_native_inputs_checked=native_inputs,
         measured_person_retained_native_inputs_checked=person_native_inputs,
