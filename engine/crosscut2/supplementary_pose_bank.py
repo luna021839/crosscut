@@ -168,7 +168,8 @@ def observe_requests(path,requests,*,sensor,cache,source_clock,check,maximum_sec
 
 
 def augment_missing_grid(*,sources,banks,poses,body_states,warps,nodes,master_start,fps,
-        camera_census,model_path,cache,check,maximum_seconds=600.,maximum_calls=6000,node_scope=None):
+        camera_census,model_path,cache,check,maximum_seconds=600.,maximum_calls=6000,node_scope=None,
+        temporal_faces=None):
     """Supplement a failed/degenerate close-up window, never mix model flanks.
 
     Base pose/state arrays and caches remain unchanged. A targeted window uses
@@ -185,6 +186,24 @@ def augment_missing_grid(*,sources,banks,poses,body_states,warps,nodes,master_st
         raise ValueError('supplementary grid lost its source domains')
     selected=set(range(len(nodes))) if node_scope is None else set(map(int,node_scope))
     if any(n<0 or n>=len(nodes) for n in selected):raise ValueError('supplementary node scope escapes grid')
+    # No new sensor or decoder is hidden in this consumer. A separate bounded
+    # observer may explicitly supply contemporary local-face chains. Default
+    # calls remain byte-for-byte on the legacy observation path/cache keys.
+    temporal={} if temporal_faces is None else dict(temporal_faces)
+    if temporal:
+        from .temporal_face_chain import BoundWindowFaces,reanchor_existing_raw
+        for key,value in temporal.items():
+            if (not isinstance(key,tuple) or len(key)!=3 or any(type(k) is not int for k in key)
+                    or not 0<=key[0]<len(sources) or key[1] not in selected or not 0<=key[2]<3
+                    or not isinstance(value,BoundWindowFaces)):
+                raise ValueError('explicit selected temporal source/node/face domain required')
+            s,n,h=key;clock=camera_census[s]
+            physical=pose_indices(warps[s],nodes=nodes,master_start=master_start,fps=fps,
+                native_fps=clock['fps'],native_count=clock['frame_count'])[n]
+            if (file_identity(sources[s])!=value.source_file_identity
+                    or tuple(map(int,physical))!=value.native_indices
+                    or not np.array_equal(banks[s]['heads'][n,:,h],value.endpoint_heads)):
+                raise ValueError('temporal face evidence lost its physical source/window/endpoint binding')
     def live():
         check()
         if monotonic()-started>=maximum_seconds:raise TimeoutError('whole-grid supplementary allowance exhausted; raw checkpoints retained')
@@ -196,6 +215,10 @@ def augment_missing_grid(*,sources,banks,poses,body_states,warps,nodes,master_st
         heights=np.repeat(heads[:,:,:3,2],2,axis=1).reshape(len(nodes),4,3)
         targets=(((states!=1)|(shoulder<.025))&(heights>=.12)).any(1)
         targets[[n for n in range(len(nodes)) if n not in selected]]=False
+        explicit_new_windows=0
+        for source,n,h in temporal:
+            if source==s:
+                explicit_new_windows+=int(not targets[n,h]);targets[n,h]=True
         clock=camera_census[s];indices=pose_indices(warps[s],nodes=nodes,master_start=master_start,
             fps=fps,native_fps=clock['fps'],native_count=clock['frame_count'])
         requests=[];links=[]
@@ -209,18 +232,28 @@ def augment_missing_grid(*,sources,banks,poses,body_states,warps,nodes,master_st
             receipts.append(dict(source=s,target_windows=0,new_neural_calls=0,reused_neural_inputs=0));continue
         raw,receipt=observe_requests(path,requests,sensor=sensor,cache=cache,source_clock=clock,check=live,
             maximum_seconds=max(1.,maximum_seconds-(monotonic()-started)),maximum_calls=maximum_calls-spent)
-        supported=0
+        supported=0;reanchored=[]
         for values,(n,phase,h) in zip(raw,links):
             side=0 if phase<2 else 1
             others=np.delete(heads[n,side],h,axis=0)
             evidence=SimpleNamespace(reason='observed',raw_keypoints_xyc=values[:17])
-            partial=face_guided_hypothesis(evidence,heads[n,side,h],others)
+            anchor=temporal.get((s,n,h))
+            if anchor is not None and phase in anchor.flank_chains:
+                partial=reanchor_existing_raw(evidence,anchor.flank_chains[phase],
+                    raw_roi_xywh=face_proposals(heads[n,side,h])[0])
+                reanchored.append(dict(node=int(n),phase=int(phase),face_index=int(h),reason=partial.reason,
+                    supported_model_joints=int(partial.supported.sum()),named_or_anatomical_identity_certified=False))
+            else:
+                partial=face_guided_hypothesis(evidence,heads[n,side,h],others)
             result[s][n,phase,h]=partial.points;supported+=int(partial.supported.any())
         spent+=receipt['new_neural_calls']
         receipt.update(source=s,target_windows=int(targets.sum()),supported_partial_samples=supported,
             same_model_for_all_four_temporal_samples=True,base_observation_states_unchanged=True,
             points_are_model_hypotheses_not_verified_anatomical_ownership=True)
         receipts.append(receipt)
+        if reanchored:
+            receipt['opt_in_contemporary_face_reanchors']=reanchored
+            receipt['explicit_new_temporal_windows_using_all_four_same_model_samples']=explicit_new_windows
         print(json.dumps(dict(phase='source_wholebody_supplement_complete',source=s,new_neural_calls=receipt['new_neural_calls'],
             reused_neural_inputs=receipt['reused_neural_inputs'],elapsed_seconds=monotonic()-started)),flush=True)
     return result,receipts
