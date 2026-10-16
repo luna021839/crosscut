@@ -107,6 +107,39 @@ def test_raw_actor_retrieval_consumes_the_same_articulated_action_before_pruning
     assert receipt['actual_articulated_action_used_before_global_pruning']
 
 
+def test_naturally_matched_original_views_are_explicit_pair_bound_options():
+    from crosscut2.boundary_port_domain import make
+    from test_crosscut2_dense_subject_catalogue import prepared
+    a,_,_=prepared(0,bump=.08);b,w,clock=prepared(1,bump=.08)
+    from crosscut2.dense_subject_catalogue import DenseSubjects
+    b.bank['heads'][:,:,0,2]=.23
+    heads=w.heads.copy();heads[:,2]=.23
+    b.subjects=DenseSubjects(source=1,binding='1',indices=clock,
+        windows=[replace(w,heads=heads)],bank=b.bank,fps=30.)
+    paths=[[(np.array([0,200]),np.tile([1.,.5,.5],(2,1))) for _ in range(4)] for _ in range(2)]
+    entry,exit,_,receipt=make(a.nodes,[a,b],paths,fps=30.,articulated_actions=True,
+        recycle_static_capacity=True)
+    original=np.tile([1.,.5,.5],(7,1))
+    native={i for p in entry[1] if np.array_equal(p.strip,original)
+        for i in p.proposal_ids if i[0]=='paired'}
+    assert native
+    assert native & {i for p in exit[1] if np.array_equal(p.strip,original)
+        for i in p.proposal_ids if i[0]=='paired'}
+    assert receipt['retained_paired_original_boundary_views']>0
+    assert receipt['natural_action_original_view_options_added']>0
+    assert max(map(len,entry))<=16 and max(map(len,exit))<=16
+
+
+def test_static_or_unknown_action_does_not_gain_an_original_view_pair_option():
+    from crosscut2.boundary_port_domain import make
+    from test_crosscut2_dense_subject_catalogue import prepared
+    a,_,_=prepared(0,bump=0.);b,_,_=prepared(1,bump=0.)
+    paths=[[(np.array([0,200]),np.tile([1.,.5,.5],(2,1))) for _ in range(4)] for _ in range(2)]
+    _,_,_,receipt=make(a.nodes,[a,b],paths,fps=30.,articulated_actions=True,
+        recycle_static_capacity=True)
+    assert receipt['natural_action_original_view_options_added']==0
+
+
 def test_measured_action_never_revives_a_missing_or_incompatible_change_cue():
     from types import SimpleNamespace
     from test_crosscut2_dense_subject_catalogue import prepared

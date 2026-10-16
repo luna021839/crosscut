@@ -23,7 +23,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
-    extra_count=0;pair_capacities=[]
+    extra_count=0;pair_capacities=[];natural_added=0;original_retained=0
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
     intent_cache={}
     def port(source,n,side,strip,ids,*,target_head_index=None):
@@ -119,6 +119,19 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         # subject-pinned and competes in the same global8.
                         from .paired_geometry import Camera
                         options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
+                    # A naturally matching MOVING connection must not need
+                    # an artificial common-size crop to become pair-bound.
+                    # Keep its real discrepancy and the same finite global
+                    # domain. Ordinary static ports still cannot borrow a
+                    # different outgoing proposal's action benefit.
+                    if (articulated_actions and native_pair['measured_face'][ai,bi]
+                            and native_pair['face_rate'][ai,bi]<=1.
+                            and native_pair['matched_action_change_density'][ai,bi]>0
+                            and not any(all(c.zoom==1. and c.x==.5 and c.y==.5 for c in pair)
+                                        for pair in options)):
+                        from .paired_geometry import Camera
+                        options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
+                        natural_added+=1
                     for k,(ca,cb) in enumerate(options):
                         left=np.array([ca.zoom,ca.x,ca.y]);right=np.array([cb.zoom,cb.x,cb.y])
                         pa=.5+left[0]*(fa[:2]-left[1:]);pb=.5+right[0]*(fb[:2]-right[1:])
@@ -173,6 +186,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     retained.add(key);proposals.append(option)
                 extra_count+=len(proposals)-before
             for _,a,b,ha,hb,k,ca,cb in proposals:
+                original_retained+=int(np.array_equal(ca,[1.,.5,.5]) and np.array_equal(cb,[1.,.5,.5]))
                 pair_id=('paired',n,a,b,ha,hb,k)
                 non_native_focal_pairs+=int(ha!=left_native[a] or hb!=right_native[b])
                 add(outgoing,port(a,n,0,np.tile(ca,(7,1)),(pair_id,),
@@ -192,6 +206,8 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
         raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
         actual_articulated_action_used_before_global_pruning=bool(articulated_actions),
+        natural_action_original_view_options_added=natural_added,
+        retained_paired_original_boundary_views=original_retained,
         original_feature_role_used_before_global_pruning=roles is not None,
         identical_static_port_aliases_coalesced=static_aliases,
         all_baseline_interior_camera_families_retained=True,
