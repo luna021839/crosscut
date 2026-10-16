@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from audit_stageedit_face_spaces import select_observations, verify_source, _iou
+from audit_stageedit_face_spaces import select_observations, verify_source, observed_face_geometry, _iou
 
 
 def obs(source, time, *, height=.3, identifier=None):
@@ -70,3 +70,13 @@ def test_verify_source_rejects_symlink_and_wrong_device(tmp_path):
     source['path'] = str(link)
     with pytest.raises(OSError, match='nonsymlink'):
         verify_source(source, device=path.stat().st_dev, root=tmp_path)
+
+
+def test_detector_rectangle_can_spill_without_changing_observed_alignment_points():
+    face = [-2., 10., 50., 60., 5., 20., 35., 20., 20., 35., 8., 50., 32., 50., .9]
+    box, landmarks, raw = observed_face_geometry(face, 100, 100)
+    assert raw[0] == -.02 and box == (0., .1, .48, .6)
+    assert landmarks == ((.05,.2),(.35,.2),(.2,.35),(.08,.5),(.32,.5))
+    face[4] = -1.
+    with pytest.raises(ValueError, match='inside the frame'):
+        observed_face_geometry(face, 100, 100)

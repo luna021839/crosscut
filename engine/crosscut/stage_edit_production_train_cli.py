@@ -45,6 +45,7 @@ from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     StageEditLossContract,
     StageEditTransformerConfig,
+    StageEditTokenSchema,
     production_stage_edit_config,
 )
 
@@ -93,6 +94,7 @@ def _snapshot_map(
     *,
     edit_mode: object = "group",
     target_member: object | None = None,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
 ) -> dict[str, StageEditFeatureSnapshot]:
     output: dict[str, StageEditFeatureSnapshot] = {}
     for value in values:
@@ -111,12 +113,12 @@ def _snapshot_map(
             raise ValueError(f"feature snapshot root must be an object: {path}")
         snapshot = StageEditFeatureSnapshot.from_dict(
             payload,
-            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            schema=schema,
         )
         snapshot.require_production_causal_sensing(
             edit_mode=edit_mode,
             target_member=target_member,
-            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            schema=schema,
         )
         output[reference] = snapshot
     return output
@@ -317,6 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--edit-mode", choices=("group", "member"), default="group")
     parser.add_argument("--target-member")
+    parser.add_argument("--token-schema-json",
+        help="Explicit canonical token schema for versioned additional source inputs; legacy default is unchanged.")
     parser.add_argument(
         "--dynamic-crop-artifact",
         action="append",
@@ -531,6 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_training_progress()
+    schema = (DEFAULT_STAGE_EDIT_SCHEMA if args.token_schema_json is None else
+        StageEditTokenSchema.from_dict(_json_object_argument(args.token_schema_json, "--token-schema-json")))
     explicit_contract_values = (
         args.model_config_json,
         args.base_loss_contract_json,
@@ -581,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "model and loss transition authority contracts differ"
             )
     else:
-        model_config = production_stage_edit_config()
+        model_config = production_stage_edit_config(schema)
         base_loss_contract = StageEditLossContract()
         dynamic_crop_loss_contract = (
             DynamicCropV3LossContract()
@@ -711,10 +717,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.checkpoint_dir = checkpoint_directory
     corpus = load_reference_training_corpus(
         args.input,
+        schema=schema,
         feature_snapshot_by_reference=_snapshot_map(
             args.feature_snapshot,
             edit_mode=args.edit_mode,
             target_member=args.target_member,
+            schema=schema,
         ),
         song_id_by_reference=_song_map(args.song_id),
         negative_samples_per_hold=args.negative_samples_per_hold,
@@ -749,6 +757,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = mx.cpu if args.device == "cpu" else mx.gpu
     result = train_production_stage_edit(
         corpus,
+        schema=schema,
         checkpoint_directory=args.checkpoint_dir,
         held_out_song_ids=args.held_out_song,
         required_training_song_ids=args.required_training_song,

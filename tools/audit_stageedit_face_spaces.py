@@ -24,6 +24,7 @@ from crosscut.native_face_descriptor import (
     ARCFACE_MODEL_NAME, NativeArcFaceR50, NativeFaceDescriptorSpace,
 )
 from crosscut.reference_evidence_builder import ReferenceSourceClock
+from crosscut.face_identity import _validate_normalized_face
 
 
 def select_observations(observations, *, per_source=3, minimum_face_height=.15):
@@ -60,6 +61,22 @@ def _iou(a, b):
     intersection = x * y
     union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - intersection
     return intersection / union if union > 0 else 0.
+
+
+def observed_face_geometry(face, width, height):
+    """Intersect the detector rectangle, never fabricate off-screen landmarks.
+
+    ArcFace alignment uses the FIVE ORIGINAL points, not the rectangle. A
+    detector box spilling by a few pixels cannot invalidate otherwise fully
+    observed eyes/nose/mouth. Missing landmark evidence still stays missing.
+    """
+    raw = tuple(float(v) for v in (face[0]/width, face[1]/height, face[2]/width, face[3]/height))
+    left, top = max(0., raw[0]), max(0., raw[1])
+    right, bottom = min(1., raw[0]+raw[2]), min(1., raw[1]+raw[3])
+    box = (left, top, right-left, bottom-top)
+    landmarks = tuple((float(face[k]/width), float(face[k+1]/height)) for k in range(4, 14, 2))
+    _validate_normalized_face(box, landmarks)
+    return box, landmarks, raw
 
 
 def _file_identity(path):
@@ -124,11 +141,17 @@ def main():
     for name in ("request", "member-graph", "member-bank", "yujin-bank", "arcface-model", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--per-source", type=int, default=3)
+    parser.add_argument("--all-cached-faces", action="store_true",
+        help="Explicit face-only corpus extraction; no pose/visual reanalysis.")
+    parser.add_argument("--maximum-face-observations", type=int, default=2048)
+    parser.add_argument("--arcface-only", action="store_true")
     parser.add_argument("--seconds", type=float, default=120.)
     parser.add_argument("--ssd-device", type=int, required=True)
     args = parser.parse_args()
-    if not 0 < args.seconds <= 180:
-        parser.error("seconds must be in (0, 180]")
+    if not 1 <= args.maximum_face_observations <= 4096:
+        parser.error("maximum-face-observations must be between one and4096")
+    if not 0 < args.seconds <= (600 if args.all_cached_faces else 180):
+        parser.error("seconds exceeds the explicitly selected observation mode")
     started = time.monotonic()
     volume = Path("/Volumes/CrossCutMedia")
 
@@ -145,11 +168,13 @@ def main():
     request = json.loads(request_bytes)
     sources = {source["source_id"]: source for source in request["sources"]}
     graph = load_member_state_graph_artifact(args.member_graph)
-    selected = select_observations(graph.graph.observations, per_source=args.per_source)
-    if not selected or len(sources) > 32 or len(selected) > 192:
-        raise ValueError("comparison needs one to 192 existing source-native face observations")
+    selected = (tuple(sorted((obs for obs in graph.graph.observations if obs.face_bbox is not None),
+        key=lambda obs: (obs.source_id, obs.timestamp_seconds, obs.observation_id)))
+        if args.all_cached_faces else select_observations(graph.graph.observations, per_source=args.per_source))
+    if not selected or len(sources) > 32 or len(selected) > (args.maximum_face_observations if args.all_cached_faces else 192):
+        raise ValueError("face observation count exceeds this explicit bounded mode")
     installed = request["gallery_installation"]
-    sface_gallery = load_ive_face_identity_gallery_artifact(
+    sface_gallery = None if args.arcface_only else load_ive_face_identity_gallery_artifact(
         Path(installed["gallery_artifact_path"]),
         expected_content_sha256=installed["gallery_content_sha256"])
     gallery = LocalIVEArcFaceGallery.from_existing_photo_banks(args.member_bank, args.yujin_bank)
@@ -159,7 +184,8 @@ def main():
     cv2.setNumThreads(2)
     detector = cv2.FaceDetectorYN.create("engine/crosscut/models/face_detection_yunet_2023mar.onnx",
         "", (960, 540), .75, .3, 5000)
-    recognizer = cv2.FaceRecognizerSF.create("engine/crosscut/models/face_recognition_sface_2021dec.onnx", "")
+    recognizer = None if args.arcface_only else cv2.FaceRecognizerSF.create(
+        "engine/crosscut/models/face_recognition_sface_2021dec.onnx", "")
     rows = []
     capture = None
     current_source = None
@@ -186,7 +212,12 @@ def main():
             clock = ReferenceSourceClock.from_mapping(source["clock"])
             source_seconds = clock.master_to_source(obs.timestamp_seconds)
             native_frame = round(source_seconds * source["frame_rate"])
-            if not capture.set(cv2.CAP_PROP_POS_FRAMES, native_frame):
+            current = round(capture.get(cv2.CAP_PROP_POS_FRAMES))
+            if current <= native_frame and native_frame-current <= 30:
+                for _ in range(native_frame-current):
+                    if not capture.grab():
+                        raise OSError("native source advance rejected")
+            elif not capture.set(cv2.CAP_PROP_POS_FRAMES, native_frame):
                 raise OSError("native source seek rejected")
             ok, pixels = capture.read()
             if not ok or round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1 != native_frame:
@@ -215,19 +246,30 @@ def main():
             height, width = pixels.shape[:2]
             face[:14:2] *= width/960
             face[1:14:2] *= height/540
-            box = tuple(float(v) for v in (face[0]/width, face[1]/height, face[2]/width, face[3]/height))
-            landmarks = tuple((float(face[k]/width), float(face[k+1]/height)) for k in range(4, 14, 2))
+            try:
+                box, landmarks, raw_box = observed_face_geometry(face, width, height)
+            except ValueError:
+                row["state"] = "FIVE_FACE_LANDMARKS_NOT_FULLY_OBSERVED"
+                rows.append(row)
+                continue
             arc_vector = arc.embedding(pixels, bbox_xywh=box, landmarks_xy=landmarks)
             calls["arcface"] += 1
             hint = gallery.classify(arc_vector, descriptor_space=space)
-            sface_vector = recognizer.feature(recognizer.alignCrop(pixels, face)).ravel()
-            calls["sface"] += 1
-            sface_result = classify_open_set_ive_identity(sface_gallery.gallery,
-                tuple(float(v) for v in sface_vector))
+            sface_result = None
+            if recognizer is not None:
+                sface_vector = recognizer.feature(recognizer.alignCrop(pixels, face)).ravel()
+                calls["sface"] += 1
+                sface_result = classify_open_set_ive_identity(sface_gallery.gallery,
+                    tuple(float(v) for v in sface_vector)).to_scalar_dict()
+                del sface_vector
             row.update(state="OBSERVED", cached_bbox_iou=float(overlap), face_bbox_xywh=box,
-                arcface=hint, sface=sface_result.to_scalar_dict())
+                detector_bbox_xywh=raw_box, alignment_landmarks_changed=False,
+                arcface=hint, sface=sface_result)
             rows.append(row)
-            del arc_vector, sface_vector, pixels, small
+            del arc_vector, pixels, small
+            if len(rows) % 100 == 0:
+                print(json.dumps(dict(completed=len(rows), selected=len(selected), calls=calls,
+                    elapsed_seconds=time.monotonic()-started)), flush=True)
     finally:
         if capture is not None:
             capture.release()
@@ -237,7 +279,8 @@ def main():
     report = dict(contract="bounded_source_native_sface_arcface_comparison_v1",
         request_file_sha256=hashlib.sha256(request_bytes).hexdigest(),
         graph_content_sha256=graph.content_sha256, selected_count=len(selected),
-        selection="time_quantiles_per_source_face_height_at_least_015_one_second_separation",
+        selection=("every_cached_primary_face_exact_source_time" if args.all_cached_faces else
+            "time_quantiles_per_source_face_height_at_least_015_one_second_separation"),
         calls=calls, rows=rows, elapsed_seconds=time.monotonic()-started,
         current_source_contents_verified_against_request=True,
         raw_query_or_reference_vectors_serialized=False, gallery_changed=False,

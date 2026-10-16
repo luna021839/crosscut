@@ -20,7 +20,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .audio import AlignmentResult, SourceAlignment
 from .draft import GroupDraftTimeline
@@ -37,11 +37,13 @@ from .stage_edit_feature_materializer import (
 )
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    StageEditTokenSchema,
     STAGE_EDIT_DECISION_HISTORY_OWNER,
     STAGE_EDIT_RECENT_HISTORY_MASK_CONTRACT,
     mask_stage_edit_recent_history_for_semimarkov,
     stage_edit_recent_history_mask_contract,
 )
+from .stage_edit_face_cues import FaceCueTable, augment_snapshot, schema_with_face_cues
 from .timewarp import TimeWarpMap
 from .visual_score import (
     _VideoSampler,
@@ -335,9 +337,16 @@ def materialize_stage_edit_inference_snapshot(
     causal_sensing: StageEditCausalSensingArtifacts | None = None,
     edit_mode: object = "group",
     target_member: object | None = None,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    face_cue_provider: Callable[[StageEditFeatureSnapshot], FaceCueTable] | None = None,
 ) -> StageEditInferenceSnapshotResult:
     """Decode target-free model inputs from one actual synchronized source pool."""
 
+    if schema.fingerprint == DEFAULT_STAGE_EDIT_SCHEMA.fingerprint:
+        if face_cue_provider is not None:
+            raise StageEditInferenceSnapshotError('legacy model cannot silently discard supplied face cues')
+    elif schema.fingerprint != schema_with_face_cues().fingerprint or not callable(face_cue_provider):
+        raise StageEditInferenceSnapshotError('extended model requires its source-exact face cue provider')
     normalized_song = str(song_id).strip()
     normalized_sources = tuple(
         Path(path).expanduser().resolve(strict=True) for path in sources
@@ -620,11 +629,19 @@ def materialize_stage_edit_inference_snapshot(
             provenance=unmasked_snapshot.provenance,
             causal_sensing_binding=unmasked_snapshot.causal_sensing_binding,
         )
+        if face_cue_provider is not None:
+            cues = face_cue_provider(snapshot)
+            if dict(cues.source_media_sha256) != dict(zip(source_ids, content_hashes, strict=True)):
+                raise StageEditInferenceSnapshotError('face cues changed actual inference media content')
+            snapshot = augment_snapshot(snapshot, cues)
     finally:
         for sampler in samplers:
             sampler.close()
 
     destination = Path(output_directory).expanduser().resolve()
+    face_cue_path = None
+    if face_cue_provider is not None:
+        face_cue_path = _write_immutable_json(destination / f'face-cues-{cues.content_sha256}.json', cues.to_dict())
     artifact_id = f"IVE-{_safe_song(normalized_song)}"
     snapshot_path = _write_immutable_json(
         destination
@@ -655,10 +672,11 @@ def materialize_stage_edit_inference_snapshot(
             snapshot.require_production_causal_sensing(
                 edit_mode=edit_mode,
                 target_member=target_member,
+                schema=schema,
             )
         ),
         "decision_history_input_contract": (
-            stage_edit_recent_history_mask_contract(DEFAULT_STAGE_EDIT_SCHEMA)
+            stage_edit_recent_history_mask_contract(schema)
         ),
         "statistics": statistics,
         "input_policy": {
@@ -678,6 +696,10 @@ def materialize_stage_edit_inference_snapshot(
             "ive_performer_distribution_unknown_preserved": True,
         },
     }
+    if face_cue_path is not None:
+        manifest_unsigned['face_member_cues'] = dict(path=str(face_cue_path),
+            content_sha256=cues.content_sha256, observed_rows=len(cues.records),
+            token_schema=schema.to_dict())
     manifest_sha = _canonical_sha256(manifest_unsigned)
     manifest = {**manifest_unsigned, "manifest_sha256": manifest_sha}
     manifest_path = _write_immutable_json(
@@ -688,7 +710,7 @@ def materialize_stage_edit_inference_snapshot(
 
     restored = StageEditFeatureSnapshot.from_dict(
         json.loads(snapshot_path.read_text(encoding="utf-8")),
-        schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        schema=schema,
     )
     if restored.snapshot_sha256 != snapshot.snapshot_sha256:
         raise StageEditInferenceSnapshotError(
@@ -697,6 +719,7 @@ def materialize_stage_edit_inference_snapshot(
     restored.require_production_causal_sensing(
         edit_mode=edit_mode,
         target_member=target_member,
+        schema=schema,
     )
     return StageEditInferenceSnapshotResult(
         snapshot=snapshot,
