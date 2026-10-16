@@ -39,6 +39,37 @@ def face_geometry(center_a,height_a,center_b,height_b,measured):
     return np.where(measured,raw,1.),displacement,log_scale
 
 
+def out_of_view_face_risk(raw_a,head_a,camera_a,visible_a,raw_b,head_b,camera_b,visible_b):
+    """Cropping known faces away cannot turn their jump into cheaper UNKNOWN.
+
+    This is a lower bound over actual original-frame faces, not a new focal
+    identity or a claim that a hidden face is visible. A visible side stays
+    bound to its selected face. No detected original face leaves the ordinary
+    finite unknown risk unchanged; no source or camera is forbidden.
+    """
+    raw_a,raw_b,visible_a,visible_b=map(np.asarray,(raw_a,raw_b,visible_a,visible_b))
+    hidden_a=(~visible_a)&((raw_a[...,2]>.019)&(raw_a[...,3]>=.75)).any(-1)
+    hidden_b=(~visible_b)&((raw_b[...,2]>.019)&(raw_b[...,3]>=.75)).any(-1)
+    if not hidden_a.any() and not hidden_b.any():
+        shape=np.broadcast_shapes(visible_a.shape,visible_b.shape)
+        return np.zeros(shape),np.zeros(shape,bool)
+    def candidates(raw,head,camera,visible):
+        raw,head,camera,visible=map(np.asarray,(raw,head,camera,visible))
+        pinned=np.zeros(np.broadcast_shapes(raw.shape,head.shape[:-1]+(8,4)))
+        pinned[...,0,:]=head
+        values=np.where(visible[...,None,None],pinned,raw)
+        known=(values[...,2]>.019)&(values[...,3]>=.75)
+        xy=(.5+camera[...,None,:1]*(values[...,:2]-camera[...,None,1:]))*[16/9,1.]
+        return xy,values[...,2]*camera[...,None,0],known
+    a,ha,ka=candidates(raw_a,head_a,camera_a,visible_a)
+    b,hb,kb=candidates(raw_b,head_b,camera_b,visible_b)
+    known=ka[..., :,None]&kb[...,None,:]
+    risk,_,_=face_geometry(a[..., :,None,:],ha[..., :,None],b[...,None,:,:],hb[...,None,:],known)
+    minimum=np.min(np.where(known,risk,np.inf),axis=(-2,-1))
+    measured=(~np.asarray(visible_a)|~np.asarray(visible_b))&np.isfinite(minimum)
+    return np.where(measured,minimum,0.),measured
+
+
 def features(observations, *, fps, person_extents=False):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
@@ -78,6 +109,15 @@ def features(observations, *, fps, person_extents=False):
         endpoint_cameras=endpoint_camera,
         dense_subject_contexts=[o.get('dense_subject_context') for o in observations],
         appearance_vectors=np.asarray([o.get('appearance_vector',np.zeros(128)) for o in observations],float))
+    original=np.zeros((count,8,4))
+    for k,o in enumerate(observations):
+        raw=o.get('source_clock_original_heads')
+        if raw is None:continue
+        raw=np.asarray(raw,float)
+        if raw.shape!=(4,8,4) or not np.isfinite(raw).all():
+            raise ValueError('exact original endpoint face geometry required')
+        original[k]=raw[1 if side[k]==0 else 2]
+    result['native_view_heads']=original
     result['source_clock_action']=source_clock_action.describe(observations,PAIRS,fps=fps)
     result['source_colour']=np.asarray([o.get('source_colour_histogram',np.zeros((2,40))) for o in observations],float)
     result['source_colour_valid']=np.asarray([o.get('source_colour_valid',False) for o in observations],bool)
@@ -116,6 +156,10 @@ def matrix(left, right, *, details=False):
         extent_gap,extent_known=interval_gap(tuple(v[:,None] for v in left['person_extent_interval']),
             tuple(v[None,:] for v in right['person_extent_interval']))
         geometry=used_face_risk(face,face_seen,extent_gap,extent_known)
+    crop_risk,crop_known=out_of_view_face_risk(left['native_view_heads'][:,None],left['heads'][:,None],
+        left['endpoint_cameras'][:,None],left['seen'][:,None],right['native_view_heads'][None],
+        right['heads'][None],right['endpoint_cameras'][None],right['seen'][None])
+    geometry=np.maximum(geometry,crop_risk)
     # [source point coordinates] -> [actual per-side rendered coordinates].
     pa = left['xy'][ai, la][:, PAIRS[:, 1]]; pb = right['xy'][bi, rb][:, PAIRS[:, 1]]
     ua = left['unit'][ai, la]; ub = right['unit'][bi, rb]
@@ -199,6 +243,7 @@ def matrix(left, right, *, details=False):
     evidence_density=np.where(known_style&appearance_measured&~incompatible,evidence_density,0.)
     change_density=np.minimum(evidence_density,played_match_advantage)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
+        cropped_original_face_geometry_rate=crop_risk,cropped_original_face_geometry_measured=crop_known,
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
         screen_displacement=np.linalg.norm(left['center'][:,None]-right['center'][None,:],axis=-1),

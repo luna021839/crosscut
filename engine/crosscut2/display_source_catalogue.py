@@ -235,9 +235,11 @@ class SourceCatalogue:
             readable=self.target_readability(n,side,index)
             shown=np.where(scores.max(-1)>0,readable*fraction,0.)
             role=1.-self.featured_factor[n,side,index]
-            # Reuse joint_cameras' oversized-head effort, applying it only to
-            # EXTRA enlargement. An original tight shot is not called missing.
-            tight=6.*np.maximum(0.,displayed_height-np.maximum(.24,h[...,2]))
+            # Viewer framing depends on the OUTPUT, not who zoomed it. An
+            # originally oversized face must not be exempt while an equally
+            # framed matched crop pays. This soft engineering effort leaves
+            # ordinary close-ups and every source/camera available.
+            tight=6.*np.maximum(0.,displayed_height-.30)
             framing=0.
             if self.framing_evidence is not None:
                 evidence=self.framing_evidence

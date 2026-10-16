@@ -7,7 +7,7 @@ or one joint Hermite bridge. No camera fit/retiming occurs after the DP.
 import numpy as np
 from .connection_prior import physical_weights
 from .native_fragment_integrity import NativeFragmentIntegrity
-from .played_partial_pose import face_geometry
+from .played_partial_pose import face_geometry, out_of_view_face_risk
 from .focal_appearance import discrepancy as appearance_discrepancy
 from .terminal_stencil import eligible as ending_eligible
 
@@ -279,14 +279,14 @@ class ArcCosts:
             if int(x) in lookup and 'vectors' in bank:vectors[e]=bank['vectors'][lookup[int(x)]]
         own=np.take_along_axis(np.broadcast_to(vectors,(B,)+vectors.shape),
             np.broadcast_to(np.minimum(at,2)[...,None,None],(B,E,2,1,128)),axis=3).squeeze(3)
-        own=np.where((at<3)[...,None]&seen[None,:,None,None],own,0.)
+        own=np.where((at<3)[...,None]&seen[None,:,None,None]&(scores.max(-1)>0)[...,None],own,0.)
         member=np.full((B,E,2),-1,int)
         if 'member_hints' in bank:
             all_hints=np.full((E,2,8),-1,int)
             for e,x in enumerate(xs):
                 if int(x) in lookup:all_hints[e]=bank['member_hints'][lookup[int(x)]]
             member=np.take_along_axis(np.broadcast_to(all_hints,(B,)+all_hints.shape),at[...,None],axis=3)[...,0]
-            member=np.where(seen[None,:,None],member,-1)
+            member=np.where(seen[None,:,None]&(scores.max(-1)>0),member,-1)
         score_kwargs={}
         if 'member_score_profiles' in bank:
             profiles=np.zeros((E,2,8,6));strength=np.zeros((E,2,8))
@@ -313,11 +313,16 @@ class ArcCosts:
                 if pair is None or valid[:,e].all():continue
                 gap,known=interval_gap(height_interval(pair[0],before[:,e]),height_interval(pair[1],after[:,e]))
                 face[:,e]=used_face_risk(face[:,e],valid[:,e],gap,known)
+        actual_heads=np.where(seen[:,None,None,None],heads,0.)
+        crop_risk,crop_known=out_of_view_face_risk(actual_heads[None,:,0],head[:,:,0],camera[:,:,0],scores[:,:,0].max(-1)>0,
+            actual_heads[None,:,1],head[:,:,1],camera[:,:,1],scores[:,:,1].max(-1)>0)
+        face=np.maximum(face,crop_risk)
         # Existing native ports contain exact endpoint faces, not the exposed
         # body windows. Use the SAME missing-pose convention as authored K.
         # A known bad native event stays finite and playable; it is not gated
         # out or laundered through a near-constant confidence-like1-Q rate.
         detail=dict(geometry_rate=face,face_rate=face_rate,pose_rate=np.full_like(face,.5),appearance_rate=appearance,
+            cropped_original_face_geometry_rate=crop_risk,cropped_original_face_geometry_measured=crop_known,
             face_log_scale=scale,screen_displacement=np.linalg.norm((c[:,:,0]-c[:,:,1])*[16/9,1.],axis=-1),
             measured_face=valid,motion_flow_rate=np.full_like(face,.5),allowed=np.ones_like(valid))
         if getattr(self,'roles',None) is not None:

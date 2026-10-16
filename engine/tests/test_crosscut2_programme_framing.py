@@ -62,3 +62,20 @@ def test_observed_no_face_cannot_dodge_the_required_closeup_deficit():
     cat.content_scope[:]=False;unsupported_gap=cat.rates(frames,camera)
     assert (known_empty>unsupported_gap).all()
     assert np.isfinite(known_empty).all() and np.isfinite(unsupported_gap).all()
+
+
+def test_output_oversize_effort_is_origin_blind_and_keeps_ordinary_closeups():
+    cat=catalogue();cat.editorial_content=True;cat.body[:]=0.
+    cat.bank['heads'][:]=0.;cat.bank['heads'][:,:,0]=[.5,.5,.2,.99]
+    frames=np.array([19,20]);native=np.tile([1.,.5,.5],(2,1))
+    roomy=cat.rates(frames,native)
+    cat.bank['heads'][:,:,0,2]=.27
+    np.testing.assert_allclose(cat.rates(frames,native),roomy)
+    cat.bank['heads'][:,:,0,2]=.4
+    original_tight=cat.rates(frames,native)
+    np.testing.assert_allclose(original_tight-roomy,.6,atol=1e-6)
+    cat.bank['heads'][:,:,0,2]=.2
+    added_tight=cat.rates(frames,np.tile([2.,.5,.5],(2,1)))
+    # Equal output size pays equal oversize effort. Only the already existing
+    # digital enlargement/detail cost distinguishes how the shot was made.
+    np.testing.assert_allclose(added_tight-original_tight,.1,atol=1e-6)

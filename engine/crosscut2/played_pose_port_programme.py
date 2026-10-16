@@ -111,6 +111,7 @@ class PlayedPosePortPrior:
         self.artifact['played_interval_utility']=bool(played_interval_utility)
         if played_interval_utility:
             self.artifact.update(contract='pair_bound_actual_interval_action_composed_image_boundary_port_E6_v2',
+                output_focal_face_comfort_height=.30,original_tight_frame_exemption=False,
                 opportunity_credit='actual_pair_density_times_observed_entry_target_delivery_once_per_fixed_episode',
                 source_continuation_change_credit=False,
                 seven_frame_entry_credit_used=False,entry_density_times_hold_duration=False,
@@ -470,6 +471,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 actual_arm_direction_residual=(float(detail['articulated_arm_direction'][0,0])
                     if detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0] else None),
                 played_geometry_rate=float(detail['geometry_rate'][0,0]),
+                cropped_original_face_geometry_rate=float(detail['cropped_original_face_geometry_rate'][0,0]),
+                cropped_original_face_geometry_measured=bool(detail['cropped_original_face_geometry_measured'][0,0]),
                 person_visible_extent_gap=float(detail['person_visible_extent_gap'][0,0]),
                 person_visible_extent_measured=bool(detail['person_extent_measured'][0,0]),
                 person_extent_fallback_used=bool(person_extents and not detail['measured_face'][0,0]
