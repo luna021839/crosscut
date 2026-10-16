@@ -100,6 +100,10 @@ class PlaybackWorkspace:
         for value in buffers:weakref.finalize(value,released)
         return key
 
+    def frozen_input_groups(self):
+        """Existing immutable owners, without copying the buffer reference lists."""
+        return tuple(self._frozen_pins)
+
     def receipt(self):
         with self._lock:
             return dict(limit_bytes=self.limit_bytes,current_bytes=self.current_bytes,peak_bytes=self.peak_bytes,

@@ -439,7 +439,10 @@ class CompiledPlayback:
                 del evidence,values
             finally:w.release(claim)
 
-    def open_origin(self,i,roots,costs):return _Origin(self,i,roots,costs)
+    def open_origin(self,i,roots,costs):
+        lifecycle=getattr(self.context.arcs.check,'input_lifecycle',None)
+        if lifecycle is not None:lifecycle.source_checkpoint()
+        return _Origin(self,i,roots,costs)
     def filter_current_domain(self,hold,base,allowed,in_cost,in_cuts,benefit,destination,*,same_episode,width):
         """Called only after the solver checks the nonnegative-rate proof.
 

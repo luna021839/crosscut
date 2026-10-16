@@ -129,6 +129,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         check()
         origin,limit=(started,maximum_preparation_seconds) if phase=='preparation' else (selection_start,maximum_seconds)
         if monotonic()-origin>=limit:raise TimeoutError('one shared E '+phase+' allowance exhausted')
+    if hasattr(check,'input_lifecycle'):live.input_lifecycle=check.input_lifecycle
     # E consumes raw per-face observations and four physical source paths,
     # not the legacy actor x camera projected reward rows. Do not allocate
     # those416 discarded rows just to recover104raw native observations.
