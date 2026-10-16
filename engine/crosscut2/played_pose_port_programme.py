@@ -116,6 +116,8 @@ class PlayedPosePortPrior:
                 seven_frame_entry_credit_used=False,entry_density_times_hold_duration=False,
                 complete_arc_camera_argmin_after_actual_utility=True,
                 refiner_articulated_seam_observation_used_before_source_cut_selection=True,
+                complete_observed_arm_replaces_sparse_pose_unknown_floor=True,
+                articulated_pose_cost='max(arm_direction,mean(rho(configuration),rho(screen_placement),rho(common_music_motion)))',
                 observed_image_motion_is_not_actor_or_camera_cause=True)
         if shot_duration_model is not None:
             self.artifact.update(visible_shot_duration_model=shot_duration_model.artifact,

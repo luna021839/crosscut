@@ -63,6 +63,45 @@ def test_refiner_played_arm_direction_is_consumed_before_cut_choice_not_refit_af
     assert not untouched['articulated_arm_direction_measured'].any()
 
 
+def test_good_measured_arms_replace_missing_channel_penalty_without_losing_screen_or_motion():
+    from types import SimpleNamespace
+    from crosscut2.played_partial_pose import features,matrix
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+    a,_,_=prepared(0,bump=.08);b,_,_=prepared(1,bump=.08)
+    left=[SimpleNamespace(observation=obs(a,0))];right=[SimpleNamespace(observation=obs(b,1))]
+    before=matrix(features([left[0].observation],fps=30.),
+        features([right[0].observation],fps=30.),details=True)
+    assert before['pose_rate'][0,0]>.25
+    actual=articulated_seam_evidence(before,left,right)
+    assert actual['pose_rate'][0,0]<1e-6
+    assert actual['articulated_arm_direction_measured'][0,0]
+    assert actual['actual_played_match_advantage'][0,0]>.99
+    np.testing.assert_allclose(actual['matched_action_change_density'],
+        np.minimum(before['matched_action_evidence_density'],actual['actual_played_match_advantage']))
+    # The observed silhouette still has to land at the selected screen position.
+    moved=SimpleNamespace(observation=dict(right[0].observation))
+    moved.observation['camera_strip']=moved.observation['camera_strip'].copy()
+    moved.observation['camera_strip'][:,1]+=.1
+    displaced=articulated_seam_evidence(before,left,[moved])
+    assert displaced['pose_rate'][0,0]>.05
+    assert before['pose_rate'][0,0]>.25  # raw sparse evidence is unchanged
+
+
+def test_measured_action_never_revives_a_missing_or_incompatible_change_cue():
+    from types import SimpleNamespace
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+    left=[SimpleNamespace(observation=obs(prepared(0)[0],0))]
+    right=[SimpleNamespace(observation=obs(prepared(1)[0],1))]
+    before=dict(pose_rate=np.array([[.5]]),matched_action_change_density=np.array([[0.]]),
+        matched_action_evidence_density=np.array([[0.]]))
+    actual=articulated_seam_evidence(before,left,right)
+    assert actual['pose_rate'][0,0]<1e-6
+    assert actual['matched_action_change_density'][0,0]==0.
+    assert before['pose_rate'][0,0]==.5
+
+
 @pytest.mark.parametrize('joints,roots',[([2,4],[0,0]),([3,5],[1,1])])
 def test_measured_opposed_arm_cannot_keep_the_old_positive_match_benefit(joints,roots):
     from types import SimpleNamespace

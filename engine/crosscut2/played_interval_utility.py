@@ -16,12 +16,13 @@ def articulated_seam_evidence(detail,left,right):
     """Reuse the cut refiner's actual played-arm observation BEFORE DP.
 
     Contemporary source windows and the proposed physical -1/0 cameras are
-    required. A missing arm retains the ordinary finite partial-pose cost;
-    it never excludes a source or invents perfect action evidence.
+    required. A complete observed arm supplies its actual configuration,
+    placement and common-music motion instead of only being allowed to make
+    the sparse score worse. Missing arms retain the finite partial-pose cost.
     """
     from .subject_cut_moments import _seam_action
     rate=np.asarray(detail['pose_rate']).copy();direction=np.zeros_like(rate)
-    measured=np.zeros(rate.shape,bool)
+    measured=np.zeros(rate.shape,bool);components=np.zeros(rate.shape+(3,))
     for a,port_a in enumerate(left):
         ca=port_a.observation.get('dense_subject_context')
         if ca is None:continue
@@ -34,19 +35,25 @@ def articulated_seam_evidence(detail,left,right):
             value=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry)
             if not value['seam_action_supported']:continue
             measured[a,b]=True;direction[a,b]=value['seam_arm_direction_residual']
-            # Both are existing dimensionless pose discrepancies. A good
-            # shoulder average must not conceal an opposed measured arm.
-            rate[a,b]=max(rate[a,b],direction[a,b])
+            residual=np.asarray([value[k] for k in
+                ('seam_pose_residual','seam_screen_residual','seam_motion_residual')])
+            components[a,b]=residual/(1.+residual)
+            # Score the actually visible articulated connection. A missing
+            # hip/second arm must not add a neutral floor to a matching arm;
+            # an opposed arm must not disappear in an average of shoulders.
+            # These are unfitted discrepancies, not identity probabilities.
+            rate[a,b]=max(direction[a,b],float(components[a,b].mean()))
     result=dict(detail,pose_rate=rate,articulated_arm_direction=direction,
-        articulated_arm_direction_measured=measured)
+        articulated_arm_direction_measured=measured,
+        articulated_configuration_screen_motion=components)
     if 'matched_action_change_density' in detail:
-        # The new arm observation must qualify the BENEFIT as well as the
-        # cost. Otherwise an opposed arm can retain the old positive match
-        # credit even after its actual pose is no better than UNKNOWN(.5).
-        # Preserve every other existing bottleneck; never inflate a reward.
+        # Recompute both directions: an opposed arm loses the old benefit,
+        # and a genuinely matched arm is no longer buried by UNKNOWN hips.
+        # Other appearance/style/quality/activity evidence remains necessary.
         advantage=np.maximum(0.,1.-2.*rate)
         result['actual_played_match_advantage']=advantage
-        result['matched_action_change_density']=np.minimum(detail['matched_action_change_density'],advantage)
+        basis=detail.get('matched_action_evidence_density',detail['matched_action_change_density'])
+        result['matched_action_change_density']=np.minimum(basis,advantage)
     return result
 
 

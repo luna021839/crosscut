@@ -195,8 +195,9 @@ def matrix(left, right, *, details=False):
     # tolerance or an extra source/cut gate. Missing channels retain their
     # fixed denominator; weak positive evidence earns only a weak benefit.
     played_match_advantage=np.maximum(0.,1.-2.*pose)
-    change_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape,played_match_advantage])
-    change_density=np.where(known_style&appearance_measured&~incompatible,change_density,0.)
+    evidence_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape])
+    evidence_density=np.where(known_style&appearance_measured&~incompatible,evidence_density,0.)
+    change_density=np.minimum(evidence_density,played_match_advantage)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
         person_extent_measured=extent_known,pose_rate=pose, allowed=allowed, measured_face=face_seen,
         face_log_scale=log_scale, face_height_displacement=displacement,
@@ -209,7 +210,8 @@ def matrix(left, right, *, details=False):
         individual_member_score_influence=member_influence,
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
-        matched_action_change_density=change_density,measured_style_change=novelty,
+        matched_action_change_density=change_density,matched_action_evidence_density=evidence_density,
+        measured_style_change=novelty,
         native_ROI_quality_measured=left['visible_quality_measured'][:,None]&right['visible_quality_measured'][None,:],
         actual_played_match_advantage=played_match_advantage,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
