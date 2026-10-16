@@ -44,22 +44,7 @@ class _ProducerReservation:
     def __init__(self,compiler,i,j):
         self.compiler=compiler;self.i=i;self.j=j;self.key=None;self.finalizer=None
     def __enter__(self):
-        c=self.compiler;old=c.context;i,j=self.i,self.j;L=int(old.nodes[j]-old.nodes[i]);counts=[]
-        direct=0;direct_counts=[];maximum_heads=1
-        for s,cat in enumerate(old.cats):
-            P=sum(p.source==s for p in old.entries[i]);Q=sum(q.source==s for q in old.exits[j]);counts.append(P*Q)
-            adjacent=old.arcs.opportunity_episodes is not None and old.arcs.opportunity_episodes[j]-old.arcs.opportunity_episodes[i]<=2
-            whole=adjacent and L>=14 and not np.any((old.arcs.support.events[s]>old.nodes[i])&(old.arcs.support.events[s]<old.nodes[j]))
-            direct+=P*Q*L*24*(int(L<38)+int(whole))
-            direct_counts.append(P*Q if L<38 or whole else 0)
-            maximum_heads=max(maximum_heads,cat.bank['heads'].shape[-2])
-        P=len(old.entries[i]);Q=len(old.exits[j])
-        # Long baseline families use shared interiors plus38-frame endpoint
-        # geometry, NOT a full-length path batch. Only actual direct4/5
-        # recipes reserve full-length content/geometry scratch.
-        amount=(direct+max(direct_counts,default=0)*L*24*(64+16*maximum_heads)
-            +max(counts,default=0)*38*24*8
-            +(P+Q)*4*38*24+len(old.cats)*L*8+P*Q*6*64+64*2**10)
+        c=self.compiler;amount=c.producer_requirement(self.i,self.j)
         self.key=c.arena.workspace.claim(int(amount),'hold-producer-preflight-and-owned-inputs')
         self.finalizer=weakref.finalize(self,c.arena.workspace.release,self.key)
         c.maximum_producer_reservation=max(c.maximum_producer_reservation,int(amount))
@@ -91,9 +76,16 @@ class _Origin:
         self.head=w.empty((P,2,L,4),np.float64,owner='origin-exact-baseline-heads');self.head[:]=np.nan
         self.present=np.isfinite(costs)
         compiler.origin_decode_calls+=1
-    def __enter__(self):self.compiler.active_origin=self;return self
+    def __enter__(self):
+        bind=getattr(self.compiler.arena,'bind_origin',None)
+        try:
+            if callable(bind):bind(self.handles,self.decoded)
+        except BaseException:self.decoded.close();raise
+        self.compiler.active_origin=self;return self
     def __exit__(self,*unused):
         self.compiler.active_origin=None
+        unbind=getattr(self.compiler.arena,'unbind_origin',None)
+        if callable(unbind):unbind()
         self.decoded.close();self.decoded=None;self.lanes=self.handles=self.head=self.present=None
 
 
@@ -110,6 +102,17 @@ class _Current:
             raise ValueError('factored parts require the complete long reference-clock/local-intent proof')
         self.part=part
         self.middle=0.;self.tail=0.;self.lower_bound=0.;self._lease=None;self._suffix=None
+        cached=hold.cached_suffix(q,code) if part=='suffix' else None
+        if cached is not None:
+            # The reference/local-intent proof above makes the future H
+            # independent of entry p. Reuse this HOLD's compiled tail, not
+            # reconstruct/sample/project it again after prefix expansion.
+            self.keys,self.encoded=cached
+            self.frames=self.keys[:,0].view(np.int64);self.native=self.keys[:,1].view(np.int64)
+            self.camera=self.keys[:,5:].view(np.float64)
+            self.head_ends=self.tail_ends=np.zeros(0,np.int64);self._suffix=0
+            c.recipe_compilations+=1;c.factored_piece_compilations['suffix']+=1;c.prepared_suffix_reuses+=1
+            return
         if self.long:
             self.head_ends=fresh[fresh<self.first+old.history_frames+19]
             middle=fresh[(fresh>=self.first+old.history_frames+19)&(fresh<=self.final-19)]
@@ -225,15 +228,33 @@ class _Hold:
                 or not np.array_equal(self.inputs.allowed,allowed)):
             raise ValueError('current frozen actual-camera/clock hold does not match the scored domain')
         self.reference_clock={s:np.array_equal(ni,old.reference[s][self.first:self.final]) for s,ni in self.inputs.native.items()}
+        self.suffix_keys=self.suffix_values=self.suffix_ready=None
         compiler.hold_compilations+=1
         compiler.native_schedule_compilations+=len(self.inputs.native)
     def current(self,p,q,code,*,part='full'):return _Current(self,p,q,code,part)
+    def cached_suffix(self,q,code):
+        if self.suffix_ready is not None and self.suffix_ready[q,code]:
+            keys=self.suffix_keys[q,code];values=self.suffix_values[q,code]
+            keys.setflags(write=False);values.setflags(write=False);return keys,values
+        return None
+    def keep_compiled_suffix(self,q,code,current):
+        c=self.compiler;old=c.context;H=old.history_frames
+        if not current.long or current.part!='tail':raise ValueError('only the proved current long tail may seed a suffix')
+        if self.suffix_ready is None:
+            Q=len(old.exits[self.j]);w=c.arena.workspace
+            self.suffix_keys=w.empty((Q,4,H,8),np.uint64,owner='current-hold-compiled-tail-raw-inputs')
+            self.suffix_values=w.empty((Q,4,H,old.model.embedding_width),np.float64,owner='current-hold-compiled-tail-embeddings')
+            self.suffix_ready=w.empty((Q,4),bool,owner='current-hold-compiled-tail-ready');self.suffix_ready[:]=False
+        start=int(np.searchsorted(current.frames,self.final-H))
+        if len(current.frames)-start!=H:raise ValueError('compiled tail does not contain the exact future suffix')
+        self.suffix_keys[q,code]=current.keys[start:];self.suffix_values[q,code]=current.encoded[start:]
+        self.suffix_ready[q,code]=True
     def __enter__(self):return self
     def __exit__(self,*unused):
         if self.compiler.context.arcs.last_playback_inputs is self.inputs:self.compiler.context.arcs.last_playback_inputs=None
         self.compiler.context.arcs.last_camera_alternatives=None
         self.compiler.context.arcs.last_codes=None
-        self.inputs=None
+        self.inputs=self.suffix_keys=self.suffix_values=self.suffix_ready=None
 
 
 class CompiledPlayback:
@@ -256,6 +277,7 @@ class CompiledPlayback:
         self.native_schedule_compilations=self.nonreference_recipes=self.maximum_producer_reservation=0
         self.projection_tile_splits=self.maximum_projection_claim=0
         self.factored_piece_compilations=dict(head=0,tail=0,suffix=0)
+        self.prepared_suffix_reuses=0
         self.long_alternatives=self.long_prefix_evaluations=0
         w=PlaybackWorkspace(maximum_bytes) if arena is None else arena.workspace
         expected=self.namespace(context)
@@ -347,7 +369,8 @@ class CompiledPlayback:
             q,code=int(q),int(code)
             if np.isnan(self.long_tail[hold.j,q,code]):
                 p=int(np.flatnonzero(handled[:,q,code])[0])
-                with hold.current(p,q,code,part='tail') as current:self.long_tail[hold.j,q,code]=current.tail
+                with hold.current(p,q,code,part='tail') as current:
+                    self.long_tail[hold.j,q,code]=current.tail;hold.keep_compiled_suffix(q,code,current)
             tail[q,code]=self.long_tail[hold.j,q,code]
         shape=(P,Q,4,2)
         values=tuple(w.empty(shape,dtype,owner='proved-long-all-prefix-relaxation') for dtype in
@@ -401,8 +424,40 @@ class CompiledPlayback:
             finally:w.release(claim)
 
     def open_origin(self,i,roots,costs):return _Origin(self,i,roots,costs)
+    def producer_requirement(self,i,j):
+        """Same preallocation bound for runtime and all-domain preflight.
+
+        This inspects numeric domain/scene descriptors only; it never produces
+        camera paths, projections or label state. A maximum over EVERY valid
+        pair can therefore precede the next whole search instead of learning
+        its temporary-space envelope by repeated whole failures.
+        """
+        old=self.context;L=int(old.nodes[j]-old.nodes[i]);counts=[]
+        direct=0;direct_counts=[];maximum_heads=1
+        for s,cat in enumerate(old.cats):
+            P=sum(p.source==s for p in old.entries[i]);Q=sum(q.source==s for q in old.exits[j]);counts.append(P*Q)
+            adjacent=old.arcs.opportunity_episodes is not None and old.arcs.opportunity_episodes[j]-old.arcs.opportunity_episodes[i]<=2
+            whole=adjacent and L>=14 and not np.any((old.arcs.support.events[s]>old.nodes[i])&(old.arcs.support.events[s]<old.nodes[j]))
+            direct+=P*Q*L*24*(int(L<38)+int(whole))
+            direct_counts.append(P*Q if L<38 or whole else 0)
+            maximum_heads=max(maximum_heads,cat.bank['heads'].shape[-2])
+        P=len(old.entries[i]);Q=len(old.exits[j])
+        # Long baseline families use shared interiors plus38-frame endpoint
+        # geometry, NOT a full-length path batch. Only actual direct4/5
+        # recipes reserve full-length content/geometry scratch.
+        return int(direct+max(direct_counts,default=0)*L*24*(64+16*maximum_heads)
+            +max(counts,default=0)*38*24*8
+            +(P+Q)*4*38*24+len(old.cats)*L*8+P*Q*6*64+64*2**10)
+
     def reserve_hold(self,i,j):return _ProducerReservation(self,i,j)
     def compile_hold(self,i,j,base,allowed):return _Hold(self,i,j,base,allowed)
+    def make_beam(self):
+        from .spooled_playback_arena import SpooledPlaybackArena
+        if isinstance(self.arena,SpooledPlaybackArena):
+            from .spooled_context_beam import SpooledBeam
+            return SpooledBeam(self.arena)
+        from .compiled_context_beam import CompiledBeam
+        return CompiledBeam(self.arena)
 
     def score(self,bank,current,p,bit,slots):
         old=self.context;ends=current.head_ends
@@ -444,6 +499,7 @@ class CompiledPlayback:
             exact_reference_frame_reuses=self.reference_frame_reuses,exact_live_frame_reuses=self.live_frame_reuses,
             native_schedule_compilations=self.native_schedule_compilations,nonreference_recipes=self.nonreference_recipes,
             factored_long_piece_compilations=dict(self.factored_piece_compilations),
+            exact_current_hold_prepared_suffix_reuses=self.prepared_suffix_reuses,
             factored_long_camera_alternatives=self.long_alternatives,
             factored_long_prefix_evaluations=self.long_prefix_evaluations,
             maximum_hold_producer_preallocation_reservation=self.maximum_producer_reservation,

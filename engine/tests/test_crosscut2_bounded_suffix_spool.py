@@ -3,14 +3,14 @@ import gc
 import os
 import numpy as np
 import pytest
-from crosscut2.bounded_suffix_spool import BoundedSuffixSpool,capacity_requirements
+from crosscut2.bounded_suffix_spool import BoundedSuffixSpool,capacity_requirements,HEADER_BYTES
 from crosscut2.playback_workspace import PlaybackWorkspace
 
 
 def store(tmp_path,*,capacity=8,H=12,D=2,workspace=None,**kwargs):
     return BoundedSuffixSpool(namespace=('numeric-model','exact-bound-source-and-observation-inputs'),
         embedding_width=D,history_frames=H,capacity=capacity,workspace=workspace or PlaybackWorkspace(2**20),
-        directory=tmp_path,maximum_spool_bytes=capacity*H*(8+D)*8,**kwargs)
+        directory=tmp_path,maximum_spool_bytes=HEADER_BYTES+capacity*H*(8+D)*8,**kwargs)
 
 
 def payload(final,H=12,D=2,variant=0):
@@ -33,7 +33,7 @@ def test_exact_suffix_alias_roundtrip_and_fixed_backing_size(tmp_path,final):
 
 
 def test_full_digest_collision_compares_original_words_and_embedding_bits(tmp_path):
-    s=store(tmp_path);s._digest=lambda keys:bytes(32);roots=[]
+    s=store(tmp_path);s._digest=lambda keys:bytes(16);roots=[]
     for variant in range(8):
         keys,values=payload(12,variant=variant);roots.append(s.intern(keys,values,final=12))
     assert len(set(roots))==8
@@ -67,7 +67,7 @@ def test_all274_synthetic_future_ends_can_remain_owned_without_expanding_backing
     for final in np.linspace(158,4357,274).astype(int):
         keys,values=payload(int(final),H=120,D=8,variant=int(final))
         roots.append(s.intern(keys,values,final=int(final)))
-    assert s.live==274 and s.path.stat().st_size==274*120*16*8
+    assert s.live==274 and s.path.stat().st_size==HEADER_BYTES+274*120*16*8
     for root in roots:
         with s.read(root) as data:assert len(data.keys)==120
         s.release(root)
@@ -104,8 +104,18 @@ def test_failed_partial_write_publishes_no_root_or_lost_slot(tmp_path,monkeypatc
 
 def test_backing_corruption_is_not_returned_as_valid_embeddings(tmp_path):
     s=store(tmp_path);keys,values=payload(12);root=s.intern(keys,values,final=12)
-    os.pwrite(s.fd,b'\xff',s.H*64)
+    os.pwrite(s.fd,b'\xff',HEADER_BYTES+s.H*64)
     with pytest.raises(OSError,match='checksum'):s.read(root)
+    s.release(root);s.close()
+
+
+def test_truncated_payload_fails_without_changing_any_owned_root_metadata(tmp_path):
+    s=store(tmp_path);keys,values=payload(12);root=s.intern(keys,values,final=12)
+    before=tuple(a.copy() for a in s._meta)
+    os.ftruncate(s.fd,HEADER_BYTES+s.H*64+1)
+    with pytest.raises(OSError,match='short exact suffix backing read'):
+        s.read(root)
+    for actual,expected in zip(s._meta,before):np.testing.assert_array_equal(actual,expected)
     s.release(root);s.close()
 
 
@@ -164,10 +174,85 @@ def test_original_domain_sized_resource_arithmetic_requires_no_large_internal_fi
     # original whole graph. In particular this creates NO2.7GB test file.
     capacity=(N*W+W)*2*L+4
     need=capacity_requirements(embedding_width=D,history_frames=H,capacity=capacity)
-    assert need['backing_bytes']==2703421440
+    assert need['backing_bytes']==2703425536
     assert need['total_managed_index_and_io_bytes']<24*2**20
     assert list(tmp_path.iterdir())==before
     s=store(tmp_path);w=s.workspace
     assert w.current_bytes-w.bookkeeping_bytes==capacity_requirements(
         embedding_width=2,history_frames=12,capacity=8)['total_managed_index_and_io_bytes']
     s.close()
+
+
+def test_tiny_physical_reservation_is_real_not_only_sparse_length(tmp_path):
+    s=store(tmp_path,reserve_disk=True);receipt=s.receipt()
+    assert receipt['physical_space_reserved']
+    assert receipt['backing_allocated_bytes']>=receipt['declared_maximum_backing_bytes']
+    assert os.pread(s.fd,8,0)==b'IVEXSUF1'
+    assert receipt['disk_reservation']['method'] in ('posix_fallocate','Darwin_F_PREALLOCATE_F_ALLOCATEALL')
+    s.close()
+
+
+def test_physical_reservation_failure_never_falls_back_to_sparse_success(tmp_path,monkeypatch):
+    def refused(*unused):raise OSError('finite disk reservation refusal')
+    monkeypatch.setattr('crosscut2.bounded_suffix_spool._reserve_file',refused)
+    with pytest.raises(OSError,match='reservation refusal'):store(tmp_path,reserve_disk=True)
+    assert not list(tmp_path.iterdir())
+
+
+def test_darwin_reservation_checks_blocks_after_successful_allocation_sets_EOF(monkeypatch):
+    import fcntl
+    import struct
+    from types import SimpleNamespace
+    import crosscut2.bounded_suffix_spool as m
+    size=11776;state=dict(eof=False);calls=[]
+    def stat(fd):
+        assert fd==123
+        return SimpleNamespace(st_size=size if state['eof'] else 0,
+            st_blocks=256 if state['eof'] else 0)
+    def allocate(fd,command,data):
+        assert fd==123 and command==42 and not state['eof']
+        assert struct.unpack('=Iiqqq',data)==(4,3,0,size,0)
+        calls.append('successful_allocation');return struct.pack('=Iiqqq',4,3,0,size,131072)
+    def truncate(fd,end):
+        assert fd==123 and end==size and calls==['successful_allocation']
+        calls.append('EOF');state['eof']=True
+    monkeypatch.delattr(os,'posix_fallocate',raising=False)
+    monkeypatch.setattr(m.sys,'platform','darwin')
+    monkeypatch.setattr(os,'fstat',stat);monkeypatch.setattr(os,'ftruncate',truncate)
+    monkeypatch.setattr(fcntl,'fcntl',allocate)
+    r=m._reserve_file(123,size)
+    assert calls==['successful_allocation','EOF']
+    assert r['reported_bytes']==r['allocated_bytes']==131072
+
+
+def test_close_checks_live_descriptor_identity_not_obsolete_empty_file_inode(tmp_path):
+    s=store(tmp_path);path=s.path
+    s.file_identity=(s.device,2**64-1)  # ExFAT's former empty-file identity.
+    s.close();assert not path.exists()
+
+
+def test_short_reads_use_the_owned_bounded_buffer_until_complete(tmp_path,monkeypatch):
+    s=store(tmp_path);keys,values=payload(12);root=s.intern(keys,values,final=12);original=os.readv
+    def short(fd,parts):return original(fd,[parts[0][:7]])
+    monkeypatch.setattr(os,'readv',short)
+    with s.read(root) as data:
+        np.testing.assert_array_equal(data.keys,keys);np.testing.assert_array_equal(data.values,values)
+    assert s.read_calls>2;s.release(root);s.close()
+
+
+def test_packed_metadata_strict_numba_retain_release_needs_no_file_or_source_callbacks(tmp_path):
+    numba=pytest.importorskip('numba')
+    from numba.extending import register_jitable
+    from crosscut2.bounded_suffix_spool import _resolve,_retain,_release
+    register_jitable(_resolve)
+    retain=numba.njit(cache=False,fastmath=False,parallel=False)(_retain)
+    release=numba.njit(cache=False,fastmath=False,parallel=False)(_release)
+    s=store(tmp_path);s._digest=lambda keys:bytes(16);roots=[]
+    for i in range(8):
+        keys,values=payload(12,variant=i);roots.append(s.intern(keys,values,final=12))
+    written=s.written_bytes;reads=s.read_bytes
+    for root in reversed(roots):
+        retain(s._meta,np.uint64(root.handle));release(s._meta,np.uint64(root.handle));release(s._meta,np.uint64(root.handle))
+    assert s.live==0 and s.free_count==8 and not s.buckets.any()
+    assert s.written_bytes==written and s.read_bytes==reads
+    assert retain.nopython_signatures and release.nopython_signatures;s.close()

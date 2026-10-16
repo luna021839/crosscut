@@ -164,7 +164,8 @@ def test_actual_general_current_compiles_but_cannot_demand_persistent_frames_bef
     a.release(empty);a.close()
 
 
-def test_compiled_actual_make_secondary_target_and_its_missing_face_gap_do_not_revert_to_native_focal():
+@pytest.mark.parametrize('backend',['memory','spool'])
+def test_compiled_actual_make_secondary_target_and_its_missing_face_gap_do_not_revert_to_native_focal(backend,tmp_path):
     from test_crosscut2_playback_intent import secondary_target_fixture
     from test_crosscut2_ordered_preference_consumer import numeric_ordered_model
     scalar,_=secondary_target_fixture();old=scalar.arcs;nodes=scalar.nodes
@@ -172,7 +173,11 @@ def test_compiled_actual_make_secondary_target_and_its_missing_face_gap_do_not_r
         fps=30.,preserve_camera_alternatives=True,capture_playback_inputs=True)
     context=numeric_ordered_model().prepare(nodes=nodes,entries=scalar.entries,exits=scalar.exits,catalogues=scalar.cats,
         arcs=arcs,native_ports=arcs.native,fps=30.,source_bindings=['a'*64,'b'*64],check=lambda:None)
-    compiler=CompiledPlayback(context);a=compiler.arena;empty=a.empty()
+    if backend=='spool':
+        from test_crosscut2_spooled_context import spooled
+        compiler=spooled(context,tmp_path)
+    else:compiler=CompiledPlayback(context)
+    a=compiler.arena;empty=a.empty()
     def origin(i,p,root):
         ids=np.zeros((len(context.entries[i]),2,8),np.uint64);costs=np.full(ids.shape,np.inf)
         ids[p,0,0]=root.handle;costs[p,0,0]=0.

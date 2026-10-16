@@ -79,9 +79,21 @@ def batch_values(P=32):
 
 
 @pytest.mark.parametrize('kernel',['numpy','numba'])
-def test_compiled_long_resume_matches_original_saturated_beam_order_and_weak_hints_do_not_pin(kernel):
-    a=arena(kernel=kernel,history_frames=12,root_capacity=32,cell_capacity=128,frame_capacity=256)
-    empty=a.empty();batch=batch_values();beam=CompiledBeam(a);reference=CompiledBeam(a)
+@pytest.mark.parametrize('backend',['memory','spool'])
+def test_compiled_long_resume_matches_original_saturated_beam_order_and_weak_hints_do_not_pin(kernel,backend,tmp_path):
+    Beam=CompiledBeam
+    if backend=='memory':a=arena(kernel=kernel,history_frames=12,root_capacity=32,cell_capacity=128,frame_capacity=256)
+    else:
+        from crosscut2.bounded_suffix_spool import capacity_requirements
+        from crosscut2.playback_workspace import PlaybackWorkspace
+        from crosscut2.spooled_playback_arena import SpooledPlaybackArena
+        from crosscut2.spooled_context_beam import SpooledBeam
+        need=capacity_requirements(embedding_width=2,history_frames=12,capacity=32)
+        a=SpooledPlaybackArena(namespace=('finite-long-rank-only',),embedding_width=2,history_frames=12,
+            root_capacity=32,workspace=PlaybackWorkspace(2**20),directory=tmp_path,
+            maximum_spool_bytes=need['backing_bytes'],kernel=kernel)
+        Beam=SpooledBeam
+    empty=a.empty();batch=batch_values();beam=Beam(a);reference=Beam(a)
     actual=tuple(np.stack((np.stack((v,v.copy())),)) for v in fields())
     expected=tuple(v.copy() for v in actual);hints=np.zeros((1,4),np.uint64);builds=[]
     def build(p,q,code,bit,slot):

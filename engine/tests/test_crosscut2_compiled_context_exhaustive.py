@@ -67,11 +67,16 @@ class Hold:
 
 
 class Compiler:
-    def __init__(self,kernel):
-        self.arena=PlaybackSuffixArena(namespace=('numeric-independent-enumeration-only',),embedding_width=2,
+    def __init__(self,kernel,arena=None):
+        self.arena=arena or PlaybackSuffixArena(namespace=('numeric-independent-enumeration-only',),embedding_width=2,
             history_frames=H,frame_capacity=512,cell_capacity=128,root_capacity=128,kernel=kernel)
         self.context=SimpleNamespace(nodes=NODES,model=SimpleNamespace(embedding_width=2));self.origin_decode_calls=0
         self.active_origin=None
+    def make_beam(self):
+        from crosscut2.compiled_context_beam import CompiledBeam
+        from crosscut2.spooled_context_beam import SpooledBeam
+        from crosscut2.spooled_playback_arena import SpooledPlaybackArena
+        return SpooledBeam(self.arena) if isinstance(self.arena,SpooledPlaybackArena) else CompiledBeam(self.arena)
     def open_origin(self,i,roots,costs):return _Origin(self,i,roots,costs)
     def reserve_hold(self,i,j):return nullcontext(SimpleNamespace(observe=lambda *a:None))
     def compile_hold(self,i,j,base,allowed):return Hold(self,i,j)
@@ -89,7 +94,8 @@ def base_cost(i,j,code,source):return .1+source*.02+code*np.finfo(float).eps
 
 
 @pytest.mark.parametrize('kernel',['numpy','numba'])
-def test_six_code_aliases_paid_and_unpaid_states_terminal_window_match_complete_enumeration(kernel):
+@pytest.mark.parametrize('backend',['memory','spool'])
+def test_six_code_aliases_paid_and_unpaid_states_terminal_window_match_complete_enumeration(kernel,backend,tmp_path):
     if kernel=='numba':pytest.importorskip('numba')
     sources=[np.arange(2)]*len(NODES)
     def hold(i,j):
@@ -102,7 +108,16 @@ def test_six_code_aliases_paid_and_unpaid_states_terminal_window_match_complete_
         episodes=np.array([0,0,0,1]),credit=lambda i,j:np.full(2,.125 if i else 0.),
         history_frames=H,label_limit=8)
     old=reference_solve(NODES,sources,sources,context_cost=reference_extra,history_key=physical_key,**kw)
-    compiler=Compiler(kernel);new=compiled_solve(NODES,sources,sources,compiler=compiler,**kw)
+    arena=None
+    if backend=='spool':
+        from crosscut2.bounded_suffix_spool import capacity_requirements
+        from crosscut2.playback_workspace import PlaybackWorkspace
+        from crosscut2.spooled_playback_arena import SpooledPlaybackArena
+        need=capacity_requirements(embedding_width=2,history_frames=H,capacity=128)
+        arena=SpooledPlaybackArena(namespace=('numeric-independent-enumeration-only',),embedding_width=2,
+            history_frames=H,root_capacity=128,workspace=PlaybackWorkspace(2**20),directory=tmp_path,
+            maximum_spool_bytes=need['backing_bytes'],kernel=kernel)
+    compiler=Compiler(kernel,arena);new=compiled_solve(NODES,sources,sources,compiler=compiler,**kw)
     assert new[0]==old[0] and new[1]==old[1]
     assert new[2]['selected_arc_codes']==old[2]['selected_arc_codes']
     assert new[2]['opportunity_claims']==old[2]['opportunity_claims']

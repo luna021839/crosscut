@@ -12,12 +12,88 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import sys
 import tempfile
 from threading import RLock
 import numpy as np
 from .playback_suffix_arena import SuffixRoot,_owners
 from .playback_workspace import PlaybackWorkspace
+
+HEADER_BYTES=4096
+_LOW=np.uint64(0xffffffff)
+
+
+def _resolve(meta,handle):
+    refs,generations,free,ends,digests,checksums,buckets,control=meta
+    slot=np.int64(handle&_LOW)-1
+    if slot<0 or slot>=len(refs) or refs[slot]==0 or generations[slot]!=(handle>>np.uint64(32)):
+        raise ValueError('stale suffix backing handle')
+    return slot
+
+
+def _retain(meta,handle):
+    slot=_resolve(meta,handle);meta[0][slot]+=np.uint64(1)
+
+
+def _release(meta,handle):
+    refs,generations,free,ends,digests,checksums,buckets,control=meta
+    slot=_resolve(meta,handle);refs[slot]-=np.uint64(1)
+    if refs[slot]:return
+    mask=len(buckets)-1;position=np.int64(digests[slot,0]&np.uint64(mask))
+    while buckets[position]!=slot+1:position=(position+1)&mask
+    hole=position;position=(hole+1)&mask
+    while buckets[position]:
+        other=np.int64(buckets[position])-1;home=np.int64(digests[other,0]&np.uint64(mask))
+        if ((hole-home)&mask)<((position-home)&mask):buckets[hole]=buckets[position];hole=position
+        position=(position+1)&mask
+    buckets[hole]=0;control[1]-=np.uint64(1)
+    if generations[slot]<_LOW:
+        generations[slot]+=np.uint64(1);free[control[0]]=slot;control[0]+=np.uint64(1)
+
+
+def _publish(meta,slot,position,final,digest,checksum):
+    """Metadata transaction AFTER successful payload storage; no file IO.
+
+    The actual intern() is the sole production caller. Keeping the numeric
+    publisher separate lets the complete ownership envelope be stress-tested
+    without pretending to write2.7GB of payload or running the whole solver.
+    """
+    refs,generations,free,ends,digests,checksums,buckets,control=meta
+    if control[0]==0 or free[control[0]-np.uint64(1)]!=slot or refs[slot] or buckets[position]:
+        raise ValueError('suffix publication does not own an unoccupied transaction slot')
+    control[0]-=np.uint64(1);refs[slot]=1;ends[slot]=final;digests[slot]=digest;checksums[slot]=checksum
+    buckets[position]=slot+1;control[1]+=np.uint64(1);control[2]=max(control[2],control[1])
+    return (generations[slot]<<np.uint64(32))|np.uint64(slot+1)
+
+
+def _reserve_file(fd,size):
+    """Reserve an EMPTY owned file before truncation/header/payload writes.
+
+    Darwin constants/layout are from the installed sys/fcntl.h and Apple's
+    fcntl(2) F_PREALLOCATE manual. F_ALLOCATEALL is all requested space or none.
+    https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
+    Sparse length/free-space inspection alone never sets the reserved flag.
+    """
+    if os.fstat(fd).st_size or os.fstat(fd).st_blocks:raise ValueError('reserve requires an empty owned backing file')
+    if hasattr(os,'posix_fallocate'):
+        os.posix_fallocate(fd,0,size);reported=size;method='posix_fallocate'
+    elif sys.platform=='darwin':
+        import fcntl
+        result=fcntl.fcntl(fd,42,struct.pack('=Iiqqq',4,3,0,size,0))
+        reported=struct.unpack('=Iiqqq',result)[-1];method='Darwin_F_PREALLOCATE_F_ALLOCATEALL'
+    else:raise OSError('physical suffix reservation unsupported; no sparse fallback')
+    if reported<size:
+        raise OSError('physical suffix reservation did not cover the declared bound')
+    # ExFAT reports the successful allocation through fst_bytesalloc, but
+    # st_blocks remains zero until EOF is set. Check physical coverage AFTER
+    # the successful all-or-nothing reservation is made visible at its EOF;
+    # this is never a sparse fallback after refusal/partial reservation.
+    os.ftruncate(fd,size)
+    if os.fstat(fd).st_blocks*512<size:
+        raise OSError('physical suffix reservation did not cover the declared bound')
+    return dict(method=method,requested_bytes=size,reported_bytes=int(reported),
+        allocated_bytes=int(os.fstat(fd).st_blocks*512))
 
 
 class StoredSuffix:
@@ -42,12 +118,27 @@ def capacity_requirements(*,embedding_width,history_frames,capacity):
         raise ValueError('bounded exact suffix dimensions required')
     buckets=1
     while buckets<2*capacity:buckets*=2
-    shapes=((capacity,),(capacity,),(capacity,),(capacity,),(capacity,4),(capacity,4),(buckets,))
+    # Exactly64B/root: refs/gen/free/end32B + lookup/checksum16B each.
+    shapes=((capacity,),(capacity,),(capacity,),(capacity,),(capacity,2),(capacity,2),(buckets,),(3,))
     header=sys.getsizeof(np.empty(0,np.uint64));slot=history_frames*(8+embedding_width)*8
     metadata=sum(int(np.prod(s))*8+header+16*(len(s)-1) for s in shapes)
-    return dict(index_buckets=buckets,slot_bytes=slot,backing_bytes=capacity*slot,
+    return dict(index_buckets=buckets,slot_bytes=slot,backing_bytes=HEADER_BYTES+capacity*slot,
         metadata_bytes=metadata,io_scratch_bytes=2*slot+4096+header,
         total_managed_index_and_io_bytes=metadata+2*slot+4096+header)
+
+
+def _make_index(workspace,capacity):
+    # Same fixed layouts used by the complete frontier proof and real store.
+    need=capacity_requirements(embedding_width=1,history_frames=1,capacity=capacity)
+    if workspace.current_bytes+need['metadata_bytes']>workspace.limit_bytes:
+        raise MemoryError('root index refused before fixed-array allocation')
+    shapes=((capacity,),(capacity,),(capacity,),(capacity,),(capacity,2),(capacity,2),(need['index_buckets'],),(3,))
+    arrays=tuple(workspace.empty(shape,np.uint64,owner='bounded-suffix-spool-index') for shape in shapes)
+    refs,generations,free,ends,digests,checksums,buckets,control=arrays
+    refs[:]=0;generations[:]=1
+    for at in range(capacity):free[at]=capacity-1-at
+    ends[:]=0;digests[:]=0;checksums[:]=0;buckets[:]=0;control[:]=[capacity,0,0]
+    return arrays
 
 
 class BoundedSuffixSpool:
@@ -58,14 +149,14 @@ class BoundedSuffixSpool:
     Production consumers still need bank integration and whole-runtime tests.
     """
     def __init__(self,*,namespace,embedding_width,history_frames,capacity,
-                 workspace,directory,maximum_spool_bytes,check=lambda:None):
+                 workspace,directory,maximum_spool_bytes,check=lambda:None,reserve_disk=False):
         if (not isinstance(namespace,tuple) or not namespace or len(namespace)>32
                 or any(not isinstance(v,str) or not 1<=len(v)<=128 for v in namespace)
                 or type(embedding_width) is not int or not 1<=embedding_width<=16
                 or type(history_frames) is not int or not 1<=history_frames<=480
                 or type(capacity) is not int or not 1<=capacity<2**31
                 or not isinstance(workspace,PlaybackWorkspace) or not callable(check)
-                or type(maximum_spool_bytes) is not int or maximum_spool_bytes<1):
+                or type(maximum_spool_bytes) is not int or maximum_spool_bytes<1 or type(reserve_disk) is not bool):
             raise ValueError('explicit finite namespace, dimensions and memory/disk limits required')
         directory=Path(directory)
         if not directory.is_absolute() or not directory.is_dir() or directory.is_symlink():
@@ -75,8 +166,6 @@ class BoundedSuffixSpool:
         requirements=capacity_requirements(embedding_width=embedding_width,history_frames=history_frames,capacity=capacity)
         self.slot_bytes=requirements['slot_bytes'];self.maximum_bytes=requirements['backing_bytes']
         if self.maximum_bytes>maximum_spool_bytes:raise MemoryError('fixed suffix backing exceeds declared disk budget')
-        buckets=requirements['index_buckets']
-        specs=((capacity,),(capacity,),(capacity,),(capacity,),(capacity,4),(capacity,4),(buckets,))
         # readv fills an actual owned buffer: retained views/tracebacks keep
         # its allocation charged even after close. No untracked pread bytes.
         self.scratch_bytes=2*self.slot_bytes+4096
@@ -86,23 +175,43 @@ class BoundedSuffixSpool:
         if shutil.disk_usage(self.directory).free<self.maximum_bytes:
             raise OSError('insufficient free space for the explicit fixed suffix backing bound')
         self.check=check;self.binding=hashlib.sha256(json.dumps(namespace,separators=(',',':')).encode()).digest()
-        self._lock=RLock();self.closed=False;self.fd=None;self.path=None;self._io=None
-        self.free_count=capacity;self.live=self.peak_live=self.read_bytes=self.written_bytes=self.probes=0
+        self._lock=RLock();self.closed=False;self.fd=None;self.path=None;self._io=None;self._meta=None
+        self.read_bytes=self.written_bytes=self.probes=self.read_calls=self.write_calls=0
+        self.disk_reservation=None
         self.arrays=[]
         try:
-            for shape in specs:self.arrays.append(workspace.empty(shape,np.uint64,owner='bounded-suffix-spool-index'))
-            self.refs,self.generations,self.free,self.ends,self.digests,self.checksums,self.buckets=self.arrays
-            self.refs[:]=0;self.generations[:]=1;self.free[:]=np.arange(capacity-1,-1,-1,dtype=np.uint64)
-            self.ends[:]=0;self.digests[:]=0;self.checksums[:]=0;self.buckets[:]=0
+            self.arrays=list(_make_index(workspace,capacity))
+            self.refs,self.generations,self.free,self.ends,self.digests,self.checksums,self.buckets,self.control=self.arrays
+            self._meta=tuple(self.arrays)
             self._io=workspace.empty((self.scratch_bytes,),np.uint8,owner='bounded-suffix-spool-IO-scratch')
             self.fd,name=tempfile.mkstemp(prefix='ive-crosscut-owned-suffix-',suffix='.bin',dir=self.directory)
             self.path=Path(name);stat=os.fstat(self.fd);self.file_identity=(stat.st_dev,stat.st_ino)
             if stat.st_dev!=self.device:raise OSError('suffix backing directory identity changed')
+            if reserve_disk:self.disk_reservation=_reserve_file(self.fd,self.maximum_bytes)
             os.ftruncate(self.fd,self.maximum_bytes)
+            header=json.dumps(dict(contract='fixed_exact_suffix_backing_v1',namespace_sha256=self.binding.hex(),
+                capacity=capacity,history_frames=history_frames,embedding_width=embedding_width,
+                slot_bytes=self.slot_bytes,header_bytes=HEADER_BYTES),sort_keys=True,separators=(',',':')).encode()
+            raw=self._io[:HEADER_BYTES];raw[:]=0;raw[:8]=np.frombuffer(b'IVEXSUF1',np.uint8)
+            raw[8:12]=np.frombuffer(struct.pack('<I',len(header)),np.uint8)
+            raw[12:12+len(header)]=np.frombuffer(header,np.uint8);self._write(raw,0)
         except BaseException:
             self._close_file()
             self._io=None;self.arrays=[]
             raise
+
+    @property
+    def free_count(self):return int(self.control[0])
+    @free_count.setter
+    def free_count(self,value):self.control[0]=value
+    @property
+    def live(self):return int(self.control[1])
+    @live.setter
+    def live(self,value):self.control[1]=value
+    @property
+    def peak_live(self):return int(self.control[2])
+    @peak_live.setter
+    def peak_live(self,value):self.control[2]=value
 
     def _live(self):
         if self.closed:raise ValueError('suffix backing is closed')
@@ -112,45 +221,42 @@ class BoundedSuffixSpool:
     def _resolve(self,root):
         if self.closed:raise ValueError('suffix backing is closed')
         if not isinstance(root,SuffixRoot) or root.arena!=self.owner:raise ValueError('suffix root belongs to another store')
-        slot=(root.handle&0xffffffff)-1;generation=root.handle>>32
-        if slot<0 or slot>=self.capacity or not self.refs[slot] or int(self.generations[slot])!=generation:
-            raise ValueError('stale suffix backing handle')
-        return slot
+        return int(_resolve(self._meta,np.uint64(root.handle)))
 
     def _digest(self,keys):
         h=hashlib.sha256(self.binding)
         if len(keys):h.update(memoryview(keys).cast('B'))
-        return h.digest()
+        return h.digest()[:16]
 
     def _checksum(self,keys,values):
         h=hashlib.sha256(self.binding)
         if len(keys):h.update(memoryview(keys).cast('B'));h.update(memoryview(values).cast('B'))
-        return h.digest()
+        return h.digest()[:16]
 
-    def _home(self,digest):return int.from_bytes(digest[:8],'little')&(len(self.buckets)-1)
+    def _home(self,digest):return int(np.frombuffer(digest[:8],np.uint64)[0])&(len(self.buckets)-1)
 
     def _write(self,buffer,offset):
         if not len(buffer):return
         view=memoryview(buffer).cast('B');at=0
         while at<len(view):
-            self._live();n=os.pwrite(self.fd,view[at:],offset+at)
+            self._live();n=os.pwrite(self.fd,view[at:],offset+at);self.write_calls+=1
             if n<=0:raise OSError('suffix backing write made no progress')
             self.written_bytes+=n;at+=n
 
     def _read(self,count,offset,into):
         self._live();data=self._io[into:into+count];at=0;os.lseek(self.fd,offset,os.SEEK_SET)
         while at<count:
-            self._live();n=os.readv(self.fd,[memoryview(data[at:])])
+            self._live();n=os.readv(self.fd,[memoryview(data[at:])]);self.read_calls+=1
             if n<=0:raise OSError('short exact suffix backing read')
             self.read_bytes+=n;at+=n
         return data
 
     def _payload(self,slot):
-        count=min(self.H,int(self.ends[slot]));start=slot*self.slot_bytes
+        count=min(self.H,int(self.ends[slot]));start=HEADER_BYTES+slot*self.slot_bytes
         keys=self._read(count*64,start,0)
         values=self._read(count*self.width*8,start+self.H*64,self.H*64)
         h=hashlib.sha256(self.binding);h.update(keys);h.update(values)
-        if h.digest()!=self.checksums[slot].tobytes():raise OSError('exact suffix backing checksum changed')
+        if h.digest()[:16]!=self.checksums[slot].tobytes():raise OSError('exact suffix backing checksum changed')
         return keys,values
 
     def intern(self,keys,values,*,final):
@@ -173,34 +279,21 @@ class BoundedSuffixSpool:
                         return SuffixRoot(self.owner,(int(self.generations[slot])<<32)|slot+1)
                 at=(at+1)&(len(self.buckets)-1)
             if not self.free_count:raise MemoryError('live suffix backing capacity exceeded; no candidates removed')
-            slot=int(self.free[self.free_count-1]);start=slot*self.slot_bytes
+            slot=int(self.free[self.free_count-1]);start=HEADER_BYTES+slot*self.slot_bytes
             # Publish nothing until both pieces were written successfully.
             self._write(keys,start);self._write(values,start+self.H*64)
-            self.free_count-=1;self.refs[slot]=1;self.ends[slot]=final;self.digests[slot]=words
-            self.checksums[slot]=np.frombuffer(self._checksum(keys,values),np.uint64);self.buckets[at]=slot+1
-            self.live+=1;self.peak_live=max(self.peak_live,self.live)
-            return SuffixRoot(self.owner,(int(self.generations[slot])<<32)|slot+1)
+            handle=_publish(self._meta,slot,at,final,words,np.frombuffer(self._checksum(keys,values),np.uint64))
+            return SuffixRoot(self.owner,int(handle))
 
     def retain(self,root):
-        with self._lock:self.refs[self._resolve(root)]+=np.uint64(1)
+        with self._lock:self._resolve(root);_retain(self._meta,np.uint64(root.handle))
         return root
 
     def release(self,root):
         with self._lock:
             # Cleanup must still work after the caller's deadline/cancel
             # callback fails; it owns only metadata and performs no disk IO.
-            slot=self._resolve(root);self.refs[slot]-=np.uint64(1)
-            if self.refs[slot]:return
-            mask=len(self.buckets)-1;position=self._home(self.digests[slot].tobytes())
-            while int(self.buckets[position])!=slot+1:position=(position+1)&mask
-            hole=position;position=(hole+1)&mask
-            while self.buckets[position]:
-                other=int(self.buckets[position])-1;home=self._home(self.digests[other].tobytes())
-                if ((hole-home)&mask)<((position-home)&mask):self.buckets[hole]=self.buckets[position];hole=position
-                position=(position+1)&mask
-            self.buckets[hole]=0;self.live-=1
-            if self.generations[slot]<0xffffffff:
-                self.generations[slot]+=np.uint64(1);self.free[self.free_count]=slot;self.free_count+=1
+            self._resolve(root);_release(self._meta,np.uint64(root.handle))
 
     def read(self,root):
         with self._lock:
@@ -248,14 +341,22 @@ class BoundedSuffixSpool:
                 backing_allocated_bytes=None if stat is None else stat.st_blocks*512,
                 declared_maximum_backing_bytes=self.maximum_bytes,read_bytes=self.read_bytes,
                 written_bytes=self.written_bytes,collision_probes=self.probes,workspace=self.workspace.receipt(),
+                read_system_calls=self.read_calls,write_system_calls=self.write_calls,
+                physical_space_reserved=self.disk_reservation is not None,disk_reservation=self.disk_reservation,
                 append_only_candidate_history=False,raw_input_compared_after_digest_collision=True,
                 normal_app_or_selector_connected=False,whole_runtime_or_media_quality_approved=False)
 
     def _close_file(self):
-        if self.fd is not None:os.close(self.fd);self.fd=None
+        identity=self.file_identity if self.path is not None else None
+        if self.fd is not None:
+            # ExFAT assigns a new inode when an empty file gets its first
+            # allocation. Compare the path with the STILL-OPEN descriptor,
+            # not the obsolete empty-file inode. Replacements still refuse.
+            stat=os.fstat(self.fd);identity=(stat.st_dev,stat.st_ino)
+            os.close(self.fd);self.fd=None
         if self.path is not None and self.path.exists():
             stat=self.path.lstat()
-            if self.path.is_symlink() or (stat.st_dev,stat.st_ino)!=self.file_identity:
+            if self.path.is_symlink() or (stat.st_dev,stat.st_ino)!=identity:
                 raise OSError('suffix backing pathname replaced; refusing to remove another file')
             self.path.unlink()
 
@@ -263,6 +364,7 @@ class BoundedSuffixSpool:
         with self._lock:
             if self.closed:return
             if self.live:raise ValueError('cannot close suffix backing with live roots')
-            self._close_file();self.closed=True
-            self._io=None;self.arrays=[]
-            self.refs=self.generations=self.free=self.ends=self.digests=self.checksums=self.buckets=None
+            try:self._close_file()
+            finally:
+                self.closed=True;self._io=None;self.arrays=[];self._meta=None
+                self.refs=self.generations=self.free=self.ends=self.digests=self.checksums=self.buckets=self.control=None

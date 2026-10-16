@@ -61,8 +61,25 @@ def test_reference_only_long_hold_does_not_reserve_nonexistent_whole_length_dire
     context.arcs.opportunity_episodes=np.arange(5)*10
     initial=w.current_bytes
     with c.reserve_hold(0,1) as short:short_bytes=w.current_bytes-initial
+    assert short_bytes==c.producer_requirement(0,1)
     del short;gc.collect()
     assert w.current_bytes==initial
     with c.reserve_hold(0,4) as long:long_bytes=w.current_bytes-initial
+    assert long_bytes==c.producer_requirement(0,4)
     assert long_bytes<short_bytes
     del long;gc.collect();c.arena.close()
+
+
+def test_all_pair_producer_preflight_is_the_runtime_bound_without_producing_camera_inputs(monkeypatch):
+    context,c=fixture(np.array([0,14,37,158,240]));w=c.arena.workspace
+    initial=w.current_bytes;calls=context.arcs.calls
+    def forbidden(*unused):raise AssertionError('preflight must not produce camera inputs')
+    monkeypatch.setattr(context.arcs,'camera_alternatives',forbidden)
+    maximum=0
+    for i in range(len(context.nodes)-1):
+        for j in range(i+1,len(context.nodes)):
+            need=c.producer_requirement(i,j);maximum=max(maximum,need)
+            with c.reserve_hold(i,j) as guard:assert w.current_bytes-initial==need
+            del guard;gc.collect();assert w.current_bytes==initial
+    assert maximum>0 and context.arcs.calls==calls
+    c.arena.close()

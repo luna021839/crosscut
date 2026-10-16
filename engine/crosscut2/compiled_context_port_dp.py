@@ -10,6 +10,7 @@ import numpy as np
 from .boundary_port_dp import _ports,_vector,_mask,_matrix
 from .compiled_context_beam import CompiledBeam
 from .playback_suffix_arena import SuffixRoot,PlaybackSuffixArena
+from .spooled_playback_arena import SpooledPlaybackArena
 
 
 def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,credit,
@@ -23,10 +24,11 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
             or type(history_frames) is not int or history_frames<1
             or type(label_limit) is not int or not 1<=label_limit<=32
             or type(minimum_frames) is not int or minimum_frames<1
-            or not callable(credit) or not isinstance(arena,PlaybackSuffixArena) or arena.H!=history_frames):
+            or not callable(credit) or not isinstance(arena,(PlaybackSuffixArena,SpooledPlaybackArena)) or arena.H!=history_frames):
         raise ValueError('ordered nodes/episodes and an owned exact playback compiler required')
     N=len(nodes);entries=_ports(entries,N,'entry');exits=_ports(exits,N,'exit')
-    W=max(map(len,entries+exits));L=label_limit;workspace=arena.workspace;beam=CompiledBeam(arena)
+    W=max(map(len,entries+exits));L=label_limit;workspace=arena.workspace
+    beam=compiler.make_beam() if callable(getattr(compiler,'make_beam',None)) else CompiledBeam(arena)
     start=_vector(start_cost,len(entries[0]),'start_cost');begin=_mask(start_allowed,len(entries[0]),'start_allowed')
     final=np.zeros(len(exits[-1])) if final_cost is None else _vector(final_cost,len(exits[-1]),'final_cost')
     finish=_mask(final_allowed,len(exits[-1]),'final_allowed')
