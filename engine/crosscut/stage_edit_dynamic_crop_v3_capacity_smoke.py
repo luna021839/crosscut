@@ -54,6 +54,7 @@ from .stage_edit_dynamic_crop_head_v3 import (
     stage_edit_dynamic_crop_v3_loss,
     stage_edit_dynamic_crop_v3_parameter_count,
 )
+from .stage_edit_production_training import DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT
 from .stage_edit_dynamic_crop_mlx_smoke_cli import (
     FIXED_BATCH_SIZE,
     FIXED_MAX_SOURCES,
@@ -134,11 +135,9 @@ V3_PROBE_TRAINING_SCHEDULE: Mapping[str, Any] = MappingProxyType(
         "dynamic_crop_v3_prior_pretraining_peak_learning_rate": 3.0e-4,
         "dynamic_crop_v3_prior_pretraining_warmup_steps": 50,
         "dynamic_crop_v3_prior_pretraining_batch_size": 12,
+        "dynamic_crop_v3_joint_feature_mode": "serving",
         "dynamic_crop_v3_prior_retention_finetune_steps": 60,
-        "schedule_contract": (
-            "independent_warmup_cosine_cut_source_v3_prior_and_joint_"
-            "with_minibatch_prior_and_retained_selection_burn_in_v5"
-        ),
+        "schedule_contract": DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT,
     }
 )
 V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE: Mapping[str, Any] = (

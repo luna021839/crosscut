@@ -259,7 +259,8 @@ def train_fit_decision(initial,final):
     return summary,'diagnostic_pass' if passed else 'stop_investigate_no_long_rerun'
 
 
-def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False):
+def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False,
+                   warmup_cache=None, deterministic_joint_features=False):
     if interaction_release_ab and bounded_feature_release:
         raise ValueError('one declared diagnostic hypothesis at a time')
     import mlx.core as mx
@@ -285,13 +286,18 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
     mx.set_cache_limit(128 * 2**20)
     mx.set_memory_limit(budget.mlx_bytes)
     budget.check()
+    if warmup_cache is not None and interaction_release_ab:
+        raise ValueError('the historical interaction A/B does not accept a warmup cache')
+    expected_updates = 64 if warmup_cache is not None else 80
+    reused_updates = 1000 if warmup_cache is not None else 0
     report = dict(diagnostic_only=True, production_activation_authorized=False,
         production_ready=False, validation_forwards=0, heldout_forwards=0,
-        max_optimizer_updates=80, limits=dict(seconds=budget.seconds,
+        max_optimizer_updates=expected_updates, limits=dict(seconds=budget.seconds,
         rss_bytes=budget.rss_bytes, mlx_bytes=budget.mlx_bytes),
         native_affine_tolerance=dict(atol=2e-4, rtol=2e-5),
         release_step_drift_limits=dict(release_limits),
         bounded_feature_release_enabled=bounded_feature_release,
+        deterministic_joint_features=deterministic_joint_features,
         prior_minibatch_size=12 if minibatch_prior else 1,
         model_config=config.to_dict(), steps=[], evaluations={})
     examples = {e.sequence.sequence_id: e for e in corpus.examples}
@@ -418,9 +424,18 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
             transition_weight=0., source_objective="eligible_all_hybrid")
         crop_contract = h3.DynamicCropV3LossContract(base=base_contract)
         evaluate("initial")
-        # Exactly eight genuine full-model updates for each production loss.
-        for phase, contract in (("cut", production._cut_only_pretraining_loss_contract(base_contract)),
-                ("source", production._source_only_pretraining_loss_contract(base_contract))):
+        if warmup_cache is not None:
+            from train_stage_edit_warmup import restore_cached_warmup
+            report['cached_warmup'] = restore_cached_warmup(
+                model, warmup_cache, fixture[-1], check=budget.check)
+            write_report()
+        # The historical diagnostic keeps its original eight updates. A
+        # completed production-size warmup is reused without repeating it.
+        warmup_phases = () if warmup_cache is not None else (
+            ("cut", production._cut_only_pretraining_loss_contract(base_contract)),
+            ("source", production._source_only_pretraining_loss_contract(base_contract)),
+        )
+        for phase, contract in warmup_phases:
             optimizer = optim.AdamW(learning_rate=1e-4, weight_decay=.01)
             grad_fn = nn.value_and_grad(model, lambda m,b,s: stage_edit_loss(m,b,s,contract)[0])
             for step in range(1,9):
@@ -430,7 +445,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
                 model.train()
                 loss, gradients = grad_fn(model,batch,base)
                 update(loss,gradients,optimizer,model,phase,step)
-        del optimizer, grad_fn, gradients
+        if warmup_cache is None:
+            del optimizer, grad_fn, gradients
         gc.collect(); mx.clear_cache()
         model.eval()
         before_base = production._parameter_tree_sha256(model.base.parameters())
@@ -562,14 +578,19 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
                     write_report()
                 transaction=snapshot_transaction(model,optimizer)
             model.train()
-            if step==5:model.eval()  # first real joint update WITHOUT dropout
+            if step == 5 or (deterministic_joint_features and step >= 5):
+                # Eval disables stochastic feature corruption, not gradients.
+                # The real encoder/source projections still receive and take
+                # updates; their measured deltas and rematerialization remain.
+                model.eval()
             if step<=4:
                 for name in (*production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES,"input_dropout"):
                     getattr(model.base,name).eval()
             if step in (5,6):
                 def attribution(evidence):
                     report.setdefault('released_loss_attribution',[]).append(dict(
-                        phase_step=step-4,dropout_active=step==6,evidence=evidence));write_report()
+                        phase_step=step-4,dropout_active=step==6 and not deterministic_joint_features,
+                        evidence=evidence));write_report()
                 loss,gradients,_=separated_loss_gradients(model,batch,base,dynamic,crop_contract,
                     check=budget.check,record=attribution)
             else:loss,gradients=grad_fn(model,batch,base,dynamic)
@@ -593,7 +614,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
                 model.eval()
                 after_release=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
                 drift=compare_drift(before_release,after_release)
-                result=dict(phase_step=step-4,dropout_during_update=step==6,deterministic_serving_drift=drift,
+                result=dict(phase_step=step-4,dropout_during_update=step==6 and not deterministic_joint_features,
+                    deterministic_serving_drift=drift,
                     rollback_performed=False)
                 report.setdefault('release_step_probes',[]).append(result)
                 if not drift['passed']:
@@ -704,14 +726,14 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
             # metrics are already retained. Reload is explicitly NOT proven.
             report.update(status=fit_status,optimizer_update_count=len(report['steps']),
                 resources=budget.check(),failed_checkpoint_not_written=True)
-            if report['optimizer_update_count']!=80:
-                raise RuntimeError('bounded release did not execute its declared80 updates')
+            if report['optimizer_update_count'] != expected_updates:
+                raise RuntimeError('bounded release did not execute its declared updates')
             write_report()
             print(json.dumps(dict(status=fit_status,train_fit=report['train_fit'],**report['resources'])),flush=True)
             return
         # Production weights are never registered. Diagnostic save/reload only.
         metadata=h3.new_stage_edit_dynamic_crop_checkpoint_metadata_v3(out.name,schema,config,
-            training_steps=80,weights_trained=True,training_data_id=v3.data_id)
+            training_steps=reused_updates + expected_updates,weights_trained=True,training_data_id=v3.data_id)
         h3.save_stage_edit_dynamic_crop_checkpoint_v3(out/"unqualified-checkpoint",model,metadata)
         model.eval(); expected=np.asarray(raw_at(sentinel_batch,tracks[-1])[0]).copy()
         reload_probes=[]
@@ -783,8 +805,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
         report['train_fit'],report['status']=train_fit_decision(report['evaluations']['initial']['normalized_mae'],final)
         report["resources"]=budget.check()
         report["optimizer_update_count"]=len(report["steps"])
-        if report["optimizer_update_count"]!=80:
-            raise RuntimeError("diagnostic did not execute exactly the predeclared 80 updates")
+        if report["optimizer_update_count"] != expected_updates:
+            raise RuntimeError("diagnostic did not execute exactly the predeclared updates")
         write_report()
         print(json.dumps(dict(status=report["status"],train_fit=report["train_fit"],**report["resources"])),flush=True)
     except Exception as exc:
@@ -795,7 +817,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
         raise
 
 
-def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False):
+def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False,
+                       warmup_cache=None, deterministic_joint_features=False):
     """One process-age budget/watchdog around preparation AND execution."""
     budget = DiagnosticBudget(out)
     watcher = threading.Thread(target=budget.watch, daemon=True)
@@ -814,12 +837,19 @@ def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,
         (out / "preparation-report.json").write_text(json.dumps(preparation,indent=2))
         print(json.dumps(preparation), flush=True)
         if not prepare_only:
+            options = {}
+            if minibatch_prior:
+                options['minibatch_prior'] = True
+            if warmup_cache is not None:
+                options['warmup_cache'] = warmup_cache
+            if deterministic_joint_features:
+                options['deterministic_joint_features'] = True
             if bounded_feature_release:
-                run_diagnostic(fixture,out,budget=budget,bounded_feature_release=True,minibatch_prior=minibatch_prior)
+                run_diagnostic(fixture,out,budget=budget,bounded_feature_release=True,**options)
             elif interaction_release_ab:
                 run_diagnostic(fixture,out,budget=budget,interaction_release_ab=True)
             else:
-                run_diagnostic(fixture,out,budget=budget,minibatch_prior=minibatch_prior)
+                run_diagnostic(fixture,out,budget=budget,**options)
     except Exception as exc:
         try:
             binding_digest=hashlib.sha256(HISTORICAL_BINDING.read_bytes()).hexdigest()
@@ -840,6 +870,10 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--warmup-cache", type=Path,
+        help="Reuse a completed input-bound 500+500 TRAIN-only warmup; no repeated warmup updates")
+    parser.add_argument("--deterministic-joint-features", action="store_true",
+        help="Test joint learning on serving-mode features without dropout; all gradients/updates remain enabled")
     parser.add_argument('--minibatch-prior',action='store_true',
         help='Use the production12-track prior loss instead of single-track updates; TRAIN only')
     experiment=parser.add_mutually_exclusive_group()
@@ -850,6 +884,10 @@ def main():
     args = parser.parse_args()
     if args.minibatch_prior and args.interaction_release_ab:
         parser.error('the original interaction A/B keeps its original single-track prior')
+    if args.warmup_cache is not None and args.interaction_release_ab:
+        parser.error('the original interaction A/B cannot use a different warmup')
+    if args.deterministic_joint_features and not (args.bounded_feature_release and args.warmup_cache and args.minibatch_prior):
+        parser.error('deterministic joint feature hypothesis requires cached warmup, minibatch prior and bounded release')
     root = Path("/Volumes/CrossCutMedia/CrossCut-Training/diagnostics")
     if not args.out.is_absolute() or not args.out.resolve().is_relative_to(root):
         parser.error("output must be a new project diagnostics directory on SSD")
@@ -857,7 +895,8 @@ def main():
         parser.error("authorized SSD device does not match")
     args.out.mkdir(parents=True, exist_ok=False)
     execute_diagnostic(args.out,prepare_only=args.prepare_only,interaction_release_ab=args.interaction_release_ab,
-        bounded_feature_release=args.bounded_feature_release,minibatch_prior=args.minibatch_prior)
+        bounded_feature_release=args.bounded_feature_release,minibatch_prior=args.minibatch_prior,
+        warmup_cache=args.warmup_cache, deterministic_joint_features=args.deterministic_joint_features)
 
 
 if __name__ == "__main__":

@@ -1126,7 +1126,9 @@ def train_dynamic_crop_v3_final_fit(
                         device=active_device,
                     )
                 )
-                model.train()
+                production._set_dynamic_crop_v3_joint_feature_mode(
+                    model, schedule["dynamic_crop_v3_joint_feature_mode"]
+                )
                 loss, gradients = joint_loss_and_grad(
                     model, batch, supervision, dynamic_supervision
                 )
@@ -1332,6 +1334,7 @@ def train_dynamic_crop_v3_final_fit(
             "source_pretraining_optimizer_steps": source_steps,
             "dynamic_crop_v3_prior_pretraining_optimizer_steps": prior_steps,
             "finetune_optimizer_steps": finetune_steps,
+            "dynamic_crop_v3_joint_feature_mode": schedule["dynamic_crop_v3_joint_feature_mode"],
             "checkpoint_selection_performed": False,
             "validation_metrics_computed": False,
             "heldout_metrics_computed": False,
@@ -1920,6 +1923,10 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         )
     )
     if full_trajectory_adapter_prior:
+        if training.get("dynamic_crop_v3_joint_feature_mode") != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_joint_feature_mode"
+        ]:
+            raise DynamicCropV3FinalFitError("final-fit joint feature mode differs from frozen schedule")
         all_prior_parameter_groups = (
             *all_prior_parameter_groups,
             "context_center_sha256",

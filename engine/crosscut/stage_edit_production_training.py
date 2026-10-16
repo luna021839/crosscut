@@ -188,6 +188,21 @@ DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
     "standardized_fixed_deterministic_random_projection_separate_"
     "context_source_linear_full_trajectory_residual_v3"
 )
+DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT = (
+    "independent_warmup_cosine_cut_source_v3_full_trajectory_minibatch_"
+    "declared_joint_feature_mode_v7"
+)
+
+
+def _set_dynamic_crop_v3_joint_feature_mode(model: Any, mode: str) -> None:
+    """Choose feature noise, not gradient/parameter scope or rematerialization."""
+    if not isinstance(model, StageEditTransformerDynamicCropV3):
+        raise TypeError("v3 joint feature mode requires the v3 model")
+    if mode not in ("serving", "stochastic"):
+        raise ValueError("v3 joint feature mode must be serving or stochastic")
+    model.train(mode == "stochastic")
+
+
 DYNAMIC_CROP_V3_PRIOR_STRUCTURED_SELECTION_CONTRACT = (
     "validation_count_macro_recall_coverage_time_motion_nonregression_v1"
 )
@@ -2348,6 +2363,26 @@ class _DynamicCropV3PriorProjectionNormalizer:
     context_center: Any
     source_center: Any
     evidence: Mapping[str, Any]
+    context_centered_offset: Any = None
+    source_centered_offset: Any = None
+
+
+def _dynamic_crop_v3_centered_projection_offset(matrix: Any, center: Any, mean: Any) -> Any:
+    # The stored FP32 inputs define the affine function. Compute its small
+    # constant once, without subtracting two large FP32 values per forward.
+    offset = np.einsum(
+        "ij,j->i", np.asarray(matrix, dtype=np.float64),
+        np.asarray(center, dtype=np.float64), optimize=False,
+    ) - np.asarray(mean, dtype=np.float64)
+    return mx.array(offset.astype(np.float32))
+
+
+def _dynamic_crop_v3_centered_projection(
+    matrix: Any, embedding: Any, center: Any, mean: Any, scale: Any, offset: Any = None,
+) -> Any:
+    if offset is None:
+        offset = _dynamic_crop_v3_centered_projection_offset(matrix, center, mean)
+    return (mx.matmul(matrix, embedding - center) + offset) / scale
 
 
 def _dynamic_crop_v3_structured_prior_projection_normalizer(
@@ -2409,6 +2444,12 @@ def _dynamic_crop_v3_structured_prior_projection_normalizer(
     # Shared train-only raw-feature centers, not source-slot-specific state.
     context_center = mx.array(context_embeddings.mean(axis=0).astype(np.float32))
     source_center = mx.array(source_embeddings.mean(axis=0).astype(np.float32))
+    context_offset = _dynamic_crop_v3_centered_projection_offset(
+        context_projection_matrix, context_center, context_mean,
+    )
+    source_offset = _dynamic_crop_v3_centered_projection_offset(
+        source_projection_matrix, source_center, source_mean,
+    )
     mx.eval(context_mean, context_scale, source_mean, source_scale)
     evidence = {
         "contract": "training_track_projection_zscore_floor_1e_3_v1",
@@ -2432,6 +2473,7 @@ def _dynamic_crop_v3_structured_prior_projection_normalizer(
         "validation_labels_consumed": False,
         "heldout_labels_consumed": False,
         "fixed_input_center_contract": "shared_train_raw_feature_mean_float32_v1",
+        "projection_evaluation_contract": "center_raw_features_before_projection_fp64_constant_offset_v2",
         "context_center_sha256": _parameter_tree_sha256({"center": context_center}),
         "source_center_sha256": _parameter_tree_sha256({"center": source_center}),
     }
@@ -2443,6 +2485,8 @@ def _dynamic_crop_v3_structured_prior_projection_normalizer(
         context_center=context_center,
         source_center=source_center,
         evidence=evidence,
+        context_centered_offset=context_offset,
+        source_centered_offset=source_offset,
     )
 
 
@@ -2460,14 +2504,16 @@ def _dynamic_crop_v3_structured_prior_raw(
         + initial_snapshot["context_bias"]
         + mx.matmul(initial_snapshot["source_weight"], source_embedding - initial_snapshot["source_center"])
     )
-    context_projection = (
-        mx.matmul(context_projection_matrix, context_embedding)
-        - projection_normalizer.context_mean
-    ) / projection_normalizer.context_scale
-    source_projection = (
-        mx.matmul(source_projection_matrix, source_embedding)
-        - projection_normalizer.source_mean
-    ) / projection_normalizer.source_scale
+    context_projection = _dynamic_crop_v3_centered_projection(
+        context_projection_matrix, context_embedding, projection_normalizer.context_center,
+        projection_normalizer.context_mean, projection_normalizer.context_scale,
+        getattr(projection_normalizer, "context_centered_offset", None),
+    )
+    source_projection = _dynamic_crop_v3_centered_projection(
+        source_projection_matrix, source_embedding, projection_normalizer.source_center,
+        projection_normalizer.source_mean, projection_normalizer.source_scale,
+        getattr(projection_normalizer, "source_centered_offset", None),
+    )
     structured_residual = module(
         context_projection,
         source_projection,
@@ -3171,6 +3217,7 @@ def train_production_stage_edit(
     dynamic_crop_v3_prior_pretrain_learning_rate: float = 3.0e-4,
     dynamic_crop_v3_prior_pretrain_warmup_steps: int = 50,
     dynamic_crop_v3_prior_pretrain_batch_size: int = 12,
+    dynamic_crop_v3_joint_feature_mode: str = "serving",
     finetune_warmup_steps: int = 8,
     minimum_learning_rate_ratio: float = 0.10,
     minimum_finetune_optimizer_steps: int = 120,
@@ -3220,6 +3267,8 @@ def train_production_stage_edit(
         or not 1 <= dynamic_crop_v3_prior_pretrain_batch_size <= 64
     ):
         raise ValueError("prior minibatch size must be an integer in 1..64")
+    if dynamic_crop_v3_joint_feature_mode not in ("serving", "stochastic"):
+        raise ValueError("v3 joint feature mode must be serving or stochastic")
     if cut_pretrain_steps not in (0,) and cut_pretrain_steps < 500:
         raise ValueError("cut pretraining must be disabled or run for >= 500 steps")
     if source_pretrain_steps not in (0,) and source_pretrain_steps < 500:
@@ -4658,13 +4707,15 @@ def train_production_stage_edit(
                     and next_finetune_step
                     <= dynamic_crop_v3_prior_retention_finetune_steps
                 )
+                if dynamic_crop_v3_prior_pretrain_steps:
+                    _set_dynamic_crop_v3_joint_feature_mode(model, dynamic_crop_v3_joint_feature_mode)
+                elif not retain_dynamic_crop_v3_prior:
+                    model.train()
                 if retain_dynamic_crop_v3_prior:
                     # Match the deterministic frozen features used to fit the
                     # prior. Prediction heads have no stochastic layers.
                     for name in (*DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES, "input_dropout"):
                         getattr(model.base, name).eval()
-                else:
-                    model.train()
                 loss, gradients = loss_and_grad(
                     model, batch, supervision, dynamic_supervision
                 )
@@ -5676,8 +5727,7 @@ def train_production_stage_edit(
             "learning_rate": learning_rate,
             "learning_rate_schedule": {
                 "contract": (
-                    "independent_warmup_cosine_cut_source_v3_balanced_"
-                    "standardized_structured_prior_and_joint_retention_v6"
+                    DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT
                     if dynamic_crop_v3_prior_pretrain_steps
                     else "independent_warmup_cosine_cut_source_and_joint_"
                     "with_step_floor_v3"
@@ -5706,6 +5756,9 @@ def train_production_stage_edit(
                     dynamic_crop_v3_prior_pretrain_steps
                 ),
                 "dynamic_crop_v3_prior_pretraining_batch_size": dynamic_crop_v3_prior_pretrain_batch_size,
+                "dynamic_crop_v3_joint_feature_mode": (
+                    dynamic_crop_v3_joint_feature_mode if dynamic_crop_v3_prior_pretrain_steps else "stochastic"
+                ),
                 "dynamic_crop_v3_prior_pretraining_peak_learning_rate": (
                     dynamic_crop_v3_prior_pretrain_learning_rate
                 ),

@@ -32,6 +32,32 @@ def test_base_crop_combined_gradients_use_same_rng_and_crop_reaches_real_feature
     assert rows[support].max()>0 and not rows[~support].any()
 
 
+def test_serving_mode_features_keep_real_encoder_gradients_and_rematerialized_updates():
+    from crosscut.stage_edit_production_training import (
+        _enable_dynamic_crop_v3_activation_checkpointing, _set_dynamic_crop_v3_joint_feature_mode,
+    )
+
+    model, batch, base, dynamic, contract = fixture()
+    _enable_dynamic_crop_v3_activation_checkpointing(model)
+    _set_dynamic_crop_v3_joint_feature_mode(model, 'serving')
+    assert not model.training and not model.base.encoder.training
+    assert model.base.encoder.checkpoint
+    before = {name: tree_map(lambda value: value, model.base.parameters()[name])
+              for name in ('encoder', 'source_projection')}
+    loss, gradients, evidence = separated_loss_gradients(model, batch, base, dynamic, contract)
+    assert evidence['crop_reaches_features']
+    optimizer = optim.AdamW(learning_rate=1e-4, weight_decay=0.)
+    optimizer.update(model, gradients)
+    mx.eval(model.parameters(), optimizer.state, loss)
+    deltas = {name: norm(value) for name, value in measured_feature_delta(model, before).items()}
+    require_actual_feature_update(feature_groups(gradients), deltas)
+    _set_dynamic_crop_v3_joint_feature_mode(model, 'stochastic')
+    assert model.training and model.base.encoder.training
+    assert model.base.encoder.checkpoint
+    with pytest.raises(ValueError):
+        _set_dynamic_crop_v3_joint_feature_mode(model, 'silent-freeze')
+
+
 def test_crop_branch_stop_gradient_cannot_hide_behind_positive_base_loss_gradient():
     model,batch,base,dynamic,contract=fixture();records=[]
     original=_FixedCenteredLinear.__call__

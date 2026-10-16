@@ -469,6 +469,8 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
                         "500",
                         "--dynamic-crop-v3-prior-pretrain-batch-size",
                         "6",
+                        "--dynamic-crop-v3-joint-feature-mode",
+                        "stochastic",
                         "--dynamic-crop-v3-prior-pretrain-learning-rate",
                         "0.0003",
                         "--dynamic-crop-v3-prior-pretrain-warmup-steps",
@@ -497,6 +499,7 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
                 500, kwargs["dynamic_crop_v3_prior_pretrain_steps"]
             )
             self.assertEqual(6, kwargs["dynamic_crop_v3_prior_pretrain_batch_size"])
+            self.assertEqual("stochastic", kwargs["dynamic_crop_v3_joint_feature_mode"])
             self.assertEqual(
                 3.0e-4,
                 kwargs["dynamic_crop_v3_prior_pretrain_learning_rate"],

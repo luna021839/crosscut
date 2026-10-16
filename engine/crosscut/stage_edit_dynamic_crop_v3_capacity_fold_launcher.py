@@ -718,6 +718,8 @@ def _build_train_cli_args(
             ),
             '--dynamic-crop-v3-prior-pretrain-batch-size',
             str(PROBE_TRAINING_SCHEDULE['dynamic_crop_v3_prior_pretraining_batch_size']),
+            "--dynamic-crop-v3-joint-feature-mode",
+            PROBE_TRAINING_SCHEDULE["dynamic_crop_v3_joint_feature_mode"],
             "--dynamic-crop-version",
             "3",
         )
@@ -753,6 +755,7 @@ def _build_train_cli_args(
             "dynamic_crop_v3_prior_pretraining_warmup_steps"
         ),
         '--dynamic-crop-v3-prior-pretrain-batch-size':'dynamic_crop_v3_prior_pretraining_batch_size',
+        "--dynamic-crop-v3-joint-feature-mode": "dynamic_crop_v3_joint_feature_mode",
         "--minimum-finetune-optimizer-steps": "minimum_finetune_optimizer_steps",
         "--minimum-checkpoint-selection-finetune-steps": (
             "minimum_checkpoint_selection_finetune_steps"
@@ -1465,6 +1468,8 @@ def _validate_completed_v3_fold(
         ]
         or schedule.get('dynamic_crop_v3_prior_pretraining_batch_size')
         != PROBE_TRAINING_SCHEDULE['dynamic_crop_v3_prior_pretraining_batch_size']
+        or schedule.get("dynamic_crop_v3_joint_feature_mode")
+        != PROBE_TRAINING_SCHEDULE["dynamic_crop_v3_joint_feature_mode"]
         or schedule.get("contract")
         != PROBE_TRAINING_SCHEDULE["schedule_contract"]
         or optimization.get("minimum_finetune_optimizer_steps")

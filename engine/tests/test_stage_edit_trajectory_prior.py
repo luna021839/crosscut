@@ -28,6 +28,7 @@ from crosscut.stage_edit_production_training import (
     _dynamic_crop_v3_prior_head_snapshot,
     _dynamic_crop_v3_prior_loss_from_raw,
     _dynamic_crop_v3_prior_minibatch_loss,
+    _dynamic_crop_v3_centered_projection,
     _dynamic_crop_v3_structured_prior_head_snapshot,
     _dynamic_crop_v3_structured_prior_raw,
 )
@@ -35,12 +36,47 @@ from crosscut.stage_edit_production_training import (
 
 @unittest.skipUnless(mx is not None, 'MLX is optional')
 class TrajectoryPriorRegressionTests(unittest.TestCase):
+    def test_center_before_projection_matches_double_reference_and_merged_head(self):
+        rng = np.random.default_rng(173)
+        dimension, rank = 768, 16
+        projection = (rng.normal(size=(rank, dimension)) / np.sqrt(dimension)).astype(np.float32)
+        center = rng.normal(100., 1., dimension).astype(np.float32)
+        value = (center + rng.normal(0., .001, dimension)).astype(np.float32)
+        mean = (projection.astype(np.float64) @ center.astype(np.float64)).astype(np.float32)
+        scale = np.full(rank, .001, np.float32)
+        expected = (projection.astype(np.float64) @ value.astype(np.float64) - mean) / scale
+        actual = np.asarray(_dynamic_crop_v3_centered_projection(
+            mx.array(projection), mx.array(value), mx.array(center), mx.array(mean), mx.array(scale)))
+        old = np.asarray((mx.array(projection) @ mx.array(value) - mx.array(mean)) / mx.array(scale))
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        self.assertGreater(float(np.max(np.abs(old - expected))), .001)
+        normalizer = _DynamicCropV3PriorProjectionNormalizer(
+            context_mean=mx.array(mean), source_mean=mx.array(mean),
+            context_scale=mx.array(scale), source_scale=mx.array(scale),
+            context_center=mx.array(center), source_center=mx.array(center), evidence={})
+        initial = dict(context_weight=mx.zeros((76, dimension)), context_bias=mx.zeros(76),
+                       source_weight=mx.zeros((76, dimension)),
+                       context_center=mx.zeros(dimension), source_center=mx.zeros(dimension))
+        adapter = _DynamicCropV3StructuredPriorAdapterModule(rank)
+        adapter.context_adapter.weight = mx.array(rng.normal(0., .1, (76, rank)).astype(np.float32))
+        adapter.source_adapter.weight = mx.array(rng.normal(0., .1, (76, rank)).astype(np.float32))
+        raw = _dynamic_crop_v3_structured_prior_raw(adapter, initial, mx.array(projection),
+                                                 mx.array(projection), normalizer, mx.array(value), mx.array(value))
+        snapshot = _dynamic_crop_v3_structured_prior_head_snapshot(
+            adapter, initial, mx.array(projection), mx.array(projection), normalizer)
+        merged = _DynamicCropV3PriorHeadModule(
+            snapshot['context_weight'], snapshot['context_bias'], snapshot['source_weight'],
+            context_center=snapshot['context_center'], source_center=snapshot['source_center'])
+        np.testing.assert_allclose(np.asarray(merged(mx.array(value), mx.array(value))), np.asarray(raw),
+                                   atol=2e-4, rtol=2e-5)
+
     def test_minibatch_averages_each_original_ragged_loss_and_gradient_before_update(self):
         dimension=4;adapter=_DynamicCropV3StructuredPriorAdapterModule(2)
         initial=dict(context_weight=mx.zeros((76,dimension)),context_bias=mx.zeros(76),
             source_weight=mx.zeros((76,dimension)),context_center=mx.zeros(dimension),source_center=mx.zeros(dimension))
         normalizer=SimpleNamespace(context_mean=mx.zeros(2),source_mean=mx.zeros(2),
-            context_scale=mx.ones(2),source_scale=mx.ones(2))
+            context_scale=mx.ones(2),source_scale=mx.ones(2),
+            context_center=mx.zeros(dimension),source_center=mx.zeros(dimension))
         projection=mx.eye(dimension)[:2];contract=DynamicCropV3LossContract()
         balance=dict(count_class_weights_1_to_8=[1.]*8,motion_class_weights_static_dynamic=[1.2,.8])
         tracks=[]

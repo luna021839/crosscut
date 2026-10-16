@@ -14,13 +14,18 @@ def capture_sources(model,probes,projections,normalizer,*,check=lambda:None):
     import mlx.core as mx
     from .stage_edit_adoption_checks import native_source_raw
     from .stage_edit_dynamic_crop_head_v3 import renderer_safe_values_from_raw_v3,renderer_range_normalized_values_v3
+    from .stage_edit_production_training import _dynamic_crop_v3_centered_projection
     rows=[]
     for probe in probes:
         check()
         raw,context,source,_=native_source_raw(model,probe['batch'],probe['token_index'],probe['source_id'])
         value=renderer_range_normalized_values_v3(renderer_safe_values_from_raw_v3(raw[:32].reshape(8,4)))
-        zc=(projections[0]@context-normalizer.context_mean)/normalizer.context_scale
-        zs=(projections[1]@source-normalizer.source_mean)/normalizer.source_scale
+        zc = _dynamic_crop_v3_centered_projection(
+            projections[0], context, normalizer.context_center, normalizer.context_mean,
+            normalizer.context_scale, getattr(normalizer, 'context_centered_offset', None))
+        zs = _dynamic_crop_v3_centered_projection(
+            projections[1], source, normalizer.source_center, normalizer.source_mean,
+            normalizer.source_scale, getattr(normalizer, 'source_centered_offset', None))
         mx.eval(value,zc,zs)
         rows.append(dict(source_id=probe['source_id'],token_index=probe['token_index'],
             raw=np.array(raw),value=np.array(value),features=np.concatenate((np.asarray(zc),np.asarray(zs)))))
