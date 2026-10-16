@@ -14,6 +14,10 @@ ARRAYS=('native_indices','heads','head_observed','body','body_evidence','body_am
     'roi_readability','roi_measured','original_heads','original_observed')
 
 
+def exact_array_input(a,b):
+    return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
+
+
 @dataclass(frozen=True, eq=False)
 class PortIntent:
     source: int
@@ -39,8 +43,7 @@ class PortIntent:
         return (isinstance(other,PortIntent)
             and (self.first_native,self.final_native,self.scene.binding,self.scene.track,self.scene.role)==
                 (other.first_native,other.final_native,other.scene.binding,other.scene.track,other.scene.role)
-            and all(getattr(self.scene,n).dtype==getattr(other.scene,n).dtype
-                and np.array_equal(getattr(self.scene,n),getattr(other.scene,n)) for n in ARRAYS))
+            and all(exact_array_input(getattr(self.scene,n),getattr(other.scene,n)) for n in ARRAYS))
 
 
 def before_camera(catalogue, source, node, side, head_index):

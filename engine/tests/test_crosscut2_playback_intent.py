@@ -102,3 +102,15 @@ def test_actual_dense_source_binding_and_local_native_cut_survive_real_port_prod
     entry,exit,_,_=make(a.nodes,cats,paths,fps=30.,coalesce_static_ports=True)
     assert all(p.intent.scene.binding==str(p.source) for row in (*entry,*exit) for p in row if p.intent is not None)
     assert all(p.intent is None for row in (*entry,*exit) for p in row if not p.observation['target_pinned_before_camera'])
+
+
+def test_original_input_equality_after_hash_collision_is_bitwise_not_signed_zero_or_dtype_alias():
+    from crosscut2.playback_intent import before_camera,exact_array_input
+    a=np.array([0.,1.]);b=a.copy();b[0]=-0.
+    assert np.array_equal(a,b) and not exact_array_input(a,b)
+    assert not exact_array_input(a,a.reshape(1,2))
+    assert not exact_array_input(a,a.view(np.uint64))
+    intent=before_camera(prepared(np.array([0,30,60]))[0],0,1,1,0)
+    plus=intent.scene.heads.copy();minus=plus.copy();plus[0,0,0]=0.;minus[0,0,0]=-0.
+    x=replace(intent,scene=replace(intent.scene,heads=plus));y=replace(intent,scene=replace(intent.scene,heads=minus))
+    assert not x.same_input(y)

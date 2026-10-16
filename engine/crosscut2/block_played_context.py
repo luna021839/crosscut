@@ -16,6 +16,7 @@ from .context_port_dp import ArcRef
 from .played_context import PlayedContext,_SourceField,OBSERVATION_CONTRACT
 from .playback_blocks import BlockPool,bytes_used,flatten
 from .ordered_context import SCHEMA_SHA256
+from .playback_intent import exact_array_input
 
 
 class BlockPlayedContext(PlayedContext):
@@ -34,7 +35,7 @@ class BlockPlayedContext(PlayedContext):
         self.clock_cache=OrderedDict();self.fast=self.fallback=self.window_calls=self.cache_hits=self.identical_input_hits=0
         self.head_tables={};self.head_table_bytes=0;self.suffix_end=None;self.suffix_versions={};self.suffix_hints={}
         self._prepare_intents(native_ports,source_bindings,ordered=True)
-        self.fields=[];self.reference=[];self.base_rates=[];self.field_versions=[];versions={}
+        self.fields=[];self.reference=[];self.base_rates=[];self.reference_encoded=[];self.field_versions=[];versions={}
         kernel_started=monotonic()
         check();model.rates(np.zeros(0,np.int64),np.zeros((1,0,model.embedding_width)),np.zeros(0,np.int64),kernel=kernel)
         from .context_long_relax import relax
@@ -53,22 +54,26 @@ class BlockPlayedContext(PlayedContext):
             h.update(json.dumps(data.scopes,separators=(',',':')).encode());digest=h.digest()
             bucket=versions.setdefault((binding,digest),[]);version=None
             for old,number in bucket:
-                if old.scopes==data.scopes and all(np.array_equal(getattr(old,n),getattr(data,n)) for n in
+                if old.scopes==data.scopes and all(exact_array_input(getattr(old,n),getattr(data,n)) for n in
                         arrays):version=number;break
             if version is None:version=len(self.field_versions);bucket.append((data,version))
             self.field_versions.append(version)
             times=np.interp(np.arange(self.final),self.nodes,np.asarray(clock['source_times']))
             self.reference.append((((times*1000.)/1000.)*clock['fps']+.5).astype(np.int64))
         for s,field in enumerate(self.fields):
-            rates=[];frames=np.arange(self.final);native=self.reference[s]
+            rates=[];encoded_rows=[];frames=np.arange(self.final);native=self.reference[s]
             for camera in arcs.dense[s]:
                 check();blocks=self._compile(s,frames,native,np.asarray(camera),((),)*len(frames),
                     lambda t,n,c,field=field:field.project_ordered(t,n,c))
                 ticks,encoded,_=flatten(blocks)
                 rates.append(model.rates(ticks,encoded[None],self.ends,kernel=kernel)[0])
+                if arcs.capture_playback_inputs:
+                    encoded.setflags(write=False);encoded_rows.append(encoded)
             self.base_rates.append(np.asarray(rates))
+            self.reference_encoded.append(tuple(encoded_rows))
         self.source_table_bytes=(sum(f.bytes for f in (*self.fields,*self.intent_fields.values()))
             +sum(v.nbytes for v in self.reference+self.base_rates)
+            +sum(v.nbytes for rows in self.reference_encoded for v in rows)
             +sum(v.nbytes for v in model.parameters.values()))
         # Explicit fixed-label head table plus one destination's exact suffix
         # identities and bounded projection/relaxation temporaries.

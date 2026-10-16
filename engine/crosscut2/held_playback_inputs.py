@@ -31,7 +31,7 @@ class HeldInputs:
     stored_bytes: int
     shared_baseline_bytes: int
 
-    def sample(self,entry,exit,code,frames):
+    def sample(self,entry,exit,code,frames,*,camera_out=None):
         frames=np.asarray(frames)
         if (frames.ndim!=1 or frames.dtype.kind not in 'iu' or np.any(np.diff(frames)<=0)
                 or frames.min(initial=self.first_frame)<self.first_frame
@@ -40,13 +40,16 @@ class HeldInputs:
                 or not 0<=entry<self.allowed.shape[0] or not 0<=exit<self.allowed.shape[1]
                 or not self.allowed[entry,exit,code]):
             raise ValueError('only exact in-domain samples of an already admitted camera alternative are available')
+        camera=np.empty((len(frames),3),float) if camera_out is None else np.asarray(camera_out)
+        if camera.shape!=(len(frames),3) or camera.dtype!=np.float64 or not camera.flags.writeable:
+            raise ValueError('writable float64 camera output buffer required')
         source=self.source_of_entry[entry];at=frames-self.first_frame
         if code>=4:
             ps,qs,values=self.direct[source,code]
             p=int(np.flatnonzero(ps==entry)[0]);q=int(np.flatnonzero(qs==exit)[0])
-            camera=values[p*len(qs)+q,at].copy()
+            camera[:]=values[p*len(qs)+q,at]
         else:
-            camera=np.asarray(self.baselines[source][code,at],float).copy()
+            camera[:]=self.baselines[source][code,at]
             if self.final_frame-self.first_frame>=38:
                 ps,qs,left,right=self.patches[source,code]
                 p=int(np.flatnonzero(ps==entry)[0]);q=int(np.flatnonzero(qs==exit)[0])

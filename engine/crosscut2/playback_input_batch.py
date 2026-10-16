@@ -27,7 +27,7 @@ class InputBatch:
     def unique_count(self):return len(self.unique_first_rows)
 
 
-def pack(*,model_binding,frames,native,cameras,source_observation_handles,intent_handles):
+def pack(*,model_binding,frames,native,cameras,source_observation_handles,intent_handles,out=None):
     frames=np.asarray(frames);native=np.asarray(native);camera=np.asarray(cameras,np.float64)
     sources=np.asarray(source_observation_handles);intents=np.asarray(intent_handles);N=len(frames)
     if (not isinstance(model_binding,tuple) or len(model_binding)!=2
@@ -38,7 +38,9 @@ def pack(*,model_binding,frames,native,cameras,source_observation_handles,intent
             or sources.shape!=(N,) or sources.dtype.kind not in 'iu' or sources.min(initial=0)<0
             or intents.shape!=(N,2) or intents.dtype.kind not in 'iu' or intents.min(initial=0)<0):
         raise ValueError('frozen exact clocks/cameras and bound numeric cue/intent handles required')
-    keys=np.empty((N,8),np.uint64)
+    keys=np.empty((N,8),np.uint64) if out is None else np.asarray(out)
+    if keys.shape!=(N,8) or keys.dtype!=np.uint64 or not keys.flags.c_contiguous or not keys.flags.writeable:
+        raise ValueError('writable exact-shape packed input output buffer required')
     keys[:,0]=frames;keys[:,1]=native;keys[:,2]=sources;keys[:,3:5]=intents
     keys[:,5:]=np.ascontiguousarray(camera).view(np.uint64)
     keys.setflags(write=False)
