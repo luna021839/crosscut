@@ -10,11 +10,33 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 import time
 
 from crosscut.stage_edit_transformer import StageEditTokenSchema, StageEditTransformerConfig
+
+
+def checkpoint_layout(config,version=3):
+    if type(version) is not int:raise ValueError('an explicit Dynamic Crop checkpoint version is required')
+    if version==3:
+        from crosscut.stage_edit_dynamic_crop_head_v3 import stage_edit_dynamic_crop_v3_parameter_count, DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME
+        return stage_edit_dynamic_crop_v3_parameter_count(config),DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME
+    if version==2:
+        from crosscut.stage_edit_dynamic_crop_head_v2 import stage_edit_dynamic_crop_v2_parameter_count, DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
+        return stage_edit_dynamic_crop_v2_parameter_count(config),DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
+    raise ValueError('an explicit Dynamic Crop checkpoint version is required')
+
+
+def checkpoint_working_space(config,version=3,*,reserve_bytes=2**30,written_weight_bytes=0,followup_payload_bytes=0):
+    """Full FP32 weights,64MiB headers/reports, and an explicit free reserve."""
+    if (type(reserve_bytes) is not int or reserve_bytes<256*2**20
+            or type(written_weight_bytes) is not int or written_weight_bytes<0
+            or type(followup_payload_bytes) is not int or followup_payload_bytes<0):
+        raise ValueError('at least256MiB reserve and actual nonnegative weight progress required')
+    count,_=checkpoint_layout(config,version)
+    return reserve_bytes+64*2**20+followup_payload_bytes+max(0,count*4-written_weight_bytes)
 
 
 def training_arguments(original, prepared, schema, output):
@@ -52,10 +74,14 @@ def main():
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--ssd-device', required=True, type=int)
     p.add_argument('--train', action='store_true', help='Explicitly start the real model fit; no hidden training.')
+    p.add_argument('--workspace-reserve-mib',type=int,default=1024,
+        help='Explicit free-space reserve; full FP32 weights and64MiB metadata are budgeted separately. Minimum256.')
+    p.add_argument('--followup-payload-bytes',type=int,default=0,
+        help='Keep this explicitly calculated later render payload free throughout model fitting.')
     a = p.parse_args()
     volume = Path('/Volumes/CrossCutMedia')
     if (not volume.is_mount() or volume.stat().st_dev != a.ssd_device
-            or not a.output.is_relative_to(volume) or a.output.exists()):
+            or not a.output.resolve().is_relative_to(volume.resolve()) or a.output.exists()):
         raise OSError('one unused output on the authorized mounted SSD is required')
     original_bytes = a.original_launch.read_bytes()
     prepared_bytes = a.prepared_inputs.read_bytes()
@@ -66,20 +92,28 @@ def main():
     if schema.fingerprint != prepared['token_schema_fingerprint']:
         raise ValueError('prepared token schema changed')
     args, config = training_arguments(json.loads(original_bytes)['argv'], prepared, schema, a.output)
+    version=int(args[args.index('--dynamic-crop-version')+1]) if '--dynamic-crop-version' in args else 2
+    reserve=a.workspace_reserve_mib*2**20
+    needed=checkpoint_working_space(config,version,reserve_bytes=reserve,followup_payload_bytes=a.followup_payload_bytes)
+    parameter_count,weight_name=checkpoint_layout(config,version)
+    if a.train and shutil.disk_usage(volume).free<needed:
+        raise OSError('not enough actual FP32 checkpoint, metadata and declared workspace reserve; no output created')
     a.output.mkdir()
     receipt = dict(actual_production_training=a.train, production_activation_authorized=False,
         source_commit=subprocess.run(['git','rev-parse','HEAD'],check=True,capture_output=True,text=True).stdout.strip(),
         original_launch_sha256=hashlib.sha256(original_bytes).hexdigest(),
         prepared_inputs_sha256=hashlib.sha256(prepared_bytes).hexdigest(),
         prepared_inputs=str(a.prepared_inputs), argv=args, model_config=config.to_dict(), pid=os.getpid(),
-        limits=dict(seconds=1200, rss_bytes=7*2**30, mlx_bytes=6*2**30, minimum_free_bytes=1536*2**20))
+        storage_budget=dict(parameter_count=parameter_count,float32_weight_bytes=parameter_count*4,
+            metadata_header_allowance_bytes=64*2**20,reserve_bytes=reserve,
+            followup_payload_bytes=a.followup_payload_bytes,
+            full_capacity_and_precision_unchanged=True),
+        limits=dict(seconds=1200, rss_bytes=7*2**30, mlx_bytes=6*2**30, minimum_free_bytes=needed))
     with (a.output/'launch.json').open('x') as stream:
         json.dump(receipt, stream, indent=2)
     if not a.train:
         print(json.dumps(dict(prepared_only=True, launch=str(a.output/'launch.json'))))
         return
-    if __import__('shutil').disk_usage(volume).free < receipt['limits']['minimum_free_bytes']:
-        raise OSError('not enough bounded checkpoint/intermediate storage for this run')
     import mlx.core as mx
     import psutil
     from crosscut.stage_edit_production_train_cli import main as train
@@ -92,12 +126,24 @@ def main():
         while not done.wait(.5):
             elapsed = time.monotonic()-started
             rss, peak = process.memory_info().rss, int(mx.get_peak_memory())
-            if (not volume.is_mount() or volume.stat().st_dev != a.ssd_device
-                    or elapsed > 1200 or rss > 7*2**30 or peak > 6*2**30):
-                with (a.output/'resource-stop.json').open('w') as stream:
-                    json.dump(dict(elapsed_seconds=elapsed, rss_bytes=rss, mlx_peak_bytes=peak,
-                        actual_production_training=True, approved=False), stream)
-                os._exit(75)
+            remaining=needed;source_live=False;free=0
+            try:
+                source_live=volume.is_mount() and volume.stat().st_dev==a.ssd_device
+                weight=a.output/'checkpoint'/weight_name
+                try:written=weight.stat().st_size
+                except FileNotFoundError:written=0
+                remaining=checkpoint_working_space(config,version,reserve_bytes=reserve,written_weight_bytes=written,
+                    followup_payload_bytes=a.followup_payload_bytes)
+                free=shutil.disk_usage(volume).free
+            except OSError:source_live=False
+            if (not source_live
+                    or elapsed > 1200 or rss > 7*2**30 or peak > 6*2**30
+                    or free<remaining):
+                try:
+                    with (a.output/'resource-stop.json').open('w') as stream:
+                        json.dump(dict(elapsed_seconds=elapsed, rss_bytes=rss, mlx_peak_bytes=peak,
+                            remaining_checkpoint_space_bytes=remaining,actual_production_training=True, approved=False), stream)
+                finally:os._exit(75)
     threading.Thread(target=watch, daemon=True).start()
     result = dict(actual_production_training=True, professional_quality_approved=False)
     try:

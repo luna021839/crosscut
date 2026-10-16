@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from train_stageedit_face_corpus import training_arguments
+from train_stageedit_face_corpus import training_arguments, checkpoint_layout, checkpoint_working_space
 from crosscut.stage_edit_face_cues import schema_with_face_cues
 from crosscut.stage_edit_transformer import production_stage_edit_config
 
@@ -33,3 +33,23 @@ def test_face_run_cannot_change_the_frozen_reference_set(snapshots):
     args = ['--feature-snapshot','ref=old.json','--model-config-json',json.dumps(production_stage_edit_config().to_dict())]
     with pytest.raises(ValueError):
         training_arguments(args, dict(feature_snapshot_by_reference=snapshots), schema_with_face_cues(), Path('/new'))
+
+
+@pytest.mark.parametrize('version',[2,3])
+def test_checkpoint_space_is_full_float32_weights_plus_metadata_and_explicit_reserve(version):
+    config=production_stage_edit_config(schema_with_face_cues())
+    count,name=checkpoint_layout(config,version)
+    assert 'v'+str(version) in name
+    initial=checkpoint_working_space(config,version)
+    assert initial==2**30+64*2**20+count*4
+    assert checkpoint_working_space(config,version,written_weight_bytes=1000)==initial-1000
+    assert checkpoint_working_space(config,version,written_weight_bytes=count*4)==2**30+64*2**20
+    assert checkpoint_working_space(config,version,reserve_bytes=256*2**20)==initial-768*2**20
+    assert checkpoint_working_space(config,version,followup_payload_bytes=700_000_000)==initial+700_000_000
+    with pytest.raises(ValueError):checkpoint_working_space(config,version,followup_payload_bytes=-1)
+
+
+@pytest.mark.parametrize('reserve,written',[(0,0),(255*2**20,0),(True,0),(2**30,-1),(2**30,True)])
+def test_checkpoint_space_cannot_erase_reserve_or_invent_progress(reserve,written):
+    with pytest.raises(ValueError):
+        checkpoint_working_space(production_stage_edit_config(),reserve_bytes=reserve,written_weight_bytes=written)

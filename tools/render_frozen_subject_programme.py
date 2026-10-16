@@ -19,19 +19,21 @@ from crosscut2.grid_perception import file_identity
 from crosscut2.subject_moment_sequence import curve_digest
 
 
-def remaining_render_space(duration_seconds,written_bytes=0):
-    """One atomic destination MP4 plus1GiB reserve, not a fixed2GiB cliff.
+def remaining_render_space(duration_seconds,written_bytes=0,*,reserve_bytes=2**30):
+    """One atomic MP4 and an explicit reserve(default1GiB,min256MiB).
 
     The explicit36Mbps video maxrate,320kbps audio,48Mbit VBV and16MiB
-    container allowance estimate outstanding bytes. The reserve remains even
-    when a software fallback exceeds this estimate. No existing output or
+    container allowance estimate outstanding bytes. Hardware and software
+    encoders share the same rate/VBV bound. No existing output or
     user data is deleted to make the budget fit.
     """
     if (type(duration_seconds) not in (int,float) or not math.isfinite(duration_seconds)
             or duration_seconds<=0 or type(written_bytes) is not int or written_bytes<0):
         raise ValueError('positive render duration and observed nonnegative byte count required')
+    if type(reserve_bytes) is not int or reserve_bytes<256*2**20:
+        raise ValueError('an explicit workspace reserve of at least256MiB is required')
     payload=math.ceil(duration_seconds*(36_000_000+320_000)/8+48_000_000/8)+16*2**20
-    return 2**30+max(0,payload-written_bytes)
+    return reserve_bytes+max(0,payload-written_bytes)
 
 
 def camera_values(segment,count,fps):
@@ -123,9 +125,13 @@ def main():
     for key in ('plan','source-spec','authorized-root'):p.add_argument('--'+key,type=Path,required=True)
     p.add_argument('--ssd-device',type=int,required=True)
     p.add_argument('--expected-plan-sha256',help='Digest retained by the actual global selection, not a new post-fit plan.')
+    p.add_argument('--workspace-reserve-mib',type=int,default=1024,
+        help='Explicit workspace reserve,minimum256MiB; source/camera/quality settings are unchanged.')
     args=p.parse_args()
     root=args.authorized_root.resolve(strict=True);raw=args.plan.read_bytes();record=json.loads(raw)
     plan=render_plan_from_json(record['render_plan']);spec=json.loads(args.source_spec.read_text())
+    reserve=args.workspace_reserve_mib*2**20
+    remaining_render_space(plan.output_frame_count/plan.fps,reserve_bytes=reserve)
     if args.expected_plan_sha256 is not None and hashlib.sha256(raw).hexdigest()!=args.expected_plan_sha256:
         raise ValueError('saved plan differs from the selected immutable plan identity')
     for path in (args.plan,plan.output,*plan.sources):
@@ -141,7 +147,7 @@ def main():
         if [list(file_identity(v)) for v in plan.sources]!=identities:raise OSError('frozen source changed')
         free=shutil.disk_usage(root).free
         minimum_free=free if minimum_free is None else min(minimum_free,free)
-        required=remaining_render_space(plan.output_frame_count/plan.fps,written)
+        required=remaining_render_space(plan.output_frame_count/plan.fps,written,reserve_bytes=reserve)
         if free<required:raise OSError(f'insufficient authorized SSD working space: {free} available, {required} still required')
     check()
     if 'subject_moment_refinement_receipt' in record:
@@ -190,8 +196,8 @@ def main():
         encoder_peak_RSS_bytes=peak,codec=codec,output_frames=plan.output_frame_count,
         plan_sha256=hashlib.sha256(raw).hexdigest(),selection_repeated=False,new_source_NN=0,
         exact_camera_materialization=materialization,render_input_plan=render_input,
-        disk_space_budget=dict(reserve_bytes=2**30,observed_output_bytes=written,
-            initial_required_bytes=remaining_render_space(plan.output_frame_count/plan.fps),
+        disk_space_budget=dict(reserve_bytes=reserve,observed_output_bytes=written,
+            initial_required_bytes=remaining_render_space(plan.output_frame_count/plan.fps,reserve_bytes=reserve),
             minimum_observed_free_bytes=minimum_free,fixed_two_GiB_completion_cliff_removed=True),
         normal_speed_audio_playback_performed=False,professional_quality_approved=False)
     if plan.output.exists():

@@ -2823,7 +2823,9 @@ def render(
                 # A quality-targeted software fallback avoids wasting bits on
                 # static shots while retaining fine stage lighting, confetti,
                 # and hair detail in high-motion sections.
-                command.extend(("-preset", "slow", "-crf", "16", "-profile:v", "high"))
+                command.extend(("-preset", "slow", "-crf", "16",
+                    "-maxrate", video_maxrate, "-bufsize", video_buffer_size,
+                    "-profile:v", "high"))
             else:
                 # VideoToolbox has no CRF-equivalent quality mode. Give the
                 # hardware encoder enough headroom for dense choreography and

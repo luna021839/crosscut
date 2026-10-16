@@ -32,6 +32,14 @@ def test_render_storage_tracks_remaining_payload_and_keeps_reserve():
     assert remaining_render_space(145.4,0)==initial
 
 
+def test_explicit_workspace_reserve_does_not_change_render_payload_or_quality():
+    initial=remaining_render_space(145.4)
+    changed=remaining_render_space(145.4,reserve_bytes=256*2**20)
+    assert initial-changed==768*2**20
+    assert remaining_render_space(145.4,3*2**30,reserve_bytes=256*2**20)==256*2**20
+    with pytest.raises(ValueError,match='reserve'):remaining_render_space(145.4,reserve_bytes=0)
+
+
 @pytest.mark.parametrize('duration,written',[(float('nan'),0),(0.,0),(1.,-1),(1.,True)])
 def test_render_storage_rejects_invalid_progress_or_duration(duration,written):
     with pytest.raises(ValueError,match='render duration'):

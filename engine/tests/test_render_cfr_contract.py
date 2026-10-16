@@ -3,6 +3,8 @@ from dataclasses import replace
 from fractions import Fraction
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +17,29 @@ from crosscut.render import (RenderPlan, RenderSegment, RenderTransition, Transi
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg required')
 class RenderCFRContractTests(unittest.TestCase):
+    def test_real_software_fallback_obeys_the_same_declared_rate_budget(self):
+        from crosscut.render_process import run_observed_render
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);source=root/'source.mp4'
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=s=128x72:r=30:d=1',
+                '-f','lavfi','-i','anullsrc=r=48000:cl=mono','-c:v','libx264','-c:a','aac','-shortest',str(source)],
+                check=True,capture_output=True)
+            plan=RenderPlan((source,),(RenderSegment(0,0.,.5,0.),),0,AspectRatio.LANDSCAPE,
+                root/'fallback.mp4',width=128,height=72,fps=30.)
+            commands=[]
+            def observed(command,**kwargs):
+                commands.append(command)
+                if command[command.index('-c:v')+1]=='h264_videotoolbox':
+                    return SimpleNamespace(returncode=1,stderr='intentional fixture hardware failure')
+                self.assertEqual(command[command.index('-crf')+1],'16')
+                self.assertEqual(command[command.index('-maxrate')+1],'36M')
+                self.assertEqual(command[command.index('-bufsize')+1],'48M')
+                return run_observed_render(command,**kwargs)
+            with patch('crosscut.render_process.run_observed_render',side_effect=observed):
+                self.assertEqual(render(plan,maximum_runtime_seconds=15.),'libx264')
+            self.assertEqual(len(commands),2)
+            self.assertGreater(plan.output.stat().st_size,0)
+
     def test_short_render_clock_matrix(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
