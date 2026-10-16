@@ -9,7 +9,7 @@ from crosscut2.played_interval_utility import PlayedIntervalUtility
 from test_crosscut2_played_interval_utility import samples
 
 
-def fixture(*,clock_gap=False,missing=False,event_utility=False):
+def fixture(*,clock_gap=False,missing=False,event_utility=False,preference_weight=1.):
     nodes=np.array([0,30,60,120]);table=samples(120)
     support=table.support.copy()
     if missing:support[37:,2:6]=False
@@ -41,13 +41,14 @@ def fixture(*,clock_gap=False,missing=False,event_utility=False):
         from crosscut2.editorial_opportunities import Opportunities
         events=Opportunities(nodes,[0,1,1,0],fps=30.,families=['source'])
         events.utility[:]=1.
-    return arcs,MatchedEntryDelivery(arcs,events,event_utility=event_utility)
+    return arcs,MatchedEntryDelivery(arcs,events,event_utility=event_utility,preference_weight=preference_weight)
 
 
 @pytest.mark.parametrize('clock_gap',[False,True])
-@pytest.mark.parametrize('event_utility',[False,True])
-def test_compiled_claim_equals_raw_actual_camera_for_all_families_and_lengths(clock_gap,event_utility):
-    arcs,claim=fixture(clock_gap=clock_gap,event_utility=event_utility);allowed=np.ones((2,2,6),bool)
+@pytest.mark.parametrize(('event_utility','preference_weight'),[(False,1.),(True,1.),(True,2.)])
+def test_compiled_claim_equals_raw_actual_camera_for_all_families_and_lengths(clock_gap,event_utility,preference_weight):
+    arcs,claim=fixture(clock_gap=clock_gap,event_utility=event_utility,preference_weight=preference_weight)
+    allowed=np.ones((2,2,6),bool)
     for i,j in ((1,2),(1,3),(2,3)):
         density=np.array([.8,.8])
         direct=claim.benefits(i,j,density,allowed,direct=True)
@@ -60,6 +61,44 @@ def test_compiled_claim_equals_raw_actual_camera_for_all_families_and_lengths(cl
                 curve=camera_samples_many(arcs.entries[i][0].strip[None],arcs.exits[j][q].strip[None],
                     arcs.dense[0][0 if code>=4 else code][first:final],np.arange(final-first),code=code)[0]
                 assert compiled[0,q,code]==pytest.approx(claim.replay(i,j,0,curve,.8),abs=1e-12)
+
+
+def test_editorial_weight_changes_only_actual_benefit_not_measurements_or_static_ports():
+    _,base=fixture(missing=True,event_utility=True)
+    arcs,preferred=fixture(missing=True,event_utility=True,preference_weight=2.)
+    allowed=np.ones((2,2,6),bool);density=np.array([.8,0.])
+    np.testing.assert_allclose(preferred.benefits(1,3,density,allowed),2.*base.benefits(1,3,density,allowed))
+    assert preferred.receipt()['editorial_preference_weight']==2.
+    assert preferred.receipt()['preference_weight_is_not_measured_quality_or_confidence']
+    assert not preferred.benefits(0,3,density,allowed).any()
+    arcs,missing=fixture(missing=True,event_utility=True,preference_weight=2.)
+    arcs.entries[1][0].observation['dense_subject_context']['window'].support[:]=False
+    assert not missing.benefits(1,3,density,allowed).any()
+    _,disabled=fixture(event_utility=True,preference_weight=0.)
+    assert not disabled.benefits(1,3,density,allowed).any()
+
+
+@pytest.mark.parametrize('value',[-1.,float('inf'),float('nan'),True])
+def test_editorial_preference_rejects_invalid_weight(value):
+    from crosscut2.played_pose_port_programme import PlayedPosePortPrior
+    with pytest.raises(ValueError,match='preference'):fixture(event_utility=True,preference_weight=value)
+    with pytest.raises(ValueError,match='preference'):
+        PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True,
+            matched_event_utility=True,matched_action_preference=value)
+
+
+def test_nondefault_editorial_preference_requires_event_consumer(monkeypatch):
+    from crosscut2.played_pose_port_programme import PlayedPosePortPrior
+    with pytest.raises(ValueError,match='musical-event'):fixture(preference_weight=2.)
+    with pytest.raises(ValueError,match='musical-event'):PlayedPosePortPrior(matched_action_preference=2.)
+    prior=PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True,
+        matched_event_utility=True,matched_action_preference=2.)
+    assert prior.artifact['matched_action_editorial_preference']==2.
+    assert not prior.artifact['matched_action_preference_learned_from_references']
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused','--matched-action-preference','2'])
+    with pytest.raises(ValueError,match='musical-event'):main()
 
 
 def test_claim_uses_actual_long_hold_action_not_only_seven_frame_entry_or_duration():

@@ -328,6 +328,8 @@ def main():
         help='Explicit E6: score actual pair-bound action delivery and composed image motion over every candidate camera')
     parser.add_argument('--matched-event-utility',action='store_true',
         help='Explicit comparison: fixed musical-event value times capped actual pair/camera action coverage')
+    parser.add_argument('--matched-action-preference',type=float,default=1.,
+        help='Editorial weight for observed matched-action events, not measurement confidence; default unchanged')
     parser.add_argument('--visible-shot-duration-model',type=Path,
         help='Explicit TRAIN-only soft visible-shot duration distribution; requires E6, not app/default activation')
     parser.add_argument('--recycle-static-camera-capacity',action='store_true',
@@ -403,6 +405,9 @@ def main():
         raise ValueError('actual interval utility requires E4 and cannot silently replace a sequence model')
     if args.matched_event_utility and not args.played_interval_utility:
         raise ValueError('matched event utility requires actual played interval utility')
+    if (not math.isfinite(args.matched_action_preference) or args.matched_action_preference<0
+            or (args.matched_action_preference!=1. and not args.matched_event_utility)):
+        raise ValueError('finite nonnegative matched-action preference requires fixed musical-event utility')
     if args.visible_shot_duration_model is not None and not args.played_interval_utility:
         raise ValueError('visible-shot pacing requires the actual E6 interval consumer')
     if args.recycle_static_camera_capacity and not args.played_interval_utility:
@@ -449,7 +454,8 @@ def main():
         connection_prior=PlayedPosePortPrior(person_extents=args.person_rectangle_model is not None,
             editorial_opportunities=args.editorial_opportunity_exposure,
             played_interval_utility=args.played_interval_utility,shot_duration_model=duration_model,
-            recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility)
+            recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
+            matched_action_preference=args.matched_action_preference)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():

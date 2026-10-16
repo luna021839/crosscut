@@ -11,10 +11,16 @@ from .boundary_arc_costs import cameras,camera_samples_many
 
 
 class MatchedEntryDelivery:
-    def __init__(self,arcs,opportunities,*,event_utility=False):
+    def __init__(self,arcs,opportunities,*,event_utility=False,preference_weight=1.):
         self.arcs=arcs;self.events=opportunities;self.nodes=arcs.nodes
         self.field=arcs.played_interval_utility;self.fps=arcs.fps
         self.event_utility=bool(event_utility)
+        if (isinstance(preference_weight,(bool,np.bool_)) or not np.isscalar(preference_weight)
+                or not np.isfinite(preference_weight) or preference_weight<0):
+            raise ValueError('finite nonnegative editorial preference weight required')
+        if preference_weight!=1. and not self.event_utility:
+            raise ValueError('editorial preference weight requires fixed musical-event utility')
+        self.preference_weight=float(preference_weight)
         if self.field is None or self.field.delivery_in_base:
             raise ValueError('matched-entry benefit requires the motion-only base, not a source-content reward')
         self._nodes={};self.calls=0;self.direct_camera_rows=0;self.observed_rows=0
@@ -107,7 +113,7 @@ class MatchedEntryDelivery:
             # seconds. Actual visible delivery determines bounded coverage
             # of that event; it does not extrapolate a body through a hold.
             # Retain the actual pair/camera-dependent observation field.
-            return self.events.credit(i,density[:,None,None],exposure)
+            return self.preference_weight*self.events.credit(i,density[:,None,None],exposure)
         return exposure*density[:,None,None]
 
     def choose(self,i,j,density,cost,allowed):
@@ -131,7 +137,8 @@ class MatchedEntryDelivery:
         native=self.field.native(source,first,final,frames)
         exposure=float((delivery_amount(table,positions,np.asarray(curve)[None,frames-first])
             *(native==table.native[positions])).sum()/self.fps)
-        return float(self.events.credit(i,density,exposure) if self.event_utility else exposure*density)
+        return float(self.preference_weight*self.events.credit(i,density,exposure)
+            if self.event_utility else exposure*density)
 
     def receipt(self):
         return dict(contract='pair_bound_actual_incoming_action_interval_once_per_event_v1',
@@ -140,6 +147,8 @@ class MatchedEntryDelivery:
             target_is_actual_entry_subject=True,benefit_before_camera_argmin=True,
             source_continuation_earns_no_change_credit=True,credit_only_in_entry_episode=True,
             musical_event_utility_normalization=self.event_utility,
+            editorial_preference_weight=self.preference_weight,
+            preference_weight_is_not_measured_quality_or_confidence=True,
             event_coverage_capped_at_one=self.event_utility,
             utility_is_not_unobserved_body_persistence=True,
             no_seven_frame_extrapolation=True,no_hold_duration_extrapolation=True,

@@ -26,7 +26,7 @@ class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
-                 matched_event_utility=False):
+                 matched_event_utility=False,matched_action_preference=1.):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -45,6 +45,12 @@ class PlayedPosePortPrior:
         if matched_event_utility and not played_interval_utility:
             raise ValueError('matched event utility requires actual pair-bound interval observations')
         self.matched_event_utility=bool(matched_event_utility)
+        if (isinstance(matched_action_preference,(bool,np.bool_)) or not np.isscalar(matched_action_preference)
+                or not np.isfinite(matched_action_preference) or matched_action_preference<0):
+            raise ValueError('finite nonnegative matched-action preference required')
+        if matched_action_preference!=1. and not self.matched_event_utility:
+            raise ValueError('matched-action preference requires fixed musical-event utility')
+        self.matched_action_preference=float(matched_action_preference)
         self.source_cohort=None if source_cohort is None else tuple(source_cohort)
         if self.source_cohort is not None and (not self.source_cohort or
                 any(type(s) is not int or s<0 for s in self.source_cohort) or
@@ -152,6 +158,8 @@ class PlayedPosePortPrior:
                 paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
                 global_port_limit_per_side='four_per_source_plus_eight_unchanged')
         self.artifact['matched_musical_event_utility']=self.matched_event_utility
+        self.artifact['matched_action_editorial_preference']=self.matched_action_preference
+        self.artifact['matched_action_preference_learned_from_references']=False
         if self.matched_event_utility:
             self.artifact.update(opportunity_credit='fixed_music_event_utility_times_capped_actual_pair_camera_delivery_coverage',
                 event_coverage_unit='seven_actual_output_frame_seconds',
@@ -293,7 +301,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if played:
         from .matched_entry_delivery import MatchedEntryDelivery
         matched_delivery=MatchedEntryDelivery(arcs,opportunities,
-            event_utility=getattr(prior,'matched_event_utility',False))
+            event_utility=getattr(prior,'matched_event_utility',False),
+            preference_weight=getattr(prior,'matched_action_preference',1.))
     contextual=None
     if sequence:
         contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
