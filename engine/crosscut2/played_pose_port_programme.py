@@ -24,11 +24,20 @@ from .focal_appearance import cosine as focal_appearance_cosine
 
 class PlayedPosePortPrior:
     port_camera_prior=True
-    def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False):
+    def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
+                 shot_duration_model=None,recycle_static_capacity=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
             raise ValueError('played interval utility requires fixed events without the rejected readout objective')
+        if shot_duration_model is not None:
+            from .visible_shot_duration import Model as DurationModel
+            if not isinstance(shot_duration_model,DurationModel) or not played_interval_utility:
+                raise ValueError('an explicit TRAIN duration model requires the actual played-interval path')
+        self.shot_duration_model=shot_duration_model
+        if recycle_static_capacity and not played_interval_utility:
+            raise ValueError('recovered camera capacity requires actual interval camera scoring')
+        self.recycle_static_capacity=bool(recycle_static_capacity)
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
@@ -39,7 +48,7 @@ class PlayedPosePortPrior:
             'sequence_preference_model.py','played_context.py','context_port_dp.py','sequence_context_kernel.py',
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
-            'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py']
+            'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -107,6 +116,14 @@ class PlayedPosePortPrior:
                 complete_arc_camera_argmin_after_actual_utility=True,
                 refiner_articulated_seam_observation_used_before_source_cut_selection=True,
                 observed_image_motion_is_not_actor_or_camera_cause=True)
+        if shot_duration_model is not None:
+            self.artifact.update(visible_shot_duration_model=shot_duration_model.artifact,
+                contract='pair_bound_actual_interval_soft_visible_duration_E6_v3')
+        if recycle_static_capacity:
+            self.artifact.update(recycle_identical_static_capacity=True,
+                same_total_port_bound=True,all_old_physical_candidates_retained=True,
+                paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
+                global_port_limit_per_side='four_per_source_plus_eight_unchanged')
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
 
@@ -188,7 +205,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-        coalesce_static_ports=sequence)
+        coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -198,7 +215,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-            coalesce_static_ports=sequence)
+            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -208,6 +225,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     events=[sorted(set(map(int,xs))|set(map(int,bank['frames']))) for xs,bank in zip(source_events,native_ports)]
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
+    duration_model=getattr(prior,'shot_duration_model',None)
+    duration_costs=None if duration_model is None else duration_model.table(nodes,source_events,fps=fps)
+    duration_sources=[np.asarray([p.source for p in ports],int) for ports in entries]
     interval_utility=None
     if played:
         from .played_interval_utility import PlayedIntervalUtility
@@ -278,6 +298,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         density=entry_density.get(i,np.zeros(len(entries[i])))
         reward=(min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
             if opportunities is None else 0.)
+        if duration_costs is not None:
+            costs=costs+duration_costs[i,j,duration_sources[i]][:,None,None]
         if sequence:return costs-(potential[j]-potential[i]),allowed
         if played:
             codes=np.argmin(np.where(allowed,costs,np.inf),axis=-1)
@@ -291,6 +313,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         if arcs.last_camera_alternatives[:2]!=(i,j):
             raise AssertionError('claimed hold must consume this exact candidate camera domain')
         costs,allowed=arcs.last_camera_alternatives[2:]
+        if duration_costs is not None:
+            costs=costs+duration_costs[i,j,duration_sources[i]][:,None,None]
         density=entry_density.get(i,np.zeros(len(entries[i])))
         value,valid,codes,benefit=matched_delivery.choose(i,j,density,costs,allowed)
         return value-(potential[j]-potential[i]),valid,codes,benefit
@@ -339,6 +363,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         # camera refit, boundary shift or source choice is performed here.
         curve=arcs.replay(i,j,p,q,code);ticks=np.arange(first,final)
         cost=float(arcs.direct_cost(source,first,curve[None])[0]+fragments(i,j)[source])
+        pacing=0. if duration_costs is None else float(duration_costs[i,j,source])
         effect=(dict(observed_action_delivery_credit=0.,composed_image_motion_delta=0.,adjustment=0.)
             if interval_utility is None else interval_utility.replay(source,first,final,curve))
         density=entry_density.get(i,np.zeros(len(entries[i])))
@@ -360,7 +385,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             debt,extra=apply(transfer,debt);sequence_cost+=float(extra)
             if not math.isclose(debt,dp['selected_readout_states'][k]['exit_debt'],rel_tol=1e-8,abs_tol=1e-8):
                 raise AssertionError('selected readout exit state differs from exact camera replay')
-        cumulative+=cost-change_credit+incoming+sequence_cost+effect['adjustment']
+        cumulative+=cost+pacing-change_credit+incoming+sequence_cost+effect['adjustment']
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
         heads,indices,ambiguity,scene=focal_metadata(banks[source]['heads'],grid_camera)
         chosen_states.append(State(source,None,'boundary_arc_'+str(code)))
@@ -386,6 +411,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             camera_arc_code=int(code),camera_path_sha256=digest,per_frame_camera_count=len(curve)))
         parts.append(dict(first_frame=first,final_frame=final,source=source,
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
+                visible_shot_duration_prior=pacing,
                 measured_matched_action_change_credit=-change_credit,
                 observed_played_action_delivery_credit=(-effect['observed_action_delivery_credit']
                     if interval_utility is not None and interval_utility.delivery_in_base else 0.),
@@ -455,6 +481,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         camera_argmin_includes_actual_played_interval_utility=played,
         played_interval_utility=None if interval_utility is None else interval_utility.receipt(),
         matched_entry_action_delivery=None if matched_delivery is None else matched_delivery.receipt(),
+        visible_shot_duration_prior=None if duration_model is None else dict(
+            model_sha256=duration_model.artifact['content_sha256'],
+            references=duration_model.artifact['references'],
+            preferred_log_seconds_mean=duration_model.mean,preferred_log_seconds_scale=duration_model.scale,
+            includes_retained_native_cuts=True,table_bytes=duration_costs.nbytes,
+            hard_minimum_or_maximum_added=False,aesthetic_weight_fitted=False),
         sequence_preference_consumed=sequence,
         sequence_preference_model_sha256=None if not sequence else sequence_preference_model.artifact['content_sha256'],
         sequence_preference_context=None if contextual is None else contextual.receipt(),

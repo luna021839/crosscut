@@ -19,9 +19,11 @@ class BoundaryPort:
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
-         coalesce_static_ports=False):
+         coalesce_static_ports=False,recycle_static_capacity=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
+    coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
+    extra_count=0;pair_capacities=[]
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
     intent_cache={}
     def port(source,n,side,strip,ids,*,target_head_index=None):
@@ -62,6 +64,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 add(outgoing,port(s,n,0,before,(('static',family),)))
                 add(incoming,port(s,n,1,after,(('static',family),)))
         proposals=[]
+        capacity=min(4*S+maximum_pairs-len(incoming),4*S+maximum_pairs-len(outgoing))
+        if not maximum_pairs:capacity=0
+        pair_capacities.append(capacity if recycle_static_capacity else maximum_pairs)
         if 0<n<N-1:
             # Retrieve a physical actor pair BEFORE proposing its cameras.
             # Looking at only the native largest face loses a valid same-
@@ -125,13 +130,19 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             score-=opportunities.density(n,left_obs,right_obs,a,b,
                                 native_pair['matched_action_change_density'][ai,bi])
                         candidates.setdefault((a,b),[]).append((float(score),a,b,ha_index,hb_index,k,left,right))
+            feasibility={}
+            def feasible(option):
+                _,a,b,ha_index,hb_index,k,left,right=option
+                key=(a,b,ha_index,hb_index,k)
+                if key not in feasibility:
+                    left_obs=catalogues[a].observation(n,0,np.tile(left,(7,1)),target_head_index=ha_index)
+                    right_obs=catalogues[b].observation(n,1,np.tile(right,(7,1)),target_head_index=hb_index)
+                    feasibility[key]=bool(left_obs['target_is_displayed_focal'] and right_obs['target_is_displayed_focal'])
+                return feasibility[key]
             for a in range(S):
                 for b in range(S):
                     for option in sorted(candidates.get((a,b),()),key=lambda x:x[:6]):
-                        _,_,_,ha_index,hb_index,_,left,right=option
-                        left_obs=catalogues[a].observation(n,0,np.tile(left,(7,1)),target_head_index=ha_index)
-                        right_obs=catalogues[b].observation(n,1,np.tile(right,(7,1)),target_head_index=hb_index)
-                        if not left_obs['target_is_displayed_focal'] or not right_obs['target_is_displayed_focal']:
+                        if not feasible(option):
                             # This CAMERA option lost the proposed focal; do
                             # not quietly score another actor's pose or veto
                             # the source. Other legal camera options remain.
@@ -141,6 +152,23 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         break
             # One representative per ordered SOURCE PAIR, not a source quota.
             proposals=sorted(proposals,key=lambda x:x[:6])[:maximum_pairs]
+            if recycle_static_capacity:
+                # Identical static aliases consume DP slots but add no movie.
+                # Reuse only those freed slots for distinct, already-generated
+                # camera/subject options. Keep all old source-pair winners and
+                # every physical baseline. Never enlarge the port-work bound.
+                def physical(option):
+                    _,a,b,ha,hb,_,left,right=option
+                    return (a,b,ha,hb,*left,*right)
+                retained={physical(option) for option in proposals}
+                before=len(proposals)
+                remaining=sorted((option for options in candidates.values() for option in options),key=lambda x:x[:6])
+                for option in remaining:
+                    if len(proposals)>=capacity:break
+                    key=physical(option)
+                    if key in retained or not feasible(option):continue
+                    retained.add(key);proposals.append(option)
+                extra_count+=len(proposals)-before
             for _,a,b,ha,hb,k,ca,cb in proposals:
                 pair_id=('paired',n,a,b,ha,hb,k)
                 non_native_focal_pairs+=int(ha!=left_native[a] or hb!=right_native[b])
@@ -150,7 +178,10 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     target_head_index=hb))
         if max(len(incoming),len(outgoing))>4*S+maximum_pairs:raise AssertionError('port domain grew beyond global bound')
         entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(len(proposals))
-    return entries,exits,dense,dict(global_paired_proposal_limit_per_node=maximum_pairs,
+    return entries,exits,dense,dict(global_paired_proposal_limit_per_node=max(pair_capacities,default=maximum_pairs),
+        baseline_paired_proposal_limit_per_node=maximum_pairs,global_port_limit_per_side=4*S+maximum_pairs,
+        identical_static_capacity_recycled=bool(recycle_static_capacity),
+        additional_distinct_proposals_from_static_aliases=extra_count,
         retained_pair_counts=counts,maximum_entry_ports=max(map(len,entries)),maximum_exit_ports=max(map(len,exits)),
         paired_endpoints_kept_together=True,roll_degrees=0.,post_DP_camera_fit=False,
         paired_subject_pinned_before_camera=True,rejected_camera_focal_reassignments=rejected_reassignments,

@@ -320,6 +320,12 @@ def main():
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
     parser.add_argument('--editorial-opportunity-exposure',action='store_true',
         help='Explicit E4 trial: once-per-musical-episode actual subject exposure and readable framing deficit')
+    parser.add_argument('--played-interval-utility',action='store_true',
+        help='Explicit E6: score actual pair-bound action delivery and composed image motion over every candidate camera')
+    parser.add_argument('--visible-shot-duration-model',type=Path,
+        help='Explicit TRAIN-only soft visible-shot duration distribution; requires E6, not app/default activation')
+    parser.add_argument('--recycle-static-camera-capacity',action='store_true',
+        help='Use redundant static port slots for distinct paired crops without enlarging the total E6 port bound')
     parser.add_argument('--opportunity-subject-spec',type=Path,
         help='Explicit local source/model JSON for bounded raw observations BEFORE E4 final selection')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
@@ -382,6 +388,13 @@ def main():
         raise ValueError('one finite declared perception allowance required')
     if args.editorial_opportunity_exposure and not args.played_pose_port_camera_prior:
         raise ValueError('editorial opportunity exposure requires the actual played port-camera consumer')
+    if args.played_interval_utility and (not args.editorial_opportunity_exposure
+            or args.experimental_sequence_preference_model is not None):
+        raise ValueError('actual interval utility requires E4 and cannot silently replace a sequence model')
+    if args.visible_shot_duration_model is not None and not args.played_interval_utility:
+        raise ValueError('visible-shot pacing requires the actual E6 interval consumer')
+    if args.recycle_static_camera_capacity and not args.played_interval_utility:
+        raise ValueError('recovered static capacity requires the actual E6 interval consumer')
     if args.experimental_sequence_preference_model is not None and (
             not args.editorial_opportunity_exposure or not args.played_pose_port_camera_prior
             or args.experimental_preference_model is not None):
@@ -413,8 +426,14 @@ def main():
         connection_prior=PlayedFacePrior()
     if args.played_pose_port_camera_prior:
         from .played_pose_port_programme import PlayedPosePortPrior
+        duration_model=None
+        if args.visible_shot_duration_model is not None:
+            from .visible_shot_duration import Model as DurationModel
+            duration_model=DurationModel(json.loads(args.visible_shot_duration_model.read_text()))
         connection_prior=PlayedPosePortPrior(person_extents=args.person_rectangle_model is not None,
-            editorial_opportunities=args.editorial_opportunity_exposure)
+            editorial_opportunities=args.editorial_opportunity_exposure,
+            played_interval_utility=args.played_interval_utility,shot_duration_model=duration_model,
+            recycle_static_capacity=args.recycle_static_camera_capacity)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -570,7 +589,7 @@ def main():
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],
                     identities=[file_identity(p) for p in original.sources],
                     cache=args.cache.parent/'crosscut2-subject-opportunities-v1',
-                    authorized_root=args.cache.parent.parent,device=expected)
+                    authorized_root=args.cache.parent.parent,device=expected,image_changes=args.played_interval_utility)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,

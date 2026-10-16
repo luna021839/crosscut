@@ -89,3 +89,35 @@ def test_actor_pair_retrieval_can_find_non_native_focal_before_the_camera():
     assert pair[0].observation['target_is_displayed_focal']
     assert report['retained_pairs_using_non_native_focal']>0
     assert len(entry[1])<=4*len(catalogues)+8
+
+
+def test_redundant_static_slots_keep_distinct_paired_crops_before_interval_choice():
+    nodes,catalogues,_=prepared();paths=[]
+    for cat in catalogues:
+        cat.bank['heads'][:]=0.;cat.bank['heads'][:,:,0]=[.5,.4,.1,.99]
+        cat.bank['zoom_cap']=2.
+        paths.append([(np.array([0,53]),np.tile([z,.5,.4+.1/z],(2,1)))
+            for z in (1.,1.5,2.,2.)])
+    old_in,old_out,base,old=make(nodes,catalogues,paths,fps=30.)
+    entry,exit,other,new=make(nodes,catalogues,paths,fps=30.,recycle_static_capacity=True)
+    np.testing.assert_array_equal(base,other)
+    assert new['additional_distinct_proposals_from_static_aliases']>0
+    assert max(map(len,entry))<=16 and max(map(len,exit))<=16
+    for before,after in ((old_in,entry),(old_out,exit)):
+        for previous,current in zip(before,after):
+            physical=lambda values:{(p.source,p.geometry_hash,p.observation['head_index'],
+                p.observation['target_pinned_before_camera']) for p in values}
+            assert physical(previous)<=physical(current)
+            assert {i for p in previous for i in p.proposal_ids if i[0]=='paired'}<={
+                i for p in current for i in p.proposal_ids if i[0]=='paired'}
+    def paired_zooms(ports):
+        return {round(float(p.strip[0,0]),6) for p in ports if p.source==1
+            and any(i[0]=='paired' and i[2:4]==(0,1) for i in p.proposal_ids)}
+    assert paired_zooms(old_in[1])=={1.}
+    assert paired_zooms(entry[1])=={1.,1.5,2.}
+    for n in range(1,len(nodes)-1):
+        a={i for p in entry[n] for i in p.proposal_ids if i[0]=='paired'}
+        b={i for p in exit[n] for i in p.proposal_ids if i[0]=='paired'}
+        assert a==b
+    none,_,_,_=make(nodes,catalogues,paths,fps=30.,maximum_pairs=0,recycle_static_capacity=True)
+    assert not any(i[0]=='paired' for ports in none for p in ports for i in p.proposal_ids)
