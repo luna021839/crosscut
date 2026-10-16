@@ -20,10 +20,15 @@ from .playback_workspace import PlaybackWorkspace
 
 
 def _owned_inputs(values,exclude=()):
-    seen=set(exclude);buffers=[]
+    seen=set();buffers=[]
     def size(value):
-        if id(value) in seen:return 0
-        seen.add(id(value));used=sys.getsizeof(value)
+        identity=id(value)
+        if identity in seen:return 0
+        if isinstance(exclude,np.ndarray):
+            at=int(np.searchsorted(exclude,identity))
+            if at<len(exclude) and int(exclude[at])==identity:return 0
+        elif identity in exclude:return 0
+        seen.add(identity);used=sys.getsizeof(value)
         if isinstance(value,np.ndarray):
             buffers.append(value)
             if isinstance(value.base,np.ndarray):used+=size(value.base)
@@ -40,15 +45,20 @@ class _ProducerReservation:
         self.compiler=compiler;self.i=i;self.j=j;self.key=None;self.finalizer=None
     def __enter__(self):
         c=self.compiler;old=c.context;i,j=self.i,self.j;L=int(old.nodes[j]-old.nodes[i]);counts=[]
-        direct=0;maximum_heads=1
+        direct=0;direct_counts=[];maximum_heads=1
         for s,cat in enumerate(old.cats):
             P=sum(p.source==s for p in old.entries[i]);Q=sum(q.source==s for q in old.exits[j]);counts.append(P*Q)
             adjacent=old.arcs.opportunity_episodes is not None and old.arcs.opportunity_episodes[j]-old.arcs.opportunity_episodes[i]<=2
             whole=adjacent and L>=14 and not np.any((old.arcs.support.events[s]>old.nodes[i])&(old.arcs.support.events[s]<old.nodes[j]))
             direct+=P*Q*L*24*(int(L<38)+int(whole))
+            direct_counts.append(P*Q if L<38 or whole else 0)
             maximum_heads=max(maximum_heads,cat.bank['heads'].shape[-2])
         P=len(old.entries[i]);Q=len(old.exits[j])
-        amount=(direct+max(counts,default=0)*max(L,38)*24*(64+16*maximum_heads)
+        # Long baseline families use shared interiors plus38-frame endpoint
+        # geometry, NOT a full-length path batch. Only actual direct4/5
+        # recipes reserve full-length content/geometry scratch.
+        amount=(direct+max(direct_counts,default=0)*L*24*(64+16*maximum_heads)
+            +max(counts,default=0)*38*24*8
             +(P+Q)*4*38*24+len(old.cats)*L*8+P*Q*6*64+64*2**10)
         self.key=c.arena.workspace.claim(int(amount),'hold-producer-preflight-and-owned-inputs')
         self.finalizer=weakref.finalize(self,c.arena.workspace.release,self.key)
@@ -155,14 +165,7 @@ class _Current:
             c.live_frame_reuses+=live_hits
             missing=np.flatnonzero(~hit)
             if not len(missing):continue
-            claim=w.claim(c.projection_reservation_bytes,'ordered-projection-encoder-temporaries')
-            try:
-                used=a+missing
-                evidence=old._intent_projection(self.ref,self.frames[used],self.native[used],self.camera[used],ordered=True)
-                values=old.model.encode(evidence)
-                self.encoded[used]=values;c.projection_batches+=1;c.encoded_frames+=len(used)
-                del evidence,values
-            finally:w.release(claim)
+            c.encode_missing(self,a+missing)
         if len(self.tail_ends):self.tail=self._own_cost(self.tail_ends)
         self.lower_bound=(self.middle+self.tail) if self.long else self.tail
         suffix=int(np.searchsorted(self.frames,max(self.first,self.final-old.history_frames)))
@@ -222,10 +225,13 @@ class CompiledPlayback:
     def __init__(self,context,*,arena=None,maximum_bytes=200*2**20,label_limit=8):
         if not isinstance(context,BlockPlayedContext) or not context.arcs.capture_playback_inputs:
             raise ValueError('prepared ordered observations and opt-in captured actual playback producer required')
+        if getattr(context.model,'pointwise_frame_encoder',False) is not True:
+            raise ValueError('lossless frame tiling requires an explicit pointwise encoder contract')
         self.context=context;self.origin_decode_calls=self.hold_compilations=self.recipe_compilations=0
         self.camera_sample_calls=self.projection_batches=self.encoded_frames=self.window_evaluations=0
         self.reference_frame_reuses=self.live_frame_reuses=0;self.active_origin=None
         self.native_schedule_compilations=self.nonreference_recipes=self.maximum_producer_reservation=0
+        self.projection_tile_splits=self.maximum_projection_claim=0
         w=PlaybackWorkspace(maximum_bytes) if arena is None else arena.workspace
         expected=self.namespace(context)
         if arena is not None and (arena.namespace!=expected or arena.width!=context.model.embedding_width
@@ -235,8 +241,13 @@ class CompiledPlayback:
             raise ValueError('captured producer must retain its exact prepared baseline frame embeddings')
         owned=[context.fields,context.intent_fields,context.intents,context.reference,context.base_rates,context.reference_encoded,context.arcs.dense,
             context.model.parameters,context.source_bindings,context.model_key,context.ends,context.durations]
-        amount,buffers=_owned_inputs(owned);w.adopt_group(amount,buffers,owner='frozen-ordered-context-source-inputs')
-        self.source_buffer_ids=tuple(map(id,buffers))
+        amount,buffers=_owned_inputs(owned)
+        w.pin_frozen_inputs(amount,buffers,owner='frozen-ordered-context-source-inputs')
+        # A compact sorted numeric exclusion index, not53k Python ints/weak
+        # callbacks copied into a new set on every hold accounting pass.
+        self.source_buffer_ids=w.empty((len(buffers),),np.uint64,owner='frozen-input-allocation-index')
+        for i,value in enumerate(buffers):self.source_buffer_ids[i]=id(value)
+        self.source_buffer_ids.sort();self.source_buffer_ids.setflags(write=False)
         self.source_input_bytes=amount
         # These are recomputable caches, NOT owners of persistent suffixes.
         # Their preparation role is over; the new executor never calls them.
@@ -262,8 +273,47 @@ class CompiledPlayback:
         # at most120 rows, including both overlay intents. This conservative
         # reservation is charged before projection; it is not a RSS reading.
         self.projection_reservation_bytes=120*(64+max(1,maximum_people)*81)*8*32
-        if self.projection_reservation_bytes>32*2**20:
-            raise MemoryError('untruncated ragged projection exceeds its declared workspace; no people removed')
+
+    def projection_requirement(self,ref,native):
+        """Count actual ragged rows before allocation, including BOTH overlays.
+
+        Original projection is computed even on claimed frames, so its
+        temporaries are included too. No actor/evidence slot is truncated.
+        """
+        old=self.context;s=old.entries[ref.first][ref.entry].source
+        def units(field,ordinals):
+            data=field.ordered_static;T=len(ordinals);people=hits=0
+            if len(data.frames):
+                at=np.searchsorted(data.frames,ordinals);safe=np.minimum(at,len(data.frames)-1)
+                hit=(at<len(data.frames))&(data.frames[safe]==ordinals);hits=int(hit.sum())
+                people=int(np.diff(data.person_splits)[at[hit]].sum())
+            padding=hits*(field.heads.shape[1]*4+field.body.shape[1]*2)
+            return 64*T+81*people+4*padding
+        count=units(old.fields[s],native)
+        for port in (old.entries[ref.first][ref.entry],old.exits[ref.final][ref.exit]):
+            if port.intent is None or not port.intent.pinned:continue
+            intent=old.intents[id(port.intent)];key=old.intent_bindings[id(port.intent)]
+            active=(native>=intent.first_native)&(native<intent.final_native)
+            if active.any():count+=units(old.intent_fields[key],native[active])
+        return int(count*8*32+64*2**10)
+
+    def encode_missing(self,current,used):
+        old=self.context;w=self.arena.workspace;pending=[used]
+        while pending:
+            used=pending.pop();old.check();required=self.projection_requirement(current.ref,current.native[used])
+            if required>w.limit_bytes-w.current_bytes:
+                if len(used)<2:
+                    raise MemoryError('one complete observed frame exceeds available workspace; no people or cues removed')
+                middle=len(used)//2;pending.extend((used[middle:],used[:middle]));self.projection_tile_splits+=1
+                continue
+            claim=w.claim(required,'actual-ragged-projection-encoder-temporaries')
+            try:
+                evidence=old._intent_projection(current.ref,current.frames[used],current.native[used],current.camera[used],ordered=True)
+                values=old.model.encode(evidence)
+                current.encoded[used]=values;self.projection_batches+=1;self.encoded_frames+=len(used)
+                self.maximum_projection_claim=max(self.maximum_projection_claim,required)
+                del evidence,values
+            finally:w.release(claim)
 
     def open_origin(self,i,roots,costs):return _Origin(self,i,roots,costs)
     def reserve_hold(self,i,j):return _ProducerReservation(self,i,j)
@@ -311,6 +361,8 @@ class CompiledPlayback:
             maximum_hold_producer_preallocation_reservation=self.maximum_producer_reservation,
             window_evaluations=self.window_evaluations,source_input_bytes=self.source_input_bytes,
             projection_reservation_bytes=self.projection_reservation_bytes,
+            projection_reservation_policy='actual_ragged_rows_with_lossless_pointwise_frame_tiling',
+            projection_tile_splits=self.projection_tile_splits,maximum_actual_projection_claim=self.maximum_projection_claim,
             history_camera_or_native_reconstruction_calls=0,source_NN_calls=0,new_source_rasters=0,
             per_frame_physical_input_preserved=True,workspace=self.arena.workspace.receipt(),
             owned_suffix_state=self.arena.receipt(),normal_app_activation_approved=False,

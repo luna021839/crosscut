@@ -21,6 +21,7 @@ class PlaybackWorkspace:
         if type(limit_bytes) is not int or limit_bytes<self.bookkeeping_bytes:
             raise ValueError('explicit playback workspace including bookkeeping required')
         self.limit_bytes=limit_bytes;self._claims={};self._serial=0;self._lock=RLock()
+        self._frozen_pins=[]
         self.current_bytes=self.peak_bytes=self.bookkeeping_bytes
 
     def claim(self,amount,owner):
@@ -63,6 +64,25 @@ class PlaybackWorkspace:
         key=self.claim(amount+len(buffers)*512,owner)
         return self.pin_group(key,amount,buffers)
 
+    def pin_frozen_inputs(self,amount,buffers,*,owner):
+        """One lifetime for immutable source inputs retained for this workspace.
+
+        The workspace strongly owns the actual arrays, not a weak callback
+        for each tiny source array. This claim is NEVER discounted mid-job;
+        external small views cannot make it undercount. Only plain arrays are
+        pinned, not the context/callback graph or this workspace's own buffers.
+        """
+        buffers=tuple(buffers)
+        if (type(amount) is not int or amount<0 or not buffers
+                or any(not isinstance(value,np.ndarray) for value in buffers)):
+            raise ValueError('actual immutable prepared source inputs required')
+        key=self.claim(amount+sys.getsizeof(buffers)+1024,owner)
+        try:
+            for value in buffers:value.setflags(write=False)
+            self._frozen_pins.append(buffers)
+        except BaseException:self.release(key);raise
+        return key
+
     def pin_group(self,key,amount,buffers):
         """Convert a pre-allocation reservation to actual buffer ownership."""
         buffers=tuple(buffers)
@@ -84,5 +104,6 @@ class PlaybackWorkspace:
         with self._lock:
             return dict(limit_bytes=self.limit_bytes,current_bytes=self.current_bytes,peak_bytes=self.peak_bytes,
                 bookkeeping_reservation_bytes=self.bookkeeping_bytes,active_claims=len(self._claims),
+                immutable_source_groups_pinned_for_workspace_lifetime=len(self._frozen_pins),
                 actual_buffer_lifetime_accounted=True,whole_process_RSS_included=False,
                 owners=tuple((name,size) for size,name in self._claims.values()))

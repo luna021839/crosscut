@@ -38,6 +38,7 @@ def _compiled():
 
 
 class OrderedModel(ScalarModel):
+    pointwise_frame_encoder=True
     def __init__(self,artifact):
         payload=dict(artifact);expected=payload.pop('content_sha256',None)
         config=payload.get('window_config',{});training=payload.get('training',{})
