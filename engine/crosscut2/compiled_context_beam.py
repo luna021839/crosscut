@@ -98,13 +98,14 @@ def _compiled():
     from numba.extending import register_jitable
     for f in (_rank,_room,_place,_offer_extended,_offer_existing,_live):register_jitable(f)
     options=dict(cache=False,nogil=True,fastmath=False,parallel=False)
-    return tuple(njit(**options)(f) for f in (_offer_extended,_offer_existing,_long_batch))
+    return tuple(njit(**options)(f) for f in (_offer_extended,_offer_existing,_long_batch,_room))
 
 
 class CompiledBeam:
     def __init__(self,arena):
         self.arena=arena
-        self.extended,self.existing,self._long=(_offer_extended,_offer_existing,_long_batch) if arena.kernel=='numpy' else _compiled()
+        self.extended,self.existing,self._long,self.room=(
+            _offer_extended,_offer_existing,_long_batch,_room) if arena.kernel=='numpy' else _compiled()
         self.discarded=self.equivalent=self.rank_rejected=0
         self.long_kernel_calls=self.long_suffix_misses=0
 
@@ -120,6 +121,18 @@ class CompiledBeam:
         a=self.arena
         with a._lock:result=self.existing(fields,values,np.uint64(handle),a._roots,a._cells,a._frames)
         self._count(result)
+
+    def offer_lazy(self,fields,values,parent,current):
+        """A rejected candidate never asks current for persistent frame IDs.
+
+        Raw inputs were compiled already. Persist only after the unchanged
+        rank can enter; offer still checks exact physical-state equivalence
+        and only publishes after its successful extension.
+        """
+        a=self.arena
+        with a._lock:target=self.room(fields,(values[0],values[1],values[2],values[3],-values[4]))
+        if target<0:self._count((1,0,1,0));return
+        self.offer(fields,values,parent,current.lease)
 
     def long_batch(self,destination,values,hints,build):
         """Only a rank-viable cache miss may build a proved physical suffix.

@@ -141,7 +141,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                                                 paid=float(benefit[p,q]) if claim else 0.
                                                 outbit=(1 if bit or claim else 0) if episodes[i]==episodes[j] else 0
                                                 values=(raw-paid,count,back,code,paid,float(extra))
-                                                beam.offer(group(destination,q,outbit),values,incoming[6][p,bit,k],current.lease)
+                                                beam.offer_lazy(group(destination,q,outbit),values,incoming[6][p,bit,k],current)
                             batch=general=values=None
                     base=allowed=benefit=None
             release(incoming)

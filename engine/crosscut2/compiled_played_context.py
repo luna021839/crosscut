@@ -109,7 +109,7 @@ class _Current:
         if part not in ('full','head','tail','suffix') or (part!='full' and not self.long):
             raise ValueError('factored parts require the complete long reference-clock/local-intent proof')
         self.part=part
-        self.middle=0.;self.tail=0.;self.lower_bound=0.;self.lease=None
+        self.middle=0.;self.tail=0.;self.lower_bound=0.;self._lease=None;self._suffix=None
         if self.long:
             self.head_ends=fresh[fresh<self.first+old.history_frames+19]
             middle=fresh[(fresh>=self.first+old.history_frames+19)&(fresh<=self.final-19)]
@@ -182,10 +182,18 @@ class _Current:
         if len(self.tail_ends):self.tail=self._own_cost(self.tail_ends)
         self.lower_bound=(self.middle+self.tail) if self.long else self.tail
         if part in ('full','suffix'):
-            suffix=int(np.searchsorted(self.frames,max(self.first,self.final-old.history_frames)))
+            self._suffix=int(np.searchsorted(self.frames,max(self.first,self.final-old.history_frames)))
             # Head/tail scalar evaluation owns no suffix at all. Only a
             # candidate admitted by the existing beam creates its future state.
-            self.lease=c.arena.admit(self.keys[suffix:],self.encoded[suffix:],first=self.first)
+
+    @property
+    def lease(self):
+        if self.frames is None:raise ValueError('compiled current is closed')
+        if self._suffix is None:return None
+        if self._lease is None:
+            a=self.hold.compiler.arena;suffix=self._suffix
+            self._lease=a.admit(self.keys[suffix:],self.encoded[suffix:],first=self.first)
+        return self._lease
 
     def _own_cost(self,ends):
         old=self.hold.compiler.context
@@ -203,7 +211,8 @@ class _Current:
     def __enter__(self):return self
     def __exit__(self,*unused):self.close()
     def close(self):
-        if self.lease is not None:self.lease.close();self.lease=None
+        # Do not invoke the lazy property while closing an unselected current.
+        if self._lease is not None:self._lease.close();self._lease=None
         self.frames=self.camera=self.native=self.keys=self.encoded=None
 
 

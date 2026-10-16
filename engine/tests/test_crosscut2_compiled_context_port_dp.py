@@ -5,8 +5,12 @@ from crosscut2.boundary_arc_costs import ArcCosts
 from crosscut2.boundary_port_domain import make
 from crosscut2.compiled_played_context import CompiledPlayback
 from crosscut2.compiled_context_port_dp import solve as compiled_solve
+from crosscut2.compiled_context_beam import CompiledBeam
+from crosscut2.playback_suffix_arena import PlaybackSuffixArena
 from crosscut2.context_port_dp import solve as reference_solve,ArcRef
 from test_crosscut2_ordered_preference_consumer import ordered_fixture
+from test_crosscut2_playback_suffix_arena import descriptor
+from test_crosscut2_compiled_context_beam import fields
 
 
 def fixture(nodes,*,kernel='numpy',nonlinear=False):
@@ -127,6 +131,37 @@ def test_cancelled_search_releases_pending_future_roots_current_origin_and_curre
 def test_legacy_non_captured_context_cannot_silently_enter_new_executor():
     context=ordered_fixture(np.array([0,18,36]))
     with pytest.raises(ValueError,match='captured actual playback producer'):CompiledPlayback(context)
+
+
+@pytest.mark.parametrize('kernel',['numpy','numba'])
+def test_actual_general_current_compiles_but_cannot_demand_persistent_frames_before_beam_rank(kernel,monkeypatch):
+    context,old=fixture(np.array([0,18,36]),kernel=kernel);old.arena.close()
+    a=PlaybackSuffixArena(namespace=CompiledPlayback.namespace(context),embedding_width=2,history_frames=120,
+        frame_capacity=96,cell_capacity=32,root_capacity=20,kernel=kernel)
+    c=CompiledPlayback(context,arena=a);empty=a.empty();kept=[];beam=CompiledBeam(a);state=fields()
+    for variant in range(8):
+        with descriptor(a,0,12,lambda keys,v=variant:keys.__setitem__((slice(None),2),v+100)) as current:
+            root=a.append(empty,current);kept.append(root)
+        beam.cut(state,(float(variant+1),0,variant,0,0.,0.),root.handle)
+    assert a.receipt()['tables']['frames']['live']==96
+    P=len(context.entries[0]);ids=np.zeros((P,2,8),np.uint64);costs=np.full(ids.shape,np.inf)
+    ids[0,0,0]=empty.handle;costs[0,0,0]=0.
+    with c.open_origin(0,ids,costs):
+        base,allowed=context.arcs.camera_alternatives(0,1)
+        p,q,code=map(int,next(v for v in np.argwhere(allowed) if v[0]==0 and v[2]==4))
+        with c.compile_hold(0,1,base,allowed) as hold:
+            before=a.receipt()['tables']['frames']['requests'];snapshot=tuple(v.copy() for v in state)
+            with hold.current(p,q,code) as current:
+                assert current._lease is None and len(current.keys)==18
+                def forbidden(*unused,**kwargs):raise AssertionError('rejected candidate persisted before rank')
+                monkeypatch.setattr(a,'admit',forbidden)
+                beam.offer_lazy(state,(100.,0,0,code,0.,.1),empty.handle,current)
+                assert current._lease is None
+            assert a.receipt()['tables']['frames']['requests']==before
+            for actual,expected in zip(state,snapshot):np.testing.assert_array_equal(actual,expected)
+    for handle in state[6]:a.release(type(empty)(a.owner,int(handle)))
+    for root in kept:a.release(root)
+    a.release(empty);a.close()
 
 
 def test_compiled_actual_make_secondary_target_and_its_missing_face_gap_do_not_revert_to_native_focal():
