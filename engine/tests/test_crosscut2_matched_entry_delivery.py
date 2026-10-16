@@ -9,7 +9,7 @@ from crosscut2.played_interval_utility import PlayedIntervalUtility
 from test_crosscut2_played_interval_utility import samples
 
 
-def fixture(*,clock_gap=False,missing=False):
+def fixture(*,clock_gap=False,missing=False,event_utility=False):
     nodes=np.array([0,30,60,120]);table=samples(120)
     support=table.support.copy()
     if missing:support[37:,2:6]=False
@@ -37,12 +37,17 @@ def fixture(*,clock_gap=False,missing=False):
         dense=[np.array([np.tile([z,.5,.5],(120,1)) for z in (1.,1.15,1.3,1.4)])],
         cats=[SimpleNamespace(bank=dict(zoom_cap=1.4))],played_interval_utility=field)
     events=SimpleNamespace(episodes=np.array([0,1,1,2]),boundaries=np.array([0,30,120]))
-    return arcs,MatchedEntryDelivery(arcs,events)
+    if event_utility:
+        from crosscut2.editorial_opportunities import Opportunities
+        events=Opportunities(nodes,[0,1,1,0],fps=30.,families=['source'])
+        events.utility[:]=1.
+    return arcs,MatchedEntryDelivery(arcs,events,event_utility=event_utility)
 
 
 @pytest.mark.parametrize('clock_gap',[False,True])
-def test_compiled_claim_equals_raw_actual_camera_for_all_families_and_lengths(clock_gap):
-    arcs,claim=fixture(clock_gap=clock_gap);allowed=np.ones((2,2,6),bool)
+@pytest.mark.parametrize('event_utility',[False,True])
+def test_compiled_claim_equals_raw_actual_camera_for_all_families_and_lengths(clock_gap,event_utility):
+    arcs,claim=fixture(clock_gap=clock_gap,event_utility=event_utility);allowed=np.ones((2,2,6),bool)
     for i,j in ((1,2),(1,3),(2,3)):
         density=np.array([.8,.8])
         direct=claim.benefits(i,j,density,allowed,direct=True)
@@ -73,6 +78,34 @@ def test_current_episode_clips_benefit_even_if_entry_track_continues():
     claim.events.episodes=np.array([0,1,2,3])
     benefit=claim.benefits(1,3,np.array([1.,0.]),np.ones((2,2,6),bool))
     assert benefit.max()<=15/30.+1e-12
+
+
+def test_event_value_uses_actual_coverage_but_never_creates_unobserved_body_persistence():
+    arcs,claim=fixture(missing=True,event_utility=True)
+    allowed=np.ones((2,2,6),bool);density=np.array([.8,0.])
+    benefits=claim.benefits(1,3,density,allowed)
+    _,old=fixture(missing=True)
+    seconds_reward=old.benefits(1,3,density,allowed)
+    # Same actual seven-frame strip; only the fixed musical EVENT unit
+    # differs. A longer observation window is not required to value a cut.
+    np.testing.assert_allclose(benefits,seconds_reward*(3./(7./30.)))
+    assert benefits.max()<=3.*.8 and not benefits[1].any()
+    assert not claim.benefits(0,3,density,allowed).any()
+    # Neither long holds nor extra camera variants can exceed this one
+    # episode's fixed raw utility. Entirely missing incoming arms earn0.
+    _,complete=fixture(event_utility=True)
+    assert complete.benefits(1,3,density,allowed).max()<=3.*.8
+    arcs,missing=fixture(missing=True,event_utility=True)
+    arcs.entries[1][0].observation['dense_subject_context']['window'].support[:]=False
+    assert not missing.benefits(1,3,density,allowed).any()
+
+
+def test_event_normalization_is_explicit_and_requires_actual_interval_consumer():
+    from crosscut2.played_pose_port_programme import PlayedPosePortPrior
+    with pytest.raises(ValueError,match='actual pair-bound interval'):PlayedPosePortPrior(matched_event_utility=True)
+    prior=PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True,matched_event_utility=True)
+    assert prior.artifact['matched_musical_event_utility']
+    assert not PlayedPosePortPrior().artifact['matched_musical_event_utility']
 
 
 def test_claim_camera_argmin_can_differ_from_base_camera_and_replay_is_frozen():

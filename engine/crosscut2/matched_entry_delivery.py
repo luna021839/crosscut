@@ -11,9 +11,10 @@ from .boundary_arc_costs import cameras,camera_samples_many
 
 
 class MatchedEntryDelivery:
-    def __init__(self,arcs,opportunities):
+    def __init__(self,arcs,opportunities,*,event_utility=False):
         self.arcs=arcs;self.events=opportunities;self.nodes=arcs.nodes
         self.field=arcs.played_interval_utility;self.fps=arcs.fps
+        self.event_utility=bool(event_utility)
         if self.field is None or self.field.delivery_in_base:
             raise ValueError('matched-entry benefit requires the motion-only base, not a source-content reward')
         self._nodes={};self.calls=0;self.direct_camera_rows=0;self.observed_rows=0
@@ -100,7 +101,14 @@ class MatchedEntryDelivery:
                 self.direct_camera_rows+=len(qs)*len(positions)
         # Cancellation of a compiled prefix can leave roundoff below zero;
         # this is not manufactured exposure and never changes a positive row.
-        return np.maximum(0.,result)*density[:,None,None]
+        exposure=np.maximum(0.,result)
+        if self.event_utility:
+            # A matched edit is a fixed musical EVENT, not source-content
+            # seconds. Actual visible delivery determines bounded coverage
+            # of that event; it does not extrapolate a body through a hold.
+            # Retain the actual pair/camera-dependent observation field.
+            return self.events.credit(i,density[:,None,None],exposure)
+        return exposure*density[:,None,None]
 
     def choose(self,i,j,density,cost,allowed):
         benefit=self.benefits(i,j,density,allowed)
@@ -121,8 +129,9 @@ class MatchedEntryDelivery:
         if not len(positions):return 0.
         frames=table.frames[positions];source=self.arcs.entries[i][p].source
         native=self.field.native(source,first,final,frames)
-        return float((delivery_amount(table,positions,np.asarray(curve)[None,frames-first])
-            *(native==table.native[positions])).sum()/self.fps*density)
+        exposure=float((delivery_amount(table,positions,np.asarray(curve)[None,frames-first])
+            *(native==table.native[positions])).sum()/self.fps)
+        return float(self.events.credit(i,density,exposure) if self.event_utility else exposure*density)
 
     def receipt(self):
         return dict(contract='pair_bound_actual_incoming_action_interval_once_per_event_v1',
@@ -130,6 +139,9 @@ class MatchedEntryDelivery:
             candidate_calls=self.calls,direct_camera_rows=self.direct_camera_rows,
             target_is_actual_entry_subject=True,benefit_before_camera_argmin=True,
             source_continuation_earns_no_change_credit=True,credit_only_in_entry_episode=True,
+            musical_event_utility_normalization=self.event_utility,
+            event_coverage_capped_at_one=self.event_utility,
+            utility_is_not_unobserved_body_persistence=True,
             no_seven_frame_extrapolation=True,no_hold_duration_extrapolation=True,
             no_new_source_analysis=True,no_cut_quota_or_maximum_hold=True,
             professional_quality_approved=False)

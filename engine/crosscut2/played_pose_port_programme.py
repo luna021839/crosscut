@@ -25,7 +25,8 @@ from .focal_appearance import cosine as focal_appearance_cosine
 class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
-                 shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None):
+                 shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
+                 matched_event_utility=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -41,6 +42,9 @@ class PlayedPosePortPrior:
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
+        if matched_event_utility and not played_interval_utility:
+            raise ValueError('matched event utility requires actual pair-bound interval observations')
+        self.matched_event_utility=bool(matched_event_utility)
         self.source_cohort=None if source_cohort is None else tuple(source_cohort)
         if self.source_cohort is not None and (not self.source_cohort or
                 any(type(s) is not int or s<0 for s in self.source_cohort) or
@@ -147,6 +151,11 @@ class PlayedPosePortPrior:
                 same_total_port_bound=True,all_old_physical_candidates_retained=True,
                 paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
                 global_port_limit_per_side='four_per_source_plus_eight_unchanged')
+        self.artifact['matched_musical_event_utility']=self.matched_event_utility
+        if self.matched_event_utility:
+            self.artifact.update(opportunity_credit='fixed_music_event_utility_times_capped_actual_pair_camera_delivery_coverage',
+                event_coverage_unit='seven_actual_output_frame_seconds',
+                unobserved_body_persistence_rewarded=False)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
 
@@ -283,7 +292,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     matched_delivery=None
     if played:
         from .matched_entry_delivery import MatchedEntryDelivery
-        matched_delivery=MatchedEntryDelivery(arcs,opportunities)
+        matched_delivery=MatchedEntryDelivery(arcs,opportunities,
+            event_utility=getattr(prior,'matched_event_utility',False))
     contextual=None
     if sequence:
         contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
