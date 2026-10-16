@@ -15,7 +15,7 @@ from .spooled_playback_arena import SpooledPlaybackArena
 
 def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,credit,
           history_frames,label_limit=8,minimum_frames=12,check=lambda:None,
-          start_allowed=None,final_cost=None,final_allowed=None):
+          start_allowed=None,final_cost=None,final_allowed=None,precompile_rank_bound=True):
     nodes=np.asarray(nodes);episodes=np.asarray(episodes)
     arena=getattr(compiler,'arena',None)
     if (nodes.ndim!=1 or len(nodes)<2 or nodes.dtype.kind not in 'iu' or nodes[0]!=0
@@ -24,6 +24,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
             or type(history_frames) is not int or history_frames<1
             or type(label_limit) is not int or not 1<=label_limit<=32
             or type(minimum_frames) is not int or minimum_frames<1
+            or type(precompile_rank_bound) is not bool
             or not callable(credit) or not isinstance(arena,(PlaybackSuffixArena,SpooledPlaybackArena)) or arena.H!=history_frames):
         raise ValueError('ordered nodes/episodes and an owned exact playback compiler required')
     N=len(nodes);entries=_ports(entries,N,'entry');exits=_ports(exits,N,'exit')
@@ -40,6 +41,8 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
         fields.append(array)
     arrays=sum(a.nbytes for a in fields);hold_calls=cut_calls=cameras=batches=evaluations=bound_rejected=0
     origin_banks=0
+    precompile_skipped=0
+    use_precompile_bound=precompile_rank_bound and getattr(compiler,'proved_nonnegative_context',False) is True
 
     def state(side,n,size):return tuple(f[side,n*W:n*W+size] for f in fields)
     def group(state,p,bit):return tuple(f[p,bit] for f in state)
@@ -97,10 +100,21 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                             raise ValueError('actual finite nonnegative once-only opportunity credit required')
                         producer.observe(base,allowed,benefit)
                         hold_calls+=1;cameras+=int(allowed.sum());destination=state(1,j,len(exits[j]))
+                        work_allowed=allowed
+                        if use_precompile_bound:
+                            from .context_compile_bound import viable
+                            work_allowed=viable(base,allowed,incoming[0],incoming[1],benefit,destination,
+                                same_episode=episodes[i]==episodes[j],origin=i,width=W,
+                                workspace=workspace,kernel=arena.kernel)
+                            precompile_skipped+=int(allowed.sum())-int(work_allowed.sum())
                         with compiler.compile_hold(i,j,base,allowed) as hold:
-                            general=allowed;batch=None
+                            if use_precompile_bound and callable(getattr(compiler,'filter_current_domain',None)):
+                                tighter=compiler.filter_current_domain(hold,base,work_allowed,incoming[0],incoming[1],benefit,destination,
+                                    same_episode=episodes[i]==episodes[j],width=W)
+                                precompile_skipped+=int(work_allowed.sum())-int(tighter.sum());work_allowed=tighter
+                            general=work_allowed;batch=None
                             if callable(getattr(compiler,'long_candidates',None)):
-                                batch=compiler.long_candidates(hold,bank,base,allowed,incoming[0],incoming[1],benefit,
+                                batch=compiler.long_candidates(hold,bank,base,work_allowed,incoming[0],incoming[1],benefit,
                                     same_episode=episodes[i]==episodes[j],width=W)
                             if batch is not None:
                                 handled,values=batch
@@ -109,7 +123,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                                         return arena.append(SuffixRoot(arena.owner,int(incoming[6][p,bit,slot])),current.lease)
                                 beam.long_batch(destination,values,compiler.long_roots[j],build_suffix)
                                 general=workspace.empty(allowed.shape,bool,owner='unfactored-current-camera-domain')
-                                general[:]=allowed;general[:,:,:4]&=~handled
+                                general[:]=work_allowed;general[:,:,:4]&=~handled
                                 batch=handled=values=None
                             for p,q,code in zip(*np.nonzero(general)):
                                 p,q,code=map(int,(p,q,code))
@@ -144,7 +158,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                                                 outbit=(1 if bit or claim else 0) if episodes[i]==episodes[j] else 0
                                                 values=(raw-paid,count,back,code,paid,float(extra))
                                                 beam.offer_lazy(group(destination,q,outbit),values,incoming[6][p,bit,k],current)
-                            batch=general=values=None
+                            batch=general=values=work_allowed=None
                     base=allowed=benefit=None
             release(incoming)
         last=state(1,N-1,len(exits[-1]));total=np.where(finish[:,None,None],last[0]+final[:,None,None],np.inf)
@@ -169,6 +183,8 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
             labels_discarded_by_bound_events=beam.discarded,equivalent_histories_merged=beam.equivalent,
             expensive_history_keys_skipped_by_existing_beam_rank=beam.rank_rejected,
             prefix_context_evaluations_skipped_by_explicit_lower_bound=bound_rejected,
+            camera_recipes_skipped_before_compile_by_proved_rank=precompile_skipped,
+            nonnegative_precompile_rank_bound_enabled=use_precompile_bound,
             finalized_origin_banks_decoded=origin_banks,history_frames=history_frames,
             factored_long_beam_kernel_calls=beam.long_kernel_calls,
             factored_long_rank_viable_suffix_compilations=beam.long_suffix_misses,

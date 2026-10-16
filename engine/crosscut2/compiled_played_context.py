@@ -229,9 +229,27 @@ class _Hold:
             raise ValueError('current frozen actual-camera/clock hold does not match the scored domain')
         self.reference_clock={s:np.array_equal(ni,old.reference[s][self.first:self.final]) for s,ni in self.inputs.native.items()}
         self.suffix_keys=self.suffix_values=self.suffix_ready=None
+        self.proved_long_domain=self.long_middle=None
         compiler.hold_compilations+=1
         compiler.native_schedule_compilations+=len(self.inputs.native)
     def current(self,p,q,code,*,part='full'):return _Current(self,p,q,code,part)
+    def prepare_long(self):
+        old=self.compiler.context
+        if self.final-self.first<old.history_frames+38:return False
+        if self.proved_long_domain is not None:return True
+        P=len(old.entries[self.i]);Q=len(old.exits[self.j]);w=self.compiler.arena.workspace
+        proof=w.empty((P,Q,4),bool,owner='current-hold-reference-local-intent-proof');proof[:]=True
+        for p,port in enumerate(old.entries[self.i]):
+            proof[p]&=(self.reference_clock.get(port.source,False) and old._port_local(port,self.first,self.final,0))
+        for q,port in enumerate(old.exits[self.j]):proof[:,q]&=old._port_local(port,self.first,self.final,1)
+        middle=w.empty((P,4),np.float64,owner='proved-long-middle-costs');middle[:]=0.
+        ends=old.ends[(old.ends>=self.first+old.history_frames+19)&(old.ends<=self.final-19)]
+        at=np.searchsorted(old.ends,ends)
+        for s in range(len(old.cats)):
+            ps=[p for p,port in enumerate(old.entries[self.i]) if port.source==s]
+            if ps:
+                for code in range(4):middle[ps,code]=(old.base_rates[s][code,at]*old.durations[at]).sum()
+        self.proved_long_domain=proof;self.long_middle=middle;return True
     def cached_suffix(self,q,code):
         if self.suffix_ready is not None and self.suffix_ready[q,code]:
             keys=self.suffix_keys[q,code];values=self.suffix_values[q,code]
@@ -255,6 +273,7 @@ class _Hold:
         self.compiler.context.arcs.last_camera_alternatives=None
         self.compiler.context.arcs.last_codes=None
         self.inputs=self.suffix_keys=self.suffix_values=self.suffix_ready=None
+        self.proved_long_domain=self.long_middle=None
 
 
 class CompiledPlayback:
@@ -272,6 +291,11 @@ class CompiledPlayback:
         if getattr(context.model,'pointwise_frame_encoder',False) is not True:
             raise ValueError('lossless frame tiling requires an explicit pointwise encoder contract')
         self.context=context;self.origin_decode_calls=self.hold_compilations=self.recipe_compilations=0
+        # Every exact context increment is a positive-duration sum of this
+        # specific softplus rates implementation. Unknown/overridden temporal
+        # models do NOT inherit a zero bound merely through a class flag.
+        from .ordered_preference_model import OrderedModel
+        self._nonnegative_rate_function=OrderedModel.rates
         self.camera_sample_calls=self.projection_batches=self.encoded_frames=self.window_evaluations=0
         self.reference_frame_reuses=self.live_frame_reuses=0;self.active_origin=None
         self.native_schedule_compilations=self.nonreference_recipes=self.maximum_producer_reservation=0
@@ -342,12 +366,10 @@ class CompiledPlayback:
         clocks stay in the general path. No camera alternatives are removed.
         """
         old=self.context;first,final=hold.first,hold.final
-        if final-first<old.history_frames+38:return None
+        if not hold.prepare_long():return None
         w=self.arena.workspace;P,Q=allowed.shape[:2];L=in_cost.shape[-1]
         handled=w.empty((P,Q,4),bool,owner='proved-long-baseline-domain');handled[:]=allowed[:,:,:4]
-        for p,port in enumerate(old.entries[hold.i]):
-            handled[p]&=(hold.reference_clock.get(port.source,False) and old._port_local(port,first,final,0))
-        for q,port in enumerate(old.exits[hold.j]):handled[:,q]&=old._port_local(port,first,final,1)
+        handled&=hold.proved_long_domain
         if not handled.any():return None
         for p,code in zip(*np.nonzero(handled.any(axis=1))):
             p,code=int(p),int(code)
@@ -357,14 +379,8 @@ class CompiledPlayback:
                 for bit in (0,1):
                     slots=np.flatnonzero(bank.present[p,bit]&np.isnan(bank.head[p,bit,:,code]))
                     if len(slots):self.score(bank,current,p,bit,slots)
-        middle=w.empty((P,4),np.float64,owner='proved-long-middle-costs');middle[:]=0.
+        middle=hold.long_middle
         tail=w.empty((Q,4),np.float64,owner='proved-long-current-tails');tail[:]=0.
-        ends=old.ends[(old.ends>=first+old.history_frames+19)&(old.ends<=final-19)]
-        at=np.searchsorted(old.ends,ends)
-        for s in range(len(old.cats)):
-            ps=[p for p,port in enumerate(old.entries[hold.i]) if port.source==s]
-            if ps:
-                for code in range(4):middle[ps,code]=(old.base_rates[s][code,at]*old.durations[at]).sum()
         for q,code in zip(*np.nonzero(handled.any(axis=0))):
             q,code=int(q),int(code)
             if np.isnan(self.long_tail[hold.j,q,code]):
@@ -424,6 +440,28 @@ class CompiledPlayback:
             finally:w.release(claim)
 
     def open_origin(self,i,roots,costs):return _Origin(self,i,roots,costs)
+    def filter_current_domain(self,hold,base,allowed,in_cost,in_cuts,benefit,destination,*,same_episode,width):
+        """Called only after the solver checks the nonnegative-rate proof.
+
+        For exactly the EXISTING long/reference/local-intent identity,
+        (head+middle)+tail >= middle with the original FP operations. The
+        prepared middle is itself the exact old sum, not a reassociated prefix
+        sum or fitted aesthetic threshold. Other recipes retain zero bounds.
+        """
+        if not hold.prepare_long():return allowed
+        from .context_compile_bound import viable
+        floors=self.arena.workspace.empty(allowed.shape,np.float64,owner='proved-current-context-lower-bounds');floors[:]=0.
+        np.multiply(hold.long_middle[:,None,:],hold.proved_long_domain,out=floors[:,:,:4])
+        return viable(base,allowed,in_cost,in_cuts,benefit,destination,same_episode=same_episode,
+            origin=hold.i,width=width,workspace=self.arena.workspace,kernel=self.arena.kernel,floors=floors)
+
+    @property
+    def proved_nonnegative_context(self):
+        old=self.context
+        return (getattr(old.model.rates,'__func__',None) is self._nonnegative_rate_function
+            and bool(np.isfinite(old.durations).all() and np.all(old.durations>=0.))
+            and all(np.isfinite(row).all() and np.all(row>=0.) for row in old.base_rates))
+
     def producer_requirement(self,i,j):
         """Same preallocation bound for runtime and all-domain preflight.
 
@@ -495,6 +533,7 @@ class CompiledPlayback:
         return dict(contract='pre_history_compiled_actual_hold_ordered_context_v1',
             origin_prefix_banks_decoded=self.origin_decode_calls,holds_compiled=self.hold_compilations,
             current_recipes_compiled=self.recipe_compilations,held_camera_samples=self.camera_sample_calls,
+            proved_nonnegative_context_increment=self.proved_nonnegative_context,
             projection_batches=self.projection_batches,frames_encoded=self.encoded_frames,
             exact_reference_frame_reuses=self.reference_frame_reuses,exact_live_frame_reuses=self.live_frame_reuses,
             native_schedule_compilations=self.native_schedule_compilations,nonreference_recipes=self.nonreference_recipes,
