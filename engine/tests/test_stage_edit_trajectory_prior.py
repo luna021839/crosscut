@@ -5,6 +5,7 @@ These are isolated gradient/merge tests, not production quality evidence.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 import numpy as np
 try:
     import mlx.core as mx
@@ -26,6 +27,7 @@ from crosscut.stage_edit_production_training import (
     _DynamicCropV3PriorProjectionNormalizer,
     _dynamic_crop_v3_prior_head_snapshot,
     _dynamic_crop_v3_prior_loss_from_raw,
+    _dynamic_crop_v3_prior_minibatch_loss,
     _dynamic_crop_v3_structured_prior_head_snapshot,
     _dynamic_crop_v3_structured_prior_raw,
 )
@@ -33,6 +35,34 @@ from crosscut.stage_edit_production_training import (
 
 @unittest.skipUnless(mx is not None, 'MLX is optional')
 class TrajectoryPriorRegressionTests(unittest.TestCase):
+    def test_minibatch_averages_each_original_ragged_loss_and_gradient_before_update(self):
+        dimension=4;adapter=_DynamicCropV3StructuredPriorAdapterModule(2)
+        initial=dict(context_weight=mx.zeros((76,dimension)),context_bias=mx.zeros(76),
+            source_weight=mx.zeros((76,dimension)),context_center=mx.zeros(dimension),source_center=mx.zeros(dimension))
+        normalizer=SimpleNamespace(context_mean=mx.zeros(2),source_mean=mx.zeros(2),
+            context_scale=mx.ones(2),source_scale=mx.ones(2))
+        projection=mx.eye(dimension)[:2];contract=DynamicCropV3LossContract()
+        balance=dict(count_class_weights_1_to_8=[1.]*8,motion_class_weights_static_dynamic=[1.2,.8])
+        tracks=[]
+        for count,masked in ((1,False),(3,True)):
+            values=np.asarray(renderer_safe_values_from_raw_v3(mx.full((count,4),.1)))
+            tracks.append(SimpleNamespace(context_embedding=np.array([.2,.1,0.,0.]),
+                source_embedding=np.array([-.1,.3,0.,0.]),values=values,
+                normalized_times=np.arange(count)/count,motion_label='dynamic',motion_label_loss_masked=masked))
+        def loss(module,batch):return _dynamic_crop_v3_prior_minibatch_loss(module,batch,initial,
+            projection,projection,normalizer,contract,balance)
+        total,parts=loss(adapter,tracks)
+        individual=[loss(adapter,[t])[1] for t in tracks]
+        for key in parts:
+            self.assertAlmostEqual(float(parts[key].item()),sum(float(v[key].item()) for v in individual)/2,places=6)
+        fn=nn.value_and_grad(adapter,lambda m,batch:loss(m,batch)[0])
+        _,combined=fn(adapter,tracks);single=[fn(adapter,[t])[1] for t in tracks]
+        for name in combined:
+            for leaf in combined[name]:
+                np.testing.assert_allclose(np.asarray(combined[name][leaf]),
+                    (np.asarray(single[0][name][leaf])+np.asarray(single[1][name][leaf]))/2,atol=1e-6)
+        self.assertTrue(np.isfinite(float(total.item())))
+
     def test_value_gradients_learn_source_conditioned_moving_path_and_merge_exactly(self):
         # Small dimension only isolates the same production prior functions.
         config = StageEditTransformerConfig.from_schema(
@@ -56,7 +86,8 @@ class TrajectoryPriorRegressionTests(unittest.TestCase):
                 context_mean=mx.array([0.2, -0.1]),
                 context_scale=mx.array([0.5, 2.0]),
                 source_mean=mx.array([-0.1, 0.2]),
-                source_scale=mx.array([1.5, 0.7]), evidence={},
+                source_scale=mx.array([1.5, 0.7]),
+                context_center=mx.zeros(16),source_center=mx.zeros(16),evidence={},
             )
             context = mx.array([0.4, 0.3] + [0.0] * 14)
             sources = [mx.array([sign, 0.2] + [0.0] * 14) for sign in (-1.0, 1.0)]

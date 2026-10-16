@@ -58,7 +58,9 @@ from .stage_edit_production_train_cli import main as production_train_main
 from .stage_edit_production_training import (
     DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT,
     DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS,
+    DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
+    _dynamic_crop_v3_prior_history_samples,
     _stage_edit_validation_selection_with_dynamic_crop_v3,
 )
 from .stage_edit_training import stage_edit_validation_selection_score
@@ -714,6 +716,8 @@ def _build_train_cli_args(
                     "dynamic_crop_v3_prior_pretraining_warmup_steps"
                 ]
             ),
+            '--dynamic-crop-v3-prior-pretrain-batch-size',
+            str(PROBE_TRAINING_SCHEDULE['dynamic_crop_v3_prior_pretraining_batch_size']),
             "--dynamic-crop-version",
             "3",
         )
@@ -748,6 +752,7 @@ def _build_train_cli_args(
         "--dynamic-crop-v3-prior-pretrain-warmup-steps": (
             "dynamic_crop_v3_prior_pretraining_warmup_steps"
         ),
+        '--dynamic-crop-v3-prior-pretrain-batch-size':'dynamic_crop_v3_prior_pretraining_batch_size',
         "--minimum-finetune-optimizer-steps": "minimum_finetune_optimizer_steps",
         "--minimum-checkpoint-selection-finetune-steps": (
             "minimum_checkpoint_selection_finetune_steps"
@@ -1458,6 +1463,8 @@ def _validate_completed_v3_fold(
         != PROBE_TRAINING_SCHEDULE[
             "dynamic_crop_v3_prior_retention_finetune_steps"
         ]
+        or schedule.get('dynamic_crop_v3_prior_pretraining_batch_size')
+        != PROBE_TRAINING_SCHEDULE['dynamic_crop_v3_prior_pretraining_batch_size']
         or schedule.get("contract")
         != PROBE_TRAINING_SCHEDULE["schedule_contract"]
         or optimization.get("minimum_finetune_optimizer_steps")
@@ -1571,6 +1578,33 @@ def _validate_completed_v3_fold(
         *invariant_parameter_groups,
         "context_value_bias_sha256",
     )
+    full_trajectory_prior = (
+        prior.get("mutable_parameter_scope")
+        == DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
+    )
+    if full_trajectory_prior:
+        invariant_parameter_groups = ("base_parameter_tree_sha256",)
+        all_prior_parameter_groups = (
+            "base_parameter_tree_sha256",
+            "context_weight_sha256",
+            "source_head_parameter_tree_sha256",
+            "dynamic_head_parameter_tree_sha256",
+            "context_center_sha256",
+            "source_center_sha256",
+            "context_bias_sha256",
+            "context_non_value_bias_sha256",
+            "context_value_bias_sha256",
+            "context_value_weight_sha256",
+            "context_structured_weight_sha256",
+            "source_value_weight_sha256",
+            "source_structured_weight_sha256",
+        )
+        if prior.get("prior_minibatch_size") != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_batch_size"
+        ]:
+            raise DynamicCropV3CapacityFoldLauncherError(
+                "v3 prior minibatch size differs from the planned schedule"
+            )
     if (
         prior.get("enabled") is not True
         or prior.get("partition") != "training_references_only"
@@ -1597,6 +1631,10 @@ def _validate_completed_v3_fold(
         != list(DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
         or candidate_selection.get("selection_rule")
         != (
+            "renderer_safe_and_structured_noncollapsed_highest_"
+            "finite_existing_validation_score_then_lower_candidate_"
+            "step_on_exact_tie_else_restore_initial_dynamic_head"
+            if full_trajectory_prior else
             "highest_finite_selectable_existing_validation_score_"
             "then_lower_candidate_step_on_exact_tie"
         )
@@ -1806,6 +1844,12 @@ def _validate_completed_v3_fold(
     observed_song_samples: dict[str, int] = {}
     observed_reference_samples: dict[str, int] = {}
     observed_prior_learning_rates: list[float] = []
+    expected_reference_song_ids = {
+        reference_id: song_id
+        for song_id in preflight.training_song_ids
+        for reference_id in preflight.reference_ids_by_song.get(song_id, ())
+        if reference_id in observed_train_references
+    }
     for step, raw_record in enumerate(prior_history, start=1):
         record = _mapping(raw_record, f"v3 prior history step {step}")
         song_id = str(record.get("song_id") or "")
@@ -1836,21 +1880,29 @@ def _validate_completed_v3_fold(
             raise DynamicCropV3CapacityFoldLauncherError(
                 "v3 prior history step differs"
             )
-        observed_song_samples[song_id] = (
-            observed_song_samples.get(song_id, 0) + 1
-        )
-        observed_reference_samples[reference_id] = (
-            observed_reference_samples.get(reference_id, 0) + 1
-        )
+        try:
+            samples = _dynamic_crop_v3_prior_history_samples(
+                record,
+                expected_batch_size=(
+                    PROBE_TRAINING_SCHEDULE["dynamic_crop_v3_prior_pretraining_batch_size"]
+                    if full_trajectory_prior else None
+                ),
+                reference_song_ids=expected_reference_song_ids,
+            )
+        except ValueError as error:
+            raise DynamicCropV3CapacityFoldLauncherError(str(error)) from error
+        for sample in samples:
+            sampled_song = sample["song_id"]
+            sampled_reference = sample["reference_id"]
+            observed_song_samples[sampled_song] = (
+                observed_song_samples.get(sampled_song, 0) + 1
+            )
+            observed_reference_samples[sampled_reference] = (
+                observed_reference_samples.get(sampled_reference, 0) + 1
+            )
         observed_prior_learning_rates.append(
             float(record["actual_learning_rate"])
         )
-    expected_reference_song_ids = {
-        reference_id: song_id
-        for song_id in preflight.training_song_ids
-        for reference_id in preflight.reference_ids_by_song.get(song_id, ())
-        if reference_id in observed_train_references
-    }
     if (
         observed_song_samples != sampling.get("per_song_sampled_counts")
         or observed_reference_samples

@@ -133,10 +133,11 @@ V3_PROBE_TRAINING_SCHEDULE: Mapping[str, Any] = MappingProxyType(
         "dynamic_crop_v3_prior_pretraining_steps": 500,
         "dynamic_crop_v3_prior_pretraining_peak_learning_rate": 3.0e-4,
         "dynamic_crop_v3_prior_pretraining_warmup_steps": 50,
+        "dynamic_crop_v3_prior_pretraining_batch_size": 12,
         "dynamic_crop_v3_prior_retention_finetune_steps": 60,
         "schedule_contract": (
             "independent_warmup_cosine_cut_source_v3_prior_and_joint_"
-            "with_retained_selection_burn_in_v4"
+            "with_minibatch_prior_and_retained_selection_burn_in_v5"
         ),
     }
 )

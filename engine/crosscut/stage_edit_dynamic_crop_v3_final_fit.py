@@ -661,35 +661,12 @@ def train_dynamic_crop_v3_final_fit(
 
         def prior_loss(
             trained_adapter: Any,
-            context_embedding: Any,
-            source_embedding: Any,
-            target_values: Any,
-            target_times: Any,
-            count_target: int,
-            motion_target: float,
-            motion_supervised: bool,
+            batch_tracks: Any,
         ) -> Any:
-            raw = production._dynamic_crop_v3_structured_prior_raw(
-                trained_adapter,
-                initial_prior_snapshot,
-                prior_context_projection,
-                prior_source_projection,
-                prior_projection_normalizer,
-                context_embedding,
-                source_embedding,
-            )
-            return production._dynamic_crop_v3_prior_loss_from_raw(
-                raw,
-                target_values,
-                target_times,
-                count_target,
-                motion_target,
-                motion_supervised,
-                effective_dynamic_loss,
-                class_balance["count_class_weights_1_to_8"][count_target - 1],
-                class_balance["motion_class_weights_static_dynamic"][
-                    int(motion_target)
-                ],
+            return production._dynamic_crop_v3_prior_minibatch_loss(
+                trained_adapter, batch_tracks, initial_prior_snapshot,
+                prior_context_projection, prior_source_projection,
+                prior_projection_normalizer, effective_dynamic_loss, class_balance,
             )[0]
 
         prior_loss_and_grad = production.nn.value_and_grad(
@@ -702,35 +679,11 @@ def train_dynamic_crop_v3_final_fit(
             1,
             int(schedule["dynamic_crop_v3_prior_pretraining_steps"]) + 1,
         ):
-            track = prior_sampler.sample()
-            if (
-                track.context_embedding is None
-                or track.source_embedding is None
-            ):
-                raise RuntimeError(
-                    "final-fit v3 prior sampled an unmaterialized feature"
-                )
-            context_embedding = production.mx.array(track.context_embedding)
-            source_embedding = production.mx.array(track.source_embedding)
-            target_values = production.mx.array(
-                np.asarray(track.values, dtype=np.float32)
+            batch_tracks = prior_sampler.sample_batch(
+                int(schedule["dynamic_crop_v3_prior_pretraining_batch_size"])
             )
-            target_times = production.mx.array(
-                np.asarray(track.normalized_times, dtype=np.float32)
-            )
-            count_target = len(track.values)
-            motion_target = float(track.motion_label == "dynamic")
-            motion_supervised = not track.motion_label_loss_masked
-            loss, gradients = prior_loss_and_grad(
-                prior_adapter,
-                context_embedding,
-                source_embedding,
-                target_values,
-                target_times,
-                count_target,
-                motion_target,
-                motion_supervised,
-            )
+            track = batch_tracks[0]
+            loss, gradients = prior_loss_and_grad(prior_adapter, batch_tracks)
             if clipping_supported:
                 gradients, gradient_norm = production.optim.clip_grad_norm(
                     gradients, float(schedule["gradient_clip_norm"])
@@ -738,27 +691,10 @@ def train_dynamic_crop_v3_final_fit(
             else:
                 gradient_norm = production.mx.array(float("nan"))
             prior_optimizer.update(prior_adapter, gradients)
-            updated_raw = production._dynamic_crop_v3_structured_prior_raw(
-                prior_adapter,
-                initial_prior_snapshot,
-                prior_context_projection,
-                prior_source_projection,
-                prior_projection_normalizer,
-                context_embedding,
-                source_embedding,
-            )
-            _, prior_components = production._dynamic_crop_v3_prior_loss_from_raw(
-                updated_raw,
-                target_values,
-                target_times,
-                count_target,
-                motion_target,
-                motion_supervised,
-                effective_dynamic_loss,
-                class_balance["count_class_weights_1_to_8"][count_target - 1],
-                class_balance["motion_class_weights_static_dynamic"][
-                    int(motion_target)
-                ],
+            _, prior_components = production._dynamic_crop_v3_prior_minibatch_loss(
+                prior_adapter, batch_tracks, initial_prior_snapshot,
+                prior_context_projection, prior_source_projection,
+                prior_projection_normalizer, effective_dynamic_loss, class_balance,
             )
             optimizer_steps += 1
             prior_steps += 1
@@ -809,9 +745,16 @@ def train_dynamic_crop_v3_final_fit(
                     "token_index": track.token_index,
                     "source_id": track.source_id,
                     "keyframe_count": len(track.values),
+                    "batch_size": len(batch_tracks),
+                    "batch_tracks": [
+                        dict(reference_id=t.reference_id, token_index=t.token_index,
+                             source_id=t.source_id, song_id=t.song_id)
+                        for t in batch_tracks
+                    ],
                     "gate_aligned_normalized_coordinate_mae": float(
-                        prior_components["values_normalized"].item()
+                        prior_components["values_normalized_mae"].item()
                     ),
+                    "normalized_value_smooth_l1": float(prior_components["values_normalized"].item()),
                     "prior_total_loss": float(
                         prior_components["total"].item()
                     ),
@@ -824,7 +767,7 @@ def train_dynamic_crop_v3_final_fit(
                     "prior_motion_loss": float(
                         prior_components["motion"].item()
                     ),
-                    "motion_label_supervised": motion_supervised,
+                    "motion_label_supervised": not track.motion_label_loss_masked,
                     "gradient_norm_before_clip": float(
                         gradient_norm.item()
                     ),
@@ -860,9 +803,6 @@ def train_dynamic_crop_v3_final_fit(
         )
         invariant_keys = (
             "base_parameter_tree_sha256",
-            "context_value_bias_sha256",
-            "context_value_weight_sha256",
-            "source_value_weight_sha256",
         )
         invariant = all(
             before_prior_digests[key] == after_prior_digests[key]
@@ -922,7 +862,7 @@ def train_dynamic_crop_v3_final_fit(
             "partition": "all_references_fixed_after_loso_selection",
             "objective": (
                 "detached_low_rank_context_and_source_conditioned_count_"
-                "times_motion_residual_with_frozen_values_v3"
+                "times_motion_full_trajectory_residual_v4"
             ),
             "feature_contract": (
                 production.DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT
@@ -933,6 +873,7 @@ def train_dynamic_crop_v3_final_fit(
             "optimizer_weight_decay": 0.0,
             "optimizer_initial_step": 0,
             "optimizer_state_final_step": prior_steps,
+            "prior_minibatch_size": int(schedule["dynamic_crop_v3_prior_pretraining_batch_size"]),
             "checkpoint_selection_performed": False,
             "validation_metrics_computed": False,
             "heldout_metrics_computed": False,
@@ -1041,7 +982,7 @@ def train_dynamic_crop_v3_final_fit(
                 "source_head_gradients_computed": True,
                 "context_weight_gradients_computed": True,
                 "count_time_motion_bias_gradients_computed": True,
-                "value_row_gradients_computed": False,
+                "value_row_gradients_computed": True,
                 "full_head_gradients_computed": False,
                 "structured_low_rank_adapter_gradients_computed": True,
             },
@@ -1647,6 +1588,11 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         "all_reference_predeclared_structured_low_rank_adapter_"
         "milestones_frozen_loso_candidate_no_reselection_v3"
     )
+    full_trajectory_adapter_prior = (
+        standardized_structured_adapter_prior
+        and prior.get("mutable_parameter_scope")
+        == production.DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
+    )
     head_snapshot_prior = full_head_prior or structured_adapter_prior
     if (
         not full_head_prior
@@ -1736,9 +1682,9 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         or not isinstance(invariance, Mapping)
         or invariance.get("all_declared_invariant_groups_byte_identical")
         is not True
-        or structured_adapter_prior
+        or structured_adapter_prior and not full_trajectory_adapter_prior
         and invariance.get("context_value_bias_changed") is not False
-        or not structured_adapter_prior
+        or (not structured_adapter_prior or full_trajectory_adapter_prior)
         and invariance.get("context_value_bias_changed") is not True
         or head_snapshot_prior
         and invariance.get("dynamic_head_parameter_tree_changed") is not True
@@ -1794,6 +1740,8 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         projection_rank = sampling.get("projection_rank")
         structured_dimension = (
             production.DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
+            if full_trajectory_adapter_prior
+            else production.DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
             - production.DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
         )
         expected_parameter_count = (
@@ -1896,7 +1844,11 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             or normalization.get("heldout_labels_consumed") is not False
             or not isinstance(class_balance, Mapping)
             or class_balance.get("contract")
-            != "training_only_inverse_frequency_expected_weight_one_v1"
+            != (
+                "training_only_hierarchical_sampler_conditional_expected_weight_one_v2"
+                if full_trajectory_adapter_prior
+                else "training_only_inverse_frequency_expected_weight_one_v1"
+            )
             or not count_histogram_valid
             or not valid_weights(count_weights, 8)
             or not motion_histogram_valid
@@ -1905,11 +1857,11 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             or motion_total < 1
             or class_balance.get("validation_labels_consumed") is not False
             or class_balance.get("heldout_labels_consumed") is not False
-            or invariance.get("context_value_weight_changed") is not False
-            or invariance.get("source_value_weight_changed") is not False
+            or invariance.get("context_value_weight_changed") is not full_trajectory_adapter_prior
+            or invariance.get("source_value_weight_changed") is not full_trajectory_adapter_prior
             or invariance.get("context_structured_weight_changed") is not True
             or invariance.get("source_structured_weight_changed") is not True
-            or invariance.get("value_row_gradients_computed") is not False
+            or invariance.get("value_row_gradients_computed") is not full_trajectory_adapter_prior
             or invariance.get(
                 "structured_low_rank_adapter_gradients_computed"
             )
@@ -1919,6 +1871,7 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
                 "final-fit standardized structured prior evidence differs"
             )
     invariant_parameter_groups = (
+        ('base_parameter_tree_sha256',) if full_trajectory_adapter_prior else
         (
             "base_parameter_tree_sha256",
             "context_value_bias_sha256",
@@ -1966,6 +1919,18 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             "context_value_bias_sha256",
         )
     )
+    if full_trajectory_adapter_prior:
+        all_prior_parameter_groups = (
+            *all_prior_parameter_groups,
+            "context_center_sha256",
+            "source_center_sha256",
+        )
+        if prior.get("prior_minibatch_size") != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_batch_size"
+        ]:
+            raise DynamicCropV3FinalFitError(
+                "final-fit prior minibatch size differs from the frozen schedule"
+            )
     invariance_before = invariance.get("before")
     invariance_after = invariance.get("after")
     if (
@@ -1984,10 +1949,10 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             invariance_before.get(key) != invariance_after.get(key)
             for key in invariant_parameter_groups
         )
-        or structured_adapter_prior
+        or structured_adapter_prior and not full_trajectory_adapter_prior
         and invariance_before.get("context_value_bias_sha256")
         != invariance_after.get("context_value_bias_sha256")
-        or not structured_adapter_prior
+        or (not structured_adapter_prior or full_trajectory_adapter_prior)
         and invariance_before.get("context_value_bias_sha256")
         == invariance_after.get("context_value_bias_sha256")
         or invariance_after.get("context_value_bias_sha256")
@@ -2087,10 +2052,26 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             raise DynamicCropV3FinalFitError(
                 "final-fit v3 prior history differs"
             )
-        observed_song_samples[song_id] = observed_song_samples.get(song_id, 0) + 1
-        observed_reference_samples[reference_id] = (
-            observed_reference_samples.get(reference_id, 0) + 1
-        )
+        try:
+            samples = production._dynamic_crop_v3_prior_history_samples(
+                raw_record,
+                expected_batch_size=(
+                    PROBE_TRAINING_SCHEDULE["dynamic_crop_v3_prior_pretraining_batch_size"]
+                    if full_trajectory_adapter_prior else None
+                ),
+                reference_song_ids=expected_reference_song_ids,
+            )
+        except ValueError as error:
+            raise DynamicCropV3FinalFitError(str(error)) from error
+        for sample in samples:
+            sampled_song = sample["song_id"]
+            sampled_reference = sample["reference_id"]
+            observed_song_samples[sampled_song] = (
+                observed_song_samples.get(sampled_song, 0) + 1
+            )
+            observed_reference_samples[sampled_reference] = (
+                observed_reference_samples.get(sampled_reference, 0) + 1
+            )
         observed_prior_learning_rates.append(
             float(raw_record["actual_learning_rate"])
         )

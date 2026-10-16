@@ -259,7 +259,7 @@ def train_fit_decision(initial,final):
     return summary,'diagnostic_pass' if passed else 'stop_investigate_no_long_rerun'
 
 
-def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded_feature_release=False):
+def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False):
     if interaction_release_ab and bounded_feature_release:
         raise ValueError('one declared diagnostic hypothesis at a time')
     import mlx.core as mx
@@ -269,7 +269,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
     from crosscut import stage_edit_dynamic_crop_head_v3 as h3
     from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import DynamicCropHeadPredictionV3
     from crosscut.stage_edit_decoded_curve_metrics import decoded_observation_error, summarize_decoded_observations
-    from crosscut.stage_edit_adoption_checks import native_source_raw,adopt_and_verify,verify_public_outputs
+    from crosscut.stage_edit_adoption_checks import (native_source_raw,adopt_and_verify,
+        verify_public_outputs,compare_decoded_prefix_raw)
     from crosscut.stage_edit_gradient_checks import (separated_loss_gradients,head_row_norms,row_supervision,
         measured_feature_delta,require_actual_feature_update)
     from crosscut.stage_edit_train_fit_checks import label_fit_checks
@@ -291,6 +292,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
         native_affine_tolerance=dict(atol=2e-4, rtol=2e-5),
         release_step_drift_limits=dict(release_limits),
         bounded_feature_release_enabled=bounded_feature_release,
+        prior_minibatch_size=12 if minibatch_prior else 1,
         model_config=config.to_dict(), steps=[], evaluations={})
     examples = {e.sequence.sequence_id: e for e in corpus.examples}
     tracks = inventory.tracks
@@ -447,18 +449,13 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
         adapter = production._DynamicCropV3StructuredPriorAdapterModule(16)
         optimizer = optim.AdamW(learning_rate=.01,weight_decay=0.)
         sampler = production._HierarchicalDynamicCropV3PriorSampler(inventory.tracks,seed=1731)
-        def prior_loss(module, track):
-            raw = production._dynamic_crop_v3_structured_prior_raw(module,initial_head,*projections,
-                normalizer,mx.array(track.context_embedding),mx.array(track.source_embedding))
-            return production._dynamic_crop_v3_prior_loss_from_raw(raw,mx.array(track.values),
-                mx.array(track.normalized_times),len(track.values),float(track.motion_label=="dynamic"),
-                not track.motion_label_loss_masked,crop_contract,
-                balance["count_class_weights_1_to_8"][len(track.values)-1],
-                balance["motion_class_weights_static_dynamic"][int(track.motion_label=="dynamic")])[0]
+        def prior_loss(module, batch_tracks):
+            return production._dynamic_crop_v3_prior_minibatch_loss(module,batch_tracks,
+                initial_head,*projections,normalizer,crop_contract,balance)[0]
         grad_fn = nn.value_and_grad(adapter,prior_loss)
         for step in range(1,33):
-            track = sampler.sample()
-            loss, gradients = grad_fn(adapter,track)
+            batch_tracks = sampler.sample_batch(12 if minibatch_prior else 1)
+            loss, gradients = grad_fn(adapter,batch_tracks)
             update(loss,gradients,optimizer,adapter,"detached_prior",step,adapter=True)
         merged = production._dynamic_crop_v3_structured_prior_head_snapshot(adapter,initial_head,*projections,normalizer)
         merged_module=production._DynamicCropV3PriorHeadModule(
@@ -484,24 +481,28 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
             mx.eval(expected,actual)
             max_error=max(max_error,float(mx.max(mx.abs(actual-expected)).item()))
             batch=prefix_batch(track)
-            _,prefix_context,prefix_source,_=native_source_raw(model,batch,track.token_index,track.source_id)
+            _,prefix_context,prefix_source,prefix_slot=native_source_raw(model,batch,track.token_index,track.source_id)
             prefix_expected=production._dynamic_crop_v3_structured_prior_raw(adapter,initial_head,*projections,
                 normalizer,prefix_context,prefix_source)
             mx.eval(prefix_expected)
             cached,prefix=np.asarray(expected),np.asarray(prefix_expected)
+            target=v3.sequence_for(track.sequence_id).targets[track.token_index]
+            prefix_parity=compare_decoded_prefix_raw(cached,prefix,source_id=track.source_id,
+                source_slot=prefix_slot,duration_seconds=target.shot_duration_seconds,
+                observed_times=[k.time_seconds for k in target.original_observed_keyframes])
             merge_rows.append(dict(source_id=track.source_id,original_token_index=track.token_index,
                 standalone_passed=bool(np.allclose(np.asarray(actual),cached,atol=2e-4,rtol=2e-5)),
                 cached_to_prefix_passed=bool(np.allclose(prefix,cached,atol=2e-4,rtol=2e-5)),
                 cached_to_prefix_raw76_max_error=float(np.max(np.abs(prefix-cached))),
+                cached_to_prefix_decoded_parity=prefix_parity,
                 context_feature_max_error=float(np.max(np.abs(np.asarray(prefix_context)-track.context_embedding))),
                 source_feature_max_error=float(np.max(np.abs(np.asarray(prefix_source)-track.source_embedding)))))
-            target=v3.sequence_for(track.sequence_id).targets[track.token_index]
             adoption_probes.append(dict(batch=batch,token_index=track.token_index,source_id=track.source_id,
                 expected_raw=np.array(prefix,copy=True),duration_seconds=target.shot_duration_seconds,
                 observed_times=tuple(k.time_seconds for k in target.original_observed_keyframes)))
         report['native_affine_prefix_checks']=merge_rows
         write_report()
-        if not all(r['standalone_passed'] and r['cached_to_prefix_passed'] for r in merge_rows):
+        if not all(r['standalone_passed'] and r['cached_to_prefix_decoded_parity']['passed'] for r in merge_rows):
             raise AssertionError('native affine cached/prefix comparison failed; complete rows saved')
         if before_base != production._parameter_tree_sha256(model.base.parameters()):
             raise RuntimeError("detached prior changed the base model")
@@ -794,7 +795,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
         raise
 
 
-def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,bounded_feature_release=False):
+def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,bounded_feature_release=False,minibatch_prior=False):
     """One process-age budget/watchdog around preparation AND execution."""
     budget = DiagnosticBudget(out)
     watcher = threading.Thread(target=budget.watch, daemon=True)
@@ -814,11 +815,11 @@ def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,
         print(json.dumps(preparation), flush=True)
         if not prepare_only:
             if bounded_feature_release:
-                run_diagnostic(fixture,out,budget=budget,bounded_feature_release=True)
+                run_diagnostic(fixture,out,budget=budget,bounded_feature_release=True,minibatch_prior=minibatch_prior)
             elif interaction_release_ab:
                 run_diagnostic(fixture,out,budget=budget,interaction_release_ab=True)
             else:
-                run_diagnostic(fixture,out,budget=budget)
+                run_diagnostic(fixture,out,budget=budget,minibatch_prior=minibatch_prior)
     except Exception as exc:
         try:
             binding_digest=hashlib.sha256(HISTORICAL_BINDING.read_bytes()).hexdigest()
@@ -839,12 +840,16 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument('--minibatch-prior',action='store_true',
+        help='Use the production12-track prior loss instead of single-track updates; TRAIN only')
     experiment=parser.add_mutually_exclusive_group()
     experiment.add_argument("--interaction-release-ab", action="store_true",
         help="54-update train-only first-release prerequisite A/B; never qualifies or activates a model")
     experiment.add_argument('--bounded-feature-release',action='store_true',
         help='One80-update diagnostic with finite post-AdamW feature proposals; no production activation')
     args = parser.parse_args()
+    if args.minibatch_prior and args.interaction_release_ab:
+        parser.error('the original interaction A/B keeps its original single-track prior')
     root = Path("/Volumes/CrossCutMedia/CrossCut-Training/diagnostics")
     if not args.out.is_absolute() or not args.out.resolve().is_relative_to(root):
         parser.error("output must be a new project diagnostics directory on SSD")
@@ -852,7 +857,7 @@ def main():
         parser.error("authorized SSD device does not match")
     args.out.mkdir(parents=True, exist_ok=False)
     execute_diagnostic(args.out,prepare_only=args.prepare_only,interaction_release_ab=args.interaction_release_ab,
-        bounded_feature_release=args.bounded_feature_release)
+        bounded_feature_release=args.bounded_feature_release,minibatch_prior=args.minibatch_prior)
 
 
 if __name__ == "__main__":

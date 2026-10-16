@@ -57,6 +57,7 @@ from crosscut.stage_edit_production_training import (
     _cut_only_pretraining_loss_contract,
     _dynamic_crop_v3_validation_selection_evidence,
     _dynamic_crop_v3_prior_inventory,
+    _dynamic_crop_v3_prior_history_samples,
     _dynamic_crop_v3_prior_structured_selection_evidence,
     _dynamic_crop_v3_structured_prior_head_snapshot,
     _dynamic_crop_v3_structured_prior_projections,
@@ -252,6 +253,38 @@ def _passing_dynamic_v3_metrics() -> dict:
 
 
 class StageEditProductionQualityTests(unittest.TestCase):
+    def test_prior_history_counts_every_batch_member_and_rejects_foreign_labels(self):
+        from copy import deepcopy
+
+        samples = [
+            {"song_id": "A", "reference_id": "a", "token_index": 1, "source_id": "s1"},
+            {"song_id": "B", "reference_id": "b", "token_index": 2, "source_id": "s2"},
+        ]
+        record = {**samples[0], "batch_size": 2, "batch_tracks": samples}
+        arguments = dict(expected_batch_size=2, reference_song_ids={"a": "A", "b": "B"})
+        self.assertEqual(tuple(samples), _dynamic_crop_v3_prior_history_samples(record, **arguments))
+        mutations = (
+            lambda value: value.update(batch_size=True),
+            lambda value: value["batch_tracks"].pop(),
+            lambda value: value["batch_tracks"][1].update(reference_id="validation"),
+            lambda value: value["batch_tracks"][1].update(song_id="A"),
+            lambda value: value["batch_tracks"][1].update(token_index=True),
+            lambda value: value.update(source_id="other"),
+        )
+        for mutate in mutations:
+            bad = deepcopy(record)
+            mutate(bad)
+            with self.assertRaises(ValueError):
+                _dynamic_crop_v3_prior_history_samples(bad, **arguments)
+        self.assertEqual(
+            ({"song_id": "A", "reference_id": "a"},),
+            _dynamic_crop_v3_prior_history_samples(
+                {"song_id": "A", "reference_id": "a"},
+                expected_batch_size=None,
+                reference_song_ids={"a": "A"},
+            ),
+        )
+
     def test_checkpoint_namespace_never_reinterprets_v2_as_v3(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory)
@@ -930,6 +963,13 @@ class StageEditSourcePretrainingTests(unittest.TestCase):
             },
             first.per_reference_sampled_counts,
         )
+        batch=first.sample_batch(12)
+        self.assertEqual([(t.reference_id,t.token_index) for t in batch],
+            [(t.reference_id,t.token_index) for t in [second.sample() for _ in range(12)]])
+        self.assertEqual({'SONG-A':206,'SONG-B':206},first.per_song_sampled_counts)
+        for invalid in (0,65,True,1.5):
+            with self.assertRaises(ValueError):first.sample_batch(invalid)
+        self.assertEqual({'SONG-A':206,'SONG-B':206},first.per_song_sampled_counts)
 
     def test_sampler_balances_song_then_reference_then_group(self) -> None:
         examples = (

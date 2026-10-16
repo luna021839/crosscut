@@ -2099,6 +2099,11 @@ class _HierarchicalDynamicCropV3PriorSampler:
         self._per_reference_sampled_counts[reference_id] += 1
         return track
 
+    def sample_batch(self, size: int) -> tuple[_DynamicCropV3PriorTrack, ...]:
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 64:
+            raise ValueError("prior minibatch size must be an integer in 1..64")
+        return tuple(self.sample() for _ in range(size))
+
     @property
     def per_song_sampled_counts(self) -> dict[str, int]:
         return dict(sorted(self._per_song_sampled_counts.items()))
@@ -2106,6 +2111,55 @@ class _HierarchicalDynamicCropV3PriorSampler:
     @property
     def per_reference_sampled_counts(self) -> dict[str, int]:
         return dict(sorted(self._per_reference_sampled_counts.items()))
+
+
+def _dynamic_crop_v3_prior_history_samples(
+    record: Mapping[str, Any],
+    *,
+    expected_batch_size: int | None,
+    reference_song_ids: Mapping[str, str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Count actual sampled labels, with explicit support for old single-track logs."""
+    if expected_batch_size is None:
+        samples = (record,)
+    else:
+        raw_samples = record.get("batch_tracks")
+        if (
+            isinstance(record.get("batch_size"), bool)
+            or record.get("batch_size") != expected_batch_size
+            or not isinstance(raw_samples, list)
+            or len(raw_samples) != expected_batch_size
+            or any(not isinstance(item, Mapping) for item in raw_samples)
+        ):
+            raise ValueError("prior minibatch history size differs")
+        samples = tuple(raw_samples)
+        for sample in samples:
+            token_index = sample.get("token_index")
+            if (
+                isinstance(token_index, bool)
+                or not isinstance(token_index, int)
+                or token_index < 0
+                or not isinstance(sample.get("source_id"), str)
+                or not sample["source_id"]
+            ):
+                raise ValueError("prior minibatch trajectory identity differs")
+        if any(
+            record.get(key) != samples[0].get(key)
+            for key in ("song_id", "reference_id", "token_index", "source_id")
+        ):
+            raise ValueError("prior minibatch representative differs")
+    for sample in samples:
+        reference_id = sample.get("reference_id")
+        song_id = sample.get("song_id")
+        if (
+            not isinstance(reference_id, str)
+            or not reference_id
+            or not isinstance(song_id, str)
+            or not song_id
+            or reference_song_ids.get(reference_id) != song_id
+        ):
+            raise ValueError("prior history contains a foreign reference or song")
+    return samples
 
 
 def _dynamic_crop_v3_prior_inventory(
@@ -2728,11 +2782,56 @@ def _dynamic_crop_v3_prior_loss_from_raw(
     )
     return total, {
         "values_normalized": value_loss,
+        "values_normalized_mae": mx.mean(
+            mx.abs(predicted_values[:count] - normalized_targets)
+        ),
         "count": count_loss,
         "times": time_loss,
         "motion": motion_loss,
         "total": total,
     }
+
+
+def _dynamic_crop_v3_prior_minibatch_loss(
+    module: Any,
+    tracks: Sequence[_DynamicCropV3PriorTrack],
+    initial_snapshot: Mapping[str, Any],
+    context_projection: Any,
+    source_projection: Any,
+    normalizer: Any,
+    contract: DynamicCropV3LossContract,
+    balance: Mapping[str, Any],
+) -> tuple[Any, Mapping[str, Any]]:
+    """Average complete trajectory losses before the shared affine update.
+
+    Count-specific times, observed value rows and motion masks remain local
+    to each track. The batch never pads a missing trajectory into a label.
+    Only already detached TRAIN features are consumed, not new video/model
+    forwards. Averaging before Adam avoids chasing one camera path at a time.
+    """
+    if not tracks:
+        raise ValueError("a nonempty prior trajectory batch is required")
+    parts = []
+    for track in tracks:
+        if track.context_embedding is None or track.source_embedding is None:
+            raise RuntimeError("Dynamic Crop v3 prior sampled an unmaterialized feature")
+        raw = _dynamic_crop_v3_structured_prior_raw(
+            module, initial_snapshot, context_projection, source_projection,
+            normalizer, mx.array(track.context_embedding), mx.array(track.source_embedding),
+        )
+        count = len(track.values)
+        motion = float(track.motion_label == "dynamic")
+        _, components = _dynamic_crop_v3_prior_loss_from_raw(
+            raw, mx.array(track.values), mx.array(track.normalized_times), count,
+            motion, not track.motion_label_loss_masked, contract,
+            balance["count_class_weights_1_to_8"][count - 1],
+            balance["motion_class_weights_static_dynamic"][int(motion)],
+        )
+        parts.append(components)
+    averaged = {
+        key: mx.stack([row[key] for row in parts]).mean() for key in parts[0]
+    }
+    return averaged["total"], averaged
 
 
 def _parameter_tree_sha256(tree: Any) -> str:
@@ -3071,6 +3170,7 @@ def train_production_stage_edit(
     dynamic_crop_v3_prior_pretrain_steps: int = 0,
     dynamic_crop_v3_prior_pretrain_learning_rate: float = 3.0e-4,
     dynamic_crop_v3_prior_pretrain_warmup_steps: int = 50,
+    dynamic_crop_v3_prior_pretrain_batch_size: int = 12,
     finetune_warmup_steps: int = 8,
     minimum_learning_rate_ratio: float = 0.10,
     minimum_finetune_optimizer_steps: int = 120,
@@ -3114,6 +3214,12 @@ def train_production_stage_edit(
         raise ValueError(
             "checkpoint selection burn-in cannot exceed the finetune step floor"
         )
+    if (
+        isinstance(dynamic_crop_v3_prior_pretrain_batch_size, bool)
+        or not isinstance(dynamic_crop_v3_prior_pretrain_batch_size, int)
+        or not 1 <= dynamic_crop_v3_prior_pretrain_batch_size <= 64
+    ):
+        raise ValueError("prior minibatch size must be an integer in 1..64")
     if cut_pretrain_steps not in (0,) and cut_pretrain_steps < 500:
         raise ValueError("cut pretraining must be disabled or run for >= 500 steps")
     if source_pretrain_steps not in (0,) and source_pretrain_steps < 500:
@@ -3792,37 +3898,13 @@ def train_production_stage_edit(
 
             def prior_loss(
                 trained_adapter: _DynamicCropV3StructuredPriorAdapterModule,
-                context_embedding: Any,
-                source_embedding: Any,
-                target_values: Any,
-                target_times: Any,
-                count_target: int,
-                motion_target: float,
-                motion_supervised: bool,
+                batch_tracks: Sequence[_DynamicCropV3PriorTrack],
             ) -> Any:
-                raw = _dynamic_crop_v3_structured_prior_raw(
-                    trained_adapter,
-                    dynamic_crop_v3_prior_initial_snapshot,
-                    prior_context_projection,
-                    prior_source_projection,
-                    prior_projection_normalizer,
-                    context_embedding,
-                    source_embedding,
-                )
-                return _dynamic_crop_v3_prior_loss_from_raw(
-                    raw,
-                    target_values,
-                    target_times,
-                    count_target,
-                    motion_target,
-                    motion_supervised,
-                    effective_dynamic_crop_v3_loss_contract,
-                    prior_class_balance_evidence[
-                        "count_class_weights_1_to_8"
-                    ][count_target - 1],
-                    prior_class_balance_evidence[
-                        "motion_class_weights_static_dynamic"
-                    ][int(motion_target)],
+                return _dynamic_crop_v3_prior_minibatch_loss(
+                    trained_adapter, batch_tracks, dynamic_crop_v3_prior_initial_snapshot,
+                    prior_context_projection, prior_source_projection,
+                    prior_projection_normalizer, effective_dynamic_crop_v3_loss_contract,
+                    prior_class_balance_evidence,
                 )[0]
 
             prior_loss_and_grad = nn.value_and_grad(
@@ -3830,35 +3912,9 @@ def train_production_stage_edit(
                 prior_loss,
             )
             for prior_step in range(1, dynamic_crop_v3_prior_pretrain_steps + 1):
-                track = prior_sampler.sample()
-                if (
-                    track.context_embedding is None
-                    or track.source_embedding is None
-                ):
-                    raise RuntimeError(
-                        "Dynamic Crop v3 prior sampled an unmaterialized feature"
-                    )
-                context_embedding = mx.array(track.context_embedding)
-                source_embedding = mx.array(track.source_embedding)
-                target_values = mx.array(
-                    np.asarray(track.values, dtype=np.float32)
-                )
-                target_times = mx.array(
-                    np.asarray(track.normalized_times, dtype=np.float32)
-                )
-                count_target = len(track.values)
-                motion_target = float(track.motion_label == "dynamic")
-                motion_supervised = not track.motion_label_loss_masked
-                loss, gradients = prior_loss_and_grad(
-                    prior_adapter,
-                    context_embedding,
-                    source_embedding,
-                    target_values,
-                    target_times,
-                    count_target,
-                    motion_target,
-                    motion_supervised,
-                )
+                batch_tracks = prior_sampler.sample_batch(dynamic_crop_v3_prior_pretrain_batch_size)
+                track = batch_tracks[0]
+                loss, gradients = prior_loss_and_grad(prior_adapter, batch_tracks)
                 if clipping_supported:
                     gradients, gradient_norm = optim.clip_grad_norm(
                         gradients, gradient_clip_norm
@@ -3866,29 +3922,11 @@ def train_production_stage_edit(
                 else:
                     gradient_norm = mx.array(float("nan"))
                 prior_optimizer.update(prior_adapter, gradients)
-                updated_raw = _dynamic_crop_v3_structured_prior_raw(
-                    prior_adapter,
-                    dynamic_crop_v3_prior_initial_snapshot,
-                    prior_context_projection,
-                    prior_source_projection,
-                    prior_projection_normalizer,
-                    context_embedding,
-                    source_embedding,
-                )
-                _, prior_components = _dynamic_crop_v3_prior_loss_from_raw(
-                    updated_raw,
-                    target_values,
-                    target_times,
-                    count_target,
-                    motion_target,
-                    motion_supervised,
-                    effective_dynamic_crop_v3_loss_contract,
-                    prior_class_balance_evidence[
-                        "count_class_weights_1_to_8"
-                    ][count_target - 1],
-                    prior_class_balance_evidence[
-                        "motion_class_weights_static_dynamic"
-                    ][int(motion_target)],
+                _, prior_components = _dynamic_crop_v3_prior_minibatch_loss(
+                    prior_adapter, batch_tracks, dynamic_crop_v3_prior_initial_snapshot,
+                    prior_context_projection, prior_source_projection,
+                    prior_projection_normalizer, effective_dynamic_crop_v3_loss_contract,
+                    prior_class_balance_evidence,
                 )
                 optimizer_steps += 1
                 dynamic_crop_v3_prior_pretraining_optimizer_steps += 1
@@ -3936,9 +3974,16 @@ def train_production_stage_edit(
                         "token_index": track.token_index,
                         "source_id": track.source_id,
                         "keyframe_count": len(track.values),
+                        "batch_size": len(batch_tracks),
+                        "batch_tracks": [
+                            dict(song_id=t.song_id, reference_id=t.reference_id,
+                                 sequence_id=t.sequence_id, token_index=t.token_index, source_id=t.source_id)
+                            for t in batch_tracks
+                        ],
                         "gate_aligned_normalized_coordinate_mae": float(
-                            prior_components["values_normalized"].item()
+                            prior_components["values_normalized_mae"].item()
                         ),
+                        "normalized_value_smooth_l1": float(prior_components["values_normalized"].item()),
                         "prior_total_loss": float(
                             prior_components["total"].item()
                         ),
@@ -3951,7 +3996,7 @@ def train_production_stage_edit(
                         "prior_motion_loss": float(
                             prior_components["motion"].item()
                         ),
-                        "motion_label_supervised": motion_supervised,
+                        "motion_label_supervised": not track.motion_label_loss_masked,
                         "gradient_norm_before_clip": float(
                             gradient_norm.item()
                         ),
@@ -5660,6 +5705,7 @@ def train_production_stage_edit(
                 "dynamic_crop_v3_prior_pretraining_steps": (
                     dynamic_crop_v3_prior_pretrain_steps
                 ),
+                "dynamic_crop_v3_prior_pretraining_batch_size": dynamic_crop_v3_prior_pretrain_batch_size,
                 "dynamic_crop_v3_prior_pretraining_peak_learning_rate": (
                     dynamic_crop_v3_prior_pretrain_learning_rate
                 ),
@@ -5720,13 +5766,14 @@ def train_production_stage_edit(
                     "partition": "training_references_only",
                     "objective": (
                         "detached_low_rank_context_and_source_conditioned_"
-                        "count_times_motion_residual_with_frozen_values_v3"
+                        "count_times_motion_full_trajectory_residual_v4"
                     ),
                     "feature_contract": DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT,
                     "mutable_parameter_scope": (
                         DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
                     ),
                     "optimizer_weight_decay": 0.0,
+                    "prior_minibatch_size": dynamic_crop_v3_prior_pretrain_batch_size,
                     "checkpoint_selection_eligible_during_warmup": False,
                     "checkpoint_write_before_joint_finetuning": False,
                     "selection_gate_evaluated_without_gradients": True,

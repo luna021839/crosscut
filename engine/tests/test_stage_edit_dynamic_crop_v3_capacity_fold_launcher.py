@@ -674,7 +674,12 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                 ):
                     launcher._strict_plan(forged)
 
-    def test_completed_fold_writes_nonselecting_v3_receipt(self) -> None:
+    def test_completed_full_trajectory_minibatch_fold_writes_inactive_receipt(self) -> None:
+        self.test_completed_fold_writes_nonselecting_v3_receipt(full_trajectory_prior=True)
+
+    def test_completed_fold_writes_nonselecting_v3_receipt(
+        self, *, full_trajectory_prior: bool = False
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             cut_steps = int(
@@ -769,13 +774,40 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                     "legacy_v2_checkpoint_or_output_used": False,
                     "legacy_static_crop_head_used_for_trajectory": False,
                     "trajectory": {
+                        "track_label_count": 2,
                         "aggregate_normalized_improvement_over_static_prior": (
                             0.02 - index * 0.001
                         ),
                         "target_source_slot_mismatch_count": 0,
+                        "decoded_observed_time": {
+                            "contract": "actual_decoded_source_count_time_renderer_on_original_observations_v1",
+                            "complete": True,
+                            "expected_tracks": 2,
+                            "evaluated_tracks": 2,
+                            "source_identity_mismatch_count": 0,
+                            "predicted_count_and_time_consumed": True,
+                            "synthetic_target_points_used": False,
+                            "improvement_over_static_prior": 0.02 - index * 0.001,
+                        },
+                        "teacher_forced_count_normalized_time_mae": 0.03,
+                        "count": {
+                            "label_count": 2,
+                            "exact_accuracy": 1.0,
+                            "target_histogram_1_to_8": [1, 1, 0, 0, 0, 0, 0, 0],
+                            "predicted_histogram_1_to_8": [1, 1, 0, 0, 0, 0, 0, 0],
+                        },
+                        "motion": {
+                            "label_count": 2,
+                            "balanced_accuracy": 1.0,
+                            "recall": {"static": 1.0, "dynamic": 1.0},
+                        },
+                        "curve_delta_and_range": {
+                            name: {"target_mean_range": 0.02, "predicted_mean_range": 0.02}
+                            for name in ("zoom", "center_x", "center_y", "roll_degrees")
+                        },
                         "renderer_decode": {
-                            "attempt_count": 1,
-                            "eligible_count": 1,
+                            "attempt_count": 2,
+                            "eligible_count": 2,
                             "eligible_rate": 1.0,
                             "minimum_safe_zoom_projection_count": 0,
                         },
@@ -1148,6 +1180,47 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                     "production_activation_authorized": False,
                 },
             }
+            if full_trajectory_prior:
+                prior = report["optimization"]["dynamic_crop_v3_prior_pretraining"]
+                prior["mutable_parameter_scope"] = launcher.DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
+                batch_size = launcher.PROBE_TRAINING_SCHEDULE["dynamic_crop_v3_prior_pretraining_batch_size"]
+                prior["prior_minibatch_size"] = batch_size
+                prior["candidate_selection"]["selection_rule"] = (
+                    "renderer_safe_and_structured_noncollapsed_highest_"
+                    "finite_existing_validation_score_then_lower_candidate_"
+                    "step_on_exact_tie_else_restore_initial_dynamic_head"
+                )
+                invariance = prior["parameter_invariance"]
+                invariance["invariant_parameter_groups"] = ["base_parameter_tree_sha256"]
+                extra_groups = (
+                    "dynamic_head_parameter_tree_sha256", "context_bias_sha256",
+                    "context_center_sha256", "source_center_sha256",
+                    "context_value_weight_sha256", "context_structured_weight_sha256",
+                    "source_value_weight_sha256", "source_structured_weight_sha256",
+                )
+                for group in extra_groups:
+                    for stage in ("before", "after"):
+                        invariance[stage][group] = hashlib.sha256(f"{stage}:{group}".encode()).hexdigest()
+                for group in ("context_weight_sha256", "source_head_parameter_tree_sha256", "context_non_value_bias_sha256"):
+                    invariance["after"][group] = hashlib.sha256(f"after:{group}".encode()).hexdigest()
+                for key in ("warmup_head_digests", "retained_head_digests"):
+                    prior["retention"][key] = {
+                        group: invariance["after"][group]
+                        for group in prior["retention"][key]
+                    }
+                for key in ("per_song_sampled_counts", "per_reference_sampled_counts"):
+                    prior["sampling"][key] = {
+                        name: count * batch_size for name, count in prior["sampling"][key].items()
+                    }
+                for record in report["dynamic_crop_v3_prior_pretraining_history"]:
+                    record.update(token_index=0, source_id="fixture-source", batch_size=batch_size)
+                    index = (record["prior_pretrain_step"] - 1) % 2
+                    record["batch_tracks"] = [
+                        {"song_id": training_songs[(index + slot) % 2],
+                         "reference_id": training_references[(index + slot) % 2],
+                         "token_index": 0, "source_id": "fixture-source"}
+                        for slot in range(batch_size)
+                    ]
             _write_json(checkpoint / PRODUCTION_TRAINING_REPORT_FILENAME, report)
             _write_json(
                 checkpoint / STAGE_EDIT_SELECTION_FREEZE_FILENAME,

@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 mx=pytest.importorskip('mlx.core')
 
-from crosscut.stage_edit_adoption_checks import adopt_and_verify,native_source_raw,verify_public_outputs
+from crosscut.stage_edit_adoption_checks import (adopt_and_verify,native_source_raw,
+    verify_public_outputs,compare_decoded_prefix_raw)
 from crosscut.stage_edit_dynamic_crop_head_v3 import (
     StageEditTransformerDynamicCropV3,new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
     save_stage_edit_dynamic_crop_checkpoint_v3,load_stage_edit_dynamic_crop_checkpoint_v3)
@@ -16,6 +17,29 @@ from crosscut.stage_edit_production_training import _assign_dynamic_crop_v3_prio
 from crosscut.stage_edit_transformer import smoke_stage_edit_config,tensorize_stage_edit_batch
 from tests.test_stage_edit_dynamic_crop_head_v3 import _permuted_sequence
 from tests.test_stage_edit_transformer import SCHEMA
+
+
+def test_causal_execution_shape_roundoff_is_checked_in_renderer_units_not_unbounded_value_logits():
+    a=np.zeros(76,np.float32);b=a.copy();b[1]=.00039
+    assert not np.allclose(a,b,atol=2e-4,rtol=2e-5)
+    result=compare_decoded_prefix_raw(a,b,source_id='same-physical-source',source_slot=2,
+        duration_seconds=1.,observed_times=(0.,.5,1.))
+    assert result['passed'] and result['raw76_max_error']>.0003
+    assert max(result['maximum_renderer_coordinate_error'])<.0002
+    assert result['count_equal'] and result['motion_sign_equal']
+
+
+@pytest.mark.parametrize('mutation',['count','motion','values','time'])
+def test_prefix_parity_does_not_hide_changed_decisions_camera_or_clock(mutation):
+    a=np.zeros(76,np.float32);b=a.copy()
+    if mutation=='count':b[33]=.0001
+    elif mutation=='motion':b[75]=-.00001
+    elif mutation=='values':b[1]=.3
+    else:
+        a[33]=b[33]=5.;b[40]=2.;b[41]=-2.
+    result=compare_decoded_prefix_raw(a,b,source_id='same-physical-source',source_slot=2,
+        duration_seconds=1.,observed_times=(0.,.5,1.))
+    assert not result['passed']
 
 
 def material():

@@ -467,6 +467,8 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
                         "3",
                         "--dynamic-crop-v3-prior-pretrain-steps",
                         "500",
+                        "--dynamic-crop-v3-prior-pretrain-batch-size",
+                        "6",
                         "--dynamic-crop-v3-prior-pretrain-learning-rate",
                         "0.0003",
                         "--dynamic-crop-v3-prior-pretrain-warmup-steps",
@@ -494,6 +496,7 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
             self.assertEqual(
                 500, kwargs["dynamic_crop_v3_prior_pretrain_steps"]
             )
+            self.assertEqual(6, kwargs["dynamic_crop_v3_prior_pretrain_batch_size"])
             self.assertEqual(
                 3.0e-4,
                 kwargs["dynamic_crop_v3_prior_pretrain_learning_rate"],

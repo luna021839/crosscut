@@ -416,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
     )
+    parser.add_argument("--dynamic-crop-v3-prior-pretrain-batch-size", type=int, default=12)
     parser.add_argument("--finetune-warmup-steps", type=int, default=8)
     parser.add_argument(
         "--minimum-finetune-optimizer-steps", type=int, default=120
@@ -775,6 +776,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dynamic_crop_v3_prior_pretrain_warmup_steps=(
             args.dynamic_crop_v3_prior_pretrain_warmup_steps
         ),
+        dynamic_crop_v3_prior_pretrain_batch_size=args.dynamic_crop_v3_prior_pretrain_batch_size,
         finetune_warmup_steps=args.finetune_warmup_steps,
         minimum_finetune_optimizer_steps=args.minimum_finetune_optimizer_steps,
         minimum_checkpoint_selection_finetune_steps=(

@@ -11,6 +11,63 @@ import numpy as np
 RAW_ATOL, RAW_RTOL = 2e-4, 2e-5
 
 
+def compare_decoded_prefix_raw(
+    first, second, *, source_id, source_slot, duration_seconds, observed_times=()
+):
+    """Compare two causal execution shapes in renderer/output units.
+
+    A full-sequence cached feature and a prefix forward can differ by FP32
+    roundoff before a high-gain affine head. Keep the raw discrepancy visible,
+    require EXACT discrete count/motion decisions, and compare both decoded
+    curves on their complete piecewise-linear knot union. This is not the
+    affine merge/public-adoption check, whose raw tolerances are unchanged.
+    """
+    import mlx.core as mx
+    from .stage_edit_dynamic_crop_head_v3 import renderer_safe_values_from_raw_v3
+    from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import DynamicCropHeadPredictionV3
+    raw = [np.asarray(value, np.float32) for value in (first, second)]
+    if any(value.shape != (76,) or not np.isfinite(value).all() for value in raw):
+        raise ValueError("two finite source-bound raw76 prefixes required")
+    predictions = []
+    for value in raw:
+        values = np.asarray(renderer_safe_values_from_raw_v3(mx.array(value[:32]).reshape(8, 4)))
+        predictions.append(DynamicCropHeadPredictionV3(
+            source_id, source_slot, tuple(map(tuple, values.tolist())),
+            tuple(value[32:40].tolist()), tuple(value[40:75].tolist()), float(value[75]),
+        ))
+    decoded = [prediction.decode(duration_seconds) for prediction in predictions]
+    result = dict(
+        raw76_max_error=float(np.max(np.abs(raw[0] - raw[1]))),
+        count_equal=predictions[0].predicted_keyframe_count == predictions[1].predicted_keyframe_count,
+        motion_sign_equal=bool((raw[0][75] >= 0) == (raw[1][75] >= 0)),
+        both_eligible=all(item.eligible and item.track is not None for item in decoded),
+        decoded_times_equal=False,
+        renderer_values_equal=False,
+    )
+    if result["both_eligible"]:
+        a, b = [item.track for item in decoded]
+        ta = [point.time_seconds for point in a.keyframes]
+        tb = [point.time_seconds for point in b.keyframes]
+        result["decoded_times_equal"] = len(ta) == len(tb) and bool(
+            np.allclose(ta, tb, atol=RAW_ATOL, rtol=RAW_RTOL)
+        )
+        times = sorted({0., float(duration_seconds), *map(float, observed_times), *ta, *tb})
+
+        def values(track):
+            return np.array([
+                [point.zoom, point.center_x, point.center_y, point.roll_degrees]
+                for point in (track.evaluate(time) for time in times)
+            ])
+
+        av, bv = values(a), values(b)
+        result["renderer_values_equal"] = bool(np.allclose(av, bv, atol=RAW_ATOL, rtol=RAW_RTOL))
+        result["maximum_renderer_coordinate_error"] = np.max(np.abs(av - bv), axis=0).tolist()
+    result["passed"] = all(result[key] for key in (
+        "count_equal", "motion_sign_equal", "both_eligible", "decoded_times_equal", "renderer_values_equal"
+    ))
+    return result
+
+
 def native_source_raw(model, batch, token_index, source_id):
     import mlx.core as mx
     slot = batch.source_ids[0][token_index].index(source_id)
