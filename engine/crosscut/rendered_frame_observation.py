@@ -19,7 +19,13 @@ class RenderedFrameObservation:
     pts_ticks: np.ndarray
     time_base: Fraction
     selected_indexes: np.ndarray
-    grayscale: np.ndarray
+    pixels: np.ndarray
+    pixel_format: str = 'gray'
+
+    @property
+    def grayscale(self):
+        if self.pixel_format!='gray':raise ValueError('this observation contains BGR color, not a grayscale plane')
+        return self.pixels
 
     @property
     def selected_seconds(self):
@@ -44,7 +50,8 @@ def _parsed_pts(stderr: str, expected_frames: int):
 
 
 def observe_rendered_frames(path, *, expected_frames, stride=8, width=320,height=180,
-                            max_rasters=2048,timeout_seconds=120.,ffmpeg='ffmpeg'):
+                            max_rasters=2048,timeout_seconds=120.,ffmpeg='ffmpeg',
+                            selected_indexes=None,pixel_format='gray'):
     """Read a local completed film once, without changing it or saving rasters.
 
     Container PTS (including a nonzero origin) are retained with -copyts.
@@ -58,8 +65,29 @@ def observe_rendered_frames(path, *, expected_frames, stride=8, width=320,height
             raise ValueError(f'{name} must be a positive integer')
     if expected_frames>20000:
         raise ValueError('bounded observation supports at most 20000 decoded frames')
-    indexes=np.arange(0,expected_frames,stride,dtype=np.int64)
-    if len(indexes)>max_rasters or (len(indexes)+1)*width*height>128*2**20:
+    if pixel_format not in ('gray','bgr24'):
+        raise ValueError('bounded gray or bgr24 pixel format required')
+    if selected_indexes is None:
+        indexes=np.arange(0,expected_frames,stride,dtype=np.int64)
+        selection=f'not(mod(n\\,{stride}))'
+    else:
+        if not isinstance(selected_indexes,(tuple,list,np.ndarray)):
+            raise ValueError('bounded explicit output-frame sample sequence required')
+        if isinstance(selected_indexes,np.ndarray) and (selected_indexes.ndim!=1 or selected_indexes.dtype.kind not in 'iu'):
+            raise ValueError('strictly ordered actual output-frame sample indexes required')
+        if not len(selected_indexes) or len(selected_indexes)>max_rasters:
+            raise ValueError('analysis raster/byte allowance exceeded before decode')
+        if any(isinstance(n,(bool,np.bool_)) or not isinstance(n,(int,np.integer)) or not 0<=n<expected_frames
+                for n in selected_indexes):
+            raise ValueError('strictly ordered actual output-frame sample indexes required')
+        indexes=np.asarray(selected_indexes,dtype=np.int64).copy()
+        if np.any(np.diff(indexes)<=0):
+            raise ValueError('strictly ordered actual output-frame sample indexes required')
+        # The next-frame sentinel also bounds a wrongly declared long input:
+        # selection cannot silently discard millions of extra decoded frames.
+        selection='+'.join(f'eq(n\\,{int(n)})' for n in np.r_[indexes,expected_frames])
+    channels=1 if pixel_format=='gray' else 3
+    if len(indexes)>max_rasters or (len(indexes)+1)*width*height*channels>128*2**20:
         raise ValueError('analysis raster/byte allowance exceeded before decode')
     if isinstance(timeout_seconds,bool) or not isinstance(timeout_seconds,(int,float)) or not math.isfinite(timeout_seconds) or not 0<timeout_seconds<=120:
         raise ValueError('explicit observation deadline in (0,120] required')
@@ -69,7 +97,7 @@ def observe_rendered_frames(path, *, expected_frames, stride=8, width=320,height
     before=os.stat(path)
     args=[os.fspath(ffmpeg),'-hide_banner','-nostdin','-v','info','-xerror','-copyts','-i',os.fspath(path),
           '-map','0:v:0','-an','-sn','-dn','-vf',
-          f'showinfo,select=not(mod(n\\,{stride})),scale={width}:{height},format=gray',
+          f'showinfo,select={selection},scale={width}:{height},format={pixel_format}',
           '-fps_mode','passthrough','-frames:v',str(len(indexes)+1),'-f','rawvideo','pipe:1']
     result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout_seconds)
     after=os.stat(path)
@@ -79,8 +107,9 @@ def observe_rendered_frames(path, *, expected_frames, stride=8, width=320,height
     if result.returncode:
         raise RuntimeError(f'frame observation decoder failed (exit {result.returncode})')
     ticks,time_base=_parsed_pts(result.stderr.decode('utf-8',errors='replace'),expected_frames)
-    if len(result.stdout)!=len(indexes)*width*height:
+    if len(result.stdout)!=len(indexes)*width*height*channels:
         raise ValueError('sampled decoded pixel count differs from plan')
-    pixels=np.frombuffer(result.stdout,dtype=np.uint8).reshape(len(indexes),height,width)
+    shape=(len(indexes),height,width) if channels==1 else (len(indexes),height,width,channels)
+    pixels=np.frombuffer(result.stdout,dtype=np.uint8).reshape(shape)
     indexes.setflags(write=False)
-    return RenderedFrameObservation(ticks,time_base,indexes,pixels)
+    return RenderedFrameObservation(ticks,time_base,indexes,pixels,pixel_format)

@@ -22,7 +22,17 @@ def test_exact_integer_ticks_not_rounded_seconds_and_invalid_census():
 @pytest.mark.parametrize('options',[{'expected_frames':True},{'expected_frames':20001},
     {'expected_frames':100,'stride':0},{'expected_frames':100,'max_rasters':1},
     {'expected_frames':100,'timeout_seconds':float('inf')},
-    {'expected_frames':100,'width':100000000}])
+    {'expected_frames':100,'width':100000000},
+    {'expected_frames':100,'selected_indexes':(0,0)},
+    {'expected_frames':100,'selected_indexes':(2,1)},
+    {'expected_frames':100,'selected_indexes':(-1,2)},
+    {'expected_frames':100,'selected_indexes':(0,100)},
+    {'expected_frames':100,'selected_indexes':(False,True)},
+    {'expected_frames':100,'selected_indexes':(0,.5)},
+    {'expected_frames':100,'selected_indexes':()},
+    {'expected_frames':100,'pixel_format':'arbitrary'},
+    {'expected_frames':100,'selected_indexes':tuple(range(100)),
+        'width':1024,'height':500,'pixel_format':'bgr24'}])
 def test_resource_contract_rejects_before_launch(tmp_path,monkeypatch,options):
     monkeypatch.setattr(subprocess,'run',lambda *a,**k:pytest.fail('must not launch'))
     with pytest.raises(ValueError):observe_rendered_frames(tmp_path/'absent.mp4',**options)
@@ -45,3 +55,18 @@ def test_one_pass_matches_independent_tiny_ffprobe_and_nonzero_origin(tmp_path):
     assert not observed.grayscale.flags.writeable and not observed.selected_indexes.flags.writeable
     with pytest.raises(ValueError,match='census'):
         observe_rendered_frames(path,expected_frames=23,stride=8,width=32,height=18,ffmpeg=ffmpeg,timeout_seconds=10)
+    color=observe_rendered_frames(path,expected_frames=24,selected_indexes=(3,9,23),pixel_format='bgr24',
+        width=32,height=18,ffmpeg=ffmpeg,timeout_seconds=10)
+    assert color.selected_indexes.tolist()==[3,9,23] and color.pixels.shape==(3,18,32,3)
+    assert not color.pixels.flags.writeable
+    np.testing.assert_array_equal(color.pts_ticks,observed.pts_ticks)
+    with pytest.raises(ValueError,match='BGR color'):color.grayscale
+    reference=subprocess.run([ffmpeg,'-nostdin','-v','error','-i',str(path),'-an',
+        '-vf','select=eq(n\\,3),scale=32:18,format=bgr24','-frames:v','1','-f','rawvideo','pipe:1'],
+        check=True,capture_output=True,timeout=10)
+    assert color.pixels[0].tobytes()==reference.stdout
+    # Wrong long input is stopped by the next-frame sentinel, not discarded
+    # silently after the last requested custom image.
+    with pytest.raises(ValueError,match='census'):
+        observe_rendered_frames(path,expected_frames=23,selected_indexes=(0,10),pixel_format='bgr24',
+            width=32,height=18,ffmpeg=ffmpeg,timeout_seconds=10)
