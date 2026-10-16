@@ -113,6 +113,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _UPSTREAM_COMPONENTS = frozenset(
     {
         "face_member_cues",
+        "source_native_face_completion",
         "visual_feature_cache",
         "visual_score",
         "timeline_candidate",
