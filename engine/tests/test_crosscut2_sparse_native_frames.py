@@ -24,6 +24,16 @@ def test_unproven_long_gop_cannot_be_advertised_as_local_bounded_decode():
         with pytest.raises(ValueError):sparse.windows(values,clock())
 
 
+def test_explicit_preroll_budget_can_admit_a_verified_long_gop_without_a_fallback():
+    c=sparse.SeekClock(Fraction(30),1000,(0,),(),'a'*64)
+    with pytest.raises(sparse.UnsupportedSeek,match='preroll'):sparse.windows([270,271],c)
+    actual=sparse.windows([270,271],c,maximum_decode_seconds=12.)
+    assert actual==((268,273,0,(270,271)),)
+    # The requested frame identities and known IDR stay exact. Raising this
+    # explicit planning bound neither changes the clock nor scans blindly.
+    with pytest.raises(sparse.UnsupportedSeek):sparse.windows([900],c,maximum_decode_seconds=12.)
+
+
 def test_AVC_open_GOP_key_picture_is_not_a_random_access_IDR():
     import io
     packet=lambda kinds:b''.join((2).to_bytes(4,'big')+bytes([kind,0]) for kind in kinds)
