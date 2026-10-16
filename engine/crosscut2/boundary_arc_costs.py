@@ -117,7 +117,7 @@ def whole_viewports(entry,exit,*,length,cap):
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
-                 preserve_camera_alternatives=False):
+                 preserve_camera_alternatives=False,capture_playback_inputs=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -128,6 +128,14 @@ class ArcCosts:
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
         self.preserve_camera_alternatives=bool(preserve_camera_alternatives or readout_tau is not None)
         self.last_camera_alternatives=None
+        if capture_playback_inputs and not self.preserve_camera_alternatives:
+            raise ValueError('captured playback requires explicit all-camera alternatives')
+        self.capture_playback_inputs=bool(capture_playback_inputs);self.last_playback_inputs=None
+        self.captured_baseline_bytes=0
+        if self.capture_playback_inputs:
+            from .held_playback_inputs import frozen
+            self.dense=tuple(frozen(paths) for paths in dense);dense=self.dense
+            self.captured_baseline_bytes=sum(value.nbytes for value in dense)
         if readout_tau is not None:
             from .scene_readout import SceneReadout
             self.readouts=[SceneReadout(cat,native_ports[s],support.events[s],dense[s],tau=readout_tau)
@@ -309,6 +317,10 @@ class ArcCosts:
         shape=(len(self.entries[i]),len(self.exits[j]));cost=np.zeros(shape);allowed=np.zeros(shape,bool);codes=np.full(shape,-1,np.int8)
         if self.preserve_camera_alternatives:
             alternatives=np.zeros(shape+(6,));alternative_ok=np.zeros_like(alternatives,bool)
+        capture=None
+        if self.capture_playback_inputs:
+            from .held_playback_inputs import HoldRecorder
+            capture=HoldRecorder(self,i,j)
         if self.readouts is not None:
             from .scene_readout import IDENTITY,then
             transfers=np.broadcast_to(IDENTITY,shape+(6,4)).copy()
@@ -341,6 +353,7 @@ class ArcCosts:
                 if self.readouts is not None:direct,bridge_transfer=self.direct_cost(s,first,path,with_readout=True)
                 else:direct=self.direct_cost(s,first,path)
                 v=direct.reshape(len(p),len(q));ok=valid.reshape(v.shape);g=np.full(v.shape,4,np.int8)
+                if capture is not None:capture.record_direct(s,4,p,q,path)
                 if self.preserve_camera_alternatives:
                     ac[:,:,4]=v;av[:,:,4]=ok
                 if self.readouts is not None:
@@ -366,6 +379,7 @@ class ArcCosts:
                 if self.readouts is not None:direct,whole_transfer=self.direct_cost(s,first,safe,with_readout=True)
                 else:direct=self.direct_cost(s,first,safe)
                 actual=direct.reshape(len(p),len(q));valid=valid.reshape(v.shape)
+                if capture is not None:capture.record_direct(s,5,p,q,safe)
                 if self.preserve_camera_alternatives:
                     ac[:,:,5]=actual;av[:,:,5]=valid
                 if self.readouts is not None:
@@ -398,6 +412,7 @@ class ArcCosts:
                         transfers[np.ix_(p,q,[family])]=summary.reshape(len(p),len(q),1,4)
         self.last_codes=(i,j,codes)
         if self.preserve_camera_alternatives:self.last_camera_alternatives=(i,j,alternatives,alternative_ok)
+        if capture is not None:self.last_playback_inputs=capture.seal(alternative_ok)
         if self.readouts is not None:self.last_alternatives=(alternatives,alternative_ok,transfers)
         return cost,allowed,codes
 
