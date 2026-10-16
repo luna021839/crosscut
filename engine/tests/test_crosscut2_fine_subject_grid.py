@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from crosscut2.fine_subject_grid import propose, expand, rebind_hints, schedule
+from crosscut2.fine_subject_grid import propose, expand, rebind_hints, schedule, observe_style
 from crosscut2.source_member_scores import MemberScoreSeeds, bank_signature
 from crosscut2.fixed_holds import local_actor_hypotheses
 from crosscut2.dense_subject_catalogue import bind_windows
@@ -28,7 +28,7 @@ def inputs(count=2):
             pose_native_indices=schedule(warps[s],clocks[s],nodes[:,None]+[-7,-1,0,6],master_start=0.,fps=30.,final=200),
             native_readability=np.ones((3,2,8,4),np.float32),native_readability_valid=np.ones((3,2,8),bool)))
         poses.append(np.zeros((3,4,3,8,3),np.float32));states.append(np.zeros((3,4,3),np.uint8))
-        styles.append(dict(colour=np.ones((3,2,8,40),np.float32),colour_valid=np.ones((3,2,8),bool),
+        styles.append(dict(colour=np.ones((3,2,8,2,40),np.float32),colour_valid=np.ones((3,2,8),bool),
             presence=np.zeros((3,2,2),np.float32)))
     return nodes,banks,poses,styles,states,groups,warps,clocks
 
@@ -95,3 +95,25 @@ def test_gallery_query_profiles_remain_bound_while_new_cluster_numbers_can_chang
     bad=dict(bs[0],heads=bs[0]['heads'].copy());bad['heads'][0,0,0,0]+=.1
     with pytest.raises(ValueError,match='physical occurrence'):
         rebind_hints(banks,[bad,bs[1]],hints)
+
+
+def test_native_style_observes_only_new_actual_face_rows_and_keeps_original_values(monkeypatch,tmp_path):
+    from crosscut2 import source_style
+    nodes,banks,poses,styles,states,groups,warps,clocks=inputs();groups[1]=[]
+    bs,_,ss,_,_=expand(nodes,np.array([0,98,100,200]),banks,poses,styles,states,
+        groups,warps,clocks,master_start=0.,fps=30.)
+    calls=[]
+    def measure(*,sources,banks,cache,check,maximum_seconds):
+        calls.append(sources)
+        assert sources==['source-a'] and len(banks)==1
+        np.testing.assert_array_equal(banks[0]['native_indices'],[[97,98]])
+        return [dict(colour=np.full((1,2,8,2,40),.2,np.float32),
+            colour_valid=np.ones((1,2,8),bool),presence=np.full((1,2,2),.3,np.float32))],\
+            [dict(source=0,decoded_native_inputs=2,new_neural_calls=0)]
+    monkeypatch.setattr(source_style,'observe',measure)
+    result,receipt=observe_style(['source-a','source-b'],bs,ss,cache=tmp_path)
+    assert len(calls)==1 and receipt['decoded_native_inputs']==2
+    assert result[0]['colour_valid'][1].all() and not result[1]['colour_valid'][1].any()
+    assert not ss[0]['colour_valid'][1].any()  # old observation object not mutated
+    for old,new in zip(ss,result):
+        for key in old:np.testing.assert_array_equal(old[key][[0,2,3]],new[key][[0,2,3]])

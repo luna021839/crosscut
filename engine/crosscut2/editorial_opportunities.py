@@ -8,12 +8,17 @@ import numpy as np
 
 
 class Opportunities:
-    def __init__(self,nodes,music,*,fps,families):
+    def __init__(self,nodes,music,*,fps,families,beat_frames=None):
         self.nodes=np.asarray(nodes,int);self.music=np.asarray(music,float);self.fps=float(fps)
         if self.music.shape!=self.nodes.shape or not np.isfinite(self.music).all() or np.any((self.music<0)|(self.music>1)):
             raise ValueError('fixed measured music strengths required')
         self.families=tuple(families)
-        beats=self.nodes[self.music>0]
+        self.continuous_strength=beat_frames is not None
+        beats=self.nodes[self.music>0] if beat_frames is None else np.asarray(beat_frames)
+        if beat_frames is not None and not beats.size:beats=np.zeros(0,np.int64)
+        if beat_frames is not None and (beats.ndim!=1 or beats.dtype.kind not in 'iu' or np.any(np.diff(beats)<=0)
+                or np.any((beats<=0)|(beats>=self.nodes[-1]))):
+            raise ValueError('distinct observed interior beat frames required')
         self.boundaries=np.unique(np.r_[0,beats[::2],self.nodes[-1]])
         self.episodes=np.searchsorted(self.boundaries,self.nodes,side='right')-1
         self.utility=np.zeros(max(0,len(self.boundaries)-1));self.bindings={};self.exposures={}
@@ -77,6 +82,7 @@ class Opportunities:
     def receipt(self):
         return dict(contract='fixed_nonoverlapping_observed_music_opportunity_v1',
             event_kind='MATCH_ACTION_CHANGE',episode_boundaries=self.boundaries.tolist(),
+            music_strength_continuous_not_extra_beat_events=self.continuous_strength,
             episode_utility_density=self.utility.tolist(),raw_source_actor_bindings=len(self.bindings),
             credit_contract='fixed_event_utility_times_actual_seven_frame_action_coverage',
             full_hold_target_persistence_claimed=False,

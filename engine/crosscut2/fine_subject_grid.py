@@ -181,3 +181,38 @@ def rebind_hints(old_banks,new_banks,hints):
         result.append(MemberScoreSeeds(values,hint.vectors,hint.scores,bank_signature(new),hint.gallery_identity,
             hint.minimum_similarity,hint.minimum_member_margin) if isinstance(hint,MemberScoreSeeds) else values)
     return result
+
+
+def observe_style(sources,banks,styles,*,cache,check=lambda:None,maximum_seconds=180.):
+    """Measure only new, actually observed face rows; preserve coarse pixels.
+
+    Missing colour must not masquerade as a measured zero costume change.
+    The existing source-native decoder supplies real chest/background colour
+    without new face/pose inference, frame storage, or old cache rewrites.
+    """
+    from .source_style import observe
+    if not len(sources)==len(banks)==len(styles):
+        raise ValueError('one physical source and style bank per fine grid required')
+    selected=[];sub_banks=[];sub_sources=[]
+    for s,(path,bank) in enumerate(zip(sources,banks,strict=True)):
+        old=np.asarray(bank['fine_grid_old_indices'],int)
+        extra=np.ones(len(bank['heads']),bool);extra[old]=False
+        seen=((bank['heads'][...,2]>.019)&(bank['heads'][...,3]>=.75)).any((1,2))
+        at=np.flatnonzero(extra&seen)
+        if not len(at):continue
+        selected.append((s,at));sub_sources.append(path)
+        sub_banks.append(dict(heads=bank['heads'][at],native_indices=bank['native_indices'][at]))
+    output=[{k:np.array(v,copy=True) for k,v in style.items()} for style in styles]
+    if not selected:return output,dict(sources=[],new_neural_calls=0,decoded_native_inputs=0)
+    values,receipts=observe(sources=sub_sources,banks=sub_banks,cache=cache,check=check,
+        maximum_seconds=maximum_seconds)
+    for (s,at),value,row in zip(selected,values,receipts,strict=True):
+        for key,array in value.items():output[s][key][at]=array
+        row['source']=s;row['fine_grid_rows']=len(at)
+    for bank,before,after in zip(banks,styles,output,strict=True):
+        old=bank['fine_grid_old_indices']
+        if any(not np.array_equal(before[k][old],after[k][old]) for k in before):
+            raise AssertionError('fine colour changed an original measured row')
+    return output,dict(sources=receipts,new_neural_calls=0,
+        decoded_native_inputs=sum(r['decoded_native_inputs'] for r in receipts),
+        missing_style_fabricated=False,original_measured_rows_unchanged=True)

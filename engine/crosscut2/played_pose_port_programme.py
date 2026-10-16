@@ -49,7 +49,7 @@ class PlayedPosePortPrior:
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
-            'source_member_scores.py','fine_subject_grid.py']
+            'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -138,13 +138,16 @@ class SelectedPorts:
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
            identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
            check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.,
-           sequence_preference_model=None,sequence_source_bindings=None,sequence_context_kernel='numpy'):
+           sequence_preference_model=None,sequence_source_bindings=None,sequence_context_kernel='numpy',
+           music_event_frames=None):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
     played=bool(prior.artifact.get('played_interval_utility',False))
+    if music_event_frames is not None and not played:
+        raise ValueError('continuous musical strength requires the explicit played-interval path')
     sequence=sequence_preference_model is not None
     if sequence_context_kernel not in ('numpy','numba') or (not sequence and sequence_context_kernel!='numpy'):
         raise ValueError('explicit sequence model required for a changed context kernel')
@@ -211,9 +214,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if editorial:
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
-            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
+            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-        coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False))
+        coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -221,9 +224,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         # Nothing has been selected yet; do not patch an old chosen movie.
         from .editorial_opportunities import Opportunities
         opportunities=Opportunities(nodes,music,fps=fps,
-            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)])
+            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False))
+            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit

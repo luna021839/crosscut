@@ -30,6 +30,29 @@ def music_on_nodes(nodes, *, fps, master_start, rhythm):
     return values
 
 
+def continuous_music_context(nodes, *, fps, master_start, rhythm):
+    """Separate observed beat events from their continuous strength envelope.
+
+    A source-observed action moment between beats is not an invented beat.
+    Interpolation supplies only local musical strength, never pose, a new
+    episode boundary, a downbeat label, or repeated event credit.
+    """
+    music_on_nodes(nodes, fps=fps, master_start=master_start, rhythm=rhythm)
+    nodes = np.asarray(nodes)
+    beats = {}
+    for beat in rhythm.get('beat_grid', ()):
+        tick = round((float(beat['time_seconds'])-master_start)*fps)
+        beats[tick] = max(beats.get(tick, 0.), float(beat['strength']))
+    ticks = np.asarray(sorted(beats), np.int64)
+    if len(ticks):
+        strength = np.interp(nodes, ticks, [beats[int(t)] for t in ticks], left=0., right=0.)
+    else:
+        strength = np.zeros(len(nodes))
+    strength[[0,-1]] = 0.
+    events = ticks[(ticks > 0) & (ticks < nodes[-1])]
+    return strength, events
+
+
 def phase_tail(left, right):
     """Worst observed articulated residual; no torso-only match credit."""
     a, av = normalized_body(left)

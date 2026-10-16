@@ -19,7 +19,7 @@ class BoundaryPort:
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
-         coalesce_static_ports=False,recycle_static_capacity=False):
+         coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
@@ -92,6 +92,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(0)
                 continue
             native_pair=matrix(features(native_left,fps=fps),features(native_right,fps=fps),details=True)
+            if articulated_actions:
+                from .played_interval_utility import articulated_seam_evidence
+                native_pair=articulated_seam_evidence(native_pair,native_left,native_right)
             if opportunities is not None:
                 opportunities.observe(n,native_left,native_right,native_pair,left_sources,right_sources)
             role_strength=np.zeros(native_pair['pose_rate'].shape)
@@ -188,6 +191,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         physical_actor_pairs_compared_before_camera=actor_pairs_considered,
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
         raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
+        actual_articulated_action_used_before_global_pruning=bool(articulated_actions),
         original_feature_role_used_before_global_pruning=roles is not None,
         identical_static_port_aliases_coalesced=static_aliases,
         all_baseline_interior_camera_families_retained=True,

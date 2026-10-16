@@ -24,14 +24,16 @@ def articulated_seam_evidence(detail,left,right):
     rate=np.asarray(detail['pose_rate']).copy();direction=np.zeros_like(rate)
     measured=np.zeros(rate.shape,bool);components=np.zeros(rate.shape+(3,))
     for a,port_a in enumerate(left):
-        ca=port_a.observation.get('dense_subject_context')
+        observation_a=getattr(port_a,'observation',port_a)
+        ca=observation_a.get('dense_subject_context')
         if ca is None:continue
         for b,port_b in enumerate(right):
-            cb=port_b.observation.get('dense_subject_context')
+            observation_b=getattr(port_b,'observation',port_b)
+            cb=observation_b.get('dense_subject_context')
             if cb is None or not np.array_equal(ca['clock'].output_frames,cb['clock'].output_frames):continue
             geometry=dict(common_source_shot_sample_mask=ca['same_shot']&cb['same_shot'],
-                outgoing_camera=port_a.observation['camera_strip'][-1],
-                incoming_camera=port_b.observation['camera_strip'][0])
+                outgoing_camera=observation_a['camera_strip'][-1],
+                incoming_camera=observation_b['camera_strip'][0])
             value=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry)
             if not value['seam_action_supported']:continue
             measured[a,b]=True;direction[a,b]=value['seam_arm_direction_residual']

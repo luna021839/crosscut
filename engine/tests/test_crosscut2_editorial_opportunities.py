@@ -139,3 +139,35 @@ def test_new_consumer_is_explicit_and_keeps_existing_main_path_unchanged():
     assert receipt['boundary_port_domain']['raw_fixed_opportunity_used_before_global_pruning']
     assert receipt['editorial_opportunities']['role_handoff_objective_implemented'] is False
     assert score==pytest.approx(sum(sum(x['components'].values()) for x in receipt['selected_hold_cost_decomposition']))
+
+
+def test_continuous_strength_does_not_turn_fine_moments_into_extra_beat_episodes():
+    from crosscut2.opportunity import continuous_music_context
+    nodes=np.array([0,10,15,20,25,30,40])
+    rhythm=dict(beat_grid=[dict(time_seconds=t/10.,strength=s)
+        for t,s in ((10,.8),(20,.4),(30,.9))])
+    strength,events=continuous_music_context(nodes,fps=10.,master_start=0.,rhythm=rhythm)
+    np.testing.assert_allclose(strength,[0,.8,.6,.4,.65,.9,0])
+    event=Opportunities(nodes,strength,fps=10.,families=['a','b'],beat_frames=events)
+    np.testing.assert_array_equal(event.boundaries,[0,10,30,40])
+    assert event.episodes[2]==event.episodes[3]==event.episodes[4]
+    a,_,_=prepared(0,bump=.08);b,_,_=prepared(1,bump=.08)
+    left,right=obs(a,0),obs(b,1)
+    detail=matrix(features([left],fps=30.),features([right],fps=30.),details=True)
+    event.observe(2,[left],[right],detail,[0],[1])
+    assert event.bindings[(2,0,1,0,0)]>0  # real pose opportunity need not be an exact beat
+    assert event.receipt()['music_strength_continuous_not_extra_beat_events']
+    for bad in ([10,10],[-1,10],[40],np.array([10.])):
+        with pytest.raises(ValueError):Opportunities(nodes,strength,fps=10.,families=['a'],beat_frames=bad)
+
+
+def test_empty_or_single_beat_does_not_invent_a_continuous_music_region():
+    from crosscut2.opportunity import continuous_music_context
+    for rhythm in ({},dict(beat_grid=[dict(time_seconds=1.,strength=.7)])):
+        strength,events=continuous_music_context([0,5,10,15,20],fps=10.,master_start=0.,rhythm=rhythm)
+        assert strength[1]==strength[3]==0.
+        assert len(events)==len(rhythm.get('beat_grid',()))
+    legacy=Opportunities([0,100,200],[1,1,1],fps=30.,families=['a'])
+    np.testing.assert_array_equal(legacy.boundaries,[0,200])
+    explicit_empty=Opportunities([0,100,200],[0,0,0],fps=30.,families=['a'],beat_frames=[])
+    np.testing.assert_array_equal(explicit_empty.boundaries,[0,200])

@@ -88,6 +88,25 @@ def test_good_measured_arms_replace_missing_channel_penalty_without_losing_scree
     assert before['pose_rate'][0,0]>.25  # raw sparse evidence is unchanged
 
 
+def test_raw_actor_retrieval_consumes_the_same_articulated_action_before_pruning():
+    from crosscut2.boundary_port_domain import make
+    from test_crosscut2_dense_subject_catalogue import prepared
+    a,_,_=prepared(0,bump=.08);b,_,_=prepared(1,bump=.08)
+    paths=[[(np.array([0,200]),np.tile([1.,.5,.5],(2,1))) for _ in range(4)] for _ in range(2)]
+    class Capture:
+        detail=None
+        def observe(self,n,left,right,detail,*sources):self.detail=detail
+        def density(self,*args):return 0.
+    old=Capture();new=Capture()
+    make(a.nodes,[a,b],paths,fps=30.,maximum_pairs=0,opportunities=old)
+    _,_,_,receipt=make(a.nodes,[a,b],paths,fps=30.,maximum_pairs=0,
+        opportunities=new,articulated_actions=True)
+    assert 'articulated_arm_direction_measured' not in old.detail
+    mask=new.detail['articulated_arm_direction_measured']
+    assert mask.any() and (new.detail['pose_rate'][mask]<old.detail['pose_rate'][mask]).any()
+    assert receipt['actual_articulated_action_used_before_global_pruning']
+
+
 def test_measured_action_never_revives_a_missing_or_incompatible_change_cue():
     from types import SimpleNamespace
     from test_crosscut2_dense_subject_catalogue import prepared
