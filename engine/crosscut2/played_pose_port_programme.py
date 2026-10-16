@@ -48,7 +48,8 @@ class PlayedPosePortPrior:
             'sequence_preference_model.py','played_context.py','context_port_dp.py','sequence_context_kernel.py',
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
-            'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py']
+            'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
+            'source_member_scores.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -186,6 +187,11 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             from .editorial_roles import FeatureRoles
             roles=FeatureRoles(nodes,role_evidence)
         receipt.update(source_local_member_hints_consumed=True,featured_member_state=featured_receipt)
+        receipt['individual_member_score_fields']=[dict(source=s,
+            gallery_identity=bank.get('member_score_gallery_identity',''),
+            supported_face_occurrences=int((bank.get('member_score_support',np.zeros(0))>0).sum()),
+            raw_scores_are_not_probabilities=True,forced_member_labels=False,
+            raw_scores_or_embeddings_exported=False) for s,bank in enumerate(banks)]
     framing=None
     if editorial:
         from .programme_framing import evidence as framing_evidence
@@ -443,6 +449,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 appearance_used_in_objective=True,anonymous_appearance_is_not_member_identity=True,
                 anonymous_appearance_rate=float(detail['appearance_rate'][0,0]),
                 anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),
+                individual_member_score_influence=float(detail['individual_member_score_influence'][0,0]),
                 feature_handoff_strength=float(detail.get('feature_handoff_strength',np.zeros((1,1)))[0,0]),
                 editorial_transition_kind='SCENE_CHANGE' if ordinary else 'MATCH_ACTION_CANDIDATE',
                 successful_face_match_claimed=not ordinary and bool(detail['allowed'][0,0]),

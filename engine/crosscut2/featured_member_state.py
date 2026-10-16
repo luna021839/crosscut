@@ -13,6 +13,10 @@ def bind_hints(banks,hints,native_ports):
     if len(hints)!=len(banks):raise ValueError('one recurrent-hint array per actual source required')
     faces=[];native=[]
     for bank,values,ports in zip(banks,hints,native_ports):
+        from .source_member_scores import MemberScoreSeeds
+        individual=values if isinstance(values,MemberScoreSeeds) else None
+        if individual is not None:
+            individual.verify(bank);values=individual.cluster_hints
         labels,count=local_actor_hypotheses(bank);values=np.asarray(values)
         if (values.shape!=(count,) or values.dtype.kind not in 'iu'
                 or np.any((values<-1)|(values>=6))):raise ValueError('source-local hint/cluster domain changed')
@@ -38,7 +42,18 @@ def bind_hints(banks,hints,native_ports):
             second=np.take_along_axis(by_member,order[...,1:2],axis=-1)[...,0]
             known=(np.linalg.norm(query,axis=-1)>.5)&(best>=.55)&(best-second>=.03)
             result[...,:3]=np.where(known,order[...,0],-1)
-        native.append(dict(ports,member_hints=result))
+        augmented=dict(ports,member_hints=result)
+        if individual is not None:
+            for target,query in ((bank,bank['vectors']),(augmented,ports.get('vectors'))):
+                shape=target['heads'].shape[:3]
+                raw=np.zeros(shape+(6,));support=np.zeros(shape)
+                if query is not None:
+                    profile,weight=individual.project(query);width=profile.shape[-2]
+                    raw[...,:width,:]=profile;support[...,:width]=weight
+                raw.setflags(write=False);support.setflags(write=False)
+                target.update(member_score_profiles=raw,member_score_support=support,
+                    member_score_gallery_identity=individual.gallery_identity)
+        native.append(augmented)
     return faces,native
 
 

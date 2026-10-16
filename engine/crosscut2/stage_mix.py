@@ -300,6 +300,8 @@ def main():
         help='Opt-in coherent same-clock motion/style events with source-shot-constant paired cameras')
     parser.add_argument('--local-ive-photo-tool',type=Path,
         help='Explicit existing local IVE ArcFace/photo-bank tool directory; references remain private and are not copied')
+    parser.add_argument('--individual-member-scores',action='store_true',
+        help='Retain individual cached gallery likeness scores as soft appearance cues; no forced member labels')
     parser.add_argument('--native-part-pixel-support',action='store_true',
         help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
     parser.add_argument('--experimental-preference-model',type=Path,
@@ -363,6 +365,8 @@ def main():
         raise ValueError('coherent event experiment requires fixed body/native-readability/native-ports and legacy experiments OFF')
     if args.local_ive_photo_tool is not None and not args.joint_motion_event_seconds:
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
+    if args.individual_member_scores and (args.local_ive_photo_tool is None or not args.played_pose_port_camera_prior):
+        raise ValueError('individual member scores require explicit local photo assets and played port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if args.supplement_native_cut_flanks and not args.joint_motion_event_seconds:
@@ -558,7 +562,8 @@ def main():
                 identity_hints,identity_receipts=measure(sources=original.sources,banks=banks,census=camera_census,
                     photo_tool=args.local_ive_photo_tool,models=args.models,
                     cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
-                    maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288)
+                    maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288,
+                    preserve_member_scores=args.individual_member_scores)
             part_observer=None
             person_observer=None
             if args.person_rectangle_model is not None:

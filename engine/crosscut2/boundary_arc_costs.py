@@ -287,7 +287,20 @@ class ArcCosts:
                 if int(x) in lookup:all_hints[e]=bank['member_hints'][lookup[int(x)]]
             member=np.take_along_axis(np.broadcast_to(all_hints,(B,)+all_hints.shape),at[...,None],axis=3)[...,0]
             member=np.where(seen[None,:,None],member,-1)
-        appearance,_=appearance_discrepancy(own[:,:,0],own[:,:,1],member_a=member[:,:,0],member_b=member[:,:,1])
+        score_kwargs={}
+        if 'member_score_profiles' in bank:
+            profiles=np.zeros((E,2,8,6));strength=np.zeros((E,2,8))
+            for e,x in enumerate(xs):
+                if int(x) in lookup:
+                    k=lookup[int(x)];profiles[e]=bank['member_score_profiles'][k];strength[e]=bank['member_score_support'][k]
+            selected=np.take_along_axis(np.broadcast_to(profiles,(B,)+profiles.shape),
+                np.broadcast_to(at[...,None,None],(B,E,2,1,6)),axis=3).squeeze(3)
+            weight=np.take_along_axis(np.broadcast_to(strength,(B,)+strength.shape),at[...,None],axis=3)[...,0]
+            weight=np.where(seen[None,:,None]&(scores.max(-1)>0),weight,0.)
+            score_kwargs=dict(profile_a=selected[:,:,0],profile_b=selected[:,:,1],
+                support_a=weight[:,:,0],support_b=weight[:,:,1],
+                profile_compatible=bool(bank.get('member_score_gallery_identity','')))
+        appearance,_=appearance_discrepancy(own[:,:,0],own[:,:,1],member_a=member[:,:,0],member_b=member[:,:,1],**score_kwargs)
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
         valid=(scores.max(-1)>0).all(-1)
         face,displacement,scale=face_geometry(c[:,:,0]*[16/9,1.],h[:,:,0],c[:,:,1]*[16/9,1.],h[:,:,1],valid)

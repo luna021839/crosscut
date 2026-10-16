@@ -85,6 +85,9 @@ def features(observations, *, fps, person_extents=False):
     result['visible_quality_measured']=np.asarray([o.get('displayed_native_quality_measured',False)
         for o in observations],bool)
     result['member_hints']=np.asarray([o.get('recurrent_member_hint',-1) for o in observations],int)
+    result['individual_member_scores']=np.asarray([o.get('individual_member_score_profile',np.zeros(6)) for o in observations],float)
+    result['individual_member_score_support']=np.asarray([o.get('individual_member_score_support',0.) for o in observations],float)
+    result['individual_member_score_galleries']=np.asarray([o.get('individual_member_score_gallery','') for o in observations])
     if person_extents:
         from .person_extent import height_interval
         intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
@@ -165,8 +168,12 @@ def matrix(left, right, *, details=False):
     combined=(played_phase+played_bridge+context)/3.
     channels=np.where(supplied[...,None],combined,channels)
     pose = channels.mean(-1)
-    appearance,appearance_measured=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
-        member_a=left['member_hints'][:,None],member_b=right['member_hints'][None,:])
+    galleries_a=left['individual_member_score_galleries'][:,None];galleries_b=right['individual_member_score_galleries'][None,:]
+    appearance,appearance_measured,member_influence=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
+        member_a=left['member_hints'][:,None],member_b=right['member_hints'][None,:],
+        profile_a=left['individual_member_scores'][:,None],profile_b=right['individual_member_scores'][None,:],
+        support_a=left['individual_member_score_support'][:,None],support_b=right['individual_member_score_support'][None,:],
+        profile_compatible=(galleries_a!='')&(galleries_a==galleries_b),details=True)
     # Actual normalized chest/background histograms. Hellinger affinity uses
     # sqrt(p*q), not a plain dot product that calls identical broad histograms
     # "novel". Missing appearance/style/action earns NO change credit.
@@ -199,6 +206,7 @@ def matrix(left, right, *, details=False):
         played_body_placement_channels=(played_phase+played_bridge)/2.,
         common_clock_action_channels=context,
         appearance_rate=appearance,appearance_measured=appearance_measured,
+        individual_member_score_influence=member_influence,
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,measured_style_change=novelty,

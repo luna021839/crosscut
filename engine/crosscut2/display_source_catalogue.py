@@ -187,6 +187,11 @@ class SourceCatalogue:
             displayed_native_quality_contract=('target_ROI_native_detail_visibility_original_role_v1'
                 if self.editorial_content else 'legacy_display_quality_v1'),
             recurrent_member_hint=-1 if h<0 else int(self.member_hints[n,side,h]),
+            individual_member_score_profile=(np.zeros(6) if h<0 or 'member_score_profiles' not in self.bank
+                else self.bank['member_score_profiles'][n,side,h]),
+            individual_member_score_support=(0. if h<0 or 'member_score_support' not in self.bank
+                else float(self.bank['member_score_support'][n,side,h])),
+            individual_member_score_gallery=self.bank.get('member_score_gallery_identity',''),
             source_clock_context_is_sparse_model_hypothesis=True,
             appearance_vector=appearance,appearance_is_not_named_identity=True,
             person_native_ordinal=endpoint_native,

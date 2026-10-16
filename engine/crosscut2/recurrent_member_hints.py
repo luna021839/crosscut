@@ -102,7 +102,7 @@ def recover_query_snapshots(cache,binding,*,exclude=None):
 
 
 def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds=240.,maximum_calls=288,
-            cache_only_partial=False):
+            cache_only_partial=False,preserve_member_scores=False):
     if not len(sources)==len(banks)==len(census) or not 1<=maximum_seconds<=600 or not 0<=maximum_calls<=1024:
         raise ValueError('bounded source-local member-hint observation allowance required')
     started=monotonic();photo_tool=Path(photo_tool);models=Path(models);cache=Path(cache)
@@ -188,15 +188,22 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             checkpoint()
         finally:
             if dirty and file_identity(path)==identity:checkpoint()
-        hints=[]
+        hints=[];individual_votes=[None]*len(requests)
         for indices in groups:
             votes=[]
             for index in indices:
                 vector,valid=values.get(keys[index],(np.zeros(512,np.float32),False))
-                votes.append(gallery.classify(tuple(map(float,vector)) if valid else None,descriptor_space=space))
+                vote=gallery.classify(tuple(map(float,vector)) if valid else None,descriptor_space=space)
+                votes.append(vote);individual_votes[index]=vote
             hints.append(consensus(votes))
         if file_identity(path)!=identity:raise OSError('source changed before member-hint result')
-        result.append(np.asarray(hints,np.int16))
+        scores=None
+        if preserve_member_scores:
+            from .source_member_scores import from_queries
+            scores=from_queries(bank,requests,individual_votes,hints,gallery_identity=gallery.identity,
+                member_names=tuple(m.value for m in IVEMember),minimum_similarity=gallery.minimum_similarity,
+                minimum_member_margin=gallery.minimum_member_margin)
+        result.append(np.asarray(hints,np.int16) if scores is None else scores)
         receipt=dict(source=s,anonymous_source_clusters=count,preselected_faces=len(requests),
             labelled_by_recurrent_consensus=sum(h>=0 for h in hints),new_arcface_calls=source_calls,
             new_supplementary_detector_calls=source_detectors,reused_query_inputs=sum(k in preexisting_keys for k in keys),
@@ -205,6 +212,9 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             unobserved_query_inputs=len(unobserved_keys) if cache_only_partial else 0,
             missing_query_is_unknown_not_a_source_exclusion=bool(cache_only_partial),
             query_snapshot_recovery=recovery,
+            individual_gallery_scores_retained=preserve_member_scores,
+            individual_score_query_count=0 if scores is None else len(scores.vectors),
+            raw_score_profiles_are_not_member_probabilities=True,
             base_face_body_cache_invalidated=False,private_references_copied_or_exported=False,
             stage_video_hint_accuracy_calibrated=False,named_identity_certified=False,elapsed_seconds=monotonic()-started)
         receipts.append(receipt);print(json.dumps(dict(phase='source_recurrent_member_hints',**receipt)),flush=True)
