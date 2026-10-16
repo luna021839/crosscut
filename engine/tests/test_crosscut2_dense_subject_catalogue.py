@@ -127,3 +127,30 @@ def test_optional_dense_evidence_cannot_silently_enter_other_cli_mode(monkeypatc
     monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
         '--output','unused','--models','unused','--reuse-subject-observations','unused'])
     with pytest.raises(ValueError,match='explicit played port-camera'):main()
+
+
+def test_multiple_observation_plans_are_unioned_and_duplicate_paths_are_not_extra_tracks(tmp_path):
+    import json
+    from crosscut2.grid_perception import file_identity
+    from crosscut2.subject_window_bank import save
+    from crosscut2.dense_subject_catalogue import load_windows
+    _,first,_=prepared();second=replace(first,track='second-window',ordinals=first.ordinals+30)
+    source=tmp_path/'source.mp4';source.touch()
+    a,b=tmp_path/'first.npz',tmp_path/'second.npz'
+    save(first,a,provenance={});save(second,b,provenance={})
+    common=dict(render_plan=dict(sources=[str(source)],fps=30.,master_audio_start=0.),
+        source_sha256=['0'],source_file_identities=[file_identity(source)])
+    one,two=tmp_path/'one.json',tmp_path/'two.json'
+    one.write_text(json.dumps(dict(common,subject_moment_refinement_receipt=dict(window_receipts=[dict(source=0,path=str(a))]))))
+    two.write_text(json.dumps(dict(common,fixed_actor_camera_hold_receipt=dict(opportunity_subject_observations=dict(
+        window_receipts=[dict(source=0,path=str(a)),dict(source=0,path=str(b))])))))
+    groups=load_windows([one,two,one],sources=[source],source_hashes=['0'],master_start=0.,fps=30.,authorized_root=tmp_path)
+    assert len(groups)==1 and [w.track for w in groups[0]]==[first.track,second.track]
+    np.testing.assert_array_equal(groups[0][1].ordinals,second.ordinals)
+
+
+def test_extra_subject_plans_cannot_launch_an_unbound_cli_observation_path(monkeypatch):
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused','--extra-subject-observations','unused'])
+    with pytest.raises(ValueError,match='primary bound subject reference'):main()

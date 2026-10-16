@@ -320,6 +320,8 @@ def main():
         help='Explicit untrained GROUP E: physical focal played partial pose and immutable two-ended camera port DAG')
     parser.add_argument('--reuse-subject-observations',type=Path,
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
+    parser.add_argument('--extra-subject-observations',type=Path,action='append',default=[],
+        help='Additional immutable subject-observation plans merged with the primary source-bound reference')
     parser.add_argument('--editorial-opportunity-exposure',action='store_true',
         help='Explicit E4 trial: once-per-musical-episode actual subject exposure and readable framing deficit')
     parser.add_argument('--played-interval-utility',action='store_true',
@@ -415,6 +417,8 @@ def main():
         raise ValueError('bounded subject opportunity probe requires explicit E4 and bound existing subject observations')
     if args.explore_missing_action and args.opportunity_subject_spec is None:
         raise ValueError('missing action exploration requires an explicit bounded subject opportunity probe')
+    if args.extra_subject_observations and args.reuse_subject_observations is None:
+        raise ValueError('extra subject observations require the primary bound subject reference')
     started = monotonic()
     preference_model=None
     sequence_preference_model=None
@@ -591,7 +595,7 @@ def main():
             subjects=None
             if args.reuse_subject_observations is not None:
                 from .dense_subject_catalogue import load_reused
-                subjects=load_reused(args.reuse_subject_observations,sources=original.sources,
+                subjects=load_reused([args.reuse_subject_observations,*args.extra_subject_observations],sources=original.sources,
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,nodes=nodes,
                     warps=warps,clocks=camera_census,master_start=original.master_audio_start,fps=original.fps,
                     authorized_root=args.cache.parent.parent,check=check)
