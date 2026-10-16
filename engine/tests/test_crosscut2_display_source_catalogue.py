@@ -32,6 +32,19 @@ def test_catalogue_uses_physical_head_and_never_creates_motion_on_stationary_sou
     assert np.isfinite(batched).all()
 
 
+def test_explicit_source_cohort_keeps_original_indices_and_exact_cameras():
+    nodes,catalogues,paths=prepared()
+    _,_,old,_=make(nodes,catalogues,paths,fps=30.)
+    entry,exit,dense,receipt=make(nodes,catalogues,paths,fps=30.,source_cohort=(1,))
+    assert all(p.source==1 for row in (*entry,*exit) for p in row)
+    np.testing.assert_array_equal(old,dense)
+    assert receipt['source_cohort']==[1] and receipt['original_source_index_domain_preserved']
+    assert max(map(len,entry))<=12 and max(map(len,exit))<=12
+    for bad in ((),(0,0),(2,),(True,)):
+        with pytest.raises(ValueError,match='source cohort'):
+            make(nodes,catalogues,paths,fps=30.,source_cohort=bad)
+
+
 def test_proposal_pairs_retained_and_finite_global_domain_bound():
     nodes,catalogues,paths=prepared()
     entry,exit,dense,report=make(nodes,catalogues,paths,fps=30.)

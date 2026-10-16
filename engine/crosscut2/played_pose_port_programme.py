@@ -25,7 +25,7 @@ from .focal_appearance import cosine as focal_appearance_cosine
 class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
-                 shot_duration_model=None,recycle_static_capacity=False,person_attention=False):
+                 shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -41,6 +41,11 @@ class PlayedPosePortPrior:
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
+        self.source_cohort=None if source_cohort is None else tuple(source_cohort)
+        if self.source_cohort is not None and (not self.source_cohort or
+                any(type(s) is not int or s<0 for s in self.source_cohort) or
+                len(set(self.source_cohort))!=len(self.source_cohort)):
+            raise ValueError('distinct physical source cohort indices required')
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
@@ -114,6 +119,7 @@ class PlayedPosePortPrior:
                 unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['played_interval_utility']=bool(played_interval_utility)
         self.artifact['visible_person_competition']=self.person_attention
+        self.artifact['explicit_source_cohort']=self.source_cohort
         if self.person_attention:
             self.artifact.update(person_competition_unknown=.5,
                 person_competition_original_rectangles_only=True,
@@ -157,6 +163,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
+    cohort=getattr(prior,'source_cohort',None)
+    if cohort is not None and any(s>=len(banks) for s in cohort):
+        raise ValueError('source cohort escapes the physical source domain')
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
     played=bool(prior.artifact.get('played_interval_utility',False))
@@ -237,7 +246,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-        coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played)
+        coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
+        source_cohort=cohort)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -247,7 +257,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         opportunities=Opportunities(nodes,music,fps=fps,
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played)
+            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
+            source_cohort=cohort)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit

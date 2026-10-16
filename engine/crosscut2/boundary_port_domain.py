@@ -19,10 +19,15 @@ class BoundaryPort:
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
-         coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False):
+         coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
+    active=tuple(range(S)) if source_cohort is None else tuple(source_cohort)
+    if (not active or any(type(s) is not int or not 0<=s<S for s in active)
+            or len(set(active))!=len(active)):
+        raise ValueError('distinct actual source cohort indices required')
+    port_limit=4*len(active)+maximum_pairs
     extra_count=0;pair_capacities=[];natural_added=0;original_retained=0
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
     intent_cache={}
@@ -57,14 +62,14 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     rejected_reassignments=0;actor_pairs_considered=0;non_native_focal_pairs=0
     for n,tick in enumerate(nodes):
         check();incoming=[];outgoing=[]
-        for s in range(S):
+        for s in active:
             for family,curve in enumerate(dense[s]):
                 before=curve[np.clip(tick+np.arange(-7,0),0,final-1)]
                 after=curve[np.clip(tick+np.arange(0,7),0,final-1)]
                 add(outgoing,port(s,n,0,before,(('static',family),)))
                 add(incoming,port(s,n,1,after,(('static',family),)))
         proposals=[]
-        capacity=min(4*S+maximum_pairs-len(incoming),4*S+maximum_pairs-len(outgoing))
+        capacity=min(port_limit-len(incoming),port_limit-len(outgoing))
         if not maximum_pairs:capacity=0
         pair_capacities.append(capacity if recycle_static_capacity else maximum_pairs)
         if 0<n<N-1:
@@ -74,10 +79,11 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             # All three face/body-bound hypotheses remain available here;
             # a native fourth focal is retained with its honestly missing body.
             def observed(side):
-                values=[];sources=[];native_indices=[]
+                values=[];sources=[];native_indices=[-1]*S
                 for s,cat in enumerate(catalogues):
+                    if s not in active:continue
                     native=cat.observation(n,side,np.tile([1.,.5,.5],(7,1)))
-                    native_indices.append(native['head_index'])
+                    native_indices[s]=native['head_index']
                     indices=set(range(min(3,len(cat.bank['heads'][n,side]))))
                     if native['head_index']>=0:indices.add(native['head_index'])
                     for h in sorted(indices):
@@ -155,8 +161,8 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     right_obs=catalogues[b].observation(n,1,np.tile(right,(7,1)),target_head_index=hb_index)
                     feasibility[key]=bool(left_obs['target_is_displayed_focal'] and right_obs['target_is_displayed_focal'])
                 return feasibility[key]
-            for a in range(S):
-                for b in range(S):
+            for a in active:
+                for b in active:
                     for option in sorted(candidates.get((a,b),()),key=lambda x:x[:6]):
                         if not feasible(option):
                             # This CAMERA option lost the proposed focal; do
@@ -193,10 +199,11 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     target_head_index=ha))
                 add(incoming,port(b,n,1,np.tile(cb,(7,1)),(pair_id,),
                     target_head_index=hb))
-        if max(len(incoming),len(outgoing))>4*S+maximum_pairs:raise AssertionError('port domain grew beyond global bound')
+        if max(len(incoming),len(outgoing))>port_limit:raise AssertionError('port domain grew beyond global bound')
         entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(len(proposals))
     return entries,exits,dense,dict(global_paired_proposal_limit_per_node=max(pair_capacities,default=maximum_pairs),
-        baseline_paired_proposal_limit_per_node=maximum_pairs,global_port_limit_per_side=4*S+maximum_pairs,
+        baseline_paired_proposal_limit_per_node=maximum_pairs,global_port_limit_per_side=port_limit,
+        source_cohort=list(active),original_source_index_domain_preserved=True,
         identical_static_capacity_recycled=bool(recycle_static_capacity),
         additional_distinct_proposals_from_static_aliases=extra_count,
         retained_pair_counts=counts,maximum_entry_ports=max(map(len,entries)),maximum_exit_ports=max(map(len,exits)),
