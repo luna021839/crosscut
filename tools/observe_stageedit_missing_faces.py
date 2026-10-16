@@ -102,6 +102,42 @@ def read_journal(path, source, desired, *, resume):
     return rows
 
 
+def reusable_rows(directories, plan):
+    """Reuse physical measurements, not a neighbour time or another source."""
+    wanted={(q['source_id'],s['media_content_sha256'],q['native_frame'])
+        for g in plan['groups'] for q in g['queries']
+        for s in g['request']['sources'] if s['source_id']==q['source_id']}
+    result={};receipts=[]
+    for directory in directories:
+        parent=json.loads((directory/'plan.json').read_bytes())
+        for key in ('contract','gallery_identity','descriptor_space','detector_sha256','primary_selection'):
+            if parent[key]!=plan[key]:raise ValueError('reused face measurement model/gallery/selection differs')
+        for group in parent['groups']:
+            path=directory/(group['request_file_sha256']+'-observations.json')
+            raw=path.read_bytes();report=json.loads(raw);sha=hashlib.sha256(raw).hexdigest()
+            if (report.get('current_source_contents_verified_against_request') is not True
+                    or report.get('teacher_labels_consumed') is not False
+                    or report.get('gallery_identity')!=plan['gallery_identity']
+                    or report.get('descriptor_space')!=plan['descriptor_space']
+                    or report.get('request_file_sha256')!=group['request_file_sha256']
+                    or len(report['rows'])!=len(group['queries'])
+                    or {(r['source_id'],r['native_frame']) for r in report['rows']}
+                    !={(q['source_id'],q['native_frame']) for q in group['queries']}):
+                raise ValueError('reused source observation report is incomplete or incompatible')
+            count=0
+            for row in report['rows']:
+                key=(row['source_id'],row['media_content_sha256'],row['native_frame'])
+                if key not in wanted or row['state']=='FRAME_UNAVAILABLE':continue
+                copied={k:v for k,v in row.items() if k!='reused_from_observation_report_sha256'}
+                if key in result:
+                    old={k:v for k,v in result[key].items() if k!='reused_from_observation_report_sha256'}
+                    if old!=copied:raise ValueError('conflicting measurements for one exact source-native frame')
+                else:result[key]=dict(copied,reused_from_observation_report_sha256=sha)
+                count+=1
+            if count:receipts.append(dict(path=str(path),sha256=sha,exact_native_rows=count))
+    return result,receipts
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--snapshot', action='append', required=True)
@@ -114,6 +150,7 @@ def main():
     p.add_argument('--maximum-frames',type=int,default=8000)
     p.add_argument('--observe',action='store_true')
     p.add_argument('--resume',action='store_true')
+    p.add_argument('--reuse-observation-directory',type=Path,action='append',default=[])
     a=p.parse_args(); volume=Path('/Volumes/CrossCutMedia'); started=time.monotonic()
     if not 0<a.seconds<=1800 or not 1<=a.maximum_frames<=20000:
         p.error('one bounded observation allowance is required')
@@ -129,9 +166,12 @@ def main():
         detector_sha256=hashlib.sha256(Path('engine/crosscut/models/face_detection_yunet_2023mar.onnx').read_bytes()).hexdigest(),
         primary_selection='largest_visible_face_with_original_viewport_center_weight',
         input_selection='all_available_snapshot_candidates_with_absent_face_inputs')
+    external,reuse_receipts=reusable_rows(a.reuse_observation_directory,plan)
+    if reuse_receipts:plan['reused_observation_reports']=reuse_receipts
     plan_sha=digest(plan)
     print(json.dumps(dict(prepared_frames=count,groups=len(groups),snapshot_count=len(a.snapshot),
-        query_plan_sha256=plan_sha,observation_started=a.observe,teacher_labels_consumed=False)),flush=True)
+        query_plan_sha256=plan_sha,observation_started=a.observe,teacher_labels_consumed=False,
+        reusable_exact_native_measurements=len(external))),flush=True)
     if not a.observe:return
     if a.resume:
         if digest(json.loads((a.output/'plan.json').read_bytes()))!=plan_sha:
@@ -179,6 +219,15 @@ def main():
                 retained=read_journal(cache,source,desired,resume=a.resume)
                 calls['reused']+=len(retained)
                 identity=verify_source(source,device=a.ssd_device,check=live)
+                with cache.open('a') as f:
+                    for native in sorted(desired-set(retained)):
+                        reused=external.get((sid,source['media_content_sha256'],native))
+                        if reused is not None:
+                            f.write(json.dumps(reused,allow_nan=False)+'\n');f.flush()
+                            retained[native]=reused;calls['reused']+=1
+                if not desired-set(retained):
+                    results.extend(retained[n] for n in sorted(retained))
+                    continue
                 capture=cv2.VideoCapture(str(source['path']))
                 if not capture.isOpened():raise OSError('cannot open retained source')
                 try:
