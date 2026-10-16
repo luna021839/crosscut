@@ -6,7 +6,7 @@ import sys
 import numpy as np
 import pytest
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
-from render_frozen_subject_programme import validate_camera_clock,materialize_scored_cameras,camera_values
+from render_frozen_subject_programme import validate_camera_clock,materialize_scored_cameras,camera_values,remaining_render_space
 from crosscut.render import (RenderPlan,RenderSegment,AspectRatio,
     EditorialTransformTrack,EditorialTransformKeyframe)
 from crosscut2.subject_moment_sequence import curve_digest
@@ -20,6 +20,22 @@ def fixture():
     proof=[dict(source=0,first_frame=k*30,final_frame=(k+1)*30,
         native_first=60+k*30,native_last=89+k*30,scored_camera_sha256=camera) for k in range(2)]
     return plan,proof,[dict(fps=30.,frame_count=300,native_cuts=[75,100])]
+
+
+def test_render_storage_tracks_remaining_payload_and_keeps_reserve():
+    initial=remaining_render_space(145.4)
+    assert 2**30<initial<2*2**30
+    assert remaining_render_space(145.4,440_000_000)==initial-440_000_000
+    assert remaining_render_space(145.4,3*2**30)==2**30
+    assert remaining_render_space(3600.)>16*2**30
+    # A replacement encoder starts at0 bytes and reserves its full payload.
+    assert remaining_render_space(145.4,0)==initial
+
+
+@pytest.mark.parametrize('duration,written',[(float('nan'),0),(0.,0),(1.,-1),(1.,True)])
+def test_render_storage_rejects_invalid_progress_or_duration(duration,written):
+    with pytest.raises(ValueError,match='render duration'):
+        remaining_render_space(duration,written)
 
 
 def test_saved_subject_programme_checks_every_camera_and_exact_native_endpoints_without_reselection():

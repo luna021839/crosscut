@@ -3,6 +3,7 @@ import argparse
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import sys
@@ -16,6 +17,21 @@ from crosscut.render_frame_schedule import sampler_frame_schedule
 from crosscut.render_plan_serialization import render_plan_from_json
 from crosscut2.grid_perception import file_identity
 from crosscut2.subject_moment_sequence import curve_digest
+
+
+def remaining_render_space(duration_seconds,written_bytes=0):
+    """One atomic destination MP4 plus1GiB reserve, not a fixed2GiB cliff.
+
+    The explicit36Mbps video maxrate,320kbps audio,48Mbit VBV and16MiB
+    container allowance estimate outstanding bytes. The reserve remains even
+    when a software fallback exceeds this estimate. No existing output or
+    user data is deleted to make the budget fit.
+    """
+    if (type(duration_seconds) not in (int,float) or not math.isfinite(duration_seconds)
+            or duration_seconds<=0 or type(written_bytes) is not int or written_bytes<0):
+        raise ValueError('positive render duration and observed nonnegative byte count required')
+    payload=math.ceil(duration_seconds*(36_000_000+320_000)/8+48_000_000/8)+16*2**20
+    return 2**30+max(0,payload-written_bytes)
 
 
 def camera_values(segment,count,fps):
@@ -118,11 +134,15 @@ def main():
         raise ValueError('source/clock specification changed')
     report=plan.output.with_suffix('.render.json');claim=plan.output.with_suffix('.render.claim.json')
     if any(v.exists() for v in (plan.output,report,claim)):raise FileExistsError('recover the saved render; no overwrite/retry')
-    identities=record['source_file_identities']
+    identities=record['source_file_identities'];written=0;minimum_free=None
     def check():
+        nonlocal minimum_free
         if root.stat().st_dev!=args.ssd_device or not Path('/Volumes/CrossCutMedia').is_mount():raise OSError('authorized SSD changed')
         if [list(file_identity(v)) for v in plan.sources]!=identities:raise OSError('frozen source changed')
-        if shutil.disk_usage(root).free<2*2**30:raise OSError('insufficient authorized SSD working space')
+        free=shutil.disk_usage(root).free
+        minimum_free=free if minimum_free is None else min(minimum_free,free)
+        required=remaining_render_space(plan.output_frame_count/plan.fps,written)
+        if free<required:raise OSError(f'insufficient authorized SSD working space: {free} available, {required} still required')
     check()
     if 'subject_moment_refinement_receipt' in record:
         replay=record['subject_moment_refinement_receipt']['camera_native_replay']
@@ -149,7 +169,9 @@ def main():
     limit=plan.output_frame_count/plan.fps+35.;started=monotonic();peak=0;last=-10.;failure=None;codec=None
     with claim.open('x') as f:json.dump(dict(plan_sha256=hashlib.sha256(raw).hexdigest(),maximum_seconds=limit,automatic_retry=False),f)
     def progress(event):
-        nonlocal peak,last
+        nonlocal peak,last,written
+        size=event.get('total_size')
+        if type(size) is int and size>=0:written=size
         check()
         try:peak=max(peak,psutil.Process(event['pid']).memory_info().rss)
         except psutil.NoSuchProcess:pass
@@ -159,7 +181,8 @@ def main():
             print(json.dumps(dict(phase='frozen_subject_render',seconds=elapsed,event=event)),flush=True);last=elapsed
     try:
         codec=render(plan,ffmpeg='/opt/homebrew/bin/ffmpeg',maximum_runtime_seconds=limit,
-            video_bitrate='24M',progress_callback=progress)
+            video_bitrate='24M',video_maxrate='36M',video_buffer_size='48M',audio_bitrate='320k',
+            progress_callback=progress)
         check()
         if args.plan.read_bytes()!=raw:raise OSError('frozen plan changed while encoding')
     except Exception as exc:failure=dict(type=type(exc).__name__,message=str(exc))
@@ -167,6 +190,9 @@ def main():
         encoder_peak_RSS_bytes=peak,codec=codec,output_frames=plan.output_frame_count,
         plan_sha256=hashlib.sha256(raw).hexdigest(),selection_repeated=False,new_source_NN=0,
         exact_camera_materialization=materialization,render_input_plan=render_input,
+        disk_space_budget=dict(reserve_bytes=2**30,observed_output_bytes=written,
+            initial_required_bytes=remaining_render_space(plan.output_frame_count/plan.fps),
+            minimum_observed_free_bytes=minimum_free,fixed_two_GiB_completion_cliff_removed=True),
         normal_speed_audio_playback_performed=False,professional_quality_approved=False)
     if plan.output.exists():
         result['movie_bytes']=plan.output.stat().st_size
