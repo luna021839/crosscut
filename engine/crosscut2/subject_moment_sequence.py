@@ -17,6 +17,8 @@ def hold_curve(first, final, interior, entry, exit, *, cap,family='connectors'):
     ticks,values=interior
     base=_curve_at(np.asarray(ticks),np.asarray(values),np.arange(first,final))
     if family=='connectors':return build(np.asarray(entry),np.asarray(exit),base,cap=cap)
+    if family=='convex_connectors':
+        return convex_connectors(base,entry,exit,cap=cap)
     if family not in ('whole_viewport','whole_open'):raise ValueError('declared finite camera family required')
     entry=np.asarray(entry,float);exit=np.asarray(exit,float);length=len(base)
     if length<14:return build(entry,exit,base,cap=cap)
@@ -42,6 +44,50 @@ def hold_curve(first, final, interior, entry, exit, *, cap,family='connectors'):
     bends=np.flatnonzero(np.any(np.diff(path,2,axis=0)!=0.,axis=1))+1
     path.setflags(write=False);changed.setflags(write=False)
     return CameraArc(path,changed,tuple(sorted({0,length-1,*map(int,bends)})),family)
+
+
+def convex_connectors(base,entry,exit,*,cap,connector_frames=12):
+    """Local crop bridges in the convex inverse-zoom/centre domain.
+
+    For constant observed seam strips, blend each endpoint with the actual
+    baseline viewport, not an additive zoom/pan offset. Both endpoints and
+    that baseline can be legal while an additive offset leaves the padding
+    domain. This family preserves every seam sample and the long-hold middle;
+    it is not a camera/actor/comfort certificate or a whole-shot zoom hold.
+    The caller must not bridge an original native camera discontinuity.
+    """
+    base=np.asarray(base,float);entry=np.asarray(entry,float);exit=np.asarray(exit,float)
+    length=len(base)
+    if (isinstance(cap,(bool,np.bool_)) or not np.isfinite(cap) or cap<1
+            or length<14 or entry.shape!=(7,3) or exit.shape!=(7,3)
+            or type(connector_frames) is not int or connector_frames<1
+            or not realizable(base,cap) or not realizable(entry,cap) or not realizable(exit,cap)):
+        return None
+    if not np.array_equal(entry,np.broadcast_to(entry[-1],entry.shape)) \
+            or not np.array_equal(exit,np.broadcast_to(exit[0],exit.shape)):
+        return None  # no fabricated extension of a moving seam camera
+    inverse=base.copy();inverse[:,0]=1/inverse[:,0]
+    a=entry[-1].copy();b=exit[0].copy();a[0]=1/a[0];b[0]=1/b[0]
+    if length>=14+2*connector_frames:
+        for side,anchor in ((0,a),(1,b)):
+            for step in range(1,connector_frames):
+                k=6+step if side==0 else length-7-step
+                t=step/connector_frames;weight=1-3*t*t+2*t*t*t
+                inverse[k]=weight*anchor+(1-weight)*inverse[k]
+    else:
+        span=length-13
+        for k in range(7,length-7):
+            t=(k-6)/span;weight=3*t*t-2*t*t*t
+            inverse[k]=(1-weight)*a+weight*b
+    inverse[:,0]=1/inverse[:,0]
+    inverse[:7]=entry;inverse[-7:]=exit
+    if length>=14+2*connector_frames:
+        inverse[6+connector_frames:length-6-connector_frames]=base[6+connector_frames:length-6-connector_frames]
+    if not realizable(inverse,cap):return None
+    changed=np.any(inverse!=base,axis=1)
+    bends=np.flatnonzero(np.any(np.diff(inverse,2,axis=0)!=0.,axis=1))+1
+    inverse.setflags(write=False);changed.setflags(write=False)
+    return CameraArc(inverse,changed,tuple(sorted({0,length-1,*map(int,bends)})),'convex_connectors')
 
 
 def observed_view_cost(values,native_indices,windows,*,fps):

@@ -208,3 +208,50 @@ def test_window_arrays_are_immutable_and_comparison_does_not_mutate_original_obs
     matched(a,b)
     assert hashlib.sha256(a.body.tobytes()+b.body.tobytes()).hexdigest()==before
     with pytest.raises(ValueError):b.body[0,0,0]=1.
+
+
+def test_new_joint_crop_consumes_actual_played_body_without_unnecessary_grid_zoom():
+    from crosscut2.paired_geometry import joint_cameras
+    from crosscut2.action_geometry import action_crop_cost
+    a,b=window(0),window(1)
+    points=BASE.copy();points[4,0]=.05;points[5,0]=.95
+    a=replace(a,heads=np.tile([.25,.3,.2,.99],(len(a.ordinals),1)),
+        body=np.tile(points,(len(a.ordinals),1,1)))
+    b=replace(b,heads=np.tile([.35,.3,.24,.99],(len(b.ordinals),1)),
+        body=np.tile(points,(len(b.ordinals),1,1)))
+    old=joint_cameras(a.heads[0,:2],b.heads[0,:2],.2,.24,caps=(2.,2.))
+    value=matched(a,b,outgoing_locked=False,outgoing_cap=2.)
+    actual=[np.array(value[k]) for k in ('outgoing_camera','incoming_camera')]
+    assert value['camera_action_support_samples']==[2,2]
+    assert value['camera_construction_uses_played_side_observed_action']
+    assert value['face_residual']<1e-10
+    assert sum(c[0] for c in actual)<sum(c.zoom for c in old[:2])
+    def crop(z,c):return float(action_crop_cost([z],[c],points[None])[0])
+    assert sum(crop(c[0],c[1:]) for c in actual)<sum(crop(c.zoom,[c.x,c.y]) for c in old[:2])
+
+
+def test_camera_support_respects_explicit_support_mask_played_flank_and_native_cuts():
+    from crosscut2.subject_action_match import _camera_action_support
+    value=window(0,cut=(101,));ticks=np.arange(-6,7);at=np.arange(8,21)
+    support=value.support.copy();support[:,5]=False
+    value=replace(value,support=support)
+    # At native100, source-native101 is a new camera. Even a confident body
+    # cannot be used as the incoming focal person's continuation.
+    incoming=_camera_action_support(value,at,ticks,6,1)
+    assert incoming.shape==(1,8,3) and incoming[0,5,2]==0
+    outgoing=_camera_action_support(value,at,ticks,5,-1)
+    np.testing.assert_array_equal(outgoing[:,:,:2],value.body[[12,13],:,:2])
+    assert (outgoing[:,5,2]==0).all()
+    absent=replace(value,support=np.zeros_like(value.support))
+    assert _camera_action_support(absent,at,ticks,6,1) is None
+
+
+def test_unobserved_action_keeps_legacy_joint_geometry_without_a_fabricated_support():
+    from crosscut2.paired_geometry import joint_cameras
+    a,b=window(0,missing=True),window(1,missing=True)
+    value=matched(a,b,outgoing_locked=False,outgoing_cap=2.)
+    expected=joint_cameras(a.heads[0,:2],b.heads[0,:2],a.heads[0,2],b.heads[0,2],caps=(2.,2.))
+    np.testing.assert_array_equal(value['outgoing_camera'],[expected[0].zoom,expected[0].x,expected[0].y])
+    np.testing.assert_array_equal(value['incoming_camera'],[expected[1].zoom,expected[1].x,expected[1].y])
+    assert value['camera_action_support_samples']==[0,0]
+    assert not value['camera_construction_uses_played_side_observed_action']

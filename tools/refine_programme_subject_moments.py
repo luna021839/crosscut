@@ -40,6 +40,12 @@ def main():
         help='Explicit existing source/producer-bound window receipt; reuse actual covered native observations')
     parser.add_argument('--whole-hold-camera-family',action='store_true',
         help='Score a whole-viewport bridge and observed played crop loss before freezing; no forced return to neutral')
+    parser.add_argument('--cached-only',action='store_true',
+        help='Use exact already-observed windows only; missing coverage stays deferred, no new decode/model calls')
+    parser.add_argument('--freeze-cut-moments',action='store_true',
+        help='Explicit camera-only comparison: preserve all existing authored cut instants and source schedules')
+    parser.add_argument('--feasible-local-camera-connectors',action='store_true',
+        help='Include local convex viewport connectors on native-cut-free holds; preserve seam strips and baseline middle')
     args=parser.parse_args();started=monotonic()
     root=Path('/Volumes/CrossCutMedia/CrossCut-Validation').resolve(strict=True)
     if any(not p.resolve().is_relative_to(root) for p in (args.plan,args.cache,args.output)):
@@ -112,6 +118,22 @@ def main():
             playback_rate=segment.source_playback_rate,output_fps=fps,native_fps=source['fps'],
             native_count=source['frame_count'])
     def raw_head(seam,side):
+        if 'expected_output_focal' not in seam:
+            metric=seam['metrics'];suffix='A' if side==0 else 'B'
+            source=metric['source_'+suffix];track=metric['track_'+suffix]
+            ordinals=metric['native_'+suffix]
+            if (len(ordinals)<3 or len(ordinals)%2!=1
+                    or source!=seam['left_source' if side==0 else 'right_source']):
+                raise ValueError('refined seam source/window endpoint contract changed')
+            center=len(ordinals)//2;native=int(ordinals[center-1 if side==0 else center])
+            matches=[window for _,window in reused_windows if window.source==source and window.track==track
+                and window.ordinals[0]<=native<=window.ordinals[-1]]
+            if not matches:raise ValueError('refined seam seed absent from source-bound reused windows')
+            heads=[window.heads[native-int(window.ordinals[0])] for window in matches
+                if window.associated[native-int(window.ordinals[0])]]
+            if not heads or any(not np.array_equal(heads[0],head) for head in heads[1:]):
+                raise ValueError('refined seam source-local seed is missing or ambiguous')
+            return heads[0].copy()
         index=1 if side==0 else 2
         expected=seam['expected_output_focal'][index]
         camera=np.asarray(seam['actual_camera_strips'][side][-1 if side==0 else 0])
@@ -142,6 +164,8 @@ def main():
         # full-source decode, or permanent 'bad match' cache entry.
         unavailable=dict(source=s,reused=False,status='OBSERVATION_DEFERRED',
             reason='shared_new_observation_allowance',path_not_created=True)
+        if args.cached_only:
+            return None,dict(unavailable,reason='explicit_cached_only_observation_inventory')
         if (center not in new_centres and len(new_centres)>=12) or new_windows>=24:return None,unavailable
         for kind,count in (('face',len(wanted)),('pose',len(requests)),('raster',len(wanted)),('recognition',8*len(wanted))):
             if budget.used[kind]+count>getattr(budget,kind+'_limit'):return None,unavailable
@@ -193,8 +217,11 @@ def main():
     for i,seam in enumerate(parent['seams'],start=1):
         check();tick=int(starts[i]);a,b=plan.segments[i-1:i+1]
         radius=max(0,min(6,(tick-starts[i-1]-14)//2,(ends[i]-tick-14)//2))
+        if args.freeze_cut_moments:radius=0
         if min(tick-starts[i-1],ends[i]-tick)<14:
             levels.append([anchor(i)]);cases.append(dict(frame=tick,status='short_original_arc_unchanged'));continue
+        if 'expected_output_focal' not in seam and seam.get('metrics') is None:
+            levels.append([anchor(i)]);cases.append(dict(frame=tick,status='unobserved_refined_anchor_unchanged'));continue
         lc,rc=source_clock(a,starts[i-1],tick),source_clock(b,starts[i],tick)
         try:left,lreceipt=observed(a.source_index,lc,int(lc.native_indices[lc.output_frames==-1][0]),raw_head(seam,0),i)
         except TimeoutError:
@@ -227,8 +254,9 @@ def main():
             source_playback_rate=segment.source_playback_rate,native_fps=spec['sources'][s]['fps'],output_fps=fps,
             frame_count=b['frame']-a['frame'],source_frame_count=spec['sources'][s]['frame_count']).source_frame_indices
         families=['connectors']
-        if args.whole_hold_camera_family and not any(native[0]<cut<=native[-1] for cut in spec['sources'][s]['native_cuts']):
-            families.extend(('whole_viewport','whole_open'))
+        if not any(native[0]<cut<=native[-1] for cut in spec['sources'][s]['native_cuts']):
+            if args.whole_hold_camera_family:families.extend(('whole_viewport','whole_open'))
+            if args.feasible_local_camera_connectors:families.append('convex_connectors')
         candidates=[]
         for family in families:
             value=hold_curve(a['frame'],b['frame'],interiors[i],a['right_strip'],b['left_strip'],cap=spec['sources'][s]['zoom_cap'],family=family)
@@ -241,6 +269,8 @@ def main():
         return None if not candidates else min(candidates,key=lambda v:v['camera_cost'])
     selected,edge_receipts,receipt=choose(levels,arc,check=check)
     moments=[values[k] for values,k in zip(levels,selected)];segments=[];seams=[];proof=[]
+    if args.freeze_cut_moments and [v['frame'] for v in moments]!=[int(v) for v in np.r_[starts,final]]:
+        raise AssertionError('explicit camera-only comparison changed authored cut instants')
     for i,(a,b,edge) in enumerate(zip(moments[:-1],moments[1:],edge_receipts)):
         old=plan.segments[i];first,last=a['frame'],b['frame'];s=old.source_index
         curve=hold_curve(first,last,interiors[i],a['right_strip'],b['left_strip'],cap=spec['sources'][s]['zoom_cap'],family=edge['camera_family'])
@@ -269,6 +299,9 @@ def main():
         parent_plan_sha256=hashlib.sha256(parent_bytes).hexdigest(),old_observations_rewritten=False,
         new_observation_centres=len(new_centres),new_observation_windows=new_windows,
         observation_allowances=dict(centres=12,windows=24,face=768,pose=512,recognition=4096,raster=2048,seconds=180.),
+        explicitly_cached_only=args.cached_only,
+        explicitly_frozen_cut_moments=args.freeze_cut_moments,
+        feasible_local_camera_connectors_scored=args.feasible_local_camera_connectors,
         whole_hold_camera_family_scored=args.whole_hold_camera_family,
         selected_camera_families=[v['camera_family'] for v in edge_receipts],camera_edge_costs=edge_receipts,
         source_hashes_reused_from_identity_verified_parent=True,normal_app_path_validated=False)

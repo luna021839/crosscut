@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from crosscut2.subject_moment_sequence import choose,hold_curve,curve_digest,camera_motion,observed_view_cost
+from crosscut2.subject_moment_sequence import convex_connectors
 
 
 def moment(frame,cost=0.,*,observed=True):
@@ -123,3 +124,36 @@ def test_open_family_can_leave_breathing_room_without_a_twelve_frame_snapback():
     np.testing.assert_array_equal(curve.values[:7],entry);np.testing.assert_array_equal(curve.values[-7:],exit)
     assert camera_motion(curve.values,np.arange(90),[],fps=30.)<camera_motion(
         hold_curve(0,90,base,entry,exit,cap=1.35).values,np.arange(90),[],fps=30.)
+def test_convex_local_connectors_handle_legal_endpoints_that_additive_offsets_cannot_join():
+    from crosscut2.boundary_camera_arc import build,realizable
+    base=np.tile([1.,.5,.5],(80,1));base[:7,0]=1.2
+    entry=exit=np.tile([1.,.5,.5],(7,1))
+    assert build(entry,exit,base,cap=2.) is None
+    value=convex_connectors(base,entry,exit,cap=2.)
+    assert value is not None and realizable(value.values,2.)
+    np.testing.assert_array_equal(value.values[:7],entry)
+    np.testing.assert_array_equal(value.values[-7:],exit)
+    np.testing.assert_array_equal(value.values[18:-18],base[18:-18])
+
+
+@pytest.mark.parametrize('length',[14,15,20,37,38,39,80])
+def test_convex_local_connectors_preserve_every_boundary_sample_and_long_baseline_middle(length):
+    from crosscut2.boundary_camera_arc import realizable
+    base=np.tile([1.35,.52,.5],(length,1))
+    entry=np.tile([1.,.5,.5],(7,1));exit=np.tile([2.,.6,.55],(7,1))
+    value=convex_connectors(base,entry,exit,cap=2.)
+    assert value is not None and realizable(value.values,2.)
+    np.testing.assert_array_equal(value.values[:7],entry)
+    np.testing.assert_array_equal(value.values[-7:],exit)
+    assert not value.values.flags.writeable
+    if length>=38:np.testing.assert_array_equal(value.values[18:-18],base[18:-18])
+    replay=hold_curve(0,length,(np.arange(length),base),entry,exit,cap=2.,family='convex_connectors')
+    np.testing.assert_array_equal(replay.values,value.values)
+
+
+def test_convex_family_does_not_invent_a_moving_strip_extension_or_clamp_illegal_geometry():
+    base=np.tile([1.,.5,.5],(80,1));entry=np.tile([1.5,.5,.5],(7,1));exit=entry.copy()
+    entry[-1,1]=.51
+    assert convex_connectors(base,entry,exit,cap=2.) is None
+    entry[:]=[1.,.4,.5]
+    assert convex_connectors(base,entry,exit,cap=2.) is None

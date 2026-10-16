@@ -39,19 +39,31 @@ class Match:
     framing_loss: float = 0.
 
 
-def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35), *, support=(None, None)):
+def joint_cameras(a, b, ha, hb, caps=(1.35, 1.35), *, support=(None, None),
+                  include_shared_geometry_breakpoint=False):
     """Minimize realized scale/position error with no padding or zoom-out.
 
     Search a small *shared* target-size grid; extra crop can make a common
     focal position reachable. Choosing each camera separately misses this.
     """
     a, b = np.asarray(a, float), np.asarray(b, float)
-    if (a.shape != (2,) or b.shape != (2,) or not np.isfinite([*a, *b, ha, hb, *caps]).all()
+    if (type(include_shared_geometry_breakpoint) is not bool or a.shape != (2,) or b.shape != (2,) or not np.isfinite([*a, *b, ha, hb, *caps]).all()
             or min(ha, hb) <= 0 or any(not 1 <= c <= 2 for c in caps)):
         raise ValueError('finite geometry and supported zoom caps required')
     lower = max(ha, hb)
     upper = max(ha * caps[0], hb * caps[1])
     target = np.linspace(lower, upper, 9)
+    if include_shared_geometry_breakpoint:
+        # Exact smallest shared face extent whose no-padding screen-position
+        # rectangles intersect. A coarse9-point grid can skip it, trading a
+        # positional mismatch against unnecessary enlargement/action clipping.
+        # The existing radial pan check below still applies to the real crop;
+        # rectangle overlap is NOT an identity/pose/comfort certificate.
+        denominators=np.r_[a/ha-(b-1)/hb,b/hb-(a-1)/ha]
+        if np.all(denominators>0):
+            minimum=max(lower,float(np.max(1/denominators)))
+            if minimum<=min(ha*caps[0],hb*caps[1]):
+                target=np.unique(np.r_[target,minimum])
     za, zb = np.clip(target / ha, 1., caps[0]), np.clip(target / hb, 1., caps[1])
     # Evaluate the shared target grid in one numeric pass, not 9 Python loops
     # for every head pairing at every boundary.

@@ -79,6 +79,27 @@ def _visibility(head,camera,others):
     return fraction,float(score[0]/max(1e-12,float(score.max())))
 
 
+def _camera_action_support(window,indices,ticks,endpoint,side):
+    """At most two actual played-side body samples for crop construction.
+
+    Keep observed support, association and original-shot ownership. Missing
+    joints' raw confidence must not turn them into visible crop constraints.
+    No interpolated joints, unplayed opposite flank or identity inference.
+    """
+    native=window.ordinals[indices]
+    shot=np.searchsorted(window.native_cuts,native,side='right')
+    delta=ticks-ticks[endpoint]
+    valid=(delta*side>=0)&(np.abs(delta)<=4)&(shot==shot[endpoint])
+    valid &= window.associated[indices]&window.support[indices].any(-1)
+    eligible=np.flatnonzero(valid)
+    if not len(eligible):return None
+    nearest=eligible[np.argsort(np.abs(delta[eligible]),kind='stable')[:2]]
+    selected=np.sort(nearest);actual=indices[selected]
+    points=window.body[actual].copy()
+    points[...,2]=np.where(window.support[actual],points[...,2],0.)
+    return points
+
+
 def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
             nonzero_audio_and_mouth_verified=False,following_four_seconds_verified=False,
             outgoing_locked=True,outgoing_cap=None):
@@ -94,6 +115,7 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         raise ValueError('actual outgoing camera samples required')
     la,rb=int(np.flatnonzero(ticks==-1)[0]),int(np.flatnonzero(ticks==0)[0])
     ca=cameras[la];cb=incoming_camera(left.heads[a[la]],right.heads[b[rb]],ca,cap=incoming_cap)
+    camera_support=(None,None)
     if not outgoing_locked:
         # A NEW joint camera proposal, before programme selection. This is
         # not permission to patch the frozen old programme after DP or claim
@@ -101,7 +123,11 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         if outgoing_cap is None:raise ValueError('explicit outgoing zoom capacity required')
         ha,hb=left.heads[a[la]],right.heads[b[rb]]
         if min(ha[2],hb[2])>.019:
-            lc,rc,_=joint_cameras(ha[:2],hb[:2],ha[2],hb[2],caps=(outgoing_cap,incoming_cap))
+            camera_support=(_camera_action_support(left,a,ticks,la,-1),
+                _camera_action_support(right,b,ticks,rb,1))
+            lc,rc,_=joint_cameras(ha[:2],hb[:2],ha[2],hb[2],caps=(outgoing_cap,incoming_cap),
+                support=camera_support,
+                include_shared_geometry_breakpoint=any(v is not None for v in camera_support))
             ca=np.array([lc.zoom,lc.x,lc.y]);cb=np.array([rc.zoom,rc.x,rc.y])
             cameras=np.broadcast_to(ca,cameras.shape)
     common=left.support[a]&right.support[b]&left.associated[a,None]&right.associated[b,None]
@@ -170,6 +196,8 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         target_visible_fraction=visible,target_attention_ratio=attention,rank_score=score,
         outgoing_target_visible_fraction=outgoing_visible,outgoing_target_attention_ratio=outgoing_attention,
         outgoing_camera_locked=bool(outgoing_locked),new_joint_camera_before_selection=not outgoing_locked,
+        camera_action_support_samples=[0 if v is None else len(v) for v in camera_support],
+        camera_construction_uses_played_side_observed_action=any(v is not None for v in camera_support),
         candidate_has_measured_action=evidence,matched_identity_certified=False,anatomical_ownership_certified=False,
         target_reselected_after_camera=False,following_four_seconds_verified=following_four_seconds_verified,
         diagnostic_phase_only=bool(right_clock.phase_frames and not nonzero_audio_and_mouth_verified),
