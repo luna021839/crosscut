@@ -245,6 +245,7 @@ class ArcCosts:
                                 rr[ids,g]=self.readouts[s].summary(int(tick)-context,safe,hold_first=0,baseline=dense[s][g])
             self.left.append((left,left_ok));self.right.append((right,right_ok))
             if self.readouts is not None:self.readout_left.append(rl);self.readout_right.append(rr)
+        if self.played_interval_utility is not None:self.played_interval_utility.prepare(self)
 
     def movement(self,s,frames,values):
         """Quadratic digital velocity integral; native source jumps are not pans."""

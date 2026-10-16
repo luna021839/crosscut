@@ -134,6 +134,7 @@ class PlayedIntervalUtility:
             self.images.append(tuple(by_tick[t][1] for t in sorted(by_tick)))
         if len(self.images)!=len(delivery):raise ValueError('one image domain per source required')
         self.calls=0;self.sampled_camera_rows=0
+        self._prepared_for=None;self.prefix_interval_uses=0;self.clock_correction_rows=0
 
     @classmethod
     def from_catalogues(cls,catalogues,opportunities,*,check=lambda:None):
@@ -213,21 +214,25 @@ class PlayedIntervalUtility:
 
     def effects(self,source,frames,native,cameras):
         """Actual pointwise utility and motion replacement, never extrapolated."""
-        frames=np.asarray(frames,int);native=np.asarray(native,int);cameras=np.asarray(cameras,float)
+        return self._effects(source,frames,np.asarray(native,int),cameras)
+
+    def _effects(self,source,frames,native,cameras):
+        frames=np.asarray(frames,int);cameras=np.asarray(cameras,float)
         B=len(cameras);delivery=np.zeros(B);motion=np.zeros(B)
-        if (cameras.shape!=(B,len(frames),3) or native.shape!=frames.shape
+        if (cameras.shape!=(B,len(frames),3) or (native is not None and native.shape!=frames.shape)
                 or not np.isfinite(cameras).all() or np.any(cameras[:,:,0]<1.-1e-9)
-                or np.any(np.diff(frames)<=0) or np.any(native<0)):
+                or np.any(np.diff(frames)<=0) or (native is not None and np.any(native<0))):
             raise ValueError('actual sampled camera/native arrays required')
         samples=self.delivery[source];at=np.searchsorted(samples.frames,frames)
         safe=np.minimum(at,max(0,len(samples.frames)-1))
         if len(samples.frames):
-            hit=(at<len(samples.frames))&(samples.frames[safe]==frames)&(samples.native[safe]==native)
+            hit=(at<len(samples.frames))&(samples.frames[safe]==frames)
+            if native is not None:hit&=samples.native[safe]==native
             if hit.any():delivery=delivery_amount(samples,at[hit],cameras[:,hit]).sum(-1)/self.fps
         for row in self.images[source]:
             pair=np.asarray(row['output_frames'],int);where=np.searchsorted(frames,pair)
             if np.any(where>=len(frames)) or not np.array_equal(frames[where],pair):continue
-            if not np.array_equal(native[where],row['native_pair']):continue
+            if native is not None and not np.array_equal(native[where],row['native_pair']):continue
             first,last=cameras[:,where[0]],cameras[:,where[1]]
             energy,supported=displayed_energy_many(row['observation'],first,last,seconds=1./self.fps)
             digital=self.fps*(np.sum(((last[:,1:]-first[:,1:])*[16/9,1.])**2,axis=-1)
@@ -236,9 +241,11 @@ class PlayedIntervalUtility:
         return dict(observed_action_delivery_credit=delivery,composed_image_motion_delta=motion,
             adjustment=motion-delivery)
 
-    def adjust(self,arcs,i,j,source,ps,qs,costs,allowed):
+    def direct_adjust(self,arcs,i,j,source,ps,qs,costs,allowed,*,frames=None,correction=False):
+        """Independent direct oracle; also handles short/nonseparable paths."""
         from .boundary_arc_costs import camera_samples_many
-        first,final=map(int,self.nodes[[i,j]]);frames=self.frames(source,first,final)
+        first,final=map(int,self.nodes[[i,j]])
+        if frames is None:frames=self.frames(source,first,final)
         if not len(frames):return costs
         native=self.native(source,first,final,frames);result=costs.copy();self.calls+=1
         for code in range(6):
@@ -256,7 +263,90 @@ class PlayedIntervalUtility:
                 leave=np.asarray([arcs.exits[j][qs[k]].strip for k in qq])
                 cameras=camera_samples_many(entry,leave,baseline,frames-first,code=code)
                 effect=self.effects(source,frames,native,cameras)
-                result[pp,qq,code]+=effect['adjustment'];self.sampled_camera_rows+=len(pp)*len(frames)
+                delta=effect['adjustment']
+                if correction:delta=delta-self._effects(source,frames,None,cameras)['adjustment']
+                result[pp,qq,code]+=delta;self.sampled_camera_rows+=len(pp)*len(frames)
+        return result
+
+    def prepare(self,arcs):
+        """Compile the existing four fixed interiors and19-frame patches once.
+
+        These are provisional geometry integrals, not native-clock authority.
+        Each admitted interval still checks ALL consumed native ordinals and
+        corrects every mismatching sample with its actual camera values.
+        """
+        import weakref
+        from .boundary_arc_costs import cameras
+        if self._prepared_for is not None and self._prepared_for() is arcs:return
+        final=int(self.nodes[-1]);self._prefix=[];self._motion_at_first=[]
+        for source,paths in enumerate(arcs.dense):
+            paths=np.asarray(paths)
+            arcs.check();cost=np.zeros((4,final));motion=np.zeros_like(cost)
+            table=self.delivery[source]
+            if len(table.frames):
+                cost[:,table.frames]-=delivery_amount(table,np.arange(len(table.frames)),paths[:,table.frames])/self.fps
+            for row in self.images[source]:
+                a,b=row['output_frames']
+                if not 0<=a<b<final:continue
+                first,last=paths[:,a],paths[:,b]
+                energy,known=displayed_energy_many(row['observation'],first,last,seconds=1/self.fps)
+                digital=self.fps*(np.sum(((last[:,1:]-first[:,1:])*[16/9,1.])**2,axis=-1)
+                    +np.log(last[:,0]/first[:,0])**2)
+                motion[:,b]+=np.where(known,energy-digital,0.)
+            self._prefix.append(np.pad(np.cumsum(cost+motion,axis=1),((0,0),(1,0))))
+            self._motion_at_first.append(motion)
+        self._entry=[np.zeros((len(v),4)) for v in arcs.entries]
+        self._exit=[np.zeros((len(v),4)) for v in arcs.exits]
+        for n,tick in enumerate(self.nodes):
+            arcs.check()
+            for source,cat in enumerate(arcs.cats):
+                for side,ports,output in ((0,arcs.entries[n],self._entry[n]),(1,arcs.exits[n],self._exit[n])):
+                    first=int(tick) if side==0 else int(tick)-38
+                    if first<0 or first+38>final:continue
+                    ids=np.array([k for k,p in enumerate(ports) if p.source==source],int)
+                    if not len(ids):continue
+                    strips=np.asarray([ports[k].strip for k in ids])
+                    for code in range(4):
+                        baseline=arcs.dense[source][code][first:first+38]
+                        if side==0:
+                            path,valid=cameras(strips,np.broadcast_to(baseline[-7:],strips.shape),baseline,cap=cat.bank['zoom_cap'])
+                            frames=np.arange(first,first+19);new=path[:,:19];old=np.broadcast_to(baseline[:19],new.shape)
+                        else:
+                            path,valid=cameras(np.broadcast_to(baseline[:7],strips.shape),strips,baseline,cap=cat.bank['zoom_cap'])
+                            frames=np.arange(first+19,first+38);new=path[:,-19:];old=np.broadcast_to(baseline[-19:],new.shape)
+                        safe=np.where(valid[:,None,None],new,old)
+                        output[ids,code]=(self._effects(source,frames,None,safe)['adjustment']
+                            -self._effects(source,frames,None,old)['adjustment'])
+        self._prepared_for=weakref.ref(arcs)
+
+    def _clock_mismatches(self,source,first,final):
+        frames=self.frames(source,first,final)
+        if not len(frames):return frames
+        actual=self.native(source,first,final,frames);table=self.delivery[source];bad=[]
+        if len(table.frames):
+            at=np.searchsorted(table.frames,frames);safe=np.minimum(at,len(table.frames)-1)
+            hit=(at<len(table.frames))&(table.frames[safe]==frames)
+            bad.extend(frames[hit&(table.native[safe]!=actual)])
+        for row in self.images[source]:
+            pair=np.asarray(row['output_frames']);where=np.searchsorted(frames,pair)
+            if np.any(where>=len(frames)) or not np.array_equal(frames[where],pair):continue
+            if not np.array_equal(actual[where],row['native_pair']):bad.extend(pair)
+        return np.unique(bad).astype(np.int64)
+
+    def adjust(self,arcs,i,j,source,ps,qs,costs,allowed):
+        first,final=map(int,self.nodes[[i,j]])
+        if final-first<38:return self.direct_adjust(arcs,i,j,source,ps,qs,costs,allowed)
+        self.prepare(arcs);result=costs.copy()
+        baseline=self._prefix[source][:,final]-self._prefix[source][:,first]-self._motion_at_first[source][:,first]
+        result[:,:,:4]+=baseline[None,None,:]+self._entry[i][ps,None,:]+self._exit[j][None,qs,:]
+        self.prefix_interval_uses+=1
+        bad=self._clock_mismatches(source,first,final)
+        if len(bad):
+            mask=allowed.copy();mask[:,:,4:]=False
+            result=self.direct_adjust(arcs,i,j,source,ps,qs,result,mask,frames=bad,correction=True)
+            self.clock_correction_rows+=len(bad)
+        direct=allowed.copy();direct[:,:,:4]=False
+        if direct.any():result=self.direct_adjust(arcs,i,j,source,ps,qs,result,direct)
         return result
 
     def replay(self,source,first,final,curve):
@@ -270,6 +360,7 @@ class PlayedIntervalUtility:
             targets=list(self.targets),observed_samples=[len(s.frames) for s in self.delivery],
             image_pairs=[len(v) for v in self.images],conflicting_image_pairs=self.conflicts,
             candidate_calls=self.calls,sampled_camera_rows=self.sampled_camera_rows,
+            compiled_prefix_interval_uses=self.prefix_interval_uses,exact_native_clock_correction_rows=self.clock_correction_rows,
             entry_density_times_hold_duration=False,seven_frame_credit_used=False,
             utility_is_pointwise_and_segment_split_invariant=True,unknown_exposure_interpolated=False,
             actual_candidate_native_ordinals_checked=True,source_NN=0,source_decode=0,

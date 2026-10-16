@@ -223,6 +223,34 @@ def test_actual_programme_consumer_replays_new_interval_costs_and_no_entry_bonus
     assert not receipt['professional_quality_approved']
 
 
+@pytest.mark.parametrize('changed_clock',[False,True])
+def test_compiled_fixed_interiors_and_patches_equal_direct_all_codes_with_image_and_clock_gaps(changed_clock):
+    from test_crosscut2_boundary_arc_costs import arc_fixture
+    nodes,entries,exits,arcs,_=arc_fixture(False,preserve_camera_alternatives=True)
+    value=samples(54)
+    if changed_clock:
+        native=value.native.copy();native[5::7]+=1;value=replace(value,native=native)
+    field=utility([value,value],nodes=nodes,images=[
+        [image_pair(6,7,.02),image_pair(17,18,-.02),image_pair(18,19,.03),image_pair(35,36,.02)],
+        [image_pair(30,31,.03),image_pair(40,41,-.03)]])
+    arcs.played_interval_utility=field
+    calls=0
+    for i in range(len(nodes)-1):
+        for j in range(i+1,len(nodes)):
+            for source in range(2):
+                p=np.array([k for k,v in enumerate(entries[i]) if v.source==source])
+                q=np.array([k for k,v in enumerate(exits[j]) if v.source==source])
+                if not len(p) or not len(q):continue
+                arcs(i,j);allowed=arcs.last_camera_alternatives[3][np.ix_(p,q,np.arange(6))]
+                zero=np.zeros(allowed.shape)
+                direct=field.direct_adjust(arcs,i,j,source,p,q,zero,allowed)
+                compiled=field.adjust(arcs,i,j,source,p,q,zero,allowed)
+                np.testing.assert_allclose(compiled[allowed],direct[allowed],rtol=1e-11,atol=1e-11)
+                calls+=1
+    assert calls and field.prefix_interval_uses>0
+    if changed_clock:assert field.clock_correction_rows>0
+
+
 def test_malformed_actual_camera_is_not_hidden_by_unknown_delivery():
     value=samples();field=utility([value]);camera=np.tile([1.,.5,.5],(1,90,1));camera[0,0,0]=np.nan
     with pytest.raises(ValueError,match='actual sampled'):
