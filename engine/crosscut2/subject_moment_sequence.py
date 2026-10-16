@@ -151,6 +151,19 @@ def camera_motion(values, native_indices, native_cuts, *, fps):
     return float(movement.sum())
 
 
+def camera_path_cost(values, native_indices, native_cuts, windows, *, fps):
+    """Score an actual path independently of which families were proposed.
+
+    Choosing whether to offer a whole-shot family must never turn off the
+    content cost of an otherwise identical local connector. Missing subject
+    observations remain explicit coverage, not a whole-hold visibility claim.
+    """
+    motion = camera_motion(values, native_indices, native_cuts, fps=fps)
+    view = observed_view_cost(values, native_indices, windows, fps=fps)
+    return dict(camera_cost=motion+view['observed_crop_cost']+view['digital_zoom_cost'],
+                digital_motion_cost=motion, **view)
+
+
 def choose(levels, hold, *, check=lambda:None):
     """Exact chain DP over one finite pose/connection/camera sum.
 

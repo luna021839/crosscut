@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from crosscut2.subject_moment_sequence import choose,hold_curve,curve_digest,camera_motion,observed_view_cost
 from crosscut2.subject_moment_sequence import convex_connectors
+from crosscut2.subject_moment_sequence import camera_path_cost
 
 
 def moment(frame,cost=0.,*,observed=True):
@@ -104,6 +105,58 @@ def test_camera_rounding_tolerance_does_not_create_negative_content_cost():
     value=observed_view_cost(camera,np.arange(86,115),[w],fps=30.)
     assert value['observed_crop_cost']>=0 and value['digital_zoom_cost']>=0
     np.testing.assert_array_equal(camera,saved)
+
+
+def test_all_local_families_pay_whole_hold_view_cost_before_camera_selection():
+    """Pro F253: the actual90-frame legal-family winner changes with the cost.
+
+    Synthetic observed body/face support; no real-film benefit is asserted.
+    Offering whole-shot camera families is not needed to pay this cost.
+    """
+    from types import SimpleNamespace
+    length=90;native=np.arange(length)
+    body=np.array([[.4,.4,.9],[.6,.4,.9],[.35,.5,.9],[.65,.5,.9],
+                   [.15,.55,.9],[.85,.55,.9],[.43,.7,.9],[.57,.7,.9]])
+    window=SimpleNamespace(ordinals=native,associated=np.ones(length,bool),
+        heads=np.tile([.5,.3,.2,.99],(length,1)),body=np.tile(body,(length,1,1)),
+        support=np.ones((length,8),bool),competitors=tuple(np.zeros((0,4)) for _ in native))
+    base=np.array([[1.3407834406393584,.5039068465781759,.5028197199065984],
+        [1.0856397414190302,.504322873714037,.5028058293945431],
+        [1.4431110024195715,.5198280180493401,.49381993969956994],
+        [1.0893981294376767,.5030689863798059,.4824388753363989]])
+    endpoints=np.array([[1.6373467719602766,.5586491108123623,.48374104238864907],
+                        [1.252752488334927,.5462584245729089,.5296537252702411]])
+    costs={};curves={}
+    for family in ('connectors','convex_connectors'):
+        curve=hold_curve(0,length,([0,30,60,89],base),np.tile(endpoints[0],(7,1)),
+            np.tile(endpoints[1],(7,1)),cap=1.8,family=family)
+        assert curve is not None
+        curves[family]=curve
+        costs[family]=camera_path_cost(curve.values,native,[],[window],fps=30.)
+        assert costs[family]['camera_cost']==pytest.approx(sum(costs[family][k]
+            for k in ('digital_motion_cost','observed_crop_cost','digital_zoom_cost')))
+        assert costs[family]['observed_output_frames']==length
+        assert costs[family]['unobserved_output_frames']==0
+        assert not costs[family]['full_hold_subject_visibility_certified']
+    assert min(costs,key=lambda k:costs[k]['digital_motion_cost'])=='connectors'
+    assert min(costs,key=lambda k:costs[k]['camera_cost'])=='convex_connectors'
+    # An unrelated offer cannot alter either existing path's actual score.
+    before={k:dict(v) for k,v in costs.items()}
+    extra=hold_curve(0,length,([0,30,60,89],base),np.tile(endpoints[0],(7,1)),
+        np.tile(endpoints[1],(7,1)),cap=1.8,family='whole_viewport')
+    assert extra is not None
+    camera_path_cost(extra.values,native,[],[window],fps=30.)
+    for family,curve in curves.items():
+        assert camera_path_cost(curve.values,native,[],[window],fps=30.)==before[family]
+
+
+def test_unobserved_path_cost_keeps_unknown_coverage_and_known_digital_zoom():
+    values=np.tile([1.35,.5,.5],(90,1))
+    value=camera_path_cost(values,np.arange(90),[],[],fps=30.)
+    assert value['observed_output_frames']==0 and value['unobserved_output_frames']==90
+    assert value['observed_crop_cost']==0 and value['digital_zoom_cost']>0
+    assert value['camera_cost']==value['digital_zoom_cost']
+    assert not value['full_hold_subject_visibility_certified']
 
 
 def test_tiny_pose_improvement_cannot_outweigh_arbitrarily_bad_camera_cost():

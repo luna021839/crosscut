@@ -24,7 +24,7 @@ from crosscut2 import sparse_native_frames as sparse,subject_window_bank as bank
 from crosscut2.grid_perception import file_identity
 from crosscut2.subject_action_match import clock
 from crosscut2.subject_cut_moments import search
-from crosscut2.subject_moment_sequence import choose,hold_curve,curve_digest,camera_motion,observed_view_cost
+from crosscut2.subject_moment_sequence import choose,hold_curve,curve_digest,camera_path_cost
 from crosscut2.fixed_holds import _curve_at
 from crosscut2.rtmw_pose import WholeBodySensor,MODEL_SHA256
 
@@ -39,7 +39,7 @@ def main():
     parser.add_argument('--reuse-subject-observations',type=Path,
         help='Explicit existing source/producer-bound window receipt; reuse actual covered native observations')
     parser.add_argument('--whole-hold-camera-family',action='store_true',
-        help='Score a whole-viewport bridge and observed played crop loss before freezing; no forced return to neutral')
+        help='Offer whole-viewport bridge families; every family always pays observed played crop and zoom costs')
     parser.add_argument('--cached-only',action='store_true',
         help='Use exact already-observed windows only; missing coverage stays deferred, no new decode/model calls')
     parser.add_argument('--freeze-cut-moments',action='store_true',
@@ -261,11 +261,8 @@ def main():
         for family in families:
             value=hold_curve(a['frame'],b['frame'],interiors[i],a['right_strip'],b['left_strip'],cap=spec['sources'][s]['zoom_cap'],family=family)
             if value is None:continue
-            motion=camera_motion(value.values,native,spec['sources'][s]['native_cuts'],fps=fps)
-            view=observed_view_cost(value.values,native,held_windows[i],fps=fps) if args.whole_hold_camera_family else {}
-            cost=motion+view.get('observed_crop_cost',0.)+view.get('digital_zoom_cost',0.)
-            candidates.append(dict(camera_cost=cost,digital_motion_cost=motion,camera_family=family,
-                camera_sha256=curve_digest(value.values),**view))
+            costs=camera_path_cost(value.values,native,spec['sources'][s]['native_cuts'],held_windows[i],fps=fps)
+            candidates.append(dict(camera_family=family,camera_sha256=curve_digest(value.values),**costs))
         return None if not candidates else min(candidates,key=lambda v:v['camera_cost'])
     selected,edge_receipts,receipt=choose(levels,arc,check=check)
     moments=[values[k] for values,k in zip(levels,selected)];segments=[];seams=[];proof=[]
@@ -303,6 +300,7 @@ def main():
         explicitly_frozen_cut_moments=args.freeze_cut_moments,
         feasible_local_camera_connectors_scored=args.feasible_local_camera_connectors,
         whole_hold_camera_family_scored=args.whole_hold_camera_family,
+        whole_hold_view_cost_scored_for_every_family=True,
         selected_camera_families=[v['camera_family'] for v in edge_receipts],camera_edge_costs=edge_receipts,
         source_hashes_reused_from_identity_verified_parent=True,normal_app_path_validated=False)
     record={k:v for k,v in parent.items() if k not in ('render_plan','seams','fixed_actor_camera_hold_receipt',
