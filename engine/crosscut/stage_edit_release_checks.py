@@ -7,6 +7,7 @@ import numpy as np
 
 LIMITS=dict(max_raw76_step_drift=1.,max_normalized_value_step_drift=.25,
     max_projected_train_sigma_step_drift=10.)
+FEATURE_RELEASE_SCALES=(1.,.1,.01,.001)
 
 
 def capture_sources(model,probes,projections,normalizer,*,check=lambda:None):
@@ -51,14 +52,78 @@ def snapshot_transaction(model,optimizer):
     from mlx.utils import tree_map
     # MLX leaves are immutable; copy tree containers, not 106M arrays to disk.
     return dict(parameters=tree_map(lambda v:v,model.parameters()),
-        optimizer=tree_map(lambda v:v,optimizer.state),rng=[mx.array(np.array(k,copy=True)) for k in mx.random.state])
+        optimizer=tree_map(lambda v:v,optimizer.state),rng=[mx.array(np.array(k,copy=True)) for k in mx.random.state],
+        training_modes=tuple((name,module.training) for name,module in model.named_modules()))
+
+
+def _restore_modes(model,snapshot):
+    modules=model.named_modules()
+    if tuple(name for name,_ in modules)!=tuple(name for name,_ in snapshot['training_modes']):
+        raise ValueError('release transaction module domain changed')
+    # Parent-before-child restores even mixed eval/train submodule states.
+    for (_,module),(_,mode) in zip(modules,snapshot['training_modes'],strict=True):
+        module.train(mode)
 
 
 def restore_transaction(model,optimizer,snapshot):
     import mlx.core as mx
     from .stage_edit_production_training import _parameter_tree_sha256
     model.update(snapshot['parameters']);optimizer.state=snapshot['optimizer'];mx.random.state=snapshot['rng']
+    _restore_modes(model,snapshot)
     mx.eval(model.parameters(),optimizer.state)
     if (_parameter_tree_sha256(model.parameters())!=_parameter_tree_sha256(snapshot['parameters'])
             or _parameter_tree_sha256(optimizer.state)!=_parameter_tree_sha256(snapshot['optimizer'])):
         raise AssertionError('release rollback did not restore parameter/optimizer state')
+    if len(mx.random.state)!=len(snapshot['rng']) or any(not np.array_equal(np.asarray(a),np.asarray(b))
+            for a,b in zip(mx.random.state,snapshot['rng'],strict=True)):
+        raise AssertionError('release rollback did not restore RNG state')
+
+
+class ReleaseProposalRejected(AssertionError):
+    def __init__(self,receipt):
+        super().__init__('all four predeclared feature-release proposals failed; exact rollback and stop')
+        self.receipt=receipt
+
+
+def apply_bounded_feature_release(model,optimizer,*,before,before_sources,capture,check=lambda:None):
+    """Inspect ONE already-computed AdamW proposal, never rerun the optimizer.
+
+    Scale only the five shared feature modules, always from the same original
+    parameter tree. Other supervised heads retain the full proposal. This is
+    an explicit diagnostic mechanism, not a production/fit/AV qualification.
+    All candidate forwards, snapshots and checks consume the caller's budget.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_map
+    from .stage_edit_production_training import DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES
+    proposal=snapshot_transaction(model,optimizer)
+    receipt=dict(contract='single_adamw_proposal_bounded_feature_release_v1',
+        scales=list(FEATURE_RELEASE_SCALES),attempts=[],accepted_scale=None,
+        optimizer_proposals=1,optimizer_moments_interpolated=False,rollback_performed=False)
+    try:
+        for alpha in FEATURE_RELEASE_SCALES:
+            check()
+            candidate=tree_map(lambda v:v,proposal['parameters'])
+            for name in DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES:
+                if alpha!=1.:
+                    candidate['base'][name]=tree_map(lambda a,b:a+alpha*(b-a),
+                        before['parameters']['base'][name],proposal['parameters']['base'][name])
+            model.update(candidate)
+            model.eval();mx.random.state=proposal['rng']
+            mx.eval(model.parameters())
+            check()
+            drift=compare_drift(before_sources,capture())
+            check()
+            receipt['attempts'].append(dict(scale=alpha,drift=drift))
+            if drift['passed']:
+                # Exactly one moment/step and one training RNG advance, even
+                # after several candidate eval forwards. No moment blending.
+                optimizer.state=proposal['optimizer'];mx.random.state=proposal['rng']
+                _restore_modes(model,proposal)
+                receipt['accepted_scale']=alpha
+                return receipt
+        raise ReleaseProposalRejected(receipt)
+    except Exception:
+        restore_transaction(model,optimizer,before)
+        receipt['rollback_performed']=True
+        raise

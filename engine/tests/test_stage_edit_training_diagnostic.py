@@ -157,5 +157,41 @@ class TrainingDiagnosticInstrumentTests(unittest.TestCase):
     def test_zero_tree_has_finite_norm(self):
         self.assertEqual(diagnostic.tree_norm({}),0.)
 
+    def test_label_fit_of_bad_prior_never_replaces_final_decoded_curve_conjunction(self):
+        initial=.10699194686674549
+        metric=dict(normalized_mae=.697441,
+            dynamic_subset=dict(improvement_over_static_prior=.1),
+            predictions=[dict(predicted_count=1,motion_logit=-1.),dict(predicted_count=3,motion_logit=1.)],
+            label_and_decode_fit=dict(passed=True))
+        summary,status=diagnostic.train_fit_decision(initial,metric)
+        self.assertLess(summary['relative_curve_error_reduction'],0.)
+        self.assertEqual(status,'stop_investigate_no_long_rerun')
+        metric['normalized_mae']=initial*.79
+        self.assertEqual(diagnostic.train_fit_decision(initial,metric)[1],'diagnostic_pass')
+        for key in ('count','motion','dynamic','labels'):
+            import copy
+            changed=copy.deepcopy(metric)
+            if key=='count':
+                for row in changed['predictions']:row['predicted_count']=2
+            elif key=='motion':
+                for row in changed['predictions']:row['motion_logit']=1.
+            elif key=='dynamic':changed['dynamic_subset']['improvement_over_static_prior']=0.
+            else:changed['label_and_decode_fit']['passed']=False
+            with self.subTest(missing=key):
+                self.assertEqual(diagnostic.train_fit_decision(initial,changed)[1],'stop_investigate_no_long_rerun')
+
+    def test_new_bounded_release_mode_is_explicit_and_uses_same_process_budget(self):
+        fixture=(None,None,None,None,Item(tracks=(1,2)),{})
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory);budget=mock.Mock(start=diagnostic.time.monotonic())
+            budget.seconds=600;budget.rss_bytes=5*2**30;budget.mlx_bytes=int(4.5*2**30)
+            budget.check.return_value={}
+            with mock.patch.object(diagnostic,'DiagnosticBudget',return_value=budget), \
+                    mock.patch.object(diagnostic.threading,'Thread'), \
+                    mock.patch.object(diagnostic,'prepare_fixture',return_value=fixture), \
+                    mock.patch.object(diagnostic,'run_diagnostic') as run:
+                diagnostic.execute_diagnostic(out,bounded_feature_release=True)
+            run.assert_called_once_with(fixture,out,budget=budget,bounded_feature_release=True)
+
 
 if __name__=="__main__":unittest.main()

@@ -246,7 +246,22 @@ def gradient_evidence(gradients, *, adapter=False):
     return groups
 
 
-def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
+def train_fit_decision(initial,final):
+    """The unchanged final conjunction; a stable/bad prior is not a pass."""
+    reduction=(initial-final['normalized_mae'])/max(initial,1e-12)
+    counts={p['predicted_count'] for p in final['predictions']}
+    motion={p['motion_logit']>=0 for p in final['predictions']}
+    summary=dict(relative_curve_error_reduction=reduction,
+        dynamic_beats_static=final['dynamic_subset']['improvement_over_static_prior']>0,
+        predicted_count_classes=sorted(counts),predicted_motion_classes=sorted(motion))
+    passed=reduction>=.2 and summary['dynamic_beats_static'] and len(counts)>1 and len(motion)>1 \
+        and final['label_and_decode_fit']['passed']
+    return summary,'diagnostic_pass' if passed else 'stop_investigate_no_long_rerun'
+
+
+def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded_feature_release=False):
+    if interaction_release_ab and bounded_feature_release:
+        raise ValueError('one declared diagnostic hypothesis at a time')
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -259,7 +274,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
         measured_feature_delta,require_actual_feature_update)
     from crosscut.stage_edit_train_fit_checks import label_fit_checks
     from crosscut.stage_edit_release_checks import (LIMITS as release_limits,capture_sources,
-        compare_drift,snapshot_transaction,restore_transaction)
+        compare_drift,snapshot_transaction,restore_transaction,apply_bounded_feature_release,ReleaseProposalRejected)
     from crosscut.stage_edit_transformer import (
         DEFAULT_STAGE_EDIT_SCHEMA as schema, StageEditLossContract,
         StageEditTargetSequence, tensorize_stage_edit_batch, tensorize_stage_edit_supervision,
@@ -275,6 +290,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
         rss_bytes=budget.rss_bytes, mlx_bytes=budget.mlx_bytes),
         native_affine_tolerance=dict(atol=2e-4, rtol=2e-5),
         release_step_drift_limits=dict(release_limits),
+        bounded_feature_release_enabled=bounded_feature_release,
         model_config=config.to_dict(), steps=[], evaluations={})
     examples = {e.sequence.sequence_id: e for e in corpus.examples}
     tracks = inventory.tracks
@@ -338,7 +354,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
         print(json.dumps(dict(phase=name, mae=metric["normalized_mae"], **budget.check())), flush=True)
         return metric
 
-    def update(loss, gradients, optimizer, trained, phase, local_step, *, adapter=False):
+    def update(loss, gradients, optimizer, trained, phase, local_step, *, adapter=False,
+            release_transaction=None,before_serving=None):
         from mlx.utils import tree_map
         budget.check()
         evidence = gradient_evidence(gradients, adapter=adapter)
@@ -355,6 +372,19 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
         write_report()
         optimizer.update(trained, gradients)
         mx.eval(loss, norm, trained.parameters(), optimizer.state)
+        if bounded_feature_release and phase=='released_joint':
+            if release_transaction is None or before_serving is None:
+                raise ValueError('bounded feature release requires original parameter/output snapshots')
+            try:
+                control=apply_bounded_feature_release(trained,optimizer,before=release_transaction,
+                    before_sources=before_serving,check=budget.check,
+                    capture=lambda:capture_sources(trained,release_probes,projections,normalizer,check=budget.check))
+            except ReleaseProposalRejected as exc:
+                report.setdefault('bounded_feature_release',[]).append(dict(phase_step=local_step,**exc.receipt))
+                write_report()
+                raise
+            report.setdefault('bounded_feature_release',[]).append(dict(phase_step=local_step,**control))
+            write_report()
         deltas = {key:{leaf:values-before[key][leaf]
             for leaf,values in getattr(trained,key).parameters().items()} for key in keys}
         # Retention is measured again after its byte-for-byte restoration below.
@@ -513,7 +543,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
             track=tracks[(step-1)%len(tracks)]
             batch=prefix_batch(track); base,dynamic=target_supervision(track,batch)
             transaction=None;before_release=None
-            if step in (5,6):
+            if step in (5,6) or (bounded_feature_release and step>=5):
                 model.eval()
                 before_release=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
                 if step==5:
@@ -556,7 +586,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
                 gradients["base"]=dict(gradients["base"])
                 for name in production.DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES:
                     gradients["base"][name]=production._zero_gradient_tree(gradients["base"][name])
-            update(loss,gradients,optimizer,model,"retention" if step<=4 else "released_joint",step if step<=4 else step-4)
+            update(loss,gradients,optimizer,model,"retention" if step<=4 else "released_joint",step if step<=4 else step-4,
+                release_transaction=transaction,before_serving=before_release)
             if transaction is not None:
                 model.eval()
                 after_release=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
@@ -663,8 +694,20 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
                 report["release"][key] for key in ("features_changed","heads_changed")):
             raise RuntimeError("genuine post-retention joint release failed")
         final=evaluate("after_joint")
+        report['train_fit'],fit_status=train_fit_decision(report['evaluations']['initial']['normalized_mae'],final)
         del optimizer,gradients,grad_fn,features,head
         gc.collect(); mx.clear_cache()
+        if bounded_feature_release and fit_status!='diagnostic_pass':
+            # Do not create another425MB known-failed weight tree merely to
+            # record a numeric counterexample. Public outputs and failure
+            # metrics are already retained. Reload is explicitly NOT proven.
+            report.update(status=fit_status,optimizer_update_count=len(report['steps']),
+                resources=budget.check(),failed_checkpoint_not_written=True)
+            if report['optimizer_update_count']!=80:
+                raise RuntimeError('bounded release did not execute its declared80 updates')
+            write_report()
+            print(json.dumps(dict(status=fit_status,train_fit=report['train_fit'],**report['resources'])),flush=True)
+            return
         # Production weights are never registered. Diagnostic save/reload only.
         metadata=h3.new_stage_edit_dynamic_crop_checkpoint_metadata_v3(out.name,schema,config,
             training_steps=80,weights_trained=True,training_data_id=v3.data_id)
@@ -736,16 +779,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
             for group in ("values","count","time","motion"):
                 if not any(row["head_parameter_delta_l2"][group]>0 for row in phase_rows):
                     raise RuntimeError(f"supervised head parameters never updated: {group}")
-        initial=report["evaluations"]["initial"]["normalized_mae"]
-        reduction=(initial-final["normalized_mae"])/max(initial,1e-12)
-        count_classes={p["predicted_count"] for p in final["predictions"]}
-        motion_classes={p["motion_logit"]>=0 for p in final["predictions"]}
-        report["train_fit"]=dict(relative_curve_error_reduction=reduction,
-            dynamic_beats_static=final["dynamic_subset"]["improvement_over_static_prior"]>0,
-            predicted_count_classes=sorted(count_classes),predicted_motion_classes=sorted(motion_classes))
-        report["status"]="diagnostic_pass" if reduction>=.2 and report["train_fit"]["dynamic_beats_static"] \
-            and len(count_classes)>1 and len(motion_classes)>1 and final['label_and_decode_fit']['passed'] \
-            else "stop_investigate_no_long_rerun"
+        report['train_fit'],report['status']=train_fit_decision(report['evaluations']['initial']['normalized_mae'],final)
         report["resources"]=budget.check()
         report["optimizer_update_count"]=len(report["steps"])
         if report["optimizer_update_count"]!=80:
@@ -760,7 +794,7 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
         raise
 
 
-def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False):
+def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False,bounded_feature_release=False):
     """One process-age budget/watchdog around preparation AND execution."""
     budget = DiagnosticBudget(out)
     watcher = threading.Thread(target=budget.watch, daemon=True)
@@ -779,7 +813,9 @@ def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False)
         (out / "preparation-report.json").write_text(json.dumps(preparation,indent=2))
         print(json.dumps(preparation), flush=True)
         if not prepare_only:
-            if interaction_release_ab:
+            if bounded_feature_release:
+                run_diagnostic(fixture,out,budget=budget,bounded_feature_release=True)
+            elif interaction_release_ab:
                 run_diagnostic(fixture,out,budget=budget,interaction_release_ab=True)
             else:
                 run_diagnostic(fixture,out,budget=budget)
@@ -803,8 +839,11 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--interaction-release-ab", action="store_true",
+    experiment=parser.add_mutually_exclusive_group()
+    experiment.add_argument("--interaction-release-ab", action="store_true",
         help="54-update train-only first-release prerequisite A/B; never qualifies or activates a model")
+    experiment.add_argument('--bounded-feature-release',action='store_true',
+        help='One80-update diagnostic with finite post-AdamW feature proposals; no production activation')
     args = parser.parse_args()
     root = Path("/Volumes/CrossCutMedia/CrossCut-Training/diagnostics")
     if not args.out.is_absolute() or not args.out.resolve().is_relative_to(root):
@@ -812,7 +851,8 @@ def main():
     if root.parent.stat().st_dev != args.device:
         parser.error("authorized SSD device does not match")
     args.out.mkdir(parents=True, exist_ok=False)
-    execute_diagnostic(args.out,prepare_only=args.prepare_only,interaction_release_ab=args.interaction_release_ab)
+    execute_diagnostic(args.out,prepare_only=args.prepare_only,interaction_release_ab=args.interaction_release_ab,
+        bounded_feature_release=args.bounded_feature_release)
 
 
 if __name__ == "__main__":
