@@ -1462,6 +1462,13 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             else:
                 self.assertFalse(candidate_gate["selectable"])
                 self.assertIsNone(retention)
+                initializer = candidate["joint_training_initializer"]
+                self.assertFalse(initializer["checkpoint_qualification_or_retention_authorized"])
+                self.assertFalse(initializer["validation_or_heldout_inputs_used"])
+                self.assertFalse(initializer["gradients_computed"])
+                self.assertEqual(0, initializer["new_encoder_forwards"])
+                self.assertLessEqual(initializer["selected_training_loss"], initializer["initial_training_loss"])
+                self.assertGreater(initializer["training_trajectory_count"], 0)
                 self.assertEqual([], reset_steps)
                 self.assertEqual(list(range(1, len(phase_steps) + 1)), phase_steps)
             self.assertIn(
