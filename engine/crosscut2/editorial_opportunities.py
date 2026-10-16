@@ -22,6 +22,7 @@ class Opportunities:
         self.boundaries=np.unique(np.r_[0,beats[::2],self.nodes[-1]])
         self.episodes=np.searchsorted(self.boundaries,self.nodes,side='right')-1
         self.utility=np.zeros(max(0,len(self.boundaries)-1));self.bindings={};self.exposures={}
+        self.missing_action_requests={}
 
     def observe(self,n,left,right,detail,left_sources,right_sources):
         """All physical raw pairs BEFORE global8 camera proposal pruning."""
@@ -29,9 +30,19 @@ class Opportunities:
             for b,rb in enumerate(right):
                 sa,sb=int(left_sources[a]),int(right_sources[b])
                 if self.families[sa]==self.families[sb]:continue
+                key=(n,sa,sb,int(la['head_index']),int(rb['head_index']))
+                if (la.get('dense_subject_context') is None or rb.get('dense_subject_context') is None):
+                    # Acquisition cannot require the very dense action it is
+                    # meant to measure. Rank original face-supported pairs
+                    # by existing geometry/appearance/quality only. These are
+                    # observation requests, NEVER matched-action utility.
+                    quality=min(la['displayed_native_quality_proxy'],rb['displayed_native_quality_proxy'])
+                    priority=float(self.music[n]*(1.-detail['appearance_rate'][a,b])
+                        *quality/(1.+detail['face_rate'][a,b]))
+                    if priority>0:
+                        self.missing_action_requests[key]=max(priority,self.missing_action_requests.get(key,0.))
                 value=float(detail['matched_action_change_density'][a,b]*self.music[n])
                 if value<=0:continue
-                key=(n,sa,sb,int(la['head_index']),int(rb['head_index']))
                 self.bindings[key]=max(value,self.bindings.get(key,0.))
                 e=int(self.episodes[n]);self.utility[e]=max(self.utility[e],value)
 
@@ -84,6 +95,8 @@ class Opportunities:
             event_kind='MATCH_ACTION_CHANGE',episode_boundaries=self.boundaries.tolist(),
             music_strength_continuous_not_extra_beat_events=self.continuous_strength,
             episode_utility_density=self.utility.tolist(),raw_source_actor_bindings=len(self.bindings),
+            missing_action_observation_requests=len(self.missing_action_requests),
+            observation_request_priority_adds_no_edit_utility=True,
             credit_contract='fixed_event_utility_times_actual_seven_frame_action_coverage',
             full_hold_target_persistence_claimed=False,
             source_families=len(set(self.families)),family_duplicates_add_no_utility=True,

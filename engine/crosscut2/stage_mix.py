@@ -330,6 +330,8 @@ def main():
         help='Use redundant static port slots for distinct paired crops without enlarging the total E6 port bound')
     parser.add_argument('--opportunity-subject-spec',type=Path,
         help='Explicit local source/model JSON for bounded raw observations BEFORE E4 final selection')
+    parser.add_argument('--explore-missing-action',action='store_true',
+        help='Spend the same bounded preselection probe allowance on unmeasured face-supported action candidates')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -407,6 +409,8 @@ def main():
         raise ValueError('compiled sequence kernel requires an explicit sequence model')
     if args.opportunity_subject_spec is not None and (not args.editorial_opportunity_exposure or args.reuse_subject_observations is None):
         raise ValueError('bounded subject opportunity probe requires explicit E4 and bound existing subject observations')
+    if args.explore_missing_action and args.opportunity_subject_spec is None:
+        raise ValueError('missing action exploration requires an explicit bounded subject opportunity probe')
     started = monotonic()
     preference_model=None
     sequence_preference_model=None
@@ -594,7 +598,8 @@ def main():
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],
                     identities=[file_identity(p) for p in original.sources],
                     cache=args.cache.parent/'crosscut2-subject-opportunities-v1',
-                    authorized_root=args.cache.parent.parent,device=expected,image_changes=args.played_interval_utility)
+                    authorized_root=args.cache.parent.parent,device=expected,image_changes=args.played_interval_utility,
+                    explore_missing_action=args.explore_missing_action)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,

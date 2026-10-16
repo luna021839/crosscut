@@ -21,6 +21,37 @@ def test_already_observed_pair_does_not_trigger_new_source_inference():
     assert candidates(cats,events,include_observed=True)==[(1,0,1,0,0)]
 
 
+def test_exploration_acquires_missing_action_without_requiring_positive_action_first():
+    cats=[SimpleNamespace(subjects=SimpleNamespace(sample=lambda *a:None)) for _ in range(2)]
+    key=(1,0,1,0,0)
+    events=SimpleNamespace(bindings={},missing_action_requests={key:.4},
+        episodes=np.array([0,1,2]),nodes=np.array([0,30,60]))
+    assert candidates(cats,events)==[]
+    assert candidates(cats,events,explore_missing_action=True)==[key]
+    assert not events.bindings
+    cats[0].subjects.sample=cats[1].subjects.sample=lambda *a:object()
+    assert candidates(cats,events,include_observed=True,explore_missing_action=True)==[]
+
+
+def test_exploration_spreads_one_finite_allowance_over_the_whole_music_clock():
+    cats=[SimpleNamespace(subjects=SimpleNamespace(sample=lambda *a:None)) for _ in range(2)]
+    requests={(n,0,1,0,0):value for n,value in ((1,.9),(2,.8),(3,.7),(5,.2),(8,.1))}
+    events=SimpleNamespace(bindings={},missing_action_requests=requests,
+        episodes=np.arange(10),nodes=np.arange(10)*30)
+    actual=candidates(cats,events,maximum=3,explore_missing_action=True)
+    assert actual==[(1,0,1,0,0),(3,0,1,0,0),(8,0,1,0,0)]
+    assert len(actual)==3 and not events.bindings
+    assert candidates(cats,events,maximum=0,explore_missing_action=True)==[]
+
+
+def test_exploration_cannot_silently_launch_a_subject_model_from_another_cli_path(monkeypatch):
+    import pytest
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused','--explore-missing-action'])
+    with pytest.raises(ValueError,match='explicit bounded subject opportunity probe'):main()
+
+
 def test_opportunity_observer_finishes_before_final_domain_and_actual_costs(monkeypatch):
     from crosscut2 import played_pose_port_programme as module
     from test_crosscut2_preference_integration import producer

@@ -79,6 +79,33 @@ def test_duplicate_source_family_cannot_create_extra_raw_utility():
     assert before.sum()>0 and unique.receipt()['raw_source_actor_bindings']==1
 
 
+def test_unmeasured_action_can_request_observation_without_inventing_edit_credit():
+    a,_,_=prepared(0);b,_,_=prepared(1)
+    left,right=dict(obs(a,0)),dict(obs(b,1))
+    left.pop('dense_subject_context');right.pop('dense_subject_context')
+    detail=matrix(features([left],fps=30.),features([right],fps=30.),details=True)
+    detail['matched_action_change_density'][:]=0.
+    event=Opportunities([0,100,200],[0,1,0],fps=30.,families=['a','b'])
+    event.observe(1,[left],[right],detail,[0],[1])
+    assert event.missing_action_requests[(1,0,1,0,0)]>0
+    assert not event.bindings and event.utility.sum()==0.
+    assert event.density(1,left,right,0,1,1.)==0.
+    assert event.credit(1,1.,7/30.)==0.
+    # Observation availability must not fabricate a repeated-source option.
+    duplicate=Opportunities([0,100,200],[0,1,0],fps=30.,families=['a','a'])
+    duplicate.observe(1,[left],[right],detail,[0],[1])
+    assert not duplicate.missing_action_requests
+
+
+def test_existing_dense_action_does_not_request_the_same_observation_again():
+    a,_,_=prepared(0,bump=.08);b,_,_=prepared(1,bump=.08)
+    left,right=obs(a,0),obs(b,1)
+    detail=matrix(features([left],fps=30.),features([right],fps=30.),details=True)
+    event=Opportunities([0,100,200],[0,1,0],fps=30.,families=['a','b'])
+    event.observe(1,[left],[right],detail,[0],[1])
+    assert event.bindings and not event.missing_action_requests
+
+
 def test_exposure_never_continues_after_target_gap_native_cut_or_missing_arm():
     cat,w,indices=prepared();original=obs(cat,1)
     opportunity=Opportunities([0,100,200],[0,1,0],fps=30.,families=['a'])

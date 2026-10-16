@@ -17,19 +17,34 @@ from .grid_perception import file_identity
 from .rtmw_pose import WholeBodySensor,MODEL_SHA256
 
 
-def candidates(catalogues,opportunities,*,maximum=12,include_observed=False):
+def candidates(catalogues,opportunities,*,maximum=12,include_observed=False,explore_missing_action=False):
     """At most one physical pair per fixed music episode; no shot quota."""
+    if type(maximum) is not int or maximum<0:raise ValueError('nonnegative observation centre limit required')
+    if maximum==0:return []
     best={}
-    for key,value in opportunities.bindings.items():
+    requests=opportunities.missing_action_requests if explore_missing_action else opportunities.bindings
+    for key,value in requests.items():
         n,a,b,ha,hb=key
         if any(catalogues[s].subjects is None for s in (a,b)):continue
-        if not include_observed and all(catalogues[s].subjects.sample(n,side,h) is not None for s,side,h in ((a,0,ha),(b,1,hb))):continue
+        if (explore_missing_action or not include_observed) and all(catalogues[s].subjects.sample(n,side,h) is not None for s,side,h in ((a,0,ha),(b,1,hb))):continue
         episode=int(opportunities.episodes[n]);item=(float(value),key)
         if episode not in best or (-item[0],item[1])<(-best[episode][0],best[episode][1]):best[episode]=item
-    return [key for _,key in sorted(best.values(),key=lambda v:(-v[0],v[1]))[:maximum]]
+    ranked=sorted(best.values(),key=lambda v:(-v[0],v[1]))
+    if not explore_missing_action:return [key for _,key in ranked[:maximum]]
+    # Spread the SAME finite measurement allowance across the whole clock,
+    # then fill unused slots by priority. This schedules observations only:
+    # no cut, hold length, or editorial utility is prescribed by these bins.
+    bins={};nodes=opportunities.nodes;span=max(1,int(nodes[-1]-nodes[0]))
+    for item in ranked:
+        slot=min(maximum-1,int((nodes[item[1][0]]-nodes[0])*maximum//span))
+        bins.setdefault(slot,item)
+    chosen=list(bins.values());seen={item[1] for item in chosen}
+    chosen.extend(item for item in ranked if item[1] not in seen)
+    return [key for _,key in chosen[:maximum]]
 
 
-def observer(specification,*,sources,source_hashes,identities,cache,authorized_root,device,image_changes=False):
+def observer(specification,*,sources,source_hashes,identities,cache,authorized_root,device,image_changes=False,
+             explore_missing_action=False):
     """Explicit local model/media spec; sessions stay lazy until a cache miss."""
     spec=json.loads(Path(specification).read_text());root=Path(authorized_root).resolve(strict=True);cache=Path(cache)
     if [str(p) for p in sources]!=[v['path'] for v in spec['sources']]:raise ValueError('probe source specification differs')
@@ -52,7 +67,8 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             if not Path('/Volumes/CrossCutMedia').is_mount() or root.stat().st_dev!=device:raise OSError('authorized SSD changed')
             if any(file_identity(p)!=v for p,v in zip(sources,identities)):raise OSError('probe source changed')
         budget=bank.ProbeBudget(face_limit=768,recognition_limit=4096,pose_limit=512,raster_limit=2048,seconds=180.,check=live)
-        selected=candidates(catalogues,opportunities,include_observed=image_changes)
+        selected=candidates(catalogues,opportunities,include_observed=image_changes,
+            explore_missing_action=explore_missing_action)
         receipts=[];decodes=[];new=[[] for _ in sources];windows=0
         cache.mkdir(parents=True,exist_ok=True);cv2.setNumThreads(2)
         for n,a,b,ha,hb in selected:
@@ -150,6 +166,9 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             used=budget.used,window_receipts=receipts,decode_receipts=decodes,elapsed_seconds=monotonic()-started,
             neural_model_sessions_initialized=sessions[0] is not None,source_NN_calls=sum(budget.used[k] for k in ('face','pose','recognition')),
             selected_movie_or_reference_timestamps_used=False,old_observations_rewritten=False,
+            missing_action_exploration=bool(explore_missing_action),
+            observation_requests_are_not_action_credit=True,
+            observation_centres=[list(key) for key in selected],
             image_changes_observed_on_same_preselection_centres=bool(image_changes),
             image_observation_receipts=image_receipts,image_measurements_share_original_budget=True,
             explicit_array_peak_bytes=budget.peak_array_bytes,total_process_RSS_not_certified=True)
