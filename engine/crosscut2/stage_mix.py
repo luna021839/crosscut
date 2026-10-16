@@ -400,8 +400,8 @@ def main():
         if preference_model.artifact['supervision_kinds']==['reference_editor_choice_weak_imitation']:
             raise ValueError('weak source-choice checkpoints are diagnostic, not primary connection quality')
     if args.experimental_sequence_preference_model is not None:
-        from .sequence_preference_model import Model as SequenceModel
-        sequence_preference_model=SequenceModel(json.loads(args.experimental_sequence_preference_model.read_text()))
+        from .ordered_preference_model import load_model
+        sequence_preference_model=load_model(json.loads(args.experimental_sequence_preference_model.read_text()))
     if args.fixed_connection_prior:
         from .connection_prior import ConnectionPrior
         connection_prior=ConnectionPrior()

@@ -38,7 +38,7 @@ class _Candidate:
 
 def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
           context_cost, episodes, credit, history_frames, label_limit=8,
-          history_key=None, context_lower_bound=None, minimum_frames=12, check=lambda: None,
+          history_key=None, context_lower_bound=None, long_context_batch=None, minimum_frames=12, check=lambda: None,
           workspace_limit_bytes=200*2**20, start_allowed=None,
           final_cost=None, final_allowed=None):
     """Score all retained camera codes jointly with the previous context.
@@ -53,6 +53,9 @@ def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
     context_lower_bound(ref), if supplied, must be a proved lower bound on
     EVERY prefix's extra cost. It only skips candidates unable to enter the
     already-declared beam, never applies scalar dominance across histories.
+    long_context_batch, if supplied, may merge prefix candidates ONLY where
+    the caller proves their future physical suffixes equal. It must preserve
+    every declared camera cell, paid-bit transition and original rank rule.
     """
     nodes=np.asarray(nodes);episodes=np.asarray(episodes)
     if (nodes.ndim!=1 or len(nodes)<2 or nodes.dtype.kind not in 'iu' or nodes[0]!=0
@@ -64,6 +67,7 @@ def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
             or type(workspace_limit_bytes) is not int or workspace_limit_bytes<1
             or not callable(context_cost) or not callable(credit)
             or (context_lower_bound is not None and not callable(context_lower_bound))
+            or (long_context_batch is not None and not callable(long_context_batch))
             or (history_key is not None and not callable(history_key))):
         raise ValueError('ordered physical nodes/episodes and explicit bounded context required')
     N=len(nodes);entries=_ports(entries,N,'entry');exits=_ports(exits,N,'exit')
@@ -81,7 +85,7 @@ def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
     arrays=sum(a.nbytes for states in (incoming,outgoing) for state in states for a in state)
     histories=[()];history_ids={():0};arc_objects=set();object_bytes=0
     peak=arrays;discarded=equivalent=hold_calls=cut_calls=batches=evaluations=camera_count=rank_rejected=bound_rejected=0
-    worst_cache={}
+    worst_cache={};long_batched_holds=long_merged_prefixes=0
 
     def reserve(transient=0):
         nonlocal peak
@@ -168,8 +172,34 @@ def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
                 for bit in (0,1):
                     slots=np.flatnonzero(np.isfinite(incoming[i][0][p,bit]))
                     prefix[p,bit]=(slots,[histories[int(incoming[i][6][p,bit,k])] for k in slots])
+            handled=np.zeros(allowed.shape,bool)
+            if long_context_batch is not None:
+                batch=long_context_batch(i,j,base,allowed,prefix,incoming[i][0],incoming[i][1],benefit,
+                    same_episode=episodes[i]==episodes[j],width=width)
+                if batch is not None:
+                    subset,values=batch
+                    if subset.shape!=allowed.shape[:2]+(4,) or subset.dtype!=bool or np.any(subset&~allowed[:,:,:4]):
+                        raise ValueError('long context batch changed the declared camera domain')
+                    handled[:,:,:4]=subset;long_batched_holds+=1
+                    costs,counts,backs,bits,slots,claims,extras=values
+                    expected=allowed.shape[:2]+(4,2)
+                    if any(v.shape!=expected for v in values):raise ValueError('complete long context candidate matrices required')
+                    present=np.isfinite(costs)
+                    if (np.any(present&~subset[:,:,:,None]) or not np.isfinite(claims[present]).all()
+                            or not np.isfinite(extras[present]).all() or np.any(claims[present]<0)
+                            or np.any((bits[present]<0)|(bits[present]>1))
+                            or np.any((slots[present]<0)|(slots[present]>=L))):
+                        raise ValueError('valid unchanged long prefix/paid-bit transitions required')
+                    for p,q,code,outbit in zip(*np.nonzero(np.isfinite(costs))):
+                        p,q,code,outbit=map(int,(p,q,code,outbit));bit=int(bits[p,q,code,outbit]);k=int(slots[p,q,code,outbit])
+                        history=histories[int(incoming[i][6][p,bit,k])];ref=ArcRef(i,j,p,q,code)
+                        h=suffix(history,ref,int(nodes[j]));paid=float(claims[p,q,code,outbit])
+                        retain(out_pool[q][outbit],_Candidate(float(costs[p,q,code,outbit]),int(counts[p,q,code,outbit]),
+                            int(backs[p,q,code,outbit]),code,paid,float(extras[p,q,code,outbit]),h),int(nodes[j]))
+                    long_merged_prefixes+=int(subset.sum())
             for p,q,code in zip(*np.nonzero(allowed)):
                 p,q,code=int(p),int(q),int(code);ref=ArcRef(i,j,p,q,code)
+                if handled[p,q,code]:continue
                 lower=None if context_lower_bound is None else float(context_lower_bound(ref))
                 if lower is not None and not np.isfinite(lower):raise ValueError('finite explicit context lower bound required')
                 for bit in (0,1):
@@ -241,6 +271,9 @@ def solve(nodes, entries, exits, *, start_cost, hold_cost, cut_cost,
         expensive_history_keys_skipped_by_existing_beam_rank=rank_rejected,
         prefix_context_evaluations_skipped_by_explicit_lower_bound=bound_rejected,
         explicit_context_lower_bound_used=context_lower_bound is not None,
+        exact_long_suffix_batch_enabled=long_context_batch is not None,
+        exact_long_suffix_batched_holds=long_batched_holds,
+        exact_long_suffix_camera_cells=long_merged_prefixes,
         history_merge_policy='identical_suffix_refs' if history_key is None else 'caller_supplied_future_equivalent_physical_suffix',
         scalar_cost_or_debt_dominance=False,exact_global_optimum_claimed=False,
         no_beam_pruning_in_this_finite_domain=discarded==0 and bound_rejected==0,

@@ -7,6 +7,7 @@ fitting, music timestamps or source numbers enter the preference features.
 Full-frame/background motion remains UNKNOWN until actually observed.
 """
 from collections import OrderedDict
+from dataclasses import replace
 import hashlib
 import json
 import re
@@ -18,7 +19,7 @@ from .physical_display_observations import focal_metadata
 from .sequence_context import Evidence,PRIMITIVES,project,merge,windows,batched_window_features
 from .programme_source_clock import indices
 
-OBSERVATION_CONTRACT='original_native_frame_target_context_no_candidate_argmax_v1'
+OBSERVATION_CONTRACT='intent_bound_exact_native_target_context_v2'
 
 
 def _native_scene(scene,k):
@@ -97,24 +98,36 @@ def _native_cut_scenes(native,binding):
 
 class _SourceField:
     """Shared raw native observations and exact camera projection tables."""
-    def __init__(self,cat,native,binding,check):
-        originals=[from_original_view(cat,n,side,source_binding=binding)
-            for n in range(len(cat.nodes)) for side in (0,1)]
-        originals.extend(_dense_scenes(cat,binding));native_scenes=list(_native_cut_scenes(native,binding))
+    def __init__(self,cat,native,binding,check,*,intent=None,ordered=False):
+        originals=([from_original_view(cat,n,side,source_binding=binding)
+            for n in range(len(cat.nodes)) for side in (0,1)] if intent is None else [intent.scene])
+        native_scenes=list(_native_cut_scenes(native,binding)) if intent is None else []
+        if intent is None:originals.extend(_dense_scenes(cat,binding))
         originals.extend(native_scenes)
         self.native_cut_endpoint_rows=len(native_scenes)
         observed=np.asarray(native.get('observed',np.ones(len(native['frames']),bool)))
         keys=native.get('native_event_keys');ordinals=native.get('native_indices')
         self.native_cut_events_missing_ordinal=sum(bool(known) and ordinals is None and
             (keys is None or len(keys[k])!=1) for k,known in enumerate(observed))
-        groups={};parts=[];self.normalized_rows=0
+        groups={};parts=[];ordered_parts=[];self.normalized_rows=0
+        if ordered:
+            from .ordered_context import project as ordered_project,merge as ordered_merge
         for scene in originals:
             check()
             for k in range(len(scene.frames)):
-                actual=_native_scene(scene,k);self.normalized_rows+=1
+                if intent is None:actual=_native_scene(scene,k)
+                else:
+                    ordinal=int(scene.native_indices[k])
+                    if not intent.first_native<=ordinal<intent.final_native:continue
+                    actual=TargetScene(scene.binding,scene.track,np.array([ordinal]),np.array([ordinal]),scene.role,
+                        **{name:getattr(scene,name)[k:k+1] for name in ('heads','head_observed','body',
+                            'body_evidence','body_ambiguity','roi_readability','roi_measured','original_heads','original_observed')})
+                self.normalized_rows+=1
                 evidence=project(actual,np.array([[1.,.5,.5]]));parts.append(evidence)
+                if ordered:ordered_parts.append(ordered_project(actual,np.array([[1.,.5,.5]])))
                 groups.setdefault(int(actual.native_indices[0]),[]).append(actual)
         self.static=merge(parts);T=len(self.static.frames)
+        self.ordered_static=ordered_merge(ordered_parts) if ordered else None
         head_rows=[];body_rows=[];head_valid=np.zeros(T,bool);body_valid=np.zeros(T,bool)
         for i,ordinal in enumerate(self.static.frames):
             faces=[];points=[]
@@ -140,6 +153,8 @@ class _SourceField:
         self.head_consistent=head_valid;self.body_consistent=body_valid
         self.bytes=sum(v.nbytes for v in (self.static.frames,self.static.values,self.static.observed,self.static.conflicted,
             self.heads,self.heads_known,self.body,self.body_known,head_valid,body_valid))
+        if ordered:self.bytes+=sum(getattr(self.ordered_static,n).nbytes for n in ('frames','values',
+            'observed','conflicted','person_splits','people','people_observed','people_conflicted'))
         for v in (self.heads,self.heads_known,self.body,self.body_known,head_valid,body_valid):v.setflags(write=False)
 
     def project(self,frames,native,cameras):
@@ -176,6 +191,12 @@ class _SourceField:
         known&=~conflicts
         return Evidence(np.asarray(frames),values,known,tuple(scopes),conflicts)
 
+    def project_ordered(self,frames,native,cameras):
+        from .ordered_context import lookup,recamera
+        if self.ordered_static is None:raise ValueError('ordered observations were not prepared')
+        evidence=lookup(self.ordered_static,frames,native)
+        return recamera(evidence,cameras,self.project(frames,native,cameras))
+
 
 class PlayedContext:
     def __init__(self,model,*,nodes,entries,exits,catalogues,arcs,native_ports,fps,source_bindings,check,kernel='numpy'):
@@ -196,6 +217,7 @@ class PlayedContext:
                     for value in (frames,raw,known):value.setflags(write=False)
                 check();self._window_features(frames,raw,known,np.zeros(0,np.int64),fps=fps,context_frames=self.history_frames)
         self.kernel_preparation_seconds=monotonic()-kernel_started
+        self._prepare_intents(native_ports,source_bindings)
         self.fields=[];self.reference=[];self.base_prefix=[];self.ends=np.r_[np.arange(6,self.final,6),self.final]
         self.durations=np.diff(np.r_[0,self.ends])/fps
         self.cache=OrderedDict();self.cache_bytes=0;self.cache_limit=32*2**20
@@ -214,9 +236,27 @@ class PlayedContext:
                 report=windows(evidence,final_frame=self.final,fps=fps)
                 baseline.append(np.r_[0.,np.cumsum(model.costs(report['features'])*report['interval_seconds'])])
             self.base_prefix.append(np.asarray(baseline))
-        self.source_table_bytes=sum(f.bytes for f in self.fields)+sum(v.nbytes for v in self.reference+self.base_prefix)
+        self.source_table_bytes=sum(f.bytes for f in (*self.fields,*self.intent_fields.values()))+sum(v.nbytes for v in self.reference+self.base_prefix)
         self.workspace_reserved_bytes=self.source_table_bytes+self.cache_limit+16*2**20
         if self.workspace_reserved_bytes>=180*2**20:raise MemoryError('source context leaves no declared label workspace')
+
+    def _prepare_intents(self,native_ports,source_bindings,*,ordered=False):
+        self.intents={};self.intent_fields={};self.intent_bindings={};buckets={}
+        for ports in (self.entries,self.exits):
+            for row in ports:
+                for port in row:
+                    raw=port.intent
+                    if raw is None or not raw.pinned:continue
+                    if id(raw) not in self.intents:
+                        bound,digest=raw.bind(source_bindings[port.source]);bucket=buckets.setdefault(digest,[])
+                        match=next((k for k,(old,_) in enumerate(bucket) if bound.same_input(old)),None)
+                        if match is None:
+                            key=digest+':'+str(len(bucket));bucket.append((bound,key))
+                        else:key=bucket[match][1]
+                        self.intents[id(raw)]=bound;self.intent_bindings[id(raw)]=key
+                        if key not in self.intent_fields:
+                            self.intent_fields[key]=_SourceField(self.cats[port.source],native_ports[port.source],
+                                source_bindings[port.source],self.check,intent=bound,ordered=ordered)
 
     def _native(self,ref,frames):
         s=self.entries[ref.first][ref.entry].source;clock=self.cats[s].bank['programme_render_clock']
@@ -228,7 +268,40 @@ class PlayedContext:
         a=max(first,int(self.nodes[ref.first]));b=min(final,int(self.nodes[ref.final]))
         frames=np.arange(a,b);s=self.entries[ref.first][ref.entry].source
         camera=self.arcs.sample_camera(ref.first,ref.final,ref.entry,ref.exit,ref.camera,frames)
-        return self.fields[s].project(frames,self._native(ref,frames),camera)
+        native=self._native(ref,frames)
+        return self._project_intents(ref,frames,native,camera)
+
+    def _project_intents(self,ref,frames,native,cameras):
+        return self._intent_projection(ref,frames,native,cameras,ordered=False)
+
+    def _intent_projection(self,ref,frames,native,cameras,*,ordered):
+        if ordered:
+            from .ordered_context import OrderedEvidence as Result,merge as combine
+            scope_name='scopes';project_name='project_ordered'
+        else:Result=Evidence;combine=merge;scope_name='target_scopes';project_name='project'
+        s=self.entries[ref.first][ref.entry].source
+        original=getattr(self.fields[s],project_name)(frames,native,cameras)
+        overlays=[];claimed=np.zeros(len(frames),bool)
+        for port in (self.entries[ref.first][ref.entry],self.exits[ref.final][ref.exit]):
+            if port.intent is None or not port.intent.pinned:continue
+            intent=self.intents[id(port.intent)];key=self.intent_bindings[id(port.intent)]
+            active=(native>=intent.first_native)&(native<intent.final_native)
+            if not active.any():continue
+            value=getattr(self.intent_fields[key],project_name)(frames[active],native[active],cameras[active])
+            # The target plan applies throughout its finite associated window,
+            # but absent face/body rasters do NOT become observations. Keep a
+            # known intended role separately from target visibility.
+            raw=value.values.copy();known=value.observed.copy()
+            for name,kind in (('role_feature',FEATURE),('role_formation',FORMATION),('role_unknown',UNKNOWN)):
+                k=PRIMITIVES.index(name);raw[:,k]=float(intent.scene.role==kind);known[:,k]=True
+            value=(replace(value,values=raw,observed=known,scopes=(key,)*len(value.frames)) if ordered else
+                Result(value.frames,raw,known,(key,)*len(value.frames),value.conflicted))
+            overlays.append(value);claimed|=active
+        if not overlays:return original
+        keep=~claimed
+        base=(original.take(np.flatnonzero(keep)) if ordered else Result(original.frames[keep],original.values[keep],
+            original.observed[keep],tuple(x for x,k in zip(getattr(original,scope_name),keep) if k),original.conflicted[keep]))
+        return combine([base,*overlays])
 
     def _memo(self,key,make):
         if key in self.cache:
@@ -363,6 +436,8 @@ class PlayedContext:
         return dict(observation_contract=OBSERVATION_CONTRACT,source_NN_calls=0,new_source_rasters=0,
             exact_native_observation_lookup_no_interpolation=True,pre_camera_targets=True,
             head_and_body_not_borrowed_between_people=True,background_flow_measured=False,
+            selected_pre_camera_intents_consumed=True,finite_pinned_intents=len(self.intent_fields),
+            global_singer_or_dense_intent_plan_completed=False,
             original_native_cut_observations_consumed=any(f.native_cut_endpoint_rows for f in self.fields),
             native_cut_endpoint_rows_per_source=[f.native_cut_endpoint_rows for f in self.fields],
             observed_native_cut_events_missing_ordinal_per_source=[f.native_cut_events_missing_ordinal for f in self.fields],

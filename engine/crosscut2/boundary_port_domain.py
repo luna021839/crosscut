@@ -15,6 +15,7 @@ class BoundaryPort:
     observation: dict
     proposal_ids: tuple
     geometry_hash: str
+    intent: object = None
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
@@ -22,11 +23,20 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
+    intent_cache={}
     def port(source,n,side,strip,ids,*,target_head_index=None):
+        from .playback_intent import before_camera
+        key=(source,n,side,target_head_index)
+        # Static ports use the source's pre-camera native-role schedule. Do
+        # not build unused contextual scenes in the ordinary scalar E4 path
+        # or impose its stronger sample-clock contract on unrelated callers.
+        if target_head_index is not None and key not in intent_cache:
+            intent_cache[key]=before_camera(catalogues[source],source,n,side,target_head_index)
+        intent=intent_cache.get(key)
         strip=np.asarray(strip,float).copy();strip.setflags(write=False)
         observation=catalogues[source].observation(n,side,strip,target_head_index=target_head_index)
         digest=hashlib.sha256(strip.tobytes()).hexdigest()
-        return BoundaryPort(source,strip,observation,tuple(ids),digest)
+        return BoundaryPort(source,strip,observation,tuple(ids),digest,intent)
     static_aliases=0
     def add(items,value):
         nonlocal static_aliases
@@ -36,8 +46,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     and old.observation['head_index']==value.observation['head_index']
                     and (old.proposal_ids==value.proposal_ids or same_static)):
                 observation=value.observation if value.observation['target_pinned_before_camera'] else old.observation
+                intent=value.intent if value.observation['target_pinned_before_camera'] else old.intent
                 items[i]=BoundaryPort(old.source,old.strip,observation,
-                    old.proposal_ids+tuple(x for x in value.proposal_ids if x not in old.proposal_ids),old.geometry_hash)
+                    old.proposal_ids+tuple(x for x in value.proposal_ids if x not in old.proposal_ids),old.geometry_hash,intent)
                 static_aliases+=int(same_static and old.proposal_ids!=value.proposal_ids)
                 return
         items.append(value)
