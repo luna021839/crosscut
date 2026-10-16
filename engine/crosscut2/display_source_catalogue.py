@@ -13,11 +13,12 @@ from .source_clock_action import endpoint_correspondence
 
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
-                 editorial_content=False,framing_evidence=None):
+                 editorial_content=False,framing_evidence=None,person_attention=False):
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
         self.subjects=subjects
         self.editorial_content=bool(editorial_content)
         self.framing_evidence=framing_evidence
+        self.person_attention=bool(person_attention)
         N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
         self.member_hints=np.full(bank['heads'].shape[:3],-1,int) if member_hints is None else np.asarray(member_hints,int)
         self.featured_factor=np.ones(bank['heads'].shape[:3]) if featured_factor is None else np.asarray(featured_factor,float)
@@ -41,6 +42,14 @@ class SourceCatalogue:
         self.endpoint_matches=endpoint_correspondence(bank['heads'],bank['vectors']) if 'vectors' in bank else np.full((N,3),-1,int)
         self.physical=np.ones((N,2),bool)
         self.native=np.asarray(bank['pose_native_indices'],int)
+        self.person_boxes=None
+        if self.person_attention:
+            mapping=bank.get('person_rectangles_by_native',{})
+            maximum=max((len(v) for v in mapping.values()),default=0)
+            self.person_boxes=np.zeros((N,2,max(1,maximum),5),np.float32)
+            for n,side in np.ndindex(N,2):
+                values=mapping.get(int(bank['native_indices'][n,side]))
+                if values is not None:self.person_boxes[n,side,:len(values)]=values
         native_cuts=np.asarray(bank.get('native_cut_frames',[]),int)
         for side in (0,1):
             a,b=self.native[:,2*side],self.native[:,2*side+1]
@@ -207,6 +216,14 @@ class SourceCatalogue:
             appearance_vector=appearance,appearance_is_not_named_identity=True,
             person_native_ordinal=endpoint_native,
             person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
+        if self.person_attention:
+            from .person_attention import competition
+            value=competition(self.person_boxes[n,side],selected[0,0],camera)
+            result.update(person_competition_deficit=float(value['deficit']),
+                person_competition_measured=bool(value['measured']),
+                person_competition_is_not_occlusion_or_ownership=True)
+            if value['measured']:
+                result['displayed_native_quality_proxy']*=1.-float(value['deficit'])
         return result if self.subjects is None or not include_subjects else self.subjects.augment(result,n,side,h)
 
     def rates(self,frames,cameras):
@@ -273,5 +290,12 @@ class SourceCatalogue:
             # observed empty viewport. Retain the previous unfitted1 proxy,
             # without fabricating face/framing/oversize evidence in the gap.
             # Digital enlargement and movement still pay their real costs.
-            return np.where(self.content_scope[frames],observed,1.)+.1*np.log(camera[...,0])/np.log(2.)
+            loss=np.where(self.content_scope[frames],observed,1.)+.1*np.log(camera[...,0])/np.log(2.)
+            if self.person_attention:
+                from .person_attention import competition
+                value=competition(self.person_boxes[n,side],h,camera)
+                # Same declared sparse quadrature as the face samples, not
+                # a dense rectangle track. Unobserved gaps retain UNKNOWN.
+                loss=loss+np.where(self.content_scope[frames],value['deficit'],.5)
+            return loss
         return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[n,side,index]

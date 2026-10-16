@@ -25,7 +25,7 @@ from .focal_appearance import cosine as focal_appearance_cosine
 class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
-                 shot_duration_model=None,recycle_static_capacity=False):
+                 shot_duration_model=None,recycle_static_capacity=False,person_attention=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -38,6 +38,9 @@ class PlayedPosePortPrior:
         if recycle_static_capacity and not played_interval_utility:
             raise ValueError('recovered camera capacity requires actual interval camera scoring')
         self.recycle_static_capacity=bool(recycle_static_capacity)
+        if person_attention and not played_interval_utility:
+            raise ValueError('person attention requires the explicit actual played-interval path')
+        self.person_attention=bool(person_attention)
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
@@ -49,7 +52,8 @@ class PlayedPosePortPrior:
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
-            'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py']
+            'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
+            'person_attention.py','person_rectangle_bank.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -109,6 +113,12 @@ class PlayedPosePortPrior:
                 known_original_faces_clipped_by_view_are_not_missing_sensor_evidence=True,
                 unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['played_interval_utility']=bool(played_interval_utility)
+        self.artifact['visible_person_competition']=self.person_attention
+        if self.person_attention:
+            self.artifact.update(person_competition_unknown=.5,
+                person_competition_original_rectangles_only=True,
+                person_competition_target_area_is_optimistic_upper_bound=True,
+                person_competition_is_not_mask_occlusion_or_ownership=True)
         if played_interval_utility:
             self.artifact.update(contract='pair_bound_actual_interval_action_composed_image_boundary_port_E6_v2',
                 output_focal_face_comfort_height=.30,original_tight_frame_exemption=False,
@@ -208,8 +218,15 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
             member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s],
-            editorial_content=editorial,framing_evidence=framing))
+            editorial_content=editorial,framing_evidence=framing,
+            person_attention=getattr(prior,'person_attention',False)))
     del states,rows,raw
+    if getattr(prior,'person_attention',False):
+        receipt['person_attention_observation_coverage']=[dict(source=s,
+            original_native_measurements=len(cat.bank.get('person_rectangles_by_native',{})),
+            grid_endpoints_with_rectangles=int((cat.person_boxes[...,4]>0).any(-1).sum()),
+            rectangles_do_not_certify_focal_ownership=True,unknown_deficit=.5)
+            for s,cat in enumerate(cats)]
     music=np.zeros(len(nodes)) if music is None else np.asarray(music,float)
     if music.shape!=(len(nodes),) or not np.isfinite(music).all() or np.any((music<0)|(music>1)):
         raise ValueError('observed per-node musical strengths required')

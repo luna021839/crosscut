@@ -68,6 +68,20 @@ def requested_unknown_endpoints(banks, bound, registry):
 
 def _runtime(model):
     """Warm fingerprint without creating an ORT session or probing media."""
+    runtime = _runtime_metadata()
+    identity = file_identity(model)
+    digest = hashlib.sha256()
+    with Path(model).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 ** 2), b''):
+            digest.update(block)
+    if (digest.hexdigest() != native_person_onnx.PINNED_YOLO11L_ONNX_SHA256
+            or file_identity(model) != identity):
+        raise ValueError('person bank requires the existing immutable pinned YOLO asset')
+    return runtime, identity
+
+
+def _runtime_metadata():
+    """The original producer contract, without requiring a model file to READ."""
     found = shutil.which('ffmpeg')
     decoder = None if found is None else [str(Path(found).resolve()), *file_identity(Path(found).resolve())]
     files = [Path(__file__), Path(native_person_onnx.__file__), Path(onnx_cpu_inference.__file__),
@@ -82,18 +96,80 @@ def _runtime(model):
                                           'read_frames').encode()).hexdigest(),
               hashlib.sha256(function_text(render_frame_schedule.__file__,
                              'render_frame_clock_from_probe').encode()).hexdigest()]
-    identity = file_identity(model)
-    digest = hashlib.sha256()
-    with Path(model).open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 ** 2), b''):
-            digest.update(block)
-    if (digest.hexdigest() != native_person_onnx.PINNED_YOLO11L_ONNX_SHA256
-            or file_identity(model) != identity):
-        raise ValueError('person bank requires the existing immutable pinned YOLO asset')
     return dict(implementation=seals, decoder=decoder, numpy=np.__version__, opencv=cv2.__version__,
-        onnxruntime=version('onnxruntime'), model_sha256=digest.hexdigest(), maximum_side=1280,
+        onnxruntime=version('onnxruntime'), model_sha256=native_person_onnx.PINNED_YOLO11L_ONNX_SHA256, maximum_side=1280,
         confidence=.35, nms_iou=.55, backend='onnxruntime_CPU_4_intra_1_inter',
-        coordinates='original_raster_normalized_xyxy_score'), identity
+        coordinates='original_raster_normalized_xyxy_score')
+
+
+def recover_existing_rectangles(*, sources, bound, requests, cache, check, maximum_seconds=20.):
+    """Read immutable, qualified raw observations after an SSD remount.
+
+    Rehash CURRENT source contents and preserve original bindings. The device
+    number may differ. The previously recorded NumPy2.2.6/OpenCV4.10/ORT1.30
+    producer is readable, NOT relabelled as current-runtime inference. All
+    reader/model/clock seals and original raster semantics still match.
+    No model asset/session is needed
+    to read a prior measurement; missing requests remain unmeasured, never
+    authorize inference. Conflicting observations are not silently chosen.
+    """
+    started=monotonic();identities=[file_identity(p) for p in sources]
+    if not len(sources)==len(bound)==len(requests):
+        raise ValueError('source-matched raw person recovery required')
+    if not math.isfinite(maximum_seconds) or not 1<=maximum_seconds<=120:
+        raise ValueError('finite bounded person recovery time required')
+    def live():
+        check()
+        if any(file_identity(p)!=i for p,i in zip(sources,identities)):
+            raise OSError('source changed during raw person recovery')
+        if monotonic()-started>=maximum_seconds:
+            raise TimeoutError('bounded raw person recovery exhausted')
+    for s,(path,record,request) in enumerate(zip(sources,bound,requests)):
+        live()
+        if record['source']!=s or list(identities[s])!=record['source_file_identity']:
+            raise OSError('raw person recovery current source binding differs')
+        if any(type(f) is not int or not 0<=f<record['frame_count'] for f in request):
+            raise ValueError('exact physical person recovery ordinals required')
+        with Path(path).open('rb') as stream:
+            digest=hashlib.file_digest(stream,'sha256').hexdigest()
+        if digest!=record['source_sha256']:
+            raise ValueError('raw person recovery source content changed')
+    runtime=_runtime_metadata()
+    historical=dict(runtime,numpy='2.2.6',opencv='4.10.0',onnxruntime='1.30.0')
+    accepted=tuple(v for v in (runtime,_qualified_legacy_runtime(runtime),historical,
+        _qualified_legacy_runtime(historical)) if v is not None)
+    output=[{} for _ in sources];reused=[];remounted=0;historical_abi=0
+    paths=sorted(p for p in Path(cache).glob('*.npz') if len(p.stem)==64 and
+                 all(v in '0123456789abcdef' for v in p.stem))
+    if len(paths)>4096:raise ValueError('bounded raw person cache inventory exceeded')
+    lookup={record['source_sha256']:s for s,record in enumerate(bound)}
+    for path in paths:
+        live()
+        with np.load(path,allow_pickle=False) as saved:
+            encoded=str(saved['binding']);binding=json.loads(encoded)
+        s=lookup.get(binding.get('source_sha256'))
+        if s is None:continue
+        record=bound[s];old=binding.get('source',[]);f=binding.get('native_ordinal')
+        if type(f) is not int or f not in requests[s]:continue
+        if (binding.get('contract')!=CONTRACT or binding.get('runtime') not in accepted
+                or len(old)!=4 or old[1:]!=list(identities[s][1:])
+                or binding.get('fps')!=record['fps'] or binding.get('frame_count')!=record['frame_count']):
+            continue
+        if path.stem!=hashlib.sha256(encoded.encode()).hexdigest():
+            raise ValueError('raw person record name does not match its original binding')
+        rectangles=_load(path,encoded)
+        if f in output[s] and not np.array_equal(output[s][f],rectangles):
+            raise ValueError('conflicting qualified original person observations')
+        output[s][f]=rectangles;reused.append(path.name);remounted+=old[0]!=identities[s][0]
+        historical_abi+=binding['runtime'] in (historical,_qualified_legacy_runtime(historical))
+    live()
+    return output,dict(contract='content_reverified_read_only_person_recovery_v1',
+        recovered_frames=sum(map(len,output)),requested_frames=sum(map(len,requests)),
+        original_record_names=reused,remounted_records=remounted,elapsed_seconds=monotonic()-started,
+        historical_runtime_records_read_as_original=historical_abi,old_runtime_relabelled=False,
+        source_contents_rehashed=True,old_cache_bindings_rewritten=False,model_file_required=False,
+        source_rasters=0,new_person_forwards=0,new_face_pose_forwards=0,
+        missing_is_unmeasured=True)
 
 
 def _detector(model):
