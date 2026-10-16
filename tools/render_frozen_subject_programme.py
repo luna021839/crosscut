@@ -1,5 +1,6 @@
 """Render a saved subject-moment programme without repeating its selection."""
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -10,11 +11,64 @@ from time import monotonic
 import numpy as np
 import psutil
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'engine'))
-from crosscut.render import render,segment_frame_counts
+from crosscut.render import render,segment_frame_counts,EditorialTransformTrack,EditorialTransformKeyframe
 from crosscut.render_frame_schedule import sampler_frame_schedule
 from crosscut.render_plan_serialization import render_plan_from_json
 from crosscut2.grid_perception import file_identity
 from crosscut2.subject_moment_sequence import curve_digest
+
+
+def camera_values(segment,count,fps):
+    if segment.editorial_transform is None:
+        if segment.crop is not None or segment.pan_crop is not None:raise ValueError('a different crop needs its own replay proof')
+        return np.tile([1.,.5,.5],(count,1))
+    keys=segment.editorial_transform.keyframes;t=np.arange(count)/fps
+    if any(k.roll_degrees!=0 for k in keys):raise ValueError('unscored rotation in subject programme')
+    return np.column_stack([np.interp(t,[k.time_seconds for k in keys],[getattr(k,a) for k in keys])
+        for a in ('zoom','center_x','center_y')])
+
+
+def materialize_scored_cameras(plan,record):
+    """Recover an exact frozen arc, never accept a merely similar camera hash.
+
+    Compact linear keyframes can differ by an ULP from the scored sampled
+    curve. A declared connector is recoverable from its hashed strips and
+    unchanged constant interior. Accept ONLY the original full-frame hash;
+    the compact plan must also differ by no more than floating roundoff.
+    No media observation, source/cut change, fitting or selection occurs.
+    """
+    frozen=record.get('fixed_actor_camera_hold_receipt',{}).get('frozen_selected_camera_arcs')
+    if frozen is None:return plan,[]
+    from crosscut2.boundary_arc_costs import cameras,whole_viewports
+    result=[];receipts=[];seams=record.get('seams',[])
+    for i,(segment,n,row) in enumerate(zip(plan.segments,segment_frame_counts(plan),frozen,strict=True)):
+        values=camera_values(segment,n,plan.fps);expected=row['camera_path_sha256']
+        if curve_digest(values)==expected:result.append(segment);continue
+        code=row.get('camera_arc_code')
+        if code not in (0,1,2,3,5) or n<38:
+            raise ValueError('cannot restore exact frozen camera family')
+        entry=np.asarray(seams[i-1]['actual_camera_strips'][1] if i else values[:7],float)
+        leave=np.asarray(seams[i]['actual_camera_strips'][0] if i<len(plan.segments)-1 else values[-7:],float)
+        if (hashlib.sha256(entry.tobytes()).hexdigest()!=row.get('entry_geometry_hash')
+                or hashlib.sha256(leave.tobytes()).hexdigest()!=row.get('exit_geometry_hash')):
+            raise ValueError('frozen endpoint geometry changed')
+        if code==5:paths,valid=whole_viewports(entry[None],leave[None],length=n,cap=2.)
+        else:
+            base=np.tile(values[n//2],(n,1))
+            paths,valid=cameras(entry[None],leave[None],base,cap=2.)
+        exact=paths[0]
+        if not valid[0] or curve_digest(exact)!=expected:
+            raise ValueError('cannot restore exact frozen camera hash')
+        difference=float(np.abs(exact-values).max())
+        if difference>8*np.finfo(float).eps*max(1.,float(np.abs(values).max())):
+            raise ValueError('camera differs by more than replay roundoff')
+        track=EditorialTransformTrack(tuple(EditorialTransformKeyframe(k/plan.fps,*map(float,v))
+            for k,v in enumerate(exact)),reason='exact_hash_verified_scored_arc_materialization')
+        result.append(replace(segment,editorial_transform=track))
+        receipts.append(dict(segment=i,camera_arc_code=code,frames=n,maximum_difference=difference,
+            exact_original_scored_sha256=expected,endpoint_geometry_hashes_exact=True,
+            source_or_cut_or_camera_choice_changed=False))
+    return replace(plan,segments=tuple(result)),receipts
 
 
 def validate_camera_clock(plan,proof,sources):
@@ -24,14 +78,7 @@ def validate_camera_clock(plan,proof,sources):
     for s,n,row in zip(plan.segments,counts,proof,strict=True):
         if (row['source'],row['first_frame'],row['final_frame'])!=(s.source_index,offset,offset+n):
             raise ValueError('frozen source/output interval changed')
-        if s.editorial_transform is None:
-            if s.crop is not None or s.pan_crop is not None:raise ValueError('a different crop needs its own replay proof')
-            values=np.tile([1.,.5,.5],(n,1))
-        else:
-            keys=s.editorial_transform.keyframes;t=np.arange(n)/plan.fps
-            values=np.column_stack([np.interp(t,[k.time_seconds for k in keys],[getattr(k,a) for k in keys])
-                for a in ('zoom','center_x','center_y')])
-            if any(k.roll_degrees!=0 for k in keys):raise ValueError('unscored rotation in subject programme')
+        values=camera_values(s,n,plan.fps)
         if 'scored_camera_sha256' in row:
             if 'camera_path_sha256' in row or not all(k in row for k in ('native_first','native_last')):
                 raise ValueError('ambiguous or incomplete subject camera/native proof')
@@ -88,7 +135,17 @@ def main():
                 or clock.get('selected_scored_camera_frames_checked')!=plan.output_frame_count):
             raise ValueError('global programme requires its complete preselected source/camera/native replay')
         replay=record['fixed_actor_camera_hold_receipt']['frozen_selected_camera_arcs']
+    plan,materialization=materialize_scored_cameras(plan,record)
     boundary=validate_camera_clock(plan,replay,spec['sources'])
+    render_input=None
+    if materialization:
+        path=plan.output.with_suffix('.render-input-plan.json')
+        content=json.dumps(plan.to_json(),indent=2,allow_nan=False)+'\n'
+        if path.exists():
+            if path.read_text()!=content:raise ValueError('saved exact render input differs')
+        else:
+            with path.open('x') as f:f.write(content)
+        render_input=dict(path=str(path),sha256=hashlib.sha256(content.encode()).hexdigest())
     limit=plan.output_frame_count/plan.fps+35.;started=monotonic();peak=0;last=-10.;failure=None;codec=None
     with claim.open('x') as f:json.dump(dict(plan_sha256=hashlib.sha256(raw).hexdigest(),maximum_seconds=limit,automatic_retry=False),f)
     def progress(event):
@@ -109,6 +166,7 @@ def main():
     result=dict(movie=str(plan.output),failure=failure,elapsed_seconds=monotonic()-started,
         encoder_peak_RSS_bytes=peak,codec=codec,output_frames=plan.output_frame_count,
         plan_sha256=hashlib.sha256(raw).hexdigest(),selection_repeated=False,new_source_NN=0,
+        exact_camera_materialization=materialization,render_input_plan=render_input,
         normal_speed_audio_playback_performed=False,professional_quality_approved=False)
     if plan.output.exists():
         result['movie_bytes']=plan.output.stat().st_size

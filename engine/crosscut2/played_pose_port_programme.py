@@ -409,9 +409,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             if context is not None and 0<n<len(nodes)-1:
                 boundary_contexts.append(dict(output_frame=int(nodes[n]),
                     offsets=context['clock'].output_frames.tolist(),native_indices=context['clock'].native_indices.tolist()))
-        # Exact collinear-run removal, not an approximate camera re-fit.
-        bends=np.flatnonzero(np.any(np.diff(curve,n=2,axis=0)!=0.,axis=1))+1
-        knots=np.array(sorted({0,len(curve)-1,*map(int,bends)}),int)
+        # Keep the actual scored samples. Even mathematically collinear-run
+        # removal can introduce an ULP when the renderer interpolates again,
+        # breaking the retained byte-exact camera hash near a float boundary.
+        knots=np.arange(len(curve))
         chosen_rows.append(dict(ticks=ticks[knots],curve=curve[knots],heads=heads,indices=indices,formation=scene==2,
             scored_camera_frames=ticks,scored_camera_values=curve,
             cameras=grid_camera,displayed_focal_heads=heads,displayed_focal_indices=indices,

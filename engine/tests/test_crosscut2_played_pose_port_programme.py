@@ -17,6 +17,8 @@ def test_actual_producer_uses_physical_pose_and_saved_two_ended_camera_codes(tmp
     assert score==pytest.approx(sum(sum(x['components'].values()) for x in receipt['selected_hold_cost_decomposition']))
     for k,(i,j,index) in enumerate(runs):
         assert len(data[index]['scored_camera_values'])==args[0][j]-args[0][i]
+        np.testing.assert_array_equal(data[index]['ticks'],data[index]['scored_camera_frames'])
+        np.testing.assert_array_equal(data[index]['curve'],data[index]['scored_camera_values'])
         if k:assert ports.selected(i,k-1,k)['partial_pose_cost_used']
     assert not list(tmp_path.iterdir())
 
