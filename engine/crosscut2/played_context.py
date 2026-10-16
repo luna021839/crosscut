@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sys
+from time import monotonic
 import numpy as np
 from .scene_targets import TargetScene,from_original_view,FEATURE,FORMATION,UNKNOWN
 from .physical_display_observations import focal_metadata
@@ -177,17 +178,29 @@ class _SourceField:
 
 
 class PlayedContext:
-    def __init__(self,model,*,nodes,entries,exits,catalogues,arcs,native_ports,fps,source_bindings,check):
+    def __init__(self,model,*,nodes,entries,exits,catalogues,arcs,native_ports,fps,source_bindings,check,kernel='numpy'):
         if (not isinstance(source_bindings,(list,tuple)) or len(source_bindings)!=len(catalogues)
                 or any(not isinstance(v,str) or not re.fullmatch('[0-9a-f]{64}',v) for v in source_bindings)):
             raise ValueError('actual content-bound physical sources required for sequence context')
         self.model=model;self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits
         self.cats=catalogues;self.arcs=arcs;self.fps=float(fps);self.check=check;self.final=int(nodes[-1])
         self.history_frames=int(np.ceil(model.context_seconds*fps));self.interval_frames=model.interval_frames
+        if kernel not in ('numpy','numba'):raise ValueError('explicit numpy reference or strict numba context kernel required')
+        self.kernel=kernel;self._window_features=batched_window_features;kernel_started=monotonic()
+        if kernel=='numba':
+            from .sequence_context_kernel import features as compiled_features
+            self._window_features=compiled_features
+            for readonly in (False,True):
+                frames=np.zeros(0,np.int64);raw=np.zeros((1,0,len(PRIMITIVES)));known=np.zeros(raw.shape,bool)
+                if readonly:
+                    for value in (frames,raw,known):value.setflags(write=False)
+                check();self._window_features(frames,raw,known,np.zeros(0,np.int64),fps=fps,context_frames=self.history_frames)
+        self.kernel_preparation_seconds=monotonic()-kernel_started
         self.fields=[];self.reference=[];self.base_prefix=[];self.ends=np.r_[np.arange(6,self.final,6),self.final]
         self.durations=np.diff(np.r_[0,self.ends])/fps
         self.cache=OrderedDict();self.cache_bytes=0;self.cache_limit=32*2**20
         self.clock_cache=OrderedDict();self.fast=0;self.fallback=0;self.window_calls=0;self.cache_hits=0
+        self.identical_input_hits=0
         for s,(cat,binding,native) in enumerate(zip(catalogues,source_bindings,native_ports,strict=True)):
             check();clock=cat.bank.get('programme_render_clock')
             if (clock is None or len(clock['source_times'])!=len(nodes) or clock['fps']<=0 or clock['count']<1):
@@ -236,23 +249,45 @@ class PlayedContext:
     def _batch_head_cost(self,histories,ref,ends):
         if not len(ends):return np.zeros(len(histories))
         first=max(0,int(ends[0])-self.history_frames);final=int(ends[-1]);begin=int(self.nodes[ref.first])
-        frames=np.arange(first,final);B=len(histories)
+        current=self._part(ref,first,final)
+        h=hashlib.sha256(ends.tobytes())
+        for a in (current.frames,np.where(current.observed,current.values,0.),current.observed):h.update(a.tobytes())
+        signature=h.digest();keys=[('evaluated-head',history,first,final,begin,signature) for history in histories]
+        result=np.empty(len(histories));missing=[]
+        for b,key in enumerate(keys):
+            if key in self.cache:
+                result[b]=self._memo(key,lambda:None);self.identical_input_hits+=1
+            else:missing.append(b)
+        if not missing:return result
+        # Reuse only exactly identical observed scoring inputs. Camera codes,
+        # physical prefix refs and their future-equivalence states are NOT
+        # merged/dropped by this bounded scalar-cost cache.
+        frames=np.arange(first,final);B=len(missing)
         values=np.zeros((B,len(frames),len(PRIMITIVES)));known=np.zeros(values.shape,bool)
-        current=self._part(ref,first,final);at=current.frames-first
+        at=current.frames-first
         values[:,at]=current.values;known[:,at]=current.observed
-        for b,history in enumerate(histories):
+        for b,original in enumerate(missing):
+            history=histories[original]
             past=self._history(history,first,begin);at=past.frames-first
             values[b,at]=past.values;known[b,at]=past.observed
-        features=batched_window_features(frames,values,known,ends,fps=self.fps,context_frames=self.history_frames)
+        features=self._window_features(frames,values,known,ends,fps=self.fps,context_frames=self.history_frames)
         durations=self.durations[np.searchsorted(self.ends,ends)]
         self.window_calls+=len(ends)*B
-        return self.model.costs(features)@durations
+        scores=self.model.costs(features)@durations
+        for b,score in zip(missing,scores):result[b]=self._memo(keys[b],lambda v=float(score):v)
+        return result
 
     def _cost(self,refs,ends):
         if not len(ends):return 0.
         first=max(0,int(ends[0])-self.history_frames);final=int(ends[-1])
         parts=[self._part(r,first,final) for r in refs if self.nodes[r.final]>first and self.nodes[r.first]<final]
         evidence=merge(parts);self.window_calls+=len(ends)
+        if self.kernel=='numba':
+            if not np.array_equal(ends,self.ends[(self.ends>=ends[0])&(self.ends<=final)]):
+                raise AssertionError('context windows moved with a cut')
+            features=self._window_features(evidence.frames,evidence.values[None],evidence.observed[None],ends,
+                fps=self.fps,context_frames=self.history_frames)[0]
+            return float(self.model.costs(features)@self.durations[np.searchsorted(self.ends,ends)])
         report=windows(evidence,final_frame=self.final,fps=self.fps,score_after_frame=int(ends[0])-1,
             score_until_frame=final)
         if not np.array_equal(report['interval_final'],ends):raise AssertionError('context windows moved with a cut')
@@ -267,11 +302,11 @@ class PlayedContext:
         if len(self.clock_cache)>4096:self.clock_cache.popitem(last=False)
         return equal
 
-    def incremental(self,histories,ref):
-        self.check();first,final=map(int,self.nodes[[ref.first,ref.final]])
-        fresh=self.ends[(self.ends>first)&(self.ends<=final)]
+    def _long_parts(self,ref):
+        first,final=map(int,self.nodes[[ref.first,ref.final]])
         if ref.camera<4 and final-first>=self.history_frames+38 and self._reference_clock(ref):
-            self.fast+=1;head=fresh[fresh<first+self.history_frames+19]
+            fresh=self.ends[(self.ends>first)&(self.ends<=final)]
+            head=fresh[fresh<first+self.history_frames+19]
             tail=fresh[fresh>final-19];middle=fresh[(fresh>=first+self.history_frames+19)&(fresh<=final-19)]
             s=self.entries[ref.first][ref.entry].source;mid=0.
             if len(middle):
@@ -279,13 +314,22 @@ class PlayedContext:
                 mid=float(self.base_prefix[s][ref.camera,b+1]-self.base_prefix[s][ref.camera,a])
             tail_key=('tail',s,ref.final,ref.exit,ref.camera)
             suffix=self._memo(tail_key,lambda:self._cost((ref,),tail))
-            result=[]
-            for history in histories:
-                # This fixed head cannot depend on the distant outgoing
-                # port/end once both19-frame endpoint effects are disjoint.
-                key=('head',history,ref.first,ref.entry,ref.camera)
-                result.append(self._memo(key,lambda h=history:self._cost((*h,ref),head))+mid+suffix)
-            return np.asarray(result)
+            return head,mid,suffix
+        return None
+
+    def lower_bound(self,ref):
+        # Softplus rates are nonnegative. An exact history-independent middle
+        # and tail therefore bound this arc for EVERY incoming history, not
+        # just a cheaply pooled prefix. No new editorial criterion is used.
+        parts=self._long_parts(ref)
+        return 0. if parts is None else float(parts[1]+parts[2])
+
+    def incremental(self,histories,ref):
+        self.check();first,final=map(int,self.nodes[[ref.first,ref.final]])
+        fresh=self.ends[(self.ends>first)&(self.ends<=final)];parts=self._long_parts(ref)
+        if parts is not None:
+            self.fast+=1;head,mid,suffix=parts
+            return self._batch_head_cost(histories,ref,head)+mid+suffix
         self.fallback+=1
         # Every camera code becomes independent of its incoming history after
         # four seconds. Score that suffix once, not once per retained label.
@@ -312,6 +356,10 @@ class PlayedContext:
 
     def receipt(self):
         self.model.verify()
+        execution=None
+        if self.kernel=='numba':
+            from .sequence_context_kernel import receipt
+            execution=receipt()
         return dict(observation_contract=OBSERVATION_CONTRACT,source_NN_calls=0,new_source_rasters=0,
             exact_native_observation_lookup_no_interpolation=True,pre_camera_targets=True,
             head_and_body_not_borrowed_between_people=True,background_flow_measured=False,
@@ -322,4 +370,7 @@ class PlayedContext:
             cache_bytes=self.cache_bytes,workspace_reserved_bytes=self.workspace_reserved_bytes,
             long_reference_clock_factorizations=self.fast,direct_context_evaluations=self.fallback,
             observed_window_evaluations=self.window_calls,cache_hits=self.cache_hits,
+            identical_observed_head_input_cache_hits=self.identical_input_hits,
+            context_kernel=self.kernel,kernel_preparation_seconds=self.kernel_preparation_seconds,
+            compiled_kernel_execution=execution,
             normal_speed_AV_performed=False,professional_quality_approved=False)

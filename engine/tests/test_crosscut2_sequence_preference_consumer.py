@@ -58,18 +58,22 @@ def arguments(nodes,cats):
         music=np.ones(len(nodes)),connection_prior=PlayedPosePortPrior(editorial_opportunities=True))
 
 
-def test_actual_event_entry_path_consumes_new_context_and_changes_realized_camera_values():
+@pytest.mark.parametrize('kernel',['numpy','numba'])
+def test_actual_event_entry_path_consumes_new_context_and_changes_realized_camera_values(kernel):
+    if kernel=='numba':pytest.importorskip('numba')
     nodes=np.array([0,18,36,54]);cats=prepared(nodes);kw=arguments(nodes,cats)
     a=select(nodes,[c.bank for c in cats],None,[c.style for c in cats],**kw)
     model=numeric_model(zoom_weight=-100.,bias=10.)
     b=select(nodes,[c.bank for c in cats],None,[c.style for c in cats],**kw,
-        sequence_preference_model=model,sequence_source_bindings=['a'*64,'b'*64])
+        sequence_preference_model=model,sequence_source_bindings=['a'*64,'b'*64],sequence_context_kernel=kernel)
     receipt=b[4]
     assert receipt['sequence_preference_consumed'] and not receipt['scene_readout_consumed']
     assert not receipt['pre_DP_scalar_camera_argmin_used']
     assert receipt['sequence_preference_model_sha256']==model.artifact['content_sha256']
     assert receipt['boundary_port_DP']['scalar_cost_or_debt_dominance'] is False
     assert receipt['sequence_preference_context']['source_NN_calls']==0
+    assert receipt['sequence_preference_context']['context_kernel']==kernel
+    if kernel=='numba':assert receipt['sequence_preference_context']['compiled_kernel_execution']['nopython_specializations']>0
     camera_a=np.concatenate([r['scored_camera_values'] for r in a[2]])
     camera_b=np.concatenate([r['scored_camera_values'] for r in b[2]])
     assert camera_a.shape==camera_b.shape==(54,3) and not np.array_equal(camera_a,camera_b)
@@ -111,7 +115,7 @@ def test_model_does_not_upgrade_weak_advisory_or_all_negative_evidence_to_fitted
         with pytest.raises(ValueError,match='parameters changed'):model.verify()
 
 
-def context_fixture(nodes,*,nonlinear_clock=False,feature_weights=None):
+def context_fixture(nodes,*,nonlinear_clock=False,feature_weights=None,kernel='numpy'):
     cats=prepared(nodes);paths=[[(nodes,np.tile([1.+g*.04,.5,.5],(len(nodes),1))) for g in range(4)] for _ in cats]
     cats[1].bank['heads'][:,:,0,0]=.7
     if nonlinear_clock:
@@ -123,7 +127,7 @@ def context_fixture(nodes,*,nonlinear_clock=False,feature_weights=None):
         fps=30.,preserve_camera_alternatives=True)
     model=numeric_model(zoom_weight=3.,bias=.1,feature_weights=feature_weights)
     scorer=PlayedContext(model,nodes=nodes,entries=entry,exits=exit,catalogues=cats,arcs=arcs,
-        native_ports=native,fps=30.,source_bindings=['a'*64,'b'*64],check=lambda:None)
+        native_ports=native,fps=30.,source_bindings=['a'*64,'b'*64],check=lambda:None,kernel=kernel)
     return scorer,arcs
 
 
@@ -220,6 +224,39 @@ def test_batched_distinct_prefixes_and_all_camera_codes_keep_each_real_history_c
             whole,_=context.replay([*history,arc])
             assert actual[k]==pytest.approx(whole[-1],abs=1e-11)
     assert context.cache_hits>0
+
+
+def test_identical_observed_camera_inputs_reuse_cost_without_erasing_codes_or_histories():
+    nodes=np.array([0,30,60,90]);context,arcs=context_fixture(nodes)
+    p=next(k for k,v in enumerate(context.entries[0]) if v.source==0)
+    q=next(k for k,v in enumerate(context.exits[-1]) if v.source==0)
+    refs=[ArcRef(0,3,p,q,code) for code in (0,4,5)]
+    for ref in refs[1:]:
+        np.testing.assert_array_equal(context._part(ref,0,90).values,context._part(refs[0],0,90).values)
+    values=[context.incremental([()],ref)[0] for ref in refs]
+    assert values==pytest.approx([values[0]]*3,abs=1e-12)
+    assert context.window_calls==15  # all three codes still exist; score input is identical
+    assert context.receipt()['identical_observed_head_input_cache_hits']==2
+    before=context.window_calls;different=ArcRef(0,3,p,q,1)
+    assert context.incremental([()],different)[0]!=pytest.approx(values[0],abs=1e-8)
+    assert context.window_calls>before
+
+
+@pytest.mark.parametrize('nonlinear',[False,True])
+def test_history_independent_long_bound_never_exceeds_any_actual_prefix_cost(nonlinear):
+    nodes=np.arange(0,421,30);context,_=context_fixture(nodes,nonlinear_clock=nonlinear,
+        feature_weights={'feature_center_x.observed_mean':2.,'additional_log_zoom.observed_adjacent_mean_rate':1.})
+    def arc(i,j,s,code):
+        p=next(k for k,v in enumerate(context.entries[i]) if v.source==s)
+        q=next(k for k,v in enumerate(context.exits[j]) if v.source==s)
+        return ArcRef(i,j,p,q,code)
+    histories=[(arc(0,3,0,0),),(arc(0,1,1,2),arc(1,3,0,1))]
+    for code in range(6):
+        ref=arc(3,14,0,code);bound=context.lower_bound(ref)
+        actual=context.incremental(histories,ref)
+        assert (actual>=bound).all() and bound>=0.
+        if code<4 and not nonlinear:assert bound>0.
+        else:assert bound==0.
 
 
 def test_cli_rejects_unbound_or_old_sequence_artifact_before_mount_acquisition_or_render(monkeypatch,tmp_path):

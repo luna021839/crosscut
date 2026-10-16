@@ -69,7 +69,7 @@ def fragment_costs(nodes,source_events,*,fps,support_seconds):
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,check=lambda:None,
            maximum_seconds=180.,identity_hints=None,part_observer=None,maximum_preparation_seconds=240.,
            preference_model=None,preference_workspace=None,connection_prior=None,person_observer=None,subjects=None,
-           opportunity_observer=None,sequence_preference_model=None,sequence_source_bindings=None):
+           opportunity_observer=None,sequence_preference_model=None,sequence_source_bindings=None,sequence_context_kernel='numpy'):
     if getattr(connection_prior,'port_camera_prior',False):
         if preference_model is not None:raise ValueError('E port-camera prior cannot use a preference checkpoint')
         from .played_pose_port_programme import select as choose_ports
@@ -77,9 +77,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             native_ports=native_ports,music=music,prior=connection_prior,identity_hints=identity_hints,
             part_observer=part_observer,person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer,
             sequence_preference_model=sequence_preference_model,sequence_source_bindings=sequence_source_bindings,
+            sequence_context_kernel=sequence_context_kernel,
             check=check,maximum_preparation_seconds=maximum_preparation_seconds,
             maximum_seconds=maximum_seconds)
-    if sequence_preference_model is not None or sequence_source_bindings is not None:
+    if sequence_preference_model is not None or sequence_source_bindings is not None or sequence_context_kernel!='numpy':
         raise ValueError('sequence preference requires the actual E4 played camera consumer')
     if subjects is not None:raise ValueError('dense subject evidence requires the actual played port-camera consumer')
     if opportunity_observer is not None:raise ValueError('subject opportunity probe requires the actual played port-camera consumer')

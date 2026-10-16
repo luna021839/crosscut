@@ -34,7 +34,7 @@ class PlayedPosePortPrior:
             'subject_window_bank.py','subject_action_match.py','subject_cut_moments.py','editorial_opportunities.py',
             'programme_framing.py','programme_source_clock.py','subject_opportunity_probe.py','editorial_roles.py',
             'scene_readout.py','readout_port_dp.py','scene_targets.py','sequence_context.py',
-            'sequence_preference_model.py','played_context.py','context_port_dp.py']
+            'sequence_preference_model.py','played_context.py','context_port_dp.py','sequence_context_kernel.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -104,13 +104,15 @@ class SelectedPorts:
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
            identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
            check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.,
-           sequence_preference_model=None,sequence_source_bindings=None):
+           sequence_preference_model=None,sequence_source_bindings=None,sequence_context_kernel='numpy'):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
     sequence=sequence_preference_model is not None
+    if sequence_context_kernel not in ('numpy','numba') or (not sequence and sequence_context_kernel!='numpy'):
+        raise ValueError('explicit sequence model required for a changed context kernel')
     if sequence:
         from .sequence_preference_model import Model as SequenceModel
         if not isinstance(sequence_preference_model,SequenceModel):
@@ -197,7 +199,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     contextual=None
     if sequence:
         contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
-            native_ports=native_ports,fps=fps,source_bindings=sequence_source_bindings,check=live)
+            native_ports=native_ports,fps=fps,source_bindings=sequence_source_bindings,check=live,kernel=sequence_context_kernel)
     cut_cache={};cut_statistics=[];entry_density={};cut_transfers={}
     beat_frames=np.asarray(nodes)[music>0]
     exposure_seconds=0. if len(beat_frames)<3 else float(2.*np.median(np.diff(beat_frames))/fps)
@@ -264,7 +266,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         port_runs,objective,dp=context_solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
             start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,context_cost=contextual.incremental,
             history_key=contextual.equivalent_key,history_frames=contextual.history_frames,minimum_frames=12,check=live,
-            context_lower_bound=lambda ref:0.,  # Model's softplus loss rate is nonnegative.
+            context_lower_bound=contextual.lower_bound,
             episodes=opportunities.episodes,credit=credit,workspace_limit_bytes=200*2**20-contextual.workspace_reserved_bytes)
     elif readout:
         from .readout_port_dp import solve as readout_solve

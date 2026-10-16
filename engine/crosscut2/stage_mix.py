@@ -306,6 +306,8 @@ def main():
         help='Explicit fitted same-event experimental model; not normal app or professional-quality approval')
     parser.add_argument('--experimental-sequence-preference-model',type=Path,
         help='Explicit fitted fixed-time four-second context model; E4 only, no same-event model or default weights')
+    parser.add_argument('--experimental-sequence-kernel',choices=('numpy','numba'),default='numpy',
+        help='Opt-in strict compiled context statistics; requires sequence model and installed sequence-context-numba extra')
     parser.add_argument('--fixed-connection-prior',action='store_true',
         help='One declared untrained monotone face/action B prior; no weak imitation checkpoint')
     parser.add_argument('--common-evidence-connection-prior',action='store_true',
@@ -384,6 +386,8 @@ def main():
             not args.editorial_opportunity_exposure or not args.played_pose_port_camera_prior
             or args.experimental_preference_model is not None):
         raise ValueError('new sequence preference requires E4 played ports and no same-event checkpoint')
+    if args.experimental_sequence_kernel!='numpy' and args.experimental_sequence_preference_model is None:
+        raise ValueError('compiled sequence kernel requires an explicit sequence model')
     if args.opportunity_subject_spec is not None and (not args.editorial_opportunity_exposure or args.reuse_subject_observations is None):
         raise ValueError('bounded subject opportunity probe requires explicit E4 and bound existing subject observations')
     started = monotonic()
@@ -573,6 +577,7 @@ def main():
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
                 person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer,
                 sequence_preference_model=sequence_preference_model,
+                sequence_context_kernel=args.experimental_sequence_kernel,
                 sequence_source_bindings=None if sequence_preference_model is None else
                     [v['source_sha256'] for v in bound_source_cut_events])
             plan,seams=realize(original,warps,nodes,runs,states,data,output=args.output,measured=event_ports)

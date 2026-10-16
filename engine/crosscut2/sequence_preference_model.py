@@ -75,8 +75,8 @@ class Model:
                 or payload.get('bias')!=self.bias):
             raise ValueError('sequence model parameters changed after their verified receipt')
 
-    def prepare(self,*,nodes,entries,exits,catalogues,arcs,native_ports,fps,source_bindings,check):
+    def prepare(self,*,nodes,entries,exits,catalogues,arcs,native_ports,fps,source_bindings,check,kernel='numpy'):
         self.verify()
         from .played_context import PlayedContext
         return PlayedContext(self,nodes=nodes,entries=entries,exits=exits,catalogues=catalogues,
-            arcs=arcs,native_ports=native_ports,fps=fps,source_bindings=source_bindings,check=check)
+            arcs=arcs,native_ports=native_ports,fps=fps,source_bindings=source_bindings,check=check,kernel=kernel)

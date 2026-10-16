@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sequence-context-numba = [
+  "numba==0.65.1",
+]
 native-person-onnx = [
   "onnxruntime==1.30.0",
 ]
