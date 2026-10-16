@@ -110,9 +110,8 @@ class DenseSubjects:
             ownership_certified=False)
 
 
-def load_reused(reference,*,sources,source_hashes,banks,nodes,warps,clocks,master_start,fps,
-                authorized_root,check=lambda:None):
-    """Load only window paths actually retained by one bound observation pass.
+def load_windows(reference,*,sources,source_hashes,master_start,fps,authorized_root,check=lambda:None):
+    """Load raw windows without coupling their availability to an old grid.
 
     A missing source window is permitted; a changed source/clock is not. This
     never scans all experiment folders, runs a sensor, or rewrites old caches.
@@ -143,6 +142,21 @@ def load_reused(reference,*,sources,source_hashes,banks,nodes,warps,clocks,maste
         if path.is_symlink() or not path.resolve(strict=True).is_relative_to(root):
             raise ValueError('subject window outside authorized project or symlink')
         groups[s].append(load(path,binding=source_hashes[s]))
+    return groups
+
+
+def load_reused(reference,*,sources,source_hashes,banks,nodes,warps,clocks,master_start,fps,
+                authorized_root,check=lambda:None):
+    groups=load_windows(reference,sources=sources,source_hashes=source_hashes,
+        master_start=master_start,fps=fps,authorized_root=authorized_root,check=check)
+    return bind_windows(groups,source_hashes=source_hashes,banks=banks,nodes=nodes,warps=warps,
+        clocks=clocks,master_start=master_start,fps=fps,check=check)
+
+
+def bind_windows(groups,*,source_hashes,banks,nodes,warps,clocks,master_start,fps,check=lambda:None):
+    """Bind the SAME immutable windows to the actual final decision grid."""
+    if not len(groups)==len(source_hashes)==len(banks)==len(warps)==len(clocks):
+        raise ValueError('one dense window domain per actual source is required')
     result=[]
     for s,(bank,warp,clock) in enumerate(zip(banks,warps,clocks,strict=True)):
         check()

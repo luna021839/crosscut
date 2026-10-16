@@ -49,7 +49,7 @@ class PlayedPosePortPrior:
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
-            'source_member_scores.py']
+            'source_member_scores.py','fine_subject_grid.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),

@@ -32,12 +32,19 @@ def validate_camera_clock(plan,proof,sources):
             values=np.column_stack([np.interp(t,[k.time_seconds for k in keys],[getattr(k,a) for k in keys])
                 for a in ('zoom','center_x','center_y')])
             if any(k.roll_degrees!=0 for k in keys):raise ValueError('unscored rotation in subject programme')
-        if curve_digest(values)!=row['scored_camera_sha256']:raise ValueError('scored camera changed')
+        if 'scored_camera_sha256' in row:
+            if 'camera_path_sha256' in row or not all(k in row for k in ('native_first','native_last')):
+                raise ValueError('ambiguous or incomplete subject camera/native proof')
+            expected=row['scored_camera_sha256']
+        else:
+            if row.get('per_frame_camera_count')!=n:raise ValueError('incomplete global camera proof')
+            expected=row.get('camera_path_sha256')
+        if expected is None or curve_digest(values)!=expected:raise ValueError('scored camera changed')
         source=sources[s.source_index]
         native=np.asarray(sampler_frame_schedule(source_start=s.source_start,source_playback_rate=s.source_playback_rate,
             native_fps=source['fps'],output_fps=plan.fps,frame_count=n,
             source_frame_count=source['frame_count']).source_frame_indices)
-        if (int(native[0]),int(native[-1]))!=(row['native_first'],row['native_last']):
+        if 'native_first' in row and (int(native[0]),int(native[-1]))!=(row['native_first'],row['native_last']):
             raise ValueError('observed endpoint native clock changed')
         if offset:cuts.setdefault(offset,set()).add('authored')
         for tick in source['native_cuts']:
@@ -51,9 +58,13 @@ def validate_camera_clock(plan,proof,sources):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for key in ('plan','source-spec','authorized-root'):p.add_argument('--'+key,type=Path,required=True)
-    p.add_argument('--ssd-device',type=int,required=True);args=p.parse_args()
+    p.add_argument('--ssd-device',type=int,required=True)
+    p.add_argument('--expected-plan-sha256',help='Digest retained by the actual global selection, not a new post-fit plan.')
+    args=p.parse_args()
     root=args.authorized_root.resolve(strict=True);raw=args.plan.read_bytes();record=json.loads(raw)
     plan=render_plan_from_json(record['render_plan']);spec=json.loads(args.source_spec.read_text())
+    if args.expected_plan_sha256 is not None and hashlib.sha256(raw).hexdigest()!=args.expected_plan_sha256:
+        raise ValueError('saved plan differs from the selected immutable plan identity')
     for path in (args.plan,plan.output,*plan.sources):
         if not path.resolve().is_relative_to(root):raise ValueError('explicit media root only')
     if [str(v) for v in plan.sources]!=[v['path'] for v in spec['sources']] or plan.fps!=spec['fps']:
@@ -66,7 +77,18 @@ def main():
         if [list(file_identity(v)) for v in plan.sources]!=identities:raise OSError('frozen source changed')
         if shutil.disk_usage(root).free<2*2**30:raise OSError('insufficient authorized SSD working space')
     check()
-    boundary=validate_camera_clock(plan,record['subject_moment_refinement_receipt']['camera_native_replay'],spec['sources'])
+    if 'subject_moment_refinement_receipt' in record:
+        replay=record['subject_moment_refinement_receipt']['camera_native_replay']
+    else:
+        if args.expected_plan_sha256 is None:
+            raise ValueError('global selection requires its independently retained expected plan digest')
+        clock=record.get('selected_clock_check',{})
+        if (not all(clock.get(k) is True for k in ('all_source_clocks_verified','source_observation_ordinals_exact',
+                'retained_native_clock_verified','camera_transform_replay_exact_within_roundoff'))
+                or clock.get('selected_scored_camera_frames_checked')!=plan.output_frame_count):
+            raise ValueError('global programme requires its complete preselected source/camera/native replay')
+        replay=record['fixed_actor_camera_hold_receipt']['frozen_selected_camera_arcs']
+    boundary=validate_camera_clock(plan,replay,spec['sources'])
     limit=plan.output_frame_count/plan.fps+35.;started=monotonic();peak=0;last=-10.;failure=None;codec=None
     with claim.open('x') as f:json.dump(dict(plan_sha256=hashlib.sha256(raw).hexdigest(),maximum_seconds=limit,automatic_retry=False),f)
     def progress(event):

@@ -44,3 +44,16 @@ def test_unscored_rotation_is_not_ignored_by_the_camera_hash():
     track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1,.5,.5,1.),))
     plan=replace(plan,segments=(replace(plan.segments[0],editorial_transform=track),plan.segments[1]))
     with pytest.raises(ValueError,match='unscored rotation'):validate_camera_clock(plan,proof,sources)
+
+
+def test_global_camera_receipt_uses_the_preselected_full_frame_hash_not_a_new_fit():
+    plan,proof,sources=fixture()
+    global_proof=[dict(source=row['source'],first_frame=row['first_frame'],final_frame=row['final_frame'],
+        camera_path_sha256=row['scored_camera_sha256'],per_frame_camera_count=30) for row in proof]
+    assert validate_camera_clock(plan,global_proof,sources)['output_frame_count']==60
+    global_proof[0]['per_frame_camera_count']=29
+    with pytest.raises(ValueError,match='incomplete global camera proof'):
+        validate_camera_clock(plan,global_proof,sources)
+    del proof[0]['native_first']
+    with pytest.raises(ValueError,match='incomplete subject'):
+        validate_camera_clock(plan,proof,sources)
