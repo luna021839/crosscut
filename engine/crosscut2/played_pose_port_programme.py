@@ -24,9 +24,11 @@ from .focal_appearance import cosine as focal_appearance_cosine
 
 class PlayedPosePortPrior:
     port_camera_prior=True
-    def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False):
+    def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
+        if played_interval_utility and (not editorial_opportunities or scene_readout):
+            raise ValueError('played interval utility requires fixed events without the rejected readout objective')
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
@@ -36,7 +38,8 @@ class PlayedPosePortPrior:
             'scene_readout.py','readout_port_dp.py','scene_targets.py','sequence_context.py',
             'sequence_preference_model.py','played_context.py','context_port_dp.py','sequence_context_kernel.py',
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
-            'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py']
+            'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
+            'played_interval_utility.py','observed_reframing.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -95,6 +98,14 @@ class PlayedPosePortPrior:
                 observed_net_changes_not_discarded_for_wide_sample_spacing=True,
                 known_original_faces_clipped_by_view_are_not_missing_sensor_evidence=True,
                 unknown_exposure_recovers_no_readout_burden=True)
+        self.artifact['played_interval_utility']=bool(played_interval_utility)
+        if played_interval_utility:
+            self.artifact.update(contract='actual_interval_action_delivery_composed_image_boundary_port_E6_v1',
+                opportunity_credit='fixed_event_priority_times_actually_observed_pointwise_action_delivery',
+                seven_frame_entry_credit_used=False,entry_density_times_hold_duration=False,
+                complete_arc_camera_argmin_after_actual_utility=True,
+                refiner_articulated_seam_observation_used_before_source_cut_selection=True,
+                observed_image_motion_is_not_actor_or_camera_cause=True)
         self.artifact['content_sha256']=hashlib.sha256(json.dumps(self.artifact,sort_keys=True).encode()).hexdigest()
 
 
@@ -112,6 +123,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
+    played=bool(prior.artifact.get('played_interval_utility',False))
     sequence=sequence_preference_model is not None
     if sequence_context_kernel not in ('numpy','numba') or (not sequence and sequence_context_kernel!='numpy'):
         raise ValueError('explicit sequence model required for a changed context kernel')
@@ -121,6 +133,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             raise ValueError('an explicit new fixed-time sequence model is required; no same-event checkpoint')
         if not editorial or readout:
             raise ValueError('sequence model replaces rejected E5 and requires the E4 ROI/action base')
+        if played:raise ValueError('the explicit pointwise interval trial does not replace learned sequence semantics')
         sequence_preference_model.verify()
         if sequence_source_bindings is None:raise ValueError('sequence model needs actual physical source bindings')
     elif sequence_source_bindings is not None:
@@ -194,11 +207,15 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     events=[sorted(set(map(int,xs))|set(map(int,bank['frames']))) for xs,bank in zip(source_events,native_ports)]
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
+    interval_utility=None
+    if played:
+        from .played_interval_utility import PlayedIntervalUtility
+        interval_utility=PlayedIntervalUtility.from_catalogues(cats,opportunities,check=live)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
         person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
         roles=roles,point_geometry=editorial,
         readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps),
-        preserve_camera_alternatives=sequence)
+        preserve_camera_alternatives=sequence,played_interval_utility=interval_utility)
     contextual=None
     if sequence:
         contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
@@ -212,6 +229,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents)
             right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents)
             detail=matrix(left,right,details=True)
+            if played:
+                from .played_interval_utility import articulated_seam_evidence
+                detail=articulated_seam_evidence(detail,exits[n],entries[n])
             a=np.array([p.source for p in exits[n]]);b=np.array([p.source for p in entries[n]])
             from .editorial_roles import apply,event_energy,ordinary_pairs
             if roles is not None:
@@ -280,8 +300,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     else:
         port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
             start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live,
-            opportunity_episodes=None if opportunities is None else opportunities.episodes,
-            hold_credit=None if opportunities is None else credit)
+            opportunity_episodes=None if opportunities is None or played else opportunities.episodes,
+            hold_credit=None if opportunities is None or played else credit)
     score=float(objective[0]+potential[-1]-potential[0]);selected=SelectedPorts(nodes,fps)
     context_parts=None
     if contextual is not None:
@@ -299,9 +319,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         # camera refit, boundary shift or source choice is performed here.
         curve=arcs.replay(i,j,p,q,code);ticks=np.arange(first,final)
         cost=float(arcs.direct_cost(source,first,curve[None])[0]+fragments(i,j)[source])
+        effect=(dict(observed_action_delivery_credit=0.,composed_image_motion_delta=0.,adjustment=0.)
+            if interval_utility is None else interval_utility.replay(source,first,final,curve))
         density=entry_density.get(i,np.zeros(len(entries[i])))
-        change_credit=(min(float(final-first)/fps,exposure_seconds)*float(density[p]) if opportunities is None
-            else dp['opportunity_claims'][k]['credit'])
+        if played:change_credit=0.
+        elif opportunities is None:change_credit=min(float(final-first)/fps,exposure_seconds)*float(density[p])
+        else:change_credit=dp['opportunity_claims'][k]['credit']
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
         sequence_cost=0. if context_parts is None else context_parts[k]
         if readout:
@@ -314,7 +337,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             debt,extra=apply(transfer,debt);sequence_cost+=float(extra)
             if not math.isclose(debt,dp['selected_readout_states'][k]['exit_debt'],rel_tol=1e-8,abs_tol=1e-8):
                 raise AssertionError('selected readout exit state differs from exact camera replay')
-        cumulative+=cost-change_credit+incoming+sequence_cost
+        cumulative+=cost-change_credit+incoming+sequence_cost+effect['adjustment']
         grid_camera=_curve_at(ticks,curve,np.clip(np.asarray(nodes)[:,None]+[-1,0],first,final-1))
         heads,indices,ambiguity,scene=focal_metadata(banks[source]['heads'],grid_camera)
         chosen_states.append(State(source,None,'boundary_arc_'+str(code)))
@@ -341,12 +364,17 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         parts.append(dict(first_frame=first,final_frame=final,source=source,
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
                 measured_matched_action_change_credit=-change_credit,
+                observed_played_action_delivery_credit=-effect['observed_action_delivery_credit'],
+                composed_image_motion_replacement=effect['composed_image_motion_delta'],
                 residual_readout_interaction=sequence_cost if readout else 0.,
                 fixed_time_sequence_preference=sequence_cost if sequence else 0.),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
             detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
                 features([b.observation],fps=fps,person_extents=person_extents),details=True)
+            if played:
+                from .played_interval_utility import articulated_seam_evidence
+                detail=articulated_seam_evidence(detail,[a],[b])
             if roles is not None:
                 from .editorial_roles import apply
                 detail=apply(detail,roles.at(int(nodes[i]),a.observation['recurrent_member_hint'],b.observation['recurrent_member_hint']))
@@ -376,6 +404,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 actual_played_match_advantage=float(detail['actual_played_match_advantage'][0,0]),
                 realized_incoming_change_credit=change_credit,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
+                actual_arm_direction_used=bool(detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0]),
+                actual_arm_direction_residual=(float(detail['articulated_arm_direction'][0,0])
+                    if detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0] else None),
                 played_geometry_rate=float(detail['geometry_rate'][0,0]),
                 person_visible_extent_gap=float(detail['person_visible_extent_gap'][0,0]),
                 person_visible_extent_measured=bool(detail['person_extent_measured'][0,0]),
@@ -396,6 +427,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         scene_readout_consumed=readout,
         scene_readout_observations=[] if not readout else [r.receipt() for r in arcs.readouts],
         pre_DP_scalar_camera_argmin_used=not (readout or sequence),
+        camera_argmin_includes_actual_played_interval_utility=played,
+        played_interval_utility=None if interval_utility is None else interval_utility.receipt(),
         sequence_preference_consumed=sequence,
         sequence_preference_model_sha256=None if not sequence else sequence_preference_model.artifact['content_sha256'],
         sequence_preference_context=None if contextual is None else contextual.receipt(),

@@ -3,10 +3,26 @@ import pytest
 from crosscut2.boundary_camera_arc import build as scalar
 from crosscut2.boundary_arc_costs import cameras,ArcCosts
 from crosscut2.boundary_arc_costs import whole_viewports
+from crosscut2.boundary_arc_costs import camera_samples,camera_samples_many
 from crosscut2.played_event_support import PlayedEventSupport
 from crosscut2.event_holds import fragment_costs
 from crosscut2.boundary_port_domain import make
 from test_crosscut2_display_source_catalogue import prepared
+
+
+@pytest.mark.parametrize('length',[12,14,20,37,38,39,90,173])
+def test_sparse_batch_samples_are_bit_exact_with_existing_scalar_codes(length):
+    base=np.tile([1.2,.5,.5],(length,1))
+    entry=np.tile([1.2,.5,.5],(3,7,1));leave=entry.copy()
+    if length>=14:
+        entry[:,0:,0]=np.array([1.15,1.2,1.25])[:,None]
+        leave[:,0:,0]=np.array([1.2,1.25,1.3])[:,None]
+    at=np.unique(np.r_[0,min(6,length-1),np.arange(7,length-7,3),length-1]).astype(int)
+    for code in range(6):
+        if code==5 and length<14:continue
+        values=camera_samples_many(entry,leave,base,at,code=code)
+        for k in range(len(entry)):
+            np.testing.assert_array_equal(values[k],camera_samples(entry[k],leave[k],base,at,code=code))
 
 
 @pytest.mark.parametrize('length',[1,5,12,13,14,20,37,38,54,120])

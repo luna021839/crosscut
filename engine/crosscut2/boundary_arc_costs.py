@@ -67,6 +67,49 @@ def camera_samples(entry,exit,baseline,offsets,*,code):
     return result
 
 
+def camera_samples_many(entry,exit,baseline,offsets,*,code):
+    """Batch exact sparse samples of existing codes, not a new camera family.
+
+    Only already-admitted alternatives are passed by the interval consumer.
+    Arithmetic and linspace indexing mirror camera_samples bit for bit.
+    """
+    entry=np.asarray(entry,float);exit=np.asarray(exit,float);base=np.asarray(baseline,float)
+    at=np.asarray(offsets);L=len(base)
+    if (entry.ndim!=3 or entry.shape[1:]!=(7,3) or exit.shape!=entry.shape
+            or base.shape!=(L,3) or L<1 or at.ndim!=1 or at.dtype.kind not in 'iu'
+            or np.any((at<0)|(at>=L)) or type(code) is not int or not 0<=code<6):
+        raise ValueError('batch actual strips, baseline and sparse integer samples required')
+    result=np.broadcast_to(base[at],(len(entry),len(at),3)).copy()
+    if code<4 and L<38:return result
+    def hermite(a,b,da,db,length,index):
+        t=np.linspace(0.,1.,length)[index][None,:,None]
+        return ((2*t**3-3*t**2+1)*a[:,None]
+            +(t**3-2*t**2+t)*(length-1)*da[:,None]
+            +(-2*t**3+3*t**2)*b[:,None]+(t**3-t**2)*(length-1)*db[:,None])
+    if code==5:
+        if L<14:raise ValueError('whole viewport needs two strips')
+        a=entry.copy();b=exit.copy();a[:,:,0]=1/a[:,:,0];b[:,:,0]=1/b[:,:,0]
+        mid=(at>=7)&(at<L-7)
+        value=hermite(a[:,-1],b[:,0],a[:,-1]-a[:,-2],b[:,1]-b[:,0],L-12,at[mid]-6)
+        if np.any(value[:,:,0]<=0):raise ValueError('inadmissible inverse-zoom arc')
+        value[:,:,0]=1/value[:,:,0];result[:,mid]=value
+    elif L>=14:
+        din=entry[:,-1]-base[6];dout=exit[:,0]-base[-7]
+        vin=entry[:,-1]-entry[:,-2]-(base[6]-base[5])
+        vout=exit[:,1]-exit[:,0]-(base[-6]-base[-7])
+        if L<38 or code==4:
+            mid=(at>=7)&(at<L-7)
+            result[:,mid]+=hermite(din,dout,vin,vout,L-12,at[mid]-6)
+        else:
+            early=(at>=7)&(at<18);late=(at>=L-18)&(at<L-7);zero=np.zeros_like(din)
+            result[:,early]+=hermite(din,zero,vin,zero,13,at[early]-6)
+            result[:,late]+=hermite(zero,dout,zero,vout,13,at[late]-(L-19))
+    k=min(7,L);early=at<k;late=at>=L-k
+    result[:,early]=entry[:,at[early]]
+    result[:,late]=exit[:,at[late]-(L-k)+7-k]
+    return result
+
+
 def cameras(entry,exit,baseline,*,cap,bridge_only=False):
     """Batch (... flattened B) integer replay paths, plus feasibility mask."""
     entry=np.asarray(entry,float);exit=np.asarray(exit,float);baseline=np.asarray(baseline,float)
@@ -117,7 +160,7 @@ def whole_viewports(entry,exit,*,length,cap):
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
-                 preserve_camera_alternatives=False,capture_playback_inputs=False):
+                 preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -126,7 +169,9 @@ class ArcCosts:
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
-        self.preserve_camera_alternatives=bool(preserve_camera_alternatives or readout_tau is not None)
+        self.played_interval_utility=played_interval_utility
+        self.preserve_camera_alternatives=bool(preserve_camera_alternatives or readout_tau is not None
+            or played_interval_utility is not None)
         self.last_camera_alternatives=None
         if capture_playback_inputs and not self.preserve_camera_alternatives:
             raise ValueError('captured playback requires explicit all-camera alternatives')
@@ -387,6 +432,12 @@ class ArcCosts:
                 better=valid&(~ok|(actual<v));v=np.where(better,actual,v);g=np.where(better,5,g);ok|=valid
                 self.whole_viewport_paths_scored+=len(path)
                 self.peak_batch_bytes=max(self.peak_batch_bytes,path.nbytes+safe.nbytes)
+            if self.played_interval_utility is not None:
+                av&=clock_ok[:,:,None]
+                ac=self.played_interval_utility.adjust(self,i,j,s,p,q,ac,av)
+                if not np.isfinite(ac).all():raise ValueError('finite played interval candidate costs required')
+                g=np.argmin(np.where(av,ac,np.inf),axis=-1);ok=av.any(-1)
+                v=np.take_along_axis(ac,g[...,None],axis=-1).squeeze(-1)
             ix=np.ix_(p,q);cost[ix]=v+fragments[s];allowed[ix]=ok&clock_ok;codes[ix]=g
             if self.preserve_camera_alternatives:
                 alternatives[ix]=ac+fragments[s];alternative_ok[ix]=av&clock_ok[:,:,None]

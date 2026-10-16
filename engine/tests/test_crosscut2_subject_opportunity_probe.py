@@ -18,6 +18,7 @@ def test_already_observed_pair_does_not_trigger_new_source_inference():
     cats=[SimpleNamespace(subjects=SimpleNamespace(sample=lambda *a:object())) for _ in range(2)]
     events=SimpleNamespace(bindings={(1,0,1,0,0):.8},episodes=np.array([0,1,2]))
     assert candidates(cats,events)==[]
+    assert candidates(cats,events,include_observed=True)==[(1,0,1,0,0)]
 
 
 def test_opportunity_observer_finishes_before_final_domain_and_actual_costs(monkeypatch):
