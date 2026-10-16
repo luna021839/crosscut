@@ -67,6 +67,23 @@ def test_missing_source_windows_never_borrow_another_person_or_erase_the_source(
     np.testing.assert_array_equal(bs[1]['heads'][[0,2,3]],banks[1]['heads'])
 
 
+def test_unobserved_fine_node_neither_erases_real_content_samples_nor_claims_a_face():
+    from crosscut2.display_source_catalogue import SourceCatalogue
+    nodes,banks,poses,styles,states,groups,warps,clocks=inputs();groups[1]=[]
+    ns=np.array([0,98,100,200])
+    bs,ps,ss,_,_=expand(nodes,ns,banks,poses,styles,states,groups,warps,clocks,master_start=0.,fps=30.)
+    before=SourceCatalogue(nodes,banks[1],poses[1],[],styles[1],[],fps=30.)
+    after=SourceCatalogue(ns,bs[1],ps[1],[],ss[1],[],fps=30.)
+    assert not bs[1]['face_observation_valid'][1].any()
+    assert bs[0]['face_observation_valid'][1].all()
+    frames=np.arange(94,107);camera=np.tile([1.,.5,.5],(len(frames),1))
+    np.testing.assert_array_equal(after.content_scope,before.content_scope)
+    np.testing.assert_array_equal(after.rates(frames,camera),before.rates(frames,camera))
+    # Nearby samples are only the existing integration rule. They never turn
+    # the unsampled fine endpoint into exact face/pose/appearance evidence.
+    assert after.observation(1,0,np.tile([1.,.5,.5],(7,1)))['head_index']==-1
+
+
 def test_conflicting_same_face_body_observations_cannot_win_by_input_order():
     nodes,banks,poses,styles,states,groups,warps,clocks=inputs()
     original=groups[0][0];body=original.body.copy();body[:,4,0]+=.1

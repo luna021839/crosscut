@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from crosscut2.visible_shot_duration import Model, fit
+from crosscut2.visible_shot_duration import Model, fit, tail_artifact
 
 
 def reference(identity, durations, split='train'):
@@ -39,8 +39,10 @@ def test_short_highlights_remain_finite_without_requiring_more_cuts():
     assert value.loss(0.)==0.
 
 
-def test_native_cut_prefix_table_matches_every_actual_visible_fragment():
+@pytest.mark.parametrize('tails',[False,True])
+def test_native_cut_prefix_table_matches_every_actual_visible_fragment(tails):
     value=model();nodes=np.array([0,7,12,35,80,120]);fps=30.
+    if tails:value=Model(tail_artifact(value.artifact,fps=fps))
     events=[[],np.array([0,10,25,60,120]),np.array([7,12,35,80])]
     table=value.table(nodes,events,fps=fps)
     assert not table.flags.writeable and table.nbytes<2**20
@@ -92,6 +94,24 @@ def test_real_programme_scores_duration_before_both_camera_argmins_and_replays_i
     assert receipt['boundary_port_domain']['baseline_paired_proposal_limit_per_node']==8
     assert receipt['boundary_port_domain']['maximum_entry_ports']<=4*len(banks)+8
     assert receipt['boundary_port_DP']['claim_camera_chosen_before_argmin']
+
+
+def test_reference_quartile_tails_have_a_flat_middle_not_a_preferred_single_length():
+    original=model();fitted=dict(original.artifact)
+    value=Model(tail_artifact(fitted,fps=30.))
+    middle=np.exp(original.mean+original.scale*np.array([-.5,0.,.5]))
+    np.testing.assert_allclose(value.loss(middle),0.,atol=1e-14)
+    short,long=np.exp(original.mean+original.scale*np.array([-2.,2.]))
+    assert 0.<value.loss(short)<value.loss(short/2.)
+    assert 0.<value.loss(long)<value.loss(long*2.)
+    assert value.loss(short,censored=True)==0.
+    assert value.loss(long,censored=True)==value.loss(long)
+    assert value.loss(0.)==0.
+    assert original.artifact==fitted and value.artifact['references']==fitted['references']
+    assert value.artifact['fit_content_sha256']==fitted['content_sha256']
+    assert not value.artifact['preferred_single_duration'] and not value.artifact['aesthetic_weight_fitted']
+    with pytest.raises(ValueError,match='clock changed'):value.table([0,30,60],[[]],fps=25.)
+    with pytest.raises(ValueError):tail_artifact(value.artifact,fps=30.)
 
 
 def test_cli_requires_explicit_compatible_interval_path_before_reading_a_model(monkeypatch):

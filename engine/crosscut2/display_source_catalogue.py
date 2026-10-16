@@ -58,13 +58,24 @@ class SourceCatalogue:
         self.roi_readability,self.roi_readability_valid=roi_readability(bank)
         # Explicit numerical integration domain; never used as native K proof.
         ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
-        order=np.argsort(ticks,kind='stable');ordered=ticks[order]
+        measured=np.asarray(bank.get('face_observation_valid',np.ones((N,2),bool)))
+        if measured.shape!=(N,2) or measured.dtype!=bool:
+            raise ValueError('one explicit face observation availability per native endpoint required')
+        # A fine decision node with no source observation is not a detector-
+        # observed empty frame. It cannot erase nearby genuine quadrature
+        # samples or quietly make the most densely observed source cheapest.
+        order=np.flatnonzero(measured.ravel());order=order[np.argsort(ticks[order],kind='stable')]
+        ordered=ticks[order]
         frames=np.arange(self.final);right=np.searchsorted(ordered,frames)
-        a=np.maximum(0,right-1);b=np.minimum(len(ordered)-1,right)
-        chosen=np.where(frames-ordered[a]<ordered[b]-frames,a,b)
-        original=order[chosen];self.near_n=original//2;self.near_side=original%2
-        closest=ordered[chosen];cuts=np.asarray(events,int)
-        self.content_scope=(np.abs(closest-frames)<=6)&(np.searchsorted(cuts,closest,side='right')==np.searchsorted(cuts,frames,side='right'))
+        if len(ordered):
+            a=np.maximum(0,right-1);b=np.minimum(len(ordered)-1,right)
+            chosen=np.where(frames-ordered[a]<ordered[b]-frames,a,b)
+            original=order[chosen];self.near_n=original//2;self.near_side=original%2
+            closest=ordered[chosen];cuts=np.asarray(events,int)
+            self.content_scope=(np.abs(closest-frames)<=6)&(np.searchsorted(cuts,closest,side='right')==np.searchsorted(cuts,frames,side='right'))
+        else:
+            self.near_n=np.zeros(self.final,int);self.near_side=np.zeros(self.final,int)
+            self.content_scope=np.zeros(self.final,bool)
         # Activity belongs to the SAME physical face sample used by rates(),
         # not to the source or the face dominant in an unrelated native crop.
         # Pose is unavailable for face3..7: those faces cannot borrow face0's
@@ -257,5 +268,10 @@ class SourceCatalogue:
                 wanted=evidence['people'][n,side]
                 coverage=np.maximum(0.,wanted-count)/np.maximum(1.,wanted)
                 framing=np.where(known,confidence*np.where(evidence['formation'][n,side],coverage,size_deficit),0.)
-            return 1.-shown+crop+shown*role+tight+framing+.1*np.log(camera[...,0])/np.log(2.)
+            observed=1.-shown+crop+shown*role+tight+framing
+            # Missing temporal samples are neither a readable face nor an
+            # observed empty viewport. Retain the previous unfitted1 proxy,
+            # without fabricating face/framing/oversize evidence in the gap.
+            # Digital enlargement and movement still pay their real costs.
+            return np.where(self.content_scope[frames],observed,1.)+.1*np.log(camera[...,0])/np.log(2.)
         return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[n,side,index]

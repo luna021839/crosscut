@@ -79,3 +79,12 @@ def test_output_oversize_effort_is_origin_blind_and_keeps_ordinary_closeups():
     # Equal output size pays equal oversize effort. Only the already existing
     # digital enlargement/detail cost distinguishes how the shot was made.
     np.testing.assert_allclose(added_tight-original_tight,.1,atol=1e-6)
+
+
+def test_unobserved_temporal_content_keeps_original_proxy_without_fabricated_face_or_free_crop():
+    cat=catalogue();cat.editorial_content=True;cat.content_scope[:]=False
+    frames=np.array([19,20]);native=np.tile([1.,.5,.5],(2,1))
+    np.testing.assert_allclose(cat.rates(frames,native),1.)
+    np.testing.assert_allclose(cat.rates(frames,np.tile([2.,.5,.5],(2,1))),1.1)
+    cat.bank['heads'][:]=0.;cat.content_scope[:]=True
+    assert np.isfinite(cat.rates(frames,native)).all()

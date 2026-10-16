@@ -112,6 +112,8 @@ class PlayedPosePortPrior:
         if played_interval_utility:
             self.artifact.update(contract='pair_bound_actual_interval_action_composed_image_boundary_port_E6_v2',
                 output_focal_face_comfort_height=.30,original_tight_frame_exemption=False,
+                unobserved_content_proxy=1.,unobserved_is_not_observed_empty=True,
+                matched_moving_action_does_not_require_costume_colour_change=True,
                 opportunity_credit='actual_pair_density_times_observed_entry_target_delivery_once_per_fixed_episode',
                 source_continuation_change_credit=False,
                 seven_frame_entry_credit_used=False,entry_density_times_hold_duration=False,

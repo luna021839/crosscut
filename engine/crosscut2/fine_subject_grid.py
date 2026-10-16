@@ -101,6 +101,8 @@ def expand(nodes,new_nodes,banks,poses,styles,states,windows,warps,clocks,*,mast
             value=np.asarray(array);result=np.zeros((N,)+value.shape[1:],value.dtype);result[old_at]=value;return result
         new=dict(bank)
         new['fine_grid_old_indices']=old_at.copy()
+        new['face_observation_valid']=np.zeros((N,2),bool)
+        new['face_observation_valid'][old_at]=bank.get('face_observation_valid',np.ones((len(nodes),2),bool))
         for key in ('heads','vectors','native_readability','native_readability_valid'):
             if key in new:new[key]=projected(bank[key])
         new['native_indices']=schedule(warp,clock,new_nodes[:,None]+[-1,0],master_start=master_start,fps=fps,final=final)
@@ -114,7 +116,9 @@ def expand(nodes,new_nodes,banks,poses,styles,states,windows,warps,clocks,*,mast
         for n in extra:
             for side in (0,1):
                 native=int(new['native_indices'][n,side]);raw={};bad=set()
-                for window,at in frames.get(native,[]):
+                actual=frames.get(native,[])
+                new['face_observation_valid'][n,side]=bool(actual)
+                for window,at in actual:
                     head=window.heads[at];key=tuple(map(float,head))
                     if key in bad:continue
                     if key in raw and raw[key][2] is not None and not np.array_equal(raw[key][1],window.vectors[at]):

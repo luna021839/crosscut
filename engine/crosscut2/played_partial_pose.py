@@ -239,8 +239,16 @@ def matrix(left, right, *, details=False):
     # tolerance or an extra source/cut gate. Missing channels retain their
     # fixed denominator; weak positive evidence earns only a weak benefit.
     played_match_advantage=np.maximum(0.,1.-2.*pose)
-    evidence_density=np.minimum.reduce([novelty,1.-appearance,quality,change_basis,seam_shape])
-    evidence_density=np.where(known_style&appearance_measured&~incompatible,evidence_density,0.)
+    action_basis=np.minimum.reduce([1.-appearance,quality,change_basis,seam_shape])
+    action_component=.5*action_basis
+    style_component=.5*np.minimum(action_basis,np.where(known_style,novelty,0.))
+    # A matched moving-action change is useful even in similar outfits. Real
+    # colour distinction adds another component; missing/identical colour does
+    # not fabricate novelty or veto independently measured face/action cues.
+    compatible=appearance_measured&~incompatible
+    action_component=np.where(compatible,action_component,0.)
+    style_component=np.where(compatible,style_component,0.)
+    evidence_density=action_component+style_component
     change_density=np.minimum(evidence_density,played_match_advantage)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
         cropped_original_face_geometry_rate=crop_risk,cropped_original_face_geometry_measured=crop_known,
@@ -256,7 +264,8 @@ def matrix(left, right, *, details=False):
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,matched_action_evidence_density=evidence_density,
-        measured_style_change=novelty,
+        moving_action_variation_component=action_component,measured_style_variation_component=style_component,
+        measured_style_change=np.where(known_style,novelty,0.),source_style_measured=known_style,
         native_ROI_quality_measured=left['visible_quality_measured'][:,None]&right['visible_quality_measured'][None,:],
         actual_played_match_advantage=played_match_advantage,
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,

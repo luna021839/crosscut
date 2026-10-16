@@ -13,6 +13,7 @@ import numpy as np
 
 
 CONTRACT = 'train_reference_visible_shot_log_duration_v1'
+TAIL_CONTRACT = 'train_reference_visible_shot_interquartile_tail_surprise_v1'
 
 
 def _digest(value):
@@ -61,7 +62,7 @@ def fit(references):
 class Model:
     def __init__(self, artifact):
         payload = dict(artifact); expected = payload.pop('content_sha256', None)
-        if (expected != _digest(payload) or payload.get('contract') != CONTRACT
+        if (expected != _digest(payload) or payload.get('contract') not in (CONTRACT,TAIL_CONTRACT)
                 or not payload.get('references')
                 or any(r.get('split') != 'train' for r in payload['references'])
                 or len({r['reference_id'] for r in payload['references']}) != len(payload['references'])
@@ -71,12 +72,26 @@ class Model:
         if not math.isfinite(self.mean) or not math.isfinite(self.scale) or self.scale <= 0:
             raise ValueError('finite fitted log-duration distribution required')
         self.artifact = dict(artifact)
+        self.tails=payload['contract']==TAIL_CONTRACT
+        if self.tails:
+            fps=payload.get('output_fps',0.)
+            if (not math.isfinite(fps) or fps<=0 or payload.get('perceptual_unit_seconds')!=6./fps
+                    or payload.get('tail_probability')!=.25 or not payload.get('fit_content_sha256')):
+                raise ValueError('explicit fitted-duration tails and actual six-frame output unit required')
 
     def loss(self, seconds, *, censored=False):
         seconds = np.asarray(seconds, float)
         if not np.isfinite(seconds).all() or np.any(seconds < 0):
             raise ValueError('finite nonnegative visible shot durations required')
         delta = np.log(np.maximum(np.finfo(float).tiny, seconds))-self.mean
+        if self.tails:
+            z=delta/self.scale
+            erfc=np.vectorize(math.erfc,otypes=[float])
+            lower=np.maximum(np.finfo(float).tiny,.5*erfc(-z/math.sqrt(2.)))
+            upper=np.maximum(np.finfo(float).tiny,.5*erfc(z/math.sqrt(2.)))
+            short=np.where(censored,0.,np.maximum(0.,-np.log(lower)+math.log(.25)))
+            long=np.maximum(0.,-np.log(upper)+math.log(.25))
+            return np.where(seconds>0,self.artifact['perceptual_unit_seconds']*(short+long),0.)
         # At film boundaries the observed shot may be only its remaining
         # fragment. A short censored fragment is not an intentionally short
         # edit; a long one still contains that much observed screen time.
@@ -90,6 +105,8 @@ class Model:
         state, camera family, NN observation, minimum shot, or cut count rule.
         """
         nodes = np.asarray(nodes)
+        if self.tails and fps!=self.artifact['output_fps']:
+            raise ValueError('duration-tail output clock changed')
         if (nodes.ndim != 1 or nodes.dtype.kind not in 'iu' or len(nodes) < 2
                 or nodes[0] != 0 or np.any(np.diff(nodes) <= 0)
                 or not math.isfinite(fps) or fps <= 0):
@@ -120,3 +137,21 @@ class Model:
             result[:, :, source] = np.where(chronological, base, 0.)
         result.setflags(write=False)
         return result
+
+
+def tail_artifact(artifact,*,fps):
+    """Reuse TRAIN statistics with a broad flat middle, not a target length.
+
+    Only lower/upper quartile surprises pay. Six output frames provide the
+    existing boundary-effort unit; its aesthetic weight is NOT fitted.
+    """
+    original=Model(artifact)
+    if original.tails or not math.isfinite(fps) or fps<=0:
+        raise ValueError('original TRAIN fit and actual positive output fps required')
+    value=dict(artifact);value.pop('content_sha256')
+    value.update(contract=TAIL_CONTRACT,fit_content_sha256=artifact['content_sha256'],
+        output_fps=float(fps),perceptual_unit_seconds=6./fps,tail_probability=.25,
+        loss='six_frame_unit_times_log_tail_surprise_outside_reference_interquartile_range',
+        preferred_single_duration=False,aesthetic_weight_fitted=False)
+    value['content_sha256']=_digest(value)
+    return value

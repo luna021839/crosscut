@@ -70,17 +70,24 @@ def set_style(cat,colour):
     cat.style['colour'][...,colour]=1.
 
 
-def test_change_credit_needs_measured_moving_configuration_appearance_style_and_visibility():
+def test_change_credit_needs_measured_movement_and_appearance_with_optional_real_style_distinction():
     a,b=catalogue(),catalogue();set_style(a,0);set_style(b,1)
     def detail():return matrix(features([obs(a,0)],fps=30.),features([obs(b,1)],fps=30.),details=True)
     measured=detail()
     assert measured['matched_action_change_density'][0,0]>0
     set_style(b,0)
-    assert detail()['matched_action_change_density'][0,0]==0  # identical style, not a constant cut bonus
+    same=detail()
+    assert same['matched_action_change_density'][0,0]>0
+    assert same['moving_action_variation_component'][0,0]>0
+    assert same['measured_style_variation_component'][0,0]==0
+    assert same['measured_style_change'][0,0]==0
     set_style(b,1);b.body[:]=b.body[:,1:2]
     assert detail()['matched_action_change_density'][0,0]==0  # no jointly observed movement
     b=catalogue();set_style(b,1);b.style['colour_valid'][:]=False
-    assert detail()['matched_action_change_density'][0,0]==0
+    missing=detail()
+    assert missing['matched_action_change_density'][0,0]>0
+    assert missing['measured_style_variation_component'][0,0]==0
+    assert not missing['source_style_measured'][0,0] and missing['measured_style_change'][0,0]==0
 
 
 def test_worse_action_cannot_earn_the_same_change_credit_for_a_pretty_new_stage():
