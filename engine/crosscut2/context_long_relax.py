@@ -8,11 +8,10 @@ from functools import lru_cache
 import numpy as np
 
 
-def _relax(base,handled,in_cost,in_cuts,head,middle,tail,benefit,same_episode,origin,width):
+def _relax_into(base,handled,in_cost,in_cuts,head,middle,tail,benefit,same_episode,origin,width,
+                costs,cuts,backs,bits,slots,credits,contexts):
     P,Q,C=handled.shape;L=in_cost.shape[-1];shape=(P,Q,C,2)
-    costs=np.full(shape,np.inf);cuts=np.zeros(shape,np.int64);backs=np.full(shape,-1,np.int64)
-    bits=np.full(shape,-1,np.int64);slots=np.full(shape,-1,np.int64)
-    credits=np.zeros(shape);contexts=np.zeros(shape)
+    costs[:]=np.inf;cuts[:]=0;backs[:]=-1;bits[:]=-1;slots[:]=-1;credits[:]=0.;contexts[:]=0.
     for p in range(P):
         for q in range(Q):
             for code in range(C):
@@ -42,15 +41,21 @@ def _relax(base,handled,in_cost,in_cuts,head,middle,tail,benefit,same_episode,or
 @lru_cache(maxsize=1)
 def _compiled():
     from numba import njit
-    return njit(cache=False,nogil=True,fastmath=False,parallel=False)(_relax)
+    return njit(cache=False,nogil=True,fastmath=False,parallel=False)(_relax_into)
 
 
-def relax(base,handled,in_cost,in_cuts,head,middle,tail,benefit,*,same_episode,origin,width,kernel):
+def relax(base,handled,in_cost,in_cuts,head,middle,tail,benefit,*,same_episode,origin,width,kernel,out=None):
     if kernel not in ('numpy','numba'):raise ValueError('explicit strict relaxation backend required')
     P,Q,C=handled.shape;L=in_cost.shape[-1]
     if (C!=4 or base.shape[:2]!=(P,Q) or in_cost.shape!=(P,2,L) or in_cuts.shape!=in_cost.shape
             or head.shape!=(P,2,L,C) or middle.shape!=(P,C) or tail.shape!=(Q,C)
             or benefit.shape!=(P,Q) or handled.dtype!=bool):
         raise ValueError('complete baseline domain and every retained prefix required')
-    function=_compiled() if kernel=='numba' else _relax
-    return function(base[:,:,:4],handled,in_cost,in_cuts,head,middle,tail,benefit,bool(same_episode),int(origin),int(width))
+    shape=(P,Q,C,2);dtypes=(np.float64,np.int64,np.int64,np.int64,np.int64,np.float64,np.float64)
+    if out is None:out=tuple(np.empty(shape,dtype) for dtype in dtypes)
+    if (not isinstance(out,tuple) or len(out)!=7 or any(a.shape!=shape or a.dtype!=dtype
+            or not a.flags.writeable for a,dtype in zip(out,dtypes))):
+        raise ValueError('seven complete writable numeric relaxation outputs required')
+    function=_compiled() if kernel=='numba' else _relax_into
+    return function(base[:,:,:4],handled,in_cost,in_cuts,head,middle,tail,benefit,
+        bool(same_episode),int(origin),int(width),*out)

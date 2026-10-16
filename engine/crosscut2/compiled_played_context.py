@@ -98,7 +98,7 @@ class _Origin:
 
 
 class _Current:
-    def __init__(self,hold,p,q,code):
+    def __init__(self,hold,p,q,code,part='full'):
         c=hold.compiler;old=c.context;self.hold=hold;self.ref=ArcRef(hold.i,hold.j,p,q,code)
         self.first,self.final=hold.first,hold.final;self.source=old.entries[hold.i][p].source
         if not hold.reference_clock[self.source]:c.nonreference_recipes+=1
@@ -106,22 +106,34 @@ class _Current:
         self.long=(code<4 and self.final-self.first>=old.history_frames+38
             and hold.reference_clock[self.source] and old._port_local(old.entries[hold.i][p],self.first,self.final,0)
             and old._port_local(old.exits[hold.j][q],self.first,self.final,1))
+        if part not in ('full','head','tail','suffix') or (part!='full' and not self.long):
+            raise ValueError('factored parts require the complete long reference-clock/local-intent proof')
+        self.part=part
         self.middle=0.;self.tail=0.;self.lower_bound=0.;self.lease=None
         if self.long:
             self.head_ends=fresh[fresh<self.first+old.history_frames+19]
             middle=fresh[(fresh>=self.first+old.history_frames+19)&(fresh<=self.final-19)]
             self.tail_ends=fresh[fresh>self.final-19]
             at=np.searchsorted(old.ends,middle)
-            self.middle=float((old.base_rates[self.source][code,at]*old.durations[at]).sum())
+            if part=='full':self.middle=float((old.base_rates[self.source][code,at]*old.durations[at]).sum())
             # The sparse recipe still includes EVERY frame needed by head,
             # tail windows and exact future H suffix. Baseline middle uses
             # the already prepared actual reference-clock frame sequence.
             tail_first=max(self.first,int(self.tail_ends[0])-old.history_frames) if len(self.tail_ends) else self.final
             bank=c.active_origin
             need_head=not np.isfinite(bank.head[p,:,:,code][bank.present[p]]).all()
-            ranges=[np.arange(self.first,int(self.head_ends[-1]))] if len(self.head_ends) and need_head else []
-            ranges.append(np.arange(min(tail_first,max(self.first,self.final-old.history_frames)),self.final))
-            selected=np.unique(np.concatenate(ranges))
+            if part=='head':
+                selected=np.arange(self.first,int(self.head_ends[-1])) if len(self.head_ends) else np.zeros(0,np.int64)
+                self.tail_ends=np.zeros(0,np.int64)
+            elif part=='tail':
+                selected=np.arange(tail_first,self.final);self.head_ends=np.zeros(0,np.int64)
+            elif part=='suffix':
+                selected=np.arange(self.final-old.history_frames,self.final)
+                self.head_ends=self.tail_ends=np.zeros(0,np.int64)
+            else:
+                ranges=[np.arange(self.first,int(self.head_ends[-1]))] if len(self.head_ends) and need_head else []
+                ranges.append(np.arange(min(tail_first,max(self.first,self.final-old.history_frames)),self.final))
+                selected=np.unique(np.concatenate(ranges))
         else:
             self.head_ends=fresh[fresh<self.first+old.history_frames]
             self.tail_ends=fresh[fresh>=self.first+old.history_frames]
@@ -146,6 +158,7 @@ class _Current:
         pack(model_binding=old.model_key,frames=self.frames,native=self.native,cameras=self.camera,
             source_observation_handles=source_handles,intent_handles=active,out=self.keys)
         c.recipe_compilations+=1;c.camera_sample_calls+=1
+        if part!='full':c.factored_piece_compilations[part]+=1
         # A fixed-size projection lease is reserved before any ragged tensor
         # is allocated. Chunking is storage/evaluation, never frame thinning.
         found=w.empty((min(120,len(self.frames)),),bool,owner='compile-frame-lookup-mask')
@@ -168,10 +181,11 @@ class _Current:
             c.encode_missing(self,a+missing)
         if len(self.tail_ends):self.tail=self._own_cost(self.tail_ends)
         self.lower_bound=(self.middle+self.tail) if self.long else self.tail
-        suffix=int(np.searchsorted(self.frames,max(self.first,self.final-old.history_frames)))
-        # Own only a <=H frame tail; admit copies raw keys/embeddings, so this
-        # small persistent state never pins the current hold's larger arrays.
-        self.lease=c.arena.admit(self.keys[suffix:],self.encoded[suffix:],first=self.first)
+        if part in ('full','suffix'):
+            suffix=int(np.searchsorted(self.frames,max(self.first,self.final-old.history_frames)))
+            # Head/tail scalar evaluation owns no suffix at all. Only a
+            # candidate admitted by the existing beam creates its future state.
+            self.lease=c.arena.admit(self.keys[suffix:],self.encoded[suffix:],first=self.first)
 
     def _own_cost(self,ends):
         old=self.hold.compiler.context
@@ -204,7 +218,7 @@ class _Hold:
         self.reference_clock={s:np.array_equal(ni,old.reference[s][self.first:self.final]) for s,ni in self.inputs.native.items()}
         compiler.hold_compilations+=1
         compiler.native_schedule_compilations+=len(self.inputs.native)
-    def current(self,p,q,code):return _Current(self,p,q,code)
+    def current(self,p,q,code,*,part='full'):return _Current(self,p,q,code,part)
     def __enter__(self):return self
     def __exit__(self,*unused):
         if self.compiler.context.arcs.last_playback_inputs is self.inputs:self.compiler.context.arcs.last_playback_inputs=None
@@ -232,6 +246,8 @@ class CompiledPlayback:
         self.reference_frame_reuses=self.live_frame_reuses=0;self.active_origin=None
         self.native_schedule_compilations=self.nonreference_recipes=self.maximum_producer_reservation=0
         self.projection_tile_splits=self.maximum_projection_claim=0
+        self.factored_piece_compilations=dict(head=0,tail=0,suffix=0)
+        self.long_alternatives=self.long_prefix_evaluations=0
         w=PlaybackWorkspace(maximum_bytes) if arena is None else arena.workspace
         expected=self.namespace(context)
         if arena is not None and (arena.namespace!=expected or arena.width!=context.model.embedding_width
@@ -265,6 +281,7 @@ class CompiledPlayback:
                 history_frames=context.history_frames,frame_capacity=frames,cell_capacity=cells,
                 root_capacity=roots,workspace=w,kernel=context.kernel)
         self.arena=arena;self.label_limit=label_limit
+        self._init_long_cache()
         self.source_handles=tuple(v+1 for v in context.field_versions)
         self.intent_handles={key:i+1 for i,key in enumerate(sorted(context.intent_fields))}
         maximum_people=max([int(np.diff(f.ordered_static.person_splits).max(initial=0)) for f in
@@ -273,6 +290,65 @@ class CompiledPlayback:
         # at most120 rows, including both overlay intents. This conservative
         # reservation is charged before projection; it is not a RSS reading.
         self.projection_reservation_bytes=120*(64+max(1,maximum_people)*81)*8*32
+
+    def _init_long_cache(self):
+        """Bounded scalar tails and NON-owning, generation-checked root hints.
+
+        A long proved baseline's exit window and last H physical inputs depend
+        on (end node, exit port, code), never its entry or prefix. These arrays
+        are fixed at construction, are charged, and retain no root payload.
+        """
+        if hasattr(self,'long_tail'):raise ValueError('factored long tables already initialized')
+        old=self.context;shape=(len(old.nodes),max(map(len,old.exits)),4);w=self.arena.workspace
+        self.long_tail=w.empty(shape,np.float64,owner='proved-long-tail-costs');self.long_tail[:]=np.nan
+        self.long_roots=w.empty(shape,np.uint64,owner='weak-proved-long-suffix-hints');self.long_roots[:]=0
+
+    def long_candidates(self,hold,bank,base,allowed,in_cost,in_cuts,benefit,*,same_episode,width):
+        """Compile long head/tail pieces ONCE, then relax every retained lane.
+
+        This is the existing reference-clock/local-intent head/middle/tail
+        identity with its original arithmetic. Codes 4/5 and nonreference
+        clocks stay in the general path. No camera alternatives are removed.
+        """
+        old=self.context;first,final=hold.first,hold.final
+        if final-first<old.history_frames+38:return None
+        w=self.arena.workspace;P,Q=allowed.shape[:2];L=in_cost.shape[-1]
+        handled=w.empty((P,Q,4),bool,owner='proved-long-baseline-domain');handled[:]=allowed[:,:,:4]
+        for p,port in enumerate(old.entries[hold.i]):
+            handled[p]&=(hold.reference_clock.get(port.source,False) and old._port_local(port,first,final,0))
+        for q,port in enumerate(old.exits[hold.j]):handled[:,q]&=old._port_local(port,first,final,1)
+        if not handled.any():return None
+        for p,code in zip(*np.nonzero(handled.any(axis=1))):
+            p,code=int(p),int(code)
+            if all(np.isfinite(bank.head[p,bit,:,code][bank.present[p,bit]]).all() for bit in (0,1)):continue
+            q=int(np.flatnonzero(handled[p,:,code])[0])
+            with hold.current(p,q,code,part='head') as current:
+                for bit in (0,1):
+                    slots=np.flatnonzero(bank.present[p,bit]&np.isnan(bank.head[p,bit,:,code]))
+                    if len(slots):self.score(bank,current,p,bit,slots)
+        middle=w.empty((P,4),np.float64,owner='proved-long-middle-costs');middle[:]=0.
+        tail=w.empty((Q,4),np.float64,owner='proved-long-current-tails');tail[:]=0.
+        ends=old.ends[(old.ends>=first+old.history_frames+19)&(old.ends<=final-19)]
+        at=np.searchsorted(old.ends,ends)
+        for s in range(len(old.cats)):
+            ps=[p for p,port in enumerate(old.entries[hold.i]) if port.source==s]
+            if ps:
+                for code in range(4):middle[ps,code]=(old.base_rates[s][code,at]*old.durations[at]).sum()
+        for q,code in zip(*np.nonzero(handled.any(axis=0))):
+            q,code=int(q),int(code)
+            if np.isnan(self.long_tail[hold.j,q,code]):
+                p=int(np.flatnonzero(handled[:,q,code])[0])
+                with hold.current(p,q,code,part='tail') as current:self.long_tail[hold.j,q,code]=current.tail
+            tail[q,code]=self.long_tail[hold.j,q,code]
+        shape=(P,Q,4,2)
+        values=tuple(w.empty(shape,dtype,owner='proved-long-all-prefix-relaxation') for dtype in
+            (np.float64,np.int64,np.int64,np.int64,np.int64,np.float64,np.float64))
+        from .context_long_relax import relax
+        old.check();relax(base,handled,in_cost,in_cuts,bank.head,middle,tail,benefit,
+            same_episode=same_episode,origin=hold.i,width=width,kernel=old.kernel,out=values)
+        self.long_alternatives+=int(handled.sum())
+        self.long_prefix_evaluations+=int(np.sum(handled.sum((1,2))*np.isfinite(in_cost).sum((1,2))))
+        return handled,values
 
     def projection_requirement(self,ref,native):
         """Count actual ragged rows before allocation, including BOTH overlays.
@@ -358,6 +434,9 @@ class CompiledPlayback:
             projection_batches=self.projection_batches,frames_encoded=self.encoded_frames,
             exact_reference_frame_reuses=self.reference_frame_reuses,exact_live_frame_reuses=self.live_frame_reuses,
             native_schedule_compilations=self.native_schedule_compilations,nonreference_recipes=self.nonreference_recipes,
+            factored_long_piece_compilations=dict(self.factored_piece_compilations),
+            factored_long_camera_alternatives=self.long_alternatives,
+            factored_long_prefix_evaluations=self.long_prefix_evaluations,
             maximum_hold_producer_preallocation_reservation=self.maximum_producer_reservation,
             window_evaluations=self.window_evaluations,source_input_bytes=self.source_input_bytes,
             projection_reservation_bytes=self.projection_reservation_bytes,

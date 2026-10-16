@@ -75,7 +75,13 @@ def test_origin_major_owned_state_matches_legacy_path_codes_cost_paid_bits_and_i
     assert sum(parts)==pytest.approx(total,abs=2e-13)
     assert compiler.origin_decode_calls<=len(nodes)-1
     assert compiler.hold_compilations==new[2]['hold_calls']
-    assert compiler.recipe_compilations==new[2]['camera_alternatives_scored']
+    # Factored long alternatives still ALL enter relaxation. Their shared
+    # head/tail/suffix pieces need not rebuild one entire recipe per p/q/code.
+    full_recipes=compiler.recipe_compilations-sum(compiler.factored_piece_compilations.values())
+    assert full_recipes+compiler.long_alternatives==new[2]['camera_alternatives_scored']
+    if long:
+        assert compiler.long_alternatives>0 and new[2]['factored_long_beam_kernel_calls']>0
+        assert compiler.recipe_compilations<new[2]['camera_alternatives_scored']
     assert compiler.reference_frame_reuses>0
     if long and nonlinear:assert compiler.nonreference_recipes>0
     assert all(t['live']==0 for t in compiler.arena.receipt()['tables'].values())

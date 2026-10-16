@@ -96,7 +96,20 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                         producer.observe(base,allowed,benefit)
                         hold_calls+=1;cameras+=int(allowed.sum());destination=state(1,j,len(exits[j]))
                         with compiler.compile_hold(i,j,base,allowed) as hold:
-                            for p,q,code in zip(*np.nonzero(allowed)):
+                            general=allowed;batch=None
+                            if callable(getattr(compiler,'long_candidates',None)):
+                                batch=compiler.long_candidates(hold,bank,base,allowed,incoming[0],incoming[1],benefit,
+                                    same_episode=episodes[i]==episodes[j],width=W)
+                            if batch is not None:
+                                handled,values=batch
+                                def build_suffix(p,q,code,bit,slot):
+                                    with hold.current(p,q,code,part='suffix') as current:
+                                        return arena.append(SuffixRoot(arena.owner,int(incoming[6][p,bit,slot])),current.lease)
+                                beam.long_batch(destination,values,compiler.long_roots[j],build_suffix)
+                                general=workspace.empty(allowed.shape,bool,owner='unfactored-current-camera-domain')
+                                general[:]=allowed;general[:,:,:4]&=~handled
+                                batch=handled=values=None
+                            for p,q,code in zip(*np.nonzero(general)):
                                 p,q,code=map(int,(p,q,code))
                                 with hold.current(p,q,code) as current:
                                     lower=float(current.lower_bound)
@@ -129,6 +142,7 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
                                                 outbit=(1 if bit or claim else 0) if episodes[i]==episodes[j] else 0
                                                 values=(raw-paid,count,back,code,paid,float(extra))
                                                 beam.offer(group(destination,q,outbit),values,incoming[6][p,bit,k],current.lease)
+                            batch=general=values=None
                     base=allowed=benefit=None
             release(incoming)
         last=state(1,N-1,len(exits[-1]));total=np.where(finish[:,None,None],last[0]+final[:,None,None],np.inf)
@@ -154,6 +168,8 @@ def solve(nodes,entries,exits,*,start_cost,hold_cost,cut_cost,compiler,episodes,
             expensive_history_keys_skipped_by_existing_beam_rank=beam.rank_rejected,
             prefix_context_evaluations_skipped_by_explicit_lower_bound=bound_rejected,
             finalized_origin_banks_decoded=origin_banks,history_frames=history_frames,
+            factored_long_beam_kernel_calls=beam.long_kernel_calls,
+            factored_long_rank_viable_suffix_compilations=beam.long_suffix_misses,
             history_merge_policy='exact_physical_suffix_only_within_same_port_and_paid_bit',
             scalar_cost_or_debt_dominance=False,exact_global_optimum_claimed=False,
             selected_arc_codes=list(reversed(codes)),opportunity_claims=claims,
