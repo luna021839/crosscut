@@ -2880,73 +2880,6 @@ def _dynamic_crop_v3_prior_minibatch_loss(
     return averaged["total"], averaged
 
 
-def _dynamic_crop_v3_train_only_joint_initializer(
-    inventory: _DynamicCropV3PriorInventory,
-    snapshots: Mapping[int, Mapping[str, Any]],
-    contract: DynamicCropV3LossContract,
-    balance: Mapping[str, Any],
-) -> tuple[int, dict[str, Any]]:
-    """Choose a joint-training start, NEVER a qualified checkpoint.
-
-    Failed prior validation must not silently discard every learned update.
-    Compare the fixed complete TRAIN inventory on its already detached base
-    features, with the sampler's equal song/reference weighting. No encoder
-    forward, optimizer update, validation or held-out input is used here.
-    The subsequent joint checkpoint still needs all existing quality gates.
-    """
-    if not inventory.tracks or 0 not in snapshots:
-        raise ValueError("joint initialization requires TRAIN tracks and the initial head")
-    if any(t.context_embedding is None or t.source_embedding is None for t in inventory.tracks):
-        raise ValueError("joint initialization requires already detached TRAIN features")
-    context = mx.array(np.stack([t.context_embedding for t in inventory.tracks]))
-    source = mx.array(np.stack([t.source_embedding for t in inventory.tracks]))
-    evaluations = []
-    for step, snapshot in sorted(snapshots.items()):
-        if "interaction_weight" in snapshot:
-            raise ValueError("affine joint initializer cannot discard an interaction head")
-        module = _DynamicCropV3PriorHeadModule(
-            snapshot["context_weight"], snapshot["context_bias"], snapshot["source_weight"],
-            context_center=snapshot["context_center"], source_center=snapshot["source_center"],
-        )
-        raw = module(context, source)
-        by_song: dict[str, dict[str, list[Any]]] = {}
-        for i, track in enumerate(inventory.tracks):
-            count = len(track.values)
-            motion = float(track.motion_label == "dynamic")
-            loss, _ = _dynamic_crop_v3_prior_loss_from_raw(
-                raw[i], mx.array(track.values), mx.array(track.normalized_times), count,
-                motion, not track.motion_label_loss_masked, contract,
-                balance["count_class_weights_1_to_8"][count - 1],
-                balance["motion_class_weights_static_dynamic"][int(motion)],
-            )
-            by_song.setdefault(track.song_id, {}).setdefault(track.reference_id, []).append(loss)
-        song_losses = [mx.stack([mx.stack(rows).mean() for rows in references.values()]).mean()
-            for references in by_song.values()]
-        loss = mx.stack(song_losses).mean()
-        mx.eval(loss)
-        value = float(loss.item())
-        evaluations.append(dict(candidate_step=step, training_loss=value if math.isfinite(value) else None))
-    initial_loss = next(row["training_loss"] for row in evaluations if row["candidate_step"] == 0)
-    if initial_loss is None:
-        raise ValueError("initial joint-training head has nonfinite TRAIN loss")
-    best = min((row for row in evaluations if row["training_loss"] is not None),
-        key=lambda row: (row["training_loss"], row["candidate_step"]))
-    step = int(best["candidate_step"])
-    return step, dict(
-        contract="fixed_complete_detached_TRAIN_loss_joint_initialization_v1",
-        selected_step=step, initial_training_loss=initial_loss,
-        selected_training_loss=best["training_loss"], evaluations=evaluations,
-        training_trajectory_count=len(inventory.tracks),
-        training_reference_ids=sorted(inventory.per_reference_track_counts),
-        detached_feature_content_sha256=inventory.detached_feature_content_sha256,
-        equal_song_then_reference_then_trajectory_weighting=True,
-        new_encoder_forwards=0, gradients_computed=False,
-        validation_or_heldout_inputs_used=False,
-        checkpoint_qualification_or_retention_authorized=False,
-        applied_head_parameter_sha256=_parameter_tree_sha256(snapshots[step]),
-    )
-
-
 def _parameter_tree_sha256(tree: Any) -> str:
     if tree_flatten is None:
         raise RuntimeError("MLX tree utilities are unavailable")
@@ -4686,20 +4619,6 @@ def train_production_stage_edit(
                     dynamic_crop_v3_prior_retention_finetune_steps
                 ),
             }
-            if not retention_authorized:
-                # The prior-selection receipt above remains an honest failed
-                # qualification. A separate TRAIN-only initialization cannot
-                # grant retention, write a checkpoint or bypass final VAL.
-                initializer_snapshots = {0: dynamic_crop_v3_prior_initial_snapshot,
-                    **dynamic_crop_v3_prior_candidate_snapshots}
-                initializer_step, initializer_evidence = _dynamic_crop_v3_train_only_joint_initializer(
-                    prior_inventory, initializer_snapshots,
-                    effective_dynamic_crop_v3_loss_contract, prior_class_balance_evidence,
-                )
-                _assign_dynamic_crop_v3_prior_head_snapshot(
-                    model, initializer_snapshots[initializer_step],
-                )
-                dynamic_crop_v3_prior_candidate_selection["joint_training_initializer"] = initializer_evidence
 
         for epoch in range(1, epochs + 1):
             epoch_losses: list[float] = []
