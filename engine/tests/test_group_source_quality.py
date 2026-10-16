@@ -572,7 +572,7 @@ class GroupSourceQualityTests(unittest.TestCase):
             )
             self.assertEqual(
                 upgraded.manifest["group_relative_quality_gate_version"],
-                1,
+                2,
             )
             self.assertEqual(
                 upgraded.manifest["group_relative_quality_gate"]["status"],

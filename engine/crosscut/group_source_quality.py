@@ -21,7 +21,7 @@ import numpy as np
 from .media import MediaInfo
 
 
-GROUP_RELATIVE_QUALITY_GATE_VERSION = 1
+GROUP_RELATIVE_QUALITY_GATE_VERSION = 2
 GROUP_RELATIVE_QUALITY_TARGET = 8
 GROUP_RELATIVE_QUALITY_SAMPLE_FRACTIONS = (
     0.075,
@@ -98,7 +98,7 @@ def _camera_variant(title: str) -> str:
     folded = _fold(title)
     if any(marker in folded for marker in ("one take", "one-shot", "oneshot", "원테이크")):
         return "one_take"
-    if any(marker in folded for marker in ("followcam", "follow cam", "팔로우캠")):
+    if any(marker in folded for marker in ("followcam", "follow cam", "follow-cam", "팔로우캠", "팔로우 캠")):
         return "follow_cam"
     if any(marker in folded for marker in ("fullcam", "full cam", "풀캠")):
         return "full_cam"
@@ -140,7 +140,8 @@ def _group_structure(title: str) -> tuple[float, tuple[str, ...]]:
         ("fancam" in folded or "직캠" in folded)
         and not any(
             marker in folded
-            for marker in ("fullcam", "full cam", "풀캠", "one take", "원테이크")
+            for marker in ("fullcam", "full cam", "풀캠", "one take", "원테이크",
+                           "followcam", "follow cam", "follow-cam", "팔로우캠", "팔로우 캠")
         )
     ):
         return (0.28, ("generic_fancam_structure",))
@@ -148,6 +149,8 @@ def _group_structure(title: str) -> tuple[float, tuple[str, ...]]:
         return (0.88, ("group_fullcam_structure",))
     if any(marker in folded for marker in ("one take", "one-shot", "oneshot", "원테이크")):
         return (0.94, ("group_one_take_structure",))
+    if _camera_variant(title)=="follow_cam":
+        return (0.94, ("group_followcam_structure",))
     return (1.0, ("standard_music_show_programme_feed",))
 
 
