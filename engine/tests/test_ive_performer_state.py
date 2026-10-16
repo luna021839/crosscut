@@ -9,6 +9,10 @@ import unittest
 from crosscut.causal_shooting_grammar import CausalShootingGrammarRecord
 from crosscut.ive import IVEMember
 from crosscut.ive_performer_state import (
+    CENTER_DISTRIBUTION,
+    LEGACY_CENTER_DISTRIBUTION,
+    IVEPerformerStateArtifact,
+    _artifact_content_sha256,
     CausalPerformerEvidence,
     IVEPerformerStateArtifactError,
     IVEPerformerStateError,
@@ -189,6 +193,28 @@ def _solo_inputs(
 
 
 class IVEPerformerStateDerivationTests(unittest.TestCase):
+    def test_center_identity_and_visibility_are_each_counted_once(self) -> None:
+        graph = build_member_state_graph((_observation(
+            "solo", geometry_confidence=.8, shot_confidence=.9, occlusion=.2,
+        ),))
+        result = derive_ive_performer_state_records(graph, (_grammar(0.),))[0]
+        expected = .96 * .8 * .9 * (1 - .2)
+        self.assertAlmostEqual(expected, result.center_member_known_mass)
+        self.assertAlmostEqual(expected, result.center_member.probability_for(IVEMember.GAEUL))
+        self.assertAlmostEqual(1 - expected, result.center_member.unknown_mass)
+
+    def test_two_visible_known_people_remain_a_mixture_not_artificial_unknown(self) -> None:
+        graph = build_member_state_graph((
+            _observation("left", member=IVEMember.GAEUL, center_x=.4, shot_confidence=.8),
+            _observation("right", member=IVEMember.REI, center_x=.6, shot_confidence=.8, order=1),
+        ))
+        result = derive_ive_performer_state_records(
+            graph, (_grammar(0., closeup=0., medium=0., wide=1., count=2),),
+        )[0]
+        self.assertAlmostEqual(.96 * .8, result.center_member_known_mass)
+        self.assertAlmostEqual(.96 * .8 / 2, result.center_member.probability_for(IVEMember.GAEUL))
+        self.assertAlmostEqual(.96 * .8 / 2, result.center_member.probability_for(IVEMember.REI))
+
     def test_solo_closeup_is_stronger_than_six_person_wide_but_never_hard(self) -> None:
         solo_graph, solo_grammar, solo_evidence = _solo_inputs()
         solo = derive_ive_performer_state_records(
@@ -412,6 +438,20 @@ class IVEPerformerStateDerivationTests(unittest.TestCase):
 
 
 class IVEPerformerStateArtifactTests(unittest.TestCase):
+    def test_legacy_center_policy_keeps_its_original_hash_and_is_not_silently_upgraded(self) -> None:
+        graph, grammar, evidence = _solo_inputs()
+        artifact = build_ive_performer_state_artifact(
+            graph, grammar, performer_evidence=evidence, provenance=_provenance(),
+        )
+        self.assertEqual(CENTER_DISTRIBUTION, artifact.center_distribution_contract)
+        payload = artifact.to_dict()
+        payload['computation_policy']['center_distribution'] = LEGACY_CENTER_DISTRIBUTION
+        payload['content_sha256'] = _artifact_content_sha256(payload)
+        restored = IVEPerformerStateArtifact.from_dict(payload)
+        self.assertEqual(LEGACY_CENTER_DISTRIBUTION, restored.center_distribution_contract)
+        self.assertEqual(payload, restored.to_dict())
+        self.assertNotEqual(artifact.content_sha256, restored.content_sha256)
+
     def test_content_addressed_round_trip_privacy_and_named_adapter(self) -> None:
         graph, grammar, evidence = _solo_inputs()
         artifact = build_ive_performer_state_artifact(

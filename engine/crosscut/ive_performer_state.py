@@ -6,14 +6,14 @@ claim to identify a singer.  For every exact shooting-grammar source/time key
 it emits two probability distributions over all six :class:`IVEMember` values
 plus an explicit unknown state:
 
-* ``center_member`` uses exact-time member geometry, prominence, composition,
-  headroom, and shot confidence; and
+* ``center_member`` mixes exact-time identity beliefs using visual attention,
+  applying geometry/occlusion confidence once; and
 * ``active_performer`` needs per-observation mouth/body activity corroborated
   by another independent activity, composition, or optional vocal signal.
 
-Known mass is deliberately capped and is never renormalized to one merely
-because one member has the largest score.  Missing, ambiguous, occluded, or
-non-vocal evidence therefore remains in ``unknown``.  Computation is
+Known mass is capped and never renormalized to one merely because one member
+has the largest score. Ambiguity among known people remains a soft mixture;
+missing identity, occlusion, and unsupported activity remain unknown. Computation is
 source-local and exact-time only, so appending future observations cannot
 change an existing output record.
 
@@ -44,7 +44,6 @@ from .ive import IVEMember
 from .member_state_graph import (
     CausalMemberObservation,
     MemberProbabilityMass,
-    MemberStateFeatureAdapter,
     MemberStateGraph,
 )
 
@@ -89,6 +88,8 @@ STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES = (
 
 MAX_CENTER_KNOWN_MASS = 0.95
 MAX_ACTIVE_PERFORMER_KNOWN_MASS = 0.95
+LEGACY_CENTER_DISTRIBUTION = "member_geometry_prominence_headroom_shot_confidence_v1"
+CENTER_DISTRIBUTION = "source_observation_attention_identity_geometry_once_v2"
 
 _MEMBERS = tuple(IVEMember)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -837,28 +838,6 @@ def _center_closeness(center_x: float) -> float:
     return max(0.0, 1.0 - min(1.0, abs(center_x - 0.5) / 0.5))
 
 
-def _headroom_quality(headroom: float | None) -> float:
-    if headroom is None:
-        return 0.0
-    # A modest top margin is a useful center-composition cue.  This is a
-    # quality weight, not a claim that one exact headroom is universally ideal.
-    return max(0.0, 1.0 - min(1.0, abs(headroom - 0.18) / 0.82))
-
-
-def _shot_scale_support(record: CausalShootingGrammarRecord) -> float:
-    if record.shot_closeup_probability is None:
-        return 0.0
-    return max(
-        0.0,
-        min(
-            1.0,
-            record.shot_closeup_probability
-            + 0.65 * (record.shot_medium_probability or 0.0)
-            + 0.20 * (record.shot_wide_probability or 0.0),
-        ),
-    )
-
-
 def _identity_known_quality(
     observations: Sequence[CausalMemberObservation],
     weights: Mapping[str, float] | None = None,
@@ -878,71 +857,40 @@ def _identity_known_quality(
 
 def _center_member_distribution(
     *,
-    adapter: MemberStateFeatureAdapter,
     observations: Sequence[CausalMemberObservation],
-    grammar: CausalShootingGrammarRecord,
 ) -> MemberProbabilityMass:
-    if not observations or not any(item.has_geometry for item in observations):
-        return _unknown_distribution()
-    features = {
-        member: adapter.at_timestamp(
-            source_id=grammar.source_id,
-            timestamp_seconds=grammar.master_time_seconds,
-            target_member=member,
-        )
-        for member in _MEMBERS
-    }
-    scores: dict[IVEMember, float] = {}
-    for member in _MEMBERS:
-        feature = features[member]
-        if feature.center_xy is None:
-            scores[member] = 0.0
-            continue
-        centrality = _center_closeness(feature.center_xy[0])
-        spatial = 0.65 * centrality + 0.35 * feature.prominence_probability
-        certainty_weight = 0.5 + 0.5 * (1.0 - feature.uncertainty_probability)
-        scores[member] = (
-            feature.visibility_probability * spatial * certainty_weight
-        )
-    score_total = math.fsum(scores.values())
-    if score_total <= _EPSILON:
-        return _unknown_distribution()
+    """Marginalize visible people instead of multiplying identity confidence.
 
-    visible_observations = tuple(
-        item for item in observations if _visible_geometry(item) > 0.0
-    )
-    identity_quality = _identity_known_quality(visible_observations)
-    maximum_visibility = max(
-        (feature.visibility_probability for feature in features.values()),
-        default=0.0,
-    )
-    dominance = max(scores.values()) / score_total
-    detected_count = max(
-        grammar.detected_person_count or 0,
-        len(visible_observations),
-    )
-    isolation = 1.0 / max(1, detected_count)
-    best_observation_shot_confidence = max(
-        (item.shot_confidence for item in visible_observations),
-        default=0.0,
-    )
-    grammar_confidence = (
-        grammar.shooting_grammar_confidence
-        if grammar.shooting_grammar_confidence is not None
-        else 0.5 * best_observation_shot_confidence
-    )
-    requested_known_mass = (
-        identity_quality
-        * maximum_visibility
-        * (0.30 + 0.70 * _shot_scale_support(grammar))
-        * (0.30 + 0.70 * isolation)
-        * (0.50 + 0.50 * _headroom_quality(grammar.subject_headroom_normalized))
-        * (0.50 + 0.50 * grammar_confidence)
-        * (0.50 + 0.50 * dominance)
-    )
+    Ambiguity about *which* visible person is featured belongs in the six-way
+    mixture. It is not additional probability that none of those identities
+    is known. Geometry reliability and the input identity belief each enter
+    once; missing or occluded evidence still contributes explicit unknown.
+    """
+    geometric = tuple(item for item in observations if item.association_bbox is not None)
+    if not geometric:
+        return _unknown_distribution()
+    total_area = math.fsum(item.association_bbox.area for item in geometric)
+    if total_area <= 0.0:
+        return _unknown_distribution()
+    attention = {
+        item.observation_id: (
+            0.65 * _center_closeness(item.association_bbox.center[0])
+            + 0.35 * item.association_bbox.area / total_area
+        )
+        for item in geometric
+    }
+    total_attention = math.fsum(attention.values())
+    if total_attention <= _EPSILON:
+        return _unknown_distribution()
+    scores = {member: 0.0 for member in _MEMBERS}
+    for observation in geometric:
+        weight = attention[observation.observation_id] / total_attention
+        support = weight * _visible_geometry(observation)
+        for member in _MEMBERS:
+            scores[member] += support * observation.member_probabilities.probability_for(member)
     return _distribution_from_scores(
         scores,
-        requested_known_mass=min(1.0, requested_known_mass),
+        requested_known_mass=min(1.0, math.fsum(scores.values())),
         maximum_known_mass=MAX_CENTER_KNOWN_MASS,
     )
 
@@ -1151,7 +1099,6 @@ def derive_ive_performer_state_records(
             sorted(values, key=lambda item: item.causal_order)
         )
 
-    adapter = MemberStateFeatureAdapter(graph)
     output: list[IVEPerformerStateRecord] = []
     for grammar in grammar_records:
         key = (grammar.master_time_seconds, grammar.source_id)
@@ -1166,9 +1113,7 @@ def derive_ive_performer_state_records(
                         "source/time"
                     )
         center = _center_member_distribution(
-            adapter=adapter,
             observations=observations,
-            grammar=grammar,
         )
         active, corroborated_count = _active_performer_distribution(
             observations=observations,
@@ -1364,11 +1309,9 @@ def _temporal_policy() -> dict[str, Any]:
     }
 
 
-def _computation_policy() -> dict[str, Any]:
+def _computation_policy(center_distribution: str = CENTER_DISTRIBUTION) -> dict[str, Any]:
     return {
-        "center_distribution": (
-            "member_geometry_prominence_headroom_shot_confidence_v1"
-        ),
+        "center_distribution": center_distribution,
         "active_distribution": (
             "per_observation_activity_two_family_corroboration_v1"
         ),
@@ -1397,6 +1340,7 @@ def _artifact_unsigned_payload(
     records: Sequence[IVEPerformerStateRecord],
     provenance: IVEPerformerStateProvenance,
     input_binding: IVEPerformerStateInputBinding,
+    center_distribution: str = CENTER_DISTRIBUTION,
 ) -> dict[str, Any]:
     source_ids = tuple(sorted({record.source_id for record in records}))
     return {
@@ -1407,7 +1351,7 @@ def _artifact_unsigned_payload(
         "content_hash_basis": IVE_PERFORMER_STATE_CONTENT_HASH_BASIS,
         "content_sha256": None,
         "temporal_policy": _temporal_policy(),
-        "computation_policy": _computation_policy(),
+        "computation_policy": _computation_policy(center_distribution),
         "feature_adapter": _feature_adapter_contract(),
         "storage_policy": dict(_STORAGE_POLICY),
         "source_ids": list(source_ids),
@@ -1434,6 +1378,7 @@ class IVEPerformerStateArtifact:
     input_binding: IVEPerformerStateInputBinding
     content_sha256: str
     schema_version: int = IVE_PERFORMER_STATE_SCHEMA_VERSION
+    center_distribution_contract: str = CENTER_DISTRIBUTION
 
     def __post_init__(self) -> None:
         records = tuple(self.records)
@@ -1456,6 +1401,8 @@ class IVEPerformerStateArtifact:
             raise IVEPerformerStateArtifactError(
                 "artifact input binding must be typed"
             )
+        if self.center_distribution_contract not in (CENTER_DISTRIBUTION, LEGACY_CENTER_DISTRIBUTION):
+            raise IVEPerformerStateArtifactError("unsupported center distribution policy")
         if (
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
@@ -1472,6 +1419,7 @@ class IVEPerformerStateArtifact:
             records=records,
             provenance=self.provenance,
             input_binding=self.input_binding,
+            center_distribution=self.center_distribution_contract,
         )
         if not hmac.compare_digest(_artifact_content_sha256(unsigned), digest):
             raise IVEPerformerStateArtifactError(
@@ -1523,6 +1471,7 @@ class IVEPerformerStateArtifact:
             records=self.records,
             provenance=self.provenance,
             input_binding=self.input_binding,
+            center_distribution=self.center_distribution_contract,
         )
         digest = _artifact_content_sha256(payload)
         if not hmac.compare_digest(digest, self.content_sha256):
@@ -1573,8 +1522,10 @@ class IVEPerformerStateArtifact:
             _canonical_json_bytes(_temporal_policy())
         ):
             raise IVEPerformerStateArtifactError("artifact temporal policy is unsafe")
-        if _canonical_json_bytes(payload["computation_policy"]) != (
-            _canonical_json_bytes(_computation_policy())
+        policy = payload["computation_policy"]
+        center_distribution = policy.get("center_distribution") if isinstance(policy, Mapping) else None
+        if center_distribution not in (CENTER_DISTRIBUTION, LEGACY_CENTER_DISTRIBUTION) or _canonical_json_bytes(policy) != (
+            _canonical_json_bytes(_computation_policy(center_distribution))
         ):
             raise IVEPerformerStateArtifactError(
                 "artifact computation policy changed"
@@ -1616,6 +1567,7 @@ class IVEPerformerStateArtifact:
             ),
             content_sha256=payload["content_sha256"],
             schema_version=payload["schema_version"],
+            center_distribution_contract=center_distribution,
         )
         expected_source_ids = sorted({record.source_id for record in records})
         if raw_source_ids != expected_source_ids:

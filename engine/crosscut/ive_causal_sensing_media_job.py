@@ -49,6 +49,7 @@ from .ive_face_identity_gallery import (
     load_ive_face_identity_gallery_artifact,
 )
 from .ive_performer_state import (
+    CENTER_DISTRIBUTION,
     IVEPerformerStateProvenance,
     IVEPerformerStateSourceProvenance,
     build_ive_performer_state_artifact,
@@ -756,6 +757,7 @@ def _production_runtime() -> IVECausalSensingRuntime:
             "contract": IVE_CAUSAL_SENSING_MEDIA_JOB_CONTRACT,
             "frame_contract": IVE_CAUSAL_SENSING_FRAME_CONTRACT,
             "identity_contract": IVE_CAUSAL_SENSING_IDENTITY_CONTRACT,
+            "center_distribution_policy": CENTER_DISTRIBUTION,
             "media_job_code_sha256": hashlib.sha256(
                 Path(__file__).read_bytes()
             ).hexdigest(),

@@ -2694,6 +2694,72 @@ class StageEditFeatureSnapshot:
                             "explicit unknown mass"
                         )
 
+    def refresh_ive_performer_state(
+        self,
+        previous: IVEPerformerStateArtifact,
+        refreshed: IVEPerformerStateArtifact,
+        *,
+        schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    ) -> "StageEditFeatureSnapshot":
+        """Refresh only scalar performer columns from the same causal inputs.
+
+        This never opens media, reruns perception, borrows another timestamp,
+        or edits the old snapshot. Source ordering, pose sidecars, clocks and
+        all non-performer observations are retained exactly.
+        """
+        self.require_schema(schema)
+        if self.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+            raise ValueError("performer refresh requires a current feature snapshot")
+        if (
+            previous.content_sha256 != self.causal_sensing_binding.ive_performer_state_content_sha256
+            or previous.input_binding != refreshed.input_binding
+            or previous.provenance.sources != refreshed.provenance.sources
+        ):
+            raise ValueError("performer refresh changed the bound causal inputs or media")
+        old = {(record.source_id, record.master_time_seconds): adapt_ive_performer_state_for_stage_edit(record)
+               for record in previous.records}
+        new = {(record.source_id, record.master_time_seconds): adapt_ive_performer_state_for_stage_edit(record)
+               for record in refreshed.records}
+        if set(old) != set(new):
+            raise ValueError("performer refresh changed the source/timestamp domain")
+        indices = tuple(schema.source_feature_names.index(name) for name in STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES)
+        tokens = []
+        for token in self.sequence.tokens:
+            candidates = []
+            for candidate in token.source_candidates:
+                key = (candidate.source_id, token.master_time_seconds)
+                if key not in old:
+                    raise ValueError("performer refresh lacks an exact source/timestamp")
+                if any(
+                    not math.isclose(candidate.features[index], value, abs_tol=1e-12, rel_tol=1e-12)
+                    or candidate.missing_mask[index] != missing
+                    for index, value, missing in zip(indices, old[key].values, old[key].missing_mask, strict=True)
+                ):
+                    raise ValueError("previous performer columns do not match their bound artifact")
+                values, mask = list(candidate.features), list(candidate.missing_mask)
+                for index, value, missing in zip(indices, new[key].values, new[key].missing_mask, strict=True):
+                    values[index], mask[index] = value, missing
+                candidates.append(replace(candidate, features=tuple(values), missing_mask=tuple(mask)))
+            tokens.append(replace(token, source_candidates=tuple(candidates)))
+        upstream = dict(self.provenance.upstream_sha256)
+        upstream["ive_performer_state"] = refreshed.content_sha256
+        provenance = replace(
+            self.provenance,
+            upstream_sha256=tuple(upstream.items()),
+            analyzer_fingerprint_sha256=_canonical_unicode_sha256({
+                "base_analyzer": self.provenance.analyzer_fingerprint_sha256,
+                "performer_center_policy": refreshed.center_distribution_contract,
+            }),
+            contracts=(*self.provenance.contracts, "same_causal_inputs_performer_scalar_refresh_v1"),
+        )
+        return StageEditFeatureSnapshot.build(
+            replace(self.sequence, tokens=tuple(tokens)), schema=schema, provenance=provenance,
+            causal_sensing_binding=replace(
+                self.causal_sensing_binding,
+                ive_performer_state_content_sha256=refreshed.content_sha256,
+            ),
+        )
+
     def token_at(
         self,
         master_time_seconds: float,
