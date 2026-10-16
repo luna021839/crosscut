@@ -9,11 +9,16 @@ import numpy as np
 from .physical_display_observations import focal_metadata
 
 
-def evidence(banks):
+def evidence(banks,*,source_cohort=None):
     shape=banks[0]['heads'].shape[:2];families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)]
-    groups=list(dict.fromkeys(families));height=np.zeros((len(groups),)+shape)
+    active=tuple(range(len(banks))) if source_cohort is None else tuple(source_cohort)
+    if (not active or any(type(s) is not int or not 0<=s<len(banks) for s in active)
+            or len(set(active))!=len(active)):
+        raise ValueError('distinct physical framing source indices required')
+    groups=list(dict.fromkeys(families[s] for s in active));height=np.zeros((len(groups),)+shape)
     people=np.zeros_like(height);weight=np.zeros_like(height);formation=np.zeros_like(height,bool)
-    for bank,family in zip(banks,families):
+    for s in active:
+        bank,family=banks[s],families[s]
         if bank['heads'].shape[:2]!=shape:raise ValueError('one common original programme clock required')
         heads,index,ambiguity,scene=focal_metadata(bank['heads'],np.tile([1.,.5,.5],shape+(1,)))
         quality=np.full(shape,.5)
@@ -36,7 +41,8 @@ def evidence(banks):
     support=(weight>0).sum(0);confidence=np.where(support>=2,weight.sum(0)/max(1,len(groups)),0.)
     majority=(weight*formation).sum(0)>weight.sum(0)/2.
     result=dict(height=median(height),people=median(people),formation=majority,confidence=confidence)
-    return result,dict(original_source_families=len(groups),framing_supported_nodes=int((confidence>0).sum()),
+    return result,dict(original_source_families=len(groups),original_source_indices=list(active),
+        physical_source_domain_count=len(banks),framing_supported_nodes=int((confidence>0).sum()),
         mean_framing_confidence=float(confidence.mean()),native_views_only=True,
         duplicate_family_extra_votes=False,learned_singer_or_named_identity=False,
         already_adequate_closeup_earns_no_extra_zoom_reward=True,mandatory_wide_or_closeup_count=False)

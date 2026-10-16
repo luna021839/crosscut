@@ -100,12 +100,16 @@ def test_event_value_uses_actual_coverage_but_never_creates_unobserved_body_pers
     assert not missing.benefits(1,3,density,allowed).any()
 
 
-def test_event_normalization_is_explicit_and_requires_actual_interval_consumer():
+def test_event_normalization_is_explicit_and_requires_actual_interval_consumer(monkeypatch):
     from crosscut2.played_pose_port_programme import PlayedPosePortPrior
     with pytest.raises(ValueError,match='actual pair-bound interval'):PlayedPosePortPrior(matched_event_utility=True)
     prior=PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True,matched_event_utility=True)
     assert prior.artifact['matched_musical_event_utility']
     assert not PlayedPosePortPrior().artifact['matched_musical_event_utility']
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused','--matched-event-utility'])
+    with pytest.raises(ValueError,match='actual played interval utility'):main()
 
 
 def test_claim_camera_argmin_can_differ_from_base_camera_and_replay_is_frozen():

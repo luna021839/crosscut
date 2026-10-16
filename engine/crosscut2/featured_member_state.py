@@ -57,12 +57,18 @@ def bind_hints(banks,hints,native_ports):
     return faces,native
 
 
-def consensus(banks,members,*,return_evidence=False):
+def consensus(banks,members,*,return_evidence=False,source_cohort=None):
     shape=banks[0]['heads'].shape[:2]
+    if len(members)!=len(banks):raise ValueError('one member field per physical source required')
+    active=tuple(range(len(banks))) if source_cohort is None else tuple(source_cohort)
+    if (not active or any(type(s) is not int or not 0<=s<len(banks) for s in active)
+            or len(set(active))!=len(active)):
+        raise ValueError('distinct physical featured-vote source indices required')
     families=[bank.get('consensus_family',('unverified_source',s)) for s,bank in enumerate(banks)]
-    groups={key:i for i,key in enumerate(dict.fromkeys(families))}
+    groups={key:i for i,key in enumerate(dict.fromkeys(families[s] for s in active))}
     votes=np.zeros((len(groups),)+shape+(6,));possible=np.zeros((len(groups),)+shape)
-    for bank,names,family in zip(banks,members,families):
+    for s in active:
+        bank,names,family=banks[s],members[s],families[s]
         heads,index,ambiguity,_=focal_metadata(bank['heads'],np.tile([1.,.5,.5],shape+(1,)))
         quality=np.full(shape,.5)
         if 'native_readability' in bank:
@@ -91,7 +97,8 @@ def consensus(banks,members,*,return_evidence=False):
         selected=np.take_along_axis(posterior,np.maximum(0,names),axis=2)
         probability=np.where(names>=0,selected,1./6.)
         factors.append(1.-confidence[...,None]+confidence[...,None]*probability/maximum[...,None])
-    receipt=dict(source_families=len(groups),framing_consensus_nodes=int((confidence>0).sum()),
+    receipt=dict(source_families=len(groups),voting_source_indices=list(active),physical_source_domain_count=len(banks),
+        framing_consensus_nodes=int((confidence>0).sum()),
         mean_confidence=float(confidence.mean()),maximum_confidence=float(confidence.max()),
         inferred_featured_not_verified_active_singer=True,named_identity_certified=False,
         unknown_is_not_forced_to_a_member=True,source_exclusion=False)

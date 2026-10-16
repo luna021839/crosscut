@@ -219,7 +219,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if identity_hints is not None:
         from .featured_member_state import bind_hints,consensus
         face_members,native_ports=bind_hints(banks,identity_hints,native_ports)
-        featured,featured_receipt,role_evidence=consensus(banks,face_members,return_evidence=True)
+        featured,featured_receipt,role_evidence=consensus(banks,face_members,return_evidence=True,source_cohort=cohort)
         if editorial:
             from .editorial_roles import FeatureRoles
             roles=FeatureRoles(nodes,role_evidence)
@@ -232,7 +232,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     framing=None
     if editorial:
         from .programme_framing import evidence as framing_evidence
-        framing,receipt['original_programme_framing']=framing_evidence(banks)
+        framing,receipt['original_programme_framing']=framing_evidence(banks,source_cohort=cohort)
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,

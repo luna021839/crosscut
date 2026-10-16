@@ -26,6 +26,21 @@ def test_unknown_single_original_family_does_not_impose_a_framing_role():
     assert not state['confidence'].any()
 
 
+def test_explicit_programme_cohort_also_scopes_framing_votes_without_reindexing_sources():
+    banks=[native_bank(h,str(i)) for i,h in enumerate((.03,.20,.03,.22,.03))]
+    main,receipt=evidence(banks,source_cohort=(1,3))
+    np.testing.assert_allclose(main['height'],.20)
+    assert receipt['original_source_indices']==[1,3] and receipt['physical_source_domain_count']==5
+    assert receipt['original_source_families']==2
+    # Ineligible auxiliary cameras must not still dictate the desired face
+    # size/formation after being removed from the decision port domain.
+    for s in (0,2,4):banks[s]['heads'][:]=0.
+    changed,_=evidence(banks,source_cohort=(1,3))
+    for key in main:np.testing.assert_array_equal(main[key],changed[key])
+    for invalid in ((),(1,1),(5,),(-1,),(True,)):
+        with pytest.raises(ValueError,match='physical framing'):evidence(banks,source_cohort=invalid)
+
+
 def test_readable_but_distant_shot_has_role_deficit_not_a_mandatory_cut():
     cat=catalogue();cat.editorial_content=True
     cat.bank['heads'][:]=0.;cat.bank['heads'][:,:,0]=[.5,.3,.12,.99]

@@ -34,6 +34,21 @@ def test_no_member_evidence_does_not_force_a_member_or_remove_usable_sources():
     assert receipt['maximum_confidence']==0 and all(np.all(v==1.) for v in factors)
 
 
+def test_explicit_cohort_excludes_auxiliary_role_votes_but_keeps_the_physical_source_domain():
+    import pytest
+    _,banks,_,_=inputs(count=5);names=members(banks,[1,0,1,0,1])
+    factors,receipt,evidence=consensus(banks,names,return_evidence=True,source_cohort=(1,3))
+    assert len(factors)==5 and receipt['voting_source_indices']==[1,3]
+    assert receipt['source_families']==2 and receipt['physical_source_domain_count']==5
+    assert evidence['posterior'][...,0].min()>evidence['posterior'][...,1].max()
+    before={key:value.copy() for key,value in evidence.items()}
+    for s in (0,2,4):names[s][:]=5;banks[s]['heads'][:]=0.
+    _,_,changed=consensus(banks,names,return_evidence=True,source_cohort=(1,3))
+    for key in before:np.testing.assert_array_equal(before[key],changed[key])
+    for invalid in ((),(1,1),(5,),(-1,),(True,)):
+        with pytest.raises(ValueError,match='physical featured-vote'):consensus(banks,names,source_cohort=invalid)
+
+
 def test_hint_binding_keeps_fourth_face_unknown_and_adds_native_hint_without_reinterpreting_vectors():
     _,banks,_,_=inputs(count=2)
     ports=[dict(frames=np.array([18]),heads=b['heads'][1:2].copy(),vectors=b['vectors'][1:2].copy()) for b in banks]
