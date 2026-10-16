@@ -63,6 +63,30 @@ def test_refiner_played_arm_direction_is_consumed_before_cut_choice_not_refit_af
     assert not untouched['articulated_arm_direction_measured'].any()
 
 
+@pytest.mark.parametrize('joints,roots',[([2,4],[0,0]),([3,5],[1,1])])
+def test_measured_opposed_arm_cannot_keep_the_old_positive_match_benefit(joints,roots):
+    from types import SimpleNamespace
+    from crosscut2.dense_subject_catalogue import DenseSubjects
+    from crosscut2.played_partial_pose import features,matrix
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+    a,_,_=prepared(0,bump=.08);b,w,clock=prepared(1,bump=.08)
+    body=w.body.copy();body[:,joints,:2]=2*body[:,roots,:2]-body[:,joints,:2]
+    b.subjects=DenseSubjects(source=1,binding='1',indices=clock,
+        windows=[replace(w,body=body)],bank=b.bank,fps=30.)
+    left=[SimpleNamespace(observation=obs(a,0))];right=[SimpleNamespace(observation=obs(b,1))]
+    before=matrix(features([left[0].observation],fps=30.),
+        features([right[0].observation],fps=30.),details=True)
+    old=float(before['matched_action_change_density'][0,0])
+    assert old>.1 and before['pose_rate'][0,0]<.5
+    after=articulated_seam_evidence(before,left,right)
+    advantage=np.maximum(0.,1.-2.*after['pose_rate'])
+    assert after['pose_rate'][0,0]>=.49999999
+    assert after['matched_action_change_density'][0,0]<=advantage[0,0]+1e-12
+    np.testing.assert_array_equal(after['actual_played_match_advantage'],advantage)
+    assert before['matched_action_change_density'][0,0]==old  # no mutation of raw evidence
+
+
 def test_split_and_A_B_A_cannot_duplicate_same_output_time_utility():
     value=samples();field=utility([value,value]);curve=np.tile([1.,.5,.5],(90,1))
     full=field.replay(0,0,90,curve)['observed_action_delivery_credit']

@@ -37,8 +37,17 @@ def articulated_seam_evidence(detail,left,right):
             # Both are existing dimensionless pose discrepancies. A good
             # shoulder average must not conceal an opposed measured arm.
             rate[a,b]=max(rate[a,b],direction[a,b])
-    return dict(detail,pose_rate=rate,articulated_arm_direction=direction,
+    result=dict(detail,pose_rate=rate,articulated_arm_direction=direction,
         articulated_arm_direction_measured=measured)
+    if 'matched_action_change_density' in detail:
+        # The new arm observation must qualify the BENEFIT as well as the
+        # cost. Otherwise an opposed arm can retain the old positive match
+        # credit even after its actual pose is no better than UNKNOWN(.5).
+        # Preserve every other existing bottleneck; never inflate a reward.
+        advantage=np.maximum(0.,1.-2.*rate)
+        result['actual_played_match_advantage']=advantage
+        result['matched_action_change_density']=np.minimum(detail['matched_action_change_density'],advantage)
+    return result
 
 
 @dataclass(frozen=True)
