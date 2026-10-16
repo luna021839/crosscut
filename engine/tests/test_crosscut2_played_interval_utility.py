@@ -205,7 +205,7 @@ def test_variable_port_DP_changes_source_and_cut_layout_from_actual_pointwise_de
     assert len(old)==1 and old_score[1]==0
 
 
-def test_actual_programme_consumer_replays_new_interval_costs_and_no_entry_bonus():
+def test_actual_programme_consumer_uses_pair_bound_claims_not_source_content_bonus():
     from crosscut2.played_pose_port_programme import select,PlayedPosePortPrior
     from test_crosscut2_preference_integration import producer
     args,kw,native,_,_,_=producer(opposed=False,one_arm=True)
@@ -217,9 +217,11 @@ def test_actual_programme_consumer_replays_new_interval_costs_and_no_entry_bonus
     receipt=result[4]
     assert receipt['camera_argmin_includes_actual_played_interval_utility']
     assert receipt['played_interval_utility']['seven_frame_credit_used'] is False
-    assert not receipt['boundary_port_DP'].get('current_event_paid_bit',False)
+    assert receipt['boundary_port_DP']['current_event_paid_bit']
+    assert receipt['boundary_port_DP']['claim_camera_chosen_before_argmin']
+    assert not receipt['played_interval_utility']['source_content_delivery_reward_in_base']
     assert result[3]==pytest.approx(sum(sum(p['components'].values()) for p in receipt['selected_hold_cost_decomposition']))
-    assert all(p['components']['measured_matched_action_change_credit']==0 for p in receipt['selected_hold_cost_decomposition'])
+    assert all(p['components']['observed_played_action_delivery_credit']==0 for p in receipt['selected_hold_cost_decomposition'])
     assert not receipt['professional_quality_approved']
 
 

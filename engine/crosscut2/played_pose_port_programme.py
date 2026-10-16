@@ -39,7 +39,7 @@ class PlayedPosePortPrior:
             'sequence_preference_model.py','played_context.py','context_port_dp.py','sequence_context_kernel.py',
             'playback_intent.py','playback_blocks.py','ordered_context.py','ordered_preference_model.py','block_played_context.py',
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
-            'played_interval_utility.py','observed_reframing.py']
+            'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -100,8 +100,9 @@ class PlayedPosePortPrior:
                 unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['played_interval_utility']=bool(played_interval_utility)
         if played_interval_utility:
-            self.artifact.update(contract='actual_interval_action_delivery_composed_image_boundary_port_E6_v1',
-                opportunity_credit='fixed_event_priority_times_actually_observed_pointwise_action_delivery',
+            self.artifact.update(contract='pair_bound_actual_interval_action_composed_image_boundary_port_E6_v2',
+                opportunity_credit='actual_pair_density_times_observed_entry_target_delivery_once_per_fixed_episode',
+                source_continuation_change_credit=False,
                 seven_frame_entry_credit_used=False,entry_density_times_hold_duration=False,
                 complete_arc_camera_argmin_after_actual_utility=True,
                 refiner_articulated_seam_observation_used_before_source_cut_selection=True,
@@ -210,12 +211,16 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     interval_utility=None
     if played:
         from .played_interval_utility import PlayedIntervalUtility
-        interval_utility=PlayedIntervalUtility.from_catalogues(cats,opportunities,check=live)
+        interval_utility=PlayedIntervalUtility.from_catalogues(cats,opportunities,check=live,delivery_in_base=False)
     arcs=ArcCosts(nodes,entries,exits,cats,dense,native_ports,support,fragments,fps=fps,check=live,
         person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
         roles=roles,point_geometry=editorial,
         readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps),
-        preserve_camera_alternatives=sequence,played_interval_utility=interval_utility)
+        preserve_camera_alternatives=sequence or played,played_interval_utility=interval_utility)
+    matched_delivery=None
+    if played:
+        from .matched_entry_delivery import MatchedEntryDelivery
+        matched_delivery=MatchedEntryDelivery(arcs,opportunities)
     contextual=None
     if sequence:
         contextual=sequence_preference_model.prepare(nodes=nodes,entries=entries,exits=exits,catalogues=cats,arcs=arcs,
@@ -266,7 +271,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     # removes exact common content prefix cancellation and does not add edits.
     potential=np.min(np.concatenate(arcs.prefix,axis=0),axis=0)[np.asarray(nodes,int)]
     def holds(i,j):
-        if sequence:costs,allowed=arcs.camera_alternatives(i,j)
+        if sequence or played:costs,allowed=arcs.camera_alternatives(i,j)
         elif readout:costs,allowed,transfer=arcs.alternatives(i,j)
         else:costs,allowed,codes=arcs(i,j)
         if i and i not in entry_density:cut(i)
@@ -274,7 +279,21 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         reward=(min(float(nodes[j]-nodes[i])/fps,exposure_seconds)*density[:,None]
             if opportunities is None else 0.)
         if sequence:return costs-(potential[j]-potential[i]),allowed
+        if played:
+            codes=np.argmin(np.where(allowed,costs,np.inf),axis=-1)
+            return (np.take_along_axis(costs,codes[...,None],axis=-1).squeeze(-1)
+                -(potential[j]-potential[i]),allowed.any(-1),codes)
         return costs-reward-(potential[j]-potential[i]),allowed,transfer if readout else codes
+    def claimed_holds(i,j):
+        # The ordinary callback has just built ALL legal camera alternatives.
+        # A claimed edit chooses again only after actual pair-bound delivery
+        # has been scored, instead of reusing the cheapest isolated camera.
+        if arcs.last_camera_alternatives[:2]!=(i,j):
+            raise AssertionError('claimed hold must consume this exact candidate camera domain')
+        costs,allowed=arcs.last_camera_alternatives[2:]
+        density=entry_density.get(i,np.zeros(len(entries[i])))
+        value,valid,codes,benefit=matched_delivery.choose(i,j,density,costs,allowed)
+        return value-(potential[j]-potential[i]),valid,codes,benefit
     observed_exposure={}
     def credit(i,j):
         if not i:return np.zeros(len(entries[0]))
@@ -300,8 +319,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     else:
         port_runs,objective,dp=solve(nodes,[[p.source for p in ps] for ps in entries],[[p.source for p in ps] for ps in exits],
             start_cost=np.zeros(len(entries[0])),hold_cost=holds,cut_cost=cut,minimum_frames=12,check=live,
-            opportunity_episodes=None if opportunities is None or played else opportunities.episodes,
-            hold_credit=None if opportunities is None or played else credit)
+            opportunity_episodes=None if opportunities is None else opportunities.episodes,
+            hold_credit=None if opportunities is None or played else credit,
+            claim_hold_cost=claimed_holds if played else None)
     score=float(objective[0]+potential[-1]-potential[0]);selected=SelectedPorts(nodes,fps)
     context_parts=None
     if contextual is not None:
@@ -322,9 +342,12 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         effect=(dict(observed_action_delivery_credit=0.,composed_image_motion_delta=0.,adjustment=0.)
             if interval_utility is None else interval_utility.replay(source,first,final,curve))
         density=entry_density.get(i,np.zeros(len(entries[i])))
-        if played:change_credit=0.
-        elif opportunities is None:change_credit=min(float(final-first)/fps,exposure_seconds)*float(density[p])
+        if opportunities is None:change_credit=min(float(final-first)/fps,exposure_seconds)*float(density[p])
         else:change_credit=dp['opportunity_claims'][k]['credit']
+        if played and dp['opportunity_claims'][k]['claimed']:
+            actual_credit=matched_delivery.replay(i,j,p,curve,float(density[p]))
+            if not math.isclose(change_credit,actual_credit,rel_tol=1e-9,abs_tol=1e-10):
+                raise AssertionError('claimed action benefit differs from actual selected target/camera replay')
         incoming=0. if not k else float(cut(i)[0][port_runs[k-1][3],p])
         sequence_cost=0. if context_parts is None else context_parts[k]
         if readout:
@@ -364,7 +387,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         parts.append(dict(first_frame=first,final_frame=final,source=source,
             components=dict(realized_hold_content_camera_native_fragment=cost,entry_played_face_pose=incoming,
                 measured_matched_action_change_credit=-change_credit,
-                observed_played_action_delivery_credit=-effect['observed_action_delivery_credit'],
+                observed_played_action_delivery_credit=(-effect['observed_action_delivery_credit']
+                    if interval_utility is not None and interval_utility.delivery_in_base else 0.),
                 composed_image_motion_replacement=effect['composed_image_motion_delta'],
                 residual_readout_interaction=sequence_cost if readout else 0.,
                 fixed_time_sequence_preference=sequence_cost if sequence else 0.),cumulative_cost=cumulative))
@@ -426,9 +450,11 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     live();receipt.update(objective_contract=prior.artifact['contract'],fixed_states=len(cats)*4,
         scene_readout_consumed=readout,
         scene_readout_observations=[] if not readout else [r.receipt() for r in arcs.readouts],
-        pre_DP_scalar_camera_argmin_used=not (readout or sequence),
+        pre_DP_scalar_camera_argmin_used=not (readout or sequence or played),
+        conditional_unpaid_or_paid_camera_argmin_used=played,
         camera_argmin_includes_actual_played_interval_utility=played,
         played_interval_utility=None if interval_utility is None else interval_utility.receipt(),
+        matched_entry_action_delivery=None if matched_delivery is None else matched_delivery.receipt(),
         sequence_preference_consumed=sequence,
         sequence_preference_model_sha256=None if not sequence else sequence_preference_model.artifact['content_sha256'],
         sequence_preference_context=None if contextual is None else contextual.receipt(),

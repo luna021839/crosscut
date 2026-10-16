@@ -107,9 +107,9 @@ def delivery_amount(samples,positions,cameras):
 
 
 class PlayedIntervalUtility:
-    def __init__(self,*,nodes,clocks,delivery,image_records,fps,targets=()):
+    def __init__(self,*,nodes,clocks,delivery,image_records,fps,targets=(),delivery_in_base=True):
         self.nodes=np.asarray(nodes,int);self.delivery=tuple(delivery)
-        self.fps=float(fps);self.targets=tuple(targets)
+        self.fps=float(fps);self.targets=tuple(targets);self.delivery_in_base=bool(delivery_in_base)
         if len(clocks)!=len(delivery) or not np.isfinite(fps) or fps<=0:
             raise ValueError('one actual renderer clock per physical source required')
         self.clocks=[]
@@ -137,7 +137,7 @@ class PlayedIntervalUtility:
         self._prepared_for=None;self.prefix_interval_uses=0;self.clock_correction_rows=0
 
     @classmethod
-    def from_catalogues(cls,catalogues,opportunities,*,check=lambda:None):
+    def from_catalogues(cls,catalogues,opportunities,*,check=lambda:None,delivery_in_base=True):
         """Freeze one source-local target/episode BEFORE any proposed crop.
 
         Source timestamp interpolation merely requests original native rows;
@@ -197,7 +197,8 @@ class PlayedIntervalUtility:
             if any(cat.subjects is None or row.get('source_sha256')!=cat.subjects.binding for row in rows):
                 raise ValueError('observed image evidence physical source binding changed')
             image_records.append(rows)
-        return cls(nodes=nodes,clocks=clocks,delivery=delivery,fps=fps,targets=targets,image_records=image_records)
+        return cls(nodes=nodes,clocks=clocks,delivery=delivery,fps=fps,targets=targets,image_records=image_records,
+            delivery_in_base=delivery_in_base)
 
     def native(self,source,first,final,frames):
         i,j=np.searchsorted(self.nodes,[first,final]);clock=self.clocks[source]
@@ -239,7 +240,7 @@ class PlayedIntervalUtility:
                 +np.log(last[:,0]/first[:,0])**2)
             motion+=np.where(supported,energy-digital,0.)
         return dict(observed_action_delivery_credit=delivery,composed_image_motion_delta=motion,
-            adjustment=motion-delivery)
+            adjustment=motion-delivery if self.delivery_in_base else motion)
 
     def direct_adjust(self,arcs,i,j,source,ps,qs,costs,allowed,*,frames=None,correction=False):
         """Independent direct oracle; also handles short/nonseparable paths."""
@@ -283,7 +284,7 @@ class PlayedIntervalUtility:
             paths=np.asarray(paths)
             arcs.check();cost=np.zeros((4,final));motion=np.zeros_like(cost)
             table=self.delivery[source]
-            if len(table.frames):
+            if self.delivery_in_base and len(table.frames):
                 cost[:,table.frames]-=delivery_amount(table,np.arange(len(table.frames)),paths[:,table.frames])/self.fps
             for row in self.images[source]:
                 a,b=row['output_frames']
@@ -365,4 +366,5 @@ class PlayedIntervalUtility:
             utility_is_pointwise_and_segment_split_invariant=True,unknown_exposure_interpolated=False,
             actual_candidate_native_ordinals_checked=True,source_NN=0,source_decode=0,
             new_camera_families=False,new_cut_quota=False,preference_model_fitted=False,
+            source_content_delivery_reward_in_base=self.delivery_in_base,
             professional_quality_approved=False)

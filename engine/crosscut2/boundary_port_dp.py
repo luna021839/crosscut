@@ -87,7 +87,7 @@ def _lexmin(primary, cuts):
 def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost,
           start_allowed=None, final_cost=None, final_allowed=None, minimum_frames=12,
           check=lambda: None, workspace_limit_bytes=200 * 2**20,
-          opportunity_episodes=None, hold_credit=None):
+          opportunity_episodes=None, hold_credit=None, claim_hold_cost=None):
     '''Return (runs, (primary, cuts), receipt).
 
     Each run is (start_node, end_node, entry_port_index, exit_port_index).  A
@@ -95,11 +95,12 @@ def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost
     final node.  Raises ValueError for malformed input or callbacks, an
     exceeded workspace bound, or when no complete programme exists.
     '''
-    if opportunity_episodes is not None or hold_credit is not None:
+    if opportunity_episodes is not None or hold_credit is not None or claim_hold_cost is not None:
         return _opportunity_solve(nodes,entry_sources,exit_sources,start_cost=start_cost,
             hold_cost=hold_cost,cut_cost=cut_cost,start_allowed=start_allowed,final_cost=final_cost,
             final_allowed=final_allowed,minimum_frames=minimum_frames,check=check,
-            workspace_limit_bytes=workspace_limit_bytes,episodes=opportunity_episodes,credit=hold_credit)
+            workspace_limit_bytes=workspace_limit_bytes,episodes=opportunity_episodes,credit=hold_credit,
+            claim_hold_cost=claim_hold_cost)
     nodes = np.asarray(nodes)
     if (nodes.ndim != 1 or len(nodes) < 2 or nodes.dtype.kind not in 'iu'
             or np.any(np.diff(nodes) <= 0)):
@@ -202,7 +203,7 @@ def solve(nodes, entry_sources, exit_sources, *, start_cost, hold_cost, cut_cost
     return tuple(reversed(runs)), (float(low[0]), int(fewest[0])), receipt
 
 
-def _opportunity_solve(nodes,entries,exits,*,episodes,credit,**kw):
+def _opportunity_solve(nodes,entries,exits,*,episodes,credit,claim_hold_cost=None,**kw):
     """One paid bit for the CURRENT nonoverlapping opportunity episode.
 
     Claims are optional, so a weak early view does not consume a better later
@@ -212,8 +213,10 @@ def _opportunity_solve(nodes,entries,exits,*,episodes,credit,**kw):
     """
     nodes=np.asarray(nodes);episodes=np.asarray(episodes)
     if (episodes.shape!=nodes.shape or episodes.dtype.kind not in 'iu'
-            or np.any(np.diff(episodes)<0) or not callable(credit)):
+            or np.any(np.diff(episodes)<0) or (not callable(credit) and not callable(claim_hold_cost))):
         raise ValueError('ordered fixed opportunity episodes and actual exposure credit required')
+    if claim_hold_cost is not None and (not callable(claim_hold_cost) or credit is not None):
+        raise ValueError('choose either legacy exposure credit or camera-dependent claimed holds')
     original_hold=kw.pop('hold_cost');original_cut=kw.pop('cut_cost')
     entries=_ports(entries,len(nodes),'entry');exits=_ports(exits,len(nodes),'exit')
     start=_vector(kw.pop('start_cost'),len(entries[0]),'start_cost')
@@ -225,28 +228,50 @@ def _opportunity_solve(nodes,entries,exits,*,episodes,credit,**kw):
     # not a fake extra source/actor or a zero-cost quality measurement.
     expanded_start=np.repeat(start,2)
     expanded_allowed=np.column_stack((start_mask,np.zeros(len(start_mask),bool))).ravel()
-    def hold(i,j):
+    def alternatives(i,j):
         value=original_hold(i,j)
         base,valid=_matrix(value[:2],(len(entries[i]),len(exits[j])),'hold')
-        benefit=np.asarray(credit(i,j),float)
+        codes=None if len(value)!=3 else np.asarray(value[2])
+        if claim_hold_cost is None:
+            benefit=np.asarray(credit(i,j),float)
+            if benefit.shape==(len(entries[i]),):benefit=np.broadcast_to(benefit[:,None],base.shape)
+            claimed=base-benefit;claim_valid=valid;claim_codes=codes
+        else:
+            claim=claim_hold_cost(i,j)
+            if not isinstance(claim,(tuple,list)) or len(claim)!=4:
+                raise ValueError('claimed hold requires cost, mask, frozen camera code and actual benefit')
+            claimed,claim_valid=_matrix(claim[:2],base.shape,'claimed hold')
+            claim_codes=np.asarray(claim[2]);benefit=np.asarray(claim[3],float)
+            if (codes is None or claim_codes.shape!=base.shape or claim_codes.dtype.kind not in 'iu'
+                    or np.any(claim_codes[claim_valid]<0) or np.any(claim_valid&~valid)):
+                raise ValueError('claimed hold must preserve legal sources and actual frozen camera codes')
         if benefit.shape==(len(entries[i]),):benefit=np.broadcast_to(benefit[:,None],base.shape)
         if benefit.shape!=base.shape or not np.isfinite(benefit).all() or np.any(benefit<0):
             raise ValueError('finite nonnegative supported opportunity exposure required')
+        return base,valid,codes,claimed,claim_valid,claim_codes,benefit
+    def hold(i,j):
+        base,valid,codes,claimed,claim_valid,claim_codes,benefit=alternatives(i,j)
         shape=(len(entries[i]),2,len(exits[j]),2)
         cost=np.zeros(shape);mask=np.zeros(shape,bool)
+        frozen=None if codes is None else np.broadcast_to(codes[:,None,:,None],shape).copy()
         same=bool(episodes[i]==episodes[j])
         # Unpaid -> unpaid may defer the claim; unpaid -> paid may take it.
         cost[:,0,:,0]=base;mask[:,0,:,0]=valid
         if same:
-            cost[:,0,:,1]=base-benefit;mask[:,0,:,1]=valid&(benefit>0)
+            cost[:,0,:,1]=claimed;mask[:,0,:,1]=claim_valid&(benefit>0)
+            if frozen is not None:frozen[:,0,:,1]=claim_codes
             cost[:,1,:,1]=base;mask[:,1,:,1]=valid
         else:
-            cost[:,0,:,0]=base-benefit
+            # Crossing a fixed event resets its paid bit. The claimed
+            # camera may cost more than the unclaimed camera, so claiming
+            # must remain optional even when both map to the unpaid bit.
+            take=claim_valid&(benefit>0)&((claimed<base)|~valid)
+            cost[:,0,:,0]=np.where(take,claimed,base)
+            mask[:,0,:,0]=valid|take
+            if frozen is not None:frozen[:,0,:,0]=np.where(take,claim_codes,codes)
             cost[:,1,:,0]=base;mask[:,1,:,0]=valid
         result=(cost.reshape(shape[0]*2,shape[2]*2),mask.reshape(shape[0]*2,shape[2]*2))
-        if len(value)==3:
-            codes=np.repeat(np.repeat(np.asarray(value[2]),2,axis=0),2,axis=1)
-            result=(*result,codes)
+        if frozen is not None:result=(*result,frozen.reshape(shape[0]*2,shape[2]*2))
         return result
     def cut(n):
         base,valid=_matrix(original_cut(n),(len(exits[n]),len(entries[n])),'cut')
@@ -259,13 +284,17 @@ def _opportunity_solve(nodes,entries,exits,*,episodes,credit,**kw):
         final_cost=None if final is None else np.repeat(final,2),
         final_allowed=None if finish is None else np.repeat(finish,2),**kw)
     paid=[]
-    for i,j,p,q in runs:
-        benefit=np.asarray(credit(i,j),float)
-        amount=float(benefit[p//2] if benefit.ndim==1 else benefit[p//2,q//2])
-        claim=p%2==0 and (episodes[i]!=episodes[j] or q%2==1) and amount>0
+    for k,(i,j,p,q) in enumerate(runs):
+        base,valid,codes,claimed,claim_valid,claim_codes,benefit=alternatives(i,j)
+        a,b=p//2,q//2;amount=float(benefit[a,b])
+        take=bool(claim_valid[a,b] and amount>0 and (claimed[a,b]<base[a,b] or not valid[a,b]))
+        claim=p%2==0 and (take if episodes[i]!=episodes[j] else q%2==1) and amount>0
+        if claim and claim_codes is not None and receipt['selected_arc_codes'][k]!=int(claim_codes[a,b]):
+            raise AssertionError('claimed camera differs from the camera frozen by DP')
         paid.append(dict(episode=int(episodes[i]),credit=amount if claim else 0.,claimed=bool(claim)))
     claimed=[p['episode'] for p in paid if p['claimed']]
     if len(set(claimed))!=len(claimed):raise AssertionError('one editorial opportunity paid twice')
     receipt.update(opportunity_claims=paid,current_event_paid_bit=True,all_history_subsets_stored=False,
-        fixed_opportunity_episodes=len(np.unique(episodes)),opportunity_credit_once_only=True)
+        fixed_opportunity_episodes=len(np.unique(episodes)),opportunity_credit_once_only=True,
+        claim_camera_chosen_before_argmin=claim_hold_cost is not None)
     return tuple((i,j,p//2,q//2) for i,j,p,q in runs),objective,receipt
