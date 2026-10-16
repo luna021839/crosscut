@@ -102,7 +102,7 @@ def _camera_action_support(window,indices,ticks,endpoint,side):
 
 def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
             nonzero_audio_and_mouth_verified=False,following_four_seconds_verified=False,
-            outgoing_locked=True,outgoing_cap=None):
+            outgoing_locked=True,outgoing_cap=None,played_incoming_camera=None):
     if not isinstance(left,SubjectWindow) or not isinstance(right,SubjectWindow):raise ValueError('subject windows required')
     if (left_clock.phase_frames!=0 or left_clock.fps!=right_clock.fps
             or not np.array_equal(left_clock.output_frames,right_clock.output_frames)):
@@ -114,7 +114,14 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
             or np.any(cameras[:,1:]>1)):
         raise ValueError('actual outgoing camera samples required')
     la,rb=int(np.flatnonzero(ticks==-1)[0]),int(np.flatnonzero(ticks==0)[0])
-    ca=cameras[la];cb=incoming_camera(left.heads[a[la]],right.heads[b[rb]],ca,cap=incoming_cap)
+    ca=cameras[la]
+    if played_incoming_camera is None:
+        cb=incoming_camera(left.heads[a[la]],right.heads[b[rb]],ca,cap=incoming_cap)
+    else:
+        from .boundary_camera_arc import realizable
+        cb=np.asarray(played_incoming_camera,float)
+        if not outgoing_locked or cb.shape!=(3,) or not realizable(cb[None],incoming_cap):
+            raise ValueError('an explicit legal incoming view requires the actual locked outgoing view')
     camera_support=(None,None)
     if not outgoing_locked:
         # A NEW joint camera proposal, before programme selection. This is
@@ -196,6 +203,7 @@ def compare(left,right,left_clock,right_clock,*,left_cameras,incoming_cap,
         target_visible_fraction=visible,target_attention_ratio=attention,rank_score=score,
         outgoing_target_visible_fraction=outgoing_visible,outgoing_target_attention_ratio=outgoing_attention,
         outgoing_camera_locked=bool(outgoing_locked),new_joint_camera_before_selection=not outgoing_locked,
+        incoming_camera_supplied_without_refit=played_incoming_camera is not None,
         camera_action_support_samples=[0 if v is None else len(v) for v in camera_support],
         camera_construction_uses_played_side_observed_action=any(v is not None for v in camera_support),
         candidate_has_measured_action=evidence,matched_identity_certified=False,anatomical_ownership_certified=False,

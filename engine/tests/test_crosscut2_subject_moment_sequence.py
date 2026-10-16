@@ -18,6 +18,16 @@ def test_joint_choice_does_not_create_too_short_shot_from_independent_best_momen
     assert not receipt['authored_cut_count_changed']
 
 
+def test_same_music_moment_keeps_distinct_actual_camera_choices_before_whole_hold_cost():
+    original=dict(moment(20,.1),left_strip=np.tile([1.,.5,.5],(7,1)),right_strip=np.tile([1.,.5,.5],(7,1)))
+    crop=dict(moment(20),left_strip=np.tile([1.8,.5,.5],(7,1)),right_strip=np.tile([1.8,.5,.5],(7,1)))
+    levels=[[moment(0)],[original,crop],[moment(50)]]
+    selected,_,_=choose(levels,lambda i,a,b:dict(camera_cost=1. if b.get('left_strip',np.ones((1,1)))[0,0]>1.5 else 0.))
+    assert selected==[0,0,0]  # smaller seam error cannot force the tight whole hold
+    with pytest.raises(ValueError,match='distinct'):
+        choose([[moment(0)],[original,dict(original)],[moment(50)]],lambda *a:dict(camera_cost=0.))
+
+
 def test_unknown_is_a_sole_unchanged_anchor_not_perfect_competitor():
     with pytest.raises(ValueError,match='UNKNOWN'):
         choose([[moment(0)],[moment(20,1.),moment(21,observed=False)],[moment(40)]],lambda *a:None)

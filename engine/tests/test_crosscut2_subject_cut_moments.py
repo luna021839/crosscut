@@ -43,6 +43,30 @@ def test_cut_moment_moves_both_sources_without_retiming_either_one():
         assert row['clock_hypothesis_frames'] == 0
 
 
+def test_preserved_readable_camera_pair_competes_with_matched_crop_at_the_same_moment():
+    a,b=window(0),window(1)
+    heads=b.heads.copy();heads[:,2]*=.75;b=replace(b,heads=heads)
+    original=np.array([[1.,.5,.5],[1.,.5,.5]])
+    result=search(a,b,hypothesis(a),hypothesis(b),candidate_frames=[0],
+        outgoing_cap=2.,incoming_cap=2.,preserved_cameras=original)
+    assert len(result['supported'])==2
+    by_kind={r['camera_proposal_kind']:r for r in result['supported']}
+    np.testing.assert_array_equal(by_kind['preserved']['outgoing_camera'],original[0])
+    np.testing.assert_array_equal(by_kind['preserved']['incoming_camera'],original[1])
+    assert by_kind['joint']['incoming_camera']!=original[1].tolist()
+    for row in result['supported']:
+        assert row['seam_action_supported'] and row['native_A'][6]==100 and row['native_B'][6]==100
+        assert row['both_music_clocks_moved_together'] and not row['source_retimed']
+    np.testing.assert_array_equal(original,[[1.,.5,.5],[1.,.5,.5]])
+
+
+def test_duplicate_physical_camera_pair_is_not_a_new_cut_moment_candidate():
+    a,b=window(0),window(1)
+    result=search(a,b,hypothesis(a),hypothesis(b),candidate_frames=[0],
+        outgoing_cap=2.,incoming_cap=2.,preserved_cameras=np.array([[1.,.5,.5]]*2))
+    assert len(result['candidates'])==1
+
+
 def test_good_window_average_cannot_hide_wrist_error_at_actual_seam():
     a, b = window(0), window(1)
     body = b.body.copy()

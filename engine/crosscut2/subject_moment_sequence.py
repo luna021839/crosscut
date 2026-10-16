@@ -177,8 +177,9 @@ def choose(levels, hold, *, check=lambda:None):
     for values in levels:
         kinds={bool(v['observed']) for v in values}
         if len(kinds)>1:raise ValueError('UNKNOWN anchor cannot compete as an observed action match')
-        frames=[v['frame'] for v in values]
-        if len(set(frames))!=len(frames):raise ValueError('one frozen camera proposal per cut moment required')
+        keys=[(v['frame'],*(None if v.get(side) is None else curve_digest(v[side])
+            for side in ('left_strip','right_strip'))) for v in values]
+        if len(set(keys))!=len(keys):raise ValueError('distinct physical moment/camera alternatives required')
         for value in values:
             costs=(value['configuration_cost'],value['connection_cost'])
             if type(value['frame']) is not int or not all(math.isfinite(c) and c>=0 for c in costs):

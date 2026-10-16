@@ -117,7 +117,7 @@ def _seam_action(left, right, lc, rc, geometry):
 
 
 def search(left, right, left_clock, right_clock, *, candidate_frames,
-           outgoing_cap, incoming_cap, radius=6):
+           outgoing_cap, incoming_cap, radius=6,preserved_cameras=None):
     """Rank alternative edit instants with no independent source retiming.
 
     Candidate frames are output/music offsets from the supplied anchor.  This
@@ -133,6 +133,12 @@ def search(left, right, left_clock, right_clock, *, candidate_frames,
     if (not candidates or any(type(t) is not int for t in candidates)
             or len(set(candidates)) != len(candidates) or type(radius) is not int or radius < 4):
         raise ValueError('distinct integer cut moments and a measured context required')
+    original=None if preserved_cameras is None else np.asarray(preserved_cameras,float)
+    if original is not None:
+        from .boundary_camera_arc import realizable
+        if (original.shape!=(2,3) or not realizable(original[:1],outgoing_cap)
+                or not realizable(original[1:],incoming_cap)):
+            raise ValueError('two legal explicitly preserved endpoint cameras required')
     results = []
     for center in candidates:
         lc = _at_moment(left_clock, center, radius)
@@ -141,15 +147,23 @@ def search(left, right, left_clock, right_clock, *, candidate_frames,
                            left_cameras=np.tile([1., .5, .5], (len(lc.output_frames), 1)),
                            incoming_cap=incoming_cap, outgoing_locked=False,
                            outgoing_cap=outgoing_cap)
-        seam = _seam_action(left, right, lc, rc, geometry)
-        score = None
-        if geometry['status'] == 'SUPPORTED_CANDIDATE' and seam['seam_action_supported']:
-            score = (seam['seam_pose_residual'] + seam['seam_screen_residual']
-                     + seam['seam_motion_residual'] + geometry['face_residual']
-                     + 1. - geometry['appearance_cosine'])
-        results.append(dict(**geometry, **seam, cut_offset_frames=center,
-                            cut_offset_seconds=center / lc.fps, cut_moment_score=score,
-                            both_music_clocks_moved_together=True, source_retimed=False))
+        proposals=[('joint',geometry)]
+        if original is not None and not np.allclose(original,
+                [geometry['outgoing_camera'],geometry['incoming_camera']],rtol=0.,atol=1e-12):
+            proposals.append(('preserved',compare(left,right,lc,rc,
+                left_cameras=np.tile(original[0],(len(lc.output_frames),1)),
+                incoming_cap=incoming_cap,played_incoming_camera=original[1])))
+        for kind,geometry in proposals:
+            seam = _seam_action(left, right, lc, rc, geometry)
+            score = None
+            if geometry['status'] == 'SUPPORTED_CANDIDATE' and seam['seam_action_supported']:
+                score = (seam['seam_pose_residual'] + seam['seam_screen_residual']
+                         + seam['seam_motion_residual'] + geometry['face_residual']
+                         + 1. - geometry['appearance_cosine'])
+            results.append(dict(**geometry, **seam, cut_offset_frames=center,
+                                cut_offset_seconds=center / lc.fps, cut_moment_score=score,
+                                camera_proposal_kind=kind,
+                                both_music_clocks_moved_together=True, source_retimed=False))
     # First match the articulated configuration, then screen placement and
     # motion. A small positional/velocity gain must not trade an overhead
     # crossed-arm pose for a differently directed, blurred low-arm swing.

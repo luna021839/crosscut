@@ -36,8 +36,10 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('plan','source-spec','cache','output'):parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--ssd-device',type=int,required=True);parser.add_argument('--render',action='store_true')
-    parser.add_argument('--reuse-subject-observations',type=Path,
+    parser.add_argument('--reuse-subject-observations',type=Path,action='append',default=[],
         help='Explicit existing source/producer-bound window receipt; reuse actual covered native observations')
+    parser.add_argument('--preserve-camera-candidates',action='store_true',
+        help='Compare original endpoint viewports against joint match crops at each observed fine cut moment')
     parser.add_argument('--whole-hold-camera-family',action='store_true',
         help='Offer whole-viewport bridge families; every family always pays observed played crop and zoom costs')
     parser.add_argument('--cached-only',action='store_true',
@@ -75,9 +77,9 @@ def main():
         sensor=hashlib.sha256(Path(inspect.getfile(WholeBodySensor)).read_bytes()).hexdigest(),
         window=hashlib.sha256(Path(bank.__file__).read_bytes()).hexdigest(),
         adapter=hashlib.sha256(inspect.getsource(bank.face_guided_hypothesis).encode()).hexdigest(),raster=[960,540]))
-    reused_windows=[]
-    if args.reuse_subject_observations is not None:
-        reference=args.reuse_subject_observations.resolve(strict=True)
+    reused_windows=[];seen=set()
+    for reference in args.reuse_subject_observations:
+        reference=reference.resolve(strict=True)
         if not reference.is_relative_to(root):raise ValueError('reused observations outside authorized SSD project')
         old=json.loads(reference.read_text())
         if (old['source_sha256']!=parent['source_sha256'] or old['source_file_identities']!=parent['source_file_identities']
@@ -85,7 +87,6 @@ def main():
             raise ValueError('reused observation source changed')
         if old['render_plan']['fps']!=plan.fps or old['render_plan']['master_audio_start']!=plan.master_audio_start:
             raise ValueError('reused observation music domain changed')
-        seen=set()
         receipts=old.get('subject_moment_refinement_receipt',{}).get('window_receipts',[])
         receipts+=old.get('fixed_actor_camera_hold_receipt',{}).get('opportunity_subject_observations',{}).get('window_receipts',[])
         for receipt in receipts:
@@ -236,8 +237,13 @@ def main():
             from crosscut2.subject_window_reuse import covered_offsets
             candidates=covered_offsets(left,right,lc,rc,list(range(-radius,radius+1)))
             if candidates:
+                original=None
+                if args.preserve_camera_candidates:
+                    original=np.array([_curve_at(*interiors[i-1],np.array([tick-1]))[0],
+                        _curve_at(*interiors[i],np.array([tick]))[0]])
                 result=search(left,right,lc,rc,candidate_frames=candidates,
-                    outgoing_cap=spec['sources'][a.source_index]['zoom_cap'],incoming_cap=spec['sources'][b.source_index]['zoom_cap'])
+                    outgoing_cap=spec['sources'][a.source_index]['zoom_cap'],incoming_cap=spec['sources'][b.source_index]['zoom_cap'],
+                    preserved_cameras=original)
             for value in [] if result is None else result['supported']:
                 alternatives.append(dict(frame=tick+value['cut_offset_frames'],observed=True,
                     left_strip=np.tile(value['outgoing_camera'],(7,1)),right_strip=np.tile(value['incoming_camera'],(7,1)),
@@ -264,7 +270,12 @@ def main():
             costs=camera_path_cost(value.values,native,spec['sources'][s]['native_cuts'],held_windows[i],fps=fps)
             candidates.append(dict(camera_family=family,camera_sha256=curve_digest(value.values),**costs))
         return None if not candidates else min(candidates,key=lambda v:v['camera_cost'])
-    selected,edge_receipts,receipt=choose(levels,arc,check=check)
+    selection_started=monotonic()
+    def selection_check():
+        check()
+        if monotonic()-selection_started>180.:
+            raise TimeoutError('one fine-moment/camera selection exceeded180seconds; no automatic retry')
+    selected,edge_receipts,receipt=choose(levels,arc,check=selection_check)
     moments=[values[k] for values,k in zip(levels,selected)];segments=[];seams=[];proof=[]
     if args.freeze_cut_moments and [v['frame'] for v in moments]!=[int(v) for v in np.r_[starts,final]]:
         raise AssertionError('explicit camera-only comparison changed authored cut instants')
@@ -299,6 +310,7 @@ def main():
         explicitly_cached_only=args.cached_only,
         explicitly_frozen_cut_moments=args.freeze_cut_moments,
         feasible_local_camera_connectors_scored=args.feasible_local_camera_connectors,
+        original_endpoint_camera_pairs_considered=args.preserve_camera_candidates,
         whole_hold_camera_family_scored=args.whole_hold_camera_family,
         whole_hold_view_cost_scored_for_every_family=True,
         selected_camera_families=[v['camera_family'] for v in edge_receipts],camera_edge_costs=edge_receipts,
