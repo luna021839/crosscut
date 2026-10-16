@@ -82,6 +82,9 @@ DYNAMIC_CROP_V3_OUTPUT_CONTRACT = (
 DYNAMIC_CROP_V3_SOURCE_CONDITIONING = (
     "shared_context_plus_shared_candidate_affine_permutation_equivariant_v3"
 )
+DYNAMIC_CROP_V3_INTERACTION_SOURCE_CONDITIONING = (
+    "shared_centered_context_times_candidate_zero_init_interaction_v3"
+)
 DYNAMIC_CROP_V3_TIME_PARAMETERIZATION = (
     "count_specific_epsilon_interior_gap_simplex_with_explicit_tail_v3"
 )
@@ -93,6 +96,8 @@ DYNAMIC_CROP_V3_LOSS_CONTRACT = (
 )
 DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION = 2
 DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION = "fixed_train_centered_affine_full_rank_v1"
+DYNAMIC_CROP_V3_INTERACTION_CHECKPOINT_FORMAT_VERSION = 3
+DYNAMIC_CROP_V3_INTERACTION_HEAD_REPRESENTATION = "fixed_train_centered_affine_plus_context_source_product_v1"
 DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME = "dynamic-crop-v3-metadata.json"
 DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME = "dynamic-crop-v3-model.safetensors"
 
@@ -193,12 +198,32 @@ class DynamicCropHeadV3Config:
         contracts = (
             (self.target_contract, DYNAMIC_CROP_V3_TARGET_CONTRACT),
             (self.output_contract, DYNAMIC_CROP_V3_OUTPUT_CONTRACT),
-            (self.source_conditioning, DYNAMIC_CROP_V3_SOURCE_CONDITIONING),
             (self.time_parameterization, DYNAMIC_CROP_V3_TIME_PARAMETERIZATION),
             (self.value_parameterization, DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION),
         )
         if any(value != required for value, required in contracts):
             raise ValueError("Dynamic Crop Head v3 contract is invalid")
+        if self.source_conditioning not in (
+            DYNAMIC_CROP_V3_SOURCE_CONDITIONING,
+            DYNAMIC_CROP_V3_INTERACTION_SOURCE_CONDITIONING,
+        ):
+            raise ValueError("Dynamic Crop Head v3 source conditioning is invalid")
+
+    @property
+    def uses_context_source_interaction(self) -> bool:
+        return self.source_conditioning == DYNAMIC_CROP_V3_INTERACTION_SOURCE_CONDITIONING
+
+    @property
+    def head_representation(self) -> str:
+        return (DYNAMIC_CROP_V3_INTERACTION_HEAD_REPRESENTATION
+                if self.uses_context_source_interaction
+                else DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION)
+
+    @property
+    def checkpoint_format_version(self) -> int:
+        return (DYNAMIC_CROP_V3_INTERACTION_CHECKPOINT_FORMAT_VERSION
+                if self.uses_context_source_interaction
+                else DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -615,6 +640,27 @@ class StageEditTransformerDynamicCropV3(_ModuleBase):
         for keyframe_index in range(DYNAMIC_CROP_V3_MAX_KEYFRAMES):
             prior[keyframe_index * 4] = _PRIOR_ZOOM_LOGIT
         self.dynamic_crop_context_head.bias = mx.array(prior)
+        if dynamic_crop_config.uses_context_source_interaction:
+            self.dynamic_crop_interaction_head = nn.Linear(dimension, outputs, bias=False)
+            self.dynamic_crop_interaction_head.weight = mx.zeros_like(
+                self.dynamic_crop_interaction_head.weight
+            )
+
+    def dynamic_crop_raw(self, hidden: Any, source_embeddings: Any) -> Any:
+        """One native-rank expression shared by public and diagnostic paths.
+
+        Candidate-local products allow source motion ordering to depend on
+        context without changing source masks or count/time/renderer meaning.
+        The opt-in head is exactly zero at initialization; legacy checkpoints
+        keep their original expression, parameter tree and format.
+        """
+        raw = (self.dynamic_crop_context_head(hidden)[..., None, :]
+               + self.dynamic_crop_source_head(source_embeddings))
+        if self.dynamic_crop_config.uses_context_source_interaction:
+            context = (hidden - self.dynamic_crop_context_head.input_center)[..., None, :]
+            source = source_embeddings - self.dynamic_crop_source_head.input_center
+            raw = raw + self.dynamic_crop_interaction_head(context * source)
+        return raw
 
     @property
     def checkpoint_contract(self) -> dict[str, Any]:
@@ -624,10 +670,10 @@ class StageEditTransformerDynamicCropV3(_ModuleBase):
             "base_model_config": self.base_config.to_dict(),
             "dynamic_crop_config": self.dynamic_crop_config.to_dict(),
             "dynamic_crop_config_fingerprint": self.dynamic_crop_config.fingerprint,
-            "source_conditioning": DYNAMIC_CROP_V3_SOURCE_CONDITIONING,
+            "source_conditioning": self.dynamic_crop_config.source_conditioning,
             "time_parameterization": DYNAMIC_CROP_V3_TIME_PARAMETERIZATION,
             "value_parameterization": DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION,
-            "affine_head_representation": DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION,
+            "affine_head_representation": self.dynamic_crop_config.head_representation,
             "legacy_v2_checkpoint_compatible": False,
             "production_activation_authorized": False,
         }
@@ -645,9 +691,7 @@ class StageEditTransformerDynamicCropV3(_ModuleBase):
             source_embeddings,
             effective_mask,
         )
-        context_raw = self.dynamic_crop_context_head(hidden)[..., None, :]
-        source_raw = self.dynamic_crop_source_head(source_embeddings)
-        raw = context_raw + source_raw
+        raw = self.dynamic_crop_raw(hidden, source_embeddings)
         values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
         count_stop = values_stop + DYNAMIC_CROP_V3_MAX_KEYFRAMES
         time_stop = count_stop + DYNAMIC_CROP_V3_TIME_LOGIT_COUNT
@@ -677,6 +721,8 @@ def stage_edit_dynamic_crop_v3_parameter_count(
     dimension = base_config.model_dimension
     outputs = DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
     dynamic_parameters = (dimension + 1) * outputs + dimension * outputs
+    if dynamic_crop_config.uses_context_source_interaction:
+        dynamic_parameters += dimension * outputs
     return stage_edit_parameter_count(base_config) + dynamic_parameters
 
 
@@ -1158,7 +1204,8 @@ def evaluate_stage_edit_dynamic_crop_v3(
         "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
         "output_contract": DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
         "loss_contract": DYNAMIC_CROP_V3_LOSS_CONTRACT,
-        "source_conditioning": DYNAMIC_CROP_V3_SOURCE_CONDITIONING,
+        "source_conditioning": model.dynamic_crop_config.source_conditioning,
+        "affine_head_representation": model.dynamic_crop_config.head_representation,
         "time_parameterization": DYNAMIC_CROP_V3_TIME_PARAMETERIZATION,
         "value_parameterization": DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION,
         "total_loss": float(np.asarray(total).item()),
@@ -1250,7 +1297,7 @@ class StageEditDynamicCropCheckpointMetadataV3:
     production_activation_authorized: bool = False
 
     def __post_init__(self) -> None:
-        if self.format_version != DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION:
+        if self.format_version != self.dynamic_crop_config.checkpoint_format_version:
             raise ValueError("unsupported Dynamic Crop v3 checkpoint format")
         if not str(self.checkpoint_id).strip():
             raise ValueError("Dynamic Crop v3 checkpoint id cannot be blank")
@@ -1267,10 +1314,10 @@ class StageEditDynamicCropCheckpointMetadataV3:
             (self.target_contract, DYNAMIC_CROP_V3_TARGET_CONTRACT),
             (self.output_contract, DYNAMIC_CROP_V3_OUTPUT_CONTRACT),
             (self.loss_contract, DYNAMIC_CROP_V3_LOSS_CONTRACT),
-            (self.source_conditioning, DYNAMIC_CROP_V3_SOURCE_CONDITIONING),
+            (self.source_conditioning, self.dynamic_crop_config.source_conditioning),
             (self.time_parameterization, DYNAMIC_CROP_V3_TIME_PARAMETERIZATION),
             (self.value_parameterization, DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION),
-            (self.affine_head_representation, DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION),
+            (self.affine_head_representation, self.dynamic_crop_config.head_representation),
         )
         if any(value != expected for value, expected in required):
             raise ValueError("Dynamic Crop v3 checkpoint contract is invalid")
@@ -1377,7 +1424,7 @@ def new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
     dynamic_crop_config: DynamicCropHeadV3Config = DynamicCropHeadV3Config(),
 ) -> StageEditDynamicCropCheckpointMetadataV3:
     return StageEditDynamicCropCheckpointMetadataV3(
-        format_version=DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION,
+        format_version=dynamic_crop_config.checkpoint_format_version,
         checkpoint_id=checkpoint_id,
         created_at=datetime.now(UTC).isoformat(),
         training_steps=training_steps,
@@ -1386,6 +1433,8 @@ def new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
         token_schema=schema,
         base_model_config=base_config,
         dynamic_crop_config=dynamic_crop_config,
+        source_conditioning=dynamic_crop_config.source_conditioning,
+        affine_head_representation=dynamic_crop_config.head_representation,
     )
 
 
@@ -1496,6 +1545,9 @@ __all__ = [
     "DYNAMIC_CROP_V3_TIME_SIMPLEX_EPSILON",
     "DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION",
     "DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION",
+    "DYNAMIC_CROP_V3_INTERACTION_SOURCE_CONDITIONING",
+    "DYNAMIC_CROP_V3_INTERACTION_HEAD_REPRESENTATION",
+    "DYNAMIC_CROP_V3_INTERACTION_CHECKPOINT_FORMAT_VERSION",
     "DynamicCropHeadV3Config",
     "DynamicCropV3LossContract",
     "StageEditDynamicCropCheckpointMetadataV3",

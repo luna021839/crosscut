@@ -18,8 +18,7 @@ def native_source_raw(model, batch, token_index, source_id):
     if not bool(mask[0,token_index,slot].item()):
         raise ValueError('requested adoption source is absent or hard-gated')
     # Do NOT turn these into 1D matrix-vector products before applying heads.
-    raw = (model.dynamic_crop_context_head(hidden)[...,None,:]
-           + model.dynamic_crop_source_head(source))[0,token_index,slot]
+    raw = model.dynamic_crop_raw(hidden,source)[0,token_index,slot]
     mx.eval(raw,hidden,source)
     if not np.isfinite(np.asarray(raw)).all():
         raise ValueError('nonfinite native raw76')

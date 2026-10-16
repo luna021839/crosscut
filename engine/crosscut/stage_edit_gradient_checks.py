@@ -31,7 +31,10 @@ def row_supervision(count,*,motion_masked=False):
 def head_row_norms(gradients):
     import mlx.core as mx
     terms=[]
-    for name in ('dynamic_crop_context_head','dynamic_crop_source_head'):
+    names=('dynamic_crop_context_head','dynamic_crop_source_head')
+    if 'dynamic_crop_interaction_head' in gradients:
+        names+=('dynamic_crop_interaction_head',)
+    for name in names:
         for value in gradients[name].values():
             squared=mx.square(value)
             terms.append(squared if value.ndim==1 else squared.sum(axis=tuple(range(1,value.ndim))))

@@ -234,6 +234,8 @@ def gradient_evidence(gradients, *, adapter=False):
         selected = {}
         names = ("context_adapter", "source_adapter") if adapter else (
             "dynamic_crop_context_head", "dynamic_crop_source_head")
+        if not adapter and "dynamic_crop_interaction_head" in gradients:
+            names += ("dynamic_crop_interaction_head",)
         for key in names:
             for leaf, values in gradients[key].items():
                 selected[f"{key}.{leaf}"] = values[start:stop]
@@ -244,7 +246,7 @@ def gradient_evidence(gradients, *, adapter=False):
     return groups
 
 
-def run_diagnostic(fixture, out, *, budget):
+def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False):
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -342,6 +344,8 @@ def run_diagnostic(fixture, out, *, budget):
         evidence = gradient_evidence(gradients, adapter=adapter)
         keys = ("context_adapter","source_adapter") if adapter else (
             "dynamic_crop_context_head","dynamic_crop_source_head")
+        if not adapter and trained.dynamic_crop_config.uses_context_source_interaction:
+            keys += ("dynamic_crop_interaction_head",)
         before = {key:dict(getattr(trained,key).parameters()) for key in keys}
         before_base=None if adapter else {name:tree_map(lambda value:value,trained.base.parameters()[name])
             for name in ('encoder','source_projection')}
@@ -497,7 +501,7 @@ def run_diagnostic(fixture, out, *, budget):
         grad_fn=nn.value_and_grad(model,lambda m,b,s,d: h3.stage_edit_dynamic_crop_v3_loss(m,b,s,d,crop_contract)[0])
         release_probes=[dict(batch=prefix_batch(t),token_index=t.token_index,source_id=t.source_id) for t in tracks]
         reset_count=0
-        for step in range(1,33):
+        for step in range(1,5 if interaction_release_ab else 33):
             budget.check()
             if step==5:
                 if int(optimizer.state["step"].item())!=4:
@@ -582,6 +586,70 @@ def run_diagnostic(fixture, out, *, budget):
                     np.testing.assert_array_equal(raw_before,np.asarray(raw_at(sentinel_batch,tracks[-1])[0]))
                     report["retention"] = dict(feature_sha256=feature_hash,head_sha256=head_hash,
                         output_bit_identical=True,restore_steps=4)
+        if interaction_release_ab:
+            from mlx.utils import tree_map
+            # Actual prior diagnostics now show first-update failure. Check
+            # that prerequisite before spending the proposed 14+14 updates.
+            # Both branches share all 52 updates, exact starting weights/RNG,
+            # original losses, first released sample and unchanged stop gates.
+            if len(report['steps']) != 52:
+                raise AssertionError('interaction A/B requires exactly 52 common updates')
+            model.eval()
+            common = tree_map(lambda value:value,model.parameters())
+            common_rng = [mx.array(np.array(key,copy=True)) for key in mx.random.state]
+            expected = [np.array(raw_at(p['batch'],t)[0],copy=True)
+                for p,t in zip(release_probes,tracks,strict=True)]
+            branches=[]
+            for interaction in (False,True):
+                if interaction:
+                    del model,optimizer,grad_fn,gradients
+                    gc.collect();mx.clear_cache()
+                    cfg=h3.DynamicCropHeadV3Config(source_conditioning=h3.DYNAMIC_CROP_V3_INTERACTION_SOURCE_CONDITIONING)
+                    model=h3.StageEditTransformerDynamicCropV3(config,cfg)
+                    production._enable_dynamic_crop_v3_activation_checkpointing(model)
+                    model.update(common)
+                    production._assign_dynamic_crop_v3_prior_head_snapshot(model,dict(
+                        head,interaction_weight=mx.zeros_like(model.dynamic_crop_interaction_head.weight)))
+                model.eval();mx.random.state=common_rng
+                probes=[dict(p,expected_raw=r,duration_seconds=v3.sequence_for(t.sequence_id).targets[t.token_index].shot_duration_seconds)
+                    for p,t,r in zip(release_probes,tracks,expected,strict=True)]
+                adoption=verify_public_outputs(model,probes,check=budget.check)
+                if not adoption['passed']:
+                    raise AssertionError('A/B zero-init shared public starting point differs')
+                initial=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                optimizer=optim.AdamW(learning_rate=production._offset_learning_rate_schedule(schedule,4),weight_decay=.01)
+                transaction=snapshot_transaction(model,optimizer)
+                # Original first released update is deterministic eval mode;
+                # dropout is not silently made a second changed variable.
+                track=tracks[4%len(tracks)];batch=prefix_batch(track);base,dynamic=target_supervision(track,batch)
+                grad_fn=nn.value_and_grad(model,lambda m,b,s,d:h3.stage_edit_dynamic_crop_v3_loss(m,b,s,d,crop_contract)[0])
+                loss,gradients=grad_fn(model,batch,base,dynamic)
+                update(loss,gradients,optimizer,model,'released_joint',1)
+                after=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                drift=compare_drift(initial,after)
+                name='context_source_product' if interaction else 'legacy_affine'
+                report['steps'][-1]['ab_branch']=name
+                restore_transaction(model,optimizer,transaction)
+                restored=capture_sources(model,release_probes,projections,normalizer,check=budget.check)
+                rollback=compare_drift(initial,restored)
+                if any(row['raw76_step_drift']!=0 for row in rollback['tracks']):
+                    raise AssertionError('A/B diagnostic did not restore exact source outputs')
+                branches.append(dict(name=name,source_conditioning=model.dynamic_crop_config.source_conditioning,
+                    parameter_count=h3.stage_edit_dynamic_crop_v3_parameter_count(config,model.dynamic_crop_config),
+                    zero_init_public_parity=adoption,first_update_drift=drift,
+                    exact_parameter_optimizer_rng_rollback=True,restored_serving_raw76_bit_identical=True,
+                    first_update_passed_existing_gate=drift['passed'],candidate_adopted=False))
+                del transaction,initial,after,restored
+            report.update(status='interaction_release_ab_complete_not_qualified',
+                optimizer_update_count=len(report['steps']),interaction_release_ab=dict(
+                    common_updates=52,branch_updates=1,max_total_updates=54,branches=branches,
+                    original_14_plus_14_fit_completed=False,production_activation_authorized=False),resources=budget.check())
+            if len(report['steps'])!=54:
+                raise AssertionError('interaction release A/B exceeded its declared 54 updates')
+            write_report()
+            print(json.dumps(dict(status=report['status'],updates=len(report['steps']),
+                branches=[dict(name=b['name'],passed=b['first_update_passed_existing_gate']) for b in branches])),flush=True)
+            return
         report["release"] = dict(reset_count=reset_count, schedule_offset_steps=4,
             final_optimizer_step=int(optimizer.state["step"].item()),
             features_changed=feature_hash != production._parameter_tree_sha256(
@@ -692,7 +760,7 @@ def run_diagnostic(fixture, out, *, budget):
         raise
 
 
-def execute_diagnostic(out, *, prepare_only=False):
+def execute_diagnostic(out, *, prepare_only=False, interaction_release_ab=False):
     """One process-age budget/watchdog around preparation AND execution."""
     budget = DiagnosticBudget(out)
     watcher = threading.Thread(target=budget.watch, daemon=True)
@@ -711,7 +779,10 @@ def execute_diagnostic(out, *, prepare_only=False):
         (out / "preparation-report.json").write_text(json.dumps(preparation,indent=2))
         print(json.dumps(preparation), flush=True)
         if not prepare_only:
-            run_diagnostic(fixture,out,budget=budget)
+            if interaction_release_ab:
+                run_diagnostic(fixture,out,budget=budget,interaction_release_ab=True)
+            else:
+                run_diagnostic(fixture,out,budget=budget)
     except Exception as exc:
         try:
             binding_digest=hashlib.sha256(HISTORICAL_BINDING.read_bytes()).hexdigest()
@@ -732,6 +803,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--interaction-release-ab", action="store_true",
+        help="54-update train-only first-release prerequisite A/B; never qualifies or activates a model")
     args = parser.parse_args()
     root = Path("/Volumes/CrossCutMedia/CrossCut-Training/diagnostics")
     if not args.out.is_absolute() or not args.out.resolve().is_relative_to(root):
@@ -739,7 +812,7 @@ def main():
     if root.parent.stat().st_dev != args.device:
         parser.error("authorized SSD device does not match")
     args.out.mkdir(parents=True, exist_ok=False)
-    execute_diagnostic(args.out,prepare_only=args.prepare_only)
+    execute_diagnostic(args.out,prepare_only=args.prepare_only,interaction_release_ab=args.interaction_release_ab)
 
 
 if __name__ == "__main__":

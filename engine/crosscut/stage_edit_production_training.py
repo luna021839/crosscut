@@ -2609,6 +2609,13 @@ def _assign_dynamic_crop_v3_prior_head_snapshot(
         "context_center": model.dynamic_crop_context_head.input_center.shape,
         "source_center": model.dynamic_crop_source_head.input_center.shape,
     }
+    interaction = model.dynamic_crop_config.uses_context_source_interaction
+    if interaction:
+        if "interaction_weight" not in snapshot:
+            raise ValueError("Dynamic Crop v3 interaction snapshot weight is missing")
+        shapes["interaction_weight"] = model.dynamic_crop_interaction_head.weight.shape
+    elif "interaction_weight" in snapshot:
+        raise ValueError("Dynamic Crop v3 interaction snapshot cannot be assigned to an affine model")
     prepared = {}
     for name, shape in shapes.items():
         value = np.array(snapshot[name], dtype=np.float32, copy=True)
@@ -2621,6 +2628,8 @@ def _assign_dynamic_crop_v3_prior_head_snapshot(
     model.dynamic_crop_context_head.weight = prepared["context_weight"]
     model.dynamic_crop_context_head.bias = prepared["context_bias"]
     model.dynamic_crop_source_head.weight = prepared["source_weight"]
+    if interaction:
+        model.dynamic_crop_interaction_head.weight = prepared["interaction_weight"]
     mx.eval(
         model.dynamic_crop_context_head.weight,
         model.dynamic_crop_context_head.bias,
@@ -2756,6 +2765,15 @@ def _dynamic_crop_v3_prior_parameter_digests(
     bias = model.dynamic_crop_context_head.bias
     context_weight = model.dynamic_crop_context_head.weight
     source_weight = model.dynamic_crop_source_head.weight
+    head_snapshot = {
+        "context_weight": context_weight,
+        "context_bias": bias,
+        "source_weight": source_weight,
+        "context_center": model.dynamic_crop_context_head.input_center,
+        "source_center": model.dynamic_crop_source_head.input_center,
+    }
+    if model.dynamic_crop_config.uses_context_source_interaction:
+        head_snapshot["interaction_weight"] = model.dynamic_crop_interaction_head.weight
     return {
         "base_parameter_tree_sha256": _parameter_tree_sha256(
             model.base.parameters()
@@ -2767,13 +2785,7 @@ def _dynamic_crop_v3_prior_parameter_digests(
             model.dynamic_crop_source_head.parameters()
         ),
         "dynamic_head_parameter_tree_sha256": _parameter_tree_sha256(
-            {
-                "context_weight": model.dynamic_crop_context_head.weight,
-                "context_bias": model.dynamic_crop_context_head.bias,
-                "source_weight": model.dynamic_crop_source_head.weight,
-                "context_center": model.dynamic_crop_context_head.input_center,
-                "source_center": model.dynamic_crop_source_head.input_center,
-            }
+            head_snapshot
         ),
         "context_center_sha256": _parameter_tree_sha256(
             {"center": model.dynamic_crop_context_head.input_center}
