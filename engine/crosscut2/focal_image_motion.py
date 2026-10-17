@@ -33,7 +33,8 @@ def describe(observation, *, fps):
     if not np.isfinite(fps) or fps <= 0:
         raise ValueError('A positive actual output clock is required')
     result = dict(velocity=np.zeros((13, 3)), known=np.zeros(13, bool),
-                  digital_velocity=np.zeros(3), digital_known=False, height=0., fps=float(fps))
+                  digital_velocity=np.zeros(3), digital_known=False, height=0., fps=float(fps),
+                  native_static_camera=False)
     context = observation.get('dense_subject_context')
     if context is None:
         return result
@@ -51,6 +52,7 @@ def describe(observation, *, fps):
         raise ValueError('Actual14heads and seven played view transforms required')
     endpoint = 6 if side == 0 else 7
     boundary = strips[-1 if side == 0 else 0]
+    result['native_static_camera'] = np.array_equal(strips, np.tile([1., .5, .5], (7, 1)))
     known = ((heads[:, 2] > .019) & (heads[:, 3] >= .75)
              & window.associated[at] & np.asarray(context['same_shot'], bool))
     # A native association hole inside two output samples also breaks a step.
@@ -74,6 +76,48 @@ def describe(observation, *, fps):
     return result
 
 
+def _aggregate(gap, known, scale, fps):
+    known = known & ((TICKS[:-1] >= -4) & (TICKS[1:] <= 3))
+    tau = 6. / fps
+    xy = tau * np.linalg.norm(gap[..., :2], axis=-1) / scale[..., None]
+    zoom = tau * np.abs(gap[..., 2]) / np.log(1.5)
+    raw = np.maximum(xy, zoom)
+    bounded = raw / (1. + raw)
+    count = known.sum(-1)
+    return np.where(count > 0, (bounded * known).sum(-1) / np.maximum(1, count), .5), count > 0, count
+
+
+def static_camera_pairs(left, right, left_indices, right_indices, left_zooms, right_zooms):
+    """Vectorized proposal hypothesis, NOT an actual interval camera replay.
+
+    Inputs describe identity native views. A constant proposed crop scales
+    native image translation and face height, but not logarithmic size rate.
+    Its translation adds no velocity. Missing source association stays missing.
+    Final DP costs must still use the actual played terminal view rates.
+    """
+    if not left or not right or any(x['fps'] != left[0]['fps'] for x in (*left, *right)):
+        raise ValueError('Two nonempty native focal domains on one clock required')
+    if any(x['digital_known'] and not x['native_static_camera'] for x in (*left, *right)):
+        raise ValueError('Proposal rates require identity native static descriptions')
+    a, b = np.asarray(left_indices), np.asarray(right_indices)
+    za, zb = np.asarray(left_zooms, float), np.asarray(right_zooms, float)
+    if (a.ndim != 1 or a.dtype.kind not in 'iu' or b.dtype.kind not in 'iu'
+            or not a.shape == b.shape == za.shape == zb.shape
+            or np.any((a < 0) | (a >= len(left))) or np.any((b < 0) | (b >= len(right)))
+            or not np.isfinite(za).all() or not np.isfinite(zb).all() or np.any(za < 1.) or np.any(zb < 1.)):
+        raise ValueError('Actual paired native indices and finite crop zooms required')
+    va = np.asarray([x['velocity'] for x in left])[a].copy()
+    vb = np.asarray([x['velocity'] for x in right])[b].copy()
+    va[..., :2] *= za[:, None, None]
+    vb[..., :2] *= zb[:, None, None]
+    known = np.asarray([x['known'] for x in left])[a] & np.asarray([x['known'] for x in right])[b]
+    known &= np.asarray([x['digital_known'] for x in left])[a, None]
+    known &= np.asarray([x['digital_known'] for x in right])[b, None]
+    scale = np.maximum(.02, (np.asarray([x['height'] for x in left])[a] * za
+                            + np.asarray([x['height'] for x in right])[b] * zb) / 2.)
+    return _aggregate(va - vb, known, scale, left[0]['fps'])
+
+
 def matrix(left, right):
     """Bounded time-mean mismatch of composed local image motion hypotheses.
 
@@ -89,16 +133,8 @@ def matrix(left, right):
              & np.asarray([x['known'] for x in right])[None])
     # Use the same local -4..+3 scope as articulated source motion. Do not
     # turn distant native pans into evidence about the exposed seam.
-    known &= ((TICKS[:-1] >= -4) & (TICKS[1:] <= 3))[None, None]
     known &= np.asarray([x['digital_known'] for x in left])[:, None, None]
     known &= np.asarray([x['digital_known'] for x in right])[None, :, None]
     scale = np.maximum(.02, (np.asarray([x['height'] for x in left])[:, None]
                             + np.asarray([x['height'] for x in right])[None]) / 2)
-    gap = va[:, None] - vb[None]
-    tau = 6. / left[0]['fps']
-    xy = tau * np.linalg.norm(gap[..., :2], axis=-1) / scale[..., None]
-    zoom = tau * np.abs(gap[..., 2]) / np.log(1.5)
-    raw = np.maximum(xy, zoom)
-    bounded = raw / (1. + raw)
-    count = known.sum(-1)
-    return np.where(count > 0, (bounded * known).sum(-1) / np.maximum(1, count), .5), count > 0, count
+    return _aggregate(va[:, None] - vb[None], known, scale, left[0]['fps'])

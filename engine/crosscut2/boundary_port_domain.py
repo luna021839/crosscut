@@ -20,7 +20,7 @@ class BoundaryPort:
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
-         retain_pair_cameras=False):
+         retain_pair_cameras=False,focal_motion=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
@@ -33,7 +33,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     # fixed-work budget: each primary actor pair has <=3 common-size views
     # and one original-view option. Keep all old ports, then let interval
     # costs compare these physical endpoints rather than a local proxy.
-    port_limit=old_port_limit+3*maximum_pairs*bool(retain_pair_cameras)
+    motion_pair_limit=2 if focal_motion and maximum_pairs else 0
+    port_limit=old_port_limit+3*maximum_pairs*bool(retain_pair_cameras)+(1+3*bool(retain_pair_cameras))*motion_pair_limit
+    motion_additions=[];motion_options_measured=0
     camera_variants=0
     extra_count=0;pair_capacities=[];natural_added=0;original_retained=0
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
@@ -79,7 +81,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         capacity=min(old_port_limit-len(incoming),old_port_limit-len(outgoing))
         if not maximum_pairs:capacity=0
         pair_capacities.append((capacity if recycle_static_capacity else maximum_pairs)
-            +3*maximum_pairs*bool(retain_pair_cameras))
+            +3*maximum_pairs*bool(retain_pair_cameras)+(1+3*bool(retain_pair_cameras))*motion_pair_limit)
         if 0<n<N-1:
             # Retrieve a physical actor pair BEFORE proposing its cameras.
             # Looking at only the native largest face loses a valid same-
@@ -105,7 +107,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             if not native_left or not native_right:
                 entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(0)
                 continue
-            native_pair=matrix(features(native_left,fps=fps),features(native_right,fps=fps),details=True)
+            left_features=features(native_left,fps=fps,focal_motion=focal_motion)
+            right_features=features(native_right,fps=fps,focal_motion=focal_motion)
+            native_pair=matrix(left_features,right_features,details=True)
             if articulated_actions:
                 from .played_interval_utility import articulated_seam_evidence
                 native_pair=articulated_seam_evidence(native_pair,native_left,native_right)
@@ -200,6 +204,31 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     if key in retained or not feasible(option):continue
                     retained.add(key);proposals.append(option)
                 extra_count+=len(proposals)-before
+            if motion_pair_limit:
+                from .focal_image_motion import static_camera_pairs,relative_cost
+                # Preserve every old physical proposal. Recover at most two
+                # additional actor pairs using source motion BEFORE pruning;
+                # the full interval DP still scores their real played views.
+                # UNKNOWN cannot expand or change the old candidate domain.
+                options=[o for values in candidates.values() for o in values]
+                left_lookup={(s,int(o['head_index'])):i for i,(s,o) in enumerate(zip(left_sources,native_left))}
+                right_lookup={(s,int(o['head_index'])):i for i,(s,o) in enumerate(zip(right_sources,native_right))}
+                if options:
+                    risks,known,_=static_camera_pairs(left_features['focal_image_motion'],right_features['focal_image_motion'],
+                        np.array([left_lookup[o[1],o[3]] for o in options],int),
+                        np.array([right_lookup[o[2],o[4]] for o in options],int),
+                        np.array([o[6][0] for o in options]),np.array([o[7][0] for o in options]))
+                    motion_options_measured+=int(known.sum())
+                    ranked=sorted(((float(o[0]+relative_cost(risk)),o,float(risk))
+                        for o,risk,measured in zip(options,risks,known) if measured),key=lambda x:(x[0],x[1][:6]))
+                    actors={o[1:5] for o in proposals};new=[]
+                    for score,option,risk in ranked:
+                        if len(new)>=motion_pair_limit:break
+                        if option[1:5] in actors or not feasible(option):continue
+                        actors.add(option[1:5]);proposals.append(option);new.append(option)
+                        motion_additions.append(dict(node=n,frame=int(tick),actor_pair=list(option[1:5]),
+                            base_rank=option[0],proposal_motion_rate=risk,motion_rank=score))
+                    primary=primary+tuple(new)
             if retain_pair_cameras:
                 retained={physical(option) for option in proposals}
                 actors={(a,b,ha,hb) for _,a,b,ha,hb,*_ in primary}
@@ -237,7 +266,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         all_baseline_interior_camera_families_retained=True,
         primary_actor_pair_camera_variants_retained=bool(retain_pair_cameras),
         additional_primary_pair_camera_options=camera_variants,
-        previous_work_bound_unchanged=not bool(retain_pair_cameras),
+        previous_work_bound_unchanged=not bool(retain_pair_cameras or motion_pair_limit),
         primary_pair_camera_options_per_actor_pair_upper_bound=4,
+        source_motion_used_before_pair_pruning=bool(focal_motion),
+        additional_motion_actor_pair_limit_per_node=motion_pair_limit,
+        motion_proposal_camera_is_static_hypothesis_not_final_played_path=True,
+        measured_motion_camera_options_compared=motion_options_measured,
+        additional_motion_actor_pairs=motion_additions,
+        unknown_motion_does_not_expand_candidate_domain=True,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

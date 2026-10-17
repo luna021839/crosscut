@@ -184,6 +184,16 @@ class PlayedPosePortPrior:
                 focal_image_motion_unknown=.5,native_focal_motion_unmeasured_not_exempt=True,
                 focal_image_motion_changes_admission=False,
                 terminal_digital_rate_continuation_is_a_local_hypothesis=True,
+                source_motion_used_before_pair_pruning=True,
+                additional_motion_actor_pair_limit_per_node=2,
+                primary_actor_pair_limit_per_node=10,
+                paired_proposal_global_limit_per_node=None,
+                baseline_paired_limit_per_node=8,
+                candidate_motion_preserves_every_old_physical_proposal=True,
+                candidate_motion_is_static_view_hypothesis_not_final_camera_cost=True,
+                global_port_limit_per_side=('four_per_source_plus_forty_explicit_expansion' if self.retain_pair_cameras
+                    else 'four_per_source_plus_ten_explicit_expansion'),
+                same_total_port_bound=False,
                 all_unmeasured_focal_motion_leaves_existing_objective_unchanged=True,
                 authored_cost='existing_played_pair_cost+six_frame_seconds*(composed_focal_image_motion_risk-.5)',
                 native_cost='existing_retained_native_cost+six_frame_seconds*(unmeasured_focal_image_motion_.5-.5)')
@@ -292,7 +302,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
         coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
-        source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False))
+        source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -303,7 +313,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
             coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
-            source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False))
+            source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
