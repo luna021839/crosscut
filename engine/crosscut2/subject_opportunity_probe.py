@@ -43,9 +43,21 @@ def candidates(catalogues,opportunities,*,maximum=12,include_observed=False,expl
     return [key for _,key in chosen[:maximum]]
 
 
+def observation_limits(maximum_centres,maximum_seconds):
+    """One explicit whole-programme allowance, never per-cut retry budgets."""
+    if (type(maximum_centres) is not int or not 0<=maximum_centres<=64
+            or isinstance(maximum_seconds,(bool,np.bool_)) or not np.isscalar(maximum_seconds)
+            or not np.isfinite(maximum_seconds) or not 0<maximum_seconds<=900):
+        raise ValueError('Explicit bounded opportunity observation centres/time required')
+    return dict(face_limit=max(768,64*maximum_centres),pose_limit=max(512,32*maximum_centres),
+        raster_limit=max(2048,128*maximum_centres),recognition_limit=max(4096,256*maximum_centres),
+        seconds=float(maximum_seconds))
+
+
 def observer(specification,*,sources,source_hashes,identities,cache,authorized_root,device,image_changes=False,
-             explore_missing_action=False):
+             explore_missing_action=False,maximum_centres=12,maximum_seconds=180.):
     """Explicit local model/media spec; sessions stay lazy until a cache miss."""
+    limits=observation_limits(maximum_centres,maximum_seconds)
     spec=json.loads(Path(specification).read_text());root=Path(authorized_root).resolve(strict=True);cache=Path(cache)
     if [str(p) for p in sources]!=[v['path'] for v in spec['sources']]:raise ValueError('probe source specification differs')
     if not cache.resolve().is_relative_to(root):raise ValueError('subject cache outside authorized SSD project')
@@ -66,8 +78,8 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             check()
             if not Path('/Volumes/CrossCutMedia').is_mount() or root.stat().st_dev!=device:raise OSError('authorized SSD changed')
             if any(file_identity(p)!=v for p,v in zip(sources,identities)):raise OSError('probe source changed')
-        budget=bank.ProbeBudget(face_limit=768,recognition_limit=4096,pose_limit=512,raster_limit=2048,seconds=180.,check=live)
-        selected=candidates(catalogues,opportunities,include_observed=image_changes,
+        budget=bank.ProbeBudget(**limits,check=live)
+        selected=candidates(catalogues,opportunities,maximum=maximum_centres,include_observed=image_changes,
             explore_missing_action=explore_missing_action)
         receipts=[];decodes=[];new=[[] for _ in sources];windows=0
         cache.mkdir(parents=True,exist_ok=True);cv2.setNumThreads(2)
@@ -87,7 +99,7 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                     if window.track!=expected or not np.array_equal(window.ordinals,wanted):raise ValueError('cached probe seed/clock changed')
                 else:
                     reused=False
-                    if windows>=24 or any(budget.used[k]+count>getattr(budget,k+'_limit') for k,count in
+                    if windows>=2*maximum_centres or any(budget.used[k]+count>getattr(budget,k+'_limit') for k,count in
                             (('face',len(wanted)),('pose',len(np.unique(requested))),('raster',len(wanted)),('recognition',8*len(wanted)))):
                         receipts.append(dict(source=s,status='OBSERVATION_DEFERRED',reason='shared_allowance'));continue
                     try:
@@ -103,7 +115,8 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                             raise ValueError('actual native source clock differs from probe specification')
                         budget.reserve('raster',len(wanted));budget.arrays((2*len(wanted)+8)*960*540*3)
                         decode={};pixels=dict(sparse.frames(sources[s],wanted.tolist(),clock=native_clocks[s],check=budget.live,
-                            receipt=decode,maximum_seconds=min(30.,max(1.,budget.seconds-(monotonic()-budget.started)))))
+                            receipt=decode,maximum_decode_seconds=12.,
+                            maximum_seconds=min(30.,max(1.,budget.seconds-(monotonic()-budget.started)))))
                         decodes.append(dict(source=s,**decode));heads=[];vectors=[]
                         for native in wanted:
                             key=(s,int(native))
@@ -153,7 +166,7 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                             native_cuts=spec['sources'][s]['native_cuts'],cache=cache/'observed-image-pairs',
                             budget=budget,check=live)
                     except TimeoutError:
-                        measured=[];proof=dict(status='OBSERVATION_DEFERRED',reason='same_shared180second_allowance')
+                        measured=[];proof=dict(status='OBSERVATION_DEFERRED',reason='same_shared_observation_allowance')
                     for pair,item in zip(pairs,measured):
                         if item['binding']['native']!=list(pair):raise ValueError('image pair producer changed request order')
                         for tick in pairs[pair]:
@@ -163,6 +176,7 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                         states=[r['observation']['state'] for r in rows],measurement=proof))
                 catalogues[s].observed_image_records=tuple(rows)
         return dict(contract='bounded_preselection_fixed_opportunity_subject_probe_v1',centres=len(selected),new_windows=windows,
+            maximum_centres=maximum_centres,maximum_new_windows=2*maximum_centres,maximum_seconds=maximum_seconds,
             used=budget.used,window_receipts=receipts,decode_receipts=decodes,elapsed_seconds=monotonic()-started,
             neural_model_sessions_initialized=sessions[0] is not None,source_NN_calls=sum(budget.used[k] for k in ('face','pose','recognition')),
             selected_movie_or_reference_timestamps_used=False,old_observations_rewritten=False,

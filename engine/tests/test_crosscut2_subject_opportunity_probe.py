@@ -1,6 +1,28 @@
 from types import SimpleNamespace
 import numpy as np
-from crosscut2.subject_opportunity_probe import candidates
+from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer
+
+
+def test_one_explicit_full_programme_allowance_can_cover_more_than_twelve_moments():
+    old=observation_limits(12,180.)
+    assert old==dict(face_limit=768,pose_limit=512,raster_limit=2048,recognition_limit=4096,seconds=180.)
+    whole=observation_limits(64,600.)
+    assert whole==dict(face_limit=4096,pose_limit=2048,raster_limit=8192,recognition_limit=16384,seconds=600.)
+    # More measured opportunities never require more final cuts or sources.
+    cats=[SimpleNamespace(subjects=SimpleNamespace(sample=lambda *a:None)) for _ in range(2)]
+    requests={(n,0,1,0,0):.5 for n in range(1,71)}
+    events=SimpleNamespace(bindings={},missing_action_requests=requests,episodes=np.arange(72),nodes=np.arange(72)*30)
+    selected=candidates(cats,events,maximum=64,explore_missing_action=True)
+    assert len(selected)==64 and min(k[0] for k in selected)==1 and max(k[0] for k in selected)>=69
+    assert not events.bindings
+
+
+def test_unbounded_observation_request_fails_before_reading_a_model_or_source():
+    import pytest
+    for centres,seconds in ((True,180.),(-1,180.),(65,180.),(12,True),(12,0.),(12,np.inf),(12,901.)):
+        with pytest.raises(ValueError,match='bounded opportunity'):
+            observer('not-opened',sources=[],source_hashes=[],identities=[],cache='not-opened',
+                authorized_root='not-opened',device=0,maximum_centres=centres,maximum_seconds=seconds)
 
 
 def test_preselection_probe_ranks_fixed_raw_opportunities_not_selected_movie_cuts():
@@ -50,6 +72,17 @@ def test_exploration_cannot_silently_launch_a_subject_model_from_another_cli_pat
     monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
         '--output','unused','--models','unused','--explore-missing-action'])
     with pytest.raises(ValueError,match='explicit bounded subject opportunity probe'):main()
+
+
+def test_expanded_cli_allowance_requires_an_explicit_observation_spec(monkeypatch):
+    import pytest
+    from crosscut2.stage_mix import main
+    base=['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused']
+    for option,value in (('--opportunity-observation-centres','64'),
+            ('--maximum-opportunity-perception-seconds','600')):
+        monkeypatch.setattr('sys.argv',[*base,option,value])
+        with pytest.raises(ValueError,match='explicit bounded subject opportunity probe'):main()
 
 
 def test_opportunity_observer_finishes_before_final_domain_and_actual_costs(monkeypatch):

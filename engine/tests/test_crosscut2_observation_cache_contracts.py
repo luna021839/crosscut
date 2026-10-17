@@ -15,6 +15,14 @@ def test_unchanged_part_algorithm_keeps_raw_source_snapshots_and_consumer_agrees
     assert 'part_support_bank.cache_implementation()' in inspect.getsource(part_hypotheses.retain_model_hypotheses)
 
 
+def test_qualified_optional_preroll_keeps_default_and_unqualified_changes_do_not_reuse(monkeypatch):
+    assert inspect.signature(sparse.frames).parameters['maximum_decode_seconds'].default==8.
+    semantic,reader=parts.cache_contract_components()
+    assert reader=='ea11c1e1a0252df528c4e44aeb7091d533c60bfce0dc98fe26336573c9256556'
+    monkeypatch.setattr(parts,'cache_contract_components',lambda:(semantic,'unqualified-reader'))
+    assert parts.cache_implementation()!='447432eab91d837e40edf01d482a3ef7302c210e24efa59a189266c55aba4abb'
+
+
 def test_actual_algorithm_source_change_does_not_receive_historical_key(monkeypatch):
     def changed(path,name):
         source=function_text(path,name)

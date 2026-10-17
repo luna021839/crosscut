@@ -348,6 +348,10 @@ def main():
         help='Explicit local source/model JSON for bounded raw observations BEFORE E4 final selection')
     parser.add_argument('--explore-missing-action',action='store_true',
         help='Spend the same bounded preselection probe allowance on unmeasured face-supported action candidates')
+    parser.add_argument('--opportunity-observation-centres',type=int,default=12,
+        help='Explicit whole-programme observation allowance0..64; not a final cut quota')
+    parser.add_argument('--maximum-opportunity-perception-seconds',type=float,default=180.,
+        help='One shared opportunity observation deadline, at most900s; requires explicit source/model spec')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
         help='Experimental comparison clock; paired_clock does not penalize natural one-frame motion')
     parser.add_argument('--native-camera-ports',action='store_true',
@@ -364,6 +368,11 @@ def main():
     parser.add_argument('--preview-height', type=int, choices=(540, 1080), default=540)
     parser.add_argument('--maximum-perception-seconds', type=float, default=900.)
     args = parser.parse_args()
+    from .subject_opportunity_probe import observation_limits
+    observation_limits(args.opportunity_observation_centres,args.maximum_opportunity_perception_seconds)
+    if ((args.opportunity_observation_centres!=12 or args.maximum_opportunity_perception_seconds!=180.)
+            and args.opportunity_subject_spec is None):
+        raise ValueError('Changed opportunity observation allowance requires an explicit bounded subject opportunity probe')
     if (not 0<=args.face_endpoint_record_limit<=8192
             or (args.face_endpoint_record_limit!=128 and args.face_endpoint_observations is None)):
         raise ValueError('A changed face-record allowance requires explicit face endpoint observations')
@@ -650,11 +659,15 @@ def main():
                     identities=[file_identity(p) for p in original.sources],
                     cache=args.cache.parent/'crosscut2-subject-opportunities-v1',
                     authorized_root=args.cache.parent.parent,device=expected,image_changes=args.played_interval_utility,
-                    explore_missing_action=args.explore_missing_action)
+                    explore_missing_action=args.explore_missing_action,
+                    maximum_centres=args.opportunity_observation_centres,
+                    maximum_seconds=args.maximum_opportunity_perception_seconds)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
                 maximum_seconds=300. if args.retain_pair_cameras else 180.,
+                maximum_preparation_seconds=240.+(args.maximum_opportunity_perception_seconds
+                    if args.opportunity_subject_spec is not None else 0.),
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
                 person_observer=person_observer,subjects=subjects,opportunity_observer=opportunity_observer,
                 sequence_preference_model=sequence_preference_model,

@@ -74,8 +74,13 @@ def cache_implementation():
     semantic,reader=cache_contract_components()
     # Qualified strict-queue wiring changes no interval observations. Legacy
     # values still have UNKNOWN decoder provenance; this is not certification.
+    # The optional preroll argument leaves this consumer's default8s plan
+    # and exact native rasters unchanged. Both qualified implementations
+    # pass the real sparse-vs-sequential pixel comparison. Do not qualify
+    # arbitrary future readers or upgrade legacy decoder provenance.
     if (semantic=='0297fec95b6f11d0e90dcad856d9ed967e8dd5efcaf03fa870711ece927bc319'
-            and reader=='fb8962b51a5516b567df5a9474036f46a7094a2cfc0919bf2c9356b59833c0d3'):
+            and reader in ('fb8962b51a5516b567df5a9474036f46a7094a2cfc0919bf2c9356b59833c0d3',
+                'ea11c1e1a0252df528c4e44aeb7091d533c60bfce0dc98fe26336573c9256556')):
         return '447432eab91d837e40edf01d482a3ef7302c210e24efa59a189266c55aba4abb'
     return hashlib.sha256((semantic+reader).encode()).hexdigest()
 
