@@ -79,9 +79,10 @@ def event_energy(detail,window_seconds,*,fps,point_geometry):
     boundaries. Only the window-dependent body evidence uses clipped support.
     Legacy experiments explicitly retain their previous integration.
     """
+    focal=detail.get('focal_image_motion_rate',0.)
     if not point_geometry:
-        return window_seconds*(detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate'])
-    return 6./fps*(detail['geometry_rate']+detail['appearance_rate'])+window_seconds*detail['pose_rate']
+        return window_seconds*(detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']+focal)
+    return 6./fps*(detail['geometry_rate']+detail['appearance_rate']+focal)+window_seconds*detail['pose_rate']
 
 
 def ordinary_pairs(left,right):

@@ -334,6 +334,8 @@ def main():
         help='Explicit TRAIN-only soft visible-shot duration distribution; requires E6, not app/default activation')
     parser.add_argument('--retain-pair-cameras',action='store_true',
         help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair; allow300s interval selection')
+    parser.add_argument('--focal-image-motion',action='store_true',
+        help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
     parser.add_argument('--recycle-static-camera-capacity',action='store_true',
         help='Use redundant static port slots for distinct paired crops without enlarging the total E6 port bound')
     parser.add_argument('--opportunity-subject-spec',type=Path,
@@ -414,6 +416,8 @@ def main():
         raise ValueError('visible-shot pacing requires the actual E6 interval consumer')
     if args.retain_pair_cameras and not args.played_interval_utility:
         raise ValueError('paired camera options require actual played interval utility')
+    if args.focal_image_motion and not args.played_interval_utility:
+        raise ValueError('focal image motion requires actual played interval utility')
     if args.recycle_static_camera_capacity and not args.played_interval_utility:
         raise ValueError('recovered static capacity requires the actual E6 interval consumer')
     if args.experimental_sequence_preference_model is not None and (
@@ -459,7 +463,8 @@ def main():
             editorial_opportunities=args.editorial_opportunity_exposure,
             played_interval_utility=args.played_interval_utility,shot_duration_model=duration_model,
             recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
-            matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras)
+            matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
+            focal_motion=args.focal_image_motion)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():

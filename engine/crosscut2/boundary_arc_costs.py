@@ -160,7 +160,8 @@ def whole_viewports(entry,exit,*,length,cap):
 class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
-                 preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None):
+                 preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None,
+                 focal_motion=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -170,6 +171,7 @@ class ArcCosts:
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
         self.played_interval_utility=played_interval_utility
+        self.focal_motion=bool(focal_motion)
         self.preserve_camera_alternatives=bool(preserve_camera_alternatives or readout_tau is not None
             or played_interval_utility is not None)
         self.last_camera_alternatives=None
@@ -328,10 +330,14 @@ class ArcCosts:
         if getattr(self,'roles',None) is not None:
             from .editorial_roles import apply
             detail=apply(detail,self.roles.at(np.asarray(xs)[None,:],member[:,:,0],member[:,:,1]))
-        rate=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']
+        # Native endpoint banks have no associated temporal head windows.
+        # Pay the SAME finite UNKNOWN as an unobserved authored seam, not a
+        # free native exception or a fabricated stationary face measurement.
+        focal=.5 if getattr(self,'focal_motion',False) else 0.
+        rate=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']+focal
         if not components:return rate
         if getattr(self,'point_geometry',False):
-            return detail['pose_rate'],6./self.fps*(detail['geometry_rate']+detail['appearance_rate'])
+            return detail['pose_rate'],6./self.fps*(detail['geometry_rate']+detail['appearance_rate']+focal)
         return rate,np.zeros_like(rate)
 
     def native_weights(self,s,first,final,xs):

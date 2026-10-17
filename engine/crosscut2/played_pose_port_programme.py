@@ -26,7 +26,8 @@ class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
-                 matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False):
+                 matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
+                 focal_motion=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -42,6 +43,9 @@ class PlayedPosePortPrior:
         if retain_pair_cameras and not played_interval_utility:
             raise ValueError('paired camera options require actual interval camera scoring')
         self.retain_pair_cameras=bool(retain_pair_cameras)
+        if focal_motion and not played_interval_utility:
+            raise ValueError('focal image motion requires actual played interval utility')
+        self.focal_motion=bool(focal_motion)
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
@@ -71,7 +75,7 @@ class PlayedPosePortPrior:
             'context_long_relax.py','held_playback_inputs.py','playback_input_batch.py',
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
-            'person_attention.py','person_rectangle_bank.py']
+            'person_attention.py','person_rectangle_bank.py','focal_image_motion.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -173,6 +177,15 @@ class PlayedPosePortPrior:
         self.artifact['matched_musical_event_utility']=self.matched_event_utility
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
         self.artifact['matched_action_preference_learned_from_references']=False
+        self.artifact['composed_focal_image_motion']=self.focal_motion
+        if self.focal_motion:
+            self.artifact.update(focal_image_motion_scope='same_music_-4_to_+3_observed_steps_plus_actual_terminal_digital_rate',
+                focal_image_motion_cost='six_output_frame_seconds_times_bounded_time_mean_residual',
+                focal_image_motion_unknown=.5,native_focal_motion_unmeasured_not_exempt=True,
+                focal_image_motion_changes_admission=False,
+                terminal_digital_rate_continuation_is_a_local_hypothesis=True,
+                authored_cost='existing_played_pair_cost+six_frame_seconds*composed_focal_image_motion_risk',
+                native_cost='existing_retained_native_cost+six_frame_seconds*unmeasured_focal_image_motion_.5')
         if self.matched_event_utility:
             self.artifact.update(opportunity_credit='fixed_music_event_utility_times_capped_actual_pair_camera_delivery_coverage',
                 event_coverage_unit='seven_actual_output_frame_seconds',
@@ -199,6 +212,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
     played=bool(prior.artifact.get('played_interval_utility',False))
+    focal_motion=bool(getattr(prior,'focal_motion',False))
     if music_event_frames is not None and not played:
         raise ValueError('continuous musical strength requires the explicit played-interval path')
     sequence=sequence_preference_model is not None
@@ -309,7 +323,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         person_extents=person_extents,opportunity_episodes=None if opportunities is None else opportunities.episodes,
         roles=roles,point_geometry=editorial,
         readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps),
-        preserve_camera_alternatives=sequence or played,played_interval_utility=interval_utility)
+        preserve_camera_alternatives=sequence or played,played_interval_utility=interval_utility,
+        focal_motion=focal_motion)
     matched_delivery=None
     if played:
         from .matched_entry_delivery import MatchedEntryDelivery
@@ -326,8 +341,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     def cut(n):
         live()
         if n not in cut_cache:
-            left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents)
-            right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents)
+            left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion)
+            right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion)
             detail=matrix(left,right,details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
@@ -359,6 +374,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 from .scene_readout import change
                 cut_transfers[n]=change(detail['face_rate'],unit=6./fps)
             cut_statistics.append(dict(frame=int(nodes[n]),exit_ports=len(a),entry_ports=len(b),admitted_pairs=int(admitted.sum()),
+                focal_image_motion_cost_used=focal_motion,
+                focal_image_motion_comparable_port_pairs=(int((detail['focal_image_motion_measured']
+                    &(a[:,None]!=b[None,:])).sum()) if focal_motion else 0),
                 visible_person_extent_comparable_port_pairs=int((detail['person_extent_measured']&(a[:,None]!=b[None,:])).sum()),
                 unknown_face_port_pairs_with_person_extent=int((detail['person_extent_measured']&~detail['measured_face']&(a[:,None]!=b[None,:])).sum())))
         return cut_cache[n]
@@ -496,8 +514,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 fixed_time_sequence_preference=sequence_cost if sequence else 0.),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
-            detail=matrix(features([a.observation],fps=fps,person_extents=person_extents),
-                features([b.observation],fps=fps,person_extents=person_extents),details=True)
+            detail=matrix(features([a.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion),
+                features([b.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion),details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
                 detail=articulated_seam_evidence(detail,[a],[b])
@@ -548,6 +566,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 actual_dense_context_native_inputs=[None if o.get('dense_subject_context') is None
                     else o['dense_subject_context']['clock'].native_indices.tolist() for o in observed],
                 actual_camera_strips=[o['camera_strip'].tolist() for o in observed],
+                focal_image_motion_cost_used=focal_motion,
+                focal_image_motion_rate=(float(detail['focal_image_motion_rate'][0,0]) if focal_motion else None),
+                focal_image_motion_measured=(bool(detail['focal_image_motion_measured'][0,0]) if focal_motion else False),
+                focal_image_motion_observed_steps=(int(detail['focal_image_motion_observed_steps'][0,0]) if focal_motion else 0),
                 expected_output_focal=predicted,
                 partial_pose_cost_used=True,ownership_certified=False,unmeasured_pose_is_not_perfect=True)
     if not math.isclose(cumulative,score,rel_tol=1e-8,abs_tol=1e-7):

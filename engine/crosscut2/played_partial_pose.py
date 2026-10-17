@@ -70,7 +70,7 @@ def out_of_view_face_risk(raw_a,head_a,camera_a,visible_a,raw_b,head_b,camera_b,
     return np.where(measured,minimum,0.),measured
 
 
-def features(observations, *, fps, person_extents=False):
+def features(observations, *, fps, person_extents=False, focal_motion=False):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
     heads = np.asarray([o['head'] for o in observations], float)
@@ -128,6 +128,9 @@ def features(observations, *, fps, person_extents=False):
     result['individual_member_scores']=np.asarray([o.get('individual_member_score_profile',np.zeros(6)) for o in observations],float)
     result['individual_member_score_support']=np.asarray([o.get('individual_member_score_support',0.) for o in observations],float)
     result['individual_member_score_galleries']=np.asarray([o.get('individual_member_score_gallery','') for o in observations])
+    if focal_motion:
+        from .focal_image_motion import describe
+        result['focal_image_motion']=[describe(o,fps=fps) for o in observations]
     if person_extents:
         from .person_extent import height_interval
         intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
@@ -271,7 +274,14 @@ def matrix(left, right, *, details=False):
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,
         ownership_ambiguity=ambiguous, shrinkage=.5, anatomical_ownership_certified=False)
-    return result if details else (geometry + pose + appearance, allowed)
+    if 'focal_image_motion' in left or 'focal_image_motion' in right:
+        if 'focal_image_motion' not in left or 'focal_image_motion' not in right:
+            raise ValueError('Both played sides must declare the focal motion cost')
+        from .focal_image_motion import matrix as focal_matrix
+        risk,measured,steps=focal_matrix(left['focal_image_motion'],right['focal_image_motion'])
+        result.update(focal_image_motion_rate=risk,focal_image_motion_measured=measured,
+            focal_image_motion_observed_steps=steps)
+    return result if details else (geometry + pose + appearance + result.get('focal_image_motion_rate',0.), allowed)
 
 
 def source_activity(observation, *, fps):
