@@ -27,7 +27,7 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
-                 focal_motion=False,detailed_pose=False,output_height=None):
+                 focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -52,6 +52,14 @@ class PlayedPosePortPrior:
         if output_height is not None and (not played_interval_utility or type(output_height) is not int or not 1<=output_height<=8192):
             raise ValueError('Actual output height requires the played interval consumer')
         self.output_height=output_height
+        self.camera_proposal_nodes=None
+        if camera_proposal_nodes is not None:
+            grid=np.asarray(camera_proposal_nodes)
+            mixed_bool=isinstance(camera_proposal_nodes,(tuple,list)) and any(isinstance(v,(bool,np.bool_)) for v in camera_proposal_nodes)
+            if (not played_interval_utility or grid.ndim!=1 or grid.dtype.kind not in 'iu' or len(grid)<2
+                    or mixed_bool or grid[0]!=0 or np.any(grid[1:]<=grid[:-1])):
+                raise ValueError('An explicit integer camera proposal grid requires played interval scoring')
+            self.camera_proposal_nodes=tuple(map(int,grid))
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
@@ -69,7 +77,7 @@ class PlayedPosePortPrior:
                 any(type(s) is not int or s<0 for s in self.source_cohort) or
                 len(set(self.source_cohort))!=len(self.source_cohort)):
             raise ValueError('distinct physical source cohort indices required')
-        files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py',
+        files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py','shot_camera_paths.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
             'featured_member_state.py','terminal_stencil.py','dense_subject_catalogue.py','dense_source_action.py',
@@ -194,6 +202,8 @@ class PlayedPosePortPrior:
                 detailed_pose_missing_never_fabricates_a_stationary_hand=True)
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
         self.artifact['actual_output_height_pixels']=self.output_height
+        self.artifact['explicit_camera_proposal_grid']=self.camera_proposal_nodes
+        self.artifact['camera_proposal_grid_is_not_an_edit_timing_constraint']=True
         if self.output_height is not None:
             self.artifact.update(focal_crop_support='observed_shoulders_elbows_wrists_not_hip_visibility',
                 zoom_effort='added_actual_native_pixel_interpolation_beyond_original_view',
@@ -279,7 +289,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if part_observer is not None:
         rows,part_receipts=(part_observer(states,rows,check=live) if 'check' in inspect.signature(part_observer).parameters
             else part_observer(states,rows))
-    paths,camera_receipt=make_paths(nodes,banks,source_events,check=live)
+    camera_arguments={}
+    if getattr(prior,'camera_proposal_nodes',None) is not None:
+        camera_arguments['proposal_nodes']=prior.camera_proposal_nodes
+    paths,camera_receipt=make_paths(nodes,banks,source_events,check=live,**camera_arguments)
     receipt=dict(source_local_appearance_clusters=counts,raw_actor_states_prepared_once=len(states),
         native_part_corroboration=part_receipts,camera_domain=camera_receipt,
         terminal_stencil_observations=[b.get('terminal_stencil_observation') for b in banks],

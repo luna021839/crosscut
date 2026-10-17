@@ -51,10 +51,19 @@ def representatives(candidates,*,limit=3):
     return [tuple(map(float,raw[i])) for i in chosen],float(distance.max())
 
 
-def make_paths(nodes,banks,source_events,*,check=lambda:None,maximum_candidates=2_000_000):
+def make_paths(nodes,banks,source_events,*,check=lambda:None,maximum_candidates=2_000_000,proposal_nodes=None):
     nodes=np.asarray(nodes,int);final=int(nodes[-1]);count=0
     if len(banks)!=len(source_events) or nodes[0]!=0 or np.any(np.diff(nodes)<=0):
         raise ValueError('source-matched canonical camera grid required')
+    proposed=np.ones(len(nodes),bool)
+    if proposal_nodes is not None:
+        grid=np.asarray(proposal_nodes)
+        mixed_bool=isinstance(proposal_nodes,(tuple,list)) and any(isinstance(v,(bool,np.bool_)) for v in proposal_nodes)
+        if (grid.ndim!=1 or grid.dtype.kind not in 'iu' or len(grid)<2 or mixed_bool
+                or grid[0]!=nodes[0] or grid[-1]!=nodes[-1] or np.any(grid[1:]<=grid[:-1])
+                or not np.isin(grid,nodes).all()):
+            raise ValueError('camera proposal grid must be an exact ordered subset of decision nodes')
+        proposed=np.isin(nodes,grid)
     boundaries=[np.unique(np.r_[0,np.asarray(v,int),final]) for v in source_events]
     if any(v[0]!=0 or v[-1]!=final or np.any(np.diff(v)<=0) for v in boundaries):
         raise ValueError('native camera units escape canonical source domain')
@@ -65,6 +74,7 @@ def make_paths(nodes,banks,source_events,*,check=lambda:None,maximum_candidates=
         if len(group)>=3 and group[:,2].max()<1.6*np.sort(group[:,2])[-2]:return ()
         return [r for r in rows[:3] if r[2]>=.055 and r[3]>=.75]
     for n,tick in enumerate(nodes[1:-1],start=1):
+        if not proposed[n]:continue
         check();left=[heads(s,n,0) for s in range(len(banks))];right=[heads(s,n,1) for s in range(len(banks))]
         for a in range(len(banks)):
             ua=int(np.searchsorted(boundaries[a],tick-1,side='right')-1)
@@ -96,4 +106,7 @@ def make_paths(nodes,banks,source_events,*,check=lambda:None,maximum_candidates=
             retained_non_native_representatives=sum(map(len,chosen)),maximum_numeric_covering_error=max(errors,default=0.),
             stable_inside_native_shots=True,actor_ownership_certified=False))
     return paths,dict(total_raw_proposals=count,paths_per_source=4,source_reports=reports,
+        decision_grid_nodes=len(nodes),proposal_grid_nodes=int(proposed.sum()),
+        explicit_camera_proposal_grid=proposal_nodes is not None,
+        proposal_grid_is_not_an_edit_timing_constraint=True,
         proposal_selection_used_music_or_reference_times=False,perfect_camera_coverage_claimed=False,roll_supported=False)
