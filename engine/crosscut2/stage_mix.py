@@ -322,6 +322,8 @@ def main():
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
     parser.add_argument('--extra-subject-observations',type=Path,action='append',default=[],
         help='Additional immutable subject-observation plans merged with the primary source-bound reference')
+    parser.add_argument('--original-person-observations',type=Path,
+        help='Explicit all-source original-frame COCO17 reference; cache-only E6, no per-chosen-face inference')
     parser.add_argument('--face-endpoint-observations',type=Path,action='append',
         help='Explicit source-bound observations completing missing face endpoints; never triggers new inference')
     parser.add_argument('--face-endpoint-record-limit',type=int,default=128,
@@ -448,6 +450,8 @@ def main():
     if args.played_interval_utility and (not args.editorial_opportunity_exposure
             or args.experimental_sequence_preference_model is not None):
         raise ValueError('actual interval utility requires E4 and cannot silently replace a sequence model')
+    if args.original_person_observations is not None and not args.played_interval_utility:
+        raise ValueError('original person observations require the actual E6 played-interval consumer')
     if args.matched_event_utility and not args.played_interval_utility:
         raise ValueError('matched event utility requires actual played interval utility')
     if (not math.isfinite(args.matched_action_preference) or args.matched_action_preference<0
@@ -689,6 +693,12 @@ def main():
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,nodes=nodes,
                     warps=warps,clocks=camera_census,master_start=original.master_audio_start,fps=original.fps,
                     authorized_root=args.cache.parent.parent,check=check,detailed_pose=args.detailed_pose)
+            if args.original_person_observations is not None:
+                from .original_people_bank import load_reference
+                observed=load_reference(args.original_person_observations,sources=original.sources,
+                    source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,
+                    authorized_root=args.cache.parent.parent,check=check)
+                for bank,people in zip(banks,observed,strict=True):bank['original_people_observations']=people
             opportunity_observer=None
             if args.opportunity_subject_spec is not None:
                 from .subject_opportunity_probe import observer

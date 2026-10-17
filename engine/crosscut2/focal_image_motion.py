@@ -56,7 +56,7 @@ def describe(observation, *, fps):
     result = dict(velocity=np.zeros((13, 3)), known=np.zeros(13, bool),
                   digital_velocity=np.zeros(3), digital_known=False, height=0., fps=float(fps),
                   native_static_camera=False)
-    context = observation.get('dense_subject_context')
+    context = observation.get('focal_image_motion_context',observation.get('dense_subject_context'))
     if context is None:
         return result
     clock, window, at = context['clock'], context['window'], context['at']

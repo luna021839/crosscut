@@ -101,6 +101,8 @@ def _project(points,support,head,camera):
 
 def describe(observation):
     """Exactly the actual -1/0 played endpoint, not a fitted facial pose."""
+    if observation.get('original_full_image_people_used',False):
+        return describe_original_people(observation)
     result=_empty()
     context=observation.get('dense_subject_context')
     if context is None or 'detailed_points' not in context:return result
@@ -116,6 +118,40 @@ def describe(observation):
     head=context['window'].heads[context['at'][endpoint]]
     known=support[endpoint]&context['same_shot'][endpoint]
     return _project(points[endpoint],known,head,camera)
+
+
+def describe_original_people(observation):
+    """RTMO head5 plus separately supported, matching old RTMW hand roots.
+
+    COCO17 has no finger landmarks. Never fill those42 points with zeros
+    labelled as observations, nor attach a neighbouring ROI person's hand.
+    The existing .3-face-height wrist/root convention remains MODEL_ONLY.
+    """
+    head=np.asarray(observation['head']);points=np.zeros((47,3));known=np.zeros(47,bool)
+    raw=np.asarray(observation.get('original_people_head_points',np.zeros((5,3))))
+    if raw.shape!=(5,3) or not np.isfinite(raw).all():raise ValueError('actual original COCO17 head5 required')
+    points[:5]=raw
+    known[:5]=(raw[:,2]>=.3)&(raw[:,:2]>=0).all(-1)&(raw[:,:2]<=1).all(-1)
+    known[:5]&=bool(observation.get('original_people_associated',False))
+    context=observation.get('detailed_subject_context')
+    if context is not None and 'detailed_points' in context:
+        from .subject_action_match import _sample
+        endpoint=6 if observation['side']==0 else 7
+        if (not np.array_equal(_sample(context['window'],context['clock']),context['at'])
+                or not np.array_equal(context['clock'].output_frames,np.arange(-7,7))
+                or int(context['clock'].native_indices[endpoint])!=int(observation['native_indices'][-1 if observation['side']==0 else 0])):
+            raise ValueError('detailed hands differ from the actual original endpoint clock')
+        old=np.asarray(context['detailed_points'])[endpoint]
+        support=np.asarray(context['detailed_support'])[endpoint]&context['same_shot'][endpoint]
+        body=observation['body'][-1 if observation['side']==0 else 0]
+        evidence=observation['evidence'][-1 if observation['side']==0 else 0]
+        for wrist,group in ((4,GROUPS[1]),(5,GROUPS[2])):
+            root=group[0]
+            agrees=(evidence[wrist]>0 and support[root] and
+                np.linalg.norm((old[root,:2]-body[wrist,:2])*[16/9,1.])<=.3*head[2])
+            if agrees:points[group]=old[group];known[group]=support[group]
+    camera=np.asarray(observation['camera_strip'])[-1 if observation['side']==0 else 0]
+    return _project(points,known,head,camera)
 
 
 def describe_moment(window,clock,center,side,camera):

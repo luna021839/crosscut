@@ -102,7 +102,7 @@ class PlayedPosePortPrior:
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
-            'sparse_face_completion.py']
+            'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -350,6 +350,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             editorial_content=editorial,framing_evidence=framing,
             person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None)))
     del states,rows,raw
+    if any(cat.original_people is not None for cat in cats):
+        receipt['original_full_image_people']=[None if cat.original_people is None else cat.original_people.receipt() for cat in cats]
+        receipt['whole_image_bodies_do_not_trigger_actor_selected_inference']=True
     if getattr(prior,'person_attention',False):
         receipt['person_attention_observation_coverage']=[dict(source=s,
             original_native_measurements=len(cat.bank.get('person_rectangles_by_native',{})),

@@ -96,8 +96,16 @@ class SourceCatalogue:
                         np.where(reliability[n,sl]==0.,CONTRADICTED,MODEL_ONLY))
                     self.evidence[n,sl,h]=np.where(raw[n,sl,:,2]>=.3,kind,UNMEASURED)
                 if 'utility_parts' in row:self.salience[n,side,h]=np.exp(-row['utility_parts']['salience'][n,side]/1.1)
+        self.original_people=None
+        if 'original_people_observations' in bank:
+            from .original_people_subjects import OriginalPeople
+            self.original_people=OriginalPeople(bank)
+            self.body=self.original_people.body
+            self.evidence=np.where(self.original_people.supported,MODEL_ONLY,UNMEASURED).astype(np.uint8)
+        self.body_capacity=self.body.shape[2]
         self.ambiguity=duplicate_wrists(self.body)
-        self.endpoint_matches=endpoint_correspondence(bank['heads'],bank['vectors']) if 'vectors' in bank else np.full((N,3),-1,int)
+        self.endpoint_matches=(self.original_people.endpoint_matches if self.original_people is not None else
+            endpoint_correspondence(bank['heads'],bank['vectors']) if 'vectors' in bank else np.full((N,3),-1,int))
         self.physical=np.ones((N,2),bool)
         self.native=np.asarray(bank['pose_native_indices'],int)
         self.person_boxes=None
@@ -152,7 +160,7 @@ class SourceCatalogue:
         for n in range(N):
             for side in (0,1):
                 sl=slice(2*side,2*side+2)
-                for h in range(3):
+                for h in range(self.body_capacity):
                     observation=dict(head=bank['heads'][n,side,h],body=self.body[n,sl,h],
                         evidence=self.evidence[n,sl,h],ownership_ambiguity=self.ambiguity[n,sl,h],
                         physical_window_valid=bool(self.physical[n,side]),native_indices=self.native[n,sl])
@@ -194,28 +202,28 @@ class SourceCatalogue:
             score=extent.prod(-1)*np.exp(-((center[:,0]-.5)/.4)**2)
             score=np.where((heads[0,0,:,2]>.019)&(heads[0,0,:,3]>=.75),score,0.)
             target_attention=float(score[h]/max(1e-12,float(score.max())))
-        body=np.zeros((2,8,3),np.float32) if not 0<=h<3 else self.body[n,sl,h]
-        evidence=np.zeros((2,8),np.uint8) if not 0<=h<3 else self.evidence[n,sl,h]
-        ownership=np.zeros((2,8),bool) if not 0<=h<3 else self.ambiguity[n,sl,h]
+        body=np.zeros((2,8,3),np.float32) if not 0<=h<self.body_capacity else self.body[n,sl,h]
+        evidence=np.zeros((2,8),np.uint8) if not 0<=h<self.body_capacity else self.evidence[n,sl,h]
+        ownership=np.zeros((2,8),bool) if not 0<=h<self.body_capacity else self.ambiguity[n,sl,h]
         appearance=np.zeros(128,np.float32)
         if 0<=h<3 and 'vectors' in self.bank:
             appearance=np.asarray(self.bank['vectors'][n,side,h],np.float32).copy()
         appearance.setflags(write=False)
         endpoint_native=int(self.native[n,1 if side==0 else 2])
         before=h if side==0 else next((a for a,b in enumerate(self.endpoint_matches[n]) if b==h and b>=0),-1)
-        after=int(self.endpoint_matches[n,before]) if 0<=before<3 else -1
+        after=int(self.endpoint_matches[n,before]) if 0<=before<self.body_capacity else -1
         if side==1:after=h
         cuts=np.asarray(self.bank.get('native_cut_frames',[]),int)
         if np.any((cuts>self.native[n,1])&(cuts<=self.native[n,2])):
             if side==0:after=-1
             else:before=-1
-        common=0<=h<3
+        common=0<=h<self.body_capacity
         common_body=np.zeros((4,8,3),np.float32);common_evidence=np.zeros((4,8),np.uint8);common_ambiguity=np.zeros((4,8),bool)
         common_heads=np.zeros((4,4),np.float32);sample_mask=np.zeros(4,bool)
         common_readability=np.full(4,.5);common_readability_valid=np.zeros(4,bool)
         if common:
             for source_side,target in enumerate((before,after)):
-                if not 0<=target<3:continue
+                if not 0<=target<self.body_capacity:continue
                 endpoint=1 if source_side==0 else 2
                 slots=[endpoint]
                 if self.physical[n,source_side]:slots.append(0 if source_side==0 else 3)
@@ -300,6 +308,8 @@ class SourceCatalogue:
                 person_competition_is_not_occlusion_or_ownership=True)
             if value['measured']:
                 result['displayed_native_quality_proxy']*=1.-float(value['deficit'])
+        if self.original_people is not None:
+            return self.original_people.attach_context(result,n,side,h,self.subjects if include_subjects else None)
         return result if self.subjects is None or not include_subjects else self.subjects.augment(result,n,side,h)
 
     def rates(self,frames,cameras):
@@ -325,9 +335,9 @@ class SourceCatalogue:
         quality=self.quality[n,side,index];salience=self.salience[n,side,index]
         visibility=np.sqrt(quality)*np.minimum(1.,displayed_height/.22)*np.sqrt(salience)*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,index]
         visibility=np.where(scores.max(-1)>0,np.clip(visibility,0,1),0.)
-        body=self.body[n,np.where(side==0,1,2),np.minimum(index,2)]
+        body=self.body[n,np.where(side==0,1,2),np.minimum(index,self.body_capacity-1)]
         valid=(body[...,2]>=.3)&(body[...,:2]>=0).all(-1)&(body[...,:2]<=1).all(-1)
-        valid&=(index<3)[...,None]&self.content_scope[frames,None]
+        valid&=(index<self.body_capacity)[...,None]&self.content_scope[frames,None]
         projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
         crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
         if self.editorial_content:

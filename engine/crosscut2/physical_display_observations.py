@@ -35,15 +35,15 @@ def focal_metadata(heads, cameras):
 def duplicate_wrists(bodies, *, tolerance=.015):
     """Same semantic wrist attributed to multiple face ROIs is ambiguous."""
     bodies = np.asarray(bodies)
-    if bodies.ndim != 5 or bodies.shape[1:] != (4, 3, 8, 3):
-        raise ValueError('source pose bank N x4 x3 x8 x3 required')
+    if bodies.ndim != 5 or bodies.shape[1] != 4 or bodies.shape[3:] != (8, 3) or not 1<=bodies.shape[2]<=8:
+        raise ValueError('source pose bank N x4 xH x8 x3 required')
     result = np.zeros(bodies.shape[:-1], bool)
     for joint in (4, 5):
         xy = bodies[..., joint, :2] * [16 / 9, 1.]
         valid = (bodies[..., joint, 2] >= .3) & (bodies[..., joint, :2] >= 0).all(-1) & (bodies[..., joint, :2] <= 1).all(-1)
         distance = np.linalg.norm(xy[..., :, None, :] - xy[..., None, :, :], axis=-1)
         collision = (distance <= tolerance) & valid[..., :, None] & valid[..., None, :]
-        collision &= ~np.eye(3, dtype=bool)
+        collision &= ~np.eye(bodies.shape[2], dtype=bool)
         result[..., joint] = collision.any(-1)
     return result
 
