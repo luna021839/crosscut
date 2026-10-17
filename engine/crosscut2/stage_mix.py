@@ -350,6 +350,8 @@ def main():
         help='Spend the same bounded preselection probe allowance on unmeasured face-supported action candidates')
     parser.add_argument('--opportunity-observation-centres',type=int,default=12,
         help='Explicit whole-programme observation allowance0..64; not a final cut quota')
+    parser.add_argument('--provisional-subject-observation-plan',type=Path,
+        help='Explicit source-bound preliminary plan whose missing endpoints are measured once before a new final solve')
     parser.add_argument('--maximum-opportunity-perception-seconds',type=float,default=180.,
         help='One shared opportunity observation deadline, at most900s; requires explicit source/model spec')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
@@ -373,6 +375,8 @@ def main():
     if ((args.opportunity_observation_centres!=12 or args.maximum_opportunity_perception_seconds!=180.)
             and args.opportunity_subject_spec is None):
         raise ValueError('Changed opportunity observation allowance requires an explicit bounded subject opportunity probe')
+    if args.provisional_subject_observation_plan is not None and args.opportunity_subject_spec is None:
+        raise ValueError('Provisional endpoint completion requires an explicit bounded subject opportunity probe')
     if (not 0<=args.face_endpoint_record_limit<=8192
             or (args.face_endpoint_record_limit!=128 and args.face_endpoint_observations is None)):
         raise ValueError('A changed face-record allowance requires explicit face endpoint observations')
@@ -661,7 +665,8 @@ def main():
                     authorized_root=args.cache.parent.parent,device=expected,image_changes=args.played_interval_utility,
                     explore_missing_action=args.explore_missing_action,
                     maximum_centres=args.opportunity_observation_centres,
-                    maximum_seconds=args.maximum_opportunity_perception_seconds)
+                    maximum_seconds=args.maximum_opportunity_perception_seconds,
+                    provisional_plan=args.provisional_subject_observation_plan,master_start=original.master_audio_start)
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,

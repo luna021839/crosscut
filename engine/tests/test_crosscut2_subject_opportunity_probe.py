@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import numpy as np
-from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer
+from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer,provisional_candidates
 
 
 def test_one_explicit_full_programme_allowance_can_cover_more_than_twelve_moments():
@@ -83,6 +83,43 @@ def test_expanded_cli_allowance_requires_an_explicit_observation_spec(monkeypatc
             ('--maximum-opportunity-perception-seconds','600')):
         monkeypatch.setattr('sys.argv',[*base,option,value])
         with pytest.raises(ValueError,match='explicit bounded subject opportunity probe'):main()
+
+
+def test_provisional_endpoints_only_request_missing_actual_addresses_not_a_final_edit():
+    import pytest
+    banks=[SimpleNamespace(bank={'heads':np.zeros((7,2,8,4))},
+        subjects=SimpleNamespace(sample=lambda *a:None)) for _ in range(2)]
+    def seam(t):return dict(output_frame=t,left_source=0,right_source=1,left_head_index=0,right_head_index=1)
+    rows=[seam(t) for t in (10,20,30,40,50)]
+    actual=provisional_candidates(banks,np.arange(7)*10,rows,maximum=3)
+    assert actual==[(1,0,1,0,1),(3,0,1,0,1),(5,0,1,0,1)]
+    assert provisional_candidates(banks,np.arange(7)*10,rows,maximum=0)==[]
+    banks[0].subjects.sample=banks[1].subjects.sample=lambda *a:object()
+    assert provisional_candidates(banks,np.arange(7)*10,rows,maximum=64)==[]
+    with pytest.raises(ValueError,match='actual grid'):
+        provisional_candidates(banks,np.arange(7)*10,[seam(11)],maximum=64)
+    assert rows==[seam(t) for t in (10,20,30,40,50)]
+
+
+def test_provisional_cli_cannot_silently_authorize_inference(monkeypatch):
+    import pytest
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused','--cache','unused',
+        '--output','unused','--models','unused','--provisional-subject-observation-plan','unused'])
+    with pytest.raises(ValueError,match='explicit bounded subject opportunity probe'):main()
+
+
+def test_provisional_clock_change_is_rejected_before_opening_models(tmp_path):
+    import json
+    import pytest
+    spec=tmp_path/'spec.json';plan=tmp_path/'provisional.json'
+    spec.write_text(json.dumps(dict(sources=[{'path':'not-opened.mp4'}],fps=30.)))
+    plan.write_text(json.dumps(dict(source_sha256=['source-hash'],source_file_identities=[[1,2,3,4]],
+        render_plan=dict(sources=['not-opened.mp4'],fps=30.,master_audio_start=4.),seams=[])))
+    for master in (None,True,0.,float('nan')):
+        with pytest.raises(ValueError,match='physical source/clock'):
+            observer(spec,sources=['not-opened.mp4'],source_hashes=['source-hash'],identities=[(1,2,3,4)],
+                cache=tmp_path/'cache',authorized_root=tmp_path,device=0,provisional_plan=plan,master_start=master)
 
 
 def test_opportunity_observer_finishes_before_final_domain_and_actual_costs(monkeypatch):

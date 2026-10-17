@@ -1,8 +1,9 @@
 """One bounded raw-subject acquisition BEFORE final source/camera selection.
 
-Probe the best still-unobserved fixed opportunities, not the already selected
-film's cuts. Existing observations remain immutable. No teacher/reference
-timestamps, source-phase search, model fit, or full-source decode is used.
+Default to still-unobserved fixed opportunities. An explicit provisional
+programme can instead request its missing endpoints before a final solve;
+this is bounded active perception, not teacher timestamps or a movie patch.
+Existing observations remain immutable. No source-phase search or model fit.
 """
 import hashlib
 import inspect
@@ -54,13 +55,59 @@ def observation_limits(maximum_centres,maximum_seconds):
         seconds=float(maximum_seconds))
 
 
+def provisional_candidates(catalogues,nodes,seams,*,maximum):
+    """Measure unobserved prospective endpoints once, across the whole clock.
+
+    These are requests from an automatic provisional programme. They do not
+    freeze a cut, modify its cost, prescribe a final edit, or grant a credit.
+    """
+    if type(maximum) is not int or not 0<=maximum<=64 or not isinstance(seams,list) or len(seams)>2048:
+        raise ValueError('bounded provisional programme endpoints required')
+    grid=np.asarray(nodes);keys=[];seen=set()
+    for row in seams:
+        values=[row[k] for k in ('output_frame','left_source','right_source','left_head_index','right_head_index')]
+        if any(type(v) is not int for v in values):raise ValueError('integer provisional endpoint addresses required')
+        tick,a,b,ha,hb=values;n=int(np.searchsorted(grid,tick))
+        if not 0<n<len(grid)-1 or grid[n]!=tick or not 0<=a<len(catalogues) or not 0<=b<len(catalogues) or a==b:
+            raise ValueError('provisional endpoint must use the actual grid and physical sources')
+        # A legs/formation endpoint has no face-guided seed. Do not invent
+        # one or turn its absence into a source exclusion.
+        if min(ha,hb)<0:continue
+        if any(h>=catalogues[s].bank['heads'].shape[2] for s,h in ((a,ha),(b,hb))):
+            raise ValueError('provisional face address outside actual source bank')
+        key=(n,a,b,ha,hb)
+        if key in seen:continue
+        seen.add(key)
+        if any(catalogues[s].subjects is None for s in (a,b)):continue
+        if all(catalogues[s].subjects.sample(n,side,h) is not None for s,side,h in ((a,0,ha),(b,1,hb))):continue
+        keys.append(key)
+    keys.sort()
+    if not maximum:return []
+    if len(keys)<=maximum:return keys
+    return [keys[i] for i in np.linspace(0,len(keys)-1,maximum).round().astype(int)]
+
+
 def observer(specification,*,sources,source_hashes,identities,cache,authorized_root,device,image_changes=False,
-             explore_missing_action=False,maximum_centres=12,maximum_seconds=180.):
+             explore_missing_action=False,maximum_centres=12,maximum_seconds=180.,provisional_plan=None,master_start=None):
     """Explicit local model/media spec; sessions stay lazy until a cache miss."""
     limits=observation_limits(maximum_centres,maximum_seconds)
     spec=json.loads(Path(specification).read_text());root=Path(authorized_root).resolve(strict=True);cache=Path(cache)
     if [str(p) for p in sources]!=[v['path'] for v in spec['sources']]:raise ValueError('probe source specification differs')
     if not cache.resolve().is_relative_to(root):raise ValueError('subject cache outside authorized SSD project')
+    provisional=None;provisional_sha=None
+    if provisional_plan is not None:
+        path=Path(provisional_plan)
+        if path.is_symlink() or not path.resolve(strict=True).is_relative_to(root):
+            raise ValueError('provisional programme outside authorized source project')
+        raw=path.read_bytes();provisional=json.loads(raw);provisional_sha=hashlib.sha256(raw).hexdigest()
+        if (provisional.get('source_sha256')!=list(source_hashes)
+                or provisional.get('source_file_identities')!=[list(v) for v in identities]
+                or provisional.get('render_plan',{}).get('sources')!=list(map(str,sources))
+                or provisional.get('render_plan',{}).get('fps')!=spec['fps']
+                or isinstance(master_start,(bool,np.bool_)) or not isinstance(master_start,(int,float))
+                or not np.isfinite(master_start)
+                or provisional.get('render_plan',{}).get('master_audio_start')!=master_start):
+            raise ValueError('provisional programme physical source/clock domain differs')
     models={k:hashlib.sha256(Path(spec[k]).read_bytes()).hexdigest() for k in ('pose_model','detector_model','recognizer_model')}
     if models['pose_model']!=MODEL_SHA256:raise ValueError('subject opportunity pose model changed')
     producer=hashlib.sha256(json.dumps(dict(models=models,opencv=cv2.__version__,ort=__import__('onnxruntime').__version__,
@@ -79,8 +126,9 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             if not Path('/Volumes/CrossCutMedia').is_mount() or root.stat().st_dev!=device:raise OSError('authorized SSD changed')
             if any(file_identity(p)!=v for p,v in zip(sources,identities)):raise OSError('probe source changed')
         budget=bank.ProbeBudget(**limits,check=live)
-        selected=candidates(catalogues,opportunities,maximum=maximum_centres,include_observed=image_changes,
-            explore_missing_action=explore_missing_action)
+        selected=(candidates(catalogues,opportunities,maximum=maximum_centres,include_observed=image_changes,
+            explore_missing_action=explore_missing_action) if provisional is None else
+            provisional_candidates(catalogues,opportunities.nodes,provisional['seams'],maximum=maximum_centres))
         receipts=[];decodes=[];new=[[] for _ in sources];windows=0
         cache.mkdir(parents=True,exist_ok=True);cv2.setNumThreads(2)
         for n,a,b,ha,hb in selected:
@@ -179,7 +227,10 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             maximum_centres=maximum_centres,maximum_new_windows=2*maximum_centres,maximum_seconds=maximum_seconds,
             used=budget.used,window_receipts=receipts,decode_receipts=decodes,elapsed_seconds=monotonic()-started,
             neural_model_sessions_initialized=sessions[0] is not None,source_NN_calls=sum(budget.used[k] for k in ('face','pose','recognition')),
-            selected_movie_or_reference_timestamps_used=False,old_observations_rewritten=False,
+            selected_movie_or_reference_timestamps_used=provisional is not None,old_observations_rewritten=False,
+            request_policy='fixed_music_opportunities' if provisional is None else 'provisional_programme_missing_endpoints',
+            provisional_plan_sha256=provisional_sha,provisional_cuts_are_not_frozen_final_cuts=provisional is not None,
+            user_or_teacher_timestamps_used=False,automatic_retry=False,
             missing_action_exploration=bool(explore_missing_action),
             observation_requests_are_not_action_credit=True,
             observation_centres=[list(key) for key in selected],
