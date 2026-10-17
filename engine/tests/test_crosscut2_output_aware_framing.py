@@ -21,6 +21,33 @@ def test_lossless_4k_crop_is_not_penalized_as_1080p_upscaling_or_quality_certifi
     assert added_pixel_upscale_effort(.1,54.,True,1.,output_height=1080)==0.
 
 
+def test_prepruning_candidate_uses_same_actual_pixel_effort_as_realized_interval():
+    from crosscut2.boundary_port_domain import proposal_zoom_effort
+    observation=dict(head=np.array([.5,.3,.1,.99]),actual_output_pixel_height=1080,
+        native_face_pixels=216.,native_face_pixels_measured=True)
+    assert proposal_zoom_effort(observation,2.)==0.
+    observation['native_face_pixels']=108.
+    assert proposal_zoom_effort(observation,2.)==pytest.approx(np.log(2.))
+    observation['native_face_pixels']=54.
+    # Already low-resolution native framing must not be charged twice.
+    assert proposal_zoom_effort(observation,2.)==pytest.approx(np.log(2.))
+    observation['native_face_pixels_measured']=False
+    assert proposal_zoom_effort(observation,2.)==pytest.approx(np.log(2.))
+    observation.pop('actual_output_pixel_height')
+    assert proposal_zoom_effort(observation,2.)==np.log(2.)
+
+
+def test_scalar_proposal_effort_matches_interval_sampling_without_hot_loop_arrays():
+    from crosscut2.boundary_port_domain import proposal_zoom_effort
+    for height in (720,1080,2160):
+        for native in (0.,54.,108.,216.,432.):
+            for zoom in (1.,1.15,1.5,2.):
+                obs=dict(head=np.array([.5,.3,.1,.99]),actual_output_pixel_height=height,
+                    native_face_pixels=native,native_face_pixels_measured=True)
+                exact=np.log(2.)*added_pixel_upscale_effort(.1*zoom,native,True,zoom,output_height=height)
+                assert proposal_zoom_effort(obs,zoom)==pytest.approx(exact,abs=1e-12)
+
+
 def catalogue(output_height,native_height=2160,measured=True):
     from test_crosscut2_pair_camera_options import counterexample
     _,_,_,_,arcs,_=counterexample(False);old=arcs.cats[0];bank=dict(old.bank)
@@ -40,6 +67,33 @@ def test_actual_interval_content_uses_output_pixels_without_touching_native_pose
     np.testing.assert_allclose(legacy.rates(frames,crop)-actual.rates(frames,crop),saved,atol=1e-12)
     np.testing.assert_allclose(legacy.rates(frames,native),actual.rates(frames,native),atol=1e-12)
     np.testing.assert_array_equal(before,actual.body)
+
+
+def test_output_and_native_face_sampling_follow_the_actual_pinned_subject():
+    cat=catalogue(1080)
+    for side in (0,1):
+        obs=cat.observation(1,side,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+        assert obs['actual_output_pixel_height']==1080
+        assert obs['native_face_pixels']==cat.native_face_pixels[1,side,0]
+        assert obs['native_face_pixels_measured']
+
+
+def test_candidate_pruner_consumes_sampling_before_the_global_port_limit(monkeypatch):
+    from crosscut2 import boundary_port_domain as ports
+    from crosscut2.shot_camera_paths import make_paths
+    cat=catalogue(1080);calls=[];original=ports.proposal_zoom_effort
+    def measured(obs,zoom):
+        calls.append((obs['actual_output_pixel_height'],obs['native_face_pixels'],zoom))
+        return original(obs,zoom)
+    monkeypatch.setattr(ports,'proposal_zoom_effort',measured)
+    banks=[cat.bank,cat.bank];paths,_=make_paths(cat.nodes,banks,[[],[]])
+    entries,exits,_,receipt=ports.make(cat.nodes,[cat,cat],paths,fps=30.)
+    assert calls and all(height==1080 for height,_,_ in calls)
+    assert any(zoom>1. and pixels>0 for _,pixels,zoom in calls)
+    assert receipt['proposal_zoom_cost_uses_native_output_pixels']
+    assert receipt['unknown_native_sampling_keeps_legacy_proposal_zoom_cost']
+    assert max(map(len,entries))<=receipt['global_port_limit_per_side']
+    assert max(map(len,exits))<=receipt['global_port_limit_per_side']
 
 
 @pytest.mark.parametrize('height',[0,True,-1,8193,1080.5])

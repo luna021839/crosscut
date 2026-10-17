@@ -18,6 +18,21 @@ class BoundaryPort:
     intent: object = None
 
 
+def proposal_zoom_effort(observation,zoom):
+    """Use actual native sampling before pruning, in the old natural-log units.
+
+    This is only a candidate-ranking proxy; the interval consumer still scores
+    complete framing, crop, readability and movement on the realized cameras.
+    Missing output/ROI measurements retain the old finite zoom effort.
+    """
+    height=observation.get('actual_output_pixel_height')
+    if height is None or not observation.get('native_face_pixels_measured',False):return math.log(zoom)
+    # Scalar equivalent of added_pixel_upscale_effort. This hot ranking loop
+    # must not allocate NumPy broadcast arrays for every camera/actor pair.
+    need=float(observation['head'][2])*zoom*height/max(1e-9,observation.get('native_face_pixels',0.))
+    return max(0.,math.log(max(1.,need))-math.log(max(1.,need/zoom)))
+
+
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
          retain_pair_cameras=False,focal_motion=False,detailed_pose=False):
@@ -176,7 +191,8 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             scale=abs(math.log(ha/hb))/math.log(1.5)
                             framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
                             error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
-                        score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(math.log(left[0])+math.log(right[0]))
+                        score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(
+                            proposal_zoom_effort(left_obs,left[0])+proposal_zoom_effort(right_obs,right[0]))
                         if detailed_pose:score+=detail_rank[ai,bi]
                         if opportunities is not None:
                             score-=opportunities.density(n,left_obs,right_obs,a,b,
@@ -294,5 +310,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         unknown_motion_does_not_expand_candidate_domain=True,
         detailed_head_hand_pose_used_before_pair_pruning=bool(detailed_pose),
         detailed_configuration_bounds_raw_opportunity_credit=bool(detailed_pose),
+        proposal_zoom_cost_uses_native_output_pixels=any(getattr(cat,'output_height',None) is not None for cat in catalogues),
+        unknown_native_sampling_keeps_legacy_proposal_zoom_cost=True,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

@@ -236,6 +236,9 @@ class SourceCatalogue:
             source_colour_histogram=colour,source_colour_valid=style_valid,
             displayed_native_quality_proxy=visible_quality,
             displayed_native_quality_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
+            native_face_pixels=(0. if h<0 else float(self.native_face_pixels[n,side,h])),
+            native_face_pixels_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
+            actual_output_pixel_height=self.output_height,
             displayed_native_quality_contract=('target_ROI_native_detail_visibility_original_role_v1'
                 if self.editorial_content else 'legacy_display_quality_v1'),
             recurrent_member_hint=-1 if h<0 else int(self.member_hints[n,side,h]),
