@@ -26,7 +26,7 @@ class PlayedPosePortPrior:
     port_camera_prior=True
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
-                 matched_event_utility=False,matched_action_preference=1.):
+                 matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -39,6 +39,9 @@ class PlayedPosePortPrior:
         if recycle_static_capacity and not played_interval_utility:
             raise ValueError('recovered camera capacity requires actual interval camera scoring')
         self.recycle_static_capacity=bool(recycle_static_capacity)
+        if retain_pair_cameras and not played_interval_utility:
+            raise ValueError('paired camera options require actual interval camera scoring')
+        self.retain_pair_cameras=bool(retain_pair_cameras)
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
@@ -159,6 +162,14 @@ class PlayedPosePortPrior:
                 same_total_port_bound=True,all_old_physical_candidates_retained=True,
                 paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
                 global_port_limit_per_side='four_per_source_plus_eight_unchanged')
+        self.artifact['retain_primary_pair_camera_options']=self.retain_pair_cameras
+        if self.retain_pair_cameras:
+            self.artifact.update(same_total_port_bound=False,
+                paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
+                global_port_limit_per_side='four_per_source_plus_thirty_two_explicit_expansion',
+                primary_actor_pair_limit_per_node=8,maximum_cameras_per_primary_actor_pair=4,
+                pair_camera_proxy_winner_not_forced_before_interval_choice=True,
+                all_old_physical_candidates_retained=True)
         self.artifact['matched_musical_event_utility']=self.matched_event_utility
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
         self.artifact['matched_action_preference_learned_from_references']=False
@@ -266,7 +277,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
         coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
-        source_cohort=cohort)
+        source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -277,7 +288,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
             coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
-            source_cohort=cohort)
+            source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit

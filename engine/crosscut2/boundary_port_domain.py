@@ -19,7 +19,8 @@ class BoundaryPort:
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
-         coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None):
+         coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
+         retain_pair_cameras=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
@@ -27,7 +28,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     if (not active or any(type(s) is not int or not 0<=s<S for s in active)
             or len(set(active))!=len(active)):
         raise ValueError('distinct actual source cohort indices required')
-    port_limit=4*len(active)+maximum_pairs
+    old_port_limit=4*len(active)+maximum_pairs
+    # Explicit finite representation expansion, not a claim of the former
+    # fixed-work budget: each primary actor pair has <=3 common-size views
+    # and one original-view option. Keep all old ports, then let interval
+    # costs compare these physical endpoints rather than a local proxy.
+    port_limit=old_port_limit+3*maximum_pairs*bool(retain_pair_cameras)
+    camera_variants=0
     extra_count=0;pair_capacities=[];natural_added=0;original_retained=0
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
     intent_cache={}
@@ -69,9 +76,10 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 add(outgoing,port(s,n,0,before,(('static',family),)))
                 add(incoming,port(s,n,1,after,(('static',family),)))
         proposals=[]
-        capacity=min(port_limit-len(incoming),port_limit-len(outgoing))
+        capacity=min(old_port_limit-len(incoming),old_port_limit-len(outgoing))
         if not maximum_pairs:capacity=0
-        pair_capacities.append(capacity if recycle_static_capacity else maximum_pairs)
+        pair_capacities.append((capacity if recycle_static_capacity else maximum_pairs)
+            +3*maximum_pairs*bool(retain_pair_cameras))
         if 0<n<N-1:
             # Retrieve a physical actor pair BEFORE proposing its cameras.
             # Looking at only the native largest face loses a valid same-
@@ -174,14 +182,15 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         break
             # One representative per ordered SOURCE PAIR, not a source quota.
             proposals=sorted(proposals,key=lambda x:x[:6])[:maximum_pairs]
+            primary=tuple(proposals)
+            def physical(option):
+                _,a,b,ha,hb,_,left,right=option
+                return (a,b,ha,hb,*left,*right)
             if recycle_static_capacity:
                 # Identical static aliases consume DP slots but add no movie.
                 # Reuse only those freed slots for distinct, already-generated
                 # camera/subject options. Keep all old source-pair winners and
                 # every physical baseline. Never enlarge the port-work bound.
-                def physical(option):
-                    _,a,b,ha,hb,_,left,right=option
-                    return (a,b,ha,hb,*left,*right)
                 retained={physical(option) for option in proposals}
                 before=len(proposals)
                 remaining=sorted((option for options in candidates.values() for option in options),key=lambda x:x[:6])
@@ -191,6 +200,14 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     if key in retained or not feasible(option):continue
                     retained.add(key);proposals.append(option)
                 extra_count+=len(proposals)-before
+            if retain_pair_cameras:
+                retained={physical(option) for option in proposals}
+                actors={(a,b,ha,hb) for _,a,b,ha,hb,*_ in primary}
+                for option in sorted((o for values in candidates.values() for o in values
+                        if o[1:5] in actors),key=lambda x:x[:6]):
+                    key=physical(option)
+                    if key in retained or not feasible(option):continue
+                    retained.add(key);proposals.append(option);camera_variants+=1
             for _,a,b,ha,hb,k,ca,cb in proposals:
                 original_retained+=int(np.array_equal(ca,[1.,.5,.5]) and np.array_equal(cb,[1.,.5,.5]))
                 pair_id=('paired',n,a,b,ha,hb,k)
@@ -218,5 +235,9 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         original_feature_role_used_before_global_pruning=roles is not None,
         identical_static_port_aliases_coalesced=static_aliases,
         all_baseline_interior_camera_families_retained=True,
+        primary_actor_pair_camera_variants_retained=bool(retain_pair_cameras),
+        additional_primary_pair_camera_options=camera_variants,
+        previous_work_bound_unchanged=not bool(retain_pair_cameras),
+        primary_pair_camera_options_per_actor_pair_upper_bound=4,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)
