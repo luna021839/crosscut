@@ -342,6 +342,8 @@ def main():
         help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
     parser.add_argument('--focal-geometry-weight',type=float,default=1.,
         help='Explicit1..8 importance of played face size/position continuity; same native/authored cost, no admission change')
+    parser.add_argument('--editorial-reference-source',type=int,action='append',default=None,
+        help='Physical source index for original framing/featured-member votes; repeatable, does not exclude render sources')
     parser.add_argument('--detailed-pose',action='store_true',
         help='Explicit E6: reuse existing raw133 head/hand observations; missing sidecars stay unknown')
     parser.add_argument('--recycle-static-camera-capacity',action='store_true',
@@ -416,6 +418,8 @@ def main():
     geometry_importance(args.focal_geometry_weight)
     if args.focal_geometry_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('focal geometry importance requires the explicit played-interval port consumer')
+    if args.editorial_reference_source is not None and not(args.played_pose_port_camera_prior and args.editorial_opportunity_exposure):
+        raise ValueError('editorial reference sources require the explicit editorial port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if args.supplement_native_cut_flanks and not args.joint_motion_event_seconds:
@@ -507,7 +511,7 @@ def main():
             matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
             focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose,
             output_height=args.preview_height if args.played_interval_utility else None,
-            geometry_weight=args.focal_geometry_weight)
+            geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():

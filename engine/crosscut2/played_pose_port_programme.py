@@ -27,7 +27,8 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
-                 focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.):
+                 focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
+                 editorial_reference_sources=None):
         from .editorial_roles import geometry_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
@@ -82,6 +83,12 @@ class PlayedPosePortPrior:
                 any(type(s) is not int or s<0 for s in self.source_cohort) or
                 len(set(self.source_cohort))!=len(self.source_cohort)):
             raise ValueError('distinct physical source cohort indices required')
+        self.editorial_reference_sources=None if editorial_reference_sources is None else tuple(editorial_reference_sources)
+        if self.editorial_reference_sources is not None and (not editorial_opportunities
+                or not self.editorial_reference_sources
+                or any(type(s) is not int or s<0 for s in self.editorial_reference_sources)
+                or len(set(self.editorial_reference_sources))!=len(self.editorial_reference_sources)):
+            raise ValueError('distinct physical editorial reference sources require editorial opportunities')
         files=['played_pose_port_programme.py','played_partial_pose.py','display_source_catalogue.py','fixed_holds.py','shot_camera_paths.py',
             'physical_display_observations.py','boundary_port_domain.py','boundary_arc_costs.py',
             'boundary_port_dp.py','boundary_camera_arc.py','focal_appearance.py','person_extent.py','source_clock_action.py',
@@ -160,6 +167,8 @@ class PlayedPosePortPrior:
         self.artifact['played_interval_utility']=bool(played_interval_utility)
         self.artifact['visible_person_competition']=self.person_attention
         self.artifact['explicit_source_cohort']=self.source_cohort
+        self.artifact['explicit_editorial_reference_sources']=self.editorial_reference_sources
+        self.artifact['editorial_reference_sources_do_not_exclude_render_sources']=True
         if self.person_attention:
             self.artifact.update(person_competition_unknown=.5,
                 person_competition_original_rectangles_only=True,
@@ -262,6 +271,13 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     cohort=getattr(prior,'source_cohort',None)
     if cohort is not None and any(s>=len(banks) for s in cohort):
         raise ValueError('source cohort escapes the physical source domain')
+    references=getattr(prior,'editorial_reference_sources',None)
+    if references is not None and any(s>=len(banks) for s in references):
+        raise ValueError('editorial reference sources escape the physical source domain')
+    # References express the original programme's framing/featured-person
+    # intent. Fullcams and one-takes remain legitimate render candidates;
+    # restricting editorial votes must never become a source-admission rule.
+    if references is None:references=cohort
     editorial=bool(prior.artifact.get('fixed_editorial_opportunities',False))
     readout=bool(prior.artifact.get('scene_readout',False))
     played=bool(prior.artifact.get('played_interval_utility',False))
@@ -303,6 +319,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     paths,camera_receipt=make_paths(nodes,banks,source_events,check=live,**camera_arguments)
     receipt=dict(source_local_appearance_clusters=counts,raw_actor_states_prepared_once=len(states),
         native_part_corroboration=part_receipts,camera_domain=camera_receipt,
+        editorial_reference_source_indices=list(range(len(banks))) if references is None else list(references),
         terminal_stencil_observations=[b.get('terminal_stencil_observation') for b in banks],
         unused_actor_camera_projection_rows_allocated=False,source_local_member_hints_consumed=False)
     cats=[]
@@ -311,7 +328,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     if identity_hints is not None:
         from .featured_member_state import bind_hints,consensus
         face_members,native_ports=bind_hints(banks,identity_hints,native_ports)
-        featured,featured_receipt,role_evidence=consensus(banks,face_members,return_evidence=True,source_cohort=cohort)
+        featured,featured_receipt,role_evidence=consensus(banks,face_members,return_evidence=True,source_cohort=references)
         if editorial:
             from .editorial_roles import FeatureRoles
             roles=FeatureRoles(nodes,role_evidence)
@@ -325,7 +342,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     framing=None
     if editorial:
         from .programme_framing import evidence as framing_evidence
-        framing,receipt['original_programme_framing']=framing_evidence(banks,source_cohort=cohort)
+        framing,receipt['original_programme_framing']=framing_evidence(banks,source_cohort=references)
     for s in range(len(banks)):
         live();raw=[d for state,d in zip(states,rows) if state.source==s and state.family=='native']
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
