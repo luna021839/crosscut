@@ -191,6 +191,21 @@ class SourceCatalogue:
             size=np.where(np.asarray(displayed_height)==height,size,np.minimum(1.,np.asarray(displayed_height)/.12))
         return self.roi_readability[n,side,head_index]*size
 
+    def body_subject_context(self,n,side,h):
+        """Camera-independent body evidence for fixed delivery targets too.
+
+        Head motion may reuse an old face track while a contradicted ROI arm
+        may not. All body consumers must use the same derived support mask.
+        This native strip only requests that context; it is never held as a
+        candidate camera or copied across the actual film interval.
+        """
+        if self.subjects is None:return None
+        if self.original_people is None:return self.subjects.sample(n,side,h)
+        if not 0<=h<self.bank['heads'].shape[2]:return None
+        head=self.bank['heads'][n,side,h]
+        if head[2]<=.019 or head[3]<.75:return None
+        return self.observation(n,side,np.tile([1.,.5,.5],(7,1)),target_head_index=int(h)).get('dense_subject_context')
+
     def observation(self,n,side,camera_strip,*,target_head_index=None,include_subjects=True):
         camera_strip=np.asarray(camera_strip,float)
         camera=camera_strip[-1 if side==0 else 0]

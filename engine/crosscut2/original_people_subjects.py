@@ -4,8 +4,47 @@ Four physical native samples remain sparse MODEL_ONLY hypotheses, not a
 fourteen-frame track. Face/DP changes do not request more model observations.
 """
 import numpy as np
+from dataclasses import replace
 from scipy.optimize import linear_sum_assignment
 from .multi_person_pose import bind_faces,BODY8_COCO17
+
+
+def independently_supported_dense(observation,context,*,source,binding,aspect):
+    """Keep precise14-frame gestures only on independently matching arms.
+
+    The original RTMW window/NPZ is immutable. A derived support mask removes
+    contradicted native joints; it never substitutes RTMO points into RTMW,
+    interpolates an unseen hand, or calls an unmeasured limb pixel-certified.
+    """
+    window=context['window'];at=np.asarray(context['at']);slots=np.array([0,6,7,13])
+    if (window.source!=source or window.binding!=binding or at.shape!=(14,)
+            or not np.array_equal(context['clock'].output_frames,np.arange(-7,7))
+            or not np.array_equal(context['clock'].native_indices[slots],observation['source_clock_native_indices'])
+            or not np.array_equal(window.ordinals[at[slots]],observation['source_clock_native_indices'])):
+        raise ValueError('precise and original-image body observations must share the actual physical clock/source')
+    body=np.asarray(observation['source_clock_body'])
+    kind=np.asarray(observation['source_clock_evidence'])
+    if body.shape!=(4,8,3) or kind.shape!=(4,8):raise ValueError('four exact original body samples required')
+    other=window.body[at[slots]]
+    known=np.isin(kind,(1,2))&context['supported'][slots]&context['same_shot'][slots,None]
+    gap=np.linalg.norm((other[...,:2]-body[...,:2])*[aspect,1.],axis=-1)
+    height=np.maximum(.019,window.heads[at[slots],2])
+    contradicted=known&(gap>.3*height[:,None])
+    support=window.support.copy()
+    for i,position in enumerate(at[slots]):support[position,contradicted[i]]=False
+    supported=context['supported']&support[at]
+    own=1 if observation['side']==0 else 2
+    confirmed=known[own]&~contradicted[own]
+    # Precise gestures need a complete genuinely corroborated arm, not a
+    # top-down wrist borrowed from someone else or a missing RTMO joint.
+    arms=[all(confirmed[list(chain)]) for chain in ((0,2,4),(1,3,5))]
+    if not any(arms):return None
+    supported=supported.copy();supported.setflags(write=False)
+    return dict(context,window=replace(window,support=support),supported=supported,
+        independent_full_image_body_validation=dict(confirmed_arms=arms,
+            contradicted_native_joints=int(contradicted.sum()),
+            source_code_family='separate_RTMWholebody133_and_RTMO_COCO17',
+            original_cache_rewritten=False,anatomical_ownership_certified=False))
 
 
 def link_people(a,b,*,aspect):
@@ -46,6 +85,7 @@ class OriginalPeople:
         self.associated=np.zeros((N,4,H),bool)
         self.endpoint_matches=np.full((N,H),-1,int)
         self.person_indices=np.full((N,4,H),-1,int)
+        self.precise_contexts={}
         rows=raw['by_native'];cuts=np.asarray(bank.get('native_cut_frames',[]),int)
         for n in range(N):
             frames=[rows[int(v)] for v in native[n]];seed=[]
@@ -88,6 +128,14 @@ class OriginalPeople:
             if context is not None:
                 result['focal_image_motion_context']=context
                 result['detailed_subject_context']=context
+                key=(int(n),int(side),int(h))
+                if key not in self.precise_contexts:
+                    self.precise_contexts[key]=independently_supported_dense(result,context,
+                        source=self.raw['source'],binding=self.raw['source_sha256'],aspect=self.aspect)
+                precise=self.precise_contexts[key]
+                if precise is not None:
+                    result['dense_subject_context']=precise
+                    result['precise_gesture_independently_corroborated']=True
         return result
 
     def receipt(self):
@@ -96,4 +144,5 @@ class OriginalPeople:
             associated_endpoint_faces=int(self.associated[:,[1,2]].sum()),
             associated_four_sample_faces=int(self.associated.sum()),
             face_capacity=self.body.shape[2],new_neural_calls=0,
+            independently_corroborated_precise_endpoints=sum(v is not None for v in self.precise_contexts.values()),
             four_samples_are_not_a_dense_track=True,anatomical_ownership_certified=False)

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from crosscut2.multi_person_pose import BODY8_COCO17,MODEL_SHA256
 from crosscut2.original_people_bank import FAMILY,save_chunk,load_chunk,load_reference
-from crosscut2.original_people_subjects import OriginalPeople,link_people
+from crosscut2.original_people_subjects import OriginalPeople,link_people,independently_supported_dense
 from crosscut2.display_source_catalogue import SourceCatalogue
 from crosscut2.detailed_pose import describe
 from test_crosscut2_source_clock_action import catalogue
@@ -112,6 +112,61 @@ def test_old_fingers_require_a_root_matching_the_actual_whole_frame_wrist(tmp_pa
 def row(native,people=1):
     return dict(native=native,boxes=np.zeros((people,4),np.float32),scores=np.ones(people,np.float32)*.8,
         keypoints17=np.zeros((people,17,3),np.float32),raster_sha256='a'*64)
+
+
+def precise_fixture(tmp_path):
+    from test_crosscut2_detailed_pose import fixture,observation
+    from crosscut2.detailed_pose import attach
+    window,path,_,_=fixture(tmp_path);window=attach(window,path)
+    context=observation(window,0)['dense_subject_context'];slots=[0,6,7,13]
+    value=dict(side=0,source_clock_body=window.body[slots].copy(),
+        source_clock_evidence=np.where(window.support[slots],1,0),
+        source_clock_native_indices=window.ordinals[slots].copy())
+    return window,path,context,value
+
+
+def test_precise_gestures_are_retained_without_rewriting_or_relabelling_old_windows(tmp_path):
+    window,path,context,value=precise_fixture(tmp_path);original=path.read_bytes()
+    actual=independently_supported_dense(value,context,source=0,binding=window.binding,aspect=16/9)
+    assert actual['independent_full_image_body_validation']['confirmed_arms']==[True,True]
+    np.testing.assert_array_equal(actual['window'].body,window.body)
+    np.testing.assert_array_equal(actual['supported'],context['supported'])
+    assert path.read_bytes()==original and actual['window'] is not window
+
+
+def test_one_contradicted_dense_arm_cannot_override_a_correct_original_person(tmp_path):
+    window,_,context,value=precise_fixture(tmp_path)
+    value['source_clock_body'][:,[0,2,4],0]+=.4
+    actual=independently_supported_dense(value,context,source=0,binding=window.binding,aspect=16/9)
+    assert actual['independent_full_image_body_validation']['confirmed_arms']==[False,True]
+    assert not actual['window'].support[[0,6,7,13]][:,[0,2,4]].any()
+    assert actual['window'].support[[0,6,7,13]][:,[1,3,5]].all()
+    assert window.support[[0,6,7,13]][:,[0,2,4]].all()  # old cache remains immutable
+    value['source_clock_body'][:,[1,3,5],0]+=.4
+    assert independently_supported_dense(value,context,source=0,binding=window.binding,aspect=16/9) is None
+
+
+def test_a_precise_arm_needs_actual_independent_support_not_just_missing_contradictions(tmp_path):
+    window,_,context,value=precise_fixture(tmp_path)
+    value['source_clock_evidence'][:]=0
+    assert independently_supported_dense(value,context,source=0,binding=window.binding,aspect=16/9) is None
+    value['source_clock_native_indices'][1]+=1
+    with pytest.raises(ValueError,match='physical clock/source'):
+        independently_supported_dense(value,context,source=0,binding=window.binding,aspect=16/9)
+
+
+@pytest.mark.parametrize('independent',[False,True])
+def test_unusable_supplemental_dense_evidence_does_not_erase_new_independent_source_pose(tmp_path,monkeypatch,independent):
+    from crosscut2 import dense_source_action
+    window,_,context,_=precise_fixture(tmp_path)
+    monkeypatch.setattr(dense_source_action,'_seam_action',lambda *a,**k:dict(seam_action_supported=False))
+    side=dict(dense_subject_contexts=[context],endpoint_cameras=np.array([[1.,.5,.5]]),
+        independent_full_image_body_context=np.array([independent]))
+    rates,available,basis,observed,used=dense_source_action.paired(side,side,
+        rates=np.full((1,1,2),.3),available=np.ones((1,1),bool),basis=np.full((1,1),.2))
+    np.testing.assert_allclose(rates,.3 if independent else .5)
+    assert available[0,0]==independent and basis[0,0]==(.2 if independent else 0.)
+    assert observed[0,0] and not used[0,0]
 
 
 def test_raw_bank_preserves_empty_frames_and_exact_native_bindings(tmp_path):

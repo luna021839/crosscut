@@ -108,6 +108,7 @@ def features(observations, *, fps, person_extents=False, focal_motion=False,deta
         endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps,
         endpoint_cameras=endpoint_camera,
         dense_subject_contexts=[o.get('dense_subject_context') for o in observations],
+        independent_full_image_body_context=np.asarray([o.get('original_full_image_people_used',False) for o in observations],bool),
         appearance_vectors=np.asarray([o.get('appearance_vector',np.zeros(128)) for o in observations],float))
     original=np.zeros((count,8,4))
     for k,o in enumerate(observations):

@@ -319,6 +319,31 @@ def test_original_native_cut_stops_fixed_target_without_excluding_other_source()
     assert field.delivery[1].frames.tolist()==[100,101,102,103]
 
 
+def test_fixed_delivery_uses_validated_body_context_not_the_unmasked_old_track(monkeypatch):
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from crosscut2.editorial_opportunities import Opportunities
+    cats=[prepared(s)[0] for s in range(2)]
+    context=cats[0].subjects.sample(1,0,0)
+    support=context['window'].support.copy();support[:,[0,2,4]]=False
+    validated=dict(context,window=replace(context['window'],support=support))
+    calls=[]
+    for source,cat in enumerate(cats):
+        cat.nodes=np.array([0,100,200]);cat.final=200
+        cat.bank['programme_render_clock']=dict(fps=30.,count=201,source_times=cat.nodes/30.)
+        def reader(n,side,head,source=source):
+            calls.append((source,n,side,head))
+            return validated if source==0 else None
+        monkeypatch.setattr(cat,'body_subject_context',reader)
+        monkeypatch.setattr(cat.subjects,'sample',lambda *a:pytest.fail('raw body bypassed validation'))
+    event=Opportunities([0,100,200],[0,1,0],fps=30.,families=['a','b'])
+    event.bindings[(1,0,1,0,0)]=.8;event.utility[1]=.8
+    field=PlayedIntervalUtility.from_catalogues(cats,event)
+    assert calls==[(0,1,0,0),(1,1,1,0)]
+    assert len(field.delivery[0].frames)==15 and not len(field.delivery[1].frames)
+    assert not field.delivery[0].support[:,[0,2,4]].any()
+    assert field.delivery[0].support[:,[1,3,5]].all()
+
+
 def test_batch_image_energy_preserves_scalar_support_and_compensation():
     row=image_pair(0,1,.05);obs=row['observation']
     before=np.array([[1.25,.5,.5],[1.25,.5,.5],[2.,.75,.5],[1.-2e-16,.5,.5]])

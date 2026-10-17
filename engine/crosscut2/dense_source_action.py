@@ -26,11 +26,18 @@ def motion(a,b,joints):
 def paired(left,right,*,rates,available,basis):
     rates=rates.copy();available=available.copy();basis=basis.copy()
     observed=np.zeros(available.shape,bool);used=np.zeros_like(observed)
+    original_a=left.get('independent_full_image_body_context',np.zeros(len(left['dense_subject_contexts']),bool))
+    original_b=right.get('independent_full_image_body_context',np.zeros(len(right['dense_subject_contexts']),bool))
     for i,a in enumerate(left['dense_subject_contexts']):
         if a is None:continue
         for j,b in enumerate(right['dense_subject_contexts']):
             if a is None or b is None:continue
-            observed[i,j]=True;rates[i,j]=.5;available[i,j]=False;basis[i,j]=0.
+            observed[i,j]=True
+            independent=original_a[i] and original_b[j]
+            # An unusable supplemental ROI must not erase an independently
+            # measured full-image source context. Legacy corrected windows
+            # retain their previous UNKNOWN replacement semantics.
+            if not independent:rates[i,j]=.5;available[i,j]=False;basis[i,j]=0.
             ac,bc=a['clock'],b['clock']
             if ac.fps!=bc.fps or not np.array_equal(ac.output_frames,bc.output_frames):
                 raise ValueError('dense subjects must share the actual music clock')

@@ -214,7 +214,8 @@ class PlayedIntervalUtility:
             if cat.subjects is None:continue
             selected=None
             for _,n,side,head in sorted(set(choices)):
-                context=cat.subjects.sample(n,side,head)
+                reader=getattr(cat,'body_subject_context',None)
+                context=cat.subjects.sample(n,side,head) if reader is None else reader(n,side,head)
                 if context is not None:
                     selected=(n,side,head,context);break
             if selected is None:continue
