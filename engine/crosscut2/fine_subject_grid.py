@@ -190,7 +190,7 @@ def expand(nodes,new_nodes,banks,poses,styles,states,windows,warps,clocks,*,mast
     return (*outputs,dict(sources=receipts,new_neural_calls=0,new_rasters=0))
 
 
-def rebind_hints(old_banks,new_banks,hints):
+def rebind_hints(old_banks,new_banks,hints,*,allow_previously_unobserved=False):
     """Retain original physical query profiles after adding measured occurrences."""
     result=[]
     for old,new,hint in zip(old_banks,new_banks,hints,strict=True):
@@ -204,10 +204,17 @@ def rebind_hints(old_banks,new_banks,hints):
         votes=[set() for _ in range(count)]
         for n in range(len(old_labels)):
             j=int(at[n])
+            known=np.ones(2,bool)
+            if allow_previously_unobserved:
+                known=np.asarray(old.get('face_observation_valid',np.ones(old_labels.shape[:2],bool)))[n]
+                if (np.any(old['heads'][n,~known]) or np.any(old['vectors'][n,~known])):
+                    raise ValueError('unobserved source slot contains conflicting old face evidence')
             if (not np.array_equal(new['native_indices'][j],old['native_indices'][n])
-                    or not np.array_equal(new['heads'][j],old['heads'][n]) or not np.array_equal(new['vectors'][j],old['vectors'][n])):
+                    or not np.array_equal(new['heads'][j,known],old['heads'][n,known])
+                    or not np.array_equal(new['vectors'][j,known],old['vectors'][n,known])):
                 raise ValueError('fine member reuse lost an original physical occurrence')
             for side,h in np.ndindex(old_labels.shape[1:]):
+                if not known[side]:continue
                 a,b=int(old_labels[n,side,h]),int(labels[j,side,h])
                 if a>=0 and b>=0 and old_values[a]>=0:votes[b].add(int(old_values[a]))
         values=np.asarray([next(iter(v)) if len(v)==1 else -1 for v in votes],np.int16)

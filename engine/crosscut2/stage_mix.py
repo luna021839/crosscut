@@ -322,6 +322,8 @@ def main():
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
     parser.add_argument('--extra-subject-observations',type=Path,action='append',default=[],
         help='Additional immutable subject-observation plans merged with the primary source-bound reference')
+    parser.add_argument('--face-endpoint-observations',type=Path,
+        help='Explicit source-bound observations completing missing face endpoints; never triggers new inference')
     parser.add_argument('--editorial-opportunity-exposure',action='store_true',
         help='Explicit E4 trial: once-per-musical-episode actual subject exposure and readable framing deficit')
     parser.add_argument('--played-interval-utility',action='store_true',
@@ -436,6 +438,8 @@ def main():
         raise ValueError('missing action exploration requires an explicit bounded subject opportunity probe')
     if args.extra_subject_observations and args.reuse_subject_observations is None:
         raise ValueError('extra subject observations require the primary bound subject reference')
+    if args.face_endpoint_observations is not None and not args.played_pose_port_camera_prior:
+        raise ValueError('face endpoint completion requires the actual played-pose programme path')
     started = monotonic()
     preference_model=None
     sequence_preference_model=None
@@ -596,6 +600,19 @@ def main():
                     cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
                     maximum_seconds=min(240.,args.maximum_perception_seconds),maximum_calls=288,
                     preserve_member_scores=args.individual_member_scores)
+            face_completion=None
+            if args.face_endpoint_observations is not None:
+                from .sparse_face_completion import load as load_faces,apply as apply_faces
+                from .fine_subject_grid import rebind_hints
+                hashes=[v['source_sha256'] for v in bound_source_cut_events]
+                completed,face_completion=load_faces(args.face_endpoint_observations,sources=original.sources,
+                    source_hashes=hashes,master_start=original.master_audio_start,fps=original.fps,
+                    authorized_root=args.cache.parent.parent)
+                previous_banks=banks
+                banks,poses,style,body_states,merged=apply_faces(banks,poses,style,body_states,completed,source_hashes=hashes)
+                if identity_hints is not None:
+                    identity_hints=rebind_hints(previous_banks,banks,identity_hints,allow_previously_unobserved=True)
+                face_completion['merge']=merged
             part_observer=None
             person_observer=None
             if args.person_rectangle_model is not None:
@@ -644,6 +661,7 @@ def main():
             fixed_receipt['native_event_registry']=registry_receipts
             fixed_receipt['supplementary_native_flanks']=supplementary_flank_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
+            fixed_receipt['sparse_face_endpoint_completion']=face_completion
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,
                 native_ports=native_ports,check=check)
             if args.common_evidence_connection_prior or args.played_face_connection_prior or args.played_pose_port_camera_prior:
