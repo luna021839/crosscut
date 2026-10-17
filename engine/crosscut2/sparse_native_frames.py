@@ -109,11 +109,13 @@ def windows(natives,clock,*,maximum_window_seconds=2.,maximum_decode_seconds=8.,
     return tuple(result)
 
 
-def frames(path,natives,*,clock,check=lambda:None,width=960,height=540,receipt=None,maximum_seconds=120.):
+def frames(path,natives,*,clock,check=lambda:None,width=960,height=540,receipt=None,maximum_seconds=120.,
+           maximum_decode_seconds=8.):
     if any(type(v) is not int or v<1 for v in (width,height)) or width*height*3>64*1024**2:
         raise ValueError('bounded positive raster dimensions required')
     path=Path(path);started=monotonic();consumer_pause=0.;window_started=None
-    plan=windows(natives,clock,maximum_selected_frames=min(32,(64*1024**2)//(width*height*3)))
+    plan=windows(natives,clock,maximum_decode_seconds=maximum_decode_seconds,
+        maximum_selected_frames=min(32,(64*1024**2)//(width*height*3)))
     def live():
         check()
         now=monotonic()
@@ -134,6 +136,7 @@ def frames(path,natives,*,clock,check=lambda:None,width=960,height=540,receipt=N
         planned_whole_source_presentation_coverage=any(key==0 and last==clock.count-1 for _,last,key,_ in plan),
         inspected_AVC_packet_header_bytes=clock.inspected_packet_header_bytes,
         maximum_active_decoder_seconds=maximum_seconds,per_window_deadline_seconds=min(30.,maximum_seconds),
+        maximum_declared_preroll_seconds=maximum_decode_seconds,
         AVC_random_access_requires_IDR_not_just_K_flag=True,
         source_NN=0,canonical_raster_reference='sequential_select_n_area_bgr24')
     rate=clock.rate

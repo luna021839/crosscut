@@ -34,6 +34,23 @@ def test_explicit_preroll_budget_can_admit_a_verified_long_gop_without_a_fallbac
     with pytest.raises(sparse.UnsupportedSeek):sparse.windows([900],c,maximum_decode_seconds=12.)
 
 
+def test_actual_reader_accepts_explicit_long_preroll_and_matches_sequential_pixels(tmp_path):
+    encoder=shutil.which('ffmpeg')
+    if not encoder:pytest.skip('existing FFmpeg required')
+    source=tmp_path/'long-idr-gap.mp4'
+    subprocess.run([encoder,'-nostdin','-v','error','-f','lavfi','-i',
+        'testsrc2=size=160x90:rate=30','-frames:v','330','-an','-c:v','libx264',
+        '-bf','3','-g','330','-keyint_min','330','-sc_threshold','0','-pix_fmt','yuv420p',str(source)],check=True)
+    c=sparse.probe(source);wanted=[257,258];receipt={}
+    with pytest.raises(sparse.UnsupportedSeek,match='preroll'):
+        list(sparse.frames(source,wanted,clock=c))
+    actual=dict(sparse.frames(source,wanted,clock=c,maximum_decode_seconds=9.,receipt=receipt))
+    reference=dict(sequential(source,wanted,check=lambda:None))
+    for tick in wanted:np.testing.assert_array_equal(actual[tick],reference[tick])
+    assert receipt['maximum_declared_preroll_seconds']==9.
+    assert receipt['maximum_window_presentation_span_frames']>240
+
+
 def test_AVC_open_GOP_key_picture_is_not_a_random_access_IDR():
     import io
     packet=lambda kinds:b''.join((2).to_bytes(4,'big')+bytes([kind,0]) for kind in kinds)

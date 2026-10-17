@@ -151,6 +151,27 @@ def load(reference,*,sources,source_hashes,master_start,fps,authorized_root,maxi
     """Explicit source/native records only; never start a detector on a miss."""
     from .grid_perception import file_identity
     maximum_records=_allowance(maximum_records)
+    if isinstance(reference,(list,tuple)):
+        if not 1<=len(reference)<=16 or not all(isinstance(p,(str,Path)) for p in reference):
+            raise ValueError('One to16 explicit face-observation references required')
+        rows=[];receipts=[];by_native={};seen=set()
+        for path in reference:
+            canonical=Path(path).resolve(strict=True)
+            if canonical in seen:continue
+            seen.add(canonical)
+            loaded,receipt=load(path,sources=sources,source_hashes=source_hashes,master_start=master_start,
+                fps=fps,authorized_root=authorized_root,maximum_records=maximum_records)
+            for row in loaded:
+                key=(row['source'],row['native_frame'])
+                if key in by_native:
+                    previous=by_native[key]
+                    if any(not np.array_equal(previous[k],value) for k,value in row.items()):
+                        raise ValueError('Conflicting physical face observations across references')
+                    continue
+                by_native[key]=row;rows.append(row)
+            if len(rows)>maximum_records:raise ValueError('Combined face-record allowance exceeded')
+            receipts.append(receipt)
+        return rows,dict(records_loaded=len(rows),source_references=receipts,new_NN_or_decode_in_loader=False)
     root=Path(authorized_root).resolve(strict=True);reference=Path(reference)
     if reference.is_symlink() or not reference.resolve(strict=True).is_relative_to(root):
         raise ValueError('Face endpoint reference outside the authorized project')

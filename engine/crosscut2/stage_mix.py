@@ -322,7 +322,7 @@ def main():
         help='Existing source-bound dense subject-observation plan; cache-only E matching, no new inference')
     parser.add_argument('--extra-subject-observations',type=Path,action='append',default=[],
         help='Additional immutable subject-observation plans merged with the primary source-bound reference')
-    parser.add_argument('--face-endpoint-observations',type=Path,
+    parser.add_argument('--face-endpoint-observations',type=Path,action='append',
         help='Explicit source-bound observations completing missing face endpoints; never triggers new inference')
     parser.add_argument('--face-endpoint-record-limit',type=int,default=128,
         help='Explicit cached face-record allowance (0..8192); default128, no implicit source work')

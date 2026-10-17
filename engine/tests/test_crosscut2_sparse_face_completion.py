@@ -159,3 +159,31 @@ def test_explicit_cached_reference_validates_source_and_native_binding_without_m
     record['records'][0]['native_frame']=100;reference.write_text(json.dumps(record))
     with pytest.raises(ValueError,match='producer/ordinal changed'):
         load(reference,sources=[source],source_hashes=['a'*64],master_start=0.,fps=30.,authorized_root=tmp_path)
+
+
+def test_separate_completed_batches_union_with_their_actual_producers_and_no_duplicate_work(tmp_path):
+    import json
+    from crosscut2.grid_perception import file_identity
+    from crosscut2.sparse_face_completion import load
+    source=tmp_path/'source.mp4';source.write_bytes(b'not-decoded')
+    identity=list(file_identity(source))
+    def reference(name,native,*,conflict=False):
+        data=row(native=native);producer=dict(actual_producer=name)
+        if conflict:data['heads'][0,0]+=.1
+        binding=json.dumps(dict(source_sha256='a'*64,source_identity=identity,native_frame=native,
+            producer=producer),sort_keys=True)
+        cache=tmp_path/(name+'.npz')
+        with cache.open('xb') as f:np.savez_compressed(f,binding=binding,**data)
+        path=tmp_path/(name+'.json')
+        path.write_text(json.dumps(dict(sources=[str(source)],source_sha256=['a'*64],source_file_identities=[identity],
+            fps=30.,master_audio_start=0.,records=[dict(source=0,native_frame=native,path=str(cache))],
+            producer=producer,used=dict(face=1),elapsed_seconds=.1)))
+        return path
+    a,b=reference('actual-first',99),reference('actual-complement',100)
+    kw=dict(sources=[source],source_hashes=['a'*64],master_start=0.,fps=30.,authorized_root=tmp_path)
+    rows,receipt=load([a,b,a],**kw)
+    assert [r['native_frame'] for r in rows]==[99,100]
+    assert len(receipt['source_references'])==2 and not receipt['new_NN_or_decode_in_loader']
+    with pytest.raises(ValueError,match='Combined'):load([a,b],maximum_records=1,**kw)
+    with pytest.raises(ValueError,match='Conflicting'):
+        load([a,reference('conflicting-observation',99,conflict=True)],**kw)
