@@ -468,7 +468,8 @@ def main():
             played_interval_utility=args.played_interval_utility,shot_duration_model=duration_model,
             recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
             matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
-            focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose)
+            focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose,
+            output_height=args.preview_height if args.played_interval_utility else None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():

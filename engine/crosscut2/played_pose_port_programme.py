@@ -27,7 +27,7 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
-                 focal_motion=False,detailed_pose=False):
+                 focal_motion=False,detailed_pose=False,output_height=None):
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -49,6 +49,9 @@ class PlayedPosePortPrior:
         if detailed_pose and not played_interval_utility:
             raise ValueError('detailed head/hand pose requires actual played interval utility')
         self.detailed_pose=bool(detailed_pose)
+        if output_height is not None and (not played_interval_utility or type(output_height) is not int or not 1<=output_height<=8192):
+            raise ValueError('Actual output height requires the played interval consumer')
+        self.output_height=output_height
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
@@ -189,6 +192,11 @@ class PlayedPosePortPrior:
                 all_old_physical_candidates_retained=False,
                 detailed_pose_missing_never_fabricates_a_stationary_hand=True)
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
+        self.artifact['actual_output_height_pixels']=self.output_height
+        if self.output_height is not None:
+            self.artifact.update(focal_crop_support='observed_shoulders_elbows_wrists_not_hip_visibility',
+                zoom_effort='added_actual_native_pixel_interpolation_beyond_original_view',
+                native_readability_not_increased_by_magnification=True)
         self.artifact['matched_action_preference_learned_from_references']=False
         self.artifact['composed_focal_image_motion']=self.focal_motion
         if self.focal_motion:
@@ -300,7 +308,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
             member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s],
             editorial_content=editorial,framing_evidence=framing,
-            person_attention=getattr(prior,'person_attention',False)))
+            person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None)))
     del states,rows,raw
     if getattr(prior,'person_attention',False):
         receipt['person_attention_observation_coverage']=[dict(source=s,

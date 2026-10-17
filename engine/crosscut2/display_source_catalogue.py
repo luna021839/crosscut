@@ -11,10 +11,39 @@ from .played_partial_pose import source_activity
 from .source_clock_action import endpoint_correspondence
 
 
+def upper_body_crop_loss(valid,projected):
+    """A focal close-up need not retain hips; its observed arms still matter.
+
+    Formation coverage has its separate original-family people term. A
+    face-count label cannot certify that a shot must show the lower body.
+    This changes framing preference only, not pose support or cut admission.
+    """
+    valid=np.asarray(valid)[...,:6];projected=np.asarray(projected)[...,:6,:]
+    lost=valid&((projected<0).any(-1)|(projected>1).any(-1))
+    return lost.sum(-1)/np.maximum(1,valid.sum(-1))
+
+
+def added_pixel_upscale_effort(displayed_height,native_pixels,measured,zoom,*,output_height):
+    """Only added interpolation beyond the original native-view sampling.
+
+    A 4K→1080p crop can enlarge a face without upsampling a single pixel.
+    Existing ROI readability still scores blur/clipping/native detail. No
+    measurement means the previous finite zoom effort, not a passing face.
+    """
+    shown,native,known,z=np.broadcast_arrays(displayed_height,native_pixels,measured,zoom)
+    need=shown*output_height/np.maximum(1e-9,native)
+    base=need/z
+    added=np.maximum(0.,np.log2(np.maximum(1e-9,need)))-np.maximum(0.,np.log2(np.maximum(1e-9,base)))
+    return np.where(known,np.maximum(0.,added),np.log2(z))
+
+
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
-                 editorial_content=False,framing_evidence=None,person_attention=False):
+                 editorial_content=False,framing_evidence=None,person_attention=False,output_height=None):
+        if output_height is not None and (type(output_height) is not int or not 1<=output_height<=8192):
+            raise ValueError('Actual positive integer output pixel height required')
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
+        self.output_height=output_height
         self.subjects=subjects
         self.editorial_content=bool(editorial_content)
         self.framing_evidence=framing_evidence
@@ -65,6 +94,9 @@ class SourceCatalogue:
         self.black=np.clip((style['presence'][...,0]-.8)/.2,0,1)
         from .scene_readout import roi_readability
         self.roi_readability,self.roi_readability_valid=roi_readability(bank)
+        native_measurements=bank.get('native_readability')
+        self.native_face_pixels=(np.zeros(bank['heads'].shape[:3]) if native_measurements is None
+            else np.asarray(native_measurements)[...,3])
         # Explicit numerical integration domain; never used as native K proof.
         ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
         measured=np.asarray(bank.get('face_observation_valid',np.ones((N,2),bool)))
@@ -255,6 +287,11 @@ class SourceCatalogue:
         projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
         crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
         if self.editorial_content:
+            zoom_effort=np.log2(camera[...,0])
+            if self.output_height is not None:
+                crop=upper_body_crop_loss(valid,projected)
+                zoom_effort=added_pixel_upscale_effort(displayed_height,self.native_face_pixels[n,side,index],
+                    self.roi_readability_valid[n,side,index],camera[...,0],output_height=self.output_height)
             # Native ROI deficits remain explicit; digital enlargement cannot
             # create detail. The native .12 sampling size and item-wise units
             # are engineering conventions, not fitted aesthetic thresholds.
@@ -290,7 +327,7 @@ class SourceCatalogue:
             # observed empty viewport. Retain the previous unfitted1 proxy,
             # without fabricating face/framing/oversize evidence in the gap.
             # Digital enlargement and movement still pay their real costs.
-            loss=np.where(self.content_scope[frames],observed,1.)+.1*np.log(camera[...,0])/np.log(2.)
+            loss=np.where(self.content_scope[frames],observed,1.)+.1*zoom_effort
             if self.person_attention:
                 from .person_attention import competition
                 value=competition(self.person_boxes[n,side],h,camera)
