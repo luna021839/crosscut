@@ -148,6 +148,7 @@ def test_real_selector_records_the_used_cost_and_replays_its_actual_objective():
         assert seam['focal_image_motion_rate']==.5
         assert seam['focal_image_motion_relative_cost']==0.
         assert not seam['focal_image_motion_measured']
+        assert seam['focal_image_motion_action_credit_cap']==1.
 
 
 def test_native_prefix_and_exact_replay_pay_the_same_unknown_motion():
@@ -169,6 +170,37 @@ def test_unknown_is_not_a_new_pacing_prior_or_a_perfect_motion_measurement():
     assert relative_cost(0.)==-.5 and relative_cost(1.)==.5
     for invalid in (np.nan,np.inf,-.01,1.01):
         with pytest.raises(ValueError):relative_cost(invalid)
+
+
+def test_actual_composed_flow_bounds_a_body_bonus_but_missing_flow_and_admission_do_not_change():
+    from crosscut2.focal_image_motion import bound_connection_credit
+    detail=dict(focal_image_motion_rate=np.array([[0.,.25,.6,.5]]),
+        focal_image_motion_measured=np.array([[True,True,True,False]]),
+        matched_action_change_density=np.full((1,4),.7),actual_played_match_advantage=np.full((1,4),.8),
+        allowed=np.ones((1,4),bool))
+    result=bound_connection_credit(detail)
+    np.testing.assert_allclose(result['matched_action_change_density'],[[.7,.5,0.,.7]])
+    np.testing.assert_allclose(result['actual_played_match_advantage'],[[.8,.5,0.,.8]])
+    np.testing.assert_array_equal(result['allowed'],detail['allowed'])
+    np.testing.assert_array_equal(detail['matched_action_change_density'],np.full((1,4),.7))
+
+
+def test_articulated_recomputation_caps_only_the_actual_camera_not_the_native_proposal():
+    from crosscut2.played_interval_utility import articulated_seam_evidence
+    from crosscut2.played_partial_pose import features,matrix as played_matrix
+    from test_crosscut2_played_partial_pose import observation as body_observation
+    a,b=body_observation(0),body_observation(1)
+    a.update(observation(.5+.005*(TICKS+1),side=0));b.update(observation(.5-.005*TICKS,side=1))
+    detail=played_matrix(features([a],fps=30.,focal_motion=True),features([b],fps=30.,focal_motion=True),details=True)
+    detail.update(pose_rate=np.array([[.1]]),matched_action_change_density=np.array([[.7]]),
+        matched_action_evidence_density=np.array([[.7]]))
+    # No complete arm in this fixture: preserve the actual body evidence.
+    proposal=articulated_seam_evidence(detail,[a],[b])
+    assert proposal['matched_action_change_density'][0,0]==pytest.approx(.7)
+    actual=articulated_seam_evidence(detail,[a],[b],cap_actual_focal_motion=True)
+    assert actual['focal_image_motion_rate'][0,0]>.5
+    assert actual['matched_action_change_density'][0,0]==0.
+    np.testing.assert_array_equal(actual['allowed'],proposal['allowed'])
 
 
 if __name__ == '__main__':

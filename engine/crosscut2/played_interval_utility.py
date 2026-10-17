@@ -12,7 +12,7 @@ from .programme_source_clock import indices
 from .observed_reframing import displayed_energy_many
 
 
-def articulated_seam_evidence(detail,left,right):
+def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False):
     """Reuse the cut refiner's actual played-arm observation BEFORE DP.
 
     Contemporary source windows and the proposed physical -1/0 cameras are
@@ -58,6 +58,9 @@ def articulated_seam_evidence(detail,left,right):
         result['matched_action_change_density']=np.minimum(basis,advantage)
     if 'detailed_pose_channels' in result:
         from .detailed_pose import bound_connection_credit
+        result=bound_connection_credit(result)
+    if cap_actual_focal_motion:
+        from .focal_image_motion import bound_connection_credit
         result=bound_connection_credit(result)
     return result
 

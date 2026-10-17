@@ -196,6 +196,8 @@ class PlayedPosePortPrior:
                 focal_image_motion_cost='six_output_frame_seconds_times_bounded_residual_minus_UNKNOWN_.5',
                 focal_image_motion_unknown=.5,native_focal_motion_unmeasured_not_exempt=True,
                 focal_image_motion_changes_admission=False,
+                measured_actual_camera_focal_motion_bounds_match_credit=True,
+                native_proposal_motion_does_not_cap_repairable_camera_credit=True,
                 terminal_digital_rate_continuation_is_a_local_hypothesis=True,
                 source_motion_used_before_pair_pruning=True,
                 additional_motion_actor_pair_limit_per_node=2,
@@ -373,7 +375,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             detail=matrix(left,right,details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
-                detail=articulated_seam_evidence(detail,exits[n],entries[n])
+                detail=articulated_seam_evidence(detail,exits[n],entries[n],cap_actual_focal_motion=focal_motion)
             a=np.array([p.source for p in exits[n]]);b=np.array([p.source for p in entries[n]])
             from .editorial_roles import apply,event_energy,ordinary_pairs
             if roles is not None:
@@ -545,7 +547,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 features([b.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose),details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
-                detail=articulated_seam_evidence(detail,[a],[b])
+                detail=articulated_seam_evidence(detail,[a],[b],cap_actual_focal_motion=focal_motion)
             if roles is not None:
                 from .editorial_roles import apply
                 detail=apply(detail,roles.at(int(nodes[i]),a.observation['recurrent_member_hint'],b.observation['recurrent_member_hint']))
@@ -594,6 +596,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                     else o['dense_subject_context']['clock'].native_indices.tolist() for o in observed],
                 actual_camera_strips=[o['camera_strip'].tolist() for o in observed],
                 focal_image_motion_cost_used=focal_motion,
+                focal_image_motion_action_credit_cap=(float(detail['focal_image_motion_action_credit_cap'][0,0]) if focal_motion else None),
                 detailed_pose_cost_used=detailed_pose,
                 detailed_pose_rate=(float(detail['detailed_pose_rate'][0,0]) if detailed_pose else None),
                 detailed_pose_measured=(bool(detail['detailed_pose_measured'][0,0]) if detailed_pose else False),

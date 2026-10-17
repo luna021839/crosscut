@@ -24,6 +24,27 @@ def relative_cost(risk):
     return value-.5
 
 
+def bound_connection_credit(detail):
+    """Only a measured, actual-camera flow can limit matched-action credit.
+
+    The existing UNKNOWN residual is .5. Advantage above that neutral can
+    cap, never create, a body/hand match benefit. Missing flow changes no
+    old benefit or source admission. Call after actual articulated scoring,
+    not on a native-view proposal a later digital track could compensate.
+    """
+    if 'focal_image_motion_rate' not in detail:return detail
+    risk=np.asarray(detail['focal_image_motion_rate'],float)
+    known=np.asarray(detail['focal_image_motion_measured'])
+    if known.dtype!=bool or known.shape!=risk.shape:
+        raise ValueError('Separate measured actual-camera focal flow required')
+    relative_cost(risk)  # Validate the same bounded residual, not a probability.
+    cap=np.where(known,np.maximum(0.,1.-2.*risk),1.)
+    result=dict(detail,focal_image_motion_action_credit_cap=cap)
+    for key in ('matched_action_change_density','actual_played_match_advantage'):
+        if key in result:result[key]=np.minimum(result[key],cap)
+    return result
+
+
 def _project(head, camera):
     return (.5 + camera[..., :1] * (head[..., :2] - camera[..., 1:])) * [16 / 9, 1.]
 
