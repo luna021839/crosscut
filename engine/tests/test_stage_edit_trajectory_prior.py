@@ -84,7 +84,8 @@ class TrajectoryPriorRegressionTests(unittest.TestCase):
             values=np.asarray(renderer_safe_values_from_raw_v3(mx.full((count,4),.1)))
             tracks.append(SimpleNamespace(context_embedding=np.array([.2,.1,0.,0.]),
                 source_embedding=np.array([-.1,.3,0.,0.]),values=values,
-                normalized_times=np.arange(count)/count,motion_label='dynamic',motion_label_loss_masked=masked))
+                normalized_times=np.arange(count)/count,motion_label='dynamic',motion_label_loss_masked=masked,
+                observed_values=values,observed_normalized_times=np.arange(count)/count))
         def loss(module,batch):return _dynamic_crop_v3_prior_minibatch_loss(module,batch,initial,
             projection,projection,normalizer,contract,balance)
         total,parts=loss(adapter,tracks)

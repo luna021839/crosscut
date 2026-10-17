@@ -5,7 +5,7 @@ supervision files and held-out partition. Change only prepared target-free
 features and their schema width. No automatic qualification or activation.
 """
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
@@ -39,7 +39,7 @@ def checkpoint_working_space(config,version=3,*,reserve_bytes=2**30,written_weig
     return reserve_bytes+64*2**20+followup_payload_bytes+max(0,count*4-written_weight_bytes)
 
 
-def training_arguments(original, prepared, schema, output):
+def training_arguments(original, prepared, schema, output, *, dynamic_loss_override=None):
     args = list(original)
     snapshots = prepared['feature_snapshot_by_reference']
     seen = set()
@@ -63,6 +63,25 @@ def training_arguments(original, prepared, schema, output):
         raise ValueError('one complete explicit nonactivating production launch is required')
     if '--token-schema-json' in args:
         raise ValueError('source launch already has a custom schema; do not overwrite it implicitly')
+    if dynamic_loss_override is not None:
+        from crosscut.stage_edit_dynamic_crop_head_v3 import DynamicCropV3LossContract
+        from crosscut.stage_edit_transformer import StageEditLossContract
+        if '--dynamic-crop-version' not in args or args[args.index('--dynamic-crop-version')+1] != '3':
+            raise ValueError('an explicit v3 loss override requires the unchanged v3 model path')
+        values = dict(dynamic_loss_override)
+        values['base'] = StageEditLossContract(**values['base'])
+        selected = DynamicCropV3LossContract(**values)
+        if ('--base-loss-contract-json' not in args or selected.base != StageEditLossContract(
+                **json.loads(args[args.index('--base-loss-contract-json')+1]))):
+            raise ValueError('a trajectory-loss override cannot change the frozen base objective')
+        flag = '--dynamic-crop-loss-contract-json'
+        encoded = json.dumps(asdict(selected), separators=(',', ':'))
+        if args.count(flag) > 1:
+            raise ValueError('ambiguous existing trajectory loss arguments')
+        if flag in args:
+            args[args.index(flag)+1] = encoded
+        else:
+            args.extend((flag, encoded))
     args.extend(('--token-schema-json', json.dumps(schema.to_dict(), separators=(',',':'))))
     return args, config
 
@@ -78,6 +97,8 @@ def main():
         help='Explicit free-space reserve; full FP32 weights and64MiB metadata are budgeted separately. Minimum256.')
     p.add_argument('--followup-payload-bytes',type=int,default=0,
         help='Keep this explicitly calculated later render payload free throughout model fitting.')
+    p.add_argument('--dynamic-crop-loss-contract-json',
+        help='Explicitly change the v3 trajectory objective only; preserve the frozen base loss, inputs and capacity.')
     a = p.parse_args()
     volume = Path('/Volumes/CrossCutMedia')
     if (not volume.is_mount() or volume.stat().st_dev != a.ssd_device
@@ -91,7 +112,9 @@ def main():
     schema = StageEditTokenSchema.from_dict(json.loads(Path(prepared['token_schema_path']).read_bytes()))
     if schema.fingerprint != prepared['token_schema_fingerprint']:
         raise ValueError('prepared token schema changed')
-    args, config = training_arguments(json.loads(original_bytes)['argv'], prepared, schema, a.output)
+    loss_override = None if a.dynamic_crop_loss_contract_json is None else json.loads(a.dynamic_crop_loss_contract_json)
+    args, config = training_arguments(json.loads(original_bytes)['argv'], prepared, schema, a.output,
+        dynamic_loss_override=loss_override)
     version=int(args[args.index('--dynamic-crop-version')+1]) if '--dynamic-crop-version' in args else 2
     reserve=a.workspace_reserve_mib*2**20
     needed=checkpoint_working_space(config,version,reserve_bytes=reserve,followup_payload_bytes=a.followup_payload_bytes)
@@ -104,6 +127,7 @@ def main():
         original_launch_sha256=hashlib.sha256(original_bytes).hexdigest(),
         prepared_inputs_sha256=hashlib.sha256(prepared_bytes).hexdigest(),
         prepared_inputs=str(a.prepared_inputs), argv=args, model_config=config.to_dict(), pid=os.getpid(),
+        explicit_dynamic_crop_loss_override=loss_override,
         storage_budget=dict(parameter_count=parameter_count,float32_weight_bytes=parameter_count*4,
             metadata_header_allowance_bytes=64*2**20,reserve_bytes=reserve,
             followup_payload_bytes=a.followup_payload_bytes,

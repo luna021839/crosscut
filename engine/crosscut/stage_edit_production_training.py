@@ -2038,6 +2038,8 @@ class _DynamicCropV3PriorTrack:
     motion_label_loss_masked: bool
     context_embedding: np.ndarray | None = None
     source_embedding: np.ndarray | None = None
+    observed_values: tuple[tuple[float, float, float, float], ...] | None = None
+    observed_normalized_times: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2225,6 +2227,13 @@ def _dynamic_crop_v3_prior_inventory(
                     motion_label=str(target.motion_label),
                     motion_label_loss_masked=bool(
                         target.motion_label_loss_masked
+                    ),
+                    observed_values=tuple(
+                        (float(p.zoom), float(p.center_x), float(p.center_y), float(p.roll_degrees))
+                        for p in target.original_observed_keyframes
+                    ),
+                    observed_normalized_times=tuple(
+                        float(p.time_seconds) / duration for p in target.original_observed_keyframes
                     ),
                 )
             )
@@ -2785,6 +2794,9 @@ def _dynamic_crop_v3_prior_loss_from_raw(
     contract: DynamicCropV3LossContract,
     count_sample_weight: float = 1.0,
     motion_sample_weight: float = 1.0,
+    *,
+    observed_values: Any = None,
+    observed_times: Any = None,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Evaluate the exact v3 renderer loss for an already-composed head."""
 
@@ -2820,11 +2832,24 @@ def _dynamic_crop_v3_prior_loss_from_raw(
         if motion_supervised
         else mx.array(0.0, dtype=raw.dtype)
     )
+    from .stage_edit_dynamic_crop_curve_loss import decoded_curve_risk
+    curve_loss = mx.array(0., dtype=raw.dtype)
+    if contract.decoded_curve_weight > 0.:
+        # Standalone callers may supply only their actual target knots. The
+        # production inventory/minibatch always passes the complete original
+        # observations, including knots removed by simplification.
+        curve_loss, _ = decoded_curve_risk(
+            renderer_safe_values_from_raw_v3(raw_values), all_times,
+            raw[values_stop:count_stop],
+            target_times if observed_times is None else observed_times,
+            target_values if observed_values is None else observed_values,
+        )
     total = (
         contract.value_weight * value_loss
         + contract.count_weight * count_loss
         + contract.time_weight * time_loss
         + contract.motion_weight * motion_loss
+        + contract.decoded_curve_weight * curve_loss
     )
     return total, {
         "values_normalized": value_loss,
@@ -2834,6 +2859,7 @@ def _dynamic_crop_v3_prior_loss_from_raw(
         "count": count_loss,
         "times": time_loss,
         "motion": motion_loss,
+        "decoded_curve": curve_loss,
         "total": total,
     }
 
@@ -2861,6 +2887,10 @@ def _dynamic_crop_v3_prior_minibatch_loss(
     for track in tracks:
         if track.context_embedding is None or track.source_embedding is None:
             raise RuntimeError("Dynamic Crop v3 prior sampled an unmaterialized feature")
+        if contract.decoded_curve_weight > 0. and (
+            track.observed_values is None or track.observed_normalized_times is None
+        ):
+            raise ValueError("Prior played-curve loss needs complete original observations")
         raw = _dynamic_crop_v3_structured_prior_raw(
             module, initial_snapshot, context_projection, source_projection,
             normalizer, mx.array(track.context_embedding), mx.array(track.source_embedding),
@@ -2872,6 +2902,8 @@ def _dynamic_crop_v3_prior_minibatch_loss(
             motion, not track.motion_label_loss_masked, contract,
             balance["count_class_weights_1_to_8"][count - 1],
             balance["motion_class_weights_static_dynamic"][int(motion)],
+            observed_values=None if track.observed_values is None else mx.array(track.observed_values),
+            observed_times=None if track.observed_normalized_times is None else mx.array(track.observed_normalized_times),
         )
         parts.append(components)
     averaged = {
@@ -2966,6 +2998,7 @@ def _dynamic_crop_v3_prior_component_scale_evidence(
     contract: DynamicCropV3LossContract,
 ) -> dict[str, Any]:
     residuals: list[float] = []
+    original_curve_residuals: list[float] = []
     time_residuals: list[float] = []
     keyframe_count = 0
     count_histogram = [0] * DYNAMIC_CROP_V3_MAX_KEYFRAMES
@@ -2984,6 +3017,13 @@ def _dynamic_crop_v3_prior_component_scale_evidence(
             (initial_values[:count] - targets) / scales
         )
         residuals.extend(normalized_residual.reshape(-1).tolist())
+        observed = np.asarray(
+            track.observed_values if track.observed_values is not None else track.values,
+            dtype=np.float64,
+        )
+        original_curve_residuals.extend(
+            np.abs((initial_values[0] - observed) / scales).reshape(-1).tolist()
+        )
         expected_times = (
             np.arange(count, dtype=np.float64) / count
             if count > 1
@@ -3016,16 +3056,18 @@ def _dynamic_crop_v3_prior_component_scale_evidence(
     weighted_time = contract.time_weight * time_smooth_l1
     weighted_motion = contract.motion_weight * math.log(2.0)
     return {
-        "contract": "training_only_v3_initial_component_scale_evidence_v2",
+        "contract": "training_only_v3_initial_component_scale_and_original_curve_evidence_v3",
         "training_track_count": len(inventory.tracks),
         "training_keyframe_count": keyframe_count,
         "training_count_histogram_1_to_8": count_histogram,
         "training_motion_histogram": motion_histogram,
         "training_motion_masked_count": motion_masked_count,
         "training_coordinate_scalar_count": int(value_residual.size),
-        "gate_aligned_initial_normalized_coordinate_mae": float(
+        "teacher_forced_initial_retained_knot_normalized_mae": float(
             value_residual.mean()
         ),
+        "initial_static_original_observation_curve_normalized_mae": float(np.mean(original_curve_residuals)),
+        "initial_decoded_curve_loss_weighted": contract.decoded_curve_weight * float(np.mean(original_curve_residuals)),
         "initial_value_smooth_l1_unweighted": value_smooth_l1,
         "initial_value_smooth_l1_weighted": weighted_value,
         "initial_uniform_count_cross_entropy_weighted": weighted_count,
@@ -4029,7 +4071,7 @@ def train_production_stage_edit(
                                  sequence_id=t.sequence_id, token_index=t.token_index, source_id=t.source_id)
                             for t in batch_tracks
                         ],
-                        "gate_aligned_normalized_coordinate_mae": float(
+                        "teacher_forced_retained_knot_normalized_coordinate_mae": float(
                             prior_components["values_normalized_mae"].item()
                         ),
                         "normalized_value_smooth_l1": float(prior_components["values_normalized"].item()),
@@ -4045,6 +4087,7 @@ def train_production_stage_edit(
                         "prior_motion_loss": float(
                             prior_components["motion"].item()
                         ),
+                        "prior_decoded_curve_loss": float(prior_components["decoded_curve"].item()),
                         "motion_label_supervised": not track.motion_label_loss_masked,
                         "gradient_norm_before_clip": float(
                             gradient_norm.item()

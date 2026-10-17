@@ -595,7 +595,8 @@ def run_diagnostic(fixture, out, *, budget, interaction_release_ab=False,bounded
                     check=budget.check,record=attribution)
             else:loss,gradients=grad_fn(model,batch,base,dynamic)
             if step>=5:
-                rows=head_row_norms(gradients);supported=row_supervision(len(track.values),motion_masked=track.motion_label_loss_masked)
+                rows=head_row_norms(gradients);supported=row_supervision(len(track.values),
+                    motion_masked=track.motion_label_loss_masked,decoded_curve=crop_contract.decoded_curve_weight>0)
                 report.setdefault('released_row_gradients',[]).append(dict(phase_step=step-4,
                     count_target=len(track.values),supervised_rows=np.flatnonzero(supported).tolist(),
                     row_l2=rows.tolist(),unsupported_nonzero_rows=np.flatnonzero((~supported)&(rows>0)).tolist()))

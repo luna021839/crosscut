@@ -28,7 +28,7 @@ def test_base_crop_combined_gradients_use_same_rng_and_crop_reaches_real_feature
     assert len({evidence[key]['matched_rng_sha256'] for key in ('base_only','crop_only','combined')})==1
     assert float(loss.item())==pytest.approx(evidence['combined']['loss'])
     assert all(value>0 for value in feature_groups(gradients).values())
-    rows=head_row_norms(gradients);support=row_supervision(3)
+    rows=head_row_norms(gradients);support=row_supervision(3,decoded_curve=contract.decoded_curve_weight>0)
     assert rows[support].max()>0 and not rows[~support].any()
 
 
@@ -98,3 +98,4 @@ def test_unsupervised_value_and_time_rows_are_explicit_but_all_count_logits_are_
         assert mask[:count*4].all() and not mask[24:32].any()
         assert mask[32:40].all() and not mask[60:75].any() and mask[75]
     assert not row_supervision(3,motion_masked=True)[75]
+    assert row_supervision(3,decoded_curve=True)[:75].all()

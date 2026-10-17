@@ -92,7 +92,7 @@ DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION = (
     "renderer_safe_radial_pan_roll_exact_corner_and_convex_linf_interpolation_zoom_floor_v3"
 )
 DYNAMIC_CROP_V3_LOSS_CONTRACT = (
-    "renderer_range_normalized_values_count_times_motion_loss_v3"
+    "renderer_range_normalized_values_count_times_motion_and_played_curve_loss_v3"
 )
 DYNAMIC_CROP_V3_CHECKPOINT_FORMAT_VERSION = 2
 DYNAMIC_CROP_V3_AFFINE_HEAD_REPRESENTATION = "fixed_train_centered_affine_full_rank_v1"
@@ -739,6 +739,7 @@ class DynamicCropV3LossContract:
     count_weight: float = 0.35
     time_weight: float = 0.50
     motion_weight: float = 0.15
+    decoded_curve_weight: float = 1.0
     contract: str = DYNAMIC_CROP_V3_LOSS_CONTRACT
 
     def __post_init__(self) -> None:
@@ -750,6 +751,7 @@ class DynamicCropV3LossContract:
             "count_weight",
             "time_weight",
             "motion_weight",
+            "decoded_curve_weight",
         ):
             value = _finite(getattr(self, name), name)
             if value < 0.0:
@@ -778,6 +780,46 @@ def _selected_count_times(
     safe_targets = mx.maximum(count_targets - 1, 0)
     selector = mx.arange(DYNAMIC_CROP_V3_MAX_KEYFRAMES) == safe_targets[..., None]
     return (all_times * selector[..., None].astype(all_times.dtype)).sum(axis=-2)
+
+
+def _original_observation_curve_loss(output: Any, supervision: Any) -> Any:
+    """Gather only the true target source; score every original observed knot."""
+    from .stage_edit_dynamic_crop_curve_loss import decoded_curve_risk
+
+    indices = np.argwhere(np.asarray(supervision.track_mask, dtype=bool))
+    if not len(indices):
+        return output.dynamic_crop_values.sum() * 0.
+    original = supervision.original_observed_keyframes or {}
+    rows = []
+    for index in indices:
+        key = tuple(map(int, index))
+        points = original.get(key)
+        if not points:
+            raise ValueError("Played-curve training requires original observed keyframes")
+        duration = float(supervision.shot_duration_seconds[key].item())
+        if not math.isfinite(duration) or duration <= 0.:
+            raise ValueError("Original observation needs a finite positive shot duration")
+        times = np.array([p.time_seconds for p in points], float) / duration
+        if (not np.isfinite(times).all() or times[0] != 0.
+                or np.any(np.diff(times) <= 0.) or times[-1] > 1. + 1e-6):
+            raise ValueError("Original observation clock is outside the target shot")
+        values = [[p.zoom, p.center_x, p.center_y, p.roll_degrees] for p in points]
+        rows.append((times, values))
+    width = max(len(row[0]) for row in rows)
+    times = np.zeros((len(rows), width), np.float32)
+    values = np.zeros((len(rows), width, 4), np.float32)
+    mask = np.zeros((len(rows), width), bool)
+    for i, (clock, points) in enumerate(rows):
+        times[i, :len(clock)], values[i, :len(clock)], mask[i, :len(clock)] = clock, points, True
+    b, t, s = (mx.array(indices[:, axis]) for axis in range(3))
+    risk, _ = decoded_curve_risk(
+        output.dynamic_crop_values[b, t, s],
+        dynamic_crop_v3_times_by_count(output.dynamic_crop_time_interval_logits[b, t, s]),
+        output.dynamic_crop_count_logits[b, t, s],
+        mx.array(times), mx.array(values), mx.array(mask),
+    )
+    counts = mx.array(mask.sum(axis=-1), dtype=risk.dtype)
+    return (risk * counts).sum() / counts.sum()
 
 
 def stage_edit_dynamic_crop_v3_loss(
@@ -835,11 +877,14 @@ def stage_edit_dynamic_crop_v3_loss(
         reduction="none",
     )
     motion_loss = _masked_mean(motion_values, dynamic_supervision.motion_mask)
+    curve_loss = (_original_observation_curve_loss(output, dynamic_supervision)
+                  if contract.decoded_curve_weight > 0. else mx.array(0., dtype=value_loss.dtype))
     dynamic_total = (
         contract.value_weight * value_loss
         + contract.count_weight * count_loss
         + contract.time_weight * time_loss
         + contract.motion_weight * motion_loss
+        + contract.decoded_curve_weight * curve_loss
     )
     total = contract.base_loss_weight * base_total + dynamic_total
     components: dict[str, Any] = {
@@ -848,6 +893,7 @@ def stage_edit_dynamic_crop_v3_loss(
         "dynamic_crop_count": count_loss,
         "dynamic_crop_times": time_loss,
         "dynamic_crop_motion": motion_loss,
+        "dynamic_crop_decoded_curve": curve_loss,
         "dynamic_crop_total": dynamic_total,
         "total": total,
     }

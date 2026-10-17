@@ -751,7 +751,7 @@ def train_dynamic_crop_v3_final_fit(
                              source_id=t.source_id, song_id=t.song_id)
                         for t in batch_tracks
                     ],
-                    "gate_aligned_normalized_coordinate_mae": float(
+                    "teacher_forced_retained_knot_normalized_coordinate_mae": float(
                         prior_components["values_normalized_mae"].item()
                     ),
                     "normalized_value_smooth_l1": float(prior_components["values_normalized"].item()),
@@ -767,6 +767,7 @@ def train_dynamic_crop_v3_final_fit(
                     "prior_motion_loss": float(
                         prior_components["motion"].item()
                     ),
+                    "prior_decoded_curve_loss": float(prior_components["decoded_curve"].item()),
                     "motion_label_supervised": not track.motion_label_loss_masked,
                     "gradient_norm_before_clip": float(
                         gradient_norm.item()

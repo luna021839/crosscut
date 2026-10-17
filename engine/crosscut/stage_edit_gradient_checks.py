@@ -19,12 +19,15 @@ def feature_groups(tree):
     return {name:norm(tree['base'][name]) for name in ('encoder','source_projection')}
 
 
-def row_supervision(count,*,motion_masked=False):
+def row_supervision(count,*,motion_masked=False,decoded_curve=False):
     from .stage_edit_dynamic_crop_head_v3 import DYNAMIC_CROP_V3_TIME_BLOCK_SLICES
     if count not in range(1,9):raise ValueError('one to eight supervised keyframes required')
     mask=np.zeros(76,bool);mask[:count*4]=True;mask[32:40]=True
     first,final=DYNAMIC_CROP_V3_TIME_BLOCK_SLICES.get(count,(0,0))
     mask[40+first:40+final]=True;mask[75]=not motion_masked
+    # Marginal played-curve supervision can reach every count's actual
+    # prefix and time branch. It does not create labels for other sources.
+    if decoded_curve:mask[:75]=True
     return mask
 
 
