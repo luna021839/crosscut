@@ -29,7 +29,7 @@ class PlayedPosePortPrior:
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
                  editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False,
-                 direct_face_appearance=False,appearance_weight=1.):
+                 direct_face_appearance=False,appearance_weight=1.,boundary_readability=False):
         from .editorial_roles import geometry_importance,appearance_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
@@ -41,6 +41,9 @@ class PlayedPosePortPrior:
         if direct_face_appearance and not played_interval_utility:
             raise ValueError('Direct face pairs require actual played-interval scoring')
         self.direct_face_appearance=bool(direct_face_appearance)
+        if boundary_readability and not played_interval_utility:
+            raise ValueError('Endpoint ROI readability requires actual played-interval scoring')
+        self.boundary_readability=bool(boundary_readability)
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -116,7 +119,7 @@ class PlayedPosePortPrior:
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
             'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py',
-            'articulated_camera_proposals.py','direct_face_queries.py']
+            'articulated_camera_proposals.py','direct_face_queries.py','boundary_readability.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -136,6 +139,9 @@ class PlayedPosePortPrior:
             actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=True,
             appearance_is_soft_risk_not_identity_gate=True,unknown_appearance_risk=.5,
             direct_face_appearance_used=self.direct_face_appearance,
+            endpoint_native_ROI_readability_cost=self.boundary_readability,
+            endpoint_readability_unit='six_output_frames_times_worst_original_ROI_deficit_UNKNOWN_.5',
+            endpoint_readability_changes_source_or_cut_admission=False,
             direct_face_risk=('equal_independent128D_and512D_cosine_risk_without_duplicate_gallery_vote'
                 if self.direct_face_appearance else None),
             sparse_same_clock_source_action_consumed=True,same_clock_context_is_not_dense_actor_certification=True,
@@ -437,7 +443,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         preserve_camera_alternatives=sequence or played,played_interval_utility=interval_utility,
         focal_motion=focal_motion,geometry_weight=getattr(prior,'geometry_weight',1.),
         appearance_weight=getattr(prior,'appearance_weight',1.),
-        direct_face_appearance=getattr(prior,'direct_face_appearance',False))
+        direct_face_appearance=getattr(prior,'direct_face_appearance',False),
+        boundary_readability=getattr(prior,'boundary_readability',False))
     matched_delivery=None
     if played:
         from .matched_entry_delivery import MatchedEntryDelivery
@@ -484,7 +491,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             entry_density[n]=density
             cut_cache[n]=(event_energy(detail,weights,fps=fps,point_geometry=editorial,
                 geometry_weight=getattr(prior,'geometry_weight',1.),
-                appearance_weight=getattr(prior,'appearance_weight',1.)),admitted)
+                appearance_weight=getattr(prior,'appearance_weight',1.),
+                boundary_readability=getattr(prior,'boundary_readability',False)),admitted)
             if readout:
                 from .scene_readout import change
                 cut_transfers[n]=change(detail['face_rate'],unit=6./fps)
@@ -669,6 +677,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 actual_played_match_advantage=float(detail['actual_played_match_advantage'][0,0]),
                 realized_incoming_change_credit=change_credit,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
+                endpoint_readability_used=getattr(prior,'boundary_readability',False),
+                endpoint_readability_rate=float(detail['endpoint_readability_rate'][0,0]),
+                endpoint_readability_measured=bool(detail['endpoint_readability_measured'][0,0]),
                 actual_arm_direction_used=bool(detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0]),
                 actual_arm_direction_residual=(float(detail['articulated_arm_direction'][0,0])
                     if detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0] else None),

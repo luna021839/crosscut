@@ -352,6 +352,8 @@ def main():
         help='Explicit1..8 importance of played face size/position continuity; same native/authored cost, no admission change')
     parser.add_argument('--focal-appearance-weight',type=float,default=1.,
         help='Explicit1..8 importance of subject appearance continuity; same native/authored cost, no identity/source gate')
+    parser.add_argument('--boundary-readability',action='store_true',
+        help='Score original face detail at the actual cut separately from interval-average quality; no motion/source gate')
     parser.add_argument('--editorial-reference-source',type=int,action='append',default=None,
         help='Physical source index for original framing/featured-member votes; repeatable, does not exclude render sources')
     parser.add_argument('--detailed-pose',action='store_true',
@@ -434,6 +436,8 @@ def main():
         raise ValueError('focal geometry importance requires the explicit played-interval port consumer')
     if args.focal_appearance_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('focal appearance importance requires the explicit played-interval port consumer')
+    if args.boundary_readability and not(args.played_pose_port_camera_prior and args.played_interval_utility):
+        raise ValueError('endpoint readability requires the explicit played-interval port consumer')
     if args.editorial_reference_source is not None and not(args.played_pose_port_camera_prior and args.editorial_opportunity_exposure):
         raise ValueError('editorial reference sources require the explicit editorial port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
@@ -537,6 +541,7 @@ def main():
             geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source,
             body_camera_proposals=args.body_camera_proposals,
             appearance_weight=args.focal_appearance_weight,
+            boundary_readability=args.boundary_readability,
             direct_face_appearance=args.direct_native_face_observations is not None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])

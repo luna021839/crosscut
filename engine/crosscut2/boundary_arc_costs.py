@@ -161,7 +161,8 @@ class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
                  preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None,
-                 focal_motion=False,geometry_weight=1.,appearance_weight=1.,direct_face_appearance=False):
+                 focal_motion=False,geometry_weight=1.,appearance_weight=1.,direct_face_appearance=False,
+                 boundary_readability=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -173,6 +174,10 @@ class ArcCosts:
         self.geometry_weight=geometry_importance(geometry_weight)
         self.appearance_weight=appearance_importance(appearance_weight)
         self.direct_face_appearance=bool(direct_face_appearance)
+        self.boundary_readability=bool(boundary_readability)
+        if self.boundary_readability:
+            from .boundary_readability import native_fields
+            self.native_readability=[native_fields(cat.bank,port) for cat,port in zip(catalogues,native_ports)]
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
         self.played_interval_utility=played_interval_utility
         self.focal_motion=bool(focal_motion)
@@ -352,10 +357,21 @@ class ArcCosts:
         focal=relative_cost(.5) if getattr(self,'focal_motion',False) else 0.
         geometry=getattr(self,'geometry_weight',1.)*detail['geometry_rate']
         appearance=getattr(self,'appearance_weight',1.)*detail['appearance_rate']
-        rate=geometry+detail['pose_rate']+appearance+focal
+        readability=0.
+        if getattr(self,'boundary_readability',False):
+            from .boundary_readability import pair as readable_pair
+            quality,known=self.native_readability[s]
+            q=np.full((B,E,2),.5);k=np.zeros((B,E,2),bool)
+            for e,x in enumerate(xs):
+                if int(x) in lookup:
+                    i=lookup[int(x)];side=np.arange(2)[None,:]
+                    q[:,e]=quality[i,side,at[:,e]]
+                    k[:,e]=known[i,side,at[:,e]]&seen[e]&(scores[:,e].max(-1)>0)
+            readability,_=readable_pair(q[:,:,0],q[:,:,1],k[:,:,0],k[:,:,1])
+        rate=geometry+detail['pose_rate']+appearance+focal+readability
         if not components:return rate
         if getattr(self,'point_geometry',False):
-            return detail['pose_rate'],6./self.fps*(geometry+appearance+focal)
+            return detail['pose_rate'],6./self.fps*(geometry+appearance+focal+readability)
         return rate,np.zeros_like(rate)
 
     def native_weights(self,s,first,final,xs):

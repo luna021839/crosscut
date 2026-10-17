@@ -129,6 +129,10 @@ def features(observations, *, fps, person_extents=False, focal_motion=False,deta
     result['visible_quality']=np.asarray([o.get('displayed_native_quality_proxy',0.) for o in observations],float)
     result['visible_quality_measured']=np.asarray([o.get('displayed_native_quality_measured',False)
         for o in observations],bool)
+    result['endpoint_ROI_readability']=np.asarray([o.get('target_native_ROI_readability',.5)
+        for o in observations],float)
+    result['endpoint_ROI_measured']=np.asarray([o.get('displayed_native_quality_measured',False)
+        for o in observations],bool)&seen
     result['member_hints']=np.asarray([o.get('recurrent_member_hint',-1) for o in observations],int)
     result['individual_member_scores']=np.asarray([o.get('individual_member_score_profile',np.zeros(6)) for o in observations],float)
     result['individual_member_score_support']=np.asarray([o.get('individual_member_score_support',0.) for o in observations],float)
@@ -297,6 +301,10 @@ def matrix(left, right, *, details=False):
         phase_raw=phase_raw, bridge_raw=bridge_raw, velocity_raw=velocity_raw,
         phase_evidence_kind=kind, motion_evidence_kind=motion_kind,
         ownership_ambiguity=ambiguous, shrinkage=.5, anatomical_ownership_certified=False)
+    from .boundary_readability import pair as readable_pair
+    endpoint_risk,endpoint_measured=readable_pair(left['endpoint_ROI_readability'][:,None],
+        right['endpoint_ROI_readability'][None,:],left['endpoint_ROI_measured'][:,None],right['endpoint_ROI_measured'][None,:])
+    result.update(endpoint_readability_rate=endpoint_risk,endpoint_readability_measured=endpoint_measured)
     if 'focal_image_motion' in left or 'focal_image_motion' in right:
         if 'focal_image_motion' not in left or 'focal_image_motion' not in right:
             raise ValueError('Both played sides must declare the focal motion cost')

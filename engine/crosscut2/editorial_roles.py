@@ -87,7 +87,8 @@ def apply(detail,strength):
     return result
 
 
-def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.,appearance_weight=1.):
+def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.,appearance_weight=1.,
+                 boundary_readability=False):
     """A shorter observed strip cannot erase an instantaneous visual jump.
 
     The common six-frame perceptual unit is shared by native and authored
@@ -97,9 +98,10 @@ def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.,a
     focal=detail.get('focal_image_motion_relative_cost',0.)+detail.get('detailed_pose_relative_cost',0.)
     geometry=geometry_importance(geometry_weight)*detail['geometry_rate']
     appearance=appearance_importance(appearance_weight)*detail['appearance_rate']
+    readability=detail['endpoint_readability_rate'] if boundary_readability else 0.
     if not point_geometry:
-        return window_seconds*(geometry+detail['pose_rate']+appearance+focal)
-    return 6./fps*(geometry+appearance+focal)+window_seconds*detail['pose_rate']
+        return window_seconds*(geometry+detail['pose_rate']+appearance+focal+readability)
+    return 6./fps*(geometry+appearance+focal+readability)+window_seconds*detail['pose_rate']
 
 
 def ordinary_pairs(left,right):
