@@ -336,6 +336,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     # E consumes raw per-face observations and four physical source paths,
     # not the legacy actor x camera projected reward rows. Do not allocate
     # those416 discarded rows just to recover104raw native observations.
+    if played:
+        from .programme_source_clock import validate as validate_render_clocks
+        validate_render_clocks(banks,nodes,required=True)
     states,rows,counts=make_states(nodes,banks,poses,fps=fps,source_events=source_events,
         body_states=body_states,camera_families=('native',),check=live)
     part_receipts=[]

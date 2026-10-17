@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import numpy as np
+import pytest
 from crosscut.render_frame_schedule import sampler_frame_schedule
 from crosscut2.programme_source_clock import indices,admit,attach
 
@@ -42,3 +43,14 @@ def test_dense_unplayed_context_is_bound_too_not_only_the_cut_endpoints():
 def test_absent_clock_is_not_fabricated_as_verified():
     bank,nodes,left,right=fixture();bank.pop('programme_render_clock')
     assert admit(bank,nodes,0,2,left,right,fps=30.).all()  # legacy domain, final verifier still required
+
+
+def test_stale_grid_is_rejected_before_any_actor_camera_preparation(monkeypatch):
+    from crosscut2 import played_pose_port_programme as programme
+    bank,nodes,_,_=fixture();bank['programme_render_clock']['source_times']=np.zeros(2)
+    def forbidden(*a,**k):raise AssertionError('costly actor/camera preparation started before clock validation')
+    monkeypatch.setattr(programme,'make_states',forbidden)
+    prior=programme.PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True)
+    with pytest.raises(ValueError,match='candidate grid differs'):
+        programme.select(nodes,[bank],None,[{}],fps=30.,source_events=[[]],body_states=None,
+            native_ports=[],music=np.zeros(len(nodes)),prior=prior)

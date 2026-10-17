@@ -202,7 +202,8 @@ class PlayedIntervalUtility:
         if any(not np.array_equal(cat.nodes,nodes) or cat.fps!=fps for cat in catalogues):
             raise ValueError('fixed music event and original catalogue clocks differ')
         clocks=[cat.bank.get('programme_render_clock') for cat in catalogues]
-        if any(c is None for c in clocks):raise ValueError('actual renderer clocks required for interval utility')
+        from .programme_source_clock import validate as validate_render_clocks
+        validate_render_clocks([cat.bank for cat in catalogues],nodes,required=True)
         candidates={}
         for key,strength in opportunities.bindings.items():
             n,a,b,ha,hb=key;e=int(opportunities.episodes[n])

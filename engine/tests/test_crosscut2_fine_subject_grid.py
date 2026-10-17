@@ -108,6 +108,24 @@ def test_missing_source_windows_never_borrow_another_person_or_erase_the_source(
     np.testing.assert_array_equal(bs[1]['heads'][[0,2,3]],banks[1]['heads'])
 
 
+def test_active_fine_expansion_rebinds_renderer_clock_without_changing_old_timestamps():
+    from crosscut2.programme_source_clock import attach,validate
+    nodes,banks,poses,styles,states,groups,warps,clocks=inputs()
+    attach(banks,warps,clocks,nodes,master_start=0.,fps=30.)
+    originals=[b['programme_render_clock']['source_times'].copy() for b in banks]
+    ns=np.array([0,98,100,200])
+    bs,*rest=expand(nodes,ns,banks,poses,styles,states,groups,warps,clocks,master_start=0.,fps=30.)
+    validate(bs,ns,required=True)
+    for before,old,new in zip(originals,banks,bs,strict=True):
+        np.testing.assert_array_equal(old['programme_render_clock']['source_times'],before)
+        np.testing.assert_array_equal(new['programme_render_clock']['source_times'][[0,2,3]],before)
+        assert new['programme_render_clock']['source_times'][1]==pytest.approx(98/30.)
+    assert all(r['renderer_clock_rebound'] for r in rest[-1]['sources'])
+    banks[0]['programme_render_clock']['source_times']=np.zeros(2)
+    with pytest.raises(ValueError,match='candidate grid differs'):
+        expand(nodes,ns,banks,poses,styles,states,groups,warps,clocks,master_start=0.,fps=30.)
+
+
 def test_unobserved_fine_node_neither_erases_real_content_samples_nor_claims_a_face():
     from crosscut2.display_source_catalogue import SourceCatalogue
     nodes,banks,poses,styles,states,groups,warps,clocks=inputs();groups[1]=[]

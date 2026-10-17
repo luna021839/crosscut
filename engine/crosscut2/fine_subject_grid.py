@@ -129,6 +129,13 @@ def expand(nodes,new_nodes,banks,poses,styles,states,windows,warps,clocks,*,mast
         def projected(array):
             value=np.asarray(array);result=np.zeros((N,)+value.shape[1:],value.dtype);result[old_at]=value;return result
         new=dict(bank)
+        if 'programme_render_clock' in bank:
+            from .programme_source_clock import attach as attach_clock,validate as validate_clock
+            validate_clock([bank],nodes,required=True)
+            attach_clock([new],[warp],[clock],new_nodes,master_start=master_start,fps=fps)
+            if not np.array_equal(new['programme_render_clock']['source_times'][old_at],
+                    bank['programme_render_clock']['source_times']):
+                raise ValueError('fine projection changed an original renderer timestamp')
         new['fine_grid_old_indices']=old_at.copy()
         new['face_observation_valid']=np.zeros((N,2),bool)
         new['face_observation_valid'][old_at]=bank.get('face_observation_valid',np.ones((len(nodes),2),bool))
@@ -186,7 +193,8 @@ def expand(nodes,new_nodes,banks,poses,styles,states,windows,warps,clocks,*,mast
             if not np.array_equal(new_value[old_at],old_value):raise AssertionError('original numeric observation changed')
         for target,value in zip(outputs,(new,p,sty,st),strict=True):target.append(value)
         receipts.append(dict(source=s,fine_observed_faces=observations,conflicting_descriptors=conflicts,
-            fine_style_or_readability_fabricated=False,old_rows_unchanged=True))
+            fine_style_or_readability_fabricated=False,old_rows_unchanged=True,
+            renderer_clock_rebound='programme_render_clock' in bank))
     return (*outputs,dict(sources=receipts,new_neural_calls=0,new_rasters=0))
 
 

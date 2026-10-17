@@ -8,10 +8,26 @@ audio resync, cache rewrite or post-selection repair is performed.
 import numpy as np
 
 
+def validate(banks,nodes,*,required=False):
+    """Reject a stale candidate-grid clock before expensive port preparation."""
+    shape=np.asarray(nodes).shape
+    for bank in banks:
+        clock=bank.get('programme_render_clock')
+        if clock is None:
+            if required:raise ValueError('actual renderer clocks required for interval utility')
+            continue
+        times=np.asarray(clock.get('source_times'),float)
+        if (times.shape!=shape or not np.isfinite(times).all()
+                or not np.isfinite(clock.get('fps',0.)) or clock.get('fps',0.)<=0
+                or clock.get('count',0)<1):
+            raise ValueError('actual renderer clock candidate grid differs')
+
+
 def attach(banks,warps,clocks,nodes,*,master_start,fps):
     for bank,warp,clock in zip(banks,warps,clocks,strict=True):
         bank['programme_render_clock']=dict(fps=float(clock['fps']),count=int(clock['frame_count']),
             source_times=np.asarray([warp.master_to_source(master_start+int(n)/fps) for n in nodes],float))
+    validate(banks,nodes,required=True)
 
 
 def indices(first,rate,ticks,*,fps,native_fps):
