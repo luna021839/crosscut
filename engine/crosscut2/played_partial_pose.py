@@ -110,6 +110,10 @@ def features(observations, *, fps, person_extents=False, focal_motion=False,deta
         dense_subject_contexts=[o.get('dense_subject_context') for o in observations],
         independent_full_image_body_context=np.asarray([o.get('original_full_image_people_used',False) for o in observations],bool),
         appearance_vectors=np.asarray([o.get('appearance_vector',np.zeros(128)) for o in observations],float))
+    if any('direct_face_vector' in o for o in observations):
+        result.update(direct_face_vectors=np.asarray([o.get('direct_face_vector',np.zeros(512)) for o in observations],float),
+            direct_face_known=np.asarray([o.get('direct_face_known',False) for o in observations],bool),
+            direct_face_families=np.asarray([o.get('direct_face_descriptor_family','') for o in observations]))
     original=np.zeros((count,8,4))
     for k,o in enumerate(observations):
         raw=o.get('source_clock_original_heads')
@@ -220,11 +224,17 @@ def matrix(left, right, *, details=False):
     channels=np.where(supplied[...,None],combined,channels)
     pose = channels.mean(-1)
     galleries_a=left['individual_member_score_galleries'][:,None];galleries_b=right['individual_member_score_galleries'][None,:]
+    direct_arguments={}
+    if 'direct_face_vectors' in left and 'direct_face_vectors' in right:
+        direct_arguments=dict(direct_a=left['direct_face_vectors'][:,None],direct_b=right['direct_face_vectors'][None,:],
+            direct_valid_a=left['direct_face_known'][:,None],direct_valid_b=right['direct_face_known'][None,:],
+            direct_compatible=(left['direct_face_families'][:,None]!='')&(
+                left['direct_face_families'][:,None]==right['direct_face_families'][None,:]))
     appearance,appearance_measured,member_influence=appearance_discrepancy(left['appearance_vectors'][:,None],right['appearance_vectors'][None,:],
         member_a=left['member_hints'][:,None],member_b=right['member_hints'][None,:],
         profile_a=left['individual_member_scores'][:,None],profile_b=right['individual_member_scores'][None,:],
         support_a=left['individual_member_score_support'][:,None],support_b=right['individual_member_score_support'][None,:],
-        profile_compatible=(galleries_a!='')&(galleries_a==galleries_b),details=True)
+        profile_compatible=(galleries_a!='')&(galleries_a==galleries_b),details=True,**direct_arguments)
     # Actual normalized chest/background histograms. Hellinger affinity uses
     # sqrt(p*q), not a plain dot product that calls identical broad histograms
     # "novel". Missing appearance/style/action earns NO change credit.

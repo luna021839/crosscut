@@ -69,10 +69,18 @@ def native_sampling_pixels(bank):
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
                  editorial_content=False,framing_evidence=None,person_attention=False,output_height=None,
-                 original_person_attention=False):
+                 original_person_attention=False,direct_face_appearance=False):
         if output_height is not None and (type(output_height) is not int or not 1<=output_height<=8192):
             raise ValueError('Actual positive integer output pixel height required')
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
+        self.direct_face_appearance=bool(direct_face_appearance)
+        if self.direct_face_appearance:
+            vectors=np.asarray(bank.get('direct_face_vectors'));known=np.asarray(bank.get('direct_face_known'))
+            family=bank.get('direct_face_descriptor_family','');shape=bank['heads'].shape[:-1]
+            if (vectors.shape!=shape+(512,) or known.shape!=shape or known.dtype!=bool
+                    or not np.isfinite(vectors).all() or not isinstance(family,str) or len(family)!=64
+                    or np.any(np.abs(np.linalg.norm(vectors[known],axis=-1)-1.)>.001)):
+                raise ValueError('explicit source-bound direct face query fields required')
         self.output_height=output_height
         self.subjects=subjects
         self.editorial_content=bool(editorial_content)
@@ -324,6 +332,10 @@ class SourceCatalogue:
             appearance_vector=appearance,appearance_is_not_named_identity=True,
             person_native_ordinal=endpoint_native,
             person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
+        if self.direct_face_appearance:
+            result.update(direct_face_vector=(np.zeros(512,np.float32) if h<0 else self.bank['direct_face_vectors'][n,side,h]),
+                direct_face_known=bool(h>=0 and self.bank['direct_face_known'][n,side,h]),
+                direct_face_descriptor_family=self.bank['direct_face_descriptor_family'])
         if self.person_attention:
             from .person_attention import competition
             target=None if self.person_target_indices is None else int(self.person_target_indices[n,side,h]) if h>=0 else -1

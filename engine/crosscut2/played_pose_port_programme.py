@@ -19,7 +19,7 @@ from .boundary_arc_costs import ArcCosts
 from .boundary_port_dp import solve
 from .played_event_support import PlayedEventSupport
 from .played_partial_pose import features,matrix
-from .focal_appearance import cosine as focal_appearance_cosine
+from .focal_appearance import cosine as focal_appearance_cosine,direct_cosine
 
 
 class PlayedPosePortPrior:
@@ -28,12 +28,16 @@ class PlayedPosePortPrior:
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
-                 editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False):
+                 editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False,
+                 direct_face_appearance=False):
         from .editorial_roles import geometry_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
             raise ValueError('Focal geometry importance requires actual played-interval scoring')
         self.geometry_weight=float(geometry_weight)
+        if direct_face_appearance and not played_interval_utility:
+            raise ValueError('Direct face pairs require actual played-interval scoring')
+        self.direct_face_appearance=bool(direct_face_appearance)
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -109,7 +113,7 @@ class PlayedPosePortPrior:
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
             'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py',
-            'articulated_camera_proposals.py']
+            'articulated_camera_proposals.py','direct_face_queries.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -127,6 +131,9 @@ class PlayedPosePortPrior:
             physical_GROUP_focal_owns_content_and_pose=True,anatomical_ownership_certified=False,
             actual_focal_anonymous_appearance_reported=True,appearance_used_in_objective=True,
             appearance_is_soft_risk_not_identity_gate=True,unknown_appearance_risk=.5,
+            direct_face_appearance_used=self.direct_face_appearance,
+            direct_face_risk=('equal_independent128D_and512D_cosine_risk_without_duplicate_gallery_vote'
+                if self.direct_face_appearance else None),
             sparse_same_clock_source_action_consumed=True,same_clock_context_is_not_dense_actor_certification=True,
             optional_contemporary_dense_subject_context_consumed_before_source_selection=True,
             dense_context_missing_body_never_recovers_stale_normal_pose=True,
@@ -361,7 +368,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s],
             editorial_content=editorial,framing_evidence=framing,
             person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None),
-            original_person_attention=getattr(prior,'original_person_attention',False)))
+            original_person_attention=getattr(prior,'original_person_attention',False),
+            direct_face_appearance=getattr(prior,'direct_face_appearance',False)))
     del states,rows,raw
     if any(cat.original_people is not None for cat in cats):
         receipt['original_full_image_people']=[None if cat.original_people is None else cat.original_people.receipt() for cat in cats]
@@ -632,6 +640,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                     predicted.append(dict(center=list(map(float,center)),height=float(head[2]*c[0]),confidence=float(head[3]),
                         source_face_index=obs['head_index'],face_native_sample_is_actual_endpoint=at==(-1 if side==0 else 0)))
             selected.details[i,k-1,k]=dict(cost=incoming,appearance_cosine=focal_appearance_cosine(a.observation,b.observation),
+                direct_arcface_cosine=direct_cosine(a.observation,b.observation),
+                direct_arcface_pair_measured=direct_cosine(a.observation,b.observation) is not None,
                 appearance_used_in_objective=True,anonymous_appearance_is_not_member_identity=True,
                 anonymous_appearance_rate=float(detail['appearance_rate'][0,0]),
                 anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),

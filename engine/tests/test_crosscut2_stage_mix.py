@@ -5,6 +5,17 @@ from crosscut2.stage_mix import camera_track, choose_programme, native_event_cos
 from crosscut2.paired_geometry import Camera
 
 
+def test_direct_native_queries_require_the_actual_interval_consumer_before_source_work(monkeypatch,tmp_path):
+    from crosscut2.stage_mix import main
+    argv=['stage_mix']
+    for key in ('source-plan','analysis','cache','output','models'):
+        argv.extend(['--'+key,str(tmp_path/key)])
+    argv.extend(['--direct-native-face-observations',str(tmp_path/'manifest.json')])
+    monkeypatch.setattr('sys.argv',argv)
+    with pytest.raises(ValueError,match='Direct face queries require the actual played-interval'):
+        main()
+
+
 def test_dp_selects_entire_programme_not_retained_local_patches():
     nodes = np.arange(0, 121, 10)
     unary = np.zeros((2, 12))

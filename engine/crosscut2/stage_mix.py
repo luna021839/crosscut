@@ -302,6 +302,8 @@ def main():
         help='Explicit existing local IVE ArcFace/photo-bank tool directory; references remain private and are not copied')
     parser.add_argument('--individual-member-scores',action='store_true',
         help='Retain individual cached gallery likeness scores as soft appearance cues; no forced member labels')
+    parser.add_argument('--direct-native-face-observations',type=Path,
+        help='Reuse an exact source/grid-bound ArcFace query manifest for current-face pairs; cache-only, no inference')
     parser.add_argument('--native-part-pixel-support',action='store_true',
         help='Opt-in additive original-pixel corroboration of close-up body parts, not anatomical identity certification')
     parser.add_argument('--experimental-preference-model',type=Path,
@@ -420,6 +422,9 @@ def main():
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
     if args.individual_member_scores and (args.local_ive_photo_tool is None or not args.played_pose_port_camera_prior):
         raise ValueError('individual member scores require explicit local photo assets and played port consumer')
+    if args.direct_native_face_observations is not None and not (
+            args.played_pose_port_camera_prior and args.played_interval_utility):
+        raise ValueError('Direct face queries require the actual played-interval port consumer')
     from .editorial_roles import geometry_importance
     geometry_importance(args.focal_geometry_weight)
     if args.focal_geometry_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
@@ -525,7 +530,8 @@ def main():
             person_attention=args.original_person_attention,original_person_attention=args.original_person_attention,
             output_height=args.preview_height if args.played_interval_utility else None,
             geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source,
-            body_camera_proposals=args.body_camera_proposals)
+            body_camera_proposals=args.body_camera_proposals,
+            direct_face_appearance=args.direct_native_face_observations is not None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -721,6 +727,23 @@ def main():
                     maximum_centres=args.opportunity_observation_centres,
                     maximum_seconds=args.maximum_opportunity_perception_seconds,
                     provisional_plan=args.provisional_subject_observation_plan,master_start=original.master_audio_start)
+            direct_face_receipt=None
+            if args.direct_native_face_observations is not None:
+                from .direct_face_queries import bind_manifest,refresh_member_scores
+                bindings,direct_face_receipt=bind_manifest(args.direct_native_face_observations,
+                    banks=banks,nodes=nodes,sources=original.sources,
+                    source_hashes=[v['source_sha256'] for v in bound_source_cut_events],
+                    master_start=original.master_audio_start,fps=original.fps,
+                    authorized_root=args.cache.parent.parent,
+                    legacy_cache=args.cache.parent/'crosscut2-local-member-query-v1',
+                    cache=args.cache.parent/'crosscut2-direct-native-arcface-v2')
+                if args.individual_member_scores:
+                    from crosscut.ive_local_arcface_gallery import LocalIVEArcFaceGallery
+                    gallery=LocalIVEArcFaceGallery.from_existing_photo_banks(
+                        args.local_ive_photo_tool/'face_models/user_member_arcface_embeddings.json',
+                        args.local_ive_photo_tool/'face_models/yujin_arcface_embeddings.json')
+                    identity_hints,scoring=refresh_member_scores(banks,bindings,identity_hints,gallery=gallery,check=check)
+                    direct_face_receipt['current_member_scores']=scoring
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
@@ -739,6 +762,7 @@ def main():
             fixed_receipt['native_event_registry']=registry_receipts
             fixed_receipt['supplementary_native_flanks']=supplementary_flank_receipts
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
+            fixed_receipt['direct_native_face_observations']=direct_face_receipt
             fixed_receipt['sparse_face_endpoint_completion']=face_completion
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,
                 native_ports=native_ports,check=check)
