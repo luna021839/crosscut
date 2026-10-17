@@ -71,6 +71,28 @@ def test_catalogue_uses_the_actual_displayed_person_and_keeps_unknown_gaps():
         np.stack([new.rates(frames,camera)]*2))
 
 
+def test_paired_proposal_quality_uses_its_actual_crop_not_native_person_competition():
+    from crosscut2.boundary_port_domain import proposal_display_quality
+    _,cats,_=prepared();original=cats[0]
+    original.bank['heads'][:]=0.;original.bank['heads'][:,:,0]=[.5,.25,.1,.99]
+    boxes=np.array([[.43,.19,.57,.68,.8],[.65,.1,1.,1.,.9]],np.float32)
+    original.bank['person_rectangles_by_native']={int(f):boxes for f in original.bank['native_indices'].ravel()}
+    cat=SourceCatalogue(original.nodes,original.bank,original.body,[],original.style,[],
+        fps=30.,editorial_content=True,person_attention=True,output_height=1080)
+    native=cat.observation(1,0,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    values=[]
+    for camera in ([1.,.5,.5],[2.,.5,.5]):
+        actual=cat.observation(1,0,np.tile(camera,(7,1)),target_head_index=0)
+        proposed=proposal_display_quality(native,camera)
+        np.testing.assert_allclose(proposed,actual['displayed_native_quality_proxy'])
+        values.append(proposed)
+    assert values[1]>values[0]  # A real crop removes part of the competing body.
+    missing=dict(native,person_rectangles=None,person_competition_measured=False)
+    disabled={k:v for k,v in native.items() if not k.startswith('person_')}
+    for camera in ([1.,.5,.5],[2.,.5,.5]):
+        assert proposal_display_quality(missing,camera)==proposal_display_quality(disabled,camera)
+
+
 def cached_world(tmp_path,monkeypatch):
     w=world(tmp_path,monkeypatch)
     w.bound[0]['source_sha256']=hashlib.sha256(w.paths[0].read_bytes()).hexdigest()

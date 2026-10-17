@@ -46,7 +46,18 @@ def proposal_display_quality(observation,camera):
     fy=max(0.,min(1.,cy+hy)-max(0.,cy-hy))/(2.*hy)
     fraction=min(1.,max(0.,fx*fy))
     size=float(np.minimum(1.,head[2]/.12)) if z==1. else min(1.,height/.12)
-    return observation['target_native_ROI_readability']*observation['target_original_role_factor']*size*fraction
+    quality=observation['target_native_ROI_readability']*observation['target_original_role_factor']*size*fraction
+    # Candidate pruning and final K must describe the SAME proposed view.
+    # The native observation's competition cannot simply be copied: this
+    # crop can remove a foreground body, or make it more dominant. Unknown
+    # person measurements do not discount an otherwise observed face.
+    if observation.get('person_competition_is_not_occlusion_or_ownership',False):
+        rectangles=observation.get('person_rectangles')
+        if rectangles is not None:
+            from .person_attention import competition
+            value=competition(rectangles,head,[z,x,y])
+            if value['measured']:quality*=1.-float(value['deficit'])
+    return quality
 
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
