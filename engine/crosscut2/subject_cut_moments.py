@@ -35,6 +35,30 @@ def _normalized_body(window, indices):
     return (xy - root[:, None]) / np.maximum(.02, heads[:, None, 2, None])
 
 
+def _motion_steps(na, nb, common, ticks, joints, contiguous):
+    """Actual consecutive measured steps in three-output-frame units.
+
+    A sparse endpoint displacement cannot erase an observed intermediate
+    reversal. Gaps of at most three frames compare measured endpoints only;
+    a missing associated native detection or source-shot break stops a step.
+    """
+    ticks=np.asarray(ticks);joints=np.asarray(joints,int)
+    known=common[:,joints] & ((ticks>=-4)&(ticks<=3))[:,None]
+    rows=np.arange(len(ticks))[:,None]
+    previous=np.maximum.accumulate(np.where(known,rows,-1),axis=0)
+    previous=np.vstack((np.full((1,len(joints)),-1),previous[:-1]))
+    first=np.maximum(previous,0);gap=ticks[:,None]-ticks[first]
+    breaks=np.r_[0,np.cumsum(~np.asarray(contiguous,bool))]
+    valid=known&(previous>=0)&(gap>0)&(gap<=3)&((breaks[rows]-breaks[first])==0)
+    if not valid.any():return None,0.
+    da=na[:,joints]-na[first,joints[None,:]]
+    db=nb[:,joints]-nb[first,joints[None,:]]
+    unit=3./np.maximum(1,gap)
+    residual=np.linalg.norm(da-db,axis=-1)*unit
+    activity=np.minimum(np.linalg.norm(da,axis=-1),np.linalg.norm(db,axis=-1))*unit
+    return float(residual[valid].max()),float(activity[valid].max())
+
+
 def _seam_action(left, right, lc, rc, geometry):
     """Measure arms at -1/0 and their contemporary motion, not just shoulders.
 
@@ -86,34 +110,20 @@ def _seam_action(left, right, lc, rc, geometry):
     scale = np.maximum(.02, (left.heads[ai, 2] * ca[0] + right.heads[bi, 2] * cb[0]) / 2)
     projected = (pa[seam] - pb[seam]) * [16 / 9, 1.]
     screen = float(np.sqrt(np.mean((np.sum(projected * projected, axis=-1) / scale[seam, None] ** 2)[measured])))
-    motions = []
-    activities = []
-    # Match both films over the SAME music intervals. Comparing unrelated
-    # outgoing/incoming slopes would penalize real choreography reversals.
-    for first_tick, last_tick in [(-4, -1), (-1, 0), (0, 3)]:
-        first = np.flatnonzero(lc.output_frames == first_tick)
-        last = np.flatnonzero(lc.output_frames == last_tick)
-        if not len(first) or not len(last):
-            continue
-        first, last = int(first[0]), int(last[0])
-        for joint in joints:
-            if not common[[first, last], joint].all():
-                continue
-            if (not left.associated[ai[first]:ai[last] + 1].all()
-                    or not right.associated[bi[first]:bi[last] + 1].all()):
-                continue
-            da = na[last, joint] - na[first, joint]
-            db = nb[last, joint] - nb[first, joint]
-            motions.append(float(np.linalg.norm(da - db)))
-            activities.append(float(max(np.linalg.norm(da), np.linalg.norm(db))))
-    if not motions:
+    shot=np.asarray(geometry['common_source_shot_sample_mask'],bool)
+    contiguous=shot[:-1]&shot[1:]
+    for window,at in ((left,ai),(right,bi)):
+        missing=np.r_[0,np.cumsum(~window.associated)]
+        contiguous&=(missing[at[1:]+1]-missing[at[:-1]])==0
+    motion,activity=_motion_steps(na,nb,common,lc.output_frames,joints,contiguous)
+    if motion is None:
         return dict(seam_action_supported=False, reason='no_measured_motion_near_seam')
     return dict(seam_action_supported=True, reason='measured_articulated_seam',
                 seam_arm_count=len(measured_arms), seam_arm_joints=joints,
                 seam_arm_direction_residual=float(np.mean(directions)),
                 seam_pose_residual=pose, seam_screen_residual=screen,
-                seam_motion_residual=float(np.mean(motions)),
-                seam_activity=float(np.mean(activities)))
+                seam_motion_residual=motion,
+                seam_activity=activity)
 
 
 def search(left, right, left_clock, right_clock, *, candidate_frames,

@@ -88,6 +88,69 @@ def test_good_measured_arms_replace_missing_channel_penalty_without_losing_scree
     assert before['pose_rate'][0,0]>.25  # raw sparse evidence is unchanged
 
 
+@pytest.mark.parametrize('tick',[-3,-2,1,2])
+def test_final_articulated_score_preserves_opposite_intermediate_motion_and_DP_choice(tick):
+    from crosscut2.dense_subject_catalogue import DenseSubjects
+    from crosscut2.played_partial_pose import features,matrix
+    from crosscut2.editorial_roles import event_energy
+    from crosscut2.boundary_port_dp import solve
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+
+    def moving(source,sign):
+        cat,window,indices=prepared(source,bump=0.)
+        body=window.body.copy()
+        body[window.ordinals==100+tick,4:6,0]+=sign*.08
+        cat.subjects=DenseSubjects(source=source,binding=str(source),indices=indices,
+            windows=[replace(window,body=body)],bank=cat.bank,fps=30.)
+        return cat
+
+    a,good,bad=moving(0,1),moving(1,1),moving(2,-1)
+    left=[obs(a,0)];right=[obs(cat,1) for cat in (good,bad)]
+    before=matrix(features(left,fps=30.),features(right,fps=30.),details=True)
+    after=articulated_seam_evidence(before,left,right)
+    assert before['pose_rate'][0,0]<before['pose_rate'][0,1]
+    assert after['pose_rate'][0,0]<1e-6
+    assert after['pose_rate'][0,1]>after['pose_rate'][0,0]+.01
+    np.testing.assert_allclose(after['actual_played_match_advantage'],
+        np.maximum(0.,1.-2.*after['pose_rate']))
+
+    # All other graph terms are explicit and identical. The .001 cheaper
+    # hold must not win by erasing an actually observed contrary movement.
+    seam=event_energy(after,np.full((1,2),.2),fps=30.,point_geometry=True)[0]
+    domain=[np.arange(3) for _ in range(3)]
+    def hold(i,j):
+        costs=np.full((3,3),100. if i==0 and j==2 else 0.)
+        if i==1:costs[1,1]=.001
+        return costs,np.eye(3,dtype=bool),np.zeros((3,3),int)
+    def cut(n):
+        cost=np.zeros((3,3));allowed=np.zeros((3,3),bool)
+        cost[0,1:]=seam;allowed[0,1:]=True
+        return cost,allowed
+    runs,_,_=solve([0,30,60],domain,domain,start_cost=np.array([0.,100.,100.]),
+        hold_cost=hold,cut_cost=cut,minimum_frames=12)
+    assert [run[2] for run in runs]==[0,1]
+
+
+def test_unassociated_intermediate_arm_cannot_invent_motion_credit():
+    from crosscut2.dense_subject_catalogue import DenseSubjects
+    from crosscut2.played_partial_pose import features,matrix
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+    cats=[]
+    for source in (0,1):
+        cat,window,indices=prepared(source,bump=.08)
+        associated=window.associated.copy();associated[window.ordinals==101]=False
+        support=window.support.copy();support[~associated]=False
+        cat.subjects=DenseSubjects(source=source,binding=str(source),indices=indices,
+            windows=[replace(window,associated=associated,support=support)],bank=cat.bank,fps=30.)
+        cats.append(cat)
+    left=[obs(cats[0],0)];right=[obs(cats[1],1)]
+    before=matrix(features(left,fps=30.),features(right,fps=30.),details=True)
+    after=articulated_seam_evidence(before,left,right)
+    assert after['matched_action_change_density'][0,0]==0.
+
+
 def test_raw_actor_retrieval_consumes_the_same_articulated_action_before_pruning():
     from crosscut2.boundary_port_domain import make
     from test_crosscut2_dense_subject_catalogue import prepared

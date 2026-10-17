@@ -5,7 +5,7 @@ but evaluates the ACTUAL proposed cameras without a hidden camera re-fit.
 It does not reward camera motion, invent phase shifts, or certify identities.
 """
 import numpy as np
-from .subject_cut_moments import _seam_action,_normalized_body
+from .subject_cut_moments import _seam_action,_normalized_body,_motion_steps
 
 
 def motion(a,b,joints):
@@ -18,17 +18,8 @@ def motion(a,b,joints):
     normal=[]
     for sample in (a,b):
         normal.append(_normalized_body(sample['window'],sample['at']))
-    common=a['supported']&b['supported'];residual=[];activity=[]
-    for joint in joints:
-        seen=np.flatnonzero(common[:,joint]&(ticks>=-4)&(ticks<=3))
-        for first,last in zip(seen[:-1],seen[1:]):
-            gap=int(ticks[last]-ticks[first])
-            if gap>3 or not a['contiguous'][first:last].all() or not b['contiguous'][first:last].all():continue
-            da=normal[0][last,joint]-normal[0][first,joint]
-            db=normal[1][last,joint]-normal[1][first,joint]
-            residual.append(float(np.linalg.norm(da-db)*3/gap))
-            activity.append(float(min(np.linalg.norm(da),np.linalg.norm(db))*3/gap))
-    return (None,0.) if not residual else (max(residual),max(activity))
+    return _motion_steps(*normal,a['supported']&b['supported'],ticks,joints,
+        a['contiguous']&b['contiguous'])
 
 
 def paired(left,right,*,rates,available,basis):
