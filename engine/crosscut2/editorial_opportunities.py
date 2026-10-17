@@ -23,6 +23,30 @@ class Opportunities:
         self.episodes=np.searchsorted(self.boundaries,self.nodes,side='right')-1
         self.utility=np.zeros(max(0,len(self.boundaries)-1));self.bindings={};self.exposures={}
         self.missing_action_requests={}
+        self.played_camera_options_observed=0;self.repaired_view_bindings=set()
+
+    def observe_played_pair(self,n,left,right,*,focal_motion=False,detailed_pose=False):
+        """Register an ACTUALLY offered fitted view before the final solve.
+
+        Native-view pose/placement is not an upper bound on a crop that
+        corrects that placement. Evaluate the original bound subject under
+        these exact camera strips; final delivery still checks its actual
+        camera, observed exposure and pair, so this creates no free credit.
+        """
+        shared=set(left.proposal_ids)&set(right.proposal_ids)
+        if left.source==right.source or not any(p[0]=='paired' for p in shared):
+            raise ValueError('one offered outgoing/incoming physical camera pair required')
+        from .played_partial_pose import features,matrix
+        from .played_interval_utility import articulated_seam_evidence
+        detail=matrix(features([left.observation],fps=self.fps,focal_motion=focal_motion,detailed_pose=detailed_pose),
+            features([right.observation],fps=self.fps,focal_motion=focal_motion,detailed_pose=detailed_pose),details=True)
+        detail=articulated_seam_evidence(detail,[left],[right],cap_actual_focal_motion=focal_motion)
+        key=(n,left.source,right.source,left.observation['head_index'],right.observation['head_index'])
+        old=self.bindings.get(key,0.)
+        self.observe(n,[left.observation],[right.observation],detail,[left.source],[right.source])
+        self.played_camera_options_observed+=1
+        if self.bindings.get(key,0.)>old:self.repaired_view_bindings.add(key)
+        return detail
 
     def observe(self,n,left,right,detail,left_sources,right_sources):
         """All physical raw pairs BEFORE global8 camera proposal pruning."""
@@ -91,11 +115,17 @@ class Opportunities:
         return utility*ratio*coverage
 
     def receipt(self):
-        return dict(contract='fixed_nonoverlapping_observed_music_opportunity_v1',
+        return dict(contract=('fixed_nonoverlapping_observed_candidate_view_opportunity_v2'
+            if self.played_camera_options_observed else 'fixed_nonoverlapping_observed_music_opportunity_v1'),
             event_kind='MATCH_ACTION_CHANGE',episode_boundaries=self.boundaries.tolist(),
             music_strength_continuous_not_extra_beat_events=self.continuous_strength,
             episode_utility_density=self.utility.tolist(),raw_source_actor_bindings=len(self.bindings),
             missing_action_observation_requests=len(self.missing_action_requests),
+            played_camera_options_observed_before_selection=self.played_camera_options_observed,
+            source_actor_bindings_improved_by_actual_fitted_views=len(self.repaired_view_bindings),
+            native_view_is_not_an_upper_bound_on_repaired_camera_match=True,
+            fitted_view_registration_precedes_final_programme_selection=True,
+            actual_view_discrepancy_rechecked_before_delivery=True,
             observation_request_priority_adds_no_edit_utility=True,
             credit_contract='fixed_event_utility_times_actual_seven_frame_action_coverage',
             full_hold_target_persistence_claimed=False,

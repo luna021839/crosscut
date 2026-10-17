@@ -179,7 +179,7 @@ def test_raw_opportunity_and_pair_pruning_share_configuration_credit_cap(monkeyp
     from crosscut2 import boundary_port_domain as ports
     from test_crosscut2_motion_pair_candidates import motion_catalogues
     nodes,cats,paths=motion_catalogues(False)
-    original=ports.matrix;seen=[]
+    original=ports.matrix;seen=[];fitted=[]
     def body_credit(*a,**kw):
         result=original(*a,**kw);shape=result['pose_rate'].shape
         return dict(result,pose_rate=np.full(shape,.1),
@@ -191,12 +191,15 @@ def test_raw_opportunity_and_pair_pruning_share_configuration_credit_cap(monkeyp
         return channels.max(-1),np.full(shape,measured),channels,np.full(shape+(3,),measured)
     class Opportunities:
         def observe(self,n,left,right,detail,*sources):seen.append(detail)
+        # This fixture verifies raw configuration pruning only. Actual-view
+        # re-evaluation is exercised with real Opportunities in its own test.
+        def observe_played_pair(self,n,left,right,**kw):fitted.append((n,left.source,right.source))
         def density(self,*a):return 0.
     monkeypatch.setattr(ports,'matrix',body_credit)
     monkeypatch.setattr(fine,'matrix',configuration)
     _,_,_,receipt=ports.make(nodes,cats,paths,fps=30.,detailed_pose=True,
         articulated_actions=True,opportunities=Opportunities(),retain_pair_cameras=True)
-    assert seen
+    assert seen and fitted and all(a!=b for _,a,b in fitted)
     for detail in seen:
         np.testing.assert_allclose(detail['matched_action_change_density'],0. if measured else .6)
         assert 'detailed_pose_action_credit_cap' in detail

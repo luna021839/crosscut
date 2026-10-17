@@ -301,10 +301,12 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 original_retained+=int(np.array_equal(ca,[1.,.5,.5]) and np.array_equal(cb,[1.,.5,.5]))
                 pair_id=('paired',n,a,b,ha,hb,k)
                 non_native_focal_pairs+=int(ha!=left_native[a] or hb!=right_native[b])
-                add(outgoing,port(a,n,0,np.tile(ca,(7,1)),(pair_id,),
-                    target_head_index=ha))
-                add(incoming,port(b,n,1,np.tile(cb,(7,1)),(pair_id,),
-                    target_head_index=hb))
+                left_port=port(a,n,0,np.tile(ca,(7,1)),(pair_id,),target_head_index=ha)
+                right_port=port(b,n,1,np.tile(cb,(7,1)),(pair_id,),target_head_index=hb)
+                if opportunities is not None and articulated_actions:
+                    opportunities.observe_played_pair(n,left_port,right_port,
+                        focal_motion=focal_motion,detailed_pose=detailed_pose)
+                add(outgoing,left_port);add(incoming,right_port)
         if max(len(incoming),len(outgoing))>port_limit:raise AssertionError('port domain grew beyond global bound')
         entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(len(proposals))
     return entries,exits,dense,dict(global_paired_proposal_limit_per_node=max(pair_capacities,default=maximum_pairs),
