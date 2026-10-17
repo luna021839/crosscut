@@ -331,9 +331,11 @@ class ArcCosts:
             from .editorial_roles import apply
             detail=apply(detail,self.roles.at(np.asarray(xs)[None,:],member[:,:,0],member[:,:,1]))
         # Native endpoint banks have no associated temporal head windows.
-        # Pay the SAME finite UNKNOWN as an unobserved authored seam, not a
-        # free native exception or a fabricated stationary face measurement.
-        focal=.5 if getattr(self,'focal_motion',False) else 0.
+        # The same UNKNOWN.5 as an unobserved authored seam has zero
+        # evidence-relative contribution. Do not add a new per-cut pacing
+        # penalty or fabricate a stationary face measurement.
+        from .focal_image_motion import relative_cost
+        focal=relative_cost(.5) if getattr(self,'focal_motion',False) else 0.
         rate=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']+focal
         if not components:return rate
         if getattr(self,'point_geometry',False):

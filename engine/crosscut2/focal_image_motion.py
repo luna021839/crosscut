@@ -11,6 +11,19 @@ TICKS = np.arange(-7, 7, dtype=np.int64)
 TICKS.setflags(write=False)
 
 
+def relative_cost(risk):
+    """Evidence relative to UNKNOWN, not an additional per-cut rhythm tax.
+
+    Raw risk stays0..1 and missing measurements remain explicitly.5. Only
+    their advantage/disadvantage over that neutral is added to the existing
+    objective; an entirely unobserved cue changes no old edit decision.
+    """
+    value=np.asarray(risk,float)
+    if not np.isfinite(value).all() or np.any((value<0)|(value>1)):
+        raise ValueError('A bounded focal image motion residual is required')
+    return value-.5
+
+
 def _project(head, camera):
     return (.5 + camera[..., :1] * (head[..., :2] - camera[..., 1:])) * [16 / 9, 1.]
 

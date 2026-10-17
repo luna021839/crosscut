@@ -277,11 +277,11 @@ def matrix(left, right, *, details=False):
     if 'focal_image_motion' in left or 'focal_image_motion' in right:
         if 'focal_image_motion' not in left or 'focal_image_motion' not in right:
             raise ValueError('Both played sides must declare the focal motion cost')
-        from .focal_image_motion import matrix as focal_matrix
+        from .focal_image_motion import matrix as focal_matrix,relative_cost
         risk,measured,steps=focal_matrix(left['focal_image_motion'],right['focal_image_motion'])
         result.update(focal_image_motion_rate=risk,focal_image_motion_measured=measured,
-            focal_image_motion_observed_steps=steps)
-    return result if details else (geometry + pose + appearance + result.get('focal_image_motion_rate',0.), allowed)
+            focal_image_motion_observed_steps=steps,focal_image_motion_relative_cost=relative_cost(risk))
+    return result if details else (geometry + pose + appearance + result.get('focal_image_motion_relative_cost',0.), allowed)
 
 
 def source_activity(observation, *, fps):

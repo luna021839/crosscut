@@ -180,12 +180,13 @@ class PlayedPosePortPrior:
         self.artifact['composed_focal_image_motion']=self.focal_motion
         if self.focal_motion:
             self.artifact.update(focal_image_motion_scope='same_music_-4_to_+3_observed_steps_plus_actual_terminal_digital_rate',
-                focal_image_motion_cost='six_output_frame_seconds_times_bounded_time_mean_residual',
+                focal_image_motion_cost='six_output_frame_seconds_times_bounded_residual_minus_UNKNOWN_.5',
                 focal_image_motion_unknown=.5,native_focal_motion_unmeasured_not_exempt=True,
                 focal_image_motion_changes_admission=False,
                 terminal_digital_rate_continuation_is_a_local_hypothesis=True,
-                authored_cost='existing_played_pair_cost+six_frame_seconds*composed_focal_image_motion_risk',
-                native_cost='existing_retained_native_cost+six_frame_seconds*unmeasured_focal_image_motion_.5')
+                all_unmeasured_focal_motion_leaves_existing_objective_unchanged=True,
+                authored_cost='existing_played_pair_cost+six_frame_seconds*(composed_focal_image_motion_risk-.5)',
+                native_cost='existing_retained_native_cost+six_frame_seconds*(unmeasured_focal_image_motion_.5-.5)')
         if self.matched_event_utility:
             self.artifact.update(opportunity_credit='fixed_music_event_utility_times_capped_actual_pair_camera_delivery_coverage',
                 event_coverage_unit='seven_actual_output_frame_seconds',
@@ -568,6 +569,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 actual_camera_strips=[o['camera_strip'].tolist() for o in observed],
                 focal_image_motion_cost_used=focal_motion,
                 focal_image_motion_rate=(float(detail['focal_image_motion_rate'][0,0]) if focal_motion else None),
+                focal_image_motion_relative_cost=(float(detail['focal_image_motion_relative_cost'][0,0]) if focal_motion else None),
                 focal_image_motion_measured=(bool(detail['focal_image_motion_measured'][0,0]) if focal_motion else False),
                 focal_image_motion_observed_steps=(int(detail['focal_image_motion_observed_steps'][0,0]) if focal_motion else 0),
                 expected_output_focal=predicted,

@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pytest
 
-from crosscut2.focal_image_motion import TICKS, describe, matrix
+from crosscut2.focal_image_motion import TICKS, describe, matrix,relative_cost
 
 
 def observation(x, *, side, camera=None, height=None):
@@ -89,7 +89,7 @@ def test_actual_played_features_add_finite_motion_without_changing_cut_admission
     for strength in (0.,1.):
         old,new=apply(base,strength),apply(actual,strength)
         np.testing.assert_allclose(event_energy(new,.01,fps=30.,point_geometry=True)
-            -event_energy(old,.01,fps=30.,point_geometry=True),.2*actual['focal_image_motion_rate'])
+            -event_energy(old,.01,fps=30.,point_geometry=True),.2*(actual['focal_image_motion_rate']-.5))
 
 
 def test_missing_native_and_authored_motion_have_identical_point_cost():
@@ -102,7 +102,12 @@ def test_missing_native_and_authored_motion_have_identical_point_cost():
     actual=played_matrix(features([a],fps=30.,focal_motion=True),
                         features([b],fps=30.,focal_motion=True),details=True)
     assert actual['focal_image_motion_rate'][0,0]==.5
+    assert actual['focal_image_motion_relative_cost'][0,0]==0.
     assert not actual['focal_image_motion_measured'][0,0]
+    baseline=played_matrix(features([a],fps=30.),features([b],fps=30.),details=True)
+    for width in (.01,.2):
+        np.testing.assert_array_equal(event_energy(actual,width,fps=30.,point_geometry=True),
+            event_energy(baseline,width,fps=30.,point_geometry=True))
     arcs=ArcCosts.__new__(ArcCosts);arcs.point_geometry=True;arcs.focal_motion=True;arcs.fps=30.
     heads=np.zeros((1,2,8,4));heads[0,0,0]=a['head'];heads[0,1,0]=b['head']
     arcs.native=[dict(frames=np.array([10]),heads=heads)]
@@ -141,6 +146,7 @@ def test_real_selector_records_the_used_cost_and_replays_its_actual_objective():
     for seam in selected.details.values():
         assert seam['focal_image_motion_cost_used']
         assert seam['focal_image_motion_rate']==.5
+        assert seam['focal_image_motion_relative_cost']==0.
         assert not seam['focal_image_motion_measured']
 
 
@@ -156,6 +162,13 @@ def test_native_prefix_and_exact_replay_pay_the_same_unknown_motion():
             for p,q in zip(*np.nonzero(allowed)):
                 path=arcs.replay(i,j,p,q,int(codes[p,q]));s=entry[i][p].source
                 assert values[p,q]==pytest.approx(arcs.direct_cost(s,int(nodes[i]),path[None])[0]+fragments(i,j)[s])
+
+
+def test_unknown_is_not_a_new_pacing_prior_or_a_perfect_motion_measurement():
+    assert relative_cost(.5)==0.
+    assert relative_cost(0.)==-.5 and relative_cost(1.)==.5
+    for invalid in (np.nan,np.inf,-.01,1.01):
+        with pytest.raises(ValueError):relative_cost(invalid)
 
 
 if __name__ == '__main__':
