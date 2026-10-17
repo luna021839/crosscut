@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from crosscut2.visible_shot_duration import Model, fit, tail_artifact
+from crosscut2.visible_shot_duration import Model, fit, tail_artifact,exposure_tail_artifact
 
 
 def reference(identity, durations, split='train'):
@@ -122,3 +122,56 @@ def test_cli_requires_explicit_compatible_interval_path_before_reading_a_model(m
     with pytest.raises(ValueError,match='requires the actual E6'):main()
     args.extend(['--played-interval-utility'])
     with pytest.raises(ValueError,match='requires E4'):main()
+
+
+def test_long_tail_exposure_matches_screen_time_integral_without_changing_short_or_middle_shots():
+    from scipy.integrate import quad
+    old=Model(tail_artifact(model().artifact,fps=30.));saved=dict(old.artifact)
+    value=Model(exposure_tail_artifact(old.artifact,fps=30.));a=value.upper_quartile
+    short=math.exp(value.mean-2*value.scale)
+    assert value.loss(short)==old.loss(short) and value.loss(short,censored=True)==0.
+    np.testing.assert_allclose(value.loss(np.exp(value.mean+value.scale*np.array([-.5,0.,.5]))),0.)
+    assert value.loss(a)==pytest.approx(0.) and value.loss(0.)==0.
+    for seconds in (a+1e-5,a+1.,a+8.,a+20.):
+        expected=quad(lambda t:1.-.5*math.erfc((math.log(t)-value.mean)/value.scale/math.sqrt(2.))/.25,
+            a,seconds,epsabs=1e-10)[0]
+        assert value.loss(seconds)==pytest.approx(expected,abs=1e-10)
+        assert value.loss(seconds,censored=True)==value.loss(seconds)
+    assert value.loss(a+16.)>8. and old.artifact==saved
+    assert value.artifact['references']==old.artifact['references']
+    assert value.artifact['fit_content_sha256']==old.artifact['fit_content_sha256']
+    assert value.artifact['hard_maximum_hold_seconds'] is None
+    with pytest.raises(ValueError,match='clock changed'):exposure_tail_artifact(old.artifact,fps=25.)
+
+
+def test_exposure_pacing_counts_real_native_fragments_not_an_uncut_source_hold():
+    value=Model(exposure_tail_artifact(model().artifact,fps=30.))
+    nodes=np.array([0,120,240,360,480]);events=[[],[120,240,360]]
+    table=value.table(nodes,events,fps=30.)
+    assert table[0,-1,0]>table[0,-1,1]
+    assert table[0,-1,1]==pytest.approx(4.*value.loss(4.))
+    for source,xs in enumerate(events):
+        for i,a in enumerate(nodes):
+            for j,b in enumerate(nodes):
+                if i>=j:continue
+                edges=[a,*(x for x in xs if a<x<b),b]
+                expected=sum(value.loss((right-left)/30.,censored=(left==0 or right==nodes[-1]))
+                    for left,right in zip(edges[:-1],edges[1:]))
+                assert table[i,j,source]==pytest.approx(expected,abs=1e-12)
+
+
+def test_actual_interval_pacing_includes_native_ports_missing_from_the_older_source_list(monkeypatch):
+    from crosscut2.played_pose_port_programme import PlayedPosePortPrior,select
+    from test_crosscut2_preference_integration import producer
+    args,kw,native,_,_,_=producer(opposed=False,one_arm=True)
+    nodes,banks,_,_=args
+    for bank in banks:
+        bank['programme_render_clock']=dict(fps=30.,count=int(nodes[-1]),source_times=nodes/30.)
+    native[0]=dict(native[0],frames=np.array([20]),heads=np.zeros((1,2,8,4)))
+    duration=Model(exposure_tail_artifact(model().artifact,fps=30.));observed=[];original=duration.table
+    def table(nodes,events,**kwargs):observed.append([list(v) for v in events]);return original(nodes,events,**kwargs)
+    monkeypatch.setattr(duration,'table',table)
+    prior=PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=True,shot_duration_model=duration)
+    result=select(*args,**kw,native_ports=native,music=[0,1,1,0],prior=prior)
+    assert observed and 20 in observed[0][0]
+    assert result[4]['visible_shot_duration_prior']['physical_native_event_union_used']

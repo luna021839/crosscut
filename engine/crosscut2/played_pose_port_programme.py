@@ -424,7 +424,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     support=PlayedEventSupport(events,final=int(nodes[-1]),fps=fps)
     fragments=fragment_costs(nodes,source_events,fps=fps,support_seconds=12/fps)
     duration_model=getattr(prior,'shot_duration_model',None)
-    duration_costs=None if duration_model is None else duration_model.table(nodes,source_events,fps=fps)
+    duration_costs=None if duration_model is None else duration_model.table(nodes,events,fps=fps)
     duration_sources=[np.asarray([p.source for p in ports],int) for ports in entries]
     interval_utility=None
     if played:
@@ -715,6 +715,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             references=duration_model.artifact['references'],
             preferred_log_seconds_mean=duration_model.mean,preferred_log_seconds_scale=duration_model.scale,
             includes_retained_native_cuts=True,table_bytes=duration_costs.nbytes,
+            physical_native_event_union_used=True,
             hard_minimum_or_maximum_added=False,aesthetic_weight_fitted=False),
         sequence_preference_consumed=sequence,
         sequence_preference_model_sha256=None if not sequence else sequence_preference_model.artifact['content_sha256'],

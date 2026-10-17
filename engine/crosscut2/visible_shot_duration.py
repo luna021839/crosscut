@@ -14,6 +14,8 @@ import numpy as np
 
 CONTRACT = 'train_reference_visible_shot_log_duration_v1'
 TAIL_CONTRACT = 'train_reference_visible_shot_interquartile_tail_surprise_v1'
+EXPOSURE_CONTRACT = 'train_reference_visible_shot_integrated_long_tail_exposure_v1'
+_NORMAL_UPPER_QUARTILE = .6744897501960817
 
 
 def _digest(value):
@@ -62,7 +64,7 @@ def fit(references):
 class Model:
     def __init__(self, artifact):
         payload = dict(artifact); expected = payload.pop('content_sha256', None)
-        if (expected != _digest(payload) or payload.get('contract') not in (CONTRACT,TAIL_CONTRACT)
+        if (expected != _digest(payload) or payload.get('contract') not in (CONTRACT,TAIL_CONTRACT,EXPOSURE_CONTRACT)
                 or not payload.get('references')
                 or any(r.get('split') != 'train' for r in payload['references'])
                 or len({r['reference_id'] for r in payload['references']}) != len(payload['references'])
@@ -72,12 +74,20 @@ class Model:
         if not math.isfinite(self.mean) or not math.isfinite(self.scale) or self.scale <= 0:
             raise ValueError('finite fitted log-duration distribution required')
         self.artifact = dict(artifact)
-        self.tails=payload['contract']==TAIL_CONTRACT
+        self.exposure=payload['contract']==EXPOSURE_CONTRACT
+        self.tails=payload['contract'] in (TAIL_CONTRACT,EXPOSURE_CONTRACT)
         if self.tails:
             fps=payload.get('output_fps',0.)
             if (not math.isfinite(fps) or fps<=0 or payload.get('perceptual_unit_seconds')!=6./fps
                     or payload.get('tail_probability')!=.25 or not payload.get('fit_content_sha256')):
                 raise ValueError('explicit fitted-duration tails and actual six-frame output unit required')
+        if self.exposure:
+            try:
+                self.upper_quartile=math.exp(self.mean+self.scale*_NORMAL_UPPER_QUARTILE)
+                self.mean_seconds=math.exp(self.mean+.5*self.scale**2)
+            except OverflowError as error:raise ValueError('finite reference duration exposure required') from error
+            if not all(math.isfinite(v) and v>0 for v in (self.upper_quartile,self.mean_seconds)):
+                raise ValueError('finite positive reference duration exposure required')
 
     def loss(self, seconds, *, censored=False):
         seconds = np.asarray(seconds, float)
@@ -91,6 +101,17 @@ class Model:
             upper=np.maximum(np.finfo(float).tiny,.5*erfc(z/math.sqrt(2.)))
             short=np.where(censored,0.,np.maximum(0.,-np.log(lower)+math.log(.25)))
             long=np.maximum(0.,-np.log(upper)+math.log(.25))
+            if self.exposure:
+                # Integrate every overdue screen SECOND, not one six-frame
+                # charge for a16s hold. Integral_a^T[1-S(t)/S(a)]dt, where a
+                # is the reference upper quartile and S(a)=.25. This is a
+                # continuous soft cost, not a hard maximum or a cut quota.
+                capped_mean=self.mean_seconds*.5*erfc(-(z-self.scale)/math.sqrt(2.))+seconds*upper
+                capped_at_quartile=(self.mean_seconds*.5*math.erfc(
+                    -(_NORMAL_UPPER_QUARTILE-self.scale)/math.sqrt(2.))+self.upper_quartile*.25)
+                overdue=np.maximum(0.,(seconds-self.upper_quartile)-(capped_mean-capped_at_quartile)/.25)
+                long=np.where(seconds>self.upper_quartile,overdue,0.)
+                return np.where(seconds>0,self.artifact['perceptual_unit_seconds']*short+long,0.)
             return np.where(seconds>0,self.artifact['perceptual_unit_seconds']*(short+long),0.)
         # At film boundaries the observed shot may be only its remaining
         # fragment. A short censored fragment is not an intentionally short
@@ -154,4 +175,23 @@ def tail_artifact(artifact,*,fps):
         loss='six_frame_unit_times_log_tail_surprise_outside_reference_interquartile_range',
         preferred_single_duration=False,aesthetic_weight_fitted=False)
     value['content_sha256']=_digest(value)
+    return value
+
+
+def exposure_tail_artifact(artifact,*,fps):
+    """Keep existing TRAIN statistics; charge excess held screen time.
+
+    Original/tail artefacts and their old outputs remain unchanged. Short
+    shots retain the six-frame tail cost; only long exposure is integrated.
+    """
+    original=Model(artifact)
+    if original.exposure:raise ValueError('duration exposure already declared')
+    value=dict(artifact) if original.tails else tail_artifact(artifact,fps=fps)
+    if value['output_fps']!=fps:raise ValueError('duration exposure output clock changed')
+    value.pop('content_sha256')
+    value.update(contract=EXPOSURE_CONTRACT,
+        loss='six_frame_short_tail_surprise_plus_integrated_long_tail_screen_seconds',
+        long_tail_integrated_over_held_screen_time=True,hard_maximum_hold_seconds=None)
+    value['content_sha256']=_digest(value)
+    Model(value)
     return value
