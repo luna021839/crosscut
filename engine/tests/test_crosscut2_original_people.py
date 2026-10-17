@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import pytest
-from crosscut2.multi_person_pose import BODY8_COCO17
+from crosscut2.multi_person_pose import BODY8_COCO17,MODEL_SHA256
 from crosscut2.original_people_bank import FAMILY,save_chunk,load_chunk,load_reference
 from crosscut2.original_people_subjects import OriginalPeople,link_people
 from crosscut2.display_source_catalogue import SourceCatalogue
@@ -108,7 +108,7 @@ def test_reference_reuse_is_model_free_but_requires_actual_source_schedule(tmp_p
     import onnxruntime as ort
     monkeypatch.setattr(ort,'InferenceSession',lambda *a,**k:pytest.fail('cache read ran a model'))
     source=tmp_path/'source.mp4';source.write_bytes(b'fixture')
-    chunk=tmp_path/'raw.npz';binding=dict(source_sha256='b'*64,raster=[1280,720])
+    chunk=tmp_path/'raw.npz';binding=dict(source_sha256='b'*64,raster=[1280,720],family=FAMILY,model_sha256=MODEL_SHA256)
     save_chunk(chunk,[row(7),row(9)],binding=binding)
     reference=tmp_path/'reference.json'
     reference.write_text(json.dumps(dict(family=FAMILY,sources=[str(source)],source_sha256=['b'*64],
@@ -119,3 +119,7 @@ def test_reference_reuse_is_model_free_but_requires_actual_source_schedule(tmp_p
     assert list(actual[0]['by_native'])==[7,9]
     with pytest.raises(ValueError,match='schedule was not observed'):
         load_reference(reference,banks=[dict(pose_native_indices=np.array([[7,8,9,9]]))],**kw)
+    record=json.loads(reference.read_text());record['source_records'][0]['binding']['source_sha256']='c'*64
+    reference.write_text(json.dumps(record))
+    with pytest.raises(ValueError,match='source/model/raster family'):
+        load_reference(reference,banks=[dict(pose_native_indices=np.array([[7,7,9,9]]))],**kw)

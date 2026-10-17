@@ -64,6 +64,12 @@ def load_reference(path,*,sources,source_hashes,banks,authorized_root,check=lamb
     result=[]
     for s,(source,bank,entry) in enumerate(zip(sources,banks,record['source_records'],strict=True)):
         check()
+        from .multi_person_pose import MODEL_SHA256
+        binding=entry['binding'];raster=binding.get('raster')
+        if (binding.get('source_sha256')!=source_hashes[s] or binding.get('family')!=FAMILY
+                or binding.get('model_sha256')!=MODEL_SHA256 or not isinstance(raster,list)
+                or len(raster)!=2 or any(type(v) is not int or not 2<=v<=8192 for v in raster)):
+            raise ValueError('original people checkpoint source/model/raster family changed')
         if list(file_identity(source))!=entry['source_identity']:
             # USB remounts/copies can change file identity without changing
             # a single model input. Verify CONTENT instead of re-running NN.
@@ -77,6 +83,7 @@ def load_reference(path,*,sources,source_hashes,banks,authorized_root,check=lamb
             check();p=Path(chunk['path'])
             if p.is_symlink() or not p.resolve(strict=True).is_relative_to(root):
                 raise ValueError('original people checkpoint outside project')
+            if p.stat().st_size>8*1024**2:raise ValueError('original people checkpoint exceeds bounded size')
             if hashlib.sha256(p.read_bytes()).hexdigest()!=chunk['sha256']:
                 raise ValueError('original people checkpoint content changed')
             new=load_chunk(p,binding=entry['binding'])
