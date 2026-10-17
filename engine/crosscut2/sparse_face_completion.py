@@ -12,6 +12,44 @@ from pathlib import Path
 import numpy as np
 
 
+def _allowance(value):
+    if type(value) is not int or not 0<=value<=8192:
+        raise ValueError('Explicit finite face-observation record allowance required')
+    return value
+
+
+def grid_requests(nodes,banks,*,maximum_frames=2048):
+    """Complete missing alternatives before selection, not only chosen cuts.
+
+    Every genuinely unobserved source/native endpoint in the decision grid
+    is requested once. Observed-empty frames are preserved. The caller gets
+    the full cost up front; insufficient allowance never silently drops a
+    source, a centre, or later requests into a selected-cut repair loop.
+    """
+    maximum_frames=_allowance(maximum_frames);nodes=np.asarray(nodes)
+    if (nodes.ndim!=1 or nodes.dtype.kind not in 'iu' or len(nodes)<2
+            or nodes[0]!=0 or np.any(nodes[1:]<=nodes[:-1])):
+        raise ValueError('Actual ascending integer decision grid required')
+    wanted=set();coverage=[]
+    for s,bank in enumerate(banks):
+        known=np.asarray(bank.get('face_observation_valid',np.ones((len(nodes),2),bool)))
+        native=np.asarray(bank['native_indices'])
+        if (known.shape!=(len(nodes),2) or known.dtype!=bool or native.shape!=known.shape
+                or native.dtype.kind not in 'iu' or np.any(native<0)):
+            raise ValueError('Exact native endpoint ordinals and separate observation validity required')
+        missing=np.unique(native[~known])
+        wanted.update((s,int(k)) for k in missing)
+        coverage.append(dict(source=s,unobserved_slots=int((~known).sum()),
+            unique_native_frames=len(missing)))
+    if len(wanted)>maximum_frames:
+        raise ValueError(f'Complete face grid needs {len(wanted)} frames; explicit allowance is {maximum_frames}')
+    return [dict(source=s,native_frame=k) for s,k in sorted(wanted)],dict(
+        scope='all_unobserved_decision_grid_alternatives_v1',decision_nodes=len(nodes),
+        sources=coverage,actual_frame_requests=len(wanted),maximum_frames=maximum_frames,
+        selected_source_sequence_used=False,observed_empty_frames_requested=False,
+        source_or_native_frame_requests_repeated=False)
+
+
 def requests(seams,nodes,banks,*,maximum_centres=4,maximum_frames=64):
     if (type(maximum_centres) is not int or not 0<=maximum_centres<=8
             or type(maximum_frames) is not int or not 0<=maximum_frames<=128):
@@ -48,7 +86,7 @@ def requests(seams,nodes,banks,*,maximum_centres=4,maximum_frames=64):
         rendered_movie_or_reference_pixels_used=False)
 
 
-def apply(banks,poses,styles,states,rows,*,source_hashes):
+def apply(banks,poses,styles,states,rows,*,source_hashes,maximum_records=128):
     """Merge source-bound observations ONLY into explicitly unobserved slots.
 
     Both observed faces and observed-empty frames stay byte exact. New faces
@@ -59,7 +97,7 @@ def apply(banks,poses,styles,states,rows,*,source_hashes):
     if states is None:states=[np.zeros((len(b['heads']),4,3),np.uint8) for b in banks]
     if not len(banks)==len(poses)==len(styles)==len(states)==len(source_hashes):
         raise ValueError('One exact source domain per completion input required')
-    if len(rows)>128:raise ValueError('Bounded face-endpoint batch required')
+    if len(rows)>_allowance(maximum_records):raise ValueError('Bounded face-endpoint batch required')
     seen=set();validated=[]
     for row in rows:
         s,k=row['source'],row['native_frame']
@@ -109,9 +147,10 @@ def apply(banks,poses,styles,states,rows,*,source_hashes):
         neural_calls_in_merge=0,decoder_calls_in_merge=0))
 
 
-def load(reference,*,sources,source_hashes,master_start,fps,authorized_root):
+def load(reference,*,sources,source_hashes,master_start,fps,authorized_root,maximum_records=128):
     """Explicit source/native records only; never start a detector on a miss."""
     from .grid_perception import file_identity
+    maximum_records=_allowance(maximum_records)
     root=Path(authorized_root).resolve(strict=True);reference=Path(reference)
     if reference.is_symlink() or not reference.resolve(strict=True).is_relative_to(root):
         raise ValueError('Face endpoint reference outside the authorized project')
@@ -119,7 +158,7 @@ def load(reference,*,sources,source_hashes,master_start,fps,authorized_root):
     identities=[list(file_identity(Path(p))) for p in sources]
     if (record['sources']!=list(map(str,sources)) or record['source_sha256']!=list(source_hashes)
             or record['source_file_identities']!=identities or record['fps']!=fps
-            or record['master_audio_start']!=master_start or len(record['records'])>128):
+            or record['master_audio_start']!=master_start or len(record['records'])>maximum_records):
         raise ValueError('Face endpoint source/native music domain changed')
     rows=[]
     for item in record['records']:

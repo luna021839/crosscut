@@ -324,6 +324,8 @@ def main():
         help='Additional immutable subject-observation plans merged with the primary source-bound reference')
     parser.add_argument('--face-endpoint-observations',type=Path,
         help='Explicit source-bound observations completing missing face endpoints; never triggers new inference')
+    parser.add_argument('--face-endpoint-record-limit',type=int,default=128,
+        help='Explicit cached face-record allowance (0..8192); default128, no implicit source work')
     parser.add_argument('--editorial-opportunity-exposure',action='store_true',
         help='Explicit E4 trial: once-per-musical-episode actual subject exposure and readable framing deficit')
     parser.add_argument('--played-interval-utility',action='store_true',
@@ -362,6 +364,9 @@ def main():
     parser.add_argument('--preview-height', type=int, choices=(540, 1080), default=540)
     parser.add_argument('--maximum-perception-seconds', type=float, default=900.)
     args = parser.parse_args()
+    if (not 0<=args.face_endpoint_record_limit<=8192
+            or (args.face_endpoint_record_limit!=128 and args.face_endpoint_observations is None)):
+        raise ValueError('A changed face-record allowance requires explicit face endpoint observations')
     if args.reuse_subject_observations is not None and not args.played_pose_port_camera_prior:
         raise ValueError('dense subject observations require the explicit played port-camera consumer')
     if args.native_source_readability and not args.fixed_actor_camera_holds:
@@ -607,9 +612,10 @@ def main():
                 hashes=[v['source_sha256'] for v in bound_source_cut_events]
                 completed,face_completion=load_faces(args.face_endpoint_observations,sources=original.sources,
                     source_hashes=hashes,master_start=original.master_audio_start,fps=original.fps,
-                    authorized_root=args.cache.parent.parent)
+                    authorized_root=args.cache.parent.parent,maximum_records=args.face_endpoint_record_limit)
                 previous_banks=banks
-                banks,poses,style,body_states,merged=apply_faces(banks,poses,style,body_states,completed,source_hashes=hashes)
+                banks,poses,style,body_states,merged=apply_faces(banks,poses,style,body_states,completed,
+                    source_hashes=hashes,maximum_records=args.face_endpoint_record_limit)
                 if identity_hints is not None:
                     identity_hints=rebind_hints(previous_banks,banks,identity_hints,allow_previously_unobserved=True)
                 face_completion['merge']=merged

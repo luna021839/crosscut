@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from crosscut2.sparse_face_completion import requests,apply
+from crosscut2.sparse_face_completion import requests,apply,grid_requests
 
 
 def inputs():
@@ -31,6 +31,40 @@ def test_requests_target_missing_selected_endpoints_once_not_observed_empty_fram
     assert requests([seam],nodes,banks,maximum_frames=1)[0]==[]
     for bank in banks:bank['face_observation_valid'][:]=True
     assert requests([seam],nodes,banks)[0]==[]
+
+
+def test_complete_grid_requests_missing_alternatives_even_if_selected_sources_are_observed():
+    nodes,banks,*_=inputs()
+    banks[0]['face_observation_valid'][:]=True
+    # A known selected face must not conceal unobserved alternative sources.
+    wanted,receipt=grid_requests(nodes,banks)
+    assert wanted==[dict(source=1,native_frame=k) for k in (99,100)]
+    assert not receipt['selected_source_sequence_used']
+    assert receipt['sources'][0]['unique_native_frames']==0
+    # A sampled empty original viewport is already observed, not a new probe.
+    banks[1]['face_observation_valid'][:]=True
+    assert grid_requests(nodes,banks)[0]==[]
+
+
+def test_complete_grid_deduplicates_native_aliases_and_cannot_truncate_to_a_budget():
+    nodes,banks,*_=inputs()
+    banks[0]['native_indices'][1]=99
+    wanted,receipt=grid_requests(nodes,banks,maximum_frames=3)
+    assert len(wanted)==3 and receipt['actual_frame_requests']==3
+    with pytest.raises(ValueError,match='needs 3 frames'):
+        grid_requests(nodes,banks,maximum_frames=2)
+    for bad in (True,-1,8193):
+        with pytest.raises(ValueError,match='allowance'):grid_requests(nodes,banks,maximum_frames=bad)
+
+
+def test_larger_explicit_grid_merge_preserves_small_default_budget():
+    _,banks,poses,styles,states=inputs()
+    rows=[row(native=k) for k in range(129)]
+    with pytest.raises(ValueError,match='Bounded'):
+        apply(banks,poses,styles,states,rows,source_hashes=['a'*64]*2)
+    bs,_,_,_,receipt=apply(banks,poses,styles,states,rows,source_hashes=['a'*64]*2,maximum_records=129)
+    assert receipt['source_bound_native_records']==129
+    assert bs[0]['face_observation_valid'][1].all()
 
 
 def test_completion_never_attaches_old_body_to_a_new_face_or_changes_observed_input():
@@ -93,6 +127,15 @@ def test_completion_cli_rejects_an_unrelated_editor_path_before_opening_media(mo
     monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused',
         '--cache','unused','--output','unused','--models','unused','--face-endpoint-observations','unused'])
     with pytest.raises(ValueError,match='actual played-pose'):main()
+
+
+@pytest.mark.parametrize('extra',[['--face-endpoint-record-limit','512'],
+    ['--face-endpoint-observations','unused','--played-pose-port-camera-prior','--face-endpoint-record-limit','8193']])
+def test_larger_cli_face_allowance_is_explicit_and_bounded_before_any_source_io(monkeypatch,extra):
+    from crosscut2.stage_mix import main
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused',
+        '--cache','unused','--output','unused','--models','unused',*extra])
+    with pytest.raises(ValueError,match='face-record allowance'):main()
 
 
 def test_explicit_cached_reference_validates_source_and_native_binding_without_media_models(tmp_path):
