@@ -161,7 +161,7 @@ class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
                  preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None,
-                 focal_motion=False):
+                 focal_motion=False,geometry_weight=1.):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -169,6 +169,8 @@ class ArcCosts:
         self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
+        from .editorial_roles import geometry_importance
+        self.geometry_weight=geometry_importance(geometry_weight)
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
         self.played_interval_utility=played_interval_utility
         self.focal_motion=bool(focal_motion)
@@ -336,10 +338,11 @@ class ArcCosts:
         # penalty or fabricate a stationary face measurement.
         from .focal_image_motion import relative_cost
         focal=relative_cost(.5) if getattr(self,'focal_motion',False) else 0.
-        rate=detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']+focal
+        geometry=getattr(self,'geometry_weight',1.)*detail['geometry_rate']
+        rate=geometry+detail['pose_rate']+detail['appearance_rate']+focal
         if not components:return rate
         if getattr(self,'point_geometry',False):
-            return detail['pose_rate'],6./self.fps*(detail['geometry_rate']+detail['appearance_rate']+focal)
+            return detail['pose_rate'],6./self.fps*(geometry+detail['appearance_rate']+focal)
         return rate,np.zeros_like(rate)
 
     def native_weights(self,s,first,final,xs):

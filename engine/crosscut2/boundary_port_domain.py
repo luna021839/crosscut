@@ -62,8 +62,10 @@ def proposal_display_quality(observation,camera):
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
-         retain_pair_cameras=False,focal_motion=False,detailed_pose=False):
+         retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
+    from .editorial_roles import geometry_importance
+    geometry_weight=geometry_importance(geometry_weight)
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     active=tuple(range(S)) if source_cohort is None else tuple(source_cohort)
@@ -228,7 +230,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
                             error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
                         quality=min(proposal_display_quality(left_obs,left),proposal_display_quality(right_obs,right))
-                        score=error+pose_ranks[k]+appearance[ai,bi]+1.-quality+.1*(
+                        score=geometry_weight*error+pose_ranks[k]+appearance[ai,bi]+1.-quality+.1*(
                             proposal_zoom_effort(left_obs,left[0])+proposal_zoom_effort(right_obs,right[0]))
                         if detailed_pose:score+=detail_rank[ai,bi]
                         if opportunities is not None:

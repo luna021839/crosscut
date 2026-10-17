@@ -340,6 +340,8 @@ def main():
         help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair; allow300s interval selection')
     parser.add_argument('--focal-image-motion',action='store_true',
         help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
+    parser.add_argument('--focal-geometry-weight',type=float,default=1.,
+        help='Explicit1..8 importance of played face size/position continuity; same native/authored cost, no admission change')
     parser.add_argument('--detailed-pose',action='store_true',
         help='Explicit E6: reuse existing raw133 head/hand observations; missing sidecars stay unknown')
     parser.add_argument('--recycle-static-camera-capacity',action='store_true',
@@ -410,6 +412,10 @@ def main():
         raise ValueError('local recurrent IVE hints require the explicit joint motion event consumer')
     if args.individual_member_scores and (args.local_ive_photo_tool is None or not args.played_pose_port_camera_prior):
         raise ValueError('individual member scores require explicit local photo assets and played port consumer')
+    from .editorial_roles import geometry_importance
+    geometry_importance(args.focal_geometry_weight)
+    if args.focal_geometry_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
+        raise ValueError('focal geometry importance requires the explicit played-interval port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
         raise ValueError('native part-pixel support requires the explicit joint motion event consumer')
     if args.supplement_native_cut_flanks and not args.joint_motion_event_seconds:
@@ -500,7 +506,8 @@ def main():
             recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
             matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
             focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose,
-            output_height=args.preview_height if args.played_interval_utility else None)
+            output_height=args.preview_height if args.played_interval_utility else None,
+            geometry_weight=args.focal_geometry_weight)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():

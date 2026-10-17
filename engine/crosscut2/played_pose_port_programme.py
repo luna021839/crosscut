@@ -27,7 +27,12 @@ class PlayedPosePortPrior:
     def __init__(self,*,person_extents=False,editorial_opportunities=False,scene_readout=False,played_interval_utility=False,
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
-                 focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None):
+                 focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.):
+        from .editorial_roles import geometry_importance
+        geometry_weight=geometry_importance(geometry_weight)
+        if geometry_weight!=1. and not played_interval_utility:
+            raise ValueError('Focal geometry importance requires actual played-interval scoring')
+        self.geometry_weight=float(geometry_weight)
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -98,6 +103,7 @@ class PlayedPosePortPrior:
             authored_cost='played_pair_support*(D_face_rate+mean_fixed_semantic_played_pose_channels+anonymous_appearance_risk)',
             native_cost='physical_support*(same_uncapped_played_face_geometry+unmeasured_partial_pose_.5+same_anonymous_appearance_risk)',
             native_geometry_not_flattened_or_visibility_attenuated=True,
+            focal_geometry_weight=self.geometry_weight,geometry_weight_changes_source_or_cut_admission=False,
             native_missing_pose_not_fabricated_as_measured=True,
             own_activity_bound_to_same_displayed_face_sample=True,
             maximum_measured_face_height_ratio=1.5,maximum_measured_displacement_in_face_heights=1.,
@@ -344,7 +350,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
         coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
         source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
-        detailed_pose=detailed_pose)
+        detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -356,7 +362,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
             coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
             source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
-            detailed_pose=detailed_pose)
+            detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -378,7 +384,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         roles=roles,point_geometry=editorial,
         readout_tau=None if not readout else float(np.median(np.diff(opportunities.boundaries))/fps),
         preserve_camera_alternatives=sequence or played,played_interval_utility=interval_utility,
-        focal_motion=focal_motion)
+        focal_motion=focal_motion,geometry_weight=getattr(prior,'geometry_weight',1.))
     matched_delivery=None
     if played:
         from .matched_entry_delivery import MatchedEntryDelivery
@@ -423,7 +429,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                         opportunities.density(n,exits[n][left_index].observation,port.observation,
                             a[left_index],port.source,detail['matched_action_change_density'][left_index,right_index]))
             entry_density[n]=density
-            cut_cache[n]=(event_energy(detail,weights,fps=fps,point_geometry=editorial),admitted)
+            cut_cache[n]=(event_energy(detail,weights,fps=fps,point_geometry=editorial,
+                geometry_weight=getattr(prior,'geometry_weight',1.)),admitted)
             if readout:
                 from .scene_readout import change
                 cut_transfers[n]=change(detail['face_rate'],unit=6./fps)

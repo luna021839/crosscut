@@ -7,6 +7,14 @@ soft interpretation; no cut bonus or new source exclusion is issued here.
 import numpy as np
 
 
+def geometry_importance(value):
+    """Explicit editorial importance; not evidence confidence or admission."""
+    if (isinstance(value,(bool,np.bool_)) or not isinstance(value,(int,float,np.integer,np.floating))
+            or not np.isfinite(value) or not 1.<=value<=8.):
+        raise ValueError('Explicit finite focal geometry importance must be in1..8')
+    return float(value)
+
+
 class FeatureRoles:
     def __init__(self,nodes,evidence):
         self.nodes=np.asarray(nodes,int)
@@ -72,7 +80,7 @@ def apply(detail,strength):
     return result
 
 
-def event_energy(detail,window_seconds,*,fps,point_geometry):
+def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.):
     """A shorter observed strip cannot erase an instantaneous visual jump.
 
     The common six-frame perceptual unit is shared by native and authored
@@ -80,9 +88,10 @@ def event_energy(detail,window_seconds,*,fps,point_geometry):
     Legacy experiments explicitly retain their previous integration.
     """
     focal=detail.get('focal_image_motion_relative_cost',0.)+detail.get('detailed_pose_relative_cost',0.)
+    geometry=geometry_importance(geometry_weight)*detail['geometry_rate']
     if not point_geometry:
-        return window_seconds*(detail['geometry_rate']+detail['pose_rate']+detail['appearance_rate']+focal)
-    return 6./fps*(detail['geometry_rate']+detail['appearance_rate']+focal)+window_seconds*detail['pose_rate']
+        return window_seconds*(geometry+detail['pose_rate']+detail['appearance_rate']+focal)
+    return 6./fps*(geometry+detail['appearance_rate']+focal)+window_seconds*detail['pose_rate']
 
 
 def ordinary_pairs(left,right):
