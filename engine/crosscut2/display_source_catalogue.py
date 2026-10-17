@@ -37,6 +37,35 @@ def added_pixel_upscale_effort(displayed_height,native_pixels,measured,zoom,*,ou
     return np.where(known,np.maximum(0.,added),np.log2(z))
 
 
+def native_sampling_pixels(bank):
+    """Separate source pixel sampling from an optional facial blur observation.
+
+    Existing ROI records store face-height-in-native-pixels. Their ratio to
+    the same source-normalized box independently recovers the integer image
+    height. Only unanimous, float32-roundoff-consistent records permit this
+    transfer to other actually observed faces from that source. No blur,
+    contrast, missing face, or intervening person track is invented.
+    """
+    heads=np.asarray(bank['heads']);shape=heads.shape[:3]
+    values=np.asarray(bank.get('native_readability',np.zeros(shape+(4,))))
+    roi=np.asarray(bank.get('native_readability_valid',np.zeros(shape,bool)))
+    observed=np.asarray(bank.get('face_observation_valid',np.ones(shape[:2],bool)))
+    seen=(heads[...,2]>.019)&(heads[...,3]>=.75)&observed[...,None]
+    pixels=np.where(roi,values[...,3],0.).astype(float)
+    known=roi&seen&(pixels>0)
+    measured=pixels[known]/heads[...,2][known]
+    if len(measured):
+        heights=np.rint(measured)
+        height=int(heights[0])
+        tolerance=8*np.finfo(np.float32).eps*max(1,height)
+        if (0<height<=16384 and np.all(heights==height)
+                and np.all(np.abs(measured-height)<=tolerance)):
+            added=seen&~known
+            pixels[added]=heads[...,2][added].astype(float)*height
+            known|=added
+    return pixels,known
+
+
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
                  editorial_content=False,framing_evidence=None,person_attention=False,output_height=None):
@@ -94,9 +123,7 @@ class SourceCatalogue:
         self.black=np.clip((style['presence'][...,0]-.8)/.2,0,1)
         from .scene_readout import roi_readability
         self.roi_readability,self.roi_readability_valid=roi_readability(bank)
-        native_measurements=bank.get('native_readability')
-        self.native_face_pixels=(np.zeros(bank['heads'].shape[:3]) if native_measurements is None
-            else np.asarray(native_measurements)[...,3])
+        self.native_face_pixels,self.native_face_pixels_measured=native_sampling_pixels(bank)
         # Explicit numerical integration domain; never used as native K proof.
         ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
         measured=np.asarray(bank.get('face_observation_valid',np.ones((N,2),bool)))
@@ -237,7 +264,8 @@ class SourceCatalogue:
             displayed_native_quality_proxy=visible_quality,
             displayed_native_quality_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
             native_face_pixels=(0. if h<0 else float(self.native_face_pixels[n,side,h])),
-            native_face_pixels_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
+            native_face_pixels_measured=bool(h>=0 and self.native_face_pixels_measured[n,side,h]),
+            native_pixel_sampling_is_not_ROI_readability=True,
             actual_output_pixel_height=self.output_height,
             displayed_native_quality_contract=('target_ROI_native_detail_visibility_original_role_v1'
                 if self.editorial_content else 'legacy_display_quality_v1'),
@@ -294,7 +322,7 @@ class SourceCatalogue:
             if self.output_height is not None:
                 crop=upper_body_crop_loss(valid,projected)
                 zoom_effort=added_pixel_upscale_effort(displayed_height,self.native_face_pixels[n,side,index],
-                    self.roi_readability_valid[n,side,index],camera[...,0],output_height=self.output_height)
+                    self.native_face_pixels_measured[n,side,index],camera[...,0],output_height=self.output_height)
             # Native ROI deficits remain explicit; digital enlargement cannot
             # create detail. The native .12 sampling size and item-wise units
             # are engineering conventions, not fitted aesthetic thresholds.

@@ -96,6 +96,51 @@ def test_candidate_pruner_consumes_sampling_before_the_global_port_limit(monkeyp
     assert max(map(len,exits))<=receipt['global_port_limit_per_side']
 
 
+def test_known_native_sampling_does_not_require_a_blur_measurement_at_every_fine_node():
+    from crosscut2.display_source_catalogue import native_sampling_pixels
+    from crosscut2.scene_readout import roi_readability
+    cat=catalogue(1080);bank=dict(cat.bank)
+    bank['native_readability']=bank['native_readability'].copy()
+    bank['native_readability_valid']=bank['native_readability_valid'].copy()
+    bank['native_readability'][1]=0.;bank['native_readability_valid'][1]=False
+    pixels,known=native_sampling_pixels(bank)
+    assert known[1,1,0]
+    assert pixels[1,1,0]==pytest.approx(bank['heads'][1,1,0,2]*2160)
+    readable,valid=roi_readability(bank)
+    assert not valid[1].any() and (readable[1]==.5).all()
+    actual=SourceCatalogue(cat.nodes,bank,cat.body,[],cat.style,[],fps=30.,
+        editorial_content=True,output_height=1080)
+    obs=actual.observation(1,1,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    assert obs['native_face_pixels_measured'] and not obs['displayed_native_quality_measured']
+    from crosscut2.boundary_port_domain import proposal_zoom_effort
+    assert proposal_zoom_effort(obs,2.)==0.
+
+
+@pytest.mark.parametrize('conflict',[True,False])
+def test_missing_or_contradictory_source_shape_never_certifies_fine_pixel_sampling(conflict):
+    from crosscut2.display_source_catalogue import native_sampling_pixels
+    cat=catalogue(1080);bank=dict(cat.bank)
+    bank['native_readability']=bank['native_readability'].copy()
+    bank['native_readability_valid']=bank['native_readability_valid'].copy()
+    bank['native_readability'][1]=0.;bank['native_readability_valid'][1]=False
+    if conflict:bank['native_readability'][0,...,3]*=.5
+    else:bank['native_readability_valid'][:]=False
+    _,known=native_sampling_pixels(bank)
+    assert not known[1].any()
+
+
+def test_source_shape_cannot_create_unobserved_faces_or_change_cached_arrays():
+    from crosscut2.display_source_catalogue import native_sampling_pixels
+    cat=catalogue(1080);bank=dict(cat.bank)
+    bank['face_observation_valid']=np.ones(bank['heads'].shape[:2],bool)
+    bank['face_observation_valid'][1]=False
+    old_pixels=bank['native_readability'].copy();old_heads=bank['heads'].copy()
+    _,known=native_sampling_pixels(bank)
+    assert not known[1].any()
+    np.testing.assert_array_equal(bank['heads'],old_heads)
+    np.testing.assert_array_equal(bank['native_readability'],old_pixels)
+
+
 @pytest.mark.parametrize('height',[0,True,-1,8193,1080.5])
 def test_output_height_is_actual_data_not_an_unchecked_quality_setting(height):
     from crosscut2.played_pose_port_programme import PlayedPosePortPrior
