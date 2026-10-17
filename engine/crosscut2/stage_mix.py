@@ -336,6 +336,8 @@ def main():
         help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair; allow300s interval selection')
     parser.add_argument('--focal-image-motion',action='store_true',
         help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
+    parser.add_argument('--detailed-pose',action='store_true',
+        help='Explicit E6: reuse existing raw133 head/hand observations; missing sidecars stay unknown')
     parser.add_argument('--recycle-static-camera-capacity',action='store_true',
         help='Use redundant static port slots for distinct paired crops without enlarging the total E6 port bound')
     parser.add_argument('--opportunity-subject-spec',type=Path,
@@ -418,6 +420,8 @@ def main():
         raise ValueError('paired camera options require actual played interval utility')
     if args.focal_image_motion and not args.played_interval_utility:
         raise ValueError('focal image motion requires actual played interval utility')
+    if args.detailed_pose and not args.played_interval_utility:
+        raise ValueError('detailed head/hand pose requires actual played interval utility')
     if args.recycle_static_camera_capacity and not args.played_interval_utility:
         raise ValueError('recovered static capacity requires the actual E6 interval consumer')
     if args.experimental_sequence_preference_model is not None and (
@@ -464,7 +468,7 @@ def main():
             played_interval_utility=args.played_interval_utility,shot_duration_model=duration_model,
             recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
             matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
-            focal_motion=args.focal_image_motion)
+            focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
@@ -613,7 +617,7 @@ def main():
                 subjects=load_reused([args.reuse_subject_observations,*args.extra_subject_observations],sources=original.sources,
                     source_hashes=[v['source_sha256'] for v in bound_source_cut_events],banks=banks,nodes=nodes,
                     warps=warps,clocks=camera_census,master_start=original.master_audio_start,fps=original.fps,
-                    authorized_root=args.cache.parent.parent,check=check)
+                    authorized_root=args.cache.parent.parent,check=check,detailed_pose=args.detailed_pose)
             opportunity_observer=None
             if args.opportunity_subject_spec is not None:
                 from .subject_opportunity_probe import observer

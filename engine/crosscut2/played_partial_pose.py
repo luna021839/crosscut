@@ -70,7 +70,7 @@ def out_of_view_face_risk(raw_a,head_a,camera_a,visible_a,raw_b,head_b,camera_b,
     return np.where(measured,minimum,0.),measured
 
 
-def features(observations, *, fps, person_extents=False, focal_motion=False):
+def features(observations, *, fps, person_extents=False, focal_motion=False,detailed_pose=False):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
     heads = np.asarray([o['head'] for o in observations], float)
@@ -131,6 +131,9 @@ def features(observations, *, fps, person_extents=False, focal_motion=False):
     if focal_motion:
         from .focal_image_motion import describe
         result['focal_image_motion']=[describe(o,fps=fps) for o in observations]
+    if detailed_pose:
+        from .detailed_pose import describe
+        result['detailed_pose']=[describe(o) for o in observations]
     if person_extents:
         from .person_extent import height_interval
         intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
@@ -281,7 +284,14 @@ def matrix(left, right, *, details=False):
         risk,measured,steps=focal_matrix(left['focal_image_motion'],right['focal_image_motion'])
         result.update(focal_image_motion_rate=risk,focal_image_motion_measured=measured,
             focal_image_motion_observed_steps=steps,focal_image_motion_relative_cost=relative_cost(risk))
-    return result if details else (geometry + pose + appearance + result.get('focal_image_motion_relative_cost',0.), allowed)
+    if 'detailed_pose' in left or 'detailed_pose' in right:
+        if 'detailed_pose' not in left or 'detailed_pose' not in right:raise ValueError('Both sides must declare detailed pose')
+        from .detailed_pose import matrix as detailed_matrix
+        risk,measured,channels,channel_measured=detailed_matrix(left['detailed_pose'],right['detailed_pose'])
+        result.update(detailed_pose_rate=risk,detailed_pose_measured=measured,detailed_pose_channels=channels,
+            detailed_pose_channel_measured=channel_measured,detailed_pose_relative_cost=risk-.5)
+    return result if details else (geometry + pose + appearance + result.get('focal_image_motion_relative_cost',0.)
+        + result.get('detailed_pose_relative_cost',0.), allowed)
 
 
 def source_activity(observation, *, fps):

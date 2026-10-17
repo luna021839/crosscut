@@ -20,7 +20,7 @@ class BoundaryPort:
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
-         retain_pair_cameras=False,focal_motion=False):
+         retain_pair_cameras=False,focal_motion=False,detailed_pose=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
@@ -110,6 +110,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             left_features=features(native_left,fps=fps,focal_motion=focal_motion)
             right_features=features(native_right,fps=fps,focal_motion=focal_motion)
             native_pair=matrix(left_features,right_features,details=True)
+            if detailed_pose:
+                from .detailed_pose import describe as describe_detail,matrix as detail_matrix
+                # Crop proposals solve native screen displacement separately.
+                # Rank the actor's configuration here, not an unplayed native
+                # view jump that its paired camera may legitimately correct.
+                detail_rank=detail_matrix([describe_detail(o) for o in native_left],
+                    [describe_detail(o) for o in native_right],configuration_only=True)[0]-.5
             if articulated_actions:
                 from .played_interval_utility import articulated_seam_evidence
                 native_pair=articulated_seam_evidence(native_pair,native_left,native_right)
@@ -160,6 +167,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
                             error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
                         score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(math.log(left[0])+math.log(right[0]))
+                        if detailed_pose:score+=detail_rank[ai,bi]
                         if opportunities is not None:
                             score-=opportunities.density(n,left_obs,right_obs,a,b,
                                 native_pair['matched_action_change_density'][ai,bi])
@@ -274,5 +282,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         measured_motion_camera_options_compared=motion_options_measured,
         additional_motion_actor_pairs=motion_additions,
         unknown_motion_does_not_expand_candidate_domain=True,
+        detailed_head_hand_pose_used_before_pair_pruning=bool(detailed_pose),
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

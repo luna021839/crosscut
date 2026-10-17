@@ -76,6 +76,15 @@ class DenseSubjects:
         clock=SubjectClock(self.source,self.binding,OFFSETS,schedule,0,self.fps,signature)
         result=dict(window=window,clock=clock,at=at,supported=supported,
             same_shot=same,contiguous=contiguous)
+        detailed=[(w,p) for w,p in candidates if hasattr(w,'detailed_points')]
+        if detailed:
+            points=np.zeros((14,47,3),np.float32);known=np.zeros((14,47),bool);conflict=np.zeros_like(known)
+            for other,positions in detailed:
+                raw=other.detailed_points[positions]
+                valid=other.detailed_support[positions]&other.associated[positions,None]&same[:,None]
+                conflict |= known&valid&np.any(points[...,:2]!=raw[...,:2],axis=-1)
+                new=valid&~known;points[new]=raw[new];known |= valid
+            result.update(detailed_points=points,detailed_support=known&~conflict)
         self.cache[key]=result;self.used.add(key)
         return result
 
@@ -110,7 +119,7 @@ class DenseSubjects:
             ownership_certified=False)
 
 
-def load_windows(reference,*,sources,source_hashes,master_start,fps,authorized_root,check=lambda:None):
+def load_windows(reference,*,sources,source_hashes,master_start,fps,authorized_root,check=lambda:None,detailed_pose=False):
     """Load raw windows without coupling their availability to an old grid.
 
     A missing source window is permitted; a changed source/clock is not. This
@@ -141,14 +150,18 @@ def load_windows(reference,*,sources,source_hashes,master_start,fps,authorized_r
         seen.add(path)
         if path.is_symlink() or not path.resolve(strict=True).is_relative_to(root):
             raise ValueError('subject window outside authorized project or symlink')
-        groups[s].append(load(path,binding=source_hashes[s]))
+        window=load(path,binding=source_hashes[s])
+        if detailed_pose:
+            from .detailed_pose import attach
+            window=attach(window,path)
+        groups[s].append(window)
     return groups
 
 
 def load_reused(reference,*,sources,source_hashes,banks,nodes,warps,clocks,master_start,fps,
-                authorized_root,check=lambda:None):
+                authorized_root,check=lambda:None,detailed_pose=False):
     groups=load_windows(reference,sources=sources,source_hashes=source_hashes,
-        master_start=master_start,fps=fps,authorized_root=authorized_root,check=check)
+        master_start=master_start,fps=fps,authorized_root=authorized_root,check=check,detailed_pose=detailed_pose)
     return bind_windows(groups,source_hashes=source_hashes,banks=banks,nodes=nodes,warps=warps,
         clocks=clocks,master_start=master_start,fps=fps,check=check)
 
