@@ -147,3 +147,26 @@ def matrix(left,right,*,configuration_only=False):
         channels.append(np.where(seen,risk,.5));observed.append(seen)
     channels=np.stack(channels,axis=-1);observed=np.stack(observed,axis=-1)
     return channels.max(-1),observed.any(-1),channels,observed
+
+
+def bound_connection_credit(detail):
+    """A contradictory measured hand cannot retain a body-only match bonus.
+
+    Undo only the documented model-only shrinkage of POSITION residuals,
+    not a probability calibration. A known perfect configuration caps at1;
+    a configuration no better than UNKNOWN caps at0. Missing channels cap nothing. Never
+    add credit, veto a source, or change cut admission.
+    """
+    if 'detailed_pose_channels' not in detail:return detail
+    channels=np.asarray(detail['detailed_pose_channels'],float)
+    known=np.asarray(detail['detailed_pose_channel_measured'],bool)
+    if (channels.shape!=known.shape or channels.shape[-1:]!=(3,)
+            or not np.isfinite(channels).all()):raise ValueError('Three actual measured detailed-pose channels required')
+    raw=np.clip(2.*channels-.5,0.,1.)
+    cap=np.maximum(0.,1.-2.*np.where(known,raw,0.).max(-1))
+    result=dict(detail,detailed_pose_action_credit_cap=cap)
+    if 'matched_action_change_density' in result:
+        result['matched_action_change_density']=np.minimum(result['matched_action_change_density'],cap)
+    if 'actual_played_match_advantage' in result:
+        result['actual_played_match_advantage']=np.minimum(result['actual_played_match_advantage'],cap)
+    return result

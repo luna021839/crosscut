@@ -148,3 +148,27 @@ def test_detailed_pose_configuration_is_explicit_and_has_a_real_interval_consume
     monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused',
         '--cache','unused','--output','unused','--models','unused','--detailed-pose'])
     with pytest.raises(ValueError,match='actual played interval'):main()
+
+
+def test_opposed_measured_hand_bounds_match_bonus_without_a_new_bonus_or_source_veto():
+    detail=dict(detailed_pose_channels=np.array([[[.25,.75,.25]]]),
+        detailed_pose_channel_measured=np.ones((1,1,3),bool),
+        matched_action_change_density=np.array([[.6]]),actual_played_match_advantage=np.array([[.8]]),allowed=np.array([[True]]))
+    result=fine.bound_connection_credit(detail)
+    assert result['matched_action_change_density'][0,0]==0. and result['allowed'][0,0]
+    assert detail['matched_action_change_density'][0,0]==.6
+    missing=dict(detail,detailed_pose_channel_measured=np.zeros((1,1,3),bool))
+    assert fine.bound_connection_credit(missing)['matched_action_change_density'][0,0]==.6
+    matching=dict(detail,detailed_pose_channels=np.full((1,1,3),.25))
+    assert fine.bound_connection_credit(matching)['matched_action_change_density'][0,0]==.6
+    weak=dict(detail,detailed_pose_channels=np.array([[[.25,.4,.25]]]))
+    assert fine.bound_connection_credit(weak)['matched_action_change_density'][0,0]==pytest.approx(.4)
+
+
+def test_articulated_body_recomputation_cannot_restore_a_contradicted_finger_bonus():
+    from crosscut2.played_interval_utility import articulated_seam_evidence
+    detail=dict(pose_rate=np.array([[.1]]),matched_action_change_density=np.array([[.6]]),
+        matched_action_evidence_density=np.array([[.6]]),detailed_pose_channels=np.array([[[.25,.75,.25]]]),
+        detailed_pose_channel_measured=np.ones((1,1,3),bool))
+    result=articulated_seam_evidence(detail,[{}],[{}])
+    assert result['matched_action_change_density'][0,0]==0.

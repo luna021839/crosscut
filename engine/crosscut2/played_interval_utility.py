@@ -56,6 +56,9 @@ def articulated_seam_evidence(detail,left,right):
         result['actual_played_match_advantage']=advantage
         basis=detail.get('matched_action_evidence_density',detail['matched_action_change_density'])
         result['matched_action_change_density']=np.minimum(basis,advantage)
+    if 'detailed_pose_channels' in result:
+        from .detailed_pose import bound_connection_credit
+        result=bound_connection_credit(result)
     return result
 
 

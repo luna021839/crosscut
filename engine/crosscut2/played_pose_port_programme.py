@@ -183,6 +183,8 @@ class PlayedPosePortPrior:
             self.artifact.update(detailed_pose_cost='six_frame_seconds_times_worst_fixed_head_left_hand_right_hand_model_risk_minus_UNKNOWN_.5',
                 detailed_pose_unknown=.5,detailed_pose_new_source_NN=0,
                 detailed_pose_changes_admission=False,detailed_pose_changes_actor_proposal_ranking=True,
+                measured_detailed_pose_bounds_actual_body_match_credit=True,
+                unmeasured_detailed_pose_never_removes_existing_match_credit=True,
                 all_old_physical_candidates_retained=False,
                 detailed_pose_missing_never_fabricates_a_stationary_hand=True)
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
@@ -596,6 +598,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 detailed_pose_measured=(bool(detail['detailed_pose_measured'][0,0]) if detailed_pose else False),
                 detailed_pose_channel_rates=(detail['detailed_pose_channels'][0,0].tolist() if detailed_pose else None),
                 detailed_pose_channel_measured=(detail['detailed_pose_channel_measured'][0,0].tolist() if detailed_pose else None),
+                detailed_pose_action_credit_cap=(float(detail['detailed_pose_action_credit_cap'][0,0]) if detailed_pose else None),
                 focal_image_motion_rate=(float(detail['focal_image_motion_rate'][0,0]) if focal_motion else None),
                 focal_image_motion_relative_cost=(float(detail['focal_image_motion_relative_cost'][0,0]) if focal_motion else None),
                 focal_image_motion_measured=(bool(detail['focal_image_motion_measured'][0,0]) if focal_motion else False),

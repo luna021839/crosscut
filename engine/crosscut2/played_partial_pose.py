@@ -286,10 +286,11 @@ def matrix(left, right, *, details=False):
             focal_image_motion_observed_steps=steps,focal_image_motion_relative_cost=relative_cost(risk))
     if 'detailed_pose' in left or 'detailed_pose' in right:
         if 'detailed_pose' not in left or 'detailed_pose' not in right:raise ValueError('Both sides must declare detailed pose')
-        from .detailed_pose import matrix as detailed_matrix
+        from .detailed_pose import matrix as detailed_matrix,bound_connection_credit
         risk,measured,channels,channel_measured=detailed_matrix(left['detailed_pose'],right['detailed_pose'])
         result.update(detailed_pose_rate=risk,detailed_pose_measured=measured,detailed_pose_channels=channels,
             detailed_pose_channel_measured=channel_measured,detailed_pose_relative_cost=risk-.5)
+        result=bound_connection_credit(result)
     return result if details else (geometry + pose + appearance + result.get('focal_image_motion_relative_cost',0.)
         + result.get('detailed_pose_relative_cost',0.), allowed)
 
