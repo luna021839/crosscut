@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import hashlib
 import math
+from time import monotonic
 import numpy as np
 from .fixed_holds import _curve_at
 from .shot_camera_paths import pair_proposals
@@ -62,8 +63,11 @@ def proposal_display_quality(observation,camera):
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
-         retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.,body_camera_proposals=False):
+         retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.,body_camera_proposals=False,
+         progress=None):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
+    if progress is not None and not callable(progress):raise TypeError('optional preparation progress must be callable')
+    started=monotonic()
     from .editorial_roles import geometry_importance
     geometry_weight=geometry_importance(geometry_weight)
     if body_camera_proposals and not (retain_pair_cameras and articulated_actions):
@@ -190,6 +194,10 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     np.asarray([o['recurrent_member_hint'] for o in native_right])[None,:])
                 native_pair=apply(native_pair,role_strength)
             pose=native_pair['pose_rate'];appearance=native_pair['appearance_rate']
+            if body_camera_proposals:
+                from .articulated_camera_proposals import prepare,prepared_proposal
+                prepared_left=[prepare(o) for o in native_left]
+                prepared_right=[prepare(o) for o in native_right]
             candidates={}
             for ai,left_obs in enumerate(native_left):
                 a=left_sources[ai];fa=left_obs['head'];ha_index=int(left_obs['head_index'])
@@ -218,8 +226,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
                         natural_added+=1
                     if body_camera_proposals:
-                        from .articulated_camera_proposals import proposal
-                        body_pair=proposal(left_obs,right_obs,
+                        body_pair=prepared_proposal(prepared_left[ai],prepared_right[bi],
                             caps=(catalogues[a].bank['zoom_cap'],catalogues[b].bank['zoom_cap']))
                         if body_pair is not None and body_pair not in options:
                             body_option_keys.add((a,b,ha_index,hb_index,len(options)))
@@ -334,6 +341,10 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 add(outgoing,left_port);add(incoming,right_port)
         if max(len(incoming),len(outgoing))>port_limit:raise AssertionError('port domain grew beyond global bound')
         entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(len(proposals))
+        if progress is not None and ((n+1)%32==0 or n+1==N):
+            progress(dict(phase='boundary_port_preparation',completed_nodes=n+1,total_nodes=N,
+                elapsed_seconds=monotonic()-started,actor_pairs_compared=actor_pairs_considered,
+                observed_face_arm_options=body_options_added))
     return entries,exits,dense,dict(global_paired_proposal_limit_per_node=max(pair_capacities,default=maximum_pairs),
         baseline_paired_proposal_limit_per_node=maximum_pairs,global_port_limit_per_side=port_limit,
         source_cohort=list(active),original_source_index_domain_preserved=True,

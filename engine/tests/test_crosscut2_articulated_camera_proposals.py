@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from crosscut2.articulated_camera_proposals import proposal
+from crosscut2.articulated_camera_proposals import proposal,prepare,prepared_proposal
 from crosscut2.shot_camera_paths import pair_proposals,make_paths
 from crosscut2.display_source_catalogue import SourceCatalogue
 from crosscut2.boundary_port_domain import make
@@ -58,6 +58,23 @@ def test_only_the_played_native_endpoint_is_fitted_and_legal_viewport_bounds_rem
         assert all(.5/cam.zoom-1e-12<=v<=1.-.5/cam.zoom+1e-12 for v in (cam.x,cam.y))
 
 
+def test_prepared_endpoint_copies_are_immutable_and_do_not_reobserve_source_arrays():
+    samples=observations();prepared=[prepare(s) for s in samples]
+    expected=proposal(*samples,caps=(2.,2.))
+    for sample in samples:
+        sample['body'][:]=0.;sample['head'][:]=0.;sample['evidence'][:]=0
+    assert prepared_proposal(*prepared,caps=(2.,2.))==expected
+    for p in prepared:
+        assert all(not a.flags.writeable for a in (p.head,p.points,p.known))
+    assert prepared_proposal(None,prepared[1],caps=(2.,2.)) is None
+
+
+@pytest.mark.parametrize('ratio',[.7,1.,1.2,1.8])
+def test_preparation_does_not_change_pair_cameras(ratio):
+    samples=observations(ratio)
+    assert prepared_proposal(*(prepare(s) for s in samples),caps=(1.35,2.))==proposal(*samples,caps=(1.35,2.))
+
+
 def catalogues():
     nodes,banks,poses,styles=inputs();cats=[]
     for s,bank in enumerate(banks):
@@ -85,6 +102,20 @@ def test_actual_domain_keeps_original_views_and_exposes_scored_paired_arm_views_
         assert max(len(incoming),len(outgoing))<=receipt['global_port_limit_per_side']
         assert {k for p in incoming for k in p.proposal_ids if k[0]=='paired'}=={
             k for p in outgoing for k in p.proposal_ids if k[0]=='paired'}
+
+
+def test_preparation_progress_reports_real_nodes_without_changing_any_port():
+    nodes,cats,paths=catalogues();events=[]
+    settings=dict(fps=30.,articulated_actions=True,retain_pair_cameras=True,body_camera_proposals=True)
+    before=make(nodes,cats,paths,**settings)
+    after=make(nodes,cats,paths,**settings,progress=events.append)
+    assert events[-1]['completed_nodes']==len(nodes)==events[-1]['total_nodes']
+    assert events[-1]['observed_face_arm_options']>0
+    assert events[-1]['actor_pairs_compared']>0
+    for original,reported in zip(before[:2],after[:2]):
+        for first,last in zip(original,reported):
+            assert [(p.source,p.geometry_hash,p.proposal_ids) for p in first]==[
+                (p.source,p.geometry_hash,p.proposal_ids) for p in last]
 
 
 def test_articulated_camera_domain_is_explicit_and_requires_the_actual_interval_consumer():

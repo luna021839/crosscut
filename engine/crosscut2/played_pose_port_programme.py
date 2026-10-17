@@ -276,7 +276,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
            identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
            check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.,
            sequence_preference_model=None,sequence_source_bindings=None,sequence_context_kernel='numpy',
-           music_event_frames=None):
+           music_event_frames=None,preparation_progress=None):
     from .event_holds import fragment_costs
     started=monotonic();phase='preparation';selection_start=None
     person_extents=bool(prior.artifact.get('person_visible_extent_fallback_used',False))
@@ -386,7 +386,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
         source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
         detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
-        body_camera_proposals=getattr(prior,'body_camera_proposals',False))
+        body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress)
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -399,7 +399,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
             source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
             detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
-            body_camera_proposals=getattr(prior,'body_camera_proposals',False))
+            body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress)
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
