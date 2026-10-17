@@ -87,6 +87,18 @@ def provisional_candidates(catalogues,nodes,seams,*,maximum):
     return [keys[i] for i in np.linspace(0,len(keys)-1,maximum).round().astype(int)]
 
 
+def endpoint_availability(catalogues,selected):
+    """Actual usable requested windows, not process exit or model-call counts.
+
+    Deferred requests may legitimately remain UNKNOWN. Report that state
+    explicitly; a zero-call/cache-only pass must not imply data completion.
+    """
+    addresses={(n,s,side,h) for n,a,b,ha,hb in selected for s,side,h in ((a,0,ha),(b,1,hb))}
+    missing=sum(catalogues[s].subjects.sample(n,side,h) is None for n,s,side,h in addresses)
+    return dict(requested_endpoints=len(addresses),unobserved_endpoints=missing,
+        all_requested_endpoints_available=missing==0)
+
+
 def observer(specification,*,sources,source_hashes,identities,cache,authorized_root,device,image_changes=False,
              explore_missing_action=False,maximum_centres=12,maximum_seconds=180.,provisional_plan=None,master_start=None):
     """Explicit local model/media spec; sessions stay lazy until a cache miss."""
@@ -129,6 +141,7 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
         selected=(candidates(catalogues,opportunities,maximum=maximum_centres,include_observed=image_changes,
             explore_missing_action=explore_missing_action) if provisional is None else
             provisional_candidates(catalogues,opportunities.nodes,provisional['seams'],maximum=maximum_centres))
+        initial_availability=endpoint_availability(catalogues,selected)
         receipts=[];decodes=[];new=[[] for _ in sources];windows=0
         cache.mkdir(parents=True,exist_ok=True);cv2.setNumThreads(2)
         for n,a,b,ha,hb in selected:
@@ -224,6 +237,8 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                         states=[r['observation']['state'] for r in rows],measurement=proof))
                 catalogues[s].observed_image_records=tuple(rows)
         return dict(contract='bounded_preselection_fixed_opportunity_subject_probe_v1',centres=len(selected),new_windows=windows,
+            endpoint_availability_before=initial_availability,
+            endpoint_availability_after=endpoint_availability(catalogues,selected),
             maximum_centres=maximum_centres,maximum_new_windows=2*maximum_centres,maximum_seconds=maximum_seconds,
             used=budget.used,window_receipts=receipts,decode_receipts=decodes,elapsed_seconds=monotonic()-started,
             neural_model_sessions_initialized=sessions[0] is not None,source_NN_calls=sum(budget.used[k] for k in ('face','pose','recognition')),

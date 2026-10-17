@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import numpy as np
-from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer,provisional_candidates
+from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer,provisional_candidates,endpoint_availability
 
 
 def test_one_explicit_full_programme_allowance_can_cover_more_than_twelve_moments():
@@ -15,6 +15,23 @@ def test_one_explicit_full_programme_allowance_can_cover_more_than_twelve_moment
     selected=candidates(cats,events,maximum=64,explore_missing_action=True)
     assert len(selected)==64 and min(k[0] for k in selected)==1 and max(k[0] for k in selected)>=69
     assert not events.bindings
+
+
+def test_deferred_or_zero_call_pass_cannot_claim_its_endpoint_data_is_complete():
+    available=set()
+    cats=[SimpleNamespace(subjects=SimpleNamespace(sample=lambda n,side,h,s=s:
+        object() if (n,s,side,h) in available else None)) for s in range(2)]
+    selected=[(1,0,1,0,1),(2,0,1,0,1),(1,0,1,0,1)]
+    assert endpoint_availability(cats,selected)==dict(requested_endpoints=4,unobserved_endpoints=4,
+        all_requested_endpoints_available=False)
+    # A duplicated pair/camera must not inflate the requested coverage. An
+    # existing window needs no inference, while deferred windows stay absent.
+    available.add((1,0,0,0))
+    assert endpoint_availability(cats,selected)['unobserved_endpoints']==3
+    available.update((n,s,side,h) for n,a,b,ha,hb in selected for s,side,h in ((a,0,ha),(b,1,hb)))
+    assert endpoint_availability(cats,selected)==dict(requested_endpoints=4,unobserved_endpoints=0,
+        all_requested_endpoints_available=True)
+    assert endpoint_availability(cats,[])['all_requested_endpoints_available']
 
 
 def test_unbounded_observation_request_fails_before_reading_a_model_or_source():
