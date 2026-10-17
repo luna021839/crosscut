@@ -159,10 +159,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     detailed_pose_measured=known,detailed_pose_channels=channels,
                     detailed_pose_channel_measured=channel_known))
             if articulated_actions:
-                from .played_interval_utility import articulated_seam_evidence
-                native_pair=articulated_seam_evidence(native_pair,native_left,native_right)
+                from .played_interval_utility import articulated_seam_evidence,projected_articulated_pose
+                native_pair=articulated_seam_evidence(native_pair,native_left,native_right,static_camera_terms=True)
             if opportunities is not None:
                 opportunities.observe(n,native_left,native_right,native_pair,left_sources,right_sources)
+            # Preserve pure articulated evidence before the separate role
+            # interpretation mixes it with the existing handoff-flow proxy.
+            proposal_articulation=native_pair
             role_strength=np.zeros(native_pair['pose_rate'].shape)
             if roles is not None:
                 from .editorial_roles import apply
@@ -197,6 +200,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         from .paired_geometry import Camera
                         options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
                         natural_added+=1
+                    pose_ranks=(projected_articulated_pose(proposal_articulation,ai,bi,
+                        [[ca.zoom,ca.x,ca.y] for ca,_ in options],
+                        [[cb.zoom,cb.x,cb.y] for _,cb in options]) if articulated_actions
+                        else np.full(len(options),pose[ai,bi]))
+                    if articulated_actions and roles is not None:
+                        strength=role_strength[ai,bi]
+                        pose_ranks=(1.-strength)*pose_ranks+strength*native_pair['motion_flow_rate'][ai,bi]
                     for k,(ca,cb) in enumerate(options):
                         left=np.array([ca.zoom,ca.x,ca.y]);right=np.array([cb.zoom,cb.x,cb.y])
                         pa=.5+left[0]*(fa[:2]-left[1:]);pb=.5+right[0]*(fb[:2]-right[1:])
@@ -207,7 +217,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
                             error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
                         quality=min(proposal_display_quality(left_obs,left),proposal_display_quality(right_obs,right))
-                        score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(
+                        score=error+pose_ranks[k]+appearance[ai,bi]+1.-quality+.1*(
                             proposal_zoom_effort(left_obs,left[0])+proposal_zoom_effort(right_obs,right[0]))
                         if detailed_pose:score+=detail_rank[ai,bi]
                         if opportunities is not None:
@@ -309,6 +319,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         retained_pairs_using_non_native_focal=non_native_focal_pairs,
         raw_fixed_opportunity_used_before_global_pruning=opportunities is not None,
         actual_articulated_action_used_before_global_pruning=bool(articulated_actions),
+        articulated_proposal_rank_uses_actual_static_cameras=bool(articulated_actions),
         natural_action_original_view_options_added=natural_added,
         retained_paired_original_boundary_views=original_retained,
         original_feature_role_used_before_global_pruning=roles is not None,

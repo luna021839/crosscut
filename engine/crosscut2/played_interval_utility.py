@@ -12,7 +12,7 @@ from .programme_source_clock import indices
 from .observed_reframing import displayed_energy_many
 
 
-def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False):
+def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False,static_camera_terms=False):
     """Reuse the cut refiner's actual played-arm observation BEFORE DP.
 
     Contemporary source windows and the proposed physical -1/0 cameras are
@@ -22,7 +22,7 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False)
     """
     from .subject_cut_moments import _seam_action
     rate=np.asarray(detail['pose_rate']).copy();direction=np.zeros_like(rate)
-    measured=np.zeros(rate.shape,bool);components=np.zeros(rate.shape+(3,))
+    measured=np.zeros(rate.shape,bool);components=np.zeros(rate.shape+(3,));screen_terms={}
     for a,port_a in enumerate(left):
         observation_a=getattr(port_a,'observation',port_a)
         ca=observation_a.get('dense_subject_context')
@@ -34,8 +34,10 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False)
             geometry=dict(common_source_shot_sample_mask=ca['same_shot']&cb['same_shot'],
                 outgoing_camera=observation_a['camera_strip'][-1],
                 incoming_camera=observation_b['camera_strip'][0])
-            value=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry)
+            value=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry,
+                static_camera_terms=static_camera_terms)
             if not value['seam_action_supported']:continue
+            if static_camera_terms:screen_terms[a,b]=value['static_camera_screen_terms']
             measured[a,b]=True;direction[a,b]=value['seam_arm_direction_residual']
             residual=np.asarray([value[k] for k in
                 ('seam_pose_residual','seam_screen_residual','seam_motion_residual')])
@@ -48,6 +50,7 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False)
     result=dict(detail,pose_rate=rate,articulated_arm_direction=direction,
         articulated_arm_direction_measured=measured,
         articulated_configuration_screen_motion=components)
+    if static_camera_terms:result['articulated_static_screen_terms']=screen_terms
     if 'matched_action_change_density' in detail:
         # Recompute both directions: an opposed arm loses the old benefit,
         # and a genuinely matched arm is no longer buried by UNKNOWN hips.
@@ -63,6 +66,33 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False)
         from .focal_image_motion import bound_connection_credit
         result=bound_connection_credit(result)
     return result
+
+
+def projected_articulated_pose(detail,a,b,left_cameras,right_cameras):
+    """Exact static-camera placement for pre-pruning, not native placement.
+
+    Reuse the measured configuration, direction, common-clock motion and
+    source sample mask. Only the proposed output coordinates change. Missing
+    arms retain the original finite partial-pose rate; final interval scoring
+    still evaluates the complete actually played camera path independently.
+    """
+    ca,cb=map(lambda v:np.asarray(v,float),(left_cameras,right_cameras))
+    if (ca.ndim!=2 or ca.shape[1:]!=(3,) or cb.shape!=ca.shape
+            or not np.isfinite([ca,cb]).all() or np.any(ca[:,0]<1.) or np.any(cb[:,0]<1.)):
+        raise ValueError('Explicit finite paired static cameras required')
+    result=np.full(len(ca),detail['pose_rate'][a,b],float)
+    if not detail['articulated_arm_direction_measured'][a,b]:return result
+    terms=detail.get('articulated_static_screen_terms',{}).get((a,b))
+    if terms is None:raise ValueError('Exact measured static camera screen terms required')
+    xy_a,xy_b,ha,hb,known=terms
+    pa=.5+ca[:,None,None,:1]*(xy_a[None]-ca[:,None,None,1:])
+    pb=.5+cb[:,None,None,:1]*(xy_b[None]-cb[:,None,None,1:])
+    scale=np.maximum(.02,(ha[None]*ca[:,:1]+hb[None]*cb[:,:1])/2.)
+    squared=np.sum(((pa-pb)*[16/9,1.])**2,axis=-1)/scale[:,:,None]**2
+    screen=np.sqrt(np.sum(squared*known[None],axis=(1,2))/known.sum())
+    configuration,_,motion=detail['articulated_configuration_screen_motion'][a,b]
+    return np.maximum(detail['articulated_arm_direction'][a,b],
+        (configuration+screen/(1.+screen)+motion)/3.)
 
 
 @dataclass(frozen=True)

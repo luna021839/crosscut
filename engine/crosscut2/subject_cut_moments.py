@@ -65,7 +65,7 @@ def _motion_steps(na, nb, common, ticks, joints, contiguous):
     return float(observed.max()),float(activity[valid].max()),rate
 
 
-def _seam_action(left, right, lc, rc, geometry):
+def _seam_action(left, right, lc, rc, geometry, *, static_camera_terms=False):
     """Measure arms at -1/0 and their contemporary motion, not just shoulders.
 
     A shoulder-only estimate cannot establish an articulated arm connection.
@@ -124,7 +124,7 @@ def _seam_action(left, right, lc, rc, geometry):
     motion,activity,motion_rate=_motion_steps(na,nb,common,lc.output_frames,joints,contiguous)
     if motion is None:
         return dict(seam_action_supported=False, reason='no_measured_motion_near_seam')
-    return dict(seam_action_supported=True, reason='measured_articulated_seam',
+    result = dict(seam_action_supported=True, reason='measured_articulated_seam',
                 seam_arm_count=len(measured_arms), seam_arm_joints=joints,
                 seam_arm_direction_residual=float(np.mean(directions)),
                 seam_pose_residual=pose, seam_screen_residual=screen,
@@ -133,6 +133,13 @@ def _seam_action(left, right, lc, rc, geometry):
                 seam_motion_rate=motion_rate,
                 seam_motion_aggregation='observed_time_mean_bounded_step_residual_v1',
                 seam_activity=activity)
+    if static_camera_terms:
+        # Retain the exact samples/mask already used above. Candidate crops
+        # only change placement; no new pose, association or motion is fitted.
+        result['static_camera_screen_terms'] = (
+            left.body[ai[seam]][:, joints, :2], right.body[bi[seam]][:, joints, :2],
+            left.heads[ai[seam], 2], right.heads[bi[seam], 2], measured)
+    return result
 
 
 def search(left, right, left_clock, right_clock, *, candidate_frames,
