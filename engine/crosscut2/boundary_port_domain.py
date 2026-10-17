@@ -33,6 +33,22 @@ def proposal_zoom_effort(observation,zoom):
     return max(0.,math.log(max(1.,need))-math.log(max(1.,need/zoom)))
 
 
+def proposal_display_quality(observation,camera):
+    """Same native detail, actual displayed size and visible fraction as K."""
+    legacy=observation['displayed_native_quality_proxy']
+    if (observation.get('actual_output_pixel_height') is None
+            or 'target_native_ROI_readability' not in observation):return legacy
+    head=observation['head'];z,x,y=map(float,camera);height=float(head[2])*z
+    if height<=0 or head[3]<.75:return 0.
+    cx=.5+z*(float(head[0])-x);cy=.5+z*(float(head[1])-y)
+    hx,hy=height*.45*9/16,height*.5
+    fx=max(0.,min(1.,cx+hx)-max(0.,cx-hx))/(2.*hx)
+    fy=max(0.,min(1.,cy+hy)-max(0.,cy-hy))/(2.*hy)
+    fraction=min(1.,max(0.,fx*fy))
+    size=float(np.minimum(1.,head[2]/.12)) if z==1. else min(1.,height/.12)
+    return observation['target_native_ROI_readability']*observation['target_original_role_factor']*size*fraction
+
+
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
          retain_pair_cameras=False,focal_motion=False,detailed_pose=False):
@@ -161,7 +177,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     b=right_sources[bi];fb=right_obs['head'];hb_index=int(right_obs['head_index'])
                     if a==b:continue
                     actor_pairs_considered+=1
-                    quality=min(left_obs['displayed_native_quality_proxy'],right_obs['displayed_native_quality_proxy'])
                     options=list(pair_proposals(fa,fb,caps=(catalogues[a].bank['zoom_cap'],catalogues[b].bank['zoom_cap'])))
                     if role_strength[ai,bi]>0:
                         # A genuine role change must not be represented ONLY
@@ -191,6 +206,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                             scale=abs(math.log(ha/hb))/math.log(1.5)
                             framing=(scale/(1.+scale)+np.linalg.norm((pa-pb)*[16/9,1.])/np.hypot(16/9,1.))/2.
                             error=(1.-role_strength[ai,bi])*error+role_strength[ai,bi]*framing
+                        quality=min(proposal_display_quality(left_obs,left),proposal_display_quality(right_obs,right))
                         score=error+pose[ai,bi]+appearance[ai,bi]+1.-quality+.1*(
                             proposal_zoom_effort(left_obs,left[0])+proposal_zoom_effort(right_obs,right[0]))
                         if detailed_pose:score+=detail_rank[ai,bi]
@@ -312,5 +328,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         detailed_configuration_bounds_raw_opportunity_credit=bool(detailed_pose),
         proposal_zoom_cost_uses_native_output_pixels=any(getattr(cat,'output_height',None) is not None for cat in catalogues),
         unknown_native_sampling_keeps_legacy_proposal_zoom_cost=True,
+        proposal_quality_uses_actual_displayed_size_without_creating_native_detail=True,
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

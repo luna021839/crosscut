@@ -64,7 +64,9 @@ def test_actual_interval_content_uses_output_pixels_without_touching_native_pose
     legacy=catalogue(None,native_height,measured);actual=catalogue(1080,native_height,measured)
     frames=np.array([30]);crop=np.array([[2.,.5,.5]]);native=np.array([[1.,.5,.5]])
     before=actual.body.copy()
-    np.testing.assert_allclose(legacy.rates(frames,crop)-actual.rates(frames,crop),saved,atol=1e-12)
+    native_size=actual.bank['heads'][1:2,1,0,2]
+    displayed_size_gain=actual.roi_readability[1:2,1,0]*(1.-np.minimum(1.,native_size/.12))
+    np.testing.assert_allclose(legacy.rates(frames,crop)-actual.rates(frames,crop),saved+displayed_size_gain,atol=1e-12)
     np.testing.assert_allclose(legacy.rates(frames,native),actual.rates(frames,native),atol=1e-12)
     np.testing.assert_array_equal(before,actual.body)
 
@@ -139,6 +141,39 @@ def test_source_shape_cannot_create_unobserved_faces_or_change_cached_arrays():
     assert not known[1].any()
     np.testing.assert_array_equal(bank['heads'],old_heads)
     np.testing.assert_array_equal(bank['native_readability'],old_pixels)
+
+
+def test_equal_output_face_size_and_native_detail_have_equal_readability_regardless_of_original_zoom():
+    crop=catalogue(1080);native=catalogue(1080)
+    # The same216 native face pixels are shown as216 output pixels: a2x
+    # crop of a2160px source versus the native view of a1080px source.
+    native.bank['heads'][:,:,0,2]*=2.
+    a=crop.observation(1,1,np.tile([2.,.5,.5],(7,1)),target_head_index=0)
+    b=native.observation(1,1,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    assert a['head'][2]*2.==b['head'][2]
+    assert a['native_face_pixels']==b['native_face_pixels']
+    assert a['displayed_native_quality_proxy']==pytest.approx(b['displayed_native_quality_proxy'])
+
+
+@pytest.mark.parametrize('measured',[True,False])
+def test_larger_display_readability_never_exceeds_or_rewrites_original_native_detail(measured):
+    cat=catalogue(1080,native_height=540,measured=measured)
+    original=cat.roi_readability.copy()
+    obs=cat.observation(1,1,np.tile([2.,.5,.5],(7,1)),target_head_index=0)
+    assert obs['displayed_native_quality_proxy']<=cat.roi_readability[1,1,0]+1e-12
+    if not measured:assert obs['displayed_native_quality_proxy']==pytest.approx(.5)
+    np.testing.assert_array_equal(cat.roi_readability,original)
+
+
+def test_prepruning_displayed_quality_matches_the_actual_projected_target_even_when_clipped():
+    from crosscut2.boundary_port_domain import proposal_display_quality
+    cat=catalogue(1080)
+    native=cat.observation(1,1,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    for camera in ([1.,.5,.5],[2.,.5,.5],[2.,.75,.5]):
+        actual=cat.observation(1,1,np.tile(camera,(7,1)),target_head_index=0)
+        assert proposal_display_quality(native,camera)==pytest.approx(actual['displayed_native_quality_proxy'],abs=1e-12)
+    native['actual_output_pixel_height']=None
+    assert proposal_display_quality(native,[2.,.75,.5])==native['displayed_native_quality_proxy']
 
 
 @pytest.mark.parametrize('height',[0,True,-1,8193,1080.5])

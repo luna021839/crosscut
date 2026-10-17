@@ -158,14 +158,21 @@ class SourceCatalogue:
                         physical_window_valid=bool(self.physical[n,side]),native_indices=self.native[n,sl])
                     self.own[n,side,h]=source_activity(observation,fps=fps)
 
-    def target_readability(self,n,side,head_index):
+    def target_readability(self,n,side,head_index,*,displayed_height=None):
         """Same original-detail ROI units for content and proposal quality.
 
         UNKNOWN retains its explicit neutral.5 and separate validity mask.
-        Neither added zoom nor global background brightness creates detail.
+        Native detail remains unchanged. When output dimensions are explicit,
+        readable screen size belongs to the actual crop, not the original
+        broadcast view. Equally sampled, equally sized faces then agree.
         """
         height=self.bank['heads'][n,side,head_index,2]
-        return self.roi_readability[n,side,head_index]*np.minimum(1.,height/.12)
+        size=np.minimum(1.,height/.12)
+        if self.output_height is not None and displayed_height is not None:
+            # Preserve the native view's float32 convention exactly; only a
+            # genuinely changed output size receives a different size factor.
+            size=np.where(np.asarray(displayed_height)==height,size,np.minimum(1.,np.asarray(displayed_height)/.12))
+        return self.roi_readability[n,side,head_index]*size
 
     def observation(self,n,side,camera_strip,*,target_head_index=None,include_subjects=True):
         camera_strip=np.asarray(camera_strip,float)
@@ -237,7 +244,8 @@ class SourceCatalogue:
             extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
             fraction=float(np.prod(extent/np.maximum(1e-9,2*half)))
             if self.editorial_content:
-                visible_quality=float(self.target_readability(n,side,h)*fraction*self.featured_factor[n,side,h])
+                visible_quality=float(self.target_readability(n,side,h,displayed_height=head[2]*camera[0])
+                    *fraction*self.featured_factor[n,side,h])
             else:
                 visible_quality=float(np.sqrt(self.quality[n,side,h])*min(1.,head[2]*camera[0]/.22)
                     *np.sqrt(self.salience[n,side,h])*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,h])
@@ -267,8 +275,11 @@ class SourceCatalogue:
             native_face_pixels_measured=bool(h>=0 and self.native_face_pixels_measured[n,side,h]),
             native_pixel_sampling_is_not_ROI_readability=True,
             actual_output_pixel_height=self.output_height,
-            displayed_native_quality_contract=('target_ROI_native_detail_visibility_original_role_v1'
-                if self.editorial_content else 'legacy_display_quality_v1'),
+            target_native_ROI_readability=(0. if h<0 else float(self.roi_readability[n,side,h])),
+            target_original_role_factor=(0. if h<0 else float(self.featured_factor[n,side,h])),
+            displayed_native_quality_contract=('native_ROI_detail_actual_displayed_size_visibility_original_role_v2'
+                if self.editorial_content and self.output_height is not None else
+                'target_ROI_native_detail_visibility_original_role_v1' if self.editorial_content else 'legacy_display_quality_v1'),
             recurrent_member_hint=-1 if h<0 else int(self.member_hints[n,side,h]),
             individual_member_score_profile=(np.zeros(6) if h<0 or 'member_score_profiles' not in self.bank
                 else self.bank['member_score_profiles'][n,side,h]),
@@ -324,11 +335,11 @@ class SourceCatalogue:
                 zoom_effort=added_pixel_upscale_effort(displayed_height,self.native_face_pixels[n,side,index],
                     self.native_face_pixels_measured[n,side,index],camera[...,0],output_height=self.output_height)
             # Native ROI deficits remain explicit; digital enlargement cannot
-            # create detail. The native .12 sampling size and item-wise units
-            # are engineering conventions, not fitted aesthetic thresholds.
+            # create detail. The .12 displayed-size convention (legacy native
+            # size when output is unbound) is not a fitted aesthetic threshold.
             # ROI deficits and UNKNOWN stay distinct. Global black background
             # is style, not a recurring defect in an equally readable face.
-            readable=self.target_readability(n,side,index)
+            readable=self.target_readability(n,side,index,displayed_height=displayed_height)
             shown=np.where(scores.max(-1)>0,readable*fraction,0.)
             role=1.-self.featured_factor[n,side,index]
             # Viewer framing depends on the OUTPUT, not who zoomed it. An
