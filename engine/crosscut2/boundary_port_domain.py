@@ -62,10 +62,12 @@ def proposal_display_quality(observation,camera):
 
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
-         retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.):
+         retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.,body_camera_proposals=False):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     from .editorial_roles import geometry_importance
     geometry_weight=geometry_importance(geometry_weight)
+    if body_camera_proposals and not (retain_pair_cameras and articulated_actions):
+        raise ValueError('articulated camera proposals need retained cameras and played action scoring')
     coalesce_static_ports=coalesce_static_ports or recycle_static_capacity
     N=len(nodes);S=len(catalogues);final=int(nodes[-1]);entries=[];exits=[];counts=[]
     active=tuple(range(S)) if source_cohort is None else tuple(source_cohort)
@@ -78,10 +80,12 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
     # and one original-view option. Keep all old ports, then let interval
     # costs compare these physical endpoints rather than a local proxy.
     motion_pair_limit=2 if focal_motion and maximum_pairs else 0
-    port_limit=old_port_limit+3*maximum_pairs*bool(retain_pair_cameras)+(1+3*bool(retain_pair_cameras))*motion_pair_limit
+    alternatives=3+int(bool(body_camera_proposals))
+    port_limit=old_port_limit+alternatives*maximum_pairs*bool(retain_pair_cameras)+(1+alternatives*bool(retain_pair_cameras))*motion_pair_limit
     motion_additions=[];motion_options_measured=0
     camera_variants=0
     extra_count=0;pair_capacities=[];natural_added=0;original_retained=0
+    body_options_added=body_options_retained=0
     dense=[[_curve_at(ticks,curve,np.arange(final)) for ticks,curve in paths] for paths in baseline_paths]
     intent_cache={}
     def port(source,n,side,strip,ids,*,target_head_index=None):
@@ -121,11 +125,11 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                 after=curve[np.clip(tick+np.arange(0,7),0,final-1)]
                 add(outgoing,port(s,n,0,before,(('static',family),)))
                 add(incoming,port(s,n,1,after,(('static',family),)))
-        proposals=[]
+        proposals=[];body_option_keys=set()
         capacity=min(old_port_limit-len(incoming),old_port_limit-len(outgoing))
         if not maximum_pairs:capacity=0
         pair_capacities.append((capacity if recycle_static_capacity else maximum_pairs)
-            +3*maximum_pairs*bool(retain_pair_cameras)+(1+3*bool(retain_pair_cameras))*motion_pair_limit)
+            +alternatives*maximum_pairs*bool(retain_pair_cameras)+(1+alternatives*bool(retain_pair_cameras))*motion_pair_limit)
         if 0<n<N-1:
             # Retrieve a physical actor pair BEFORE proposing its cameras.
             # Looking at only the native largest face loses a valid same-
@@ -213,6 +217,13 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         from .paired_geometry import Camera
                         options.append((Camera(1.,.5,.5),Camera(1.,.5,.5)))
                         natural_added+=1
+                    if body_camera_proposals:
+                        from .articulated_camera_proposals import proposal
+                        body_pair=proposal(left_obs,right_obs,
+                            caps=(catalogues[a].bank['zoom_cap'],catalogues[b].bank['zoom_cap']))
+                        if body_pair is not None and body_pair not in options:
+                            body_option_keys.add((a,b,ha_index,hb_index,len(options)))
+                            options.append(body_pair);body_options_added+=1
                     pose_ranks=(projected_articulated_pose(proposal_articulation,ai,bi,
                         [[ca.zoom,ca.x,ca.y] for ca,_ in options],
                         [[cb.zoom,cb.x,cb.y] for _,cb in options]) if articulated_actions
@@ -311,6 +322,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     if key in retained or not feasible(option):continue
                     retained.add(key);proposals.append(option);camera_variants+=1
             for _,a,b,ha,hb,k,ca,cb in proposals:
+                body_options_retained+=int((a,b,ha,hb,k) in body_option_keys)
                 original_retained+=int(np.array_equal(ca,[1.,.5,.5]) and np.array_equal(cb,[1.,.5,.5]))
                 pair_id=('paired',n,a,b,ha,hb,k)
                 non_native_focal_pairs+=int(ha!=left_native[a] or hb!=right_native[b])
@@ -343,7 +355,11 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         primary_actor_pair_camera_variants_retained=bool(retain_pair_cameras),
         additional_primary_pair_camera_options=camera_variants,
         previous_work_bound_unchanged=not bool(retain_pair_cameras or motion_pair_limit),
-        primary_pair_camera_options_per_actor_pair_upper_bound=4,
+        primary_pair_camera_options_per_actor_pair_upper_bound=4+int(bool(body_camera_proposals)),
+        articulated_body_camera_proposals_enabled=bool(body_camera_proposals),
+        original_face_camera_options_removed=False,
+        additional_observed_face_arm_camera_options=body_options_added,
+        retained_observed_face_arm_camera_options=body_options_retained,
         source_motion_used_before_pair_pruning=bool(focal_motion),
         additional_motion_actor_pair_limit_per_node=motion_pair_limit,
         motion_proposal_camera_is_static_hypothesis_not_final_played_path=True,

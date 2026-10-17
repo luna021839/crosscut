@@ -28,7 +28,7 @@ class PlayedPosePortPrior:
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
-                 editorial_reference_sources=None,original_person_attention=False):
+                 editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False):
         from .editorial_roles import geometry_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
@@ -49,6 +49,9 @@ class PlayedPosePortPrior:
         if retain_pair_cameras and not played_interval_utility:
             raise ValueError('paired camera options require actual interval camera scoring')
         self.retain_pair_cameras=bool(retain_pair_cameras)
+        if body_camera_proposals and not (played_interval_utility and retain_pair_cameras):
+            raise ValueError('Articulated cameras require retained actual played-interval camera options')
+        self.body_camera_proposals=bool(body_camera_proposals)
         if focal_motion and not played_interval_utility:
             raise ValueError('focal image motion requires actual played interval utility')
         self.focal_motion=bool(focal_motion)
@@ -105,7 +108,8 @@ class PlayedPosePortPrior:
             'played_interval_utility.py','observed_reframing.py','matched_entry_delivery.py','visible_shot_duration.py',
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
-            'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py']
+            'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py',
+            'articulated_camera_proposals.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -203,13 +207,16 @@ class PlayedPosePortPrior:
                 paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
                 global_port_limit_per_side='four_per_source_plus_eight_unchanged')
         self.artifact['retain_primary_pair_camera_options']=self.retain_pair_cameras
+        self.artifact['observed_face_arm_camera_proposals']=self.body_camera_proposals
         if self.retain_pair_cameras:
             self.artifact.update(same_total_port_bound=False,
                 paired_proposal_global_limit_per_node=None,baseline_paired_limit_per_node=8,
-                global_port_limit_per_side='four_per_source_plus_thirty_two_explicit_expansion',
-                primary_actor_pair_limit_per_node=8,maximum_cameras_per_primary_actor_pair=4,
+                global_port_limit_per_side=('four_per_source_plus_forty_explicit_expansion' if self.body_camera_proposals
+                    else 'four_per_source_plus_thirty_two_explicit_expansion'),
+                primary_actor_pair_limit_per_node=8,maximum_cameras_per_primary_actor_pair=4+int(self.body_camera_proposals),
                 pair_camera_proxy_winner_not_forced_before_interval_choice=True,
-                all_old_physical_candidates_retained=True)
+                all_old_physical_candidates_retained=not self.body_camera_proposals,
+                existing_face_camera_options_considered=True)
         self.artifact['matched_musical_event_utility']=self.matched_event_utility
         self.artifact['detailed_head_hand_pose']=self.detailed_pose
         if self.detailed_pose:
@@ -246,7 +253,8 @@ class PlayedPosePortPrior:
                 baseline_paired_limit_per_node=8,
                 candidate_motion_preserves_every_old_physical_proposal=True,
                 candidate_motion_is_static_view_hypothesis_not_final_camera_cost=True,
-                global_port_limit_per_side=('four_per_source_plus_forty_explicit_expansion' if self.retain_pair_cameras
+                global_port_limit_per_side=('four_per_source_plus_fifty_explicit_expansion' if self.body_camera_proposals
+                    else 'four_per_source_plus_forty_explicit_expansion' if self.retain_pair_cameras
                     else 'four_per_source_plus_ten_explicit_expansion'),
                 same_total_port_bound=False,
                 all_unmeasured_focal_motion_leaves_existing_objective_unchanged=True,
@@ -377,7 +385,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
         coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
         source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
-        detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.))
+        detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
+        body_camera_proposals=getattr(prior,'body_camera_proposals',False))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -389,7 +398,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
             coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
             source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
-            detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.))
+            detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
+            body_camera_proposals=getattr(prior,'body_camera_proposals',False))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit

@@ -342,6 +342,8 @@ def main():
         help='Explicit TRAIN-only soft visible-shot duration distribution; requires E6, not app/default activation')
     parser.add_argument('--retain-pair-cameras',action='store_true',
         help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair; allow300s interval selection')
+    parser.add_argument('--body-camera-proposals',action='store_true',
+        help='Add an actual face/arm similarity-fit camera option before DP, retaining old cameras; no post-fit')
     parser.add_argument('--focal-image-motion',action='store_true',
         help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
     parser.add_argument('--focal-geometry-weight',type=float,default=1.,
@@ -465,6 +467,8 @@ def main():
         raise ValueError('visible-shot pacing requires the actual E6 interval consumer')
     if args.retain_pair_cameras and not args.played_interval_utility:
         raise ValueError('paired camera options require actual played interval utility')
+    if args.body_camera_proposals and not (args.retain_pair_cameras and args.played_interval_utility):
+        raise ValueError('Articulated cameras require retained actual played-interval camera options')
     if args.focal_image_motion and not args.played_interval_utility:
         raise ValueError('focal image motion requires actual played interval utility')
     if args.detailed_pose and not args.played_interval_utility:
@@ -520,7 +524,8 @@ def main():
             focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose,
             person_attention=args.original_person_attention,original_person_attention=args.original_person_attention,
             output_height=args.preview_height if args.played_interval_utility else None,
-            geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source)
+            geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source,
+            body_camera_proposals=args.body_camera_proposals)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
     def check():
