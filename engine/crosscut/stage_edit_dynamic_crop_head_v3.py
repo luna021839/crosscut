@@ -89,7 +89,7 @@ DYNAMIC_CROP_V3_TIME_PARAMETERIZATION = (
     "count_specific_epsilon_interior_gap_simplex_with_explicit_tail_v3"
 )
 DYNAMIC_CROP_V3_VALUE_PARAMETERIZATION = (
-    "renderer_safe_radial_pan_roll_exact_corner_and_convex_interpolation_zoom_floor_v3"
+    "renderer_safe_radial_pan_roll_exact_corner_and_convex_linf_interpolation_zoom_floor_v3"
 )
 DYNAMIC_CROP_V3_LOSS_CONTRACT = (
     "renderer_range_normalized_values_count_times_motion_loss_v3"
@@ -497,15 +497,20 @@ def renderer_safe_values_from_raw_v3(raw_values: Any) -> Any:
         _MAXIMUM_ZOOM - 1.0e-4,
         zoom_floor + 1.0e-4 * mx.minimum(geometry_strength, 1.0),
     )
-    # This conservative convex envelope is above the exact renderer floor
-    # throughout the bounded pan/roll domain.  Euclidean norm and absolute
-    # value are convex, so linearly interpolating endpoint zooms above this
-    # envelope also stays above it between every keyframe pair.  The small
-    # epsilon keeps the center derivative finite at the zero-init prior.
-    convex_center_distance = mx.sqrt(
-        (center_offset * center_offset).sum(axis=-1)
-        + _CONVEX_CENTER_EPSILON
-    )
+    # Use the convex L-infinity pan envelope, not the unnecessarily larger
+    # Euclidean radius: a safe diagonal teacher must remain representable.
+    # With m=max(|dx|,|dy|)<=.04, r=|roll|<=1.6, b=(16/9)*pi/180,
+    # each exact corner floor is <= (1+b*r)/(1-.006*min(1,r)-2*m*(1+b*r)).
+    # Multiplying by that positive denominator gives a separately concave
+    # polynomial in m and r on r:[0,1] and [1,1.6]. The six rectangle corners
+    # certify 1+2.201*m+.05745*r as an upper bound; the roll-only extra .020
+    # margin satisfies the same piecewise concave endpoint check. L-infinity
+    # norm plus absolute roll is convex, preserving safety BETWEEN knots.
+    # Keep the old positive origin floor, prior initialization and finite
+    # zero-center gradients. Teacher values and renderer bounds do not move.
+    convex_center_distance = mx.maximum(
+        mx.abs(center_offset[..., 0]), mx.abs(center_offset[..., 1])
+    ) + math.sqrt(_CONVEX_CENTER_EPSILON)
     convex_zoom_floor = (
         _MINIMUM_ZOOM
         + _CONVEX_PAN_ZOOM_SLOPE * convex_center_distance

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from unittest import mock
@@ -43,6 +44,9 @@ from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     decode_dynamic_crop_model_source_v3,
     dynamic_crop_prediction_from_model_source_v3,
     dynamic_crop_predictions_from_model_token_v3,
+)
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
+    decode_dynamic_crop_target_v2,
 )
 import crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 as adapter_v3
 from crosscut.stage_edit_dynamic_crop_target_v3 import (
@@ -219,6 +223,70 @@ class StageEditDynamicCropHeadV3Tests(unittest.TestCase):
             self.assertLessEqual(abs(value[3]), 1.60)
             self.assertGreaterEqual(value[0], 1.0)
             self.assertLessEqual(value[0], 1.18)
+
+    def test_renderer_safe_diagonal_teacher_is_representable_without_moving_it(self) -> None:
+        from crosscut.stage_edit_dynamic_crop_head_v3 import _MANIFOLD_CENTER_SHIFT
+
+        teacher = EditorialTransformKeyframe(0.0, 1.06, .525, .525, 0.0)
+        trajectory = _trajectory(motion_label="static", keyframes=(teacher,))
+        decoded = decode_dynamic_crop_target_v2(trajectory)
+        self.assertTrue(decoded.eligible)
+        self.assertEqual(decoded.minimum_safe_zoom_projection_count, 0)
+        simplified = simplify_dynamic_crop_trajectory_v3(trajectory)
+        self.assertEqual(simplified.keyframes, (teacher,))
+        _, _, supervision = self._batches(trajectory)
+        self.assertTrue(bool(supervision.keyframe_mask[0, 0, 2, 0].item()))
+        self.assertFalse(bool(supervision.keyframe_mask[0, 0, 0, 0].item()))
+        expected = np.array([teacher.zoom, teacher.center_x, teacher.center_y, 0.0])
+        np.testing.assert_allclose(
+            np.asarray(supervision.values[0, 0, 2, 0]), expected, rtol=0., atol=1e-7
+        )
+        offset = expected[1:3] - .5
+        radius = np.linalg.norm(offset)
+        raw_center = offset / radius * np.arctanh(radius / _MANIFOLD_CENTER_SHIFT)
+        raw = np.array([-80., *raw_center, 0.], np.float32)
+        floor = np.asarray(renderer_safe_values_from_raw_v3(mx.array(raw)))[0]
+        self.assertLess(float(floor), teacher.zoom)
+        amount = (teacher.zoom - float(floor)) / (1.18 - float(floor))
+        raw[0] = math.log(amount / (1. - amount))
+        actual = np.asarray(renderer_safe_values_from_raw_v3(mx.array(raw)))
+        np.testing.assert_allclose(actual, expected, rtol=0., atol=2e-7)
+        # The original teacher coordinates and source binding are unchanged;
+        # the model's representation, not the supervision, must cover them.
+        EditorialTransformKeyframe(0., *actual.tolist())
+
+    def test_linf_envelope_certificate_covers_all_corner_and_roll_requirements(self) -> None:
+        from crosscut.stage_edit_dynamic_crop_head_v3 import (
+            DynamicCropHeadV3Config,
+            _CONVEX_PAN_ZOOM_SLOPE as a,
+            _CONVEX_ROLL_ZOOM_SLOPE as c,
+            _MAXIMUM_CENTER_SHIFT as pan,
+            _MAXIMUM_ROLL_DEGREES as roll,
+            _EDGE_MARGIN as margin,
+        )
+        b = (16 / 9) * math.pi / 180
+        # The cleared-denominator polynomial is concave in each variable
+        # separately on each side of min(1,r), so these vertices bound the
+        # entire continuous rectangle, not merely a sampled angle grid.
+        for m in (0., pan):
+            for r in (0., 1., roll):
+                denominator = 1. - 2 * margin * min(1., r) - 2 * m * (1 + b * r)
+                self.assertGreater(denominator, 0.)
+                self.assertGreaterEqual(
+                    (1 + a * m + c * r) * denominator - (1 + b * r), -1e-14
+                )
+        for r in (0., 1., roll):
+            self.assertGreaterEqual(
+                (1 + c * r - .020 * min(1., r)) * (1 - 2 * margin * min(1., r))
+                - (1 + b * r),
+                -1e-14,
+            )
+        with self.assertRaisesRegex(ValueError, 'contract'):
+            DynamicCropHeadV3Config(
+                value_parameterization=(
+                    'renderer_safe_radial_pan_roll_exact_corner_and_convex_interpolation_zoom_floor_v3'
+                )
+            )
 
     def test_extreme_random_two_to_eight_keyframe_tracks_decode_without_projection(
         self,
