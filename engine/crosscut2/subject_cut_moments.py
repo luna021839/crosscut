@@ -50,13 +50,19 @@ def _motion_steps(na, nb, common, ticks, joints, contiguous):
     first=np.maximum(previous,0);gap=ticks[:,None]-ticks[first]
     breaks=np.r_[0,np.cumsum(~np.asarray(contiguous,bool))]
     valid=known&(previous>=0)&(gap>0)&(gap<=3)&((breaks[rows]-breaks[first])==0)
-    if not valid.any():return None,0.
+    if not valid.any():return None,0.,None
     da=na[:,joints]-na[first,joints[None,:]]
     db=nb[:,joints]-nb[first,joints[None,:]]
     unit=3./np.maximum(1,gap)
     residual=np.linalg.norm(da-db,axis=-1)*unit
     activity=np.minimum(np.linalg.norm(da,axis=-1),np.linalg.norm(db,axis=-1))*unit
-    return float(residual[valid].max()),float(activity[valid].max())
+    # Integrate bounded discrepancy BEFORE aggregating time. A single noisy
+    # MODEL_ONLY wrist must not become the cost of the whole neighbourhood.
+    # Every observed intermediate reversal still contributes; no median,
+    # endpoint decimation, clipping of observations or UNKNOWN floor is used.
+    observed=residual[valid];weights=gap[valid]
+    rate=float(np.average(observed/(1.+observed),weights=weights))
+    return float(observed.max()),float(activity[valid].max()),rate
 
 
 def _seam_action(left, right, lc, rc, geometry):
@@ -115,14 +121,17 @@ def _seam_action(left, right, lc, rc, geometry):
     for window,at in ((left,ai),(right,bi)):
         missing=np.r_[0,np.cumsum(~window.associated)]
         contiguous&=(missing[at[1:]+1]-missing[at[:-1]])==0
-    motion,activity=_motion_steps(na,nb,common,lc.output_frames,joints,contiguous)
+    motion,activity,motion_rate=_motion_steps(na,nb,common,lc.output_frames,joints,contiguous)
     if motion is None:
         return dict(seam_action_supported=False, reason='no_measured_motion_near_seam')
     return dict(seam_action_supported=True, reason='measured_articulated_seam',
                 seam_arm_count=len(measured_arms), seam_arm_joints=joints,
                 seam_arm_direction_residual=float(np.mean(directions)),
                 seam_pose_residual=pose, seam_screen_residual=screen,
-                seam_motion_residual=motion,
+                seam_motion_residual=motion_rate/max(1e-12,1.-motion_rate),
+                seam_motion_maximum_observed_residual=motion,
+                seam_motion_rate=motion_rate,
+                seam_motion_aggregation='observed_time_mean_bounded_step_residual_v1',
                 seam_activity=activity)
 
 

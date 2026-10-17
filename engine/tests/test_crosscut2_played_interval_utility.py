@@ -151,6 +151,25 @@ def test_unassociated_intermediate_arm_cannot_invent_motion_credit():
     assert after['matched_action_change_density'][0,0]==0.
 
 
+def test_final_motion_integrates_observed_time_instead_of_one_wrist_maximum():
+    from crosscut2.subject_cut_moments import _motion_steps
+    ticks=np.arange(-7,7);a=np.zeros((14,8,2));b=a.copy()
+    b[ticks==1,4,0]=100.
+    known=np.ones((14,8),bool);contiguous=np.ones(13,bool)
+    maximum,_,rate=_motion_steps(a,b,known,ticks,[2,3,4,5],contiguous)
+    assert maximum==300.
+    # Only two of28 genuinely observed joint/time intervals disagree.
+    assert rate==pytest.approx((300/301)*2/28)
+    assert 0.<rate<.08
+    # A sustained measured discrepancy has a larger integrated cost, while
+    # an entirely absent wrist never becomes measured perfect movement.
+    b[:,4,0]=np.arange(14)*100.
+    _,_,sustained=_motion_steps(a,b,known,ticks,[2,3,4,5],contiguous)
+    assert sustained>rate
+    known[:]=False
+    assert _motion_steps(a,b,known,ticks,[2,3,4,5],contiguous)==(None,0.,None)
+
+
 def test_raw_actor_retrieval_consumes_the_same_articulated_action_before_pruning():
     from crosscut2.boundary_port_domain import make
     from test_crosscut2_dense_subject_catalogue import prepared

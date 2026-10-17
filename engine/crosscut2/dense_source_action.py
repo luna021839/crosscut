@@ -18,8 +18,9 @@ def motion(a,b,joints):
     normal=[]
     for sample in (a,b):
         normal.append(_normalized_body(sample['window'],sample['at']))
-    return _motion_steps(*normal,a['supported']&b['supported'],ticks,joints,
+    residual,activity,_=_motion_steps(*normal,a['supported']&b['supported'],ticks,joints,
         a['contiguous']&b['contiguous'])
+    return residual,activity
 
 
 def paired(left,right,*,rates,available,basis):

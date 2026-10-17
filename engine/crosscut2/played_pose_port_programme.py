@@ -146,6 +146,8 @@ class PlayedPosePortPrior:
                 complete_arc_camera_argmin_after_actual_utility=True,
                 refiner_articulated_seam_observation_used_before_source_cut_selection=True,
                 complete_observed_arm_replaces_sparse_pose_unknown_floor=True,
+                articulated_motion_aggregation='observed_time_mean_bounded_step_residual_v1',
+                isolated_model_joint_error_does_not_own_the_whole_window=True,
                 articulated_pose_cost='max(arm_direction,mean(rho(configuration),rho(screen_placement),rho(common_music_motion)))',
                 naturally_matched_original_views_can_be_pair_bound=True,
                 observed_image_motion_is_not_actor_or_camera_cause=True)
