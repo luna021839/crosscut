@@ -179,18 +179,21 @@ DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
 DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT = (
     "only_dynamic_crop_values_count_time_motion_low_rank_residual_mutable_v4"
 )
-DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 16
+# Avoid a rank16 warmup bottleneck in the full trajectory head (TRAIN-only
+# capacity comparison in GPT_PRO_PRODUCTION_CHECKLIST.md). Small test models
+# still use min(rank, dimension); inference size and quality gates are unchanged.
+DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 128
 DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES = (
     "context_projection", "source_projection", "input_fusion",
     "position_embedding", "encoder",
 )
 DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
-    "standardized_fixed_deterministic_random_projection_separate_"
-    "context_source_linear_full_trajectory_residual_v3"
+    "standardized_fixed_deterministic_random_projection_rank128_separate_"
+    "context_source_linear_full_trajectory_residual_v4"
 )
 DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT = (
     "independent_warmup_cosine_cut_source_v3_full_trajectory_minibatch_"
-    "declared_joint_feature_mode_v7"
+    "declared_joint_feature_mode_rank128_prior_v8"
 )
 
 
@@ -2040,6 +2043,8 @@ class _DynamicCropV3PriorTrack:
     source_embedding: np.ndarray | None = None
     observed_values: tuple[tuple[float, float, float, float], ...] | None = None
     observed_normalized_times: tuple[float, ...] | None = None
+    original_observed_keyframes: tuple[Any, ...] = ()
+    shot_duration_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2235,6 +2240,8 @@ def _dynamic_crop_v3_prior_inventory(
                     observed_normalized_times=tuple(
                         float(p.time_seconds) / duration for p in target.original_observed_keyframes
                     ),
+                    original_observed_keyframes=target.original_observed_keyframes,
+                    shot_duration_seconds=duration,
                 )
             )
             reference_count += 1
@@ -4317,6 +4324,11 @@ def train_production_stage_edit(
                 "selection": dict(initial_selection),
                 "validation_metrics": initial_validation_metrics,
             }
+            from .stage_edit_prior_fit_metrics import evaluate_materialized_prior_fit
+            initial_candidate_evaluation['training_fit'] = evaluate_materialized_prior_fit(
+                prior_inventory.tracks, dynamic_crop_v3_prior_initial_snapshot,
+                reference_song_ids=prior_inventory.reference_song_ids,
+            )
             for candidate_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
                 candidate_snapshot = dynamic_crop_v3_prior_candidate_snapshots[
                     candidate_step
@@ -4408,6 +4420,10 @@ def train_production_stage_edit(
                         "heldout_forward_performed": False,
                         "selection": dict(warmup_selection),
                         "validation_metrics": warmup_validation_metrics,
+                        "training_fit": evaluate_materialized_prior_fit(
+                            prior_inventory.tracks, candidate_snapshot,
+                            reference_song_ids=prior_inventory.reference_song_ids,
+                        ),
                     }
                 )
                 if (

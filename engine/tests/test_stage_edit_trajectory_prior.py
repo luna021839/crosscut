@@ -31,11 +31,26 @@ from crosscut.stage_edit_production_training import (
     _dynamic_crop_v3_centered_projection,
     _dynamic_crop_v3_structured_prior_head_snapshot,
     _dynamic_crop_v3_structured_prior_raw,
+    _dynamic_crop_v3_structured_prior_projections,
+    DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
 )
 
 
 @unittest.skipUnless(mx is not None, 'MLX is optional')
 class TrajectoryPriorRegressionTests(unittest.TestCase):
+    def test_real_size_warmup_preserves_more_than_sixteen_random_feature_axes(self):
+        self.assertEqual(DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK, 128)
+        first = _dynamic_crop_v3_structured_prior_projections(768, seed=20260824)
+        repeated = _dynamic_crop_v3_structured_prior_projections(768, seed=20260824)
+        for actual, expected in zip(first, repeated, strict=True):
+            self.assertEqual(actual.shape, (128, 768))
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            np.testing.assert_allclose(np.linalg.norm(np.asarray(actual), axis=1), 1., atol=1e-6)
+        small = _dynamic_crop_v3_structured_prior_projections(8, seed=20260824)
+        self.assertEqual(small[0].shape, (8, 8))
+        legacy_explicit = _dynamic_crop_v3_structured_prior_projections(768, seed=20260824, requested_rank=16)
+        np.testing.assert_array_equal(np.asarray(first[0][:16]), np.asarray(legacy_explicit[0]))
+
     def test_center_before_projection_matches_double_reference_and_merged_head(self):
         rng = np.random.default_rng(173)
         dimension, rank = 768, 16

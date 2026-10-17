@@ -1072,9 +1072,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 requested_rank=DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
             )
         )
-        adapter = _DynamicCropV3StructuredPriorAdapterModule(
-            DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK
-        )
+        projection_rank = min(DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK, dimension)
+        self.assertEqual(context_projection.shape[0], projection_rank)
+        adapter = _DynamicCropV3StructuredPriorAdapterModule(projection_rank)
         adapter.context_adapter.weight = mx.ones_like(
             adapter.context_adapter.weight
         )
@@ -1085,10 +1085,10 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             adapter.source_adapter.weight
         )
         normalizer = _DynamicCropV3PriorProjectionNormalizer(
-            context_mean=mx.zeros((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
-            context_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
-            source_mean=mx.zeros((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
-            source_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            context_mean=mx.zeros((projection_rank,)),
+            context_scale=mx.ones((projection_rank,)),
+            source_mean=mx.zeros((projection_rank,)),
+            source_scale=mx.ones((projection_rank,)),
             context_center=mx.zeros((dimension,)),
             source_center=mx.zeros((dimension,)),
             evidence={},
@@ -1382,6 +1382,15 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 candidate["predeclared_candidate_steps"],
             )
             self.assertEqual(6, len(candidate["candidate_evaluations"]))
+            for item in (candidate['initial_candidate_evaluation'], *candidate['candidate_evaluations']):
+                fit = item['training_fit']
+                self.assertGreater(fit['track_count'], 0)
+                self.assertEqual(fit['training_reference_ids'], sorted(report['split']['training_reference_ids']))
+                self.assertTrue(fit['decoded_observed_time']['complete'])
+                self.assertEqual(fit['encoder_forward_count'], 0)
+                self.assertEqual(fit['parameter_updates'], 0)
+                self.assertFalse(fit['validation_or_heldout_data_consumed'])
+                self.assertFalse(fit['checkpoint_selection_or_qualification_authority'])
             selectable_candidates = [
                 item
                 for item in candidate["candidate_evaluations"]
