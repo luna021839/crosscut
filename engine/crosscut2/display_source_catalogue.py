@@ -68,7 +68,8 @@ def native_sampling_pixels(bank):
 
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
-                 editorial_content=False,framing_evidence=None,person_attention=False,output_height=None):
+                 editorial_content=False,framing_evidence=None,person_attention=False,output_height=None,
+                 original_person_attention=False):
         if output_height is not None and (type(output_height) is not int or not 1<=output_height<=8192):
             raise ValueError('Actual positive integer output pixel height required')
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
@@ -77,6 +78,9 @@ class SourceCatalogue:
         self.editorial_content=bool(editorial_content)
         self.framing_evidence=framing_evidence
         self.person_attention=bool(person_attention)
+        self.original_person_attention=bool(original_person_attention)
+        if self.original_person_attention and (not self.person_attention or 'original_people_observations' not in bank):
+            raise ValueError('original person competition requires explicit full-image observations and attention')
         N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
         self.member_hints=np.full(bank['heads'].shape[:3],-1,int) if member_hints is None else np.asarray(member_hints,int)
         self.featured_factor=np.ones(bank['heads'].shape[:3]) if featured_factor is None else np.asarray(featured_factor,float)
@@ -109,8 +113,13 @@ class SourceCatalogue:
         self.physical=np.ones((N,2),bool)
         self.native=np.asarray(bank['pose_native_indices'],int)
         self.person_boxes=None
+        self.person_target_indices=None
         if self.person_attention:
-            mapping=bank.get('person_rectangles_by_native',{})
+            if self.original_person_attention:
+                mapping={native:np.c_[np.clip(row['boxes'],0.,1.),row['scores']]
+                    for native,row in self.original_people.raw['by_native'].items()}
+                self.person_target_indices=self.original_people.person_indices[:,[1,2]].copy()
+            else:mapping=bank.get('person_rectangles_by_native',{})
             maximum=max((len(v) for v in mapping.values()),default=0)
             self.person_boxes=np.zeros((N,2,max(1,maximum),5),np.float32)
             for n,side in np.ndindex(N,2):
@@ -302,7 +311,11 @@ class SourceCatalogue:
             person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
         if self.person_attention:
             from .person_attention import competition
-            value=competition(self.person_boxes[n,side],selected[0,0],camera)
+            target=None if self.person_target_indices is None else int(self.person_target_indices[n,side,h]) if h>=0 else -1
+            value=competition(self.person_boxes[n,side],selected[0,0],camera,target_index=target)
+            if self.original_person_attention:
+                result.update(person_target_rectangle_index=target,person_rectangles=self.person_boxes[n,side],
+                    person_competition_box_family=self.original_people.raw['family'])
             result.update(person_competition_deficit=float(value['deficit']),
                 person_competition_measured=bool(value['measured']),
                 person_competition_is_not_occlusion_or_ownership=True)
@@ -384,7 +397,8 @@ class SourceCatalogue:
             loss=np.where(self.content_scope[frames],observed,1.)+.1*zoom_effort
             if self.person_attention:
                 from .person_attention import competition
-                value=competition(self.person_boxes[n,side],h,camera)
+                targets=None if self.person_target_indices is None else self.person_target_indices[n,side,index]
+                value=competition(self.person_boxes[n,side],h,camera,target_index=targets)
                 # Same declared sparse quadrature as the face samples, not
                 # a dense rectangle track. Unobserved gaps retain UNKNOWN.
                 loss=loss+np.where(self.content_scope[frames],value['deficit'],.5)

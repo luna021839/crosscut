@@ -27,6 +27,31 @@ def test_ambiguous_large_rectangle_gives_an_optimistic_bound_not_false_occlusion
     assert value['deficit']==0.
 
 
+def test_observed_original_body_cannot_borrow_a_larger_foreground_person_area():
+    boxes=np.array([[.43,.19,.57,.68,.8],[.1,.1,.9,1.,.9]])
+    head=[.5,.25,.1,.99];camera=[1.,.5,.5]
+    assert competition(boxes,head,camera)['deficit']==0.
+    measured=competition(boxes,head,camera,target_index=0)
+    assert measured['measured'] and measured['deficit']>.85
+    missing=competition(boxes,head,camera,target_index=-1)
+    assert not missing['measured'] and missing['deficit']==.5
+    for invalid in (True,0.,2,-2):
+        with pytest.raises(ValueError,match='person-instance'):
+            competition(boxes,head,camera,target_index=invalid)
+
+
+def test_original_instance_indices_broadcast_over_real_candidate_viewports():
+    boxes=np.array([[[.43,.19,.57,.68,.8],[.1,.1,.9,1.,.9]]]*3)
+    heads=np.array([[.5,.25,.1,.99]]*3)
+    cameras=np.array([[[1.,.5,.5]]*3,[[2.,.5,.5]]*3])
+    indices=np.array([0,1,-1]);batch=competition(boxes,heads,cameras,target_index=indices)
+    for k,n in np.ndindex(2,3):
+        scalar=competition(boxes[n],heads[n],cameras[k,n],target_index=int(indices[n]))
+        assert batch['deficit'][k,n]==scalar['deficit']
+    empty=competition(np.empty((0,5)),heads[0],cameras[0,0],target_index=-1)
+    assert not empty['measured'] and empty['deficit']==.5
+
+
 @pytest.mark.parametrize('boxes,head',[
     (np.zeros((0,5)),[.5,.25,.1,.99]),
     (np.zeros((3,5)),[.5,.25,.1,.99]),

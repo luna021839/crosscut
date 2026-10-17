@@ -15,6 +15,7 @@ from test_crosscut2_source_clock_action import catalogue
 
 def observed_catalogue(*,missing=False,cut=()):
     old=catalogue(cut=cut);bank=dict(old.bank);bank['heads']=old.bank['heads'].copy()
+    bank['native_indices']=bank['pose_native_indices'][:,[1,2]].copy()
     bank['heads'][:,:,3]=[.2,.3,.12,.99]
     points=np.zeros((3,17,3),np.float32)
     for i,h in enumerate((0,1,3)):
@@ -67,6 +68,26 @@ def test_coco17_head_points_never_fabricate_finger_landmarks():
     cat=observed_catalogue();sample=cat.observation(1,0,np.tile([1.,.5,.5],(7,1)),target_head_index=3)
     detail=describe(sample)
     assert detail['known'][:5].all() and not detail['known'][5:].any()
+
+
+def test_original_instance_competition_is_shared_by_content_and_prepruning_views():
+    from crosscut2.boundary_port_domain import proposal_display_quality
+    cat=observed_catalogue();bank=cat.bank
+    for value in bank['original_people_observations']['by_native'].values():
+        value['keypoints17']=np.concatenate([value['keypoints17'],np.zeros((1,17,3),np.float32)])
+        value['boxes']=np.r_[value['boxes'],[[.01,.15,.99,1.]]]
+        value['scores']=np.r_[value['scores'],[.9]]
+    actual=SourceCatalogue(cat.nodes,bank,None,[],cat.style,[],fps=30.,editorial_content=True,
+        person_attention=True,original_person_attention=True,output_height=1080)
+    native=actual.observation(1,0,np.tile([1.,.5,.5],(7,1)),target_head_index=0)
+    assert native['person_competition_measured'] and native['person_competition_deficit']>.75
+    for camera in ([1.,.5,.5],[2.,.45,.4]):
+        proposed=proposal_display_quality(native,camera)
+        final=actual.observation(1,0,np.tile(camera,(7,1)),target_head_index=0)
+        np.testing.assert_allclose(proposed,final['displayed_native_quality_proxy'])
+    frames=np.arange(39);camera=np.tile([1.,.5,.5],(39,1))
+    np.testing.assert_allclose(actual.rates(frames,np.stack([camera,camera])),
+        np.stack([actual.rates(frames,camera)]*2))
 
 
 @pytest.mark.parametrize('wrong_wrist',[False,True])

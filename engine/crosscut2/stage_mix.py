@@ -324,6 +324,8 @@ def main():
         help='Additional immutable subject-observation plans merged with the primary source-bound reference')
     parser.add_argument('--original-person-observations',type=Path,
         help='Explicit all-source original-frame COCO17 reference; cache-only E6, no per-chosen-face inference')
+    parser.add_argument('--original-person-attention',action='store_true',
+        help='Use those same full-image instances for observed target/foreground competition; no new NN')
     parser.add_argument('--face-endpoint-observations',type=Path,action='append',
         help='Explicit source-bound observations completing missing face endpoints; never triggers new inference')
     parser.add_argument('--face-endpoint-record-limit',type=int,default=128,
@@ -452,6 +454,8 @@ def main():
         raise ValueError('actual interval utility requires E4 and cannot silently replace a sequence model')
     if args.original_person_observations is not None and not args.played_interval_utility:
         raise ValueError('original person observations require the actual E6 played-interval consumer')
+    if args.original_person_attention and args.original_person_observations is None:
+        raise ValueError('original person competition requires the already measured original person reference')
     if args.matched_event_utility and not args.played_interval_utility:
         raise ValueError('matched event utility requires actual played interval utility')
     if (not math.isfinite(args.matched_action_preference) or args.matched_action_preference<0
@@ -514,6 +518,7 @@ def main():
             recycle_static_capacity=args.recycle_static_camera_capacity,matched_event_utility=args.matched_event_utility,
             matched_action_preference=args.matched_action_preference,retain_pair_cameras=args.retain_pair_cameras,
             focal_motion=args.focal_image_motion,detailed_pose=args.detailed_pose,
+            person_attention=args.original_person_attention,original_person_attention=args.original_person_attention,
             output_height=args.preview_height if args.played_interval_utility else None,
             geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source)
     volume = Path('/Volumes/CrossCutMedia')

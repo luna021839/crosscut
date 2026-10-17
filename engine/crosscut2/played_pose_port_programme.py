@@ -28,7 +28,7 @@ class PlayedPosePortPrior:
                  shot_duration_model=None,recycle_static_capacity=False,person_attention=False,source_cohort=None,
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
-                 editorial_reference_sources=None):
+                 editorial_reference_sources=None,original_person_attention=False):
         from .editorial_roles import geometry_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
@@ -69,6 +69,9 @@ class PlayedPosePortPrior:
         if person_attention and not played_interval_utility:
             raise ValueError('person attention requires the explicit actual played-interval path')
         self.person_attention=bool(person_attention)
+        if original_person_attention and not person_attention:
+            raise ValueError('original whole-image competition requires explicit person attention')
+        self.original_person_attention=bool(original_person_attention)
         if matched_event_utility and not played_interval_utility:
             raise ValueError('matched event utility requires actual pair-bound interval observations')
         self.matched_event_utility=bool(matched_event_utility)
@@ -166,13 +169,14 @@ class PlayedPosePortPrior:
                 unknown_exposure_recovers_no_readout_burden=True)
         self.artifact['played_interval_utility']=bool(played_interval_utility)
         self.artifact['visible_person_competition']=self.person_attention
+        self.artifact['original_full_image_person_competition']=self.original_person_attention
         self.artifact['explicit_source_cohort']=self.source_cohort
         self.artifact['explicit_editorial_reference_sources']=self.editorial_reference_sources
         self.artifact['editorial_reference_sources_do_not_exclude_render_sources']=True
         if self.person_attention:
             self.artifact.update(person_competition_unknown=.5,
                 person_competition_original_rectangles_only=True,
-                person_competition_target_area_is_optimistic_upper_bound=True,
+                person_competition_target_area_is_optimistic_upper_bound=not self.original_person_attention,
                 person_competition_is_not_mask_occlusion_or_ownership=True)
         if played_interval_utility:
             self.artifact.update(contract='pair_bound_actual_interval_action_composed_image_boundary_port_E6_v2',
@@ -348,14 +352,17 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         cats.append(SourceCatalogue(nodes,banks[s],None if poses is None else poses[s],raw,styles[s],source_events[s],fps=fps,
             member_hints=face_members[s],featured_factor=featured[s],subjects=None if subjects is None else subjects[s],
             editorial_content=editorial,framing_evidence=framing,
-            person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None)))
+            person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None),
+            original_person_attention=getattr(prior,'original_person_attention',False)))
     del states,rows,raw
     if any(cat.original_people is not None for cat in cats):
         receipt['original_full_image_people']=[None if cat.original_people is None else cat.original_people.receipt() for cat in cats]
         receipt['whole_image_bodies_do_not_trigger_actor_selected_inference']=True
     if getattr(prior,'person_attention',False):
         receipt['person_attention_observation_coverage']=[dict(source=s,
-            original_native_measurements=len(cat.bank.get('person_rectangles_by_native',{})),
+            original_native_measurements=(len(cat.original_people.raw['by_native']) if cat.original_person_attention else
+                len(cat.bank.get('person_rectangles_by_native',{}))),
+            original_person_instance_association=cat.original_person_attention,
             grid_endpoints_with_rectangles=int((cat.person_boxes[...,4]>0).any(-1).sum()),
             rectangles_do_not_certify_focal_ownership=True,unknown_deficit=.5)
             for s,cat in enumerate(cats)]

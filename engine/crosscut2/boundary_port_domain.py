@@ -55,7 +55,7 @@ def proposal_display_quality(observation,camera):
         rectangles=observation.get('person_rectangles')
         if rectangles is not None:
             from .person_attention import competition
-            value=competition(rectangles,head,[z,x,y])
+            value=competition(rectangles,head,[z,x,y],target_index=observation.get('person_target_rectangle_index'))
             if value['measured']:quality*=1.-float(value['deficit'])
     return quality
 

@@ -9,13 +9,15 @@ clean view. Confidence is not used to rank people.
 import numpy as np
 
 
-def competition(rectangles, heads, cameras):
+def competition(rectangles, heads, cameras,*,target_index=None):
     """Broadcast (...,persons,5), (...,4), (...,3) original measurements.
 
     Zero padding represents absent measurements, not an empty scene. A face
     must overlap an upper rectangle anchor; a rectangle merely enclosing a
     background face cannot establish ownership. Every compatible box is kept
-    and the largest displayed target area is used optimistically.
+    and the largest displayed target area is used optimistically. An optional
+    independently observed original-person index restricts the hypothesis to
+    THAT instance; -1 stays unknown, without removing a candidate.
     """
     boxes=np.asarray(rectangles,float);head=np.asarray(heads,float);camera=np.asarray(cameras,float)
     if (boxes.ndim<2 or boxes.shape[-1]!=5 or head.shape[-1:]!=(4,) or camera.shape[-1:]!=(3,)
@@ -35,6 +37,20 @@ def competition(rectangles, heads, cameras):
     top=head[...,1,None]-boxes[...,1]
     plausible=active&(fraction>=.6)&(top>=-.5*head[...,2,None])&(top<=2.*head[...,2,None])
     target=np.max(np.where(plausible,area,0.),axis=-1,initial=0.)
+    if target_index is not None:
+        # A separately observed face->body association cannot borrow the
+        # largest foreground person's area just because both boxes overlap
+        # this face. UNKNOWN remains .5; it never becomes a source/cut veto.
+        indices=np.asarray(target_index)
+        if indices.dtype.kind not in 'iu' or np.any(indices< -1) or np.any(indices>=boxes.shape[-2]):
+            raise ValueError('actual original person-instance index or UNKNOWN -1 required')
+        shape=np.broadcast_shapes(area.shape[:-1],indices.shape)
+        indices=np.broadcast_to(indices,shape)
+        if boxes.shape[-2]:
+            supported=np.broadcast_to(np.where(plausible,area,0.),shape+(boxes.shape[-2],))
+            target=np.take_along_axis(supported,np.maximum(0,indices)[...,None],axis=-1)[...,0]
+            target=np.where(indices>=0,target,0.)
+        else:target=np.zeros(shape)
     maximum=np.max(area,axis=-1,initial=0.)
     face_center=.5+camera[...,:1]*(head[...,:2]-camera[...,1:])
     face_half=half*camera[...,:1]
