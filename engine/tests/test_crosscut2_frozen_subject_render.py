@@ -6,7 +6,7 @@ import sys
 import numpy as np
 import pytest
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
-from render_frozen_subject_programme import validate_camera_clock,materialize_scored_cameras,camera_values,remaining_render_space
+from render_frozen_subject_programme import validate_camera_clock,materialize_scored_cameras,camera_values,remaining_render_space,render_runtime_limit
 from crosscut.render import (RenderPlan,RenderSegment,AspectRatio,
     EditorialTransformTrack,EditorialTransformKeyframe)
 from crosscut2.subject_moment_sequence import curve_digest
@@ -20,6 +20,19 @@ def fixture():
     proof=[dict(source=0,first_frame=k*30,final_frame=(k+1)*30,
         native_first=60+k*30,native_last=89+k*30,scored_camera_sha256=camera) for k in range(2)]
     return plan,proof,[dict(fps=30.,frame_count=300,native_cuts=[75,100])]
+
+
+def test_single_render_default_allows_the_measured_memory_bounded_encoder():
+    assert render_runtime_limit(145.38)==pytest.approx(325.76)
+    assert render_runtime_limit(145.38)>207.886  # Actual completed eight-input trial.
+    assert render_runtime_limit(145.38,420.)==420.
+    assert render_runtime_limit(145.38,1.)==1.
+
+
+@pytest.mark.parametrize('duration,explicit',[(True,None),(0.,None),(float('nan'),None),
+    (145.,True),(145.,0.),(145.,1801.),(145.,float('inf')),(145.,'420')])
+def test_render_time_allowance_is_finite_and_cannot_trigger_an_automatic_retry(duration,explicit):
+    with pytest.raises(ValueError):render_runtime_limit(duration,explicit)
 
 
 def test_render_storage_tracks_remaining_payload_and_keeps_reserve():

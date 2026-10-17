@@ -19,6 +19,22 @@ from crosscut2.grid_perception import file_identity
 from crosscut2.subject_moment_sequence import curve_digest
 
 
+def render_runtime_limit(duration_seconds,explicit_seconds=None):
+    """Finite single attempt, allowing the memory-bounded multi-input decoder.
+
+    The eight-input1080p trial took1.43x programme duration with two decoder
+    threads. A realtime-plus35s default would kill that successful encoder.
+    This changes time allowance only; the RSS, source and quality limits stay.
+    """
+    if (type(duration_seconds) not in (int,float) or not math.isfinite(duration_seconds)
+            or duration_seconds<=0):raise ValueError('positive finite render duration required')
+    if explicit_seconds is not None:
+        if (type(explicit_seconds) not in (int,float) or not math.isfinite(explicit_seconds)
+                or not 1<=explicit_seconds<=1800):raise ValueError('bounded explicit render deadline required')
+        return float(explicit_seconds)
+    return 2.*duration_seconds+35.
+
+
 def remaining_render_space(duration_seconds,written_bytes=0,*,reserve_bytes=2**30):
     """One atomic MP4 and an explicit reserve(default1GiB,min256MiB).
 
@@ -128,7 +144,7 @@ def main():
     p.add_argument('--output',type=Path,
         help='Explicit new output filename only; source, timeline, camera and selected plan digest stay unchanged.')
     p.add_argument('--maximum-render-seconds',type=float,
-        help='Explicit finite encoder deadline; does not repeat selection or relax the4.5GiB process limit.')
+        help='Explicit finite encoder deadline; default2x programme duration+35s, no retries or relaxed4.5GiB process limit.')
     p.add_argument('--workspace-reserve-mib',type=int,default=1024,
         help='Explicit workspace reserve,minimum256MiB; source/camera/quality settings are unchanged.')
     args=p.parse_args()
@@ -136,8 +152,7 @@ def main():
     plan=render_plan_from_json(record['render_plan']);spec=json.loads(args.source_spec.read_text())
     original_output=plan.output
     if args.output is not None:plan=replace(plan,output=args.output)
-    if args.maximum_render_seconds is not None and (not math.isfinite(args.maximum_render_seconds)
-            or not 1<=args.maximum_render_seconds<=1800):raise ValueError('bounded explicit render deadline required')
+    limit=render_runtime_limit(plan.output_frame_count/plan.fps,args.maximum_render_seconds)
     reserve=args.workspace_reserve_mib*2**20
     remaining_render_space(plan.output_frame_count/plan.fps,reserve_bytes=reserve)
     if args.expected_plan_sha256 is not None and hashlib.sha256(raw).hexdigest()!=args.expected_plan_sha256:
@@ -180,7 +195,6 @@ def main():
         else:
             with path.open('x') as f:f.write(content)
         render_input=dict(path=str(path),sha256=hashlib.sha256(content.encode()).hexdigest())
-    limit=plan.output_frame_count/plan.fps+35. if args.maximum_render_seconds is None else args.maximum_render_seconds
     started=monotonic();peak=0;last=-10.;failure=None;codec=None
     with claim.open('x') as f:json.dump(dict(plan_sha256=hashlib.sha256(raw).hexdigest(),maximum_seconds=limit,automatic_retry=False),f)
     def progress(event):
