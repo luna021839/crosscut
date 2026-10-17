@@ -20,9 +20,11 @@ def schedule(warp, clock, ticks, *, master_start, fps, final):
 
 
 def propose(nodes, windows, warps, clocks, caps, *, master_start, fps,
-            maximum_new_nodes=96, check=lambda:None):
-    nodes=np.asarray(nodes,int);final=int(nodes[-1]);moments={};tested=0
-    if (type(maximum_new_nodes) is not int or not 1<=maximum_new_nodes<=256
+            maximum_new_nodes=96, additional_detailed_nodes=0, check=lambda:None):
+    nodes=np.asarray(nodes,int);final=int(nodes[-1]);moments={};detailed={};tested=0
+    if (type(maximum_new_nodes) is not int or not 0<=maximum_new_nodes<=256
+            or type(additional_detailed_nodes) is not int or not 0<=additional_detailed_nodes<=96
+            or not 1<=maximum_new_nodes+additional_detailed_nodes<=256
             or not len(windows)==len(warps)==len(clocks)==len(caps)):
         raise ValueError('one explicit bounded fine-grid proposal domain is required')
     spans=[]
@@ -58,6 +60,16 @@ def propose(nodes, windows, warps, clocks, caps, *, master_start, fps,
                         rank=(row['seam_arm_direction_residual'],row['cut_moment_score'],tick)
                         if tick not in moments or rank<moments[tick][0]:
                             moments[tick]=(rank,(a,b))
+                        if additional_detailed_nodes:
+                            from .detailed_pose import describe_moment,matrix
+                            descriptions=[describe_moment(w,c,tick,side,row[key]) for w,c,side,key in
+                                ((left,lc,0,'outgoing_camera'),(right,rc,1,'incoming_camera'))]
+                            risk,known,channels,measured=matrix(descriptions[:1],descriptions[1:])
+                            if known[0,0]:
+                                raw=np.clip(2.*channels[0,0]-.5,0.,1.)
+                                worst=float(np.where(measured[0,0],raw,0.).max())
+                                rich=(max(rank[0],worst),row['cut_moment_score']+float(risk[0,0]-.5),tick)
+                                if tick not in detailed or rich<detailed[tick][0]:detailed[tick]=(rich,(a,b))
     # Every disjoint observed time region gets a representative BEFORE extra
     # local alternatives. A particularly easy chorus cannot consume the batch.
     xs=sorted(moments);regions=[]
@@ -66,16 +78,33 @@ def propose(nodes, windows, warps, clocks, caps, *, master_start, fps,
         regions[-1].append(tick)
     ranked=[sorted(region,key=lambda tick:moments[tick][0]) for region in regions]
     old=set(map(int,nodes));chosen=[]
-    for depth in range(max(map(len,ranked),default=0)):
-        for region in ranked:
-            if depth<len(region) and region[depth] not in old:
-                chosen.append(region[depth])
-                if len(chosen)==maximum_new_nodes:break
-        if len(chosen)==maximum_new_nodes:break
+    if maximum_new_nodes:
+        for depth in range(max(map(len,ranked),default=0)):
+            for region in ranked:
+                if depth<len(region) and region[depth] not in old:
+                    chosen.append(region[depth])
+                    if len(chosen)==maximum_new_nodes:break
+            if len(chosen)==maximum_new_nodes:break
+    # Retain EVERY old/body-only fine node. Add a finite number of genuinely
+    # better detailed instants; never replace good baseline choices with a
+    # greedy hand score. Full-song source/camera selection still follows.
+    retained=old|set(chosen);improvements=[]
+    for region in regions:
+        current=[detailed[t][0] for t in region if t in retained and t in detailed]
+        options=[t for t in region if t not in retained and t in detailed]
+        if not current or not options:continue
+        before=min(current);tick=min(options,key=lambda t:detailed[t][0]);after=detailed[tick][0]
+        if after>=before:continue
+        improvements.append((before[0]-after[0],before[1]-after[1],tick,before,after))
+    additions=sorted(improvements,key=lambda r:(-r[0],-r[1],r[2]))[:additional_detailed_nodes]
+    chosen.extend(row[2] for row in additions)
     new=np.unique(np.r_[nodes,chosen]).astype(np.int64)
     return new,dict(original_nodes=len(nodes),new_nodes=len(new)-len(nodes),
         supported_fine_instants=len(moments),observed_regions=len(regions),tested_pair_moments=tested,
         proposal_capacity=maximum_new_nodes,proposals_from_source_windows_not_finished_edit=True,
+        additional_detailed_capacity=additional_detailed_nodes,additional_detailed_nodes=len(additions),
+        detailed_supported_instants=len(detailed),old_fine_proposals_retained=True,
+        detailed_improvements=[dict(frame=r[2],before=list(r[3]),after=list(r[4])) for r in additions],
         all_original_nodes_retained=True,new_neural_calls=0,new_rasters=0,
         source_retimed=False,global_sources_cuts_and_cameras_not_yet_selected=True)
 

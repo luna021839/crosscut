@@ -87,9 +87,21 @@ def attach(window,path):
         detailed_points=points,detailed_support=known)
 
 
+def _empty():
+    return dict(xy=np.zeros((47,2)),relative=np.zeros((47,2)),known=np.zeros(47,bool),visible=np.zeros(47,bool),height=0.)
+
+
+def _project(points,support,head,camera):
+    source=points[:,:2]
+    xy=(.5+camera[0]*(source-camera[1:]))*[16/9,1.]
+    relative=(source-head[:2])*[16/9,1.]/max(.005,head[2])
+    visible=(xy[:,0]>=0)&(xy[:,0]<=16/9)&(xy[:,1]>=0)&(xy[:,1]<=1)
+    return dict(xy=xy,relative=relative,known=support.copy(),visible=visible,height=float(head[2]*camera[0]))
+
+
 def describe(observation):
     """Exactly the actual -1/0 played endpoint, not a fitted facial pose."""
-    result=dict(xy=np.zeros((47,2)),relative=np.zeros((47,2)),known=np.zeros(47,bool),visible=np.zeros(47,bool),height=0.)
+    result=_empty()
     context=observation.get('dense_subject_context')
     if context is None or 'detailed_points' not in context:return result
     endpoint=6 if observation['side']==0 else 7
@@ -102,12 +114,29 @@ def describe(observation):
         raise ValueError('Detailed landmarks changed their physical native clock')
     camera=np.asarray(observation['camera_strip'])[-1 if observation['side']==0 else 0]
     head=context['window'].heads[context['at'][endpoint]]
-    source=points[endpoint,:,:2]
-    xy=(.5+camera[0]*(source-camera[1:]))*[16/9,1.]
-    relative=(source-head[:2])*[16/9,1.]/max(.005,head[2])
     known=support[endpoint]&context['same_shot'][endpoint]
-    visible=(xy[:,0]>=0)&(xy[:,0]<=16/9)&(xy[:,1]>=0)&(xy[:,1]<=1)
-    return dict(xy=xy,relative=relative,known=known,visible=visible,height=float(head[2]*camera[0]))
+    return _project(points[endpoint],known,head,camera)
+
+
+def describe_moment(window,clock,center,side,camera):
+    """Exact endpoint of a pre-selection moment, not a new temporal track.
+
+    Source windows already bind their raw133/ROI/native inputs. Unlike the
+    played-flow cue, head/hand configuration needs only this physical -1/0
+    sample; do not manufacture a fourteen-frame neighbourhood at its edges.
+    """
+    if side not in (0,1) or type(center) is not int:raise ValueError('Integer common cut moment and actual side required')
+    camera=np.asarray(camera,float)
+    if camera.shape!=(3,) or not np.isfinite(camera).all() or camera[0]<1.-1e-9:
+        raise ValueError('One finite actual proposed crop required')
+    if not isinstance(window,DetailedWindow):return _empty()
+    from .subject_action_match import _sample
+    if clock.phase_frames:raise ValueError('Detailed cut moments cannot retime a source')
+    indices=_sample(window,clock)
+    position=np.flatnonzero(clock.output_frames==center-1+side)
+    if len(position)!=1:return _empty()
+    at=int(indices[position[0]])
+    return _project(window.detailed_points[at],window.detailed_support[at]&window.associated[at],window.heads[at],camera)
 
 
 def matrix(left,right,*,configuration_only=False):

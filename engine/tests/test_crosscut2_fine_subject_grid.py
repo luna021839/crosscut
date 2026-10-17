@@ -43,6 +43,47 @@ def test_fine_proposals_come_from_common_native_observations_not_original_cut_ti
     assert none['new_nodes']==0
 
 
+def test_detailed_moments_add_a_better_finger_match_without_removing_a_single_old_node():
+    from dataclasses import fields
+    from crosscut2.subject_window_bank import SubjectWindow
+    from crosscut2.detailed_pose import DetailedWindow
+    nodes,_,_,_,_,groups,warps,clocks=inputs()
+    base,_=propose(nodes,groups,warps,clocks,[2.,2.],master_start=0.,fps=30.,maximum_new_nodes=1)
+    detailed=[]
+    for s,group in enumerate(groups):
+        w=group[0];points=np.zeros((len(w.ordinals),47,3));points[...,2]=.9
+        points[:,:5,:2]=[[.5,.3],[.47,.28],[.53,.28],[.43,.31],[.57,.31]]
+        for root,joint in ((5,4),(26,5)):
+            points[:,root,:2]=w.body[:,joint,:2]
+            for f in range(5):
+                for j in range(4):
+                    points[:,root+1+4*f+j,:2]=points[:,root,:2]+[.006*(f-2),-.008*(j+1)]
+            if s:
+                bad=np.isin(w.ordinals,base)
+                points[bad,root+1:root+21,1]=2*points[bad,root,1,None]-points[bad,root+1:root+21,1]
+        detailed.append([DetailedWindow(**{f.name:getattr(w,f.name) for f in fields(SubjectWindow)},
+            detailed_points=points,detailed_support=np.ones(points.shape[:2],bool))])
+    new,receipt=propose(base,detailed,warps,clocks,[2.,2.],master_start=0.,fps=30.,
+        maximum_new_nodes=0,additional_detailed_nodes=1)
+    assert np.isin(base,new).all() and len(new)==len(base)+1
+    assert receipt['additional_detailed_nodes']==1 and receipt['old_fine_proposals_retained']
+    assert receipt['new_neural_calls']==receipt['new_rasters']==0
+    improvement=receipt['detailed_improvements'][0]
+    assert improvement['after']<improvement['before']
+    assert improvement['frame'] not in base
+
+
+def test_missing_detailed_landmarks_never_invent_extra_moments_or_change_old_grid():
+    nodes,_,_,_,_,groups,warps,clocks=inputs()
+    base,_=propose(nodes,groups,warps,clocks,[2.,2.],master_start=0.,fps=30.,maximum_new_nodes=8)
+    new,receipt=propose(base,groups,warps,clocks,[2.,2.],master_start=0.,fps=30.,
+        maximum_new_nodes=0,additional_detailed_nodes=48)
+    np.testing.assert_array_equal(new,base)
+    assert receipt['additional_detailed_nodes']==receipt['detailed_supported_instants']==0
+    with pytest.raises(ValueError,match='bounded'):
+        propose(nodes,groups,warps,clocks,[2.,2.],master_start=0.,fps=30.,maximum_new_nodes=0)
+
+
 def test_projected_old_rows_are_byte_exact_and_fine_rows_are_actual_not_nearest_old_faces():
     nodes,banks,poses,styles,states,groups,warps,clocks=inputs()
     new_nodes=np.array([0,98,100,200])

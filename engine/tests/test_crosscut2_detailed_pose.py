@@ -202,3 +202,16 @@ def test_raw_opportunity_and_pair_pruning_share_configuration_credit_cap(monkeyp
         assert 'detailed_pose_action_credit_cap' in detail
         np.testing.assert_allclose(detail['detailed_pose_action_credit_cap'],0. if measured else 1.)
     assert receipt['detailed_configuration_bounds_raw_opportunity_credit']
+
+
+def test_fine_moment_reads_only_exact_physical_endpoint_and_never_retimes(tmp_path):
+    original,path,_,_=fixture(tmp_path);w=fine.attach(original,path)
+    for side in (0,1):
+        o=observation(w,side);actual=fine.describe_moment(w,o['dense_subject_context']['clock'],0,side,[1.,.5,.5])
+        expected=fine.describe(o)
+        for key in expected:np.testing.assert_array_equal(actual[key],expected[key])
+        assert not fine.describe_moment(original,o['dense_subject_context']['clock'],0,side,[1.,.5,.5])['known'].any()
+        wrong=replace(o['dense_subject_context']['clock'],binding='other-source')
+        with pytest.raises(ValueError,match='source binding'):fine.describe_moment(w,wrong,0,side,[1.,.5,.5])
+        shifted=replace(o['dense_subject_context']['clock'],phase_frames=1)
+        with pytest.raises(ValueError,match='retime'):fine.describe_moment(w,shifted,0,side,[1.,.5,.5])
