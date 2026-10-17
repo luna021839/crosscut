@@ -102,9 +102,11 @@ def recover_query_snapshots(cache,binding,*,exclude=None):
 
 
 def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds=240.,maximum_calls=288,
-            cache_only_partial=False,preserve_member_scores=False):
-    if not len(sources)==len(banks)==len(census) or not 1<=maximum_seconds<=600 or not 0<=maximum_calls<=1024:
+            cache_only_partial=False,preserve_member_scores=False,additional_requests=None):
+    if not len(sources)==len(banks)==len(census) or not 1<=maximum_seconds<=600 or not 0<=maximum_calls<=2048:
         raise ValueError('bounded source-local member-hint observation allowance required')
+    if additional_requests is not None and (not preserve_member_scores or len(additional_requests)!=len(sources)):
+        raise ValueError('explicit physical per-source requests require retained current-face score profiles')
     started=monotonic();photo_tool=Path(photo_tool);models=Path(models);cache=Path(cache)
     if cache_only_partial and maximum_calls!=0:raise ValueError('partial cached hints cannot authorize new inference')
     gallery=LocalIVEArcFaceGallery.from_existing_photo_banks(photo_tool/'face_models/user_member_arcface_embeddings.json',
@@ -124,6 +126,23 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             for chunk in iter(lambda:stream.read(1024*1024),b''):live();digest.update(chunk)
         source_sha=digest.hexdigest();labels,count=local_actor_hypotheses(bank)
         requests,groups=select_faces(bank,labels,count,native_fps=clock['fps'])
+        extra_count=0
+        if additional_requests is not None:
+            # Extra current-frame queries do not relabel anonymous clusters.
+            # Their exact native/rectangle address is retained in the score
+            # fields; a lookalike SFace neighbour cannot replace that query.
+            addressed={(native,*map(float,head)) for native,head in requests}
+            physical={(int(bank['native_indices'][n,side]),*map(float,head))
+                for n,side in np.ndindex(bank['native_indices'].shape) for head in bank['heads'][n,side]}
+            for native,head in additional_requests[s]:
+                head=np.asarray(head,float)
+                if (type(native) is not int or not 0<=native<clock['frame_count'] or head.shape!=(4,)
+                        or not np.isfinite(head).all() or (native,*map(float,head)) not in physical):
+                    raise ValueError('current-face requests must address actual source/native bank observations')
+                key=(native,*map(float,head))
+                if key in addressed:continue
+                addressed.add(key);requests.append((native,head.copy()));extra_count+=1
+            if len(requests)>1024:raise ValueError('bounded per-source current-face query domain required')
         binding=json.dumps(dict(source_sha256=source_sha,model=ARCFACE_R50_SHA256,adapter=adapter,detector=detector_sha,
             raster=[960,540],decoder_implementation=_DECODER_IMPLEMENTATION,
             association=hashlib.sha256(inspect.getsource(associate).encode()).hexdigest(),
@@ -168,11 +187,23 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
                 check();os.replace(temporary,target);dirty=False
             finally:
                 if os.path.exists(temporary):os.unlink(temporary)
+        decode_receipt=dict(strategy='cache_only_no_source_rasters',requested_frames=0)
         try:
             if needed:
                 if arc is None:arc=NativeArcFaceR50(model_path)
                 if detector is None:detector=cv2.FaceDetectorYN.create(str(detector_path),'',(960,540),.75,.3,5000)
-                for native,pixels in _frames(path,sorted(needed),check=live):
+                if additional_requests is None:
+                    decode_receipt=dict(strategy='canonical_sequential_select_n_area_bgr24',
+                        requested_frames=len(needed))
+                    rasters=_frames(path,sorted(needed),check=live)
+                else:
+                    from .sparse_native_frames import probe,frames
+                    packet_clock=probe(path,check=live)
+                    if packet_clock.count!=clock['frame_count'] or abs(float(packet_clock.rate)-clock['fps'])>1e-8:
+                        raise ValueError('member query native packet clock differs from declared source')
+                    rasters=frames(path,sorted(needed),clock=packet_clock,check=live,receipt=decode_receipt,
+                        maximum_seconds=120.,maximum_decode_seconds=12.)
+                for native,pixels in rasters:
                     live();_,found=detector.detect(pixels);detector_calls+=1;source_detectors+=1
                     for key,head in needed[native].items():
                         face=associate(found,head);vector=np.zeros(512,np.float32);ok=face is not None
@@ -188,14 +219,11 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
             checkpoint()
         finally:
             if dirty and file_identity(path)==identity:checkpoint()
-        hints=[];individual_votes=[None]*len(requests)
-        for indices in groups:
-            votes=[]
-            for index in indices:
-                vector,valid=values.get(keys[index],(np.zeros(512,np.float32),False))
-                vote=gallery.classify(tuple(map(float,vector)) if valid else None,descriptor_space=space)
-                votes.append(vote);individual_votes[index]=vote
-            hints.append(consensus(votes))
+        hints=[];individual_votes=[]
+        for key in keys:
+            vector,valid=values.get(key,(np.zeros(512,np.float32),False))
+            individual_votes.append(gallery.classify(tuple(map(float,vector)) if valid else None,descriptor_space=space))
+        for indices in groups:hints.append(consensus([individual_votes[index] for index in indices]))
         if file_identity(path)!=identity:raise OSError('source changed before member-hint result')
         scores=None
         if preserve_member_scores:
@@ -205,6 +233,9 @@ def measure(*,sources,banks,census,photo_tool,models,cache,check,maximum_seconds
                 minimum_member_margin=gallery.minimum_member_margin)
         result.append(np.asarray(hints,np.int16) if scores is None else scores)
         receipt=dict(source=s,anonymous_source_clusters=count,preselected_faces=len(requests),
+            additional_current_frame_queries=extra_count,
+            directly_addressed_member_score_queries=0 if scores is None else len(scores.direct_queries),
+            actual_current_face_decoder=decode_receipt,
             labelled_by_recurrent_consensus=sum(h>=0 for h in hints),new_arcface_calls=source_calls,
             new_supplementary_detector_calls=source_detectors,reused_query_inputs=sum(k in preexisting_keys for k in keys),
             raw_query_cache_bytes=0 if not target.exists() else target.stat().st_size,

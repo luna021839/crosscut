@@ -45,13 +45,11 @@ def bind_hints(banks,hints,native_ports):
         augmented=dict(ports,member_hints=result)
         if individual is not None:
             for target,query in ((bank,bank['vectors']),(augmented,ports.get('vectors'))):
-                shape=target['heads'].shape[:3]
-                raw=np.zeros(shape+(6,));support=np.zeros(shape)
-                if query is not None:
-                    profile,weight=individual.project(query);width=profile.shape[-2]
-                    raw[...,:width,:]=profile;support[...,:width]=weight
-                raw.setflags(write=False);support.setflags(write=False)
+                raw,support,direct=individual.fields(target['heads'],query,
+                    native_indices=target.get('native_indices'))
+                raw.setflags(write=False);support.setflags(write=False);direct.setflags(write=False)
                 target.update(member_score_profiles=raw,member_score_support=support,
+                    member_score_directly_observed=direct,
                     member_score_gallery_identity=individual.gallery_identity)
         native.append(augmented)
     return faces,native
@@ -67,6 +65,27 @@ def consensus(banks,members,*,return_evidence=False,source_cohort=None):
     families=[bank.get('consensus_family',('unverified_source',s)) for s,bank in enumerate(banks)]
     groups={key:i for i,key in enumerate(dict.fromkeys(families[s] for s in active))}
     votes=np.zeros((len(groups),)+shape+(6,));possible=np.zeros((len(groups),)+shape)
+    face_votes=[];profile_weights=[];profile_sources=[]
+    for s,(bank,names) in enumerate(zip(banks,members,strict=True)):
+        names=np.asarray(names);value=np.zeros(names.shape+(6,))
+        profile_weight=np.zeros(names.shape)
+        for m in range(6):value[...,m]=names==m
+        if 'member_score_profiles' in bank and bank.get('member_score_gallery_identity',''):
+            scores=np.asarray(bank['member_score_profiles'],float);support=np.asarray(bank['member_score_support'],float)
+            if (scores.shape!=value.shape or support.shape!=names.shape or not np.isfinite(scores).all()
+                    or not np.isfinite(support).all() or np.any((support<0)|(support>1))):
+                raise ValueError('source-bound six-member score fields and separate support required')
+            # Positive, centred gallery-score votes, not calibrated identity
+            # probabilities. Flat scores contribute nothing. Current query
+            # support blends out the old propagated one-hot hint ONCE.
+            positive=np.maximum(0.,scores-scores.mean(-1,keepdims=True));total=positive.sum(-1)
+            weight=np.where(total>1e-12,support,0.)
+            profile_weight=weight
+            value=(1.-weight[...,None])*value+weight[...,None]*positive/np.maximum(1e-12,total[...,None])
+            profile_sources.append(s)
+        face_votes.append(value)
+        profile_weights.append(profile_weight)
+    current_possible=np.zeros((len(groups),)+shape)
     for s in active:
         bank,names,family=banks[s],members[s],families[s]
         heads,index,ambiguity,_=focal_metadata(bank['heads'],np.tile([1.,.5,.5],shape+(1,)))
@@ -80,8 +99,11 @@ def consensus(banks,members,*,return_evidence=False,source_cohort=None):
         weight=np.sqrt(quality)*np.minimum(1.,heads[...,2]/.22)*np.maximum(0.,1.-ambiguity)
         weight=np.where(index>=0,weight,0.);g=groups[family]
         possible[g]=np.maximum(possible[g],weight)
-        selected=np.take_along_axis(names,np.maximum(0,index)[...,None],axis=2)[...,0]
-        for member in range(6):votes[g,...,member]=np.maximum(votes[g,...,member],np.where(selected==member,weight,0.))
+        selected=np.take_along_axis(face_votes[s],np.broadcast_to(np.maximum(0,index)[...,None,None],
+            shape+(1,6)),axis=2)[...,0,:]
+        votes[g]=np.maximum(votes[g],selected*weight[...,None])
+        current=np.take_along_axis(profile_weights[s],np.maximum(0,index)[...,None],axis=2)[...,0]
+        current_possible[g]=np.maximum(current_possible[g],current*weight)
     # One family cannot gain extra authority by offering several derivatives.
     mass=votes.sum(-1);votes*=np.minimum(1.,possible/np.maximum(1e-12,mass))[...,None]
     known=votes.sum((0,-1));total=possible.sum(0);summed=votes.sum(0)
@@ -91,15 +113,26 @@ def consensus(banks,members,*,return_evidence=False,source_cohort=None):
     supporting=(votes.sum(-1)>0).sum(0)
     confidence=np.clip(known/np.maximum(1e-12,total)*(1.-entropy)*total/max(1,len(groups)),0.,1.)
     confidence=np.where(supporting>=2,confidence,0.)
+    current_supported=(current_possible>0).sum(0)>=2
     factors=[]
     maximum=np.maximum(1./6.,posterior.max(-1))
-    for names in members:
-        selected=np.take_along_axis(posterior,np.maximum(0,names),axis=2)
-        probability=np.where(names>=0,selected,1./6.)
-        factors.append(1.-confidence[...,None]+confidence[...,None]*probability/maximum[...,None])
+    for value in face_votes:
+        mass=value.sum(-1)
+        probability=np.sum(value*posterior[...,None,:],axis=-1)+(1.-mass)/6.
+        relative=np.clip(probability/maximum[...,None],0.,1.)
+        legacy=1.-confidence[...,None]+confidence[...,None]*relative
+        # Current query support, missing mass, family weights and disagreement
+        # already entered this posterior. Multiplying it by entropy/confidence
+        # AGAIN nearly erases the actual featured-person preference. Keep the
+        # legacy path where fewer than two independent current profiles exist.
+        factors.append(np.where(current_supported[...,None],relative,legacy))
     receipt=dict(source_families=len(groups),voting_source_indices=list(active),physical_source_domain_count=len(banks),
         framing_consensus_nodes=int((confidence>0).sum()),
         mean_confidence=float(confidence.mean()),maximum_confidence=float(confidence.max()),
+        current_gallery_score_fields_used_before_camera=bool(profile_sources),
+        gallery_profile_sources=profile_sources,score_vote_coefficients_are_not_calibrated_identity_probabilities=True,
+        current_profile_supported_flanks=int(current_supported.sum()),
+        current_profile_uncertainty_not_applied_twice_to_role_factors=True,
         inferred_featured_not_verified_active_singer=True,named_identity_certified=False,
         unknown_is_not_forced_to_a_member=True,source_exclusion=False)
     if return_evidence:

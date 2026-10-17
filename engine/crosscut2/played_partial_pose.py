@@ -239,6 +239,15 @@ def matrix(left, right, *, details=False):
     # credit, never the source, feasible cut, or ordinary scene-change option.
     incompatible=(left['member_hints'][:,None]>=0)&(right['member_hints'][None,:]>=0)&(
         left['member_hints'][:,None]!=right['member_hints'][None,:])
+    from .source_member_scores import pair_risk
+    profile_risk,profile_support=pair_risk(left['individual_member_scores'][:,None],right['individual_member_scores'][None,:],
+        left['individual_member_score_support'][:,None],right['individual_member_score_support'][None,:],
+        compatible=(galleries_a!='')&(galleries_a==galleries_b))
+    # A shared choreography is not evidence of the SAME performer. Current
+    # gallery profiles can contradict a propagated cluster label (or recover
+    # its false disagreement). Bound only that same-actor change benefit;
+    # every feasible source/cut and its full pose cost remain available.
+    member_credit_cap=(1.-profile_support)*(~incompatible)+profile_support*np.maximum(0.,1.-2.*profile_risk)
     # A bright costume/style change is not a matched-action benefit when
     # the ACTUAL played body connection is no better than UNKNOWN (.5).
     # Use advantage over that existing neutral residual, not a new fitted
@@ -251,9 +260,8 @@ def matrix(left, right, *, details=False):
     # A matched moving-action change is useful even in similar outfits. Real
     # colour distinction adds another component; missing/identical colour does
     # not fabricate novelty or veto independently measured face/action cues.
-    compatible=appearance_measured&~incompatible
-    action_component=np.where(compatible,action_component,0.)
-    style_component=np.where(compatible,style_component,0.)
+    action_component=np.where(appearance_measured,action_component*member_credit_cap,0.)
+    style_component=np.where(appearance_measured,style_component*member_credit_cap,0.)
     evidence_density=action_component+style_component
     change_density=np.minimum(evidence_density,played_match_advantage)
     result = dict(face_rate=face, geometry_rate=geometry, person_visible_extent_gap=extent_gap,
@@ -267,6 +275,7 @@ def matrix(left, right, *, details=False):
         common_clock_action_channels=context,
         appearance_rate=appearance,appearance_measured=appearance_measured,
         individual_member_score_influence=member_influence,
+        individual_member_match_credit_cap=member_credit_cap,
         same_clock_source_action_used=same_clock_available,
         contemporary_dense_action_observed=dense_observed,contemporary_dense_action_used=dense_used,
         matched_action_change_density=change_density,matched_action_evidence_density=evidence_density,

@@ -48,6 +48,57 @@ def test_missing_queries_ties_and_duplicate_observations_do_not_create_certainty
     assert len(empty.vectors)==0 and not empty.project(bank['vectors'])[1].any()
 
 
+def test_exact_current_face_query_overrides_ambiguous_sface_transfer_only_at_its_address():
+    _,banks,_,_=inputs(count=2);bank=banks[0]
+    requests=[(int(bank['native_indices'][n,1]),bank['heads'][n,1,0]) for n in (0,1)]
+    votes=[dict(member_scores=dict(zip(NAMES,profile(m,best=.6)))) for m in (0,1)]
+    value=from_queries(bank,requests,votes,[-1],gallery_identity='gallery',member_names=NAMES)
+    assert value.project(bank['vectors'])[1].max()==0.  # same128D cue, conflicting direct observations
+    raw,support,direct=value.fields(bank['heads'],bank['vectors'],native_indices=bank['native_indices'])
+    for n,member in ((0,0),(1,1)):
+        assert direct[n,1,0] and support[n,1,0]==1.
+        np.testing.assert_array_equal(raw[n,1,0],profile(member,best=.6))
+    assert not direct[2,1,0] and support[2,1,0]==0.
+    moved=bank['heads'].copy();moved[0,1,0,0]+=.001
+    assert not value.fields(moved,bank['vectors'],native_indices=bank['native_indices'])[2][0,1,0]
+    assert not value.fields(bank['heads'],bank['vectors'])[2].any()
+
+
+def test_direct_arcface_query_does_not_require_or_borrow_a_sface_descriptor():
+    _,banks,_,_=inputs(count=2);bank=banks[0];bank['vectors'][:]=0.
+    value=seed(bank,best=.6)
+    assert len(value.vectors)==0 and len(value.direct_queries)==1
+    raw,support,direct=value.fields(bank['heads'],bank['vectors'],native_indices=bank['native_indices'])
+    assert direct[1,1,0] and support[1,1,0]==1. and raw[1,1,0].argmax()==0
+    assert not support[:,:,3:].any()
+
+
+def test_provisional_current_face_requests_cover_each_source_and_have_a_total_preflight_bound():
+    from crosscut2.source_member_scores import programme_endpoint_requests
+    nodes,banks,_,_=inputs(count=2);seams=[dict(output_frame=int(nodes[1]))]
+    requests,receipt=programme_endpoint_requests(nodes,banks,seams)
+    assert all(requests) and receipt['per_source_requests']==list(map(len,requests))
+    assert receipt['physical_face_requests']==sum(map(len,requests))
+    assert all(len({(n,*h) for n,h in values})==len(values) for values in requests)
+    with pytest.raises(ValueError,match='Complete current-face'):
+        programme_endpoint_requests(nodes,banks,seams,maximum_requests=0)
+    with pytest.raises(ValueError,match='actual source decision grid'):
+        programme_endpoint_requests(nodes,banks,[dict(output_frame=int(nodes[1])+1)])
+
+
+def test_normal_draft_over_sixty_four_cuts_is_not_rejected_as_a_cut_count_rule():
+    from crosscut2.source_member_scores import programme_endpoint_requests
+    _,banks,_,_=inputs(count=2);nodes=np.arange(72,dtype=np.int64)*18
+    for bank in banks:
+        bank['heads']=np.broadcast_to(bank['heads'][:1],(72,2,8,4)).copy()
+        bank['native_indices']=np.c_[nodes,nodes+1]
+    seams=[dict(output_frame=int(t)) for t in nodes[1:-1]]
+    requests,receipt=programme_endpoint_requests(nodes,banks,seams)
+    assert receipt['provisional_centres']==70 and all(requests)
+    with pytest.raises(ValueError,match='centre allowance'):
+        programme_endpoint_requests(nodes,banks,seams,maximum_centres=64)
+
+
 def test_source_and_native_score_fields_share_the_same_queries_and_no_fourth_face_borrow():
     _,banks,_,_=inputs(count=2)
     ports=[dict(frames=np.array([18]),heads=b['heads'][1:2].copy(),vectors=b['vectors'][1:2].copy()) for b in banks]
@@ -114,6 +165,28 @@ def test_flat_missing_or_weaker_profiles_are_not_positive_identity_proof():
     assert strength==.2
     _,strength=pair_risk(profile(),profile(),1.,1.,compatible=False)
     assert strength==0.
+
+
+def test_actual_profiles_override_cluster_credit_not_source_or_pose_admission():
+    from test_crosscut2_dense_subject_catalogue import prepared
+    from test_crosscut2_source_clock_action import obs
+    a,_,_=prepared(0,bump=.08);b,_,_=prepared(1,bump=.08)
+    left,right=obs(a,0),obs(b,1)
+    def score(first,second,hints,support=1.):
+        for row,value,hint in zip((left,right),(first,second),hints,strict=True):
+            row.update(individual_member_score_profile=value,individual_member_score_support=support,
+                individual_member_score_gallery='same',recurrent_member_hint=hint)
+        return matrix(features([left],fps=30.),features([right],fps=30.),details=True)
+    same=score(profile(best=.6),profile(best=.6),(0,1))
+    different=score(profile(best=.6),profile(1,best=.6),(0,0))
+    legacy=score(profile(best=.6),profile(best=.6),(0,1),support=0.)
+    assert same['individual_member_match_credit_cap'][0,0]==pytest.approx(1.)
+    assert same['matched_action_evidence_density'][0,0]>0.
+    assert different['individual_member_match_credit_cap'][0,0]==0.
+    assert different['matched_action_change_density'][0,0]==0.
+    assert legacy['individual_member_match_credit_cap'][0,0]==0.
+    assert same['allowed'][0,0] and different['allowed'][0,0] and legacy['allowed'][0,0]
+    np.testing.assert_array_equal(same['pose_rate'],different['pose_rate'])
 
 
 def test_actual_native_and_authored_boundaries_consume_equal_score_risk():

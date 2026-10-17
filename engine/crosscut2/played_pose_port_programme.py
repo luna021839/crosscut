@@ -113,12 +113,14 @@ class PlayedPosePortPrior:
             matched_action_change_credit='realized_incoming_hold_seconds_up_to_two_observed_beats * measured_change_density',
             change_density_uses='weakest_observed(common_clock_action,anonymous_appearance,Hellinger_style_change,native_quality,played_seam_shape,actual_played_advantage_over_UNKNOWN)',
             change_cues_are_not_multiplied_as_independent_probabilities=True,
-            known_different_member_gets_no_same_actor_change_credit=True,
+            legacy_different_member_hint_gets_no_credit_without_supported_current_profile=True,
+            actual_gallery_profile_support_bounds_same_actor_change_credit=True,
             ending_pixel_constraint='only_final_hold; measured_new_opaque_stencil_avoided_if_an_observed_clean_tail_exists',
             unmeasured_tail_never_excludes_source=True,all_questionable_tails_preserve_coverage=True,
             paired_credit_requires_its_actual_outgoing_proposal=True,unmeasured_or_static_change_credit=0.,
             change_credit_is_unfitted_engineering_not_human_preference_calibration=True,
             recurrent_member_hints_are_soft_not_certified=True,featured_state_uses_original_native_views_not_proposed_crops=True,
+            featured_state_consumes_supported_current_member_profiles_when_provided=True,
             person_visible_extent_fallback_used=bool(person_extents),
             person_extent_is_not_face_size_identity_or_camera_cause=True,
             paired_proposal_global_limit_per_node=8,roll_degrees=0.,
@@ -311,6 +313,7 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         receipt['individual_member_score_fields']=[dict(source=s,
             gallery_identity=bank.get('member_score_gallery_identity',''),
             supported_face_occurrences=int((bank.get('member_score_support',np.zeros(0))>0).sum()),
+            directly_queried_face_occurrences=int(bank.get('member_score_directly_observed',np.zeros(0,bool)).sum()),
             raw_scores_are_not_probabilities=True,forced_member_labels=False,
             raw_scores_or_embeddings_exported=False) for s,bank in enumerate(banks)]
     framing=None
@@ -589,6 +592,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 anonymous_appearance_rate=float(detail['appearance_rate'][0,0]),
                 anonymous_appearance_measured=bool(detail['appearance_measured'][0,0]),
                 individual_member_score_influence=float(detail['individual_member_score_influence'][0,0]),
+                individual_member_match_credit_cap=float(detail['individual_member_match_credit_cap'][0,0]),
+                individual_member_scores_directly_observed=[bool(o.get('individual_member_score_directly_observed',False))
+                    for o in (a.observation,b.observation)],
                 feature_handoff_strength=float(detail.get('feature_handoff_strength',np.zeros((1,1)))[0,0]),
                 editorial_transition_kind='SCENE_CHANGE' if ordinary else 'MATCH_ACTION_CANDIDATE',
                 successful_face_match_claimed=not ordinary and bool(detail['allowed'][0,0]),

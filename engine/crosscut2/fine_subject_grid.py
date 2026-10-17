@@ -219,7 +219,7 @@ def rebind_hints(old_banks,new_banks,hints,*,allow_previously_unobserved=False):
                 if a>=0 and b>=0 and old_values[a]>=0:votes[b].add(int(old_values[a]))
         values=np.asarray([next(iter(v)) if len(v)==1 else -1 for v in votes],np.int16)
         result.append(MemberScoreSeeds(values,hint.vectors,hint.scores,bank_signature(new),hint.gallery_identity,
-            hint.minimum_similarity,hint.minimum_member_margin) if isinstance(hint,MemberScoreSeeds) else values)
+            hint.minimum_similarity,hint.minimum_member_margin,hint.direct_queries) if isinstance(hint,MemberScoreSeeds) else values)
     return result
 
 

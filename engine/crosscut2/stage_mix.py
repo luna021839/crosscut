@@ -352,6 +352,10 @@ def main():
         help='Explicit whole-programme observation allowance0..64; not a final cut quota')
     parser.add_argument('--provisional-subject-observation-plan',type=Path,
         help='Explicit source-bound preliminary plan whose missing endpoints are measured once before a new final solve')
+    parser.add_argument('--provisional-member-observation-plan',type=Path,
+        help='One explicit automatic draft: measure original focal faces across source alternatives before final selection')
+    parser.add_argument('--maximum-current-member-queries',type=int,default=1024,
+        help='Explicit current-face query allowance0..2048;0 reuses cached queries only')
     parser.add_argument('--maximum-opportunity-perception-seconds',type=float,default=180.,
         help='One shared opportunity observation deadline, at most900s; requires explicit source/model spec')
     parser.add_argument('--opportunity-basis',choices=('exposed','paired_clock'),default='exposed',
@@ -377,6 +381,11 @@ def main():
         raise ValueError('Changed opportunity observation allowance requires an explicit bounded subject opportunity probe')
     if args.provisional_subject_observation_plan is not None and args.opportunity_subject_spec is None:
         raise ValueError('Provisional endpoint completion requires an explicit bounded subject opportunity probe')
+    if (not 0<=args.maximum_current_member_queries<=2048
+            or (args.maximum_current_member_queries!=1024 and args.provisional_member_observation_plan is None)):
+        raise ValueError('Changed current-member allowance requires an explicit provisional member plan')
+    if args.provisional_member_observation_plan is not None and not args.individual_member_scores:
+        raise ValueError('Provisional member observations require explicit individual member scores and local photo assets')
     if (not 0<=args.face_endpoint_record_limit<=8192
             or (args.face_endpoint_record_limit!=128 and args.face_endpoint_observations is None)):
         raise ValueError('A changed face-record allowance requires explicit face endpoint observations')
@@ -611,7 +620,7 @@ def main():
             style,style_receipts=observe(sources=original.sources,banks=banks,
                 cache=args.cache.parent/'crosscut2-native-style-v1',check=check,maximum_seconds=180.)
             identity_hints=None;identity_receipts=[]
-            if args.local_ive_photo_tool is not None:
+            if args.local_ive_photo_tool is not None and args.provisional_member_observation_plan is None:
                 from .recurrent_member_hints import measure
                 identity_hints,identity_receipts=measure(sources=original.sources,banks=banks,census=camera_census,
                     photo_tool=args.local_ive_photo_tool,models=args.models,
@@ -632,6 +641,20 @@ def main():
                 if identity_hints is not None:
                     identity_hints=rebind_hints(previous_banks,banks,identity_hints,allow_previously_unobserved=True)
                 face_completion['merge']=merged
+            if args.provisional_member_observation_plan is not None:
+                from .source_member_scores import load_programme_endpoint_requests
+                from .recurrent_member_hints import measure
+                requests,request_receipt=load_programme_endpoint_requests(args.provisional_member_observation_plan,
+                    nodes=nodes,banks=banks,sources=original.sources,
+                    source_hashes=[v['source_sha256'] for v in bound_source_cut_events],
+                    master_start=original.master_audio_start,fps=original.fps,authorized_root=args.cache.parent.parent)
+                identity_hints,identity_receipts=measure(sources=original.sources,banks=banks,census=camera_census,
+                    photo_tool=args.local_ive_photo_tool,models=args.models,
+                    cache=args.cache.parent/'crosscut2-local-member-query-v1',check=check,
+                    maximum_seconds=min(600.,args.maximum_perception_seconds),maximum_calls=args.maximum_current_member_queries,
+                    cache_only_partial=args.maximum_current_member_queries==0,preserve_member_scores=True,
+                    additional_requests=requests)
+                for row in identity_receipts:row['automatic_endpoint_request_policy']=request_receipt
             part_observer=None
             person_observer=None
             if args.person_rectangle_model is not None:

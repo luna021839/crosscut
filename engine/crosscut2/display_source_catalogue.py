@@ -285,6 +285,8 @@ class SourceCatalogue:
                 else self.bank['member_score_profiles'][n,side,h]),
             individual_member_score_support=(0. if h<0 or 'member_score_support' not in self.bank
                 else float(self.bank['member_score_support'][n,side,h])),
+            individual_member_score_directly_observed=bool(h>=0 and 'member_score_directly_observed' in self.bank
+                and self.bank['member_score_directly_observed'][n,side,h]),
             individual_member_score_gallery=self.bank.get('member_score_gallery_identity',''),
             source_clock_context_is_sparse_model_hypothesis=True,
             appearance_vector=appearance,appearance_is_not_named_identity=True,

@@ -34,6 +34,39 @@ def test_no_member_evidence_does_not_force_a_member_or_remove_usable_sources():
     assert receipt['maximum_confidence']==0 and all(np.all(v==1.) for v in factors)
 
 
+def test_current_face_profiles_supply_featured_votes_when_cluster_hints_are_unknown_or_wrong():
+    _,banks,_,_=inputs(count=3);names=members(banks,[-1,1,0])
+    for bank,member in zip(banks,[0,0,1],strict=True):
+        shape=bank['heads'].shape[:3];scores=np.full(shape+(6,),.1);scores[...,member]=.6
+        bank.update(member_score_profiles=scores,member_score_support=np.ones(shape),
+            member_score_gallery_identity='same-gallery')
+    factors,receipt=consensus(banks,names)
+    assert receipt['current_gallery_score_fields_used_before_camera']
+    assert factors[0][1,1,0]==factors[1][1,1,0]>factors[2][1,1,0]>0.
+    assert factors[2][1,1,0]<.75  # the current weighted vote is not attenuated a second time
+    assert not receipt['source_exclusion']
+    for bank in banks:bank['member_score_support'][:]=0.
+    original,_,before=consensus(banks,names,return_evidence=True)
+    for bank in banks:
+        del bank['member_score_profiles'];del bank['member_score_support']
+    legacy,_,after=consensus(banks,names,return_evidence=True)
+    for a,b in zip(original,legacy,strict=True):np.testing.assert_allclose(a,b)
+    for key in before:np.testing.assert_allclose(before[key],after[key])
+
+
+def test_current_profiles_do_not_create_extra_family_votes_or_certainty_from_flat_scores():
+    _,banks,_,_=inputs(count=3);names=members(banks,[-1,-1,-1])
+    for bank in banks:
+        shape=bank['heads'].shape[:3];scores=np.full(shape+(6,),.1);scores[...,0]=.6
+        bank.update(member_score_profiles=scores,member_score_support=np.ones(shape),
+            member_score_gallery_identity='same-gallery',consensus_family='same-performance')
+    _,receipt=consensus(banks,names)
+    assert receipt['maximum_confidence']==0.
+    for s,bank in enumerate(banks):bank['member_score_profiles'][:]=.4;bank['consensus_family']=s
+    factors,receipt=consensus(banks,names)
+    assert receipt['maximum_confidence']==0. and all(np.all(value==1.) for value in factors)
+
+
 def test_explicit_cohort_excludes_auxiliary_role_votes_but_keeps_the_physical_source_domain():
     import pytest
     _,banks,_,_=inputs(count=5);names=members(banks,[1,0,1,0,1])
