@@ -184,6 +184,7 @@ class PlayedPosePortPrior:
                 detailed_pose_unknown=.5,detailed_pose_new_source_NN=0,
                 detailed_pose_changes_admission=False,detailed_pose_changes_actor_proposal_ranking=True,
                 measured_detailed_pose_bounds_actual_body_match_credit=True,
+                measured_configuration_bounds_prepruning_opportunity_credit=True,
                 unmeasured_detailed_pose_never_removes_existing_match_credit=True,
                 all_old_physical_candidates_retained=False,
                 detailed_pose_missing_never_fabricates_a_stationary_hand=True)

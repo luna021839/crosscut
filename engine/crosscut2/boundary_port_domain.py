@@ -111,12 +111,22 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             right_features=features(native_right,fps=fps,focal_motion=focal_motion)
             native_pair=matrix(left_features,right_features,details=True)
             if detailed_pose:
-                from .detailed_pose import describe as describe_detail,matrix as detail_matrix
+                from .detailed_pose import describe as describe_detail,matrix as detail_matrix,bound_connection_credit
                 # Crop proposals solve native screen displacement separately.
                 # Rank the actor's configuration here, not an unplayed native
                 # view jump that its paired camera may legitimately correct.
-                detail_rank=detail_matrix([describe_detail(o) for o in native_left],
-                    [describe_detail(o) for o in native_right],configuration_only=True)[0]-.5
+                risk,known,channels,channel_known=detail_matrix([describe_detail(o) for o in native_left],
+                    [describe_detail(o) for o in native_right],configuration_only=True)
+                detail_rank=risk-.5
+                # The same contradiction must reach acquisition priority and
+                # actor-pair pruning, not only the final interval cost. A
+                # body-only bonus otherwise restores a rejected hand match
+                # before the useful actor/camera alternatives can reach DP.
+                # Use configuration only: later paired crops can correct the
+                # native screen placement. Missing detail caps no old credit.
+                native_pair=bound_connection_credit(dict(native_pair,detailed_pose_rate=risk,
+                    detailed_pose_measured=known,detailed_pose_channels=channels,
+                    detailed_pose_channel_measured=channel_known))
             if articulated_actions:
                 from .played_interval_utility import articulated_seam_evidence
                 native_pair=articulated_seam_evidence(native_pair,native_left,native_right)
@@ -283,5 +293,6 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
         additional_motion_actor_pairs=motion_additions,
         unknown_motion_does_not_expand_candidate_domain=True,
         detailed_head_hand_pose_used_before_pair_pruning=bool(detailed_pose),
+        detailed_configuration_bounds_raw_opportunity_credit=bool(detailed_pose),
         proposal_ranking_uses_reference_times_or_cut_count=False,
         proposal_rank_is_declared_engineering_not_preference_learning=True)

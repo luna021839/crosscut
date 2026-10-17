@@ -172,3 +172,33 @@ def test_articulated_body_recomputation_cannot_restore_a_contradicted_finger_bon
         detailed_pose_channel_measured=np.ones((1,1,3),bool))
     result=articulated_seam_evidence(detail,[{}],[{}])
     assert result['matched_action_change_density'][0,0]==0.
+
+
+@pytest.mark.parametrize('measured',[False,True])
+def test_raw_opportunity_and_pair_pruning_share_configuration_credit_cap(monkeypatch,measured):
+    from crosscut2 import boundary_port_domain as ports
+    from test_crosscut2_motion_pair_candidates import motion_catalogues
+    nodes,cats,paths=motion_catalogues(False)
+    original=ports.matrix;seen=[]
+    def body_credit(*a,**kw):
+        result=original(*a,**kw);shape=result['pose_rate'].shape
+        return dict(result,pose_rate=np.full(shape,.1),
+            matched_action_change_density=np.full(shape,.6),matched_action_evidence_density=np.full(shape,.6))
+    def configuration(left,right,*,configuration_only=False):
+        assert configuration_only  # Native placement can be corrected by a later crop.
+        shape=(len(left),len(right));channels=np.full(shape+(3,),.25 if measured else .5)
+        if measured:channels[...,1]=.75  # Contradicted fingers despite the matching body.
+        return channels.max(-1),np.full(shape,measured),channels,np.full(shape+(3,),measured)
+    class Opportunities:
+        def observe(self,n,left,right,detail,*sources):seen.append(detail)
+        def density(self,*a):return 0.
+    monkeypatch.setattr(ports,'matrix',body_credit)
+    monkeypatch.setattr(fine,'matrix',configuration)
+    _,_,_,receipt=ports.make(nodes,cats,paths,fps=30.,detailed_pose=True,
+        articulated_actions=True,opportunities=Opportunities(),retain_pair_cameras=True)
+    assert seen
+    for detail in seen:
+        np.testing.assert_allclose(detail['matched_action_change_density'],0. if measured else .6)
+        assert 'detailed_pose_action_credit_cap' in detail
+        np.testing.assert_allclose(detail['detailed_pose_action_credit_cap'],0. if measured else 1.)
+    assert receipt['detailed_configuration_bounds_raw_opportunity_credit']
