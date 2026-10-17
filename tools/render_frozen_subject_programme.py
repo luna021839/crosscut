@@ -125,11 +125,19 @@ def main():
     for key in ('plan','source-spec','authorized-root'):p.add_argument('--'+key,type=Path,required=True)
     p.add_argument('--ssd-device',type=int,required=True)
     p.add_argument('--expected-plan-sha256',help='Digest retained by the actual global selection, not a new post-fit plan.')
+    p.add_argument('--output',type=Path,
+        help='Explicit new output filename only; source, timeline, camera and selected plan digest stay unchanged.')
+    p.add_argument('--maximum-render-seconds',type=float,
+        help='Explicit finite encoder deadline; does not repeat selection or relax the4.5GiB process limit.')
     p.add_argument('--workspace-reserve-mib',type=int,default=1024,
         help='Explicit workspace reserve,minimum256MiB; source/camera/quality settings are unchanged.')
     args=p.parse_args()
     root=args.authorized_root.resolve(strict=True);raw=args.plan.read_bytes();record=json.loads(raw)
     plan=render_plan_from_json(record['render_plan']);spec=json.loads(args.source_spec.read_text())
+    original_output=plan.output
+    if args.output is not None:plan=replace(plan,output=args.output)
+    if args.maximum_render_seconds is not None and (not math.isfinite(args.maximum_render_seconds)
+            or not 1<=args.maximum_render_seconds<=1800):raise ValueError('bounded explicit render deadline required')
     reserve=args.workspace_reserve_mib*2**20
     remaining_render_space(plan.output_frame_count/plan.fps,reserve_bytes=reserve)
     if args.expected_plan_sha256 is not None and hashlib.sha256(raw).hexdigest()!=args.expected_plan_sha256:
@@ -172,7 +180,8 @@ def main():
         else:
             with path.open('x') as f:f.write(content)
         render_input=dict(path=str(path),sha256=hashlib.sha256(content.encode()).hexdigest())
-    limit=plan.output_frame_count/plan.fps+35.;started=monotonic();peak=0;last=-10.;failure=None;codec=None
+    limit=plan.output_frame_count/plan.fps+35. if args.maximum_render_seconds is None else args.maximum_render_seconds
+    started=monotonic();peak=0;last=-10.;failure=None;codec=None
     with claim.open('x') as f:json.dump(dict(plan_sha256=hashlib.sha256(raw).hexdigest(),maximum_seconds=limit,automatic_retry=False),f)
     def progress(event):
         nonlocal peak,last,written
@@ -188,13 +197,16 @@ def main():
     try:
         codec=render(plan,ffmpeg='/opt/homebrew/bin/ffmpeg',maximum_runtime_seconds=limit,
             video_bitrate='24M',video_maxrate='36M',video_buffer_size='48M',audio_bitrate='320k',
-            progress_callback=progress)
+            progress_callback=progress,decoder_threads=2,filter_complex_threads=2)
         check()
         if args.plan.read_bytes()!=raw:raise OSError('frozen plan changed while encoding')
     except Exception as exc:failure=dict(type=type(exc).__name__,message=str(exc))
     result=dict(movie=str(plan.output),failure=failure,elapsed_seconds=monotonic()-started,
         encoder_peak_RSS_bytes=peak,codec=codec,output_frames=plan.output_frame_count,
         plan_sha256=hashlib.sha256(raw).hexdigest(),selection_repeated=False,new_source_NN=0,
+        original_selected_output=str(original_output),output_filename_only_override=plan.output!=original_output,
+        resource_policy=dict(decoder_threads_per_input=2,filter_complex_threads=2,maximum_seconds=limit,
+            maximum_RSS_bytes=int(4.5*2**30),codec_or_bitrate_or_resolution_or_camera_changed=False),
         exact_camera_materialization=materialization,render_input_plan=render_input,
         disk_space_budget=dict(reserve_bytes=reserve,observed_output_bytes=written,
             initial_required_bytes=remaining_render_space(plan.output_frame_count/plan.fps,reserve_bytes=reserve),

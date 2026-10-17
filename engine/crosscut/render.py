@@ -2721,7 +2721,12 @@ def render(
     use_verified_frame_schedule: bool = True,
     progress_callback: Callable[[dict], None] | None = None,
     maximum_runtime_seconds: float | None = None,
+    decoder_threads: int = 2,
+    filter_complex_threads: int = 2,
 ) -> str:
+    for label,value in (("decoder_threads",decoder_threads),("filter_complex_threads",filter_complex_threads)):
+        if type(value) is not int or not 1<=value<=16:
+            raise ValueError(f"{label} must be an explicit integer in1..16")
     for label, value in (
         ("video_bitrate", video_bitrate),
         ("video_maxrate", video_maxrate),
@@ -2792,6 +2797,9 @@ def render(
             "timestamp_fallback_source_indices": sorted({segment.source_index for segment in plan.segments} - source_clocks.keys()),
             "plan": plan.to_json(), "filter_graph": filter_graph,
             "quality_approval": False,
+            "resource_policy": {"decoder_threads_per_input":decoder_threads,
+                "filter_complex_threads":filter_complex_threads,
+                "frame_schedule_or_encode_quality_changed":False},
         }
         temporary_output = root / f"render{plan.output.suffix or '.mp4'}"
         codecs = (video_codec, "libx264") if video_codec == "h264_videotoolbox" else (video_codec,)
@@ -2806,9 +2814,15 @@ def render(
                 "-y",
             ]
             for source in plan.sources:
-                command.extend(("-i", str(source)))
+                # A separate automatic frame-thread pool for every4K feed
+                # can retain gigabytes of decoder reference frames. Bound
+                # each pool explicitly without changing decoded pixels,
+                # source clocks, the camera graph, or encoder quality.
+                command.extend(("-threads",str(decoder_threads),"-i", str(source)))
             command.extend(
                 (
+                    "-filter_complex_threads",
+                    str(filter_complex_threads),
                     "-filter_complex_script",
                     str(filter_path),
                     "-map",
