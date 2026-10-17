@@ -70,6 +70,7 @@ SOURCE_RELATIVE_PATHS = (
     "engine/crosscut/stage_edit_production_fold_launcher.py",
     "engine/crosscut/stage_edit_production_train_cli.py",
     "engine/crosscut/stage_edit_production_training.py",
+    "engine/crosscut/stage_edit_classifier_warmup.py",
     "engine/crosscut/stage_edit_dynamic_crop_training.py",
     "engine/crosscut/stage_edit_dynamic_crop_head_v2.py",
     "engine/crosscut/stage_edit_transformer.py",

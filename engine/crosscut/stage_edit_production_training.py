@@ -38,6 +38,7 @@ from .stage_edit_decoded_curve_metrics import DECODED_OBSERVATION_METRIC_CONTRAC
 from .stage_edit_training_progress import (
     training_step_completed, training_epoch_evaluated,
 )
+from .stage_edit_classifier_warmup import begin_classifier_warmup, finish_classifier_warmup
 
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
@@ -193,7 +194,7 @@ DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
 )
 DYNAMIC_CROP_V3_TRAINING_SCHEDULE_CONTRACT = (
     "independent_warmup_cosine_cut_source_v3_full_trajectory_minibatch_"
-    "declared_joint_feature_mode_rank128_prior_v8"
+    "preserved_classifier_features_full_joint_rank128_prior_v9"
 )
 
 
@@ -3625,6 +3626,7 @@ def train_production_stage_edit(
         "per_reference_sampled_counts": {},
     }
     saved_metadata = None
+    classifier_warmup_evidence: dict[str, Any] = {}
     clipping_supported = hasattr(optim, "clip_grad_norm")
     activation_checkpointing_evidence: Mapping[str, Any] | None = None
 
@@ -3646,6 +3648,7 @@ def train_production_stage_edit(
             effective_loss_contract
         )
         if cut_pretrain_steps:
+            cut_scope = begin_classifier_warmup(model, 'cut') if dynamic_crop_v3_enabled else None
             positive_windows, negative_windows = _balanced_cut_windows(
                 split.train,
                 schema=schema,
@@ -3758,11 +3761,14 @@ def train_production_stage_edit(
                 raise RuntimeError(
                     "cut-only optimizer state step differs from history"
                 )
+            if cut_scope is not None:
+                classifier_warmup_evidence['cut'] = finish_classifier_warmup(model, cut_scope)
 
         source_only_loss_contract = _source_only_pretraining_loss_contract(
             effective_loss_contract
         )
         if source_pretrain_steps:
+            source_scope = begin_classifier_warmup(model, 'source') if dynamic_crop_v3_enabled else None
             source_inventory = _source_pretraining_inventory(
                 split.train,
                 schema=schema,
@@ -3866,6 +3872,8 @@ def train_production_stage_edit(
             source_pretraining_optimizer_state_final_step = int(
                 source_pretrain_optimizer.state["step"].item()
             )
+            if source_scope is not None:
+                classifier_warmup_evidence['source'] = finish_classifier_warmup(model, source_scope)
             if (
                 source_pretraining_optimizer_state_final_step
                 != source_pretraining_optimizer_steps
@@ -4971,6 +4979,14 @@ def train_production_stage_edit(
                 finetune_optimizer_steps
                 >= minimum_checkpoint_selection_finetune_steps
             )
+            if dynamic_crop_v3_enabled:
+                # A head calibrated on preserved features is not yet a
+                # jointly trained Transformer. Select only AFTER actual
+                # encoder/source-feature release, not its frozen boundary.
+                checkpoint_selection_eligible = checkpoint_selection_eligible and (
+                    finetune_optimizer_steps - dynamic_crop_v3_prior_retention_finetune_steps
+                    >= minimum_joint_optimizer_steps_after_prior_release
+                )
             improved = bool(
                 checkpoint_selection_eligible
                 and validation_selection.get("selectable")
@@ -5290,6 +5306,7 @@ def train_production_stage_edit(
                 "dynamic_crop_v3_prior_candidate_selection": (
                     dynamic_crop_v3_prior_candidate_selection
                 ),
+                "classifier_warmup": classifier_warmup_evidence,
                 "dynamic_crop_v3_prior_parameter_invariance": (
                     dynamic_crop_v3_prior_parameter_invariance
                 ),
@@ -5763,6 +5780,7 @@ def train_production_stage_edit(
             ),
         },
         "optimization": {
+            "classifier_warmup": classifier_warmup_evidence,
             "seed": seed,
             "requested_epochs": epochs,
             "completed_epochs": len(history),

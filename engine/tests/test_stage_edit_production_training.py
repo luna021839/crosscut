@@ -1185,7 +1185,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 epochs=8,
                 early_stopping_patience=16,
                 batch_size=2,
-                learning_rate=3.0e-3,
+                # This fixture must survive a real feature-release update;
+                # it may no longer save the frozen-feature boundary itself.
+                learning_rate=3.0e-5,
                 cut_pretrain_steps=0,
                 source_pretrain_steps=0,
                 dynamic_crop_v3_prior_pretrain_steps=500,
@@ -1314,6 +1316,10 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 ]
             )
             candidate = prior["candidate_selection"]
+            for item in report['history']:
+                if item['checkpoint_selection_eligible_after_burn_in']:
+                    self.assertGreaterEqual(
+                        item['finetune_optimizer_step_last'] - candidate['retention_finetune_steps'], 1)
             trained_prior_selected = (
                 candidate["selected_candidate_origin"]
                 == "trained_prior_candidate"

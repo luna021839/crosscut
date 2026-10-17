@@ -390,6 +390,7 @@ def train_dynamic_crop_v3_final_fit(
     prior_history: list[dict[str, Any]] = []
     finetune_history: list[dict[str, Any]] = []
     prior_evidence: dict[str, Any] | None = None
+    classifier_warmup_evidence: dict[str, Any] = {}
     retention_restore_steps = 0
     retention_optimizer_state_final_step = 0
     released_joint_optimizer_initial_step = 0
@@ -412,6 +413,7 @@ def train_dynamic_crop_v3_final_fit(
         cut_contract = production._cut_only_pretraining_loss_contract(
             effective_base_loss
         )
+        cut_scope = production.begin_classifier_warmup(model, 'cut')
         positive_windows, negative_windows = production._balanced_cut_windows(
             examples,
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
@@ -485,10 +487,12 @@ def train_dynamic_crop_v3_final_fit(
                 )
         if int(cut_optimizer.state["step"].item()) != cut_steps:
             raise RuntimeError("final-fit cut optimizer step differs")
+        classifier_warmup_evidence['cut'] = production.finish_classifier_warmup(model, cut_scope)
 
         source_contract = production._source_only_pretraining_loss_contract(
             effective_base_loss
         )
+        source_scope = production.begin_classifier_warmup(model, 'source')
         inventory = production._source_pretraining_inventory(
             examples,
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
@@ -570,6 +574,7 @@ def train_dynamic_crop_v3_final_fit(
                 )
         if int(source_optimizer.state["step"].item()) != source_steps:
             raise RuntimeError("final-fit source optimizer step differs")
+        classifier_warmup_evidence['source'] = production.finish_classifier_warmup(model, source_scope)
 
         prior_inventory = production._dynamic_crop_v3_prior_inventory(
             examples, dynamic_crop_corpus
@@ -1330,6 +1335,7 @@ def train_dynamic_crop_v3_final_fit(
             "decisions_frozen_before_final_fit": True,
         },
         "training": {
+            "classifier_warmup": classifier_warmup_evidence,
             "optimizer_steps": optimizer_steps,
             "cut_pretraining_optimizer_steps": cut_steps,
             "source_pretraining_optimizer_steps": source_steps,
