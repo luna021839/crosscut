@@ -161,7 +161,7 @@ class ArcCosts:
     def __init__(self,nodes,entries,exits,catalogues,dense,native_ports,support,fragment_cost,*,fps,check=lambda:None,
                  person_extents=False,opportunity_episodes=None,roles=None,point_geometry=False,readout_tau=None,
                  preserve_camera_alternatives=False,capture_playback_inputs=False,played_interval_utility=None,
-                 focal_motion=False,geometry_weight=1.):
+                 focal_motion=False,geometry_weight=1.,appearance_weight=1.,direct_face_appearance=False):
         self.nodes=np.asarray(nodes,int);self.entries=entries;self.exits=exits;self.cats=catalogues
         self.dense=dense;self.native=native_ports;self.support=support;self.fragments=fragment_cost
         self.fps=fps;self.check=check;self.integrity=NativeFragmentIntegrity(support,minimum_frames=12)
@@ -169,8 +169,10 @@ class ArcCosts:
         self.long_combinations=0;self.short_paths=0;self.peak_batch_bytes=0;self.person_extents=bool(person_extents)
         self.opportunity_episodes=None if opportunity_episodes is None else np.asarray(opportunity_episodes,int)
         self.roles=roles;self.point_geometry=bool(point_geometry);self.native_points=[]
-        from .editorial_roles import geometry_importance
+        from .editorial_roles import geometry_importance,appearance_importance
         self.geometry_weight=geometry_importance(geometry_weight)
+        self.appearance_weight=appearance_importance(appearance_weight)
+        self.direct_face_appearance=bool(direct_face_appearance)
         self.readouts=None;self.readout_left=[];self.readout_right=[];self.last_alternatives=None
         self.played_interval_utility=played_interval_utility
         self.focal_motion=bool(focal_motion)
@@ -304,6 +306,16 @@ class ArcCosts:
             score_kwargs=dict(profile_a=selected[:,:,0],profile_b=selected[:,:,1],
                 support_a=weight[:,:,0],support_b=weight[:,:,1],
                 profile_compatible=bool(bank.get('member_score_gallery_identity','')))
+        if getattr(self,'direct_face_appearance',False) and 'direct_face_vectors' in bank:
+            direct=np.zeros((E,2,8,512),np.float32);known=np.zeros((E,2,8),bool)
+            for e,x in enumerate(xs):
+                if int(x) in lookup:
+                    k=lookup[int(x)];direct[e]=bank['direct_face_vectors'][k];known[e]=bank['direct_face_known'][k]
+            e=np.arange(E)[None,:,None];side=np.arange(2)[None,None,:]
+            selected=direct[e,side,at];valid=known[e,side,at]&seen[None,:,None]&(scores.max(-1)>0)
+            score_kwargs.update(direct_a=selected[:,:,0],direct_b=selected[:,:,1],
+                direct_valid_a=valid[:,:,0],direct_valid_b=valid[:,:,1],
+                direct_compatible=bool(bank.get('direct_face_descriptor_family','')))
         appearance,_=appearance_discrepancy(own[:,:,0],own[:,:,1],member_a=member[:,:,0],member_b=member[:,:,1],**score_kwargs)
         c=.5+camera[...,:1]*(head[...,:2]-camera[...,1:]);h=head[...,2]*camera[...,0]
         valid=(scores.max(-1)>0).all(-1)
@@ -339,10 +351,11 @@ class ArcCosts:
         from .focal_image_motion import relative_cost
         focal=relative_cost(.5) if getattr(self,'focal_motion',False) else 0.
         geometry=getattr(self,'geometry_weight',1.)*detail['geometry_rate']
-        rate=geometry+detail['pose_rate']+detail['appearance_rate']+focal
+        appearance=getattr(self,'appearance_weight',1.)*detail['appearance_rate']
+        rate=geometry+detail['pose_rate']+appearance+focal
         if not components:return rate
         if getattr(self,'point_geometry',False):
-            return detail['pose_rate'],6./self.fps*(geometry+detail['appearance_rate']+focal)
+            return detail['pose_rate'],6./self.fps*(geometry+appearance+focal)
         return rate,np.zeros_like(rate)
 
     def native_weights(self,s,first,final,xs):

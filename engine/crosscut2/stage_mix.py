@@ -350,6 +350,8 @@ def main():
         help='Explicit E6 cue: compare same-music focal image movement composed with actual terminal digital view rates')
     parser.add_argument('--focal-geometry-weight',type=float,default=1.,
         help='Explicit1..8 importance of played face size/position continuity; same native/authored cost, no admission change')
+    parser.add_argument('--focal-appearance-weight',type=float,default=1.,
+        help='Explicit1..8 importance of subject appearance continuity; same native/authored cost, no identity/source gate')
     parser.add_argument('--editorial-reference-source',type=int,action='append',default=None,
         help='Physical source index for original framing/featured-member votes; repeatable, does not exclude render sources')
     parser.add_argument('--detailed-pose',action='store_true',
@@ -425,10 +427,13 @@ def main():
     if args.direct_native_face_observations is not None and not (
             args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('Direct face queries require the actual played-interval port consumer')
-    from .editorial_roles import geometry_importance
+    from .editorial_roles import geometry_importance,appearance_importance
     geometry_importance(args.focal_geometry_weight)
+    appearance_importance(args.focal_appearance_weight)
     if args.focal_geometry_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('focal geometry importance requires the explicit played-interval port consumer')
+    if args.focal_appearance_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
+        raise ValueError('focal appearance importance requires the explicit played-interval port consumer')
     if args.editorial_reference_source is not None and not(args.played_pose_port_camera_prior and args.editorial_opportunity_exposure):
         raise ValueError('editorial reference sources require the explicit editorial port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
@@ -531,6 +536,7 @@ def main():
             output_height=args.preview_height if args.played_interval_utility else None,
             geometry_weight=args.focal_geometry_weight,editorial_reference_sources=args.editorial_reference_source,
             body_camera_proposals=args.body_camera_proposals,
+            appearance_weight=args.focal_appearance_weight,
             direct_face_appearance=args.direct_native_face_observations is not None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])
@@ -736,7 +742,8 @@ def main():
                     master_start=original.master_audio_start,fps=original.fps,
                     authorized_root=args.cache.parent.parent,
                     legacy_cache=args.cache.parent/'crosscut2-local-member-query-v1',
-                    cache=args.cache.parent/'crosscut2-direct-native-arcface-v2')
+                    cache=args.cache.parent/'crosscut2-direct-native-arcface-v2',native_ports=native_ports,
+                    bound_native_events=bound_source_cut_events)
                 if args.individual_member_scores:
                     from crosscut.ive_local_arcface_gallery import LocalIVEArcFaceGallery
                     gallery=LocalIVEArcFaceGallery.from_existing_photo_banks(

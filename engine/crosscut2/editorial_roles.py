@@ -15,6 +15,13 @@ def geometry_importance(value):
     return float(value)
 
 
+def appearance_importance(value):
+    """Editorial importance of subject continuity, not identity confidence."""
+    try:return geometry_importance(value)
+    except ValueError as error:
+        raise ValueError('Explicit finite focal appearance importance must be in1..8') from error
+
+
 class FeatureRoles:
     def __init__(self,nodes,evidence):
         self.nodes=np.asarray(nodes,int)
@@ -80,7 +87,7 @@ def apply(detail,strength):
     return result
 
 
-def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.):
+def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.,appearance_weight=1.):
     """A shorter observed strip cannot erase an instantaneous visual jump.
 
     The common six-frame perceptual unit is shared by native and authored
@@ -89,9 +96,10 @@ def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.):
     """
     focal=detail.get('focal_image_motion_relative_cost',0.)+detail.get('detailed_pose_relative_cost',0.)
     geometry=geometry_importance(geometry_weight)*detail['geometry_rate']
+    appearance=appearance_importance(appearance_weight)*detail['appearance_rate']
     if not point_geometry:
-        return window_seconds*(geometry+detail['pose_rate']+detail['appearance_rate']+focal)
-    return 6./fps*(geometry+detail['appearance_rate']+focal)+window_seconds*detail['pose_rate']
+        return window_seconds*(geometry+detail['pose_rate']+appearance+focal)
+    return 6./fps*(geometry+appearance+focal)+window_seconds*detail['pose_rate']
 
 
 def ordinary_pairs(left,right):

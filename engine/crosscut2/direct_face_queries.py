@@ -128,27 +128,72 @@ def recover_source(binding,*,legacy_cache,cache):
         query_recovery_NN=0,source_rasters=0,historical_producers_not_relabelled=True)
 
 
-def bind_banks(banks,bindings,*,source_hashes,legacy_cache,cache):
+def native_fields(port,values,*,bound=None):
+    """Exact canonical native-cut flanks only; never nearest output frames."""
+    heads=np.asarray(port['heads']);n=len(heads)
+    if ((port.get('contract')!='physical_native_event_registry_v1' and bound is None)
+            or heads.shape!=(n,2,8,4) or len(port.get('native_event_keys',[]))!=n):
+        raise ValueError('physical exact-adjacent native event registry required')
+    observed=np.asarray(port['observed']);natives=np.zeros((n,2),np.int64)
+    if observed.shape!=(n,) or observed.dtype!=bool:raise ValueError('explicit native flank availability required')
+    rows={}
+    if bound is not None:
+        for event in bound['native_event_rows']:
+            key=(int(event['output_frame']),int(event['source_native_first_incoming']))
+            rows.setdefault(key,[]).append(event['exposed_native_ordinals'])
+    for i,keys in enumerate(port['native_event_keys']):
+        if not observed[i]:continue
+        if len(keys)!=1 or type(keys[0]) is not int or keys[0]<1:
+            raise ValueError('measured native flank must have one exact physical cut ordinal')
+        if bound is not None:
+            tick=int(port['frames'][i]);f=keys[0];exposed=rows.get((tick,f),[])
+            if (not exposed or any(list(pair)!=[f-1,f] for pair in exposed)
+                    or {native for frame,native in rows if frame==tick}!={f}):
+                raise ValueError('historical native flank differs from actual physical cut/clock record')
+        natives[i]=[keys[0]-1,keys[0]]
+    vectors,known=fields(dict(heads=heads,native_indices=natives),values)
+    vectors=vectors.copy();known=known.copy();known[~observed]=False;vectors[~known]=0.
+    vectors.setflags(write=False);known.setflags(write=False);natives.setflags(write=False)
+    return vectors,known,natives
+
+
+def bind_banks(banks,bindings,*,source_hashes,legacy_cache,cache,native_ports=None,bound_native_events=None):
     """Attach optional, exact512D fields; no change to original face/pose data."""
-    if not len(banks)==len(bindings)==len(source_hashes):raise ValueError('one actual source binding per bank required')
+    if (not len(banks)==len(bindings)==len(source_hashes)
+            or (native_ports is not None and len(native_ports)!=len(banks))
+            or (bound_native_events is not None and (native_ports is None or len(bound_native_events)!=len(banks)))):
+        raise ValueError('one actual source binding per bank required')
     reports=[]
     # Check all source domains before mutating any bank.
-    for binding,digest in zip(bindings,source_hashes):
+    for s,(binding,digest) in enumerate(zip(bindings,source_hashes)):
         descriptor_family(binding)
         if binding['source_sha256']!=digest:raise ValueError('direct query belongs to another physical source')
+        if bound_native_events is not None:
+            record=bound_native_events[s]
+            if record.get('source')!=s or record.get('source_sha256')!=digest:
+                raise ValueError('physical native cut record belongs to another source')
     for s,(bank,binding) in enumerate(zip(banks,bindings)):
         values,receipt=recover_source(binding,legacy_cache=legacy_cache,cache=cache)
         vectors,known=fields(bank,values)
         bank['direct_face_vectors']=vectors;bank['direct_face_known']=known
         bank['direct_face_descriptor_family']=descriptor_family(binding)
+        native_known=0
+        if native_ports is not None:
+            port=native_ports[s];nv,nk,ni=native_fields(port,values,
+                bound=None if bound_native_events is None else bound_native_events[s])
+            port.update(direct_face_vectors=nv,direct_face_known=nk,
+                direct_face_descriptor_family=descriptor_family(binding),native_indices=ni)
+            native_known=int(nk.sum())
         reports.append(dict(source=s,matched_current_face_slots=int(known.sum()),
-            total_current_face_slots=known.size,missing_face_excludes_no_source=True,**receipt))
+            total_current_face_slots=known.size,matched_exact_native_cut_face_slots=native_known,
+            missing_face_excludes_no_source=True,**receipt))
     return dict(sources=reports,query_recovery_NN=0,source_rasters=0,raw_vectors_exported=False,
         all_original_face_and_body_observations_retained=True,
         source_named_identity_certified=False,nearest_or_other_frame_query_transfer=False)
 
 
-def bind_manifest(path,*,banks,nodes,sources,source_hashes,master_start,fps,authorized_root,legacy_cache,cache):
+def bind_manifest(path,*,banks,nodes,sources,source_hashes,master_start,fps,authorized_root,legacy_cache,cache,
+                  native_ports=None,bound_native_events=None):
     """Cache-only CLI boundary: verify the physical programme before reuse."""
     from .grid_perception import file_identity
     path=Path(path);root=Path(authorized_root).resolve(strict=True)
@@ -165,7 +210,8 @@ def bind_manifest(path,*,banks,nodes,sources,source_hashes,master_start,fps,auth
             or record.get('original_node_count')!=len(nodes)):
         raise ValueError('direct face manifest physical source, clock or candidate grid differs')
     bindings=record.get('bindings',[])
-    receipt=bind_banks(banks,bindings,source_hashes=source_hashes,legacy_cache=legacy_cache,cache=cache)
+    receipt=bind_banks(banks,bindings,source_hashes=source_hashes,legacy_cache=legacy_cache,cache=cache,
+        native_ports=native_ports,bound_native_events=bound_native_events)
     receipt['request_manifest_sha256']=hashlib.sha256(raw).hexdigest()
     return bindings,receipt
 
