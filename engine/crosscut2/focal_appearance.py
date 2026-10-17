@@ -16,6 +16,7 @@ def discrepancy(first, second,*,member_a=None,member_b=None,
     measured=(np.abs(np.linalg.norm(a,axis=-1)-1.)<=.001)&(np.abs(np.linalg.norm(b,axis=-1)-1.)<=.001)
     cosine=np.clip(np.sum(a*b,axis=-1),-1.,1.)
     risk=np.where(measured,(1.-cosine)/2.,.5)
+    anonymous_risk=risk.copy();anonymous_measured=measured.copy()
     known=np.zeros_like(risk,bool)
     if member_a is not None and member_b is not None:
         ma,mb=np.asarray(member_a),np.asarray(member_b)
@@ -31,12 +32,15 @@ def discrepancy(first, second,*,member_a=None,member_b=None,
         if not all(provided):raise ValueError('both bound member score profiles and support values required')
         from .source_member_scores import pair_risk
         score_risk,influence=pair_risk(profile_a,profile_b,support_a,support_b,compatible=profile_compatible)
-        # The same gallery queries also produced the original hard hints.
-        # Never count that evidence twice or change established hinted pairs.
-        influence=np.where(known,0.,influence)
+        # A propagated cluster hint is not an independent current-face query.
+        # When compatible per-face profiles exist, use their actual support
+        # ONCE instead of discarding it and imposing a blanket50% hint vote.
+        # A missing/weak current profile cannot halve a real disagreement or
+        # turn a missing descriptor into a measured favourable appearance.
         weight=.5*influence
-        risk=(1.-weight)*risk+weight*score_risk
-        measured=measured|(influence>0)
+        compatible=np.asarray(profile_compatible,bool)
+        risk=np.where(compatible,(1.-weight)*anonymous_risk+weight*score_risk,risk)
+        measured=np.where(compatible,anonymous_measured|(influence>0),measured)
     return (risk,measured,influence) if details else (risk,measured)
 
 

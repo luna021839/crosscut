@@ -61,7 +61,7 @@ def test_source_and_native_score_fields_share_the_same_queries_and_no_fourth_fac
     assert 'member_score_profiles' not in ports[0]
 
 
-def test_soft_profile_risk_changes_unknown_pairs_but_not_existing_hinted_pairs_or_admission():
+def test_actual_profiles_replace_the_same_hint_evidence_once_without_changing_admission():
     a,b=profile(),profile(1)
     same,_,used=discrepancy(vector(),vector(),member_a=np.array(-1),member_b=np.array(-1),
         profile_a=a,profile_b=a,support_a=1.,support_b=1.,details=True)
@@ -71,7 +71,7 @@ def test_soft_profile_risk_changes_unknown_pairs_but_not_existing_hinted_pairs_o
     old=discrepancy(vector(),vector(-1),member_a=np.array(0),member_b=np.array(0))[0]
     actual,_,used=discrepancy(vector(),vector(-1),member_a=np.array(0),member_b=np.array(0),
         profile_a=a,profile_b=b,support_a=1.,support_b=1.,details=True)
-    assert actual==old and used==0.
+    assert actual>old and used==1.
     left=observation(0,vector());right=observation(1,vector())
     for row,p in ((left,a),(right,b)):
         row.update(individual_member_score_profile=p,individual_member_score_support=1.,individual_member_score_gallery='same')
@@ -80,6 +80,31 @@ def test_soft_profile_risk_changes_unknown_pairs_but_not_existing_hinted_pairs_o
     right['individual_member_score_gallery']='other-gallery'
     other=matrix(features([left],fps=30.),features([right],fps=30.),details=True)
     assert other['individual_member_score_influence'][0,0]==0. and other['appearance_rate'][0,0]==0.
+
+
+def test_weak_current_face_support_cannot_receive_a_blanket_same_cluster_discount():
+    a=vector();b=np.zeros(128);b[1]=1.
+    old,_=discrepancy(a,b,member_a=np.array(0),member_b=np.array(0))
+    actual,measured,influence=discrepancy(a,b,member_a=np.array(0),member_b=np.array(0),
+        profile_a=profile(),profile_b=profile(),support_a=0.,support_b=1.,details=True)
+    assert old==.25 and actual==.5 and measured and influence==0.
+    missing,measured,influence=discrepancy(np.zeros(128),np.zeros(128),
+        member_a=np.array(0),member_b=np.array(0),profile_a=profile(),profile_b=profile(),
+        support_a=0.,support_b=0.,details=True)
+    assert missing==.5 and not measured and influence==0.
+
+
+def test_current_profile_confidence_is_monotonic_and_not_double_counted_with_cluster_labels():
+    a=vector();b=np.zeros(128);b[1]=1.
+    values=[]
+    for support in (0.,.2,.5,1.):
+        hinted,_,influence=discrepancy(a,b,member_a=np.array(0),member_b=np.array(0),
+            profile_a=profile(),profile_b=profile(),support_a=support,support_b=1.,details=True)
+        no_hint,_,_=discrepancy(a,b,member_a=np.array(-1),member_b=np.array(-1),
+            profile_a=profile(),profile_b=profile(),support_a=support,support_b=1.,details=True)
+        assert hinted==no_hint and influence==support
+        values.append(hinted)
+    assert np.all(np.diff(values)<=0.) and values[0]==.5 and values[-1]==pytest.approx(.25)
 
 
 def test_flat_missing_or_weaker_profiles_are_not_positive_identity_proof():
