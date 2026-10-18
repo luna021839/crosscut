@@ -937,6 +937,12 @@ MEMBER_BLUR_BRIDGE_REASON = (
 DIRECT_MEMBER_POSE_DISSOLVE_REASON = (
     "official_target_member_pose_matched_logistic_face_dissolve_v1"
 )
+CACHED_MEMBER_SHORT_DISSOLVE_REASON = (
+    "cached_member_measured_arms_current_face_short_dissolve_v2"
+)
+MEMBER_SOURCE_MEASURED_FACE_OVERLAP_AUTHORITY = (
+    "current_source_face_overlap_with_cached_endpoint_arms_pending_pixel_review_v2"
+)
 MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY = (
     "source_measured_joint_registration_pending_pixel_review_v1"
 )
@@ -1000,10 +1006,10 @@ class RenderTransition:
             raise ValueError("transition reason cannot be blank")
         if self.transform_overlap_authority is not None and not (
             self.kind is TransitionKind.FACE_DISSOLVE
-            and self.reason == DIRECT_MEMBER_POSE_DISSOLVE_REASON
-            and self.transform_overlap_authority in {
-                MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
-                MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+            and (self.reason, self.transform_overlap_authority) in {
+                (DIRECT_MEMBER_POSE_DISSOLVE_REASON, MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY),
+                (DIRECT_MEMBER_POSE_DISSOLVE_REASON, MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY),
+                (CACHED_MEMBER_SHORT_DISSOLVE_REASON, MEMBER_SOURCE_MEASURED_FACE_OVERLAP_AUTHORITY),
             }
         ):
             raise ValueError(
@@ -1177,7 +1183,7 @@ class RenderPlan:
             actual_member_dissolves = sum(
                 transition.kind is TransitionKind.FACE_DISSOLVE
                 and transition.reason
-                == DIRECT_MEMBER_POSE_DISSOLVE_REASON
+                in {DIRECT_MEMBER_POSE_DISSOLVE_REASON, CACHED_MEMBER_SHORT_DISSOLVE_REASON}
                 for transition in self.transitions
             )
             actual_face_dissolves = sum(
@@ -1220,6 +1226,7 @@ class RenderPlan:
             if transition.transform_overlap_authority not in {
                 MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
                 MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+                MEMBER_SOURCE_MEASURED_FACE_OVERLAP_AUTHORITY,
             }:
                 raise ValueError("outgoing camera handle needs explicit registration authority")
             if (handle.keyframes[0].time_seconds != 0.0 or
@@ -1256,7 +1263,9 @@ class RenderPlan:
                         "editorial transform is unsafe at an output-frame timestamp"
                     ) from exc
         for index, transition in enumerate(self.transitions):
-            if transition.transform_overlap_authority == MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY and (
+            if transition.transform_overlap_authority in {
+                MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY, MEMBER_SOURCE_MEASURED_FACE_OVERLAP_AUTHORITY,
+            } and (
                 self.segments[index].outgoing_overlap_transform is None
                 or self.segments[index+1].editorial_transform is None
             ):
@@ -1325,6 +1334,7 @@ class RenderPlan:
                 and transition.transform_overlap_authority not in {
                     MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
                     MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+                    MEMBER_SOURCE_MEASURED_FACE_OVERLAP_AUTHORITY,
                 }
             ):
                 raise ValueError(
