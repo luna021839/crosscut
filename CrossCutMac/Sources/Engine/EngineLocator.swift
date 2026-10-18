@@ -86,6 +86,14 @@ enum EngineLocator {
             .deletingLastPathComponent()
         candidates.append(workspace.appendingPathComponent("engine/.venv/bin/python3"))
         #endif
+        if let supportDirectory = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first {
+            // A Release bundle can use the same explicitly installed external
+            // runtime without embedding a developer checkout or disk path.
+            candidates.append(userRuntimePython(in: supportDirectory))
+        }
         candidates.append(
             URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3")
         )
@@ -106,6 +114,10 @@ enum EngineLocator {
             }
         }
         return nil
+    }
+
+    static func userRuntimePython(in supportDirectory: URL) -> URL {
+        supportDirectory.appendingPathComponent("CrossCut/python3")
     }
 
     static func augmentedPath(existing: String?) -> String {

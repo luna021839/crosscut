@@ -54,6 +54,7 @@ targets:
 
           test -f "${engine_source}/crosscut_cli.py"
           test -f "${engine_source}/crosscut/__init__.py"
+          test -f "${engine_source}/crosscut2/__init__.py"
           test -f "${engine_source}/crosscut/models/face_detection_yunet_2023mar.onnx"
           test -f "${engine_source}/crosscut/models/LICENSE.yunet"
           test -f "${engine_source}/crosscut/models/face_recognition_sface_2021dec.onnx"
@@ -66,9 +67,10 @@ targets:
           test -f "${engine_source}/crosscut/models/PROVENANCE.pose.md"
 
           /bin/rm -rf "${engine_destination}"
-          /bin/mkdir -p "${engine_destination}/crosscut"
+          /bin/mkdir -p "${engine_destination}/crosscut" "${engine_destination}/crosscut2"
           /bin/cp "${engine_source}/crosscut_cli.py" "${engine_destination}/crosscut_cli.py"
           /bin/cp "${engine_source}/crosscut/"*.py "${engine_destination}/crosscut/"
+          /bin/cp "${engine_source}/crosscut2/"*.py "${engine_destination}/crosscut2/"
           /bin/cp -R "${engine_source}/crosscut/licenses" "${engine_destination}/crosscut/"
           /bin/cp -R "${engine_source}/crosscut/models" "${engine_destination}/crosscut/"
 

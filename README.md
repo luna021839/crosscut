@@ -224,8 +224,9 @@ FFmpeg/ffprobe/yt-dlp입니다. yt-dlp는 자동 검색·다운로드 모드에 
 보조 모드에는 필요하지 않습니다.
 Xcode 16+와 XcodeGen은 소스에서 앱을 다시 빌드할 때만 필요합니다. YuNet,
 SFace, MediaPipe Pose, PP-HumanSeg ONNX 모델과 라이선스는 앱에 함께 들어갑니다.
-포즈·실루엣·얼굴 임베딩도 OpenCV DNN으로 로컬 실행하므로 MediaPipe,
-TensorFlow, ONNX Runtime, Premiere Pro, 클라우드 계정은 필요하지 않습니다.
+번들 포즈·실루엣·얼굴 모델은 OpenCV DNN으로 로컬 실행합니다. 기본 카메라 컷
+분석에는 TensorFlow 2.20이 필요하며, 확장 소스 관측에는 별도 ONNX Runtime을
+사용합니다. Premiere Pro나 클라우드 계정은 필요하지 않습니다.
 
 Homebrew 기준으로 미디어 도구를 준비하고 독립 Python 환경을 만드는 예시는
 다음과 같습니다.
@@ -233,16 +234,26 @@ Homebrew 기준으로 미디어 도구를 준비하고 독립 Python 환경을 �
 ```bash
 brew install ffmpeg yt-dlp python
 python3 -m venv engine/.venv
-engine/.venv/bin/python -m pip install "numpy>=2.0" "opencv-contrib-python>=4.10"
+engine/.venv/bin/python -m pip install -e ./engine
 ```
 
 저장소에서 실행하면 `engine/.venv/bin/python3`을 가장 먼저 찾습니다. 다른 위치의
 가상환경을 사용할 때는 앱을 시작하는 환경의 `CROSSCUT_PYTHON`에 그
-`python3` 절대 경로를 지정할 수 있습니다. 앱은 먼저 Python/NumPy/OpenCV의
+`python3` 절대 경로를 지정할 수 있습니다. 배포본은 별도로 설치된 사용자 런처
+`~/Library/Application Support/CrossCut/python3`도 시스템 Python보다 먼저
+찾으므로 개발 저장소 경로를 실행 파일에 넣지 않습니다. 앱은 먼저 Python/NumPy/OpenCV/TensorFlow의
 기본 버전 계약으로 실행 후보를 찾고, 실제 시작 직전에 `doctor`의
 모드별 준비 상태를 다시 확인합니다. `doctor.ready`는 필수 미디어 도구와
 로컬·자동 단체/멤버 모드를 모두 제공할 수 있을 때만 `true`로 보고하는
 엄격한 전체 상태입니다.
+
+ExFAT 외장 디스크에서 작은 패키지 파일이 과도한 공간을 쓰는 경우에는 외장
+APFS 이미지 안에 실행환경을 둘 수 있습니다. `tools/external_runtime_python.py`는
+로컬 설정의 이미지·볼륨 UUID를 확인하고 필요할 때 한 번 마운트한 뒤 실제
+Python으로 인수를 전달합니다. 시스템 패키지를 바꾸거나 내장 디스크에 실행환경을
+대신 만들지 않습니다. 이 방식을 쓰는 로컬 `.venv/bin/python3`은 실행 런처일 수
+있으므로 기존 `.venv`를 덮어쓰기 전에 `--version`과 `crosscut_cli.py doctor`로
+확인합니다. 이미지 경로와 볼륨 UUID를 담은 로컬 설정은 Git에서 제외합니다.
 `mode_readiness.group`, `mode_readiness.member`와 자동 수집 모드별 상태로 준비
 여부를 따로 확인할 수 있습니다. 멤버 트래커는 사용자가 확인한 앵커를 쓰는
 로컬 멤버 모드에만 필수입니다. `member_anchor_tracking`은 CSRT/KCF/MIL 팩토리 존재만 보는 것이

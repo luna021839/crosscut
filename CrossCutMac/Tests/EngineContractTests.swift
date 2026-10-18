@@ -2012,6 +2012,14 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(parts.filter { $0 == "/usr/bin" }.count, 1)
     }
 
+    func testUserRuntimePathDoesNotDependOnTheCheckoutOrExternalDiskName() {
+        let support = URL(fileURLWithPath: "/tmp/crosscut-user-support", isDirectory: true)
+        XCTAssertEqual(
+            EngineLocator.userRuntimePython(in: support).path,
+            "/tmp/crosscut-user-support/CrossCut/python3"
+        )
+    }
+
     func testRuntimeProbeRequiresMachineReadableBaseRuntimeReady() {
         XCTAssertTrue(
             EngineLocator.runtimeProbeReady(

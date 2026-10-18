@@ -7,18 +7,18 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		8F73DA457BE1598E4D960812 /* SceneReviewProposalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */; };
-		AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */; };
-		BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8314CA79E417414399736965 /* EngineProgressTests.swift */; };
+		18B6AABB45E70C81E77FCDF4 /* EngineProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB9C76578954E18E2ED0E05 /* EngineProcessIntegrationTests.swift */; };
 		3542E216A753B615C38AA1A3 /* EditConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058354DD2B1876E0B582A3B /* EditConfiguration.swift */; };
 		3C2AB4E5CE835B22E4D66BB3 /* EngineLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92C8043F6391380DC44260C /* EngineLocator.swift */; };
 		42DFE733282C5F2918E7A9B5 /* EngineRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D449324FA3FF25DCC007C805 /* EngineRunner.swift */; };
 		5381B26FC3620081C66418B7 /* LargeMediaStoragePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59925055FD3153B37A0D1C77 /* LargeMediaStoragePolicy.swift */; };
 		6F20D98ABC69516E9ADC177D /* MemberAnchorEditorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0E5A0B8BF1A4C3F6B9035B7 /* MemberAnchorEditorSheet.swift */; };
+		7EA15670CF222E8320DE7AAF /* EngineProgressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9414BD37526ABAC83E1D77BC /* EngineProgressTests.swift */; };
 		A21482360ED0C650B4FB5D74 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5553292F7C883447094A43 /* ContentView.swift */; };
 		A94D1375D222565CCCA5EC14 /* EngineEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C3A3264DA982BBBCC932417 /* EngineEvent.swift */; };
 		C382BE3917C384935B13571B /* CrossCutMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 864D44BA55B50B30ECEBF325 /* CrossCutMacApp.swift */; };
 		EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC05A356C48CF84522C559B /* EngineContractTests.swift */; };
+		FB4172BB32235171488F93F5 /* SceneReviewProposalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7512288D37F1D2B037FD6C65 /* SceneReviewProposalTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,19 +32,19 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneReviewProposalTests.swift; sourceTree = "<group>"; };
-		3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProcessIntegrationTests.swift; sourceTree = "<group>"; };
-		8314CA79E417414399736965 /* EngineProgressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProgressTests.swift; sourceTree = "<group>"; };
 		0BC05A356C48CF84522C559B /* EngineContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineContractTests.swift; sourceTree = "<group>"; };
 		1C3A3264DA982BBBCC932417 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
 		257CCFDE2BF4D34FB8E9739F /* CrossCutMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CrossCutMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59925055FD3153B37A0D1C77 /* LargeMediaStoragePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LargeMediaStoragePolicy.swift; sourceTree = "<group>"; };
 		688B1C8EAA79375E043C7069 /* CrossCutMacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CrossCutMacTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7512288D37F1D2B037FD6C65 /* SceneReviewProposalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneReviewProposalTests.swift; sourceTree = "<group>"; };
 		864D44BA55B50B30ECEBF325 /* CrossCutMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrossCutMacApp.swift; sourceTree = "<group>"; };
 		8B5553292F7C883447094A43 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		9414BD37526ABAC83E1D77BC /* EngineProgressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProgressTests.swift; sourceTree = "<group>"; };
 		C058354DD2B1876E0B582A3B /* EditConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditConfiguration.swift; sourceTree = "<group>"; };
 		D449324FA3FF25DCC007C805 /* EngineRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineRunner.swift; sourceTree = "<group>"; };
 		D92C8043F6391380DC44260C /* EngineLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineLocator.swift; sourceTree = "<group>"; };
+		EBB9C76578954E18E2ED0E05 /* EngineProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		F0E5A0B8BF1A4C3F6B9035B7 /* MemberAnchorEditorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemberAnchorEditorSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -52,10 +52,10 @@
 		24B9DF779CA6FD1CA5D90FD9 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
-				3F24840CE2984AEBAB71E0CC /* EngineProcessIntegrationTests.swift */,
 				0BC05A356C48CF84522C559B /* EngineContractTests.swift */,
-				8314CA79E417414399736965 /* EngineProgressTests.swift */,
-				0B44AEF593499E3431B40D9A /* SceneReviewProposalTests.swift */,
+				EBB9C76578954E18E2ED0E05 /* EngineProcessIntegrationTests.swift */,
+				9414BD37526ABAC83E1D77BC /* EngineProgressTests.swift */,
+				7512288D37F1D2B037FD6C65 /* SceneReviewProposalTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -211,7 +211,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\nengine_source=\"${SRCROOT}/../engine\"\nengine_destination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/engine\"\n\ncase \"${engine_destination}\" in\n  \"${TARGET_BUILD_DIR}/\"*) ;;\n  *) echo \"Refusing to clean unexpected engine destination: ${engine_destination}\" >&2; exit 1 ;;\nesac\n\ntest -f \"${engine_source}/crosscut_cli.py\"\ntest -f \"${engine_source}/crosscut/__init__.py\"\ntest -f \"${engine_source}/crosscut/models/face_detection_yunet_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.yunet\"\ntest -f \"${engine_source}/crosscut/models/face_recognition_sface_2021dec.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-sface\"\ntest -f \"${engine_source}/crosscut/models/person_detection_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/pose_estimation_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/human_segmentation_pphumanseg_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-mediapipe-pose\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-pphumanseg\"\ntest -f \"${engine_source}/crosscut/models/PROVENANCE.pose.md\"\n\n/bin/rm -rf \"${engine_destination}\"\n/bin/mkdir -p \"${engine_destination}/crosscut\"\n/bin/cp \"${engine_source}/crosscut_cli.py\" \"${engine_destination}/crosscut_cli.py\"\n/bin/cp \"${engine_source}/crosscut/\"*.py \"${engine_destination}/crosscut/\"\n/bin/cp -R \"${engine_source}/crosscut/licenses\" \"${engine_destination}/crosscut/\"\n/bin/cp -R \"${engine_source}/crosscut/models\" \"${engine_destination}/crosscut/\"\n";
+			shellScript = "set -euo pipefail\n\nengine_source=\"${SRCROOT}/../engine\"\nengine_destination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/engine\"\n\ncase \"${engine_destination}\" in\n  \"${TARGET_BUILD_DIR}/\"*) ;;\n  *) echo \"Refusing to clean unexpected engine destination: ${engine_destination}\" >&2; exit 1 ;;\nesac\n\ntest -f \"${engine_source}/crosscut_cli.py\"\ntest -f \"${engine_source}/crosscut/__init__.py\"\ntest -f \"${engine_source}/crosscut2/__init__.py\"\ntest -f \"${engine_source}/crosscut/models/face_detection_yunet_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.yunet\"\ntest -f \"${engine_source}/crosscut/models/face_recognition_sface_2021dec.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-sface\"\ntest -f \"${engine_source}/crosscut/models/person_detection_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/pose_estimation_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/human_segmentation_pphumanseg_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-mediapipe-pose\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-pphumanseg\"\ntest -f \"${engine_source}/crosscut/models/PROVENANCE.pose.md\"\n\n/bin/rm -rf \"${engine_destination}\"\n/bin/mkdir -p \"${engine_destination}/crosscut\" \"${engine_destination}/crosscut2\"\n/bin/cp \"${engine_source}/crosscut_cli.py\" \"${engine_destination}/crosscut_cli.py\"\n/bin/cp \"${engine_source}/crosscut/\"*.py \"${engine_destination}/crosscut/\"\n/bin/cp \"${engine_source}/crosscut2/\"*.py \"${engine_destination}/crosscut2/\"\n/bin/cp -R \"${engine_source}/crosscut/licenses\" \"${engine_destination}/crosscut/\"\n/bin/cp -R \"${engine_source}/crosscut/models\" \"${engine_destination}/crosscut/\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -220,10 +220,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AEEA92D0D1144C8F970CDADC /* EngineProcessIntegrationTests.swift in Sources */,
 				EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */,
-				BDFA017B3A994D9387927691 /* EngineProgressTests.swift in Sources */,
-				8F73DA457BE1598E4D960812 /* SceneReviewProposalTests.swift in Sources */,
+				18B6AABB45E70C81E77FCDF4 /* EngineProcessIntegrationTests.swift in Sources */,
+				7EA15670CF222E8320DE7AAF /* EngineProgressTests.swift in Sources */,
+				FB4172BB32235171488F93F5 /* SceneReviewProposalTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
