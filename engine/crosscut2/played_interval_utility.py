@@ -23,6 +23,11 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False,
     from .subject_cut_moments import _seam_action
     rate=np.asarray(detail['pose_rate']).copy();direction=np.zeros_like(rate)
     measured=np.zeros(rate.shape,bool);components=np.zeros(rate.shape+(3,));screen_terms={}
+    # Camera alternatives share the same immutable source-native context.
+    # Arm configuration/direction/motion are measured once per context pair;
+    # only the two actual endpoint cameras change screen placement. Keep the
+    # cache local to this matrix so no result crosses a music/sample domain.
+    actions={}
     for a,port_a in enumerate(left):
         observation_a=getattr(port_a,'observation',port_a)
         ca=observation_a.get('dense_subject_context')
@@ -34,13 +39,23 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False,
             geometry=dict(common_source_shot_sample_mask=ca['same_shot']&cb['same_shot'],
                 outgoing_camera=observation_a['camera_strip'][-1],
                 incoming_camera=observation_b['camera_strip'][0])
-            value=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry,
-                static_camera_terms=static_camera_terms)
+            key=(id(ca),id(cb))
+            if key not in actions:
+                actions[key]=_seam_action(ca['window'],cb['window'],ca['clock'],cb['clock'],geometry,
+                    static_camera_terms=True)
+            value=actions[key]
             if not value['seam_action_supported']:continue
-            if static_camera_terms:screen_terms[a,b]=value['static_camera_screen_terms']
+            terms=value['static_camera_screen_terms']
+            xy_a,xy_b,ha,hb,known=terms
+            camera_a,camera_b=geometry['outgoing_camera'],geometry['incoming_camera']
+            pa=.5+camera_a[0]*(xy_a-camera_a[1:])
+            pb=.5+camera_b[0]*(xy_b-camera_b[1:])
+            scale=np.maximum(.02,(ha*camera_a[0]+hb*camera_b[0])/2.)
+            squared=np.sum(((pa-pb)*[16/9,1.])**2,axis=-1)/scale[:,None]**2
+            screen=float(np.sqrt(np.mean(squared[known])))
+            if static_camera_terms:screen_terms[a,b]=terms
             measured[a,b]=True;direction[a,b]=value['seam_arm_direction_residual']
-            residual=np.asarray([value[k] for k in
-                ('seam_pose_residual','seam_screen_residual','seam_motion_residual')])
+            residual=np.asarray([value['seam_pose_residual'],screen,value['seam_motion_residual']])
             components[a,b]=residual/(1.+residual)
             # Score the actually visible articulated connection. A missing
             # hip/second arm must not add a neutral floor to a matching arm;
