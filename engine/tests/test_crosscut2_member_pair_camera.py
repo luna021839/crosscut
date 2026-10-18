@@ -32,3 +32,24 @@ def test_missing_face_does_not_become_a_certain_member_camera_fit():
     with pytest.raises(ValueError,match='observed faces'):
         fit([0,0,0,0],[.4,.2,.1,.1],np.zeros((8,3)),np.zeros((8,3)),existing=[[1.,.5,.5]]*2,
             output_size=(1080,1920))
+
+
+def test_equal_heads_do_not_conceal_a_displaced_observed_wrist():
+    face=np.array([.45,.2,.1,.1]);a=np.zeros((8,3));a[:6]=[
+        [.4,.4,.9],[.6,.4,.9],[.35,.5,.9],[.65,.5,.9],[.3,.6,.9],[.7,.6,.9]]
+    b=a.copy();b[4,0]=.6
+    same=score([1.,.5,.5],[1.,.5,.5],face,face,a,a,output_size=(1080,1920))
+    wrong=score([1.,.5,.5],[1.,.5,.5],face,face,a,b,output_size=(1080,1920))
+    assert same['geometry']==wrong['geometry']==0.
+    assert same['measured_arm_position_in_face_heights']==0.
+    assert wrong['measured_arm_position_in_face_heights']>1 and wrong['cost']>same['cost']
+
+
+def test_joint_registration_is_an_actual_camera_candidate_not_invented_matching_limbs():
+    face_a=np.array([.45,.2,.1,.1]);face_b=np.array([.45,.2,.1,.1])
+    a=np.zeros((8,3));a[:6]=[[.4,.4,.9],[.6,.4,.9],[.35,.5,.9],[.65,.5,.9],[.3,.6,.9],[.7,.6,.9]]
+    b=a.copy();b[:6,:2]=[.5,.25]+1.5*(a[:6,:2]-[.5,.25]);before=a.copy(),b.copy()
+    cameras,receipt=fit(face_a,face_b,a,b,existing=[[1.,.5,.5]]*2,output_size=(1080,1920))
+    assert receipt['after']['cost']<receipt['before']['cost']
+    assert receipt['after']['measured_arm_position_in_face_heights']<receipt['before']['measured_arm_position_in_face_heights']
+    np.testing.assert_array_equal(a,before[0]);np.testing.assert_array_equal(b,before[1])

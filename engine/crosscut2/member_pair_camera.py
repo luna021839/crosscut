@@ -33,11 +33,18 @@ def score(first,second,face_a,face_b,pose_a,pose_b,*,output_size,sampling=(1.,1.
     projected=.5+cameras[:,None,:1]*(points[:,:6,:2]-cameras[:,None,1:])
     lost=visible&((projected<0).any(-1)|(projected>1).any(-1))
     crop=float((lost.sum(-1)/np.maximum(1,visible.sum(-1))).mean())
+    common=visible[0]&visible[1]
+    # Actual shown arm positions matter as well as a fitted head rectangle.
+    # A cropped wrist cannot erase the measured disagreement. Missing joints
+    # receive no invented alignment, confidence, or action-match credit.
+    joint_delta=np.linalg.norm((projected[0]-projected[1])*[aspect,1.],axis=-1)/max(.005,float(height.mean()))
+    joint_alignment=float(joint_delta[common].max()) if common.any() else None
     effort=float(np.maximum(0.,np.log2(cameras[:,0]/sampling)).mean())
     tight=float(np.maximum(0.,height-.28).sum())
-    cost=3.*geometry+3.*face_crop+1.5*crop+.3*effort+6.*tight+.05*float(np.log(cameras[:,0]).sum())
+    cost=3.*geometry+(0. if joint_alignment is None else 3.*joint_alignment)+3.*face_crop+1.5*crop+.3*effort+6.*tight+.05*float(np.log(cameras[:,0]).sum())
     return dict(cost=cost,geometry=geometry,position=position,log_scale=scale,
-        clipped_face_fraction=face_crop,added_arm_crop_fraction=crop,added_sampling_effort=effort)
+        clipped_face_fraction=face_crop,added_arm_crop_fraction=crop,added_sampling_effort=effort,
+        measured_arm_position_in_face_heights=joint_alignment,measured_arm_joint_count=int(common.sum()))
 
 
 def fit(face_a,face_b,pose_a,pose_b,*,existing,output_size,caps=(2.,2.),sampling=(1.,1.)):
@@ -59,6 +66,33 @@ def fit(face_a,face_b,pose_a,pose_b,*,existing,output_size,caps=(2.,2.),sampling
         delta=pan-.5;radius=np.linalg.norm(delta,axis=1)
         pan=.5+delta*np.minimum(1.,.25/np.maximum(1e-12,radius))[:,None]
         candidates.append(np.c_[z,pan])
+    # One extra face+arm registration family. Face-only zoom ratios cannot
+    # reconcile a different torso/arm scale even when a head box aligns.
+    poses=np.asarray([pose_a,pose_b],float)
+    if poses.shape!=(2,8,3) or not np.isfinite(poses).all():
+        raise ValueError('two actual screen-pose arrays required')
+    known=(poses[:,:6,2]>=.3)&(poses[:,:6,:2]>=0).all(-1)&(poses[:,:6,:2]<=1).all(-1)
+    common=known.all(0)
+    arms=[chain for chain in ((0,2,4),(1,3,5)) if common[list(chain)].all()]
+    if arms:
+        joints=sorted({j for chain in arms for j in chain})
+        points=np.concatenate((center[:,None],poses[:,joints,:2]),axis=1)
+        weights=np.r_[.5,np.full(len(joints),.5/len(joints))]
+        centroid=np.sum(points*weights[None,:,None],axis=1)
+        centered=(points-centroid[:,None])*[output_size[0]/output_size[1],1.]
+        variance=float(np.sum(weights*np.sum(centered[0]**2,axis=-1)))
+        covariance=float(np.sum(weights*np.sum(centered[0]*centered[1],axis=-1)))
+        if variance>1e-8 and covariance>0:
+            ratio=float(np.clip(covariance/variance,1./caps[1],caps[0]))
+            z=np.array([max(1.,ratio),max(1.,1./ratio)])
+            lo=1.+z[:,None]*(centroid-1.);hi=z[:,None]*centroid
+            lower=lo.max(0);upper=hi.min(0)
+            shared=np.where(lower<=upper,np.clip(centroid.mean(0),lower,upper),(lower+upper)/2)
+            pan=centroid+(.5-np.clip(shared,lo,hi))/z[:,None]
+            delta=pan-.5;radius=np.linalg.norm(delta,axis=1)
+            pan=.5+delta*np.minimum(1.,.25/np.maximum(1e-12,radius))[:,None]
+            pan=np.clip(pan,.5/z[:,None],1.-.5/z[:,None])
+            candidates.append(np.c_[z,pan])
     measured=[score(v[0],v[1],face_a,face_b,pose_a,pose_b,output_size=output_size,sampling=sampling) for v in candidates]
     at=min(range(len(candidates)),key=lambda i:measured[i]['cost'])
     return candidates[at],dict(before=measured[0],after=measured[at],original_camera_retained=at==0,

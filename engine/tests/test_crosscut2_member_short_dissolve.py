@@ -25,6 +25,14 @@ def test_current_matched_overlap_preserves_actual_pose_confidence():
 def test_a_future_wrong_arm_or_face_scale_is_not_hidden_by_matching_endpoints():
     faces,known,pose=_input();pose[2,1,4,:2]=[.1,.1]
     assert not assess(faces,known,pose,output_size=(1080,1920))['eligible']
+
+
+def test_parallel_arms_at_the_wrong_screen_position_are_not_a_registered_effect():
+    faces,known,pose=_input();pose[:,1,:6,1]-=.25
+    result=assess(faces,known,pose,output_size=(1080,1920))
+    assert result['maximum_visible_arm_direction_mismatch']<1e-12
+    assert result['maximum_visible_arm_position_in_face_heights']>2.
+    assert not result['eligible']
     faces,known,pose=_input();faces[2,1,3]*=1.8
     assert not assess(faces,known,pose,output_size=(1080,1920))['eligible']
 

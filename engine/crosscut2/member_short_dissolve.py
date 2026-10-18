@@ -32,11 +32,17 @@ def assess(faces,known,poses,*,output_size):
     unit=vector/np.maximum(.001,length)[...,None]
     direction=np.linalg.norm(unit[:,0]-unit[:,1],axis=-1)/2
     worst=None if not common.any() else float(direction[common].max())
+    joints=(body[:,:,:6,2]>=.3)&(body[:,:,:6,:2]>=0).all(-1)&(body[:,:,:6,:2]<=1).all(-1)
+    common_joints=joints[:,0]&joints[:,1]
+    delta=np.linalg.norm((body[:,0,:6,:2]-body[:,1,:6,:2])*metric,axis=-1)/mean_height[:,None]
+    arm_position=None if not common_joints.any() else float(delta[common_joints].max())
     eligible=bool(max(position)<=.7 and max(scale)<=.3 and min(visible.ravel())>=.95
-        and max(heights.ravel())<=.30 and (worst is None or worst<=.42))
+        and max(heights.ravel())<=.30 and (worst is None or worst<=.42)
+        and (arm_position is None or arm_position<=1.5))
     return dict(eligible=eligible,reason='short_measured_overlap' if eligible else 'measured_overlap_discrepancy',
         maximum_face_position_in_face_heights=float(max(position)),maximum_log_face_scale=float(max(scale)),
         minimum_visible_face_fraction=float(min(visible.ravel())),maximum_visible_arm_direction_mismatch=worst,
+        maximum_visible_arm_position_in_face_heights=arm_position,
         measured_future_bone_pairs=int(common.sum()),missing_future_bones_are_not_matches=True,
         score=float(max(position)+max(scale)+(.5 if worst is None else worst)),
         pose_invented=False,normal_speed_AV_approval=False)
