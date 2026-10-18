@@ -53,7 +53,6 @@ class SeekClock:
     identity: tuple
     packet_digest: str
     inspected_packet_header_bytes: int=0
-    grid_basis: str='exact_cfr_presentation_grid'
 
 
 def probe(path,*,check=lambda:None,maximum_seconds=10.):
@@ -87,7 +86,7 @@ def probe(path,*,check=lambda:None,maximum_seconds=10.):
     if file_identity(path)!=identity:raise OSError('source changed during random-access packet inspection')
     keyframes=tuple(sorted(set(keyframes)))
     if not keyframes or keyframes[0]!=0:raise UnsupportedSeek('verified native keyframe/preroll mapping required')
-    return SeekClock(clock.frame_rate,clock.frame_count,keyframes,identity,clock.packet_grid_sha256,bytes_read,clock.grid_basis)
+    return SeekClock(clock.frame_rate,clock.frame_count,keyframes,identity,clock.packet_grid_sha256,bytes_read)
 
 
 def windows(natives,clock,*,maximum_window_seconds=2.,maximum_decode_seconds=8.,maximum_selected_frames=32):

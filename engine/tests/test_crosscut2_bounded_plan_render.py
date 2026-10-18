@@ -12,7 +12,7 @@ from crosscut.ive import AspectRatio
 from crosscut.render import (RenderPlan,RenderSegment,RenderTransition,TransitionKind,
     PanCropTrack,PanCropKeyframe,NormalizedCrop,EditorialTransformTrack,EditorialTransformKeyframe)
 from crosscut.rendered_endpoint_component import incoming_dissolve_weight
-from crosscut2.bounded_plan_render import outgoing_handle,blend_graph,render,nominal_schedules
+from crosscut2.bounded_plan_render import outgoing_handle,blend_graph,render,nominal_schedules,verified_source_clocks
 from crosscut.render_reference_clock import load_render_reference_clock
 from crosscut.render_frame_schedule import probe_render_frame_clock
 from crosscut2.sparse_native_frames import SeekClock
@@ -154,3 +154,19 @@ def test_existing_clock_sidecar_is_never_overwritten_before_source_access(tmp_pa
         AspectRatio.LANDSCAPE,movie,width=160,height=90,fps=30.)
     with pytest.raises(FileExistsError):render(plan)
     assert sidecar.read_text()=='existing' and not movie.exists()
+
+
+def test_verified_metadata_preserves_vp9_basis_without_changing_raster_producer(tmp_path,monkeypatch):
+    from crosscut.render_frame_schedule import VerifiedRenderFrameClock
+    clock=SeekClock(Fraction(30000,1001),6,(0,),(),'a'*64)
+    verified=VerifiedRenderFrameClock(clock.rate,clock.count,clock.packet_digest,
+        'bijective_nearest_index_presentation_grid')
+    calls=[]
+    def probe(path,**kw):calls.append(path);return verified
+    monkeypatch.setattr('crosscut2.bounded_plan_render.probe_render_frame_clock',probe)
+    result=verified_source_clocks((tmp_path/'s.mp4',),{0:clock},ffprobe='ffprobe')
+    assert calls==[tmp_path/'s.mp4'] and result[0].grid_basis==verified.grid_basis
+    monkeypatch.setattr('crosscut2.bounded_plan_render.probe_render_frame_clock',
+        lambda *a,**kw:replace(verified,packet_grid_sha256='b'*64))
+    with pytest.raises(ValueError,match='differs'):
+        verified_source_clocks((tmp_path/'s.mp4',),{0:clock},ffprobe='ffprobe')

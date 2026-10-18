@@ -24,10 +24,26 @@ from crosscut.render import (
     _FACE_DISSOLVE_LOGISTIC_ENDPOINT, _FACE_DISSOLVE_LOGISTIC_SPAN,
     segment_frame_counts, _video_render_units,
 )
-from crosscut.render_frame_schedule import sampler_frame_schedule, VerifiedRenderFrameClock, NativeFrameSchedule, FRAME_SCHEDULE_CONTRACT
+from crosscut.render_frame_schedule import sampler_frame_schedule, probe_render_frame_clock, NativeFrameSchedule, FRAME_SCHEDULE_CONTRACT
 from crosscut.render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, render_clock_path
 from crosscut.render_process import run_observed_render
 from . import sparse_native_frames as sparse
+
+
+def verified_source_clocks(sources,clocks,*,ffprobe,check=lambda:None):
+    """Bind richer QA metadata without changing any raw raster cache producer.
+
+    In particular, a VP9 nearest-index grid must not be labelled exact CFR.
+    The metadata probe must reproduce the very packet grid used for seeking.
+    """
+    result={}
+    for s,clock in clocks.items():
+        check();value=probe_render_frame_clock(sources[s],ffprobe=ffprobe)
+        if (value is None or (value.frame_rate,value.frame_count,value.packet_grid_sha256)
+                !=(clock.rate,clock.count,clock.packet_digest)):
+            raise ValueError('QA frame clock differs from the actual bounded seek clock')
+        result[s]=value
+    return result
 
 
 def nominal_schedules(plan,clocks):
@@ -194,8 +210,7 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
         for s in sorted({v.source_index for v in plan.segments}):
             clocks[s] = sparse.probe(plan.sources[s], check=live)
         from crosscut.shot_video_clock import validate_shot_video_clock_bindings
-        verified={s: VerifiedRenderFrameClock(clock.rate,clock.count,clock.packet_digest,clock.grid_basis)
-            for s,clock in clocks.items()}
+        verified=verified_source_clocks(plan.sources,clocks,ffprobe=probe,check=live)
         validate_shot_video_clock_bindings(plan, frame_clocks=verified)
         schedules=nominal_schedules(plan,clocks)
         for i, (segment, n) in enumerate(zip(plan.segments, counts, strict=True)):
