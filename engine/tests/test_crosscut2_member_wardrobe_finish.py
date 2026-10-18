@@ -56,6 +56,15 @@ def test_changed_effect_curve_does_not_reuse_an_old_encoded_effect(tmp_path):
     assert match(plan,sources,[handle])[1]['matched_windows']==0
 
 
+def test_regional_replacement_has_its_own_style_without_relabelling_old_clips(tmp_path):
+    sources,plan,handle=cached(tmp_path)
+    assert implementation()!=implementation('regional_clothing_replace')
+    handle['style']='regional_clothing_replace'
+    assert match(plan,sources,[handle])[1]['matched_windows']==0
+    handle['compositor_sha256']=implementation(handle['style'])
+    assert match(plan,sources,[handle])[1]['matched_windows']==1
+
+
 def test_post_effect_receipt_does_not_pretend_the_nominal_plan_changed(tmp_path):
     base=tmp_path/'base.mp4';base.write_bytes(b'original complete film')
     digest=lambda raw:hashlib.sha256(raw).hexdigest()

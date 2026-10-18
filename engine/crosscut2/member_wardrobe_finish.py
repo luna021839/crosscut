@@ -14,9 +14,14 @@ from .member_film_effects import view
 from .member_geometry_inputs import identity
 
 
-def implementation():
+def implementation(style='garment_dissolve'):
     from . import member_wardrobe_layer
-    return hashlib.sha256(Path(member_wardrobe_layer.__file__).read_bytes()).hexdigest()
+    raw=Path(member_wardrobe_layer.__file__).read_bytes()
+    if style=='regional_clothing_replace':
+        from . import member_clothing_replace
+        raw+=Path(member_clothing_replace.__file__).read_bytes()
+    elif style!='garment_dissolve':raise ValueError('unknown wardrobe compositor style')
+    return hashlib.sha256(raw).hexdigest()
 
 
 def binding(plan,sources,boundary,*,frame_count=25,lead_frames=12):
@@ -52,7 +57,7 @@ def signature(value):
 def match(plan,sources,candidates):
     selected=[];misses=0;used=set()
     for candidate in candidates:
-        if candidate.get('compositor_sha256')!=implementation():
+        if candidate.get('compositor_sha256')!=implementation(candidate.get('style','garment_dissolve')):
             misses+=1;continue
         wanted=candidate['binding']
         if candidate['binding_sha256']!=signature(wanted):raise ValueError('wardrobe handle binding changed')
