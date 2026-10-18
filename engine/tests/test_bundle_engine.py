@@ -36,3 +36,24 @@ def test_workspace_root_cannot_be_a_cleaned_destination(tmp_path):
     source,destination,build=inputs(tmp_path)
     with pytest.raises(ValueError,match='outside this built app'):bundler.bundle(source,tmp_path,build)
     assert source.exists() and (destination/'old.py').exists()
+
+
+def test_unchanged_verified_assets_are_not_duplicated_for_a_small_code_revision(tmp_path):
+    source,destination,build=inputs(tmp_path)
+    bundler.bundle(source,destination,build)
+    asset=destination/'crosscut/models/face_detection_yunet_2023mar.onnx'
+    before=asset.stat().st_ino
+    (source/'crosscut2/member_programme.py').write_text('print(2)\n')
+    result=bundler.bundle(source,destination,build)
+    assert asset.stat().st_ino==before and asset.stat().st_nlink==1
+    assert result['verified_existing_bytes_reused']>0
+    assert (destination/'crosscut2/member_programme.py').read_text()=='print(2)\n'
+
+
+def test_changed_existing_asset_is_replaced_not_reused(tmp_path):
+    source,destination,build=inputs(tmp_path)
+    bundler.bundle(source,destination,build)
+    asset=destination/'crosscut/models/face_detection_yunet_2023mar.onnx'
+    asset.write_bytes(b'corrupt existing app asset')
+    bundler.bundle(source,destination,build)
+    assert asset.read_bytes()==b'asset'

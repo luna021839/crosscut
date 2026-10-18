@@ -32,7 +32,7 @@ def reveal(garment,progress):
 
 
 def composite(outgoing,incoming,*,incoming_garment,outgoing_person,incoming_person,incoming_to_outgoing,progress,
-        incoming_face_landmarks=None):
+        incoming_face_landmarks=None,outgoing_face_landmarks=None,face_tone_delta=None):
     if (outgoing.dtype!=np.uint8 or incoming.dtype!=np.uint8 or outgoing.shape!=incoming.shape
             or outgoing.ndim!=3 or outgoing.shape[2]!=3):raise ValueError('matching actual BGR8 pictures required')
     h,w=outgoing.shape[:2]
@@ -45,6 +45,13 @@ def composite(outgoing,incoming,*,incoming_garment,outgoing_person,incoming_pers
     phases(progress)
     if progress==0:return outgoing.copy()
     if progress==1:return incoming.copy()
+    if face_tone_delta is not None:
+        from .member_face_tone import correct
+        if outgoing_face_landmarks is None or incoming_face_landmarks is None:
+            raise ValueError('both real face guides required for a skin-tone bridge')
+        tone=smooth(progress,0.,1.)
+        outgoing=correct(outgoing,outgoing_face_landmarks,masks[1],face_tone_delta,tone)
+        incoming=correct(incoming,incoming_face_landmarks,masks[2],face_tone_delta,tone-1)
     release=smooth(progress,.38,.94)
     person_phase=smooth(progress,.68,.9)
     stage_phase=smooth(progress,.68,1.)

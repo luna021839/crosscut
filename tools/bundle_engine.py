@@ -49,10 +49,23 @@ def bundle(source,destination,build_root):
     stage=Path(tempfile.mkdtemp(prefix='.engine-staging-',dir=destination.parent))
     backup=destination.with_name('.engine-backup-'+uuid.uuid4().hex)
     published=False
+    reused_bytes=0
     try:
         for path in paths:
             relative=path.relative_to(source);target=stage/relative;target.parent.mkdir(parents=True,exist_ok=True)
-            shutil.copyfile(str(path),str(target))
+            previous=destination/relative
+            linked=False
+            if (previous.is_file() and not previous.is_symlink()
+                    and previous.resolve().is_relative_to(destination.resolve())
+                    and digest(previous)==expected[str(relative)]):
+                # Staging and the previous built tree share this filesystem.
+                # Reuse verified immutable model/source bytes, not a second
+                # 80 MiB copy for a few changed Python files on a nearly-full
+                # external disk. Hash verification still precedes publication.
+                try:os.link(previous,target,follow_symlinks=False);linked=True
+                except OSError:pass
+            if linked:reused_bytes+=path.stat().st_size
+            else:shutil.copyfile(str(path),str(target))
             with target.open('rb') as stream:os.fsync(stream.fileno())
             if digest(target)!=expected[str(relative)]:raise ValueError('bundled engine copy differs: '+str(relative))
         if any(digest(source/name)!=sha for name,sha in expected.items()):raise ValueError('engine source changed during packaging')
@@ -66,7 +79,7 @@ def bundle(source,destination,build_root):
         # workspace/cache root. Its replacement has already been verified.
         if backup.exists():shutil.rmtree(backup)
         receipt=dict(contract='verified_app_engine_bundle_v1',files=expected,
-            bytes=sum(p.stat().st_size for p in paths))
+            bytes=sum(p.stat().st_size for p in paths),verified_existing_bytes_reused=reused_bytes)
         (destination.parent/'python-engine-bundle.json').write_text(json.dumps(receipt,sort_keys=True,indent=2)+'\n')
         return receipt
     finally:

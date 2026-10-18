@@ -18,8 +18,9 @@ def implementation(style='garment_dissolve'):
     from . import member_wardrobe_layer
     raw=Path(member_wardrobe_layer.__file__).read_bytes()
     if style=='regional_clothing_replace':
-        from . import member_clothing_replace
+        from . import member_clothing_replace,member_face_tone
         raw+=Path(member_clothing_replace.__file__).read_bytes()
+        raw+=Path(member_face_tone.__file__).read_bytes()
     elif style!='garment_dissolve':raise ValueError('unknown wardrobe compositor style')
     return hashlib.sha256(raw).hexdigest()
 

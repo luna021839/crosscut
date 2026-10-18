@@ -30,12 +30,15 @@ def overlay_graph(effects, rate):
 
 
 def render(base_movie, effects, output, *, ffmpeg='ffmpeg', maximum_seconds=240.,
-        video_codec='h264_videotoolbox', check=lambda:None, progress=lambda _:None):
+        video_codec='h264_videotoolbox', reserve_bytes=768*2**20, video_bitrate=35_000_000,
+        check=lambda:None, progress=lambda _:None):
     """Overlay whole-canvas exact-frame clips and copy the original audio."""
     base_movie,output=Path(base_movie),Path(output)
     if output.exists() or output.with_suffix('.wardrobe-effects.json').exists():
         raise FileExistsError('never overwrite a viewing reference or prior wardrobe film')
-    if video_codec not in ('h264_videotoolbox','libx264') or not 1<=maximum_seconds<=600:
+    if (video_codec not in ('h264_videotoolbox','libx264') or not 1<=maximum_seconds<=600
+            or type(reserve_bytes) is not int or reserve_bytes<256*2**20
+            or type(video_bitrate) is not int or not 16_000_000<=video_bitrate<=80_000_000):
         raise ValueError('one explicit bounded encoder required')
     started=monotonic();check()
     clock=sparse.probe(base_movie,check=check)
@@ -79,7 +82,7 @@ def render(base_movie, effects, output, *, ffmpeg='ffmpeg', maximum_seconds=240.
     for path in paths[1:]:command+=['-threads','2','-i',str(path)]
     command+=['-filter_complex_threads','2','-filter_complex',overlay_graph(effects,rate),
         '-map',f'[base{len(effects)}]','-map','0:a:0?','-c:v',video_codec]
-    command+=(['-b:v','35M'] if video_codec=='h264_videotoolbox' else ['-crf','0','-preset','ultrafast','-threads','2'])
+    command+=(['-b:v',str(video_bitrate)] if video_codec=='h264_videotoolbox' else ['-crf','0','-preset','ultrafast','-threads','2'])
     command+=['-bf','0','-g','30','-pix_fmt','yuv420p','-r',str(rate),
         '-c:a','copy','-video_track_timescale',str(rate.numerator),'-movflags','+faststart','-n',str(temporary)]
     def live(event=None):
@@ -88,7 +91,7 @@ def render(base_movie, effects, output, *, ffmpeg='ffmpeg', maximum_seconds=240.
             raise TimeoutError('single wardrobe delivery allowance exhausted')
         if any(sparse.file_identity(p)!=i for p,i in zip(paths,identities,strict=True)):
             raise OSError('bound wardrobe inputs changed')
-        if shutil.disk_usage(output.parent).free<768*2**20:
+        if shutil.disk_usage(output.parent).free<reserve_bytes:
             raise OSError('wardrobe delivery storage reserve exhausted')
         if event is not None:progress(event)
     live()
@@ -113,7 +116,8 @@ def render(base_movie, effects, output, *, ffmpeg='ffmpeg', maximum_seconds=240.
         camera_programme_reselected=False,audio_stream_copied=True,
         audio_packet_payloads_and_timestamps_preserved=True,full_AV_decode_exit_code=0,
         unaffected_video_reencoded_once=True,normal_speed_audio_playback_performed=False,
-        professional_quality_approved=False)
+        professional_quality_approved=False,storage_reserve_bytes=reserve_bytes,
+        video_bitrate=video_bitrate if video_codec=='h264_videotoolbox' else None)
     if output.exists():raise FileExistsError('a viewing result appeared during wardrobe encoding')
     with output.with_suffix('.wardrobe-effects.json').open('x') as f:json.dump(receipt,f,indent=2,allow_nan=False)
     temporary.replace(output)

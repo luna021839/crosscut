@@ -21,6 +21,7 @@ def test_actual_patch_frame_bounds_and_duration(tmp_path,edge):
         ffmpeg=ffmpeg,maximum_seconds=20.,video_codec='libx264')
     assert result['output_frames']==20 and result['source_NN']==0
     assert result['audio_packet_payloads_and_timestamps_preserved']
+    assert result['storage_reserve_bytes']==768*2**20
     raw=subprocess.run([ffmpeg,'-v','error','-i',str(out),'-an','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],
         capture_output=True,check=True,timeout=10.)
     frames=np.frombuffer(raw.stdout,np.uint8).reshape(20,90,160,3)
@@ -33,3 +34,9 @@ def test_actual_patch_frame_bounds_and_duration(tmp_path,edge):
     assert not (tmp_path/'.result.encoding.mp4').exists()
     with pytest.raises(FileExistsError):
         render(base,[dict(movie=str(patch),first_frame=7,frame_count=5)],out,ffmpeg=ffmpeg)
+
+
+@pytest.mark.parametrize('option',[dict(reserve_bytes=0),dict(reserve_bytes=256*2**20-1),
+    dict(video_bitrate=0),dict(video_bitrate=80_000_001)])
+def test_explicit_low_storage_settings_are_still_bounded(tmp_path,option):
+    with pytest.raises(ValueError):render(tmp_path/'base',[],tmp_path/'new.mp4',**option)
