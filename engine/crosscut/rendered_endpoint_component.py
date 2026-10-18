@@ -7,18 +7,23 @@ of detector box padding and neighboring people's aggregate silhouette.
 from dataclasses import dataclass
 import math
 
-from .render import (FACE_DISSOLVE_ALPHA_CURVE, _FACE_DISSOLVE_LOGISTIC_ENDPOINT,
+from .render import (FACE_DISSOLVE_ALPHA_CURVE, FACE_DISSOLVE_ALPHA_CURVES,
+                     FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE, _FACE_DISSOLVE_LOGISTIC_ENDPOINT,
                      _FACE_DISSOLVE_LOGISTIC_SPAN)
 from .rendered_body_reference import RenderedBodyMeasurement
 from .timeline import _upper_body_shape_mismatch
 
 
-def incoming_dissolve_weight(relative_frame, frame_count):
+def incoming_dissolve_weight(relative_frame, frame_count, *, alpha_curve=FACE_DISSOLVE_ALPHA_CURVE):
     if (isinstance(relative_frame,bool) or not isinstance(relative_frame,int) or
             isinstance(frame_count,bool) or not isinstance(frame_count,int) or
             frame_count<3 or not 0<=relative_frame<=frame_count):
         raise ValueError('dissolve weight requires exact bounded output frames')
     p=1-relative_frame/frame_count
+    if alpha_curve not in FACE_DISSOLVE_ALPHA_CURVES:
+        raise ValueError('unknown face dissolve alpha curve')
+    if alpha_curve == FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE:
+        return 1.-p*p*(3.-2.*p)
     return min(1.,max(0.,1.-(1./(1.+math.exp(-12*(p-.5)))-_FACE_DISSOLVE_LOGISTIC_ENDPOINT)/_FACE_DISSOLVE_LOGISTIC_SPAN))
 
 
@@ -35,20 +40,20 @@ def endpoint_component_clocks(spans, transitions, boundary_index, label):
         raise ValueError('invalid endpoint component boundary')
     transition=transitions[boundary_index]
     count=transition.get('frame_count')
-    if (transition.get('kind')!='face_dissolve' or transition.get('alpha_curve')!=FACE_DISSOLVE_ALPHA_CURVE
+    if (transition.get('kind')!='face_dissolve' or transition.get('alpha_curve') not in FACE_DISSOLVE_ALPHA_CURVES
             or isinstance(count,bool) or not isinstance(count,int) or count<3):
         return None
     left,right=spans[boundary_index:boundary_index+2]
     if left.source_index==right.source_index or right.end_frame-right.start_frame<=count:
         return None
     if label=='effect_exit':
-        return ((right.start_frame+count-1,right,count-1,incoming_dissolve_weight(count-1,count)),
+        return ((right.start_frame+count-1,right,count-1,incoming_dissolve_weight(count-1,count,alpha_curve=transition['alpha_curve'])),
                 (right.start_frame+count,right,count,1.))
     if left.end_frame-left.start_frame<=left.incoming_transition_frames:
         return None
     handle=replace(left,source_start=left.source_start+left.duration*left.source_rate)
     return ((right.start_frame-1,left,left.end_frame-left.start_frame-1,1.),
-            (right.start_frame,handle,0,1.-incoming_dissolve_weight(0,count)))
+            (right.start_frame,handle,0,1.-incoming_dissolve_weight(0,count,alpha_curve=transition['alpha_curve'])))
 
 
 @dataclass(frozen=True)

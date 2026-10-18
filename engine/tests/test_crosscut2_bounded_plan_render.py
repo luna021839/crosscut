@@ -10,6 +10,7 @@ import pytest
 
 from crosscut.ive import AspectRatio
 from crosscut.render import (RenderPlan,RenderSegment,RenderTransition,TransitionKind,
+    FACE_DISSOLVE_ALPHA_CURVE, FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE, face_dissolve_xfade_expression,
     PanCropTrack,PanCropKeyframe,NormalizedCrop,EditorialTransformTrack,EditorialTransformKeyframe)
 from crosscut.rendered_endpoint_component import incoming_dissolve_weight
 from crosscut2.bounded_plan_render import outgoing_handle,blend_graph,render,nominal_schedules,verified_source_clocks
@@ -82,7 +83,24 @@ def test_real_logistic_blend_pixels_follow_the_production_alpha_curve(tmp_path):
     assert actual[0]==0 and np.all(np.diff(actual)>0)
 
 
-def test_real_sequential_render_keeps_overlap_duration_audio_and_exact_packet_grid(tmp_path):
+def test_real_smoothstep_pixels_have_a_visible_middle_without_changing_legacy_curve(tmp_path):
+    ffmpeg=_ffmpeg();h=8;curve=FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE
+    graph=blend_graph(30.,alpha_curve=curve).replace('__H__',str(h))
+    decoded=subprocess.run([ffmpeg,'-v','error','-f','lavfi','-i','color=black:s=160x90:r=30:d=1',
+        '-f','lavfi','-i','color=white:s=160x90:r=30:d=1','-filter_complex',graph,
+        '-map','[v]','-frames:v',str(h),'-pix_fmt','gray','-f','rawvideo','pipe:1'],
+        check=True,capture_output=True,timeout=10.)
+    actual=np.frombuffer(decoded.stdout,np.uint8).reshape(h,90,160).mean((1,2))/255.
+    expected=np.array([incoming_dissolve_weight(i,h,alpha_curve=curve) for i in range(h)])
+    np.testing.assert_allclose(actual,expected,atol=.012)
+    assert actual[0]==0 and np.all(np.diff(actual)>0)
+    assert np.sum((actual>=.15)&(actual<=.85))==5
+    assert 'exp(' not in graph and 'exp(' in blend_graph(30.)
+    assert '3-2*' in face_dissolve_xfade_expression(curve)
+
+
+@pytest.mark.parametrize('curve,overlap',[(FACE_DISSOLVE_ALPHA_CURVE,6),(FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE,8)])
+def test_real_sequential_render_keeps_overlap_duration_audio_and_exact_packet_grid(tmp_path,curve,overlap):
     ffmpeg=_ffmpeg();sources=[]
     for i,color in enumerate(('red','blue')):
         path=tmp_path/f'source-{i}.mp4';sources.append(path)
@@ -93,27 +111,30 @@ def test_real_sequential_render_keeps_overlap_duration_audio_and_exact_packet_gr
     fps=30000/1001;n=30;duration=n/fps
     plan=RenderPlan(tuple(sources),(RenderSegment(0,.1,duration,0.),
         RenderSegment(1,.2,duration,duration)),0,AspectRatio.LANDSCAPE,tmp_path/'film.mp4',
-        transitions=(RenderTransition(TransitionKind.FACE_DISSOLVE,6,reason='explicit_test_overlap'),),
+        transitions=(RenderTransition(TransitionKind.FACE_DISSOLVE,overlap,reason='explicit_test_overlap',face_dissolve_curve=curve),),
         width=160,height=90,fps=fps)
     receipt=render(plan,ffmpeg=ffmpeg,maximum_seconds=45.,reserve_bytes=256*2**20,video_codec='libx264')
     assert receipt['output_frames']==60 and receipt['full_AV_decode_exit_code']==0
     assert receipt['source_NN']==0 and receipt['own_transient_blocks_removed']
     assert receipt['frame_clock_artifact']==str(plan.output)+'.frame-clock.json'
-    bound=load_render_reference_clock(plan.output,plan.to_json(),[29,36],
+    bound=load_render_reference_clock(plan.output,plan.to_json(),[29,30+overlap],
         probe=lambda p:probe_render_frame_clock(p,ffprobe=str(Path(ffmpeg).with_name('ffprobe'))))
-    assert bound.frames[29].source_index==0 and bound.frames[36].source_index==1
+    assert bound.frames[29].source_index==0 and bound.frames[30+overlap].source_index==1
     with pytest.raises(ValueError,match='composited'):
         load_render_reference_clock(plan.output,plan.to_json(),[33])
     assert not receipt['professional_quality_approved']
     assert all(p.exists() for p in sources) and not list(tmp_path.glob('.crosscut-bounded-render-*'))
-    assert [v['output_frames'] for v in receipt['blocks']]==[30,6,24]
+    assert [v['output_frames'] for v in receipt['blocks']]==[30,overlap,30-overlap]
+    assert receipt['blocks'][1]['alpha_curve']==curve
     with pytest.raises(FileExistsError,match='never overwrites'):
         render(plan,ffmpeg=ffmpeg,video_codec='libx264')
     result=subprocess.run([ffmpeg,'-v','error','-i',str(plan.output),'-an','-pix_fmt','rgb24',
         '-f','rawvideo','pipe:1'],check=True,capture_output=True,timeout=10.)
     pixels=np.frombuffer(result.stdout,np.uint8).reshape(60,90,160,3).mean((1,2))
     assert pixels[29,0]>240 and pixels[30,0]>240 and pixels[30,2]<12
-    assert pixels[36,2]>240 and pixels[36,0]<12
+    assert pixels[30+overlap,2]>240 and pixels[30+overlap,0]<12
+    if curve==FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE:
+        assert 100<pixels[34,0]<155 and 100<pixels[34,2]<155
 
 
 def test_unsupported_effect_is_rejected_before_source_access_or_decoding(tmp_path):

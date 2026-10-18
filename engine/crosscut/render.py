@@ -952,6 +952,8 @@ MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY = (
 
 
 FACE_DISSOLVE_ALPHA_CURVE = "normalized_logistic_sigmoid_k12_v1"
+FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE = "cubic_smoothstep_v1"
+FACE_DISSOLVE_ALPHA_CURVES = frozenset({FACE_DISSOLVE_ALPHA_CURVE, FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE})
 # FFmpeg xfade exposes P=1 at the first transition frame and P=0 at the last.
 # Normalize logistic(k=12) so the first/last pictures remain exact rather than
 # retaining a faint ghost at either endpoint.  This follows the non-linear
@@ -968,6 +970,20 @@ _FACE_DISSOLVE_XFADE_EXPRESSION = (
     f"A*{_FACE_DISSOLVE_A_WEIGHT_EXPRESSION}+"
     f"B*(1-{_FACE_DISSOLVE_A_WEIGHT_EXPRESSION})"
 )
+
+
+def face_dissolve_a_weight_expression(alpha_curve=FACE_DISSOLVE_ALPHA_CURVE, *, progress="P"):
+    """One declared curve shared by production xfade and sequential blend."""
+    if not isinstance(alpha_curve, str) or alpha_curve not in FACE_DISSOLVE_ALPHA_CURVES:
+        raise ValueError("unknown face dissolve alpha curve")
+    if alpha_curve == FACE_DISSOLVE_ALPHA_CURVE:
+        return _FACE_DISSOLVE_A_WEIGHT_EXPRESSION.replace("P", progress)
+    return f"(({progress})*({progress})*(3-2*({progress})))"
+
+
+def face_dissolve_xfade_expression(alpha_curve=FACE_DISSOLVE_ALPHA_CURVE):
+    weight = face_dissolve_a_weight_expression(alpha_curve)
+    return f"A*{weight}+B*(1-{weight})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -988,6 +1004,7 @@ class RenderTransition:
     future_pose_max_mismatch: float | None = None
     future_silhouette_max_mismatch: float | None = None
     transform_overlap_authority: str | None = None
+    face_dissolve_curve: str = FACE_DISSOLVE_ALPHA_CURVE
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TransitionKind):
@@ -1002,6 +1019,9 @@ class RenderTransition:
             raise ValueError("hard cuts cannot have overlap frames")
         if self.kind.uses_overlap and self.frame_count < 3:
             raise ValueError("overlap transitions need at least three frames")
+        if (not isinstance(self.face_dissolve_curve, str) or self.face_dissolve_curve not in FACE_DISSOLVE_ALPHA_CURVES
+                or (self.kind is not TransitionKind.FACE_DISSOLVE and self.face_dissolve_curve != FACE_DISSOLVE_ALPHA_CURVE)):
+            raise ValueError("explicit known alpha curve is valid only for a face dissolve")
         if not self.reason:
             raise ValueError("transition reason cannot be blank")
         if self.transform_overlap_authority is not None and not (
@@ -1058,7 +1078,7 @@ class RenderTransition:
                 self.future_silhouette_max_mismatch
             ),
             "alpha_curve": (
-                FACE_DISSOLVE_ALPHA_CURVE
+                self.face_dissolve_curve
                 if self.kind is TransitionKind.FACE_DISSOLVE
                 else "ffmpeg_xfade_zoomin_v1"
                 if self.kind is TransitionKind.MEMBER_ZOOM_BRIDGE
@@ -2663,7 +2683,7 @@ def build_filter_graph(
             if transition.kind is TransitionKind.FACE_DISSOLVE:
                 xfade = (
                     "xfade=transition=custom:"
-                    f"expr='{_FACE_DISSOLVE_XFADE_EXPRESSION}':"
+                    f"expr='{face_dissolve_xfade_expression(transition.face_dissolve_curve)}':"
                 )
             elif transition.kind is TransitionKind.MEMBER_ZOOM_BRIDGE:
                 xfade = "xfade=transition=zoomin:"

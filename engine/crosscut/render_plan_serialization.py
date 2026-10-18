@@ -56,6 +56,11 @@ def render_plan_from_json(payload: Mapping[str, Any]) -> RenderPlan:
         args = values(cls, raw)
         args['keyframes'] = tuple(keyframe_cls(**item) for item in raw['keyframes'])
         return cls(**args)
+    def transition(raw):
+        args = values(RenderTransition, raw)
+        if raw.get('kind') == 'face_dissolve' and raw.get('alpha_curve') is not None:
+            args['face_dissolve_curve'] = raw['alpha_curve']
+        return RenderTransition(**args)
     try:
         args = values(RenderPlan, dict(payload))
         args['sources'] = tuple(Path(p) for p in payload['sources'])
@@ -65,8 +70,7 @@ def render_plan_from_json(payload: Mapping[str, Any]) -> RenderPlan:
             args['authorized_shot_video_clocks'] = tuple(shot_video_clock_from_dict(row)
                 for row in payload['authorized_shot_video_clocks'])
         args['segments'] = tuple(render_segment_from_json(raw) for raw in payload['segments'])
-        args['transitions'] = tuple(RenderTransition(**values(RenderTransition, raw))
-                                    for raw in payload['transitions'])
+        args['transitions'] = tuple(transition(raw) for raw in payload['transitions'])
         plan = RenderPlan(**args)
         canonical = lambda value: json.dumps(value, sort_keys=True, allow_nan=False, separators=(',', ':'))
         if canonical(plan.to_json()) != canonical(dict(payload)):

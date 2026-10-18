@@ -12,7 +12,8 @@ from crosscut.rendered_endpoint_component import (EndpointComponentFrame,Endpoin
 from crosscut.rendered_body_window import RenderedBodyWindowProvider
 from crosscut.rendered_body_reference import RenderedBodyMeasurement
 from crosscut.direct_member_rendered_continuity import evaluate_direct_member_rendered_continuity
-from crosscut.render import FACE_DISSOLVE_ALPHA_CURVE,_FACE_DISSOLVE_XFADE_EXPRESSION
+from crosscut.render import (FACE_DISSOLVE_ALPHA_CURVE,FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE,
+                            _FACE_DISSOLVE_XFADE_EXPRESSION,face_dissolve_xfade_expression)
 from engine.tests import test_rendered_body_window as body_fixture
 from engine.tests.test_direct_member_rendered_continuity import _effect_plan,_descriptor,_provider
 
@@ -156,9 +157,10 @@ class ComponentClockTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('ffmpeg'),'requires actual FFmpeg alpha proof')
     def test_formula_matches_production_expression_in_decoded_pixels(self):
         fps=29.97
-        for count in (3,7,15):
+        for curve,count in ((FACE_DISSOLVE_ALPHA_CURVE,3),(FACE_DISSOLVE_ALPHA_CURVE,7),
+                            (FACE_DISSOLVE_ALPHA_CURVE,15),(FACE_DISSOLVE_SMOOTHSTEP_ALPHA_CURVE,8)):
             graph=(f"[0:v]format=gray,settb=AVTB[a];[1:v]format=gray,settb=AVTB[b];"
-                f"[a][b]xfade=transition=custom:expr='{_FACE_DISSOLVE_XFADE_EXPRESSION}':"
+                f"[a][b]xfade=transition=custom:expr='{face_dissolve_xfade_expression(curve)}':"
                 f"duration={count/fps:.9f}:offset={30/fps:.9f},"
                 f"select='eq(n,30)+eq(n,{30+count-1})+eq(n,{30+count})'[out]")
             pixels=subprocess.run([shutil.which('ffmpeg'),'-v','error','-filter_complex_threads','1',
@@ -169,7 +171,7 @@ class ComponentClockTests(unittest.TestCase):
             self.assertEqual(len(pixels),3*256)
             for index,relative in enumerate((0,count-1,count)):
                 observed=sum(pixels[index*256:(index+1)*256])/256
-                self.assertAlmostEqual(observed,255*incoming_dissolve_weight(relative,count),delta=2.,
+                self.assertAlmostEqual(observed,255*incoming_dissolve_weight(relative,count,alpha_curve=curve),delta=2.,
                     msg=f'count={count}, relative={relative}')
 
 

@@ -639,7 +639,7 @@ def evaluate_direct_member_rendered_continuity(
         component_pair=None;component_metrics=None
         if effect_endpoint_provider is not None:
             from .rendered_endpoint_component import EndpointComponentPair,incoming_dissolve_weight
-            from .render import FACE_DISSOLVE_ALPHA_CURVE
+            from .render import FACE_DISSOLVE_ALPHA_CURVES
             component_pair=effect_endpoint_provider(boundary_index,label)
             if component_pair is not None:
                 expected_frames=tuple(int(round(s.master_seconds*fps)) for s in (left,right))
@@ -651,10 +651,10 @@ def evaluate_direct_member_rendered_continuity(
                     raise ValueError('endpoint target components differ from rendered boundary')
                 transition=transitions[boundary_index]
                 count=transition.get('frame_count')
-                if (transition.get('kind')!='face_dissolve' or transition.get('alpha_curve')!=FACE_DISSOLVE_ALPHA_CURVE
+                if (transition.get('kind')!='face_dissolve' or transition.get('alpha_curve') not in FACE_DISSOLVE_ALPHA_CURVES
                         or isinstance(count,bool) or not isinstance(count,int) or count<3):
                     raise ValueError('endpoint target component has an unbound blend curve')
-                weights=(1.,1.) if label=='effect_entry' else (incoming_dissolve_weight(count-1,count),1.)
+                weights=(1.,1.) if label=='effect_entry' else (incoming_dissolve_weight(count-1,count,alpha_curve=transition['alpha_curve']),1.)
                 if any(abs(f.component_weight-w)>1e-9 for f,w in zip(component_pair.frames,weights)):
                     raise ValueError('endpoint component weights differ from renderer')
                 component_metrics=component_pair.metrics()

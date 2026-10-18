@@ -21,7 +21,7 @@ from time import monotonic
 from crosscut.render import (
     EditorialTransformKeyframe, EditorialTransformTrack, NormalizedCrop,
     TransitionKind, _base_crop_values, _video_post_clock_filters,
-    _FACE_DISSOLVE_LOGISTIC_ENDPOINT, _FACE_DISSOLVE_LOGISTIC_SPAN,
+    FACE_DISSOLVE_ALPHA_CURVE, face_dissolve_a_weight_expression,
     segment_frame_counts, _video_render_units,
 )
 from crosscut.render_frame_schedule import sampler_frame_schedule, probe_render_frame_clock, NativeFrameSchedule, FRAME_SCHEDULE_CONTRACT
@@ -94,14 +94,13 @@ def outgoing_handle(segment, *, frame_count, fps):
         outgoing_overlap_transform=None, boundary_look_track=None)
 
 
-def blend_graph(fps):
-    """Duration-neutral production logistic curve; first sample is pure A."""
+def blend_graph(fps, *, alpha_curve=FACE_DISSOLVE_ALPHA_CURVE):
+    """Duration-neutral explicit curve; first sample remains pure A."""
     rate = Fraction(fps).limit_denominator(1_001_000)
     # T is the canonical elapsed time, not blend's version-dependent N origin.
     # H is supplied as the frame budget by the caller through a substitution.
     p = f'(1-T*{rate.numerator}/{rate.denominator}/__H__)'
-    weight = (f'((1/(1+exp(-12*({p}-0.5)))-'
-        f'{_FACE_DISSOLVE_LOGISTIC_ENDPOINT:.19f})/{_FACE_DISSOLVE_LOGISTIC_SPAN:.16f})')
+    weight = face_dissolve_a_weight_expression(alpha_curve, progress=p)
     return (f'[0:v]settb={rate.denominator}/{rate.numerator},setpts=N[a];'
         f'[1:v]settb={rate.denominator}/{rate.numerator},setpts=N[b];'
         f"[a][b]blend=all_expr='A*{weight}+B*(1-{weight})',format=yuv420p[v]")
@@ -230,7 +229,7 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
                 left = source_block(handle, overlap, 0, overlap, a, lossless=True)
                 right = source_block(segment, n, 0, overlap, b, lossless=True,schedule=schedules[i])
                 effect = work / f'{i:03d}-effect.mp4'
-                graph = blend_graph(plan.fps).replace('__H__', str(overlap))
+                graph = blend_graph(plan.fps, alpha_curve=plan.transitions[i-1].face_dissolve_curve).replace('__H__', str(overlap))
                 encode([decoder, '-nostdin', '-v', 'error', '-threads', '2', '-i', str(a),
                     '-threads', '2', '-i', str(b), '-an', '-filter_complex_threads', '2',
                     '-filter_complex', graph, '-map', '[v]', *video_options(effect, overlap)], effect.stem)
