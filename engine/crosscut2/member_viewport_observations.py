@@ -8,7 +8,21 @@ from dataclasses import dataclass,field
 import numpy as np
 from crosscut.focal_selector_geometry import FocalSelectorGeometry
 from crosscut.render import NormalizedCrop
-from .aspect_viewport import project_points,_dimensions
+from .aspect_viewport import aspect_crop,project_points,_dimensions
+
+
+def face_centered_candidate(observation,*,source_size,output_size,fallback_center=(.5,.5)):
+    """One physical aspect-fill view, not a final moving-camera trajectory.
+
+    A missing face cannot become an invented target. The caller's baseline
+    center is preserved in that case. Portrait sources keep their real full
+    frame; a landscape source can pan to its actually observed member.
+    """
+    if not isinstance(observation,FocalSelectorGeometry):raise TypeError('source-bound focal geometry required')
+    center=fallback_center
+    if observation.face_bbox_xywh is not None:
+        x,_,w,_=observation.face_bbox_xywh;center=(x+w/2.,fallback_center[1])
+    return aspect_crop(source_size,output_size,center=center)
 
 
 def compose_camera(base,camera):

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from crosscut.focal_selector_geometry import FocalSelectorGeometry
 from crosscut2.aspect_viewport import aspect_crop,project_points
-from crosscut2.member_viewport_observations import project,compose_camera
+from crosscut2.member_viewport_observations import project,compose_camera,face_centered_candidate
 
 
 def observation():
@@ -57,3 +57,21 @@ def test_invalid_camera_or_output_aspect_is_not_silently_stretched_or_recentered
     with pytest.raises(ValueError,match='escapes'):compose_camera(crop,[1.,.8,.5])
     with pytest.raises(ValueError,match='physical output aspect'):
         project(observation(),crop,source_size=(3840,2160),output_size=(1920,1080))
+
+
+def test_real_member_face_gets_an_additive_landscape_pan_candidate_not_a_source_veto():
+    original=observation();size=(3840,2160);output=(1080,1920)
+    baseline=aspect_crop(size,output)
+    chosen=face_centered_candidate(original,source_size=size,output_size=output)
+    assert chosen.width==baseline.width and chosen.height==baseline.height
+    assert chosen.x>baseline.x
+    view=project(original,chosen,source_size=size,output_size=output)
+    assert view.face_visible_fraction==pytest.approx(1.)
+    assert baseline.x<chosen.x and project(original,baseline,source_size=size,output_size=output).face_visible_fraction<1.
+
+
+def test_missing_face_uses_the_declared_baseline_and_does_not_copy_a_torso_shape_target():
+    original=FocalSelectorGeometry(0,42.,None)
+    size=(3840,2160);output=(1080,1920);center=(.3,.5)
+    assert face_centered_candidate(original,source_size=size,output_size=output,fallback_center=center)==aspect_crop(size,output,center=center)
+    assert face_centered_candidate(observation(),source_size=(2160,3840),output_size=output)==aspect_crop((2160,3840),output)
