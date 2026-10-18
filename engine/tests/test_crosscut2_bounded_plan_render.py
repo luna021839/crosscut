@@ -41,6 +41,20 @@ def test_explicit_registered_handle_is_not_silently_replaced_by_a_held_camera():
     assert outgoing_handle(segment,frame_count=6,fps=30.).editorial_transform is camera
 
 
+def test_shorter_effect_keeps_the_exact_prefix_of_a_longer_registered_future_camera():
+    camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.,.5,.5),
+        EditorialTransformKeyframe(.2,1.1,.51,.5)),reason='measured_future_camera')
+    segment=RenderSegment(0,0.,2.,0.,outgoing_overlap_transform=camera)
+    short=outgoing_handle(segment,frame_count=3,fps=30.)
+    assert short.editorial_transform is not camera
+    assert short.editorial_transform.reason==camera.reason
+    assert short.editorial_transform.keyframes[-1].time_seconds==pytest.approx(.1)
+    for time in (0.,1/30,2/30,.1):
+        a,b=short.editorial_transform.evaluate(time),camera.evaluate(time)
+        np.testing.assert_allclose([a.zoom,a.center_x,a.center_y],[b.zoom,b.center_x,b.center_y],atol=1e-15)
+    assert camera.keyframes[-1].time_seconds==.2
+
+
 def test_blend_uses_elapsed_canonical_time_not_an_ambiguous_frame_counter():
     graph=blend_graph(30000/1001)
     assert 'settb=1001/30000,setpts=N' in graph and 'T*30000/1001' in graph

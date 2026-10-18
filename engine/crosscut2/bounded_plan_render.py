@@ -79,6 +79,15 @@ def outgoing_handle(segment, *, frame_count, fps):
             reason=segment.editorial_transform.reason + '_dissolve_handle_hold',
             sampling_canvas_zoom=segment.editorial_transform.sampling_canvas_zoom)
     duration = frame_count / fps
+    if transform is not None and transform.keyframes[-1].time_seconds > duration + 1e-6:
+        # A shortened effect uses the SAME prefix of its registered future
+        # camera. Do not reject it because unused later keys exceed this
+        # temporary handle, or replace it with a different final-frame hold.
+        final = transform.evaluate(duration)
+        transform = replace(transform,keyframes=tuple(
+            k for k in transform.keyframes if k.time_seconds < duration) + (
+                EditorialTransformKeyframe(duration,final.zoom,final.center_x,
+                    final.center_y,final.roll_degrees),))
     return replace(segment, source_start=segment.source_end, duration=duration,
         source_duration=duration * segment.source_playback_rate, master_start=0.,
         crop=base, pan_crop=None, editorial_transform=transform,

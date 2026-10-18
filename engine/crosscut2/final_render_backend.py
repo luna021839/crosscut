@@ -29,5 +29,6 @@ def render(plan,*,ffmpeg,video_codec,maximum_runtime_seconds,progress_callback):
         maximum_seconds=min(1800.,seconds),progress_callback=progress)
     if progress_callback is not None and last_pid is not None:
         progress_callback(dict(phase='end',pid=last_pid,frame=result['output_frames'],
-            out_time_us=round(result['output_frames']/plan.fps*1e6),decoder_concurrency=1))
+            out_time_us=round(result['output_frames']/plan.fps*1e6),decoder_concurrency=1,
+            encoder_peak_RSS_bytes=result.get('encoder_peak_RSS_bytes')))
     return video_codec
