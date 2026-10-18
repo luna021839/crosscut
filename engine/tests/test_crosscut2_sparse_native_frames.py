@@ -10,6 +10,19 @@ from crosscut2.supplementary_pose_bank import _frames as sequential
 def clock():return sparse.SeekClock(Fraction(30),1000,(0,60,120,180,240,300,360,420,480,540,600,660,720,780,840,900,960),(), 'a'*64)
 
 
+def test_seek_clock_preserves_proven_vp9_quantized_grid_basis(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    path=tmp_path/'source.mp4';path.write_bytes(b'bound vp9 fixture')
+    payload=dict(streams=[dict(codec_name='vp9',avg_frame_rate='30000/1001',r_frame_rate='30/1',
+        time_base='1/1000',start_time='0.0',nb_frames='6')],
+        packets=[dict(pts=n,duration=33,flags='K' if i==0 else '') for i,n in enumerate((0,33,67,100,133,167))])
+    monkeypatch.setattr(sparse.subprocess,'run',lambda *a,**kw:SimpleNamespace(stdout=json.dumps(payload)))
+    actual=sparse.probe(path)
+    assert actual.grid_basis=='bijective_nearest_index_presentation_grid'
+    assert actual.rate==Fraction(30000,1001) and actual.count==6
+
+
 def test_sparse_windows_include_only_bounded_local_groups_and_known_preroll():
     plan=sparse.windows([2,3,699,700,998],clock())
     assert len(plan)==3 and plan[1]==(697,702,660,(699,700))

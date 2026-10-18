@@ -12,7 +12,10 @@ from crosscut.ive import AspectRatio
 from crosscut.render import (RenderPlan,RenderSegment,RenderTransition,TransitionKind,
     PanCropTrack,PanCropKeyframe,NormalizedCrop,EditorialTransformTrack,EditorialTransformKeyframe)
 from crosscut.rendered_endpoint_component import incoming_dissolve_weight
-from crosscut2.bounded_plan_render import outgoing_handle,blend_graph,render
+from crosscut2.bounded_plan_render import outgoing_handle,blend_graph,render,nominal_schedules
+from crosscut.render_reference_clock import load_render_reference_clock
+from crosscut.render_frame_schedule import probe_render_frame_clock
+from crosscut2.sparse_native_frames import SeekClock
 
 
 def test_outgoing_overlap_uses_the_real_boundary_clock_and_final_camera_only():
@@ -81,6 +84,12 @@ def test_real_sequential_render_keeps_overlap_duration_audio_and_exact_packet_gr
     receipt=render(plan,ffmpeg=ffmpeg,maximum_seconds=45.,reserve_bytes=256*2**20,video_codec='libx264')
     assert receipt['output_frames']==60 and receipt['full_AV_decode_exit_code']==0
     assert receipt['source_NN']==0 and receipt['own_transient_blocks_removed']
+    assert receipt['frame_clock_artifact']==str(plan.output)+'.frame-clock.json'
+    bound=load_render_reference_clock(plan.output,plan.to_json(),[29,36],
+        probe=lambda p:probe_render_frame_clock(p,ffprobe=str(Path(ffmpeg).with_name('ffprobe'))))
+    assert bound.frames[29].source_index==0 and bound.frames[36].source_index==1
+    with pytest.raises(ValueError,match='composited'):
+        load_render_reference_clock(plan.output,plan.to_json(),[33])
     assert not receipt['professional_quality_approved']
     assert all(p.exists() for p in sources) and not list(tmp_path.glob('.crosscut-bounded-render-*'))
     assert [v['output_frames'] for v in receipt['blocks']]==[30,6,24]
@@ -100,3 +109,48 @@ def test_unsupported_effect_is_rejected_before_source_access_or_decoding(tmp_pat
     plan=SimpleNamespace(transitions=[SimpleNamespace(kind=TransitionKind.MEMBER_ZOOM_BRIDGE)])
     with pytest.raises(ValueError,match='only explicit hard cuts and face dissolves'):
         render(plan)
+
+
+def test_same_source_fractional_segments_share_production_sampling_origin(tmp_path):
+    plan=RenderPlan((tmp_path/'s.mp4',),(RenderSegment(0,.0143,.084,0.),
+        RenderSegment(0,.0983,.084,.084),RenderSegment(0,.021,1.,.168)),0,
+        AspectRatio.LANDSCAPE,tmp_path/'movie.mp4',width=160,height=90,fps=30.)
+    clock=SeekClock(Fraction(60),100,(0,),(),'a'*64)
+    schedules=nominal_schedules(plan,{0:clock})
+    assert schedules[0].source_frame_indices== (1,3,5)
+    assert schedules[1].source_frame_indices== (7,9)
+    assert schedules[2].source_frame_indices[0]==1
+
+
+def test_real_shared_native_clock_pixels_match_the_standard_qa_sidecar(tmp_path):
+    ffmpeg=_ffmpeg();source=tmp_path/'frame-identities.mp4'
+    frames=np.zeros((100,90,160,3),np.uint8)
+    for i in range(100):
+        for bit in range(8):frames[i,:,bit*20:(bit+1)*20]=235 if i>>bit&1 else 16
+    subprocess.run([ffmpeg,'-v','error','-f','rawvideo','-pixel_format','rgb24',
+        '-video_size','160x90','-framerate','60','-i','pipe:0',
+        '-f','lavfi','-i','anullsrc=r=48000:cl=mono','-c:v','libx264',
+        '-crf','0','-g','30','-pix_fmt','yuv420p','-c:a','aac','-shortest','-n',str(source)],
+        input=frames.tobytes(),check=True,capture_output=True,timeout=15.)
+    plan=RenderPlan((source,),(RenderSegment(0,.0143,.084,0.),
+        RenderSegment(0,.0983,.084,.084),RenderSegment(0,.021,1.,.168)),0,
+        AspectRatio.LANDSCAPE,tmp_path/'shared.mp4',width=160,height=90,fps=30.)
+    render(plan,ffmpeg=ffmpeg,maximum_seconds=45.,reserve_bytes=256*2**20,video_codec='libx264')
+    decoded=subprocess.run([ffmpeg,'-v','error','-i',str(plan.output),'-an',
+        '-pix_fmt','rgb24','-f','rawvideo','pipe:1'],capture_output=True,check=True,timeout=10.)
+    pictures=np.frombuffer(decoded.stdout,np.uint8).reshape(-1,90,160,3)
+    identities=[]
+    for frame in pictures[:6]:
+        identities.append(sum((int(frame[:,bit*20:(bit+1)*20].mean()>128)<<bit) for bit in range(8)))
+    assert identities==[1,3,5,7,9,1]
+    bound=load_render_reference_clock(plan.output,plan.to_json(),range(6),
+        probe=lambda p:probe_render_frame_clock(p,ffprobe=str(Path(ffmpeg).with_name('ffprobe'))))
+    assert identities==[bound.frames[i].native_frame_index for i in range(6)]
+
+
+def test_existing_clock_sidecar_is_never_overwritten_before_source_access(tmp_path):
+    movie=tmp_path/'movie.mp4';sidecar=movie.with_suffix('.mp4.frame-clock.json');sidecar.write_text('existing')
+    plan=RenderPlan((tmp_path/'absent.mp4',),(RenderSegment(0,0.,1.,0.),),0,
+        AspectRatio.LANDSCAPE,movie,width=160,height=90,fps=30.)
+    with pytest.raises(FileExistsError):render(plan)
+    assert sidecar.read_text()=='existing' and not movie.exists()

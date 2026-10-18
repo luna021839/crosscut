@@ -22,11 +22,32 @@ from crosscut.render import (
     EditorialTransformKeyframe, EditorialTransformTrack, NormalizedCrop,
     TransitionKind, _base_crop_values, _video_post_clock_filters,
     _FACE_DISSOLVE_LOGISTIC_ENDPOINT, _FACE_DISSOLVE_LOGISTIC_SPAN,
-    segment_frame_counts,
+    segment_frame_counts, _video_render_units,
 )
-from crosscut.render_frame_schedule import sampler_frame_schedule, VerifiedRenderFrameClock
+from crosscut.render_frame_schedule import sampler_frame_schedule, VerifiedRenderFrameClock, NativeFrameSchedule, FRAME_SCHEDULE_CONTRACT
+from crosscut.render_clock_artifact import RENDER_CLOCK_ARTIFACT_CONTRACT, render_clock_path
 from crosscut.render_process import run_observed_render
 from . import sparse_native_frames as sparse
+
+
+def nominal_schedules(plan,clocks):
+    """Keep the production shared native origin across same-source splits.
+
+    A fractional same-source split must not restart the sampler at each
+    segment's rounded local boundary. Only pixels/cameras get local clocks.
+    """
+    result={}
+    for unit in _video_render_units(plan,segment_frame_counts(plan)):
+        first,last=unit.segments[0],unit.segments[-1];clock=clocks[first.source_index]
+        rate=(unit.coalesced_segment.source_playback_rate if unit.coalesced_segment is not None else
+            (last.source_end-first.source_start)/sum(s.duration for s in unit.segments))
+        shared=sampler_frame_schedule(source_start=first.source_start,source_playback_rate=rate,
+            native_fps=float(clock.rate),output_fps=plan.fps,frame_count=unit.frame_count,
+            source_frame_count=clock.count,maximum_terminal_hold_frames=math.ceil(plan.fps))
+        offset=0
+        for index,n in enumerate(unit.segment_frame_counts,unit.first_segment_index):
+            result[index]=NativeFrameSchedule(shared.source_frame_indices[offset:offset+n]);offset+=n
+    return result
 
 
 def outgoing_handle(segment, *, frame_count, fps):
@@ -78,7 +99,8 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
     if video_codec not in ('h264_videotoolbox', 'libx264'):
         raise ValueError('explicit hardware or software H264 encoder required; no automatic retry')
     movie = Path(plan.output)
-    if movie.exists():
+    clock_path=render_clock_path(movie)
+    if movie.exists() or clock_path.exists():
         raise FileExistsError('bounded renderer never overwrites an existing movie')
     movie.parent.mkdir(parents=True, exist_ok=True)
     identities = tuple(sparse.file_identity(p) for p in plan.sources)
@@ -123,7 +145,10 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
         codec = ['-c:v', 'ffv1', '-level', '3', '-g', '1', '-threads', '2'] if lossless else [
             '-c:v', video_codec,
             *(['-preset', 'fast', '-crf', '16'] if video_codec == 'libx264' else ['-b:v', '24M']),
-            '-maxrate', '36M', '-bufsize', '48M', '-profile:v', 'high', '-threads', '2']
+            # Independent tiny blocks can have different B-frame reorder
+            # delays. Zero reorder keeps concat DTS and presentation ticks
+            # identical even for a two-frame pure tail beside a long shot.
+            '-bf', '0', '-maxrate', '36M', '-bufsize', '48M', '-profile:v', 'high', '-threads', '2']
         return ['-frames:v', str(n), *codec, '-pix_fmt', 'yuv420p', '-r', str(rate),
             '-fps_mode:v', 'cfr', '-enc_time_base:v', str(1/rate),
             *([] if lossless else ['-video_track_timescale', str(rate.numerator), '-movflags', '+faststart']),
@@ -138,11 +163,12 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
         if int(actual['nb_read_packets']) != n or (actual['width'], actual['height']) != (plan.width, plan.height):
             raise ValueError('bounded render block changed output geometry or frame budget')
 
-    def source_block(segment, nominal_count, begin, end, path, *, lossless=False):
+    def source_block(segment, nominal_count, begin, end, path, *, lossless=False, schedule=None):
         clock = clocks[segment.source_index]
-        schedule = sampler_frame_schedule(source_start=segment.source_start,
-            source_playback_rate=segment.source_playback_rate, native_fps=float(clock.rate),
-            output_fps=plan.fps, frame_count=nominal_count, source_frame_count=clock.count)
+        if schedule is None:
+            schedule = sampler_frame_schedule(source_start=segment.source_start,
+                source_playback_rate=segment.source_playback_rate, native_fps=float(clock.rate),
+                output_fps=plan.fps, frame_count=nominal_count, source_frame_count=clock.count)
         first, last = schedule.source_frame_indices[0], schedule.source_frame_indices[end-1]
         key = clock.keyframes[bisect_right(clock.keyframes, first)-1]
         chain = [f"select='between(round(t*{float(clock.rate):.17g}),{key},{min(clock.count-1,last+2)})'"]
@@ -168,15 +194,17 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
         for s in sorted({v.source_index for v in plan.segments}):
             clocks[s] = sparse.probe(plan.sources[s], check=live)
         from crosscut.shot_video_clock import validate_shot_video_clock_bindings
-        validate_shot_video_clock_bindings(plan, frame_clocks={s: VerifiedRenderFrameClock(
-            clock.rate, clock.count, clock.packet_digest) for s, clock in clocks.items()})
+        verified={s: VerifiedRenderFrameClock(clock.rate,clock.count,clock.packet_digest,clock.grid_basis)
+            for s,clock in clocks.items()}
+        validate_shot_video_clock_bindings(plan, frame_clocks=verified)
+        schedules=nominal_schedules(plan,clocks)
         for i, (segment, n) in enumerate(zip(plan.segments, counts, strict=True)):
             overlap = plan.transitions[i-1].frame_count if i else 0
             if overlap:
                 a = work / f'{i:03d}-outgoing.mkv'; b = work / f'{i:03d}-incoming.mkv'
                 handle = outgoing_handle(plan.segments[i-1], frame_count=overlap, fps=plan.fps)
                 left = source_block(handle, overlap, 0, overlap, a, lossless=True)
-                right = source_block(segment, n, 0, overlap, b, lossless=True)
+                right = source_block(segment, n, 0, overlap, b, lossless=True,schedule=schedules[i])
                 effect = work / f'{i:03d}-effect.mp4'
                 graph = blend_graph(plan.fps).replace('__H__', str(overlap))
                 encode([decoder, '-nostdin', '-v', 'error', '-threads', '2', '-i', str(a),
@@ -188,7 +216,7 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
                 a.unlink(); b.unlink()
             if overlap < n:
                 pure = work / f'{i:03d}-pure.mp4'
-                binding = source_block(segment, n, overlap, n, pure)
+                binding = source_block(segment, n, overlap, n, pure,schedule=schedules[i])
                 blocks.append(pure); details.append(dict(kind='pure', segment=i, output_frames=n-overlap, **binding))
             progress_callback(dict(phase='bounded_segment_complete', completed=i+1, total=len(counts),
                 elapsed_seconds=monotonic()-started, bounded_encoder_peak_RSS_bytes=peak))
@@ -210,14 +238,24 @@ def render(plan, *, ffmpeg='ffmpeg', maximum_seconds=660., check=lambda: None,
         if validation.returncode or validation.stderr:
             raise ValueError('bounded complete film failed video/audio decode')
         live()
-        if movie.exists():raise FileExistsError('bounded output appeared during encoding')
+        if movie.exists() or clock_path.exists():raise FileExistsError('bounded output appeared during encoding')
         with output.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         size = output.stat().st_size
+        clock_payload=dict(artifact_contract=RENDER_CLOCK_ARTIFACT_CONTRACT,contract=FRAME_SCHEDULE_CONTRACT,
+            enabled=True,source_clocks={str(s):c.to_dict() for s,c in verified.items()},
+            timestamp_fallback_source_indices=[],plan=plan.to_json(),quality_approval=False,
+            video_content_sha256=digest,backend='sequential_native_clock_blocks_v1',
+            resource_policy=dict(decoder_concurrency=1,automatic_codec_retry=False),blocks=details)
+        clock_output=work/'frame-clock.json'
+        with clock_output.open('x') as stream:json.dump(clock_payload,stream,indent=2,allow_nan=False)
+        live()
+        os.replace(clock_output,clock_path)
         os.replace(output, movie); success = True
         return dict(movie=str(movie), movie_sha256=digest, movie_bytes=size, blocks=details,
             elapsed_seconds=monotonic()-started, encoder_peak_RSS_bytes=peak,
             source_NN=0, output_frames=final.count, full_AV_decode_exit_code=0,
+            frame_clock_artifact=str(clock_path),frame_clock_contract=RENDER_CLOCK_ARTIFACT_CONTRACT,
             source_file_identities=identities, exact_sampler_used=True,
             canonical_source_handle_time_preserved=True, normal_speed_audio_playback_performed=False,
             professional_quality_approved=False, own_transient_blocks_removed=True)
