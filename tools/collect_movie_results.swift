@@ -16,10 +16,18 @@ guard Set(preferred.map(\.lastPathComponent)).count == preferred.count else { th
 try manager.createDirectory(at: destination, withIntermediateDirectories: true)
 try manager.createDirectory(at: previous, withIntermediateDirectories: true)
 
-func alias(_ source: URL, in directory: URL) throws {
+func alias(_ source: URL, in directory: URL, honorRenamedAliases: Bool = false) throws {
     let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isAliasFileKey, .isSymbolicLinkKey])
     guard values.isRegularFile == true, values.isAliasFile != true, values.isSymbolicLink != true,
           source.pathExtension.lowercased() == "mp4" else { throw CollectionError.unsafeTarget(source.path) }
+    if honorRenamedAliases {
+        let entries = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isAliasFileKey], options: [.skipsHiddenFiles])
+        for entry in entries where (try entry.resourceValues(forKeys: [.isAliasFileKey])).isAliasFile == true {
+            if try URL(resolvingAliasFileAt: entry, options: [.withoutUI, .withoutMounting]).standardizedFileURL == source {
+                return
+            }
+        }
+    }
     let output = directory.appendingPathComponent(source.lastPathComponent)
     if manager.fileExists(atPath: output.path) {
         let existing = try output.resourceValues(forKeys: [.isAliasFileKey])
@@ -36,7 +44,7 @@ func alias(_ source: URL, in directory: URL) throws {
     }
 }
 
-for source in preferred { try alias(source, in: destination) }
+for source in preferred { try alias(source, in: destination, honorRenamedAliases: true) }
 var count = 0
 for root in roots {
     let files = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
