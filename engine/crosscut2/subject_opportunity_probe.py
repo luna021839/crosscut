@@ -237,6 +237,7 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
                         states=[r['observation']['state'] for r in rows],measurement=proof))
                 catalogues[s].observed_image_records=tuple(rows)
         return dict(contract='bounded_preselection_fixed_opportunity_subject_probe_v1',centres=len(selected),new_windows=windows,
+            camera_domain_subject_bindings_changed=any(bool(group) for group in new),
             endpoint_availability_before=initial_availability,
             endpoint_availability_after=endpoint_availability(catalogues,selected),
             maximum_centres=maximum_centres,maximum_new_windows=2*maximum_centres,maximum_seconds=maximum_seconds,
@@ -252,4 +253,8 @@ def observer(specification,*,sources,source_hashes,identities,cache,authorized_r
             image_changes_observed_on_same_preselection_centres=bool(image_changes),
             image_observation_receipts=image_receipts,image_measurements_share_original_budget=True,
             explicit_array_peak_bytes=budget.peak_array_bytes,total_process_RSS_not_certified=True)
+    # Port inputs change only by REPLACING subject bindings. Interval image
+    # records are consumed later, not by camera enumeration. Change/remove
+    # this contract if future probing mutates any other port input.
+    run.camera_domain_update_contract='replace_subject_bindings_and_interval_images_v1'
     return run

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import numpy as np
+import pytest
 from crosscut2.subject_opportunity_probe import candidates,observation_limits,observer,provisional_candidates,endpoint_availability
 
 
@@ -156,3 +157,54 @@ def test_opportunity_observer_finishes_before_final_domain_and_actual_costs(monk
     result=module.select(*args,**kw,native_ports=native,music=[0,1,1,0],
         prior=module.PlayedPosePortPrior(editorial_opportunities=True),opportunity_observer=observed)
     assert result[4]['opportunity_subject_observations']['fixture_only']
+
+
+@pytest.mark.parametrize('played',[False,True])
+def test_image_only_probe_keeps_identical_programme_with_one_camera_preparation(monkeypatch,played):
+    from crosscut2 import played_pose_port_programme as module
+    from test_crosscut2_preference_integration import producer
+    from test_crosscut2_played_interval_utility import image_pair
+    from crosscut2.dense_subject_catalogue import DenseSubjects
+    args,kw,native,_,_,_=producer(opposed=False,one_arm=True)
+    nodes,banks,_,_=args
+    if played:
+        for bank in banks:
+            bank['programme_render_clock']=dict(fps=30.,count=int(nodes[-1]),source_times=nodes/30.)
+    subjects=[DenseSubjects(source=s,binding=str(s),indices=np.clip(nodes[:,None]+np.arange(-7,7),0,nodes[-1]-1),
+        windows=[],bank=bank,fps=30.) for s,bank in enumerate(banks)]
+    calls=[];old_make=module.make
+    def make(*args,**kw):
+        calls.append('domain');return old_make(*args,**kw)
+    def observed(**kw):
+        for cat in kw['catalogues']:
+            cat.observed_image_records=(dict(image_pair(59,60,dx=.02),source_sha256=cat.subjects.binding),)
+        return dict(contract='bounded_preselection_fixed_opportunity_subject_probe_v1',
+            camera_domain_subject_bindings_changed=False,source_NN_calls=0)
+    monkeypatch.setattr(module,'make',make)
+    prior=module.PlayedPosePortPrior(editorial_opportunities=True,played_interval_utility=played)
+    old=module.select(*args,**kw,native_ports=native,music=[0,1,1,0],prior=prior,opportunity_observer=observed,subjects=subjects)
+    assert len(calls)==2 and not old[4]['camera_domain_reused_after_image_only_probe']
+    calls.clear()
+    observed.camera_domain_update_contract='replace_subject_bindings_and_interval_images_v1'
+    new=module.select(*args,**kw,native_ports=native,music=[0,1,1,0],prior=prior,opportunity_observer=observed,subjects=subjects)
+    assert len(calls)==1 and new[4]['camera_domain_reused_after_image_only_probe']
+    assert old[0]==new[0] and old[1]==new[1] and old[3]==new[3]
+    for a,b in zip(old[2],new[2]):
+        np.testing.assert_array_equal(a['curve'],b['curve'])
+
+
+def test_zero_neural_calls_does_not_skip_newly_loaded_subject_windows():
+    from crosscut2.played_pose_port_programme import probe_preserves_camera_domain
+    def observed(**kwargs):pass
+    observed.camera_domain_update_contract='replace_subject_bindings_and_interval_images_v1'
+    subjects=[object(),object()];cats=[SimpleNamespace(subjects=v) for v in subjects]
+    proof=dict(contract='bounded_preselection_fixed_opportunity_subject_probe_v1',
+        camera_domain_subject_bindings_changed=False,source_NN_calls=0)
+    assert probe_preserves_camera_domain(observed,subjects,cats,proof)
+    cats[0].subjects=object()
+    assert not probe_preserves_camera_domain(observed,subjects,cats,proof)
+    cats[0].subjects=subjects[0]
+    assert not probe_preserves_camera_domain(observed,subjects,cats,dict(proof,camera_domain_subject_bindings_changed=True))
+    assert not probe_preserves_camera_domain(observed,subjects,cats,dict(proof,camera_domain_subject_bindings_changed=None))
+    del observed.camera_domain_update_contract
+    assert not probe_preserves_camera_domain(observed,subjects,cats,proof)

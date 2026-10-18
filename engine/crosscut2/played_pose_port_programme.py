@@ -296,6 +296,21 @@ class SelectedPorts:
     def selected(self,n,left,right):return dict(self.details[n,left,right])
 
 
+def probe_preserves_camera_domain(observer,before,catalogues,receipt):
+    """Only the built-in replacement-only callback can skip re-enumeration.
+
+    Zero neural calls alone proves nothing: a newly reused window can still
+    change pruning. Image-only records, however, belong to interval scoring.
+    Unknown/custom callbacks and any replaced subject binding still rebuild.
+    """
+    return (getattr(observer,'camera_domain_update_contract',None)
+        =='replace_subject_bindings_and_interval_images_v1'
+        and receipt.get('contract')=='bounded_preselection_fixed_opportunity_subject_probe_v1'
+        and receipt.get('camera_domain_subject_bindings_changed') is False
+        and len(before)==len(catalogues)
+        and all(old is cat.subjects for old,cat in zip(before,catalogues)))
+
+
 def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports,music,prior,
            identity_hints=None,part_observer=None,person_observer=None,subjects=None,opportunity_observer=None,
            check=lambda:None,maximum_preparation_seconds=240.,maximum_seconds=180.,
@@ -419,19 +434,23 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
+        before_subjects=tuple(cat.subjects for cat in cats)
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
-        # The final camera/actor pruning must see the NEW raw observations.
-        # Nothing has been selected yet; do not patch an old chosen movie.
-        from .editorial_opportunities import Opportunities
-        opportunities=Opportunities(nodes,music,fps=fps,
-            families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
-        entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
-            coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
-            source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
-            detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
-            appearance_weight=getattr(prior,'appearance_weight',1.),
-            body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress,
-            sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
+        reuse=probe_preserves_camera_domain(opportunity_observer,before_subjects,cats,receipt['opportunity_subject_observations'])
+        receipt['camera_domain_reused_after_image_only_probe']=reuse
+        if not reuse:
+            # New raw windows (including cache hits) must reach final pruning.
+            # Nothing is selected yet; no chosen movie is being patched.
+            from .editorial_opportunities import Opportunities
+            opportunities=Opportunities(nodes,music,fps=fps,
+                families=[b.get('consensus_family',('source',s)) for s,b in enumerate(banks)],beat_frames=music_event_frames)
+            entries,exits,dense,domain=make(nodes,cats,paths,fps=fps,check=live,opportunities=opportunities,roles=roles,
+                coalesce_static_ports=sequence,recycle_static_capacity=getattr(prior,'recycle_static_capacity',False),articulated_actions=played,
+                source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
+                detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
+                appearance_weight=getattr(prior,'appearance_weight',1.),
+                body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress,
+                sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
