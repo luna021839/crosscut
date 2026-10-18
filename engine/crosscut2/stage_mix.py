@@ -38,6 +38,24 @@ def load_warps(manifest):
         for raw in manifest['local_timewarps'])
 
 
+def selection_runtime_limit(*,paired_cameras,played_intervals,explicit_seconds=None):
+    """One finite numeric solve, separate from perception and render budgets.
+
+    Completed394-node eight-source paired solves take504..563s including
+    preparation. The old fixed300s selection ceiling could abort useful
+    larger domains. A900s ceiling permits this work; it is not a retry,
+    minimum wait, speed improvement, or a change to the editing objective.
+    """
+    if type(paired_cameras) is not bool or type(played_intervals) is not bool:
+        raise ValueError('explicit paired-camera and played-interval modes required')
+    if explicit_seconds is not None:
+        if (type(explicit_seconds) not in (int,float) or not math.isfinite(explicit_seconds)
+                or not 1<=explicit_seconds<=1200):
+            raise ValueError('finite selection allowance in1..1200seconds required')
+        return float(explicit_seconds)
+    return 900. if paired_cameras and played_intervals else 300. if paired_cameras else 180.
+
+
 def editing_grid(*, duration_frames, fps, master_start, beats, warps, source_cuts):
     # Native source cuts contribute candidates; near-duplicates are quantized
     # once, with beat locations taking priority. Never import old/manual edits.
@@ -343,7 +361,9 @@ def main():
     parser.add_argument('--visible-shot-duration-model',type=Path,
         help='Explicit TRAIN-only soft visible-shot duration distribution; requires E6, not app/default activation')
     parser.add_argument('--retain-pair-cameras',action='store_true',
-        help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair; allow300s interval selection')
+        help='Explicit finite endpoint expansion: retain up to four existing cameras per primary actor pair')
+    parser.add_argument('--maximum-selection-seconds',type=float,
+        help='One numeric solve allowance1..1200s, no retries; default900s for E6 paired intervals, otherwise unchanged')
     parser.add_argument('--body-camera-proposals',action='store_true',
         help='Add an actual face/arm similarity-fit camera option before DP, retaining old cameras; no post-fit')
     parser.add_argument('--focal-image-motion',action='store_true',
@@ -392,6 +412,10 @@ def main():
     parser.add_argument('--preview-height', type=int, choices=(540, 1080), default=540)
     parser.add_argument('--maximum-perception-seconds', type=float, default=900.)
     args = parser.parse_args()
+    selection_seconds=selection_runtime_limit(paired_cameras=args.retain_pair_cameras,
+        played_intervals=args.played_interval_utility,explicit_seconds=args.maximum_selection_seconds)
+    if args.maximum_selection_seconds is not None and not args.joint_motion_event_seconds:
+        raise ValueError('Explicit selection allowance requires the joint motion-event programme consumer')
     from .subject_opportunity_probe import observation_limits
     observation_limits(args.opportunity_observation_centres,args.maximum_opportunity_perception_seconds)
     if ((args.opportunity_observation_centres!=12 or args.maximum_opportunity_perception_seconds!=180.)
@@ -765,7 +789,7 @@ def main():
             runs,states,data,score,fixed_receipt,event_ports=select(nodes,banks,poses,style,fps=original.fps,
                 source_events=source_events,body_states=body_states,native_ports=native_ports,music=music_strengths,check=check,
                 identity_hints=identity_hints,part_observer=part_observer,preference_model=preference_model,
-                maximum_seconds=300. if args.retain_pair_cameras else 180.,
+                maximum_seconds=selection_seconds,
                 maximum_preparation_seconds=240.+(args.maximum_opportunity_perception_seconds
                     if args.opportunity_subject_spec is not None else 0.),
                 preference_workspace=args.cache.parent/'crosscut2-transient-preference',connection_prior=connection_prior,
@@ -782,6 +806,7 @@ def main():
             fixed_receipt['recurrent_local_member_hints']=identity_receipts
             fixed_receipt['direct_native_face_observations']=direct_face_receipt
             fixed_receipt['sparse_face_endpoint_completion']=face_completion
+            fixed_receipt['selection_runtime_limit_seconds']=selection_seconds
             fixed_receipt['selected_clock_check']=check_selected_clock(plan,nodes,runs,states,banks,data=data,
                 native_ports=native_ports,check=check)
             if args.common_evidence_connection_prior or args.played_face_connection_prior or args.played_pose_port_camera_prior:
