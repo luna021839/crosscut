@@ -107,6 +107,7 @@ def features(observations, *, fps, person_extents=False, focal_motion=False,deta
     physical &= clocks[:, 1] > clocks[:, 0]
     result=dict(heads=heads, center=center, height=height, seen=seen, xy=xy, unit=unit,
         endpoint=at, kind=kind, ambiguous=ambiguous, physical=physical, fps=fps,
+        joint_kind=np.where(valid,evidence,UNMEASURED),joint_ambiguous=ambiguity,
         endpoint_cameras=endpoint_camera,
         dense_subject_contexts=[o.get('dense_subject_context') for o in observations],
         independent_full_image_body_context=np.asarray([o.get('original_full_image_people_used',False) for o in observations],bool),

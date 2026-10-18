@@ -139,3 +139,67 @@ def test_both_wholly_hidden_arm_has_no_added_visual_cost_but_no_false_match_cred
     after=compare(features([a],fps=30.),features([b],fps=30.))
     assert after['sparse_arm_contradiction_relative_cost'][0,0]==0.
     assert after['sparse_arm_action_credit_cap'][0,0]==0.
+
+
+def displaced_arm_pair():
+    a,b,_,_=pair()
+    # Translate only the left arm: every bone direction and the face match.
+    b['body'][:,[0,2,4],0]+=.3
+    return a,b
+
+
+def test_parallel_arm_position_jump_is_not_hidden_by_matching_face_and_directions():
+    a,b=displaced_arm_pair()
+    value=matrix(features([a],fps=30.,sparse_arm_contradictions=True),
+        features([b],fps=30.,sparse_arm_contradictions=True),details=True)
+    assert value['geometry_rate'][0,0]==0.
+    assert value['sparse_arm_direction_residual'][0,0]==pytest.approx(0.)
+    assert value['sparse_arm_position_face_heights'][0,0]==pytest.approx(.3*(16/9)/.25)
+    assert value['sparse_arm_position_relative_cost'][0,0]>.08
+    assert value['sparse_arm_action_credit_cap'][0,0]==0.
+    assert value['allowed'][0,0]
+
+
+@pytest.mark.parametrize('unknown',['missing','contradicted','ambiguous','outside','not_original','no_face'])
+def test_unobserved_position_never_invents_a_parallel_arm_jump(unknown):
+    a,b=displaced_arm_pair()
+    if unknown=='missing':b['evidence'][:,[0,2,4]]=0
+    if unknown=='contradicted':b['evidence'][:,[0,2,4]]=3
+    if unknown=='ambiguous':b['ownership_ambiguity'][:,[0,2,4]]=True
+    if unknown=='outside':b['body'][:,[0,2,4],0]=1.1
+    if unknown=='not_original':b['original_full_image_people_used']=False
+    if unknown=='no_face':b['head'][3]=.1
+    value=compare(features([a],fps=30.),features([b],fps=30.))
+    assert value['sparse_arm_position_relative_cost'][0,0]==0.
+    assert value['sparse_arm_position_action_credit_cap'][0,0]==pytest.approx(1.)
+
+
+def test_position_symmetry_scale_invariance_and_independent_candidate_pairs():
+    a,b=displaced_arm_pair();good=copy.deepcopy(a);good['side']=1
+    left=features([a],fps=30.);right=features([b,good],fps=30.)
+    first=compare(left,right);reverse=compare(right,left)
+    np.testing.assert_allclose(first['sparse_arm_position_relative_cost'],reverse['sparse_arm_position_relative_cost'].T)
+    assert first['sparse_arm_position_relative_cost'][0,0]>.08
+    assert first['sparse_arm_position_relative_cost'][0,1]==0.
+    for o in (a,b):o['camera_strip'][:]=[1.3,.5,.5]
+    after=compare(features([a],fps=30.),features([b],fps=30.))
+    assert after['sparse_arm_position_face_heights'][0,0]==pytest.approx(
+        first['sparse_arm_position_face_heights'][0,0])
+
+
+def test_crop_cannot_make_a_known_displaced_arm_earn_match_credit():
+    a,b=displaced_arm_pair()
+    # All measured joints end up off-screen on both sides.
+    for o in (a,b):o['camera_strip'][:]=[6.,.95,.95]
+    after=compare(features([a],fps=30.),features([b],fps=30.))
+    assert not after['sparse_arm_joints_measured'].any()
+    assert after['sparse_arm_position_relative_cost'][0,0]==0.
+    assert after['sparse_arm_position_action_credit_cap'][0,0]==0.
+
+
+def test_partial_known_shoulder_still_measured_without_inventing_wrist_or_bone():
+    a,b=displaced_arm_pair()
+    for o in (a,b):o['evidence'][:,[2,4]]=0
+    value=compare(features([a],fps=30.),features([b],fps=30.))
+    assert value['sparse_arm_joints_measured'][0,0].tolist()==[True,True,False,True,False,True]
+    assert value['sparse_arm_position_relative_cost'][0,0]>.08

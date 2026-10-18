@@ -150,7 +150,7 @@ class PlayedPosePortPrior:
             endpoint_readability_unit='six_output_frames_times_worst_original_ROI_deficit_UNKNOWN_.5',
             endpoint_readability_changes_source_or_cut_admission=False,
             sparse_visible_arm_contradictions=self.sparse_arm_contradictions,
-            sparse_arm_cost='six_output_frames_times_worst_visible_bone_MODEL_ONLY_excess_over_UNKNOWN_.5',
+            sparse_arm_cost='six_output_frames_times_max_visible_bone_direction_or_joint_position_MODEL_ONLY_excess_over_UNKNOWN_.5',
             sparse_arm_scoring_changes_source_or_cut_admission=False,
             direct_face_risk=('equal_independent128D_and512D_cosine_risk_without_duplicate_gallery_vote'
                 if self.direct_face_appearance else None),
@@ -725,6 +725,9 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 sparse_arm_direction_residual=(float(detail['sparse_arm_direction_residual'][0,0])
                     if detail.get('sparse_arm_direction_measured',np.zeros((1,1),bool))[0,0] else None),
                 sparse_arm_contradiction_relative_cost=float(detail.get('sparse_arm_contradiction_relative_cost',np.zeros((1,1)))[0,0]),
+                sparse_arm_position_face_heights=float(detail.get('sparse_arm_position_face_heights',np.zeros((1,1)))[0,0]),
+                sparse_arm_position_relative_cost=float(detail.get('sparse_arm_position_relative_cost',np.zeros((1,1)))[0,0]),
+                sparse_arm_position_measured=bool(detail.get('sparse_arm_joints_measured',np.zeros((1,1,6),bool))[0,0].any()),
                 endpoint_readability_rate=float(detail['endpoint_readability_rate'][0,0]),
                 endpoint_readability_measured=bool(detail['endpoint_readability_measured'][0,0]),
                 actual_arm_direction_used=bool(detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0]),
