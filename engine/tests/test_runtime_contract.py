@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from crosscut.runtime_contract import runtime_contract_report, version_at_least
+from crosscut.runtime_contract import _final_programme_renderer_status
 
 
 def _module(version: str, *, ready: bool = True) -> dict[str, object]:
@@ -22,6 +23,10 @@ class RuntimeContractTests(unittest.TestCase):
         probe = patch("crosscut.runtime_contract._stage_edit_generation_status", return_value={})
         probe.start()
         self.addCleanup(probe.stop)
+        renderer = patch("crosscut.runtime_contract._final_programme_renderer_status",
+                         return_value={"ready": True, "import_error": None})
+        renderer.start()
+        self.addCleanup(renderer.stop)
 
     def test_numeric_minimum_versions_are_not_lexicographic(self) -> None:
         self.assertTrue(version_at_least("2.0.0", (2, 0)))
@@ -124,6 +129,24 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertFalse(report["base_runtime_ready"])
         self.assertFalse(report["mode_readiness"]["group"])
         self.assertFalse(report["native_camera_cut_runtime"]["version_ready"])
+
+    @patch("crosscut.runtime_contract._final_programme_renderer_status",
+           return_value={"ready": False, "import_error": "ModuleNotFoundError: missing dependency"})
+    @patch("crosscut.runtime_contract._module_status")
+    def test_missing_final_renderer_dependency_is_detected_before_acquisition(self, module_status, _renderer):
+        module_status.side_effect = (_module("2.2.0"), _module("4.10.0"), _module("2.20.0"))
+        report = runtime_contract_report()
+        self.assertFalse(report["base_runtime_ready"])
+        self.assertFalse(report["final_programme_renderer"]["ready"])
+
+    def test_final_renderer_probe_reports_its_real_import_failure_without_loading_models(self):
+        with patch("crosscut.runtime_contract.importlib.import_module",
+                   side_effect=ModuleNotFoundError("scenedetect fixture")) as imported:
+            status = _final_programme_renderer_status()
+        imported.assert_called_once_with("crosscut2.final_render_backend")
+        self.assertFalse(status["ready"])
+        self.assertIn("scenedetect fixture", status["import_error"])
+        self.assertFalse(status["model_loaded"])
 
 
 if __name__ == "__main__":

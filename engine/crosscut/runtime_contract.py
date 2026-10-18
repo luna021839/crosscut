@@ -119,6 +119,17 @@ def _stage_edit_generation_status() -> dict[str, Any]:
     }
 
 
+def _final_programme_renderer_status() -> dict[str, Any]:
+    """Import the actual final backend and its dependencies, without models."""
+    error = None
+    try:
+        importlib.import_module("crosscut2.final_render_backend")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    return {"ready": error is None, "import_error": error,
+            "backend": "sequential_native_clock_blocks_v1", "model_loaded": False}
+
+
 def runtime_contract_report() -> dict[str, Any]:
     """Probe package versions and real member-tracker execution locally."""
 
@@ -132,11 +143,13 @@ def runtime_contract_report() -> dict[str, Any]:
     numpy_status = _module_status("numpy", MINIMUM_NUMPY_VERSION)
     opencv_status = _module_status("cv2", MINIMUM_OPENCV_VERSION)
     native_scene_status = _module_status("tensorflow", MINIMUM_TENSORFLOW_VERSION)
+    final_renderer_status = _final_programme_renderer_status()
     base_ready = bool(
         python_ready
         and numpy_status["version_ready"]
         and opencv_status["version_ready"]
         and native_scene_status["version_ready"]
+        and final_renderer_status["ready"]
     )
 
     tracker_backends: tuple[str, ...] = ()
@@ -170,6 +183,7 @@ def runtime_contract_report() -> dict[str, Any]:
         "numpy": numpy_status,
         "opencv": opencv_status,
         "native_camera_cut_runtime": native_scene_status,
+        "final_programme_renderer": final_renderer_status,
         "base_runtime_ready": base_ready,
         "member_anchor_tracking": tracker_status,
         "stage_edit_generation": _stage_edit_generation_status(),

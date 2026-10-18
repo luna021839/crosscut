@@ -36324,7 +36324,7 @@ def _analyze_impl(
             if group_request_work is not None:
                 limits['maximum_runtime_seconds'] = min(limits['maximum_runtime_seconds'],
                     group_request_work.live_remaining_seconds)
-            return render(plan, progress_callback=render_log_callback(reporter,
+            return render(plan, execution_backend='sequential_when_supported', progress_callback=render_log_callback(reporter,
                 total_frames=plan.output_frame_count), **limits)
         codec = (group_request_work.run('encode', render_final_group_plan)
             if group_request_work is not None else render_final_group_plan())
@@ -39997,6 +39997,7 @@ def _analyze_impl(
             review_first_runtime.checkpoint("full_render_started")
             codec = render(
                 plan,
+                execution_backend='sequential_when_supported',
                 progress_callback=render_log_callback(
                     reporter,
                     total_frames=plan.output_frame_count,

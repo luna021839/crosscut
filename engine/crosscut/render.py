@@ -2733,6 +2733,7 @@ def render(
     maximum_runtime_seconds: float | None = None,
     decoder_threads: int = 2,
     filter_complex_threads: int = 2,
+    execution_backend: str = "filter_graph",
 ) -> str:
     for label,value in (("decoder_threads",decoder_threads),("filter_complex_threads",filter_complex_threads)):
         if type(value) is not int or not 1<=value<=16:
@@ -2754,6 +2755,18 @@ def render(
         or maximum_runtime_seconds <= 0
     ):
         raise ValueError("maximum_runtime_seconds must be positive and finite")
+    if execution_backend not in ("filter_graph", "sequential_when_supported"):
+        raise ValueError("unknown render execution_backend")
+    if (execution_backend == "sequential_when_supported"
+            and all(t.kind in (TransitionKind.HARD_CUT, TransitionKind.FACE_DISSOLVE)
+                    for t in plan.transitions)):
+        if (not use_verified_frame_schedule or video_codec not in ("h264_videotoolbox", "libx264")
+                or (video_bitrate,video_maxrate,video_buffer_size,audio_bitrate)!=("24M","36M","48M","320k")
+                or (decoder_threads,filter_complex_threads)!=(2,2)):
+            raise ValueError("sequential renderer requires the explicit verified standard encoding contract")
+        from crosscut2.final_render_backend import render as render_sequential_final
+        return render_sequential_final(plan,ffmpeg=ffmpeg,video_codec=video_codec,
+            maximum_runtime_seconds=maximum_runtime_seconds,progress_callback=progress_callback)
     render_deadline = (
         monotonic() + float(maximum_runtime_seconds)
         if maximum_runtime_seconds is not None
