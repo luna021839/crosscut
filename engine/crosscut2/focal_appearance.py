@@ -69,7 +69,10 @@ def direct_discrepancy(first,second,valid_first,valid_second,*,compatible=True):
         raise ValueError('known direct face queries must be unit normalized')
     known=va&vb&np.asarray(compatible,bool)
     cosine=np.clip(np.einsum('...d,...d->...',a,b,optimize=True),-1.,1.)
-    return np.where(known,(1.-cosine)/2.,.5),known,np.where(known,cosine,np.nan)
+    from .appearance_pair_calibration import active
+    calibration=active()
+    risk=(1.-cosine)/2. if calibration is None else calibration.risk(cosine)
+    return np.where(known,risk,.5),known,np.where(known,cosine,np.nan)
 
 
 def direct_cosine(left,right):

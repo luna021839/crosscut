@@ -126,7 +126,8 @@ class PlayedPosePortPrior:
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
             'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py',
-            'articulated_camera_proposals.py','direct_face_queries.py','boundary_readability.py','sparse_arm_contradiction.py']
+            'articulated_camera_proposals.py','direct_face_queries.py','boundary_readability.py','sparse_arm_contradiction.py',
+            'appearance_pair_calibration.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -176,6 +177,9 @@ class PlayedPosePortPrior:
             new_source_neural_calls=0,new_source_analysis_decode=0,
             professional_quality_approved=False,normal_app_activation_approved=False)
         self.artifact['fixed_editorial_opportunities']=bool(editorial_opportunities)
+        from .appearance_pair_calibration import active as active_pair_calibration
+        calibration=active_pair_calibration() if self.direct_face_appearance else None
+        self.artifact['direct_face_pair_score_calibration']=None if calibration is None else calibration.to_dict()
         if editorial_opportunities:
             self.artifact.update(contract='fixed_episode_typed_scene_point_boundary_port_E4_v2',
                 matched_action_change_credit='once_per_fixed_music_episode * actually_observed_incoming_exposure',
