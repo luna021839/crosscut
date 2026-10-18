@@ -180,6 +180,7 @@ class AnalysisRequest:
             resolve_migrated_derived_cache(
                 self.source_cache_directory,
                 self.visual_feature_derived_cache_directory,
+                verify_mount=False,
             ),
         )
         if not isinstance(self.member_pose_dissolve_enabled, bool):

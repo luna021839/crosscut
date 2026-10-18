@@ -95,6 +95,9 @@ def _result_contains_exposable_video(artifact: object) -> bool:
                 "MP4 is not exposed because its result manifest is missing"
             )
         return False
+    from crosscut2.member_app_job import ARTIFACT_CONTRACT, exposable_review
+    if manifest.get('contract') == ARTIFACT_CONTRACT:
+        return exposable_review(artifact)
     request = manifest.get("request")
     render = manifest.get("render")
     if has_mp4 and (

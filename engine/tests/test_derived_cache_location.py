@@ -71,6 +71,25 @@ class DerivedCacheLocationTests(unittest.TestCase):
         self.assertFalse((self.source / "derived").exists())
         self.assertFalse((self.root / "disconnected").exists())
 
+    def test_request_can_read_numeric_inputs_without_mounting_unrelated_visual_cache(self):
+        missing=self.root/'disconnected'
+        self.value['mount_path']=str(missing);self.marker.write_text(json.dumps(self.value))
+        with patch('crosscut.derived_cache_location._plist_command') as command:
+            request=AnalysisRequest.from_dict(dict(song='BLACKHOLE',source_mode='automatic',edit_mode='member',
+                target_member='가을',aspect_ratio='9:16',sources=[],source_cache_directory=str(self.source),
+                output_directory=str(self.root/'out')))
+            self.assertEqual(request.visual_feature_derived_cache_directory,missing)
+            command.assert_not_called()
+        self.assertFalse(missing.exists())
+        self.assertFalse((self.source/'derived').exists())
+        # Opening a visual-cache writer still refuses the detached volume.
+        from crosscut.visual_feature_cache import PersistentVisualFeatureCache
+        with self.assertRaisesRegex(DerivedCacheLocationError,'not mounted'):
+            PersistentVisualFeatureCache(source_cache_directory=self.source,source_path=self.root/'not-read.mp4',
+                analyzer=None,derived_cache_directory=missing)
+        self.assertFalse(missing.exists())
+        self.assertFalse((self.source/'derived').exists())
+
     def test_wrong_uuid_filesystem_or_mount_rejected(self):
         for key, value in [("VolumeUUID", "other"), ("FilesystemType", "exfat"), ("MountPoint", "/wrong")]:
             with self.subTest(key=key), self.mock_storage(volume={**self.volume, key: value}):

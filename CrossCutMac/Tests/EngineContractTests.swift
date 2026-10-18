@@ -1,8 +1,65 @@
 import Darwin
+import CryptoKit
 import XCTest
 @testable import CrossCutMac
 
 final class EngineContractTests: XCTestCase {
+    func testCurrentMemberReviewUsesActualMovieAndNeverClaimsDelivery() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let output = root.appendingPathComponent("out"), cache = root.appendingPathComponent("cache")
+        let indexFolder = cache.appendingPathComponent("crosscut2")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: indexFolder, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        func write(_ value: [String: Any], _ url: URL) throws {
+            try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]).write(to: url)
+        }
+        func digest(_ url: URL) throws -> String {
+            SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
+        }
+        let movie = root.appendingPathComponent("prior-good.mp4")
+        try Data("decoded whole-film fixture".utf8).write(to: movie)
+        let movieSHA = try digest(movie)
+        let planURL = output.appendingPathComponent("current-render-plan.json")
+        let sourcePaths = [root.appendingPathComponent("source0.mp4").path, root.appendingPathComponent("source1.mp4").path]
+        let plan: [String: Any] = ["sources": sourcePaths, "output": movie.path, "aspect_ratio": "9:16",
+            "width": 1080, "height": 1920, "output_frame_count": 60, "member_pose_dissolve_requested": true]
+        try write(plan, planURL)
+        let clock = root.appendingPathComponent("prior-good.clock.json")
+        try write(["artifact_contract": "render_clock_video_plan_binding_v2", "video_content_sha256": movieSHA, "plan": plan], clock)
+        let index = indexFolder.appendingPathComponent("member-inputs-gaeul.json")
+        try write(["contract": "current_member_numeric_inputs_v1", "member": "가을",
+            "completed_movies": [["path": movie.path, "sha256": movieSHA]]], index)
+        let request = EditRequest(song: "BLACKHOLE", targetMember: .gaeul, editMode: .member,
+            aspectRatio: .portrait, sources: [], outputDirectory: output, sourceMode: .automatic,
+            sourceCacheDirectory: cache)
+        let manifest = output.appendingPathComponent("IVE-BLACKHOLE-20261018-063900-analysis.json")
+        var value: [String: Any] = ["contract": "current_member_programme_review_v1", "created_at": "2026-10-18T06:39:00Z",
+            "artifact_role": "review_ready", "professional_quality_approved": false,
+            "request": ["group": "IVE", "song": "BLACKHOLE", "target_member": "가을", "edit_mode": "member",
+                "source_mode": "automatic", "aspect_ratio": "9:16", "output_directory": output.path,
+                "source_cache_directory": cache.path, "sources": sourcePaths, "member_pose_dissolve_enabled": true],
+            "app_result_exposure": ["video_output_exposed": true, "delivery_completion_message_allowed": false],
+            "post_render_qa": ["review_first_disposition": ["contract": "ive_review_first_runtime_v1",
+                "status": "REVIEW_READY", "artifact_role": "review_ready", "video_output_exposed": true,
+                "delivery_completion_message_allowed": false, "technical_issue_codes": [],
+                "editorial_issue_codes": ["normal_speed_editorial_review_pending"]]],
+            "inputs": index.path, "inputs_sha256": try digest(index),
+            "render": ["artifact_role": "review_ready", "full_AV_decode_exit_code": 0,
+                "video_path": movie.path, "movie_sha256": movieSHA, "plan_path": planURL.path,
+                "frame_clock_artifact": clock.path, "full_film_cache_reused": true]]
+        try write(value, manifest)
+        let files = [manifest, planURL, movie]
+        let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+        XCTAssertEqual(result.artifactRole, "review_ready")
+        XCTAssertEqual(result.outputURLs.last, movie)
+        value["artifact_role"] = "delivery"; try write(value, manifest)
+        XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+        value["artifact_role"] = "review_ready"; try write(value, manifest)
+        try Data("changed movie".utf8).write(to: movie)
+        XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+    }
+
     private func makeExecutableScript(_ body: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ive-crosscut-engine-probe-\(UUID().uuidString)")
@@ -2300,6 +2357,11 @@ except KeyboardInterrupt:
             "crosscut/stage_edit_dynamic_crop_head_v2.py",
             "crosscut/stage_edit_pipeline_bridge.py",
             "crosscut/stage_edit_transition_authority.py",
+            "crosscut2/member_stage_mix.py",
+            "crosscut2/member_programme.py",
+            "crosscut2/member_app_job.py",
+            "crosscut2/member_body_context.py",
+            "crosscut2/bounded_plan_render.py",
         ]
         for relativePath in requiredProfessionalStageEditModules {
             XCTAssertTrue(
@@ -2335,10 +2397,12 @@ except KeyboardInterrupt:
             relativePaths.allSatisfy {
                 $0 == "crosscut_cli.py"
                     || $0 == "crosscut"
+                    || $0 == "crosscut2"
+                    || ($0.hasPrefix("crosscut2/") && $0.hasSuffix(".py"))
                     || ($0.hasPrefix("crosscut/") && $0.hasSuffix(".py"))
                     || $0 == "crosscut/models"
                     || $0 == "crosscut/licenses"
-                    || ["crosscut/licenses/OSNet-MIT.txt", "crosscut/licenses/RTMPose-Apache-2.0.txt", "crosscut/licenses/TransNetV2-MIT.txt"].contains($0)
+                    || ["crosscut/licenses/OSNet-MIT.txt", "crosscut/licenses/RTMPose-Apache-2.0.txt", "crosscut/licenses/TransNetV2-MIT.txt", "crosscut/licenses/SCHP-MIT.txt"].contains($0)
                     || $0 == "crosscut/models/face_detection_yunet_2023mar.onnx"
                     || $0 == "crosscut/models/LICENSE.yunet"
                     || sfaceAssetPaths.contains($0)

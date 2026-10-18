@@ -927,10 +927,88 @@ enum CompletedEngineOutputSetDiscovery {
 
     /// Validate the set explicitly reported by this run. Never search the
     /// directory for a replacement result, and expose only its eight core files.
+    private static func currentMemberReview(_ reported: [URL], for request: EditRequest) -> CompletedEngineOutputSet? {
+        guard request.sourceMode == "automatic", request.editMode == "member",
+              request.aspectRatio == "9:16", let target = request.targetMember,
+              IVEMember(rawValue: target) != nil else { return nil }
+        let directory = URL(fileURLWithPath: request.outputDirectory).standardizedFileURL
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        func json(_ url: URL) -> [String: Any]? {
+            guard isNonemptyRegularFile(url, keys: keys),
+                  let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  size <= 32 * 1024 * 1024, let data = try? Data(contentsOf: url),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return value
+        }
+        func digest(_ url: URL) -> String? {
+            guard isNonemptyRegularFile(url, keys: keys), let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            var hash = SHA256()
+            do { while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { hash.update(data: data) } }
+            catch { return nil }
+            return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        let manifests = reported.filter { $0.lastPathComponent.hasSuffix("-analysis.json")
+            && samePath($0.deletingLastPathComponent().path, directory) }
+        guard manifests.count == 1, let manifestURL = manifests.first,
+              let value = json(manifestURL), value["contract"] as? String == "current_member_programme_review_v1",
+              value["artifact_role"] as? String == "review_ready", value["professional_quality_approved"] as? Bool == false,
+              let configuration = value["request"] as? [String: Any], configuration["group"] as? String == "IVE",
+              configuration["song"] as? String == request.song, configuration["target_member"] as? String == target,
+              configuration["edit_mode"] as? String == "member", configuration["source_mode"] as? String == "automatic",
+              configuration["aspect_ratio"] as? String == "9:16",
+              configuration["output_directory"] as? String == request.outputDirectory,
+              configuration["source_cache_directory"] as? String == request.sourceCacheDirectory,
+              configuration["member_pose_dissolve_enabled"] as? Bool == request.memberPoseDissolveEnabled,
+              let sourcePaths = configuration["sources"] as? [String], !sourcePaths.isEmpty,
+              request.sources.isEmpty || request.sources == sourcePaths,
+              let exposure = value["app_result_exposure"] as? [String: Any],
+              exposure["video_output_exposed"] as? Bool == true, exposure["delivery_completion_message_allowed"] as? Bool == false,
+              let qa = value["post_render_qa"] as? [String: Any], let state = qa["review_first_disposition"],
+              let stateData = try? JSONSerialization.data(withJSONObject: state),
+              let disposition = try? JSONDecoder().decode(EngineArtifactDisposition.self, from: stateData),
+              disposition.authorizes(role: "review_ready"),
+              let inputPath = value["inputs"] as? String, let inputSHA = value["inputs_sha256"] as? String,
+              let render = value["render"] as? [String: Any], render["artifact_role"] as? String == "review_ready",
+              render["full_AV_decode_exit_code"] as? Int == 0, let videoPath = render["video_path"] as? String,
+              let videoSHA = render["movie_sha256"] as? String, isSHA256(videoSHA),
+              let planPath = render["plan_path"] as? String, let clockPath = render["frame_clock_artifact"] as? String else { return nil }
+        let video = URL(fileURLWithPath: videoPath).standardizedFileURL
+        let planURL = URL(fileURLWithPath: planPath).standardizedFileURL
+        let inputURL = URL(fileURLWithPath: inputPath).standardizedFileURL
+        let cache = URL(fileURLWithPath: request.sourceCacheDirectory).appendingPathComponent("crosscut2", isDirectory: true)
+        guard samePath(inputURL.deletingLastPathComponent().path, cache), digest(inputURL) == inputSHA,
+              let inputs = json(inputURL), inputs["contract"] as? String == "current_member_numeric_inputs_v1",
+              inputs["member"] as? String == target, samePath(planURL.deletingLastPathComponent().path, directory),
+              Set(reported.map(\.standardizedFileURL)) == Set([manifestURL.standardizedFileURL, planURL, video]),
+              let plan = json(planURL), plan["sources"] as? [String] == sourcePaths,
+              plan["output"] as? String == video.path, plan["aspect_ratio"] as? String == "9:16",
+              plan["width"] as? Int == 1080, plan["height"] as? Int == 1920,
+              plan["member_pose_dissolve_requested"] as? Bool == request.memberPoseDissolveEnabled,
+              let frames = plan["output_frame_count"] as? Int, frames > 0,
+              let clock = json(URL(fileURLWithPath: clockPath)),
+              clock["artifact_contract"] as? String == "render_clock_video_plan_binding_v2",
+              clock["video_content_sha256"] as? String == videoSHA,
+              let clockPlan = clock["plan"] as? [String: Any], NSDictionary(dictionary: clockPlan).isEqual(to: plan),
+              digest(video) == videoSHA,
+              let created = value["created_at"] as? String,
+              let date = ISO8601DateFormatter().date(from: created) else { return nil }
+        if !samePath(video.deletingLastPathComponent().path, directory) {
+            guard render["full_film_cache_reused"] as? Bool == true,
+                  let movies = inputs["completed_movies"] as? [[String: Any]],
+                  movies.contains(where: { ($0["path"] as? String) == video.path && ($0["sha256"] as? String) == videoSHA }) else { return nil }
+        }
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0); formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return CompletedEngineOutputSet(editMode: .member, timestamp: formatter.string(from: date),
+            outputURLs: [manifestURL, planURL, video], artifactRole: "review_ready")
+    }
+
     static func reported(
         _ reportedURLs: [URL],
         for request: EditRequest
     ) -> CompletedEngineOutputSet? {
+        if let current = currentMemberReview(reportedURLs, for: request) { return current }
         guard request.sourceMode == SourceMode.automatic.rawValue,
               let requestedMode = EditMode(rawValue: request.editMode) else {
             return nil

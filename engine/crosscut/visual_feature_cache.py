@@ -966,6 +966,9 @@ class PersistentVisualFeatureCache:
         analyzer: AnalyzerFingerprint,
         derived_cache_directory: Path | None = None,
     ) -> None:
+        from .derived_cache_location import resolve_migrated_derived_cache
+        derived_cache_directory = resolve_migrated_derived_cache(
+            source_cache_directory, derived_cache_directory)
         if derived_cache_directory is None:
             cache_root = Path(source_cache_directory).expanduser()
             if cache_root.is_symlink():

@@ -146,6 +146,17 @@ def _audited_active_analyzer_components() -> dict[str, object]:
     return components
 
 
+def _audited_decoder_components(descriptor_digest: str) -> dict[str, object]:
+    # Migration receipts belong to this frozen runtime, not whichever
+    # OpenCV/NumPy happens to execute the unit tests today.
+    components = _audited_active_analyzer_components()
+    components['code_sha256'].update({
+        'pose.py': 'cab4b390073348daf33181a2fa0c8a171058e33f8c21223d501370ee23f17b21',
+        'visual_score_descriptor_ast_v1': descriptor_digest,
+    })
+    return components
+
+
 def _analyzer_from_components(components: dict[str, object]) -> AnalyzerFingerprint:
     digest = hashlib.sha256(
         json.dumps(
@@ -544,13 +555,19 @@ class VisualFeatureCacheTests(unittest.TestCase):
         self.assertEqual(_decode_equivalent_analyzer_migration_closure(previous), ())
         # A later cache-capacity-only change may reuse this corrected numeric
         # generation, but must still not cross the earlier face-scale change.
-        closure = _decode_equivalent_analyzer_migration_closure(_visual_analyzer_fingerprint().digest)
+        audited = _analyzer_from_components(_audited_decoder_components(
+            'a9f194987374a325c822af71736eaacc9bd5d72060d5866c1a4e3c6caacfa1ea'))
+        self.assertEqual(audited.digest, 'c491f53fd2955bc6a91bfb9286322044bbfb46722fec702adb54ecfff1a47be4')
+        closure = _decode_equivalent_analyzer_migration_closure(audited.digest)
         self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
             "fd673124f0f2cde3116f368e0dbdf854edc140d9df967debb9859fb1b7b0bc78",
             "2b3a32dfd5b5edafd38cccb76a009f99d0a1c3f1b72df7f682c70fd79aac0762",
             "b4d75c9d934f0791937f74eed357e8bfc3862f521733b9e9e42bfd4515bb496a",
             "ed00a2703e2cf1459adf8fa983e195288ca6d6b309aad0aa5159da1d1eb64e10",
             "9e5522429b560ee3494f932dc0fa24ec9381f54349e9c6ddd37771fec501589b", previous))
+        actual = _visual_analyzer_fingerprint()
+        if actual.components['runtime'] != audited.components['runtime']:
+            self.assertEqual(_decode_equivalent_analyzer_migration_closure(actual.digest), ())
 
     def test_shared_source_readers_migrate_exact_full_and_content_records_only(self):
         from dataclasses import replace
@@ -591,7 +608,8 @@ class VisualFeatureCacheTests(unittest.TestCase):
     def test_short_gap_rgb_optimization_reuses_exact_prior_features_only(self):
         from dataclasses import replace
         from crosscut.visual_score import _visual_analyzer_fingerprint
-        current = _visual_analyzer_fingerprint()
+        current = _analyzer_from_components(_audited_decoder_components(
+            'a9f194987374a325c822af71736eaacc9bd5d72060d5866c1a4e3c6caacfa1ea'))
         components = json.loads(json.dumps(current.components))
         components['code_sha256']['visual_score_descriptor_ast_v1'] = (
             'ccc993e4a2ae1da9d62a34cc2b56e36c322779f34e931b1694e6339547968192')

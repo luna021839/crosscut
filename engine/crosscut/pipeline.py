@@ -27992,6 +27992,18 @@ def analyze(
     group_external_original_reference = resolve_request_original_reference(
         request, group_external_original_reference)
     with ExitStack() as request_work_resources:
+        if acquisition_identity_authority is not None and not (
+            request.source_mode is SourceMode.AUTOMATIC and request.edit_mode is EditMode.MEMBER
+            and is_verified_member_acquisition_identity_authority(acquisition_identity_authority)
+        ):
+            raise TypeError("acquisition identity authority is valid only for automatic member requests")
+        # The current MEMBER editor consumes bound observation/alignment
+        # caches, not a retained EDL. Cold/explicit-model jobs still use the
+        # existing observation pipeline until their adapter is migrated.
+        from crosscut2.member_app_job import try_analyze as current_member_analyze
+        current_member_artifact = current_member_analyze(request, reporter)
+        if current_member_artifact is not None:
+            return current_member_artifact
         return _analyze_impl(request, reporter,
             allow_failed_comparison_render=allow_failed_comparison_render,
             review_rendered_proxies=review_rendered_proxies,
@@ -28014,6 +28026,13 @@ def _analyze_impl(
     group_external_original_reference,
     request_work_resources: ExitStack,
 ) -> AnalysisArtifact:
+    from .derived_cache_location import resolve_migrated_derived_cache
+    # This legacy route opens visual descriptors. A numeric-cache-only route
+    # returned earlier and does not need the unrelated APFS volume mounted.
+    derived_directory = resolve_migrated_derived_cache(
+        request.source_cache_directory, request.visual_feature_derived_cache_directory)
+    if derived_directory != request.visual_feature_derived_cache_directory:
+        request = replace(request, visual_feature_derived_cache_directory=derived_directory)
     if not isinstance(allow_failed_comparison_render, bool):
         raise TypeError("allow_failed_comparison_render must be a boolean")
     if not isinstance(review_rendered_proxies, bool):

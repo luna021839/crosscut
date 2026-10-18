@@ -34,7 +34,10 @@ def _plist_command(args: list[str]) -> dict:
 def resolve_migrated_derived_cache(
     source_cache_directory: Path | None,
     explicit_directory: Path | None = None,
+    *, verify_mount: bool = True,
 ) -> Path | None:
+    if type(verify_mount) is not bool:
+        raise TypeError('derived cache mount verification preference must be boolean')
     if source_cache_directory is None:
         return explicit_directory
     marker = Path(source_cache_directory).expanduser() / LOCATION_FILE
@@ -60,14 +63,14 @@ def resolve_migrated_derived_cache(
                 or image.suffix != ".sparsebundle" or mount in (Path("/"), Path("/Volumes"))
                 or image.is_symlink() or mount.is_symlink()):
             raise ValueError("invalid cache image or mount path")
-        if not image.is_dir() or not mount.is_dir():
+        if not image.is_dir() or verify_mount and not mount.is_dir():
             raise DerivedCacheLocationError(
                 "APFS analysis cache is not mounted; connect the SSD and run "
                 "node scripts/analysis_cache_mounts.cjs mount. "
                 "The exFAT cache will not be recreated."
             )
         image = image.resolve(strict=True)
-        mount = mount.resolve(strict=True)
+        mount = mount.resolve(strict=verify_mount)
         if explicit_directory is not None and Path(explicit_directory).expanduser().resolve() != mount:
             raise ValueError("explicit derived-cache path conflicts with migrated cache location")
     except DerivedCacheLocationError:
@@ -75,6 +78,10 @@ def resolve_migrated_derived_cache(
     except (OSError, ValueError, TypeError) as exc:
         raise DerivedCacheLocationError(f"Invalid derived cache location: {exc}") from exc
 
+    # Reading a request or a different numeric cache does not open this
+    # volume. Every visual-cache consumer retains strict verification.
+    if not verify_mount:
+        return mount
     info = _plist_command(["/usr/sbin/diskutil", "info", "-plist", str(mount)])
     if (info.get("FilesystemType") != "apfs"
             or str(info.get("VolumeUUID", "")).upper() != expected_uuid

@@ -60,7 +60,7 @@ def select(sources: Sequence[Source], observations: Sequence[Mapping], *, warps,
            master_start: float, duration_frames: int, fps: float, beat_times,
            output: Path, output_size=(1080, 1920), duration_model: Model | None = None,
            content_loss: Callable | None = None, unknown_geometry=4.,
-           articulated_configuration=False, check=lambda: None, progress=None):
+           articulated_configuration=False, check=lambda: None, progress=None, reference_source=0):
     """Return a fresh whole-film RenderPlan and numeric selection receipt.
 
     `observations[s][native]` is measured source-normalized face/COCO8 geometry.
@@ -74,7 +74,8 @@ def select(sources: Sequence[Source], observations: Sequence[Mapping], *, warps,
             or len(sources) != len(observations) or len(sources) != len(warps)
             or type(duration_frames) is not int or duration_frames < 2
             or not np.isfinite([fps, master_start]).all() or fps <= 0 or master_start < 0
-            or output_size[0] >= output_size[1]):
+            or output_size[0] >= output_size[1] or type(reference_source) is not int
+            or not 0<=reference_source<len(sources)):
         raise ValueError('complete bound MEMBER sources, portrait output and aligned clock required')
     beats = np.asarray(beat_times, float)
     if beats.ndim != 1 or not len(beats) or not np.isfinite(beats).all():
@@ -173,7 +174,7 @@ def select(sources: Sequence[Source], observations: Sequence[Mapping], *, warps,
                 incoming_source=s, cost=float(transition(start)[previous, state]),
                 exact_face_flanks=bool(state_known[previous, start-1] and state_known[state, start]),
                 source_native_indices=[int(schedules[-2].source_frame_indices[-1]), int(schedule.source_frame_indices[0])]))
-    plan = RenderPlan(tuple(s.path for s in sources), tuple(segments), 0, AspectRatio.PORTRAIT, Path(output),
+    plan = RenderPlan(tuple(s.path for s in sources), tuple(segments), reference_source, AspectRatio.PORTRAIT, Path(output),
                       master_audio_start=master_start, width=size[0], height=size[1], fps=fps)
     check()
     return plan, dict(objective=objective, nodes=len(nodes), states=len(state_sources), seams=seams,
