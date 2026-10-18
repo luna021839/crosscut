@@ -354,6 +354,8 @@ def main():
         help='Explicit1..8 importance of subject appearance continuity; same native/authored cost, no identity/source gate')
     parser.add_argument('--boundary-readability',action='store_true',
         help='Score original face detail at the actual cut separately from interval-average quality; no motion/source gate')
+    parser.add_argument('--sparse-arm-contradictions',action='store_true',
+        help='Keep visible original-image arm opposition from being diluted by other joints; soft cost, no cut gate')
     parser.add_argument('--editorial-reference-source',type=int,action='append',default=None,
         help='Physical source index for original framing/featured-member votes; repeatable, does not exclude render sources')
     parser.add_argument('--detailed-pose',action='store_true',
@@ -438,6 +440,9 @@ def main():
         raise ValueError('focal appearance importance requires the explicit played-interval port consumer')
     if args.boundary_readability and not(args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('endpoint readability requires the explicit played-interval port consumer')
+    if args.sparse_arm_contradictions and not(args.played_pose_port_camera_prior and args.played_interval_utility
+            and args.original_person_attention):
+        raise ValueError('sparse arm contradictions require original full-image people and the played-interval consumer')
     if args.editorial_reference_source is not None and not(args.played_pose_port_camera_prior and args.editorial_opportunity_exposure):
         raise ValueError('editorial reference sources require the explicit editorial port consumer')
     if args.native_part_pixel_support and not args.joint_motion_event_seconds:
@@ -542,6 +547,7 @@ def main():
             body_camera_proposals=args.body_camera_proposals,
             appearance_weight=args.focal_appearance_weight,
             boundary_readability=args.boundary_readability,
+            sparse_arm_contradictions=args.sparse_arm_contradictions,
             direct_face_appearance=args.direct_native_face_observations is not None)
     volume = Path('/Volumes/CrossCutMedia')
     expected = int(os.environ['IVECROSSCUT_AUTHORIZED_SSD_DEVICE'])

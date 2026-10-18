@@ -64,7 +64,7 @@ def proposal_display_quality(observation,camera):
 def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_pairs=8,opportunities=None,roles=None,
          coalesce_static_ports=False,recycle_static_capacity=False,articulated_actions=False,source_cohort=None,
          retain_pair_cameras=False,focal_motion=False,detailed_pose=False,geometry_weight=1.,body_camera_proposals=False,
-         appearance_weight=1.,
+         appearance_weight=1.,sparse_arm_contradictions=False,
          progress=None):
     if not 0<=maximum_pairs<=8:raise ValueError('at most8 GLOBAL paired proposals per node')
     if progress is not None and not callable(progress):raise TypeError('optional preparation progress must be callable')
@@ -161,8 +161,8 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
             if not native_left or not native_right:
                 entries.append(tuple(incoming));exits.append(tuple(outgoing));counts.append(0)
                 continue
-            left_features=features(native_left,fps=fps,focal_motion=focal_motion)
-            right_features=features(native_right,fps=fps,focal_motion=focal_motion)
+            left_features=features(native_left,fps=fps,focal_motion=focal_motion,sparse_arm_contradictions=sparse_arm_contradictions)
+            right_features=features(native_right,fps=fps,focal_motion=focal_motion,sparse_arm_contradictions=sparse_arm_contradictions)
             native_pair=matrix(left_features,right_features,details=True)
             if detailed_pose:
                 from .detailed_pose import describe as describe_detail,matrix as detail_matrix,bound_connection_credit
@@ -196,6 +196,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                     np.asarray([o['recurrent_member_hint'] for o in native_right])[None,:])
                 native_pair=apply(native_pair,role_strength)
             pose=native_pair['pose_rate'];appearance=native_pair['appearance_rate']
+            arm_cost=native_pair.get('sparse_arm_contradiction_relative_cost')
             if body_camera_proposals:
                 from .articulated_camera_proposals import prepare,prepared_proposal
                 prepared_left=[prepare(o) for o in native_left]
@@ -253,6 +254,7 @@ def make(nodes, catalogues, baseline_paths, *, fps, check=lambda:None, maximum_p
                         score=geometry_weight*error+pose_ranks[k]+appearance_weight*appearance[ai,bi]+1.-quality+.1*(
                             proposal_zoom_effort(left_obs,left[0])+proposal_zoom_effort(right_obs,right[0]))
                         if detailed_pose:score+=detail_rank[ai,bi]
+                        if arm_cost is not None:score+=arm_cost[ai,bi]
                         if opportunities is not None:
                             score-=opportunities.density(n,left_obs,right_obs,a,b,
                                 native_pair['matched_action_change_density'][ai,bi])

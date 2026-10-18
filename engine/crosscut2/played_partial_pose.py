@@ -70,7 +70,8 @@ def out_of_view_face_risk(raw_a,head_a,camera_a,visible_a,raw_b,head_b,camera_b,
     return np.where(measured,minimum,0.),measured
 
 
-def features(observations, *, fps, person_extents=False, focal_motion=False,detailed_pose=False):
+def features(observations, *, fps, person_extents=False, focal_motion=False,detailed_pose=False,
+             sparse_arm_contradictions=False):
     """Each observation belongs to one physical face and one played side."""
     if not math.isfinite(fps) or fps <= 0:raise ValueError('positive played clock required')
     heads = np.asarray([o['head'] for o in observations], float)
@@ -147,6 +148,7 @@ def features(observations, *, fps, person_extents=False, focal_motion=False,deta
         from .person_extent import height_interval
         intervals=[height_interval(o.get('person_rectangles'),cam) for o,cam in zip(observations,endpoint_camera)]
         result['person_extent_interval']=tuple(np.asarray([v[k] for v in intervals]) for k in range(3))
+    if sparse_arm_contradictions:result['sparse_arm_contradictions']=True
     return result
 
 
@@ -319,8 +321,13 @@ def matrix(left, right, *, details=False):
         result.update(detailed_pose_rate=risk,detailed_pose_measured=measured,detailed_pose_channels=channels,
             detailed_pose_channel_measured=channel_measured,detailed_pose_relative_cost=risk-.5)
         result=bound_connection_credit(result)
+    if left.get('sparse_arm_contradictions') or right.get('sparse_arm_contradictions'):
+        if not(left.get('sparse_arm_contradictions') and right.get('sparse_arm_contradictions')):
+            raise ValueError('Both sides must declare sparse arm contradiction scoring')
+        from .sparse_arm_contradiction import compare,bound_credit
+        result.update(compare(left,right));result=bound_credit(result)
     return result if details else (geometry + pose + appearance + result.get('focal_image_motion_relative_cost',0.)
-        + result.get('detailed_pose_relative_cost',0.), allowed)
+        + result.get('detailed_pose_relative_cost',0.)+result.get('sparse_arm_contradiction_relative_cost',0.), allowed)
 
 
 def source_activity(observation, *, fps):

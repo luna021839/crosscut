@@ -95,7 +95,8 @@ def event_energy(detail,window_seconds,*,fps,point_geometry,geometry_weight=1.,a
     boundaries. Only the window-dependent body evidence uses clipped support.
     Legacy experiments explicitly retain their previous integration.
     """
-    focal=detail.get('focal_image_motion_relative_cost',0.)+detail.get('detailed_pose_relative_cost',0.)
+    focal=(detail.get('focal_image_motion_relative_cost',0.)+detail.get('detailed_pose_relative_cost',0.)
+        +detail.get('sparse_arm_contradiction_relative_cost',0.))
     geometry=geometry_importance(geometry_weight)*detail['geometry_rate']
     appearance=appearance_importance(appearance_weight)*detail['appearance_rate']
     readability=detail['endpoint_readability_rate'] if boundary_readability else 0.

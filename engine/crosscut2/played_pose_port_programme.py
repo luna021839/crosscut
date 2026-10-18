@@ -29,7 +29,8 @@ class PlayedPosePortPrior:
                  matched_event_utility=False,matched_action_preference=1.,retain_pair_cameras=False,
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
                  editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False,
-                 direct_face_appearance=False,appearance_weight=1.,boundary_readability=False):
+                 direct_face_appearance=False,appearance_weight=1.,boundary_readability=False,
+                 sparse_arm_contradictions=False):
         from .editorial_roles import geometry_importance,appearance_importance
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
@@ -44,6 +45,9 @@ class PlayedPosePortPrior:
         if boundary_readability and not played_interval_utility:
             raise ValueError('Endpoint ROI readability requires actual played-interval scoring')
         self.boundary_readability=bool(boundary_readability)
+        if sparse_arm_contradictions and not(played_interval_utility and original_person_attention):
+            raise ValueError('Sparse arm contradictions require original full-image people and played intervals')
+        self.sparse_arm_contradictions=bool(sparse_arm_contradictions)
         if scene_readout and not editorial_opportunities:
             raise ValueError('SceneReadout requires the fixed editorial opportunity path')
         if played_interval_utility and (not editorial_opportunities or scene_readout):
@@ -119,7 +123,7 @@ class PlayedPosePortPrior:
             'source_member_scores.py','fine_subject_grid.py','opportunity.py','source_style.py',
             'person_attention.py','person_rectangle_bank.py','focal_image_motion.py','detailed_pose.py',
             'sparse_face_completion.py','original_people_subjects.py','multi_person_pose.py','original_people_bank.py',
-            'articulated_camera_proposals.py','direct_face_queries.py','boundary_readability.py']
+            'articulated_camera_proposals.py','direct_face_queries.py','boundary_readability.py','sparse_arm_contradiction.py']
         implementation=hashlib.sha256(b''.join(Path(__file__).with_name(p).read_bytes() for p in files)).hexdigest()
         self.artifact=dict(contract=('played_partial_pose_person_visible_extent_boundary_port_E3_v1' if person_extents
             else 'played_partial_pose_physical_focal_boundary_port_E2_v2'),
@@ -142,6 +146,9 @@ class PlayedPosePortPrior:
             endpoint_native_ROI_readability_cost=self.boundary_readability,
             endpoint_readability_unit='six_output_frames_times_worst_original_ROI_deficit_UNKNOWN_.5',
             endpoint_readability_changes_source_or_cut_admission=False,
+            sparse_visible_arm_contradictions=self.sparse_arm_contradictions,
+            sparse_arm_cost='six_output_frames_times_worst_visible_bone_MODEL_ONLY_excess_over_UNKNOWN_.5',
+            sparse_arm_scoring_changes_source_or_cut_admission=False,
             direct_face_risk=('equal_independent128D_and512D_cosine_risk_without_duplicate_gallery_vote'
                 if self.direct_face_appearance else None),
             sparse_same_clock_source_action_consumed=True,same_clock_context_is_not_dense_actor_certification=True,
@@ -408,7 +415,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
         source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
         detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
         appearance_weight=getattr(prior,'appearance_weight',1.),
-        body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress)
+        body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress,
+        sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
     if opportunity_observer is not None:
         if opportunities is None:raise ValueError('pre-selection subject probe requires fixed editorial opportunities')
         receipt['opportunity_subject_observations']=opportunity_observer(catalogues=cats,opportunities=opportunities,check=live)
@@ -422,7 +430,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             source_cohort=cohort,retain_pair_cameras=getattr(prior,'retain_pair_cameras',False),focal_motion=focal_motion,
             detailed_pose=detailed_pose,geometry_weight=getattr(prior,'geometry_weight',1.),
             appearance_weight=getattr(prior,'appearance_weight',1.),
-            body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress)
+            body_camera_proposals=getattr(prior,'body_camera_proposals',False),progress=preparation_progress,
+            sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
     if person_observer is not None:
         # Freeze additive raw evidence BEFORE any DP cost is constructed.
         # The callback may not alter the finite camera/port domain or fit
@@ -464,8 +473,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
     def cut(n):
         live()
         if n not in cut_cache:
-            left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose)
-            right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose)
+            left=features([p.observation for p in exits[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose,
+                sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
+            right=features([p.observation for p in entries[n]],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose,
+                sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False))
             detail=matrix(left,right,details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
@@ -640,8 +651,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 fixed_time_sequence_preference=sequence_cost if sequence else 0.),cumulative_cost=cumulative))
         if k:
             previous=port_runs[k-1];a=exits[i][previous[3]];b=entries[i][p]
-            detail=matrix(features([a.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose),
-                features([b.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose),details=True)
+            detail=matrix(features([a.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose,
+                    sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False)),
+                features([b.observation],fps=fps,person_extents=person_extents,focal_motion=focal_motion,detailed_pose=detailed_pose,
+                    sparse_arm_contradictions=getattr(prior,'sparse_arm_contradictions',False)),details=True)
             if played:
                 from .played_interval_utility import articulated_seam_evidence
                 detail=articulated_seam_evidence(detail,[a],[b],cap_actual_focal_motion=focal_motion)
@@ -681,6 +694,10 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
                 realized_incoming_change_credit=change_credit,
                 played_face_rate=float(detail['face_rate'][0,0]),played_partial_pose_rate=float(detail['pose_rate'][0,0]),
                 endpoint_readability_used=getattr(prior,'boundary_readability',False),
+                sparse_arm_contradiction_used=getattr(prior,'sparse_arm_contradictions',False),
+                sparse_arm_direction_residual=(float(detail['sparse_arm_direction_residual'][0,0])
+                    if detail.get('sparse_arm_direction_measured',np.zeros((1,1),bool))[0,0] else None),
+                sparse_arm_contradiction_relative_cost=float(detail.get('sparse_arm_contradiction_relative_cost',np.zeros((1,1)))[0,0]),
                 endpoint_readability_rate=float(detail['endpoint_readability_rate'][0,0]),
                 endpoint_readability_measured=bool(detail['endpoint_readability_measured'][0,0]),
                 actual_arm_direction_used=bool(detail.get('articulated_arm_direction_measured',np.zeros((1,1),bool))[0,0]),

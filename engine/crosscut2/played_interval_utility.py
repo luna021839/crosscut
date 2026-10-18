@@ -65,6 +65,8 @@ def articulated_seam_evidence(detail,left,right,*,cap_actual_focal_motion=False,
     if cap_actual_focal_motion:
         from .focal_image_motion import bound_connection_credit
         result=bound_connection_credit(result)
+    from .sparse_arm_contradiction import bound_credit
+    result=bound_credit(result)
     return result
 
 
