@@ -40,14 +40,43 @@ def projected(boxes,poses,crops,*,output_size):
     return face,pose
 
 
-def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,output_size,unknown_geometry=2.):
+def arm_configuration(left_box,right_box,left_pose,right_pose,left_known,right_known,*,output_size):
+    """Measured arm shape relative to the face, not just parallel directions.
+
+    Source observations are not interpolated. A complete arm including its
+    wrist is needed on both sides. Missing support stays a finite unknown;
+    a digital crop cannot erase a measured mismatch entering either view.
+    """
+    a,b=np.asarray(left_box,float),np.asarray(right_box,float)
+    pa,pb=np.asarray(left_pose,float),np.asarray(right_pose,float)
+    ka,kb=np.asarray(left_known,bool),np.asarray(right_known,bool)
+    metric=np.array([output_size[0]/output_size[1],1.])
+    ca=a[:,:2]+a[:,2:]/2;cb=b[:,:2]+b[:,2:]/2
+    na=(pa[:,:,:2]-ca[:,None])*metric/np.maximum(.005,a[:,None,3,None])
+    nb=(pb[:,:,:2]-cb[:,None])*metric/np.maximum(.005,b[:,None,3,None])
+    known_a=(pa[:,:,2]>=.3)&ka[:,None];known_b=(pb[:,:,2]>=.3)&kb[:,None]
+    shown_a=((pa[:,:,:2]>=0)&(pa[:,:,:2]<=1)).all(-1)
+    shown_b=((pb[:,:,:2]>=0)&(pb[:,:,:2]<=1)).all(-1)
+    residual=np.linalg.norm(na[:,None]-nb[None],axis=-1)
+    used=np.zeros(residual.shape,bool)
+    for chain in ((0,2,4),(1,3,5)):
+        complete=known_a[:,chain].all(-1)[:,None]&known_b[:,chain].all(-1)[None]
+        for joint in chain[1:]:
+            used[:,:,joint]|=complete&(shown_a[:,None,joint]|shown_b[None,:,joint])
+    value=np.where(used,residual/(1.+residual),0.).max(-1)
+    return np.where(used.any(-1),value,.5)
+
+
+def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,output_size,unknown_geometry=2.,
+              articulated_configuration=False):
     """All physical state pairs, using the requested output's isotropic metric."""
     a,b=np.asarray(left_box,float),np.asarray(right_box,float)
     pa,pb=np.asarray(left_pose,float),np.asarray(right_pose,float)
     ka,kb=np.asarray(left_known,bool),np.asarray(right_known,bool)
     if (a.ndim!=2 or b.ndim!=2 or a.shape[1]!=4 or b.shape[1]!=4 or pa.shape!=(len(a),8,3) or pb.shape!=(len(b),8,3)
             or ka.shape!=(len(a),) or kb.shape!=(len(b),) or type(unknown_geometry) not in (int,float)
-            or not np.isfinite(unknown_geometry) or not 0<=unknown_geometry<=4):
+            or not np.isfinite(unknown_geometry) or not 0<=unknown_geometry<=4
+            or type(articulated_configuration) is not bool):
         raise ValueError('explicit source-native face/pose flanks required')
     aspect=output_size[0]/output_size[1];metric=np.array([aspect,1.])
     ca=a[:,:2]+a[:,2:]/2;cb=b[:,:2]+b[:,2:]/2
@@ -69,6 +98,8 @@ def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,o
     # Worst visible arm prevents three matching torso points from concealing
     # one opposed wrist. Missing limbs are not a hard source veto.
     pose=np.where(good,angle,.5).max(-1)
+    if articulated_configuration:
+        pose=np.maximum(pose,arm_configuration(a,b,pa,pb,ka,kb,output_size=output_size))
     return .15+.35*geometry+.65*pose
 
 

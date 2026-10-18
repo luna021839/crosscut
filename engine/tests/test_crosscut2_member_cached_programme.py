@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from crosscut2.member_cached_programme import follow_crops,projected,pair_cost,solve
+from crosscut2.member_cached_programme import follow_crops,projected,pair_cost,solve,arm_configuration
 
 
 def test_fixed_zoom_camera_keeps_real_portrait_aspect_without_size_breathing():
@@ -71,3 +71,25 @@ def test_soft_pacing_still_switches_at_a_useful_real_source_improvement():
     holds,_=solve(np.arange(0,241,15),loss,[0,1],lambda f:np.full((2,2),.3),
         fps=30.,minimum_seconds=1/30,maximum_seconds=8.,duration_model=model)
     assert holds==((0,120,0),(120,240,1))
+
+
+def test_parallel_bones_do_not_disguise_a_measured_hand_in_a_different_pose():
+    face=np.array([[.45,.15,.1,.1]])
+    pose=np.array([[[.4,.4,.9],[.6,.4,.9],[.3,.5,.9],[.7,.5,.9],[.2,.6,.9],[.8,.6,.9],[.4,.8,.9],[.6,.8,.9]]])
+    shifted=pose.copy();shifted[:,:6,1]-=.25
+    score=lambda other,enabled:pair_cost(face,face,pose,other,[True],[True],output_size=(1080,1920),
+        articulated_configuration=enabled)[0,0]
+    assert score(shifted,False)==pytest.approx(score(pose,False))
+    assert score(shifted,True)>score(pose,True)+.3
+    assert arm_configuration(face,face,pose,np.zeros_like(pose),[True],[True],output_size=(1080,1920))[0,0]==.5
+
+
+def test_face_relative_arm_shape_cannot_be_fitted_away_by_a_different_zoom_or_pan():
+    face=np.array([[.45,.15,.1,.1]])
+    pose=np.array([[[.4,.4,.9],[.6,.4,.9],[.3,.5,.9],[.7,.5,.9],[.2,.6,.9],[.8,.6,.9],[.4,.8,.9],[.6,.8,.9]]])
+    changed=pose.copy();changed[:,4,1]+=.1
+    baseline=arm_configuration(face,face,pose,changed,[True],[True],output_size=(1080,1920))
+    crop=np.array([[.1,.05,.8,.8]])
+    shown_face,shown_pose=projected(face,changed,crop,output_size=(1080,1920))
+    actual=arm_configuration(face,shown_face,pose,shown_pose,[True],[True],output_size=(1080,1920))
+    np.testing.assert_allclose(actual,baseline,atol=1e-15)
