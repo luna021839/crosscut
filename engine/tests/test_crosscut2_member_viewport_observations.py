@@ -75,3 +75,11 @@ def test_missing_face_uses_the_declared_baseline_and_does_not_copy_a_torso_shape
     size=(3840,2160);output=(1080,1920);center=(.3,.5)
     assert face_centered_candidate(original,source_size=size,output_size=output,fallback_center=center)==aspect_crop(size,output,center=center)
     assert face_centered_candidate(observation(),source_size=(2160,3840),output_size=output)==aspect_crop((2160,3840),output)
+
+
+def test_feasible_camera_at_source_edge_does_not_create_negative_ulp_crop():
+    from crosscut.render import NormalizedCrop
+    z=1.3;half=.5/z
+    crop=compose_camera(NormalizedCrop(0.,0.,1.,1.),[z,np.nextafter(half,0.),np.nextafter(half,0.)])
+    assert crop.x==0. and crop.y==0.
+    assert crop.width==pytest.approx(1./z)

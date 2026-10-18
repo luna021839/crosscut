@@ -34,6 +34,9 @@ def compose_camera(base,camera):
     zoom,x,y=value;half=.5/zoom
     if min(x,y)<half-1e-12 or max(x,y)>1.-half+1e-12:
         raise ValueError('camera escapes the actual base viewport')
+    # The feasibility tolerance permits arithmetic roundoff, not a negative
+    # source crop. Match the renderer's physical-edge clamp within that ULP.
+    x,y=np.clip([x,y],half,1.-half)
     return NormalizedCrop(base.x+base.width*(x-half),base.y+base.height*(y-half),
         base.width/zoom,base.height/zoom)
 
