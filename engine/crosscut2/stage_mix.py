@@ -372,6 +372,8 @@ def main():
         help='Explicit1..8 importance of played face size/position continuity; same native/authored cost, no admission change')
     parser.add_argument('--focal-appearance-weight',type=float,default=1.,
         help='Explicit1..8 importance of subject appearance continuity; same native/authored cost, no identity/source gate')
+    parser.add_argument('--preferred-focal-height',type=float,default=.12,
+        help='Soft output face-height preference.12...30; larger values favor close-ups, not extra native detail')
     parser.add_argument('--boundary-readability',action='store_true',
         help='Score original face detail at the actual cut separately from interval-average quality; no motion/source gate')
     parser.add_argument('--sparse-arm-contradictions',action='store_true',
@@ -455,9 +457,12 @@ def main():
     if args.direct_native_face_observations is not None and not (
             args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('Direct face queries require the actual played-interval port consumer')
-    from .editorial_roles import geometry_importance,appearance_importance
+    from .editorial_roles import geometry_importance,appearance_importance,focal_height_preference
     geometry_importance(args.focal_geometry_weight)
     appearance_importance(args.focal_appearance_weight)
+    focal_height_preference(args.preferred_focal_height)
+    if args.preferred_focal_height!=.12 and not(args.played_pose_port_camera_prior and args.played_interval_utility):
+        raise ValueError('Changed focal size preference requires output-bound played intervals')
     if args.focal_geometry_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
         raise ValueError('focal geometry importance requires the explicit played-interval port consumer')
     if args.focal_appearance_weight!=1. and not(args.played_pose_port_camera_prior and args.played_interval_utility):
@@ -571,6 +576,7 @@ def main():
             body_camera_proposals=args.body_camera_proposals,
             appearance_weight=args.focal_appearance_weight,
             boundary_readability=args.boundary_readability,
+            preferred_focal_height=args.preferred_focal_height,
             sparse_arm_contradictions=args.sparse_arm_contradictions,
             direct_face_appearance=args.direct_native_face_observations is not None)
     volume = Path('/Volumes/CrossCutMedia')

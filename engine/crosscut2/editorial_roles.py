@@ -7,6 +7,14 @@ soft interpretation; no cut bonus or new source exclusion is issued here.
 import numpy as np
 
 
+def focal_height_preference(value):
+    """Output framing preference, distinct from measured native face detail."""
+    if (isinstance(value,(bool,np.bool_)) or not isinstance(value,(int,float,np.integer,np.floating))
+            or not np.isfinite(value) or not .12<=value<=.30):
+        raise ValueError('Preferred focal height must be a finite output fraction in.12...30')
+    return float(value)
+
+
 def geometry_importance(value):
     """Explicit editorial importance; not evidence confidence or admission."""
     if (isinstance(value,(bool,np.bool_)) or not isinstance(value,(int,float,np.integer,np.floating))

@@ -46,7 +46,8 @@ def proposal_display_quality(observation,camera):
     fx=max(0.,min(1.,cx+hx)-max(0.,cx-hx))/(2.*hx)
     fy=max(0.,min(1.,cy+hy)-max(0.,cy-hy))/(2.*hy)
     fraction=min(1.,max(0.,fx*fy))
-    size=float(np.minimum(1.,head[2]/.12)) if z==1. else min(1.,height/.12)
+    preferred=observation.get('editorial_preferred_focal_height',.12)
+    size=float(np.minimum(1.,head[2]/preferred)) if z==1. else min(1.,height/preferred)
     quality=observation['target_native_ROI_readability']*observation['target_original_role_factor']*size*fraction
     # Candidate pruning and final K must describe the SAME proposed view.
     # The native observation's competition cannot simply be copied: this

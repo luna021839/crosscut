@@ -30,8 +30,11 @@ class PlayedPosePortPrior:
                  focal_motion=False,detailed_pose=False,output_height=None,camera_proposal_nodes=None,geometry_weight=1.,
                  editorial_reference_sources=None,original_person_attention=False,body_camera_proposals=False,
                  direct_face_appearance=False,appearance_weight=1.,boundary_readability=False,
-                 sparse_arm_contradictions=False):
-        from .editorial_roles import geometry_importance,appearance_importance
+                 sparse_arm_contradictions=False,preferred_focal_height=.12):
+        from .editorial_roles import geometry_importance,appearance_importance,focal_height_preference
+        self.preferred_focal_height=focal_height_preference(preferred_focal_height)
+        if self.preferred_focal_height!=.12 and not(played_interval_utility and output_height is not None):
+            raise ValueError('Changed focal size preference requires output-bound played intervals')
         geometry_weight=geometry_importance(geometry_weight)
         if geometry_weight!=1. and not played_interval_utility:
             raise ValueError('Focal geometry importance requires actual played-interval scoring')
@@ -254,6 +257,10 @@ class PlayedPosePortPrior:
                 detailed_pose_missing_never_fabricates_a_stationary_hand=True)
         self.artifact['matched_action_editorial_preference']=self.matched_action_preference
         self.artifact['actual_output_height_pixels']=self.output_height
+        self.artifact['preferred_displayed_focal_height']=self.preferred_focal_height
+        self.artifact['focal_size_preference_is_not_native_detail_or_confidence']=True
+        self.artifact['focal_size_preference_fitted']=False
+        self.artifact['focal_size_preference_changes_source_or_cut_admission']=False
         self.artifact['explicit_camera_proposal_grid']=self.camera_proposal_nodes
         self.artifact['camera_proposal_grid_is_not_an_edit_timing_constraint']=True
         if self.output_height is not None:
@@ -404,7 +411,8 @@ def select(nodes,banks,poses,styles,*,fps,source_events,body_states,native_ports
             editorial_content=editorial,framing_evidence=framing,
             person_attention=getattr(prior,'person_attention',False),output_height=getattr(prior,'output_height',None),
             original_person_attention=getattr(prior,'original_person_attention',False),
-            direct_face_appearance=getattr(prior,'direct_face_appearance',False)))
+            direct_face_appearance=getattr(prior,'direct_face_appearance',False),
+            preferred_focal_height=getattr(prior,'preferred_focal_height',.12)))
     del states,rows,raw
     if any(cat.original_people is not None for cat in cats):
         receipt['original_full_image_people']=[None if cat.original_people is None else cat.original_people.receipt() for cat in cats]

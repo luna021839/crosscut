@@ -69,7 +69,7 @@ def native_sampling_pixels(bank):
 class SourceCatalogue:
     def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
                  editorial_content=False,framing_evidence=None,person_attention=False,output_height=None,
-                 original_person_attention=False,direct_face_appearance=False):
+                 original_person_attention=False,direct_face_appearance=False,preferred_focal_height=.12):
         if output_height is not None and (type(output_height) is not int or not 1<=output_height<=8192):
             raise ValueError('Actual positive integer output pixel height required')
         self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
@@ -82,6 +82,10 @@ class SourceCatalogue:
                     or np.any(np.abs(np.linalg.norm(vectors[known],axis=-1)-1.)>.001)):
                 raise ValueError('explicit source-bound direct face query fields required')
         self.output_height=output_height
+        from .editorial_roles import focal_height_preference
+        self.preferred_focal_height=focal_height_preference(preferred_focal_height)
+        if self.preferred_focal_height!=.12 and not(editorial_content and output_height is not None):
+            raise ValueError('Changed focal size preference requires output-bound editorial content')
         self.subjects=subjects
         self.editorial_content=bool(editorial_content)
         self.framing_evidence=framing_evidence
@@ -192,11 +196,12 @@ class SourceCatalogue:
         broadcast view. Equally sampled, equally sized faces then agree.
         """
         height=self.bank['heads'][n,side,head_index,2]
-        size=np.minimum(1.,height/.12)
+        size=np.minimum(1.,height/self.preferred_focal_height)
         if self.output_height is not None and displayed_height is not None:
             # Preserve the native view's float32 convention exactly; only a
             # genuinely changed output size receives a different size factor.
-            size=np.where(np.asarray(displayed_height)==height,size,np.minimum(1.,np.asarray(displayed_height)/.12))
+            size=np.where(np.asarray(displayed_height)==height,size,
+                np.minimum(1.,np.asarray(displayed_height)/self.preferred_focal_height))
         return self.roi_readability[n,side,head_index]*size
 
     def body_subject_context(self,n,side,h):
@@ -315,6 +320,7 @@ class SourceCatalogue:
             native_face_pixels_measured=bool(h>=0 and self.native_face_pixels_measured[n,side,h]),
             native_pixel_sampling_is_not_ROI_readability=True,
             actual_output_pixel_height=self.output_height,
+            editorial_preferred_focal_height=self.preferred_focal_height,
             target_native_ROI_readability=(0. if h<0 else float(self.roi_readability[n,side,h])),
             target_original_role_factor=(0. if h<0 else float(self.featured_factor[n,side,h])),
             displayed_native_quality_contract=('native_ROI_detail_actual_displayed_size_visibility_original_role_v2'
@@ -387,8 +393,8 @@ class SourceCatalogue:
                 zoom_effort=added_pixel_upscale_effort(displayed_height,self.native_face_pixels[n,side,index],
                     self.native_face_pixels_measured[n,side,index],camera[...,0],output_height=self.output_height)
             # Native ROI deficits remain explicit; digital enlargement cannot
-            # create detail. The .12 displayed-size convention (legacy native
-            # size when output is unbound) is not a fitted aesthetic threshold.
+            # create detail. Display size is a separate editorial preference
+            # (.12 unchanged by default), not new native detail or confidence.
             # ROI deficits and UNKNOWN stay distinct. Global black background
             # is style, not a recurring defect in an equally readable face.
             readable=self.target_readability(n,side,index,displayed_height=displayed_height)
