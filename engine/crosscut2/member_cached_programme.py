@@ -73,13 +73,17 @@ def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,o
 
 
 def solve(nodes,loss,source_ids,transition,*,fps,maximum_seconds=5.,minimum_seconds=1.1,
-          preferred_seconds=2.6,cut_music_penalty=None):
+          preferred_seconds=2.6,cut_music_penalty=None,duration_model=None):
     """Whole-film semi-Markov DP; camera/state is retained over each hold."""
     nodes=np.asarray(nodes);loss=np.asarray(loss,float);sources=np.asarray(source_ids)
     if (nodes.ndim!=1 or nodes.dtype.kind not in 'iu' or nodes[0]!=0 or np.any(np.diff(nodes)<=0)
             or loss.shape!=(len(sources),int(nodes[-1])) or not np.isfinite(loss).all()
             or not 0<minimum_seconds<preferred_seconds<maximum_seconds or fps<=0):
         raise ValueError('finite complete output-frame/state domain required')
+    if duration_model is not None:
+        from .visible_shot_duration import Model
+        if not isinstance(duration_model,Model) or (duration_model.tails and duration_model.artifact['output_fps']!=fps):
+            raise ValueError('explicit TRAIN duration model on the member output clock required')
     K=len(sources);M=len(nodes);prefix=np.c_[np.zeros(K),loss.cumsum(1)]/fps
     dp=np.full((M,K),np.inf);entry=np.full_like(dp,np.inf);entry[0]=0.
     parent=np.full((M,K),-1,int);start=np.full((M,K),-1,int)
@@ -90,7 +94,13 @@ def solve(nodes,loss,source_ids,transition,*,fps,maximum_seconds=5.,minimum_seco
         if not len(candidates):continue
         d=(nodes[end]-nodes[candidates])/fps
         cost=entry[candidates]+(prefix[:,nodes[end],None]-prefix[:,nodes[candidates]]).T
-        cost+=.65*(d[:,None]-preferred_seconds)**2
+        if duration_model is None:cost+=.65*(d[:,None]-preferred_seconds)**2
+        else:
+            # A fitted soft pacing cue may trade an expensive mismatched cut
+            # for a longer real shot. It does not require a switch every five
+            # seconds: callers can use the whole film as the search horizon.
+            pace=duration_model.loss(d,censored=(candidates==0)|(end==M-1))
+            cost+=pace[:,None]
         at=cost.argmin(0);dp[end]=cost[at,np.arange(K)];start[end]=candidates[at]
         parent[end]=choose[candidates[at],np.arange(K)]
         if end<M-1:

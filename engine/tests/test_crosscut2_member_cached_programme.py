@@ -48,3 +48,26 @@ def test_explicit_unknown_risk_changes_no_measured_pair_or_finite_source_admissi
     cost=lambda known,risk:pair_cost(box,box,pose,pose,[known],[known],output_size=(1080,1920),unknown_geometry=risk)
     np.testing.assert_array_equal(cost(True,2.),cost(True,4.))
     assert np.isfinite(cost(False,4.)).all() and cost(False,4.)[0,0]>cost(False,2.)[0,0]
+
+
+def test_soft_train_pacing_can_keep_a_long_matching_shot_instead_of_forcing_a_bad_cut():
+    from crosscut2.visible_shot_duration import Model,fit,exposure_tail_artifact
+    model=Model(exposure_tail_artifact(fit([dict(reference_id='editor',split='train',input_sha256='a'*64,
+        cut_seconds=[0.,1.,3.,6.,10.])]),fps=30.))
+    nodes=np.arange(0,241,15);loss=np.zeros((2,240))
+    transition=lambda f:np.full((2,2),100.)
+    legacy,_=solve(nodes,loss,[0,1],transition,fps=30.)
+    actual,value=solve(nodes,loss,[0,1],transition,fps=30.,minimum_seconds=1/30,
+        maximum_seconds=8.,duration_model=model)
+    assert len(legacy)>1 and actual in (((0,240,0),),((0,240,1),))
+    assert value==pytest.approx(model.loss(8.,censored=True))
+
+
+def test_soft_pacing_still_switches_at_a_useful_real_source_improvement():
+    from crosscut2.visible_shot_duration import Model,fit,exposure_tail_artifact
+    model=Model(exposure_tail_artifact(fit([dict(reference_id='editor',split='train',input_sha256='a'*64,
+        cut_seconds=[0.,1.,3.,6.,10.])]),fps=30.))
+    loss=np.full((2,240),10.);loss[0,:120]=0.;loss[1,120:]=0.
+    holds,_=solve(np.arange(0,241,15),loss,[0,1],lambda f:np.full((2,2),.3),
+        fps=30.,minimum_seconds=1/30,maximum_seconds=8.,duration_model=model)
+    assert holds==((0,120,0),(120,240,1))
