@@ -65,3 +65,20 @@ def test_cli_does_not_silently_ignore_a_closeup_request(monkeypatch,tmp_path):
     for key in ('source-plan','analysis','cache','output','models'):argv.extend(['--'+key,str(tmp_path/key)])
     monkeypatch.setattr('sys.argv',argv)
     with pytest.raises(ValueError,match='output-bound played intervals'):main()
+
+
+def test_cli_binds_the_requested_preference_to_the_actual_programme_prior(monkeypatch,tmp_path):
+    from crosscut2 import played_pose_port_programme as programme,stage_mix
+    class PriorBuilt(Exception):pass
+    def prior(**kwargs):
+        assert kwargs['preferred_focal_height']==.22
+        assert kwargs['output_height']==1080
+        raise PriorBuilt()
+    monkeypatch.setattr(programme,'PlayedPosePortPrior',prior)
+    monkeypatch.setattr('sys.argv',['stage_mix','--source-plan','unused','--analysis','unused',
+        '--cache',str(tmp_path/'cache'),'--output',str(tmp_path/'not-rendered.mp4'),'--models','unused',
+        '--body-pose-model','unused','--fixed-actor-camera-holds','--native-source-readability',
+        '--native-camera-ports','--joint-motion-event-seconds','--native-part-pixel-support',
+        '--played-pose-port-camera-prior','--editorial-opportunity-exposure','--played-interval-utility',
+        '--preferred-focal-height','.22','--preview-height','1080'])
+    with pytest.raises(PriorBuilt):stage_mix.main()
