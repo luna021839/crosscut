@@ -977,22 +977,59 @@ enum CompletedEngineOutputSetDiscovery {
         let planURL = URL(fileURLWithPath: planPath).standardizedFileURL
         let inputURL = URL(fileURLWithPath: inputPath).standardizedFileURL
         let cache = URL(fileURLWithPath: request.sourceCacheDirectory).appendingPathComponent("crosscut2", isDirectory: true)
+        let clockVideoPath = render["base_video_path"] as? String ?? videoPath
+        let clockVideoSHA = render["base_movie_sha256"] as? String ?? videoSHA
         guard samePath(inputURL.deletingLastPathComponent().path, cache), digest(inputURL) == inputSHA,
               let inputs = json(inputURL), inputs["contract"] as? String == "current_member_numeric_inputs_v1",
               inputs["member"] as? String == target, samePath(planURL.deletingLastPathComponent().path, directory),
               Set(reported.map(\.standardizedFileURL)) == Set([manifestURL.standardizedFileURL, planURL, video]),
               let plan = json(planURL), plan["sources"] as? [String] == sourcePaths,
-              plan["output"] as? String == video.path, plan["aspect_ratio"] as? String == "9:16",
+              plan["output"] as? String == clockVideoPath, plan["aspect_ratio"] as? String == "9:16",
               plan["width"] as? Int == 1080, plan["height"] as? Int == 1920,
               plan["member_pose_dissolve_requested"] as? Bool == request.memberPoseDissolveEnabled,
               let frames = plan["output_frame_count"] as? Int, frames > 0,
               let clock = json(URL(fileURLWithPath: clockPath)),
               clock["artifact_contract"] as? String == "render_clock_video_plan_binding_v2",
-              clock["video_content_sha256"] as? String == videoSHA,
+              clock["video_content_sha256"] as? String == clockVideoSHA,
               let clockPlan = clock["plan"] as? [String: Any], NSDictionary(dictionary: clockPlan).isEqual(to: plan),
               digest(video) == videoSHA,
               let created = value["created_at"] as? String,
               let date = ISO8601DateFormatter().date(from: created) else { return nil }
+        if clockVideoPath != videoPath {
+            guard request.memberPoseDissolveEnabled,
+                  let receiptPath = render["wardrobe_receipt"] as? String,
+                  let receiptSHA = render["wardrobe_receipt_sha256"] as? String,
+                  let bound = value["wardrobe_inputs"] as? [String: Any],
+                  let handlesPath = bound["path"] as? String, let handlesSHA = bound["sha256"] as? String,
+                  samePath(URL(fileURLWithPath: handlesPath).deletingLastPathComponent().path, cache),
+                  digest(URL(fileURLWithPath: handlesPath)) == handlesSHA,
+                  let handles = json(URL(fileURLWithPath: handlesPath)), handles["member"] as? String == target,
+                  handles["contract"] as? String == "measured_member_wardrobe_handles_v1",
+                  let expectedHandles = handles["handles"] as? [[String: Any]],
+                  samePath(URL(fileURLWithPath: receiptPath).deletingLastPathComponent().path, directory),
+                  digest(URL(fileURLWithPath: receiptPath)) == receiptSHA,
+                  let receipt = json(URL(fileURLWithPath: receiptPath)),
+                  receipt["contract"] as? String == "member_spatial_garment_first_post_effect_v1",
+                  receipt["base_movie"] as? String == clockVideoPath,
+                  receipt["base_movie_sha256"] as? String == clockVideoSHA,
+                  receipt["output"] as? String == videoPath, receipt["output_sha256"] as? String == videoSHA,
+                  receipt["output_frames"] as? Int == frames,
+                  receipt["full_AV_decode_exit_code"] as? Int == 0,
+                  receipt["audio_packet_payloads_and_timestamps_preserved"] as? Bool == true,
+                  let effects = receipt["effects"] as? [[String: Any]], !effects.isEmpty,
+                  digest(URL(fileURLWithPath: clockVideoPath)) == clockVideoSHA else { return nil }
+            guard effects.allSatisfy({ effect in expectedHandles.contains(where: { handle in
+                (effect["movie"] as? String) == (handle["movie"] as? String)
+                    && (effect["sha256"] as? String) == (handle["movie_sha256"] as? String)
+                    && (effect["binding_sha256"] as? String) == (handle["binding_sha256"] as? String)
+            }) }) else { return nil }
+            let base = URL(fileURLWithPath: clockVideoPath)
+            if !samePath(base.deletingLastPathComponent().path, directory) {
+                guard let movies = inputs["completed_movies"] as? [[String: Any]],
+                      movies.contains(where: { ($0["path"] as? String) == clockVideoPath
+                          && ($0["sha256"] as? String) == clockVideoSHA }) else { return nil }
+            }
+        } else if render["wardrobe_receipt"] != nil || render["base_video_path"] != nil { return nil }
         if !samePath(video.deletingLastPathComponent().path, directory) {
             guard render["full_film_cache_reused"] as? Bool == true,
                   let movies = inputs["completed_movies"] as? [[String: Any]],

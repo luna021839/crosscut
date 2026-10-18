@@ -98,10 +98,20 @@ def load_inputs(path,request):
                 bank.setdefault(row['native'],row)
     model=Model(exposure_tail_artifact(_read(value['duration_model']),fps=value['fps']))
     warps=load_warps({'local_timewarps':value['local_timewarps']})
+    wardrobe_path=Path(path).with_name('member-wardrobe-handles-'+request.target_member.name.lower()+'.json')
+    wardrobe_handles=[];wardrobe_input=None
+    if getattr(request,'member_pose_dissolve_enabled',False) and wardrobe_path.is_file():
+        raw_wardrobe=wardrobe_path.read_bytes();wardrobe_document=json.loads(raw_wardrobe)
+        if (wardrobe_document.get('contract')!='measured_member_wardrobe_handles_v1'
+                or wardrobe_document.get('member')!=request.target_member.value):
+            raise ValueError('wardrobe input has a different target/schema')
+        wardrobe_handles=wardrobe_document['handles']
+        wardrobe_input=dict(path=str(wardrobe_path),sha256=hashlib.sha256(raw_wardrobe).hexdigest())
     return dict(sources=sources,observations=observed,original_geometry=geometry,current_faces=queries,
         warps=[warps[i] for i in order],master_start=value['master_start'],duration_frames=value['duration_frames'],
         fps=value['fps'],beat_times=value['beat_times'],duration_model=model,body_context=context,
         source_order=order,face_merge=merge,cached_movies=value.get('completed_movies',[]),
+        wardrobe_handles=wardrobe_handles,wardrobe_inputs=wardrobe_input,
         inputs_sha256=hashlib.sha256(raw).hexdigest())
 
 
@@ -160,6 +170,24 @@ def try_analyze(request,reporter):
         from .bounded_plan_render import render
         rendering=render(plan,ffmpeg=ffmpeg,maximum_seconds=660.,check=check,
             progress_callback=lambda e:reporter.emit('log',**dict(e,stage='current_member_render')))
+    final_movie=plan.output
+    if request.member_pose_dissolve_enabled and data['wardrobe_handles']:
+        from .member_wardrobe_finish import match
+        from .member_wardrobe_delivery import render as finish_wardrobe
+        handles,wardrobe=match(plan,data['sources'],data['wardrobe_handles'])
+        programme['wardrobe']=wardrobe
+        if handles:
+            reporter.status('옷 영역을 먼저 바꾸는 멤버 전환을 합성하는 중…')
+            final_movie=request.output_directory/(slug+'-member-wardrobe.mp4')
+            finished=finish_wardrobe(plan.output,handles,final_movie,ffmpeg=ffmpeg,
+                maximum_seconds=240.,check=check,
+                progress=lambda e:reporter.emit('log',**dict(e,stage='member_wardrobe_finish')))
+            receipt=final_movie.with_suffix('.wardrobe-effects.json')
+            rendering=dict(rendering,base_video_path=str(plan.output),
+                base_movie_sha256=finished['base_movie_sha256'],movie_sha256=finished['output_sha256'],
+                wardrobe_receipt=str(receipt),wardrobe_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                full_AV_decode_exit_code=finished['full_AV_decode_exit_code'],
+                full_film_cache_reused=False,base_film_cache_reused=reused,video_encoder_calls=1)
     saved_plan=request.output_directory/(slug+'-render-plan.json')
     saved_plan.write_text(json.dumps(plan.to_json(),indent=2,allow_nan=False)+'\n')
     from crosscut.review_first_runtime import ReviewFirstQADisposition,ReviewFirstStatus
@@ -168,8 +196,9 @@ def try_analyze(request,reporter):
     manifest=dict(contract=ARTIFACT_CONTRACT,created_at=datetime.now(timezone.utc).isoformat(timespec='seconds'),
         request=request.as_dict(),artifact_role='review_ready',
         professional_quality_approved=False,backend='current_member_programme_v1',inputs=str(path),
+        wardrobe_inputs=data['wardrobe_inputs'],
         inputs_sha256=data['inputs_sha256'],source_order=data['source_order'],programme=programme,
-        render=dict(rendering,video_path=str(plan.output),plan_path=str(saved_plan),artifact_role='review_ready'),
+        render=dict(rendering,video_path=str(final_movie),plan_path=str(saved_plan),artifact_role='review_ready'),
         app_result_exposure=dict(video_output_exposed=True,delivery_completion_message_allowed=False),
         post_render_qa=dict(review_first_disposition=disposition),
         elapsed_seconds=time.monotonic()-started,warnings=['검토용 출력입니다. 전문 편집 품질 판정은 완료되지 않았습니다.'])
@@ -177,7 +206,7 @@ def try_analyze(request,reporter):
     manifest_path.write_text(json.dumps(manifest,indent=2,ensure_ascii=False,allow_nan=False)+'\n')
     reporter.progress(1.,'현재 멤버 편집안과 검토용 출력을 준비했습니다.')
     from crosscut.pipeline import AnalysisArtifact
-    return AnalysisArtifact(manifest_path,manifest,(manifest_path,saved_plan,plan.output))
+    return AnalysisArtifact(manifest_path,manifest,(manifest_path,saved_plan,final_movie))
 
 
 def exposable_review(artifact):
@@ -200,11 +229,14 @@ def exposable_review(artifact):
             or exposure.get('delivery_completion_message_allowed') is not False):
         raise ValueError('current MEMBER result is not a content-bound review film')
     plan=json.loads(Path(rendering['plan_path']).read_bytes())
-    if plan['output']!=str(videos[0]):raise ValueError('current member movie differs from its newly selected programme')
+    from .member_wardrobe_finish import validate as validate_wardrobe
+    clock_movie=validate_wardrobe(rendering,plan,manifest.get('wardrobe_inputs'))
+    if rendering.get('wardrobe_receipt') is None and plan['output']!=str(videos[0]):
+        raise ValueError('current member movie differs from its newly selected programme')
     if plan['sources']!=request.get('sources'):raise ValueError('current member review source domain changed')
     if plan.get('member_pose_dissolve_requested') is not request.get('member_pose_dissolve_enabled'):
         raise ValueError('current member effect preference changed at render publication')
     with videos[0].open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
     if digest!=rendering['movie_sha256']:raise ValueError('current member film changed after media-integrity verification')
-    load_render_reference_clock(videos[0],plan,())
+    load_render_reference_clock(clock_movie,plan,())
     return True

@@ -56,6 +56,33 @@ final class EngineContractTests: XCTestCase {
         value["artifact_role"] = "delivery"; try write(value, manifest)
         XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
         value["artifact_role"] = "review_ready"; try write(value, manifest)
+        let finalMovie = output.appendingPathComponent("clothes-first.mp4")
+        try Data("actual finished film fixture".utf8).write(to: finalMovie)
+        let finalSHA = try digest(finalMovie)
+        let handlesURL = indexFolder.appendingPathComponent("member-wardrobe-handles-gaeul.json")
+        try write(["contract": "measured_member_wardrobe_handles_v1", "member": "가을",
+            "handles": [["movie": "handle.mp4", "movie_sha256": "e", "binding_sha256": "c"]]], handlesURL)
+        let receiptURL = output.appendingPathComponent("clothes-first.wardrobe-effects.json")
+        var receipt: [String: Any] = ["contract": "member_spatial_garment_first_post_effect_v1",
+            "base_movie": movie.path, "base_movie_sha256": movieSHA, "output": finalMovie.path,
+            "output_sha256": finalSHA, "output_frames": 60, "full_AV_decode_exit_code": 0,
+            "audio_packet_payloads_and_timestamps_preserved": true,
+            "effects": [["movie": "handle.mp4", "sha256": "e", "binding_sha256": "c"]]]
+        try write(receipt, receiptURL)
+        value["wardrobe_inputs"] = ["path": handlesURL.path, "sha256": try digest(handlesURL)]
+        let originalRender = try XCTUnwrap(value["render"] as? [String: Any])
+        var finishedRender = originalRender
+        finishedRender["video_path"] = finalMovie.path; finishedRender["movie_sha256"] = finalSHA
+        finishedRender["base_video_path"] = movie.path; finishedRender["base_movie_sha256"] = movieSHA
+        finishedRender["wardrobe_receipt"] = receiptURL.path
+        finishedRender["wardrobe_receipt_sha256"] = try digest(receiptURL)
+        value["render"] = finishedRender; try write(value, manifest)
+        XCTAssertNotNil(CompletedEngineOutputSetDiscovery.reported([manifest, planURL, finalMovie], for: request))
+        receipt["output_frames"] = 61; try write(receipt, receiptURL)
+        finishedRender["wardrobe_receipt_sha256"] = try digest(receiptURL)
+        value["render"] = finishedRender; try write(value, manifest)
+        XCTAssertNil(CompletedEngineOutputSetDiscovery.reported([manifest, planURL, finalMovie], for: request))
+        value["render"] = originalRender; value.removeValue(forKey: "wardrobe_inputs"); try write(value, manifest)
         try Data("changed movie".utf8).write(to: movie)
         XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
     }

@@ -63,3 +63,14 @@ def test_absent_current_cache_does_not_displace_a_cold_job(tmp_path):
     request=SimpleNamespace(source_cache_directory=tmp_path,target_member=IVEMember.GAEUL,
         edit_mode=EditMode.MEMBER,aspect_ratio=AspectRatio.PORTRAIT)
     assert try_analyze(request,None) is None
+
+
+def test_disabled_wardrobe_does_not_read_or_require_optional_handles(tmp_path):
+    path,request,_=inputs(tmp_path)
+    handles=path.with_name('member-wardrobe-handles-gaeul.json')
+    handles.write_bytes(b'incomplete optional effect cache')
+    with patch('crosscut2.member_app_job.load_warps',return_value=(object(),object())):
+        data=load_inputs(path,request)
+        assert data['wardrobe_handles']==[] and data['wardrobe_inputs'] is None
+        request.member_pose_dissolve_enabled=True
+        with pytest.raises(ValueError):load_inputs(path,request)
