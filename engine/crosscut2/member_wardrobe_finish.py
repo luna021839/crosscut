@@ -14,6 +14,11 @@ from .member_film_effects import view
 from .member_geometry_inputs import identity
 
 
+def implementation():
+    from . import member_wardrobe_layer
+    return hashlib.sha256(Path(member_wardrobe_layer.__file__).read_bytes()).hexdigest()
+
+
 def binding(plan,sources,boundary,*,frame_count=25,lead_frames=12):
     if (type(boundary) is not int or not 0<=boundary<len(plan.segments)-1
             or type(frame_count) is not int or not 3<=frame_count<=60
@@ -47,6 +52,8 @@ def signature(value):
 def match(plan,sources,candidates):
     selected=[];misses=0;used=set()
     for candidate in candidates:
+        if candidate.get('compositor_sha256')!=implementation():
+            misses+=1;continue
         wanted=candidate['binding']
         if candidate['binding_sha256']!=signature(wanted):raise ValueError('wardrobe handle binding changed')
         frames,lead=wanted['frame_count'],wanted['lead_frames']

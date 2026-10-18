@@ -74,3 +74,17 @@ def test_disabled_wardrobe_does_not_read_or_require_optional_handles(tmp_path):
         assert data['wardrobe_handles']==[] and data['wardrobe_inputs'] is None
         request.member_pose_dissolve_enabled=True
         with pytest.raises(ValueError):load_inputs(path,request)
+
+
+def test_latest_wardrobe_pointer_binds_immutable_version_without_rewriting_old_inputs(tmp_path):
+    path,request,_=inputs(tmp_path);original=path.read_bytes()
+    request.member_pose_dissolve_enabled=True
+    version=tmp_path/'wardrobe-v2.json'
+    version.write_text(json.dumps(dict(contract='measured_member_wardrobe_handles_v1',member='가을',handles=[])))
+    bound=dict(path=str(version),sha256=hashlib.sha256(version.read_bytes()).hexdigest())
+    pointer=tmp_path/'member-wardrobe-latest-gaeul.json';pointer.write_text(json.dumps(bound))
+    with patch('crosscut2.member_app_job.load_warps',return_value=(object(),object())):
+        data=load_inputs(path,request)
+        assert data['wardrobe_inputs']==bound and path.read_bytes()==original
+        version.write_bytes(b'changed cached effect version')
+        with pytest.raises(ValueError,match='dependency changed'):load_inputs(path,request)

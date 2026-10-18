@@ -18,7 +18,43 @@ def phases(progress):
     def smooth(a, b):
         v = float(np.clip((progress-a)/(b-a), 0., 1.))
         return v*v*(3.-2.*v)
-    return smooth(.02, .72), smooth(.78, 1.)
+    # Release the face registration and stage over most of the second half,
+    # rather than squeezing both into the final five/six pictures.
+    return smooth(.02, .68), smooth(.34, 1.)
+
+
+def temporal_masks(pictures, anchors):
+    """Flow-warp measured same-stage mask anchors onto their real neighbours.
+
+    Values between anchors are explicitly derived masks, never new semantic
+    observations. Bidirectional interpolation reduces per-frame segmentation
+    flicker without interpolating source pictures or changing their clocks.
+    """
+    ticks=sorted(anchors)
+    if not ticks or any(type(t) is not int or not 0<=t<len(pictures) for t in ticks):
+        raise ValueError('observed mask anchors must belong to the exact picture sequence')
+    h,w=pictures[0].shape[:2]
+    if any(p.dtype!=np.uint8 or p.shape!=(h,w,3) for p in pictures):
+        raise ValueError('one same-stage BGR8 picture grid required')
+    for masks in anchors.values():
+        if any(m.shape!=(h,w) or not np.isfinite(m).all() or m.min()<0 or m.max()>1 for m in masks):
+            raise ValueError('finite measured same-grid masks required')
+    gray=[cv2.cvtColor(p,cv2.COLOR_BGR2GRAY) for p in pictures]
+    yy,xx=np.mgrid[:h,:w].astype(np.float32);result=[]
+    for j in range(len(pictures)):
+        if j in anchors:
+            result.append(tuple(v.astype(np.float32).copy() for v in anchors[j]));continue
+        before=max((t for t in ticks if t<j),default=ticks[0])
+        after=min((t for t in ticks if t>j),default=ticks[-1])
+        observations=[]
+        for tick in sorted({before,after}):
+            flow=cv2.calcOpticalFlowFarneback(gray[j],gray[tick],None,.5,3,25,3,5,1.1,0)
+            observations.append(tuple(cv2.remap(v.astype(np.float32),xx+flow[:,:,0],yy+flow[:,:,1],
+                cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT) for v in anchors[tick]))
+        if before==after:result.append(observations[0]);continue
+        blend=(j-before)/(after-before)
+        result.append(tuple((1-blend)*a+blend*b for a,b in zip(*observations,strict=True)))
+    return result
 
 
 def similarity(source_points, target_points):

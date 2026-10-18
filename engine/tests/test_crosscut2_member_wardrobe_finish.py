@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from crosscut2.member_stage_mix import Source
-from crosscut2.member_wardrobe_finish import binding,signature,match,validate
+from crosscut2.member_wardrobe_finish import binding,signature,match,validate,implementation
 from crosscut.render import NormalizedCrop
 from test_crosscut2_member_programme import inputs
 
@@ -17,7 +17,7 @@ def cached(tmp_path):
     value=binding(plan,sources,0,frame_count=7,lead_frames=3)
     movie=tmp_path/'handle.mp4';movie.write_bytes(b'previously measured and encoded handle')
     handle=dict(binding=value,binding_sha256=signature(value),movie=str(movie),
-        movie_sha256=hashlib.sha256(movie.read_bytes()).hexdigest())
+        movie_sha256=hashlib.sha256(movie.read_bytes()).hexdigest(),compositor_sha256=implementation())
     return sources,plan,handle
 
 
@@ -48,6 +48,12 @@ def test_same_sources_reordered_keep_the_same_physical_handle(tmp_path):
     plan=replace(plan,sources=tuple(s.path for s in sources),
         segments=tuple(replace(s,source_index=1-s.source_index) for s in plan.segments))
     assert match(plan,sources,[handle])[1]['matched_windows']==1
+
+
+def test_changed_effect_curve_does_not_reuse_an_old_encoded_effect(tmp_path):
+    sources,plan,handle=cached(tmp_path)
+    handle['compositor_sha256']='0'*64
+    assert match(plan,sources,[handle])[1]['matched_windows']==0
 
 
 def test_post_effect_receipt_does_not_pretend_the_nominal_plan_changed(tmp_path):

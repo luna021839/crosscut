@@ -1,12 +1,14 @@
 import numpy as np
 import pytest
 
-from crosscut2.member_wardrobe_layer import phases, similarity, composite, target_parts
+from crosscut2.member_wardrobe_layer import phases, similarity, composite, target_parts, temporal_masks
 
 
 def test_garment_changes_before_background():
     garment, background = phases(.6)
-    assert garment > .9 and background == 0.
+    assert garment > .9 and 0.<background<.5
+    assert phases(.3)[1]==0.
+    assert phases(.8)[1]>.75
     assert phases(0.) == (0., 0.)
     assert phases(1.) == (1., 1.)
 
@@ -30,10 +32,10 @@ def test_measured_clothes_not_whole_screen_or_face():
     identity = np.eye(2, 3, dtype=np.float32)
     kwargs = dict(incoming_garment=g, outgoing_person=p,
         incoming_person=p, incoming_to_outgoing=identity)
-    result = composite(a, b, progress=.6, **kwargs)
+    result = composite(a, b, progress=.33, **kwargs)
     assert np.array_equal(result[17, 30], a[17, 30])  # no double-exposed face
     assert np.array_equal(result[45, 0], a[45, 0])  # outgoing stage retained
-    assert result[45, 30, 1] > 180  # new outfit is already visible
+    assert result[45, 30, 1] > 80  # the actual outfit changes first
     assert np.array_equal(composite(a, b, progress=0., **kwargs), a)
     assert np.array_equal(composite(a, b, progress=1., **kwargs), b)
 
@@ -54,5 +56,25 @@ def test_outgoing_skirt_cannot_import_incoming_stage():
     missing=np.zeros_like(outgoing)
     result=composite(a,b,incoming_garment=missing,
         outgoing_person=outgoing,incoming_person=missing,
-        incoming_to_outgoing=np.eye(2,3,dtype=np.float32),progress=.6)
+        incoming_to_outgoing=np.eye(2,3,dtype=np.float32),progress=.3)
     assert np.array_equal(result,a)
+
+
+def test_stage_release_is_not_a_last_six_picture_pulse():
+    values=np.array([phases(t/24) for t in range(25)])
+    assert (np.diff(values,axis=0)>=0).all()
+    assert np.diff(values[:,1]).max()<.1
+    assert np.sum(np.diff(values[:,1])>0)>=15
+
+
+def test_derived_same_stage_masks_keep_real_anchors_and_move_between_them():
+    import cv2
+    rng=np.random.default_rng(8)
+    image=rng.integers(0,256,(96,64,3),dtype=np.uint8)
+    pictures=[cv2.warpAffine(image,np.array([[1,0,j],[0,1,0]],np.float32),(64,96)) for j in range(5)]
+    mask=np.zeros((96,64),np.float32);mask[30:70,20:40]=1
+    last=np.roll(mask,4,axis=1)
+    result=temporal_masks(pictures,{0:(mask,mask),4:(last,last)})
+    assert np.array_equal(result[0][0],mask) and np.array_equal(result[4][0],last)
+    assert result[2][0][50,41]>.8 and result[2][0][50,20]<.2
+    assert all(0<=v.min()<=v.max()<=1 for pair in result for v in pair)

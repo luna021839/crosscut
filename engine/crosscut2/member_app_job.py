@@ -100,6 +100,11 @@ def load_inputs(path,request):
     warps=load_warps({'local_timewarps':value['local_timewarps']})
     wardrobe_path=Path(path).with_name('member-wardrobe-handles-'+request.target_member.name.lower()+'.json')
     wardrobe_handles=[];wardrobe_input=None
+    latest=Path(path).with_name('member-wardrobe-latest-'+request.target_member.name.lower()+'.json')
+    if getattr(request,'member_pose_dissolve_enabled',False) and latest.is_file():
+        pointer=json.loads(latest.read_bytes());wardrobe_path=Path(pointer['path'])
+        if wardrobe_path.parent!=Path(path).parent:raise ValueError('wardrobe input pointer escaped its source cache')
+        _read(pointer)  # validate an immutable version, preserving old film receipts
     if getattr(request,'member_pose_dissolve_enabled',False) and wardrobe_path.is_file():
         raw_wardrobe=wardrobe_path.read_bytes();wardrobe_document=json.loads(raw_wardrobe)
         if (wardrobe_document.get('contract')!='measured_member_wardrobe_handles_v1'

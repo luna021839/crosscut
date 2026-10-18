@@ -75,6 +75,29 @@ def test_dense_requested_frames_are_split_into_bounded_validation_buffers():
     assert [n for first,last,key,group in plan for n in group]==list(range(100))
 
 
+def test_explicit_buffer_changes_only_decode_batching_not_native_pixels(tmp_path):
+    from crosscut2 import buffered_native_frames as buffered
+    encoder=shutil.which('ffmpeg')
+    if not encoder:pytest.skip('existing FFmpeg required')
+    source=tmp_path/'buffer-grid.mp4'
+    subprocess.run([encoder,'-nostdin','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=30',
+        '-frames:v','60','-an','-c:v','libx264','-bf','0','-g','30','-pix_fmt','yuv420p',str(source)],check=True)
+    c=sparse.probe(source);wanted=list(range(10,35));small={};large={}
+    a=dict(buffered.frames(source,wanted,clock=c,width=160,height=90,
+        maximum_buffered_raster_bytes=8*160*90*3,receipt=small))
+    b=dict(buffered.frames(source,wanted,clock=c,width=160,height=90,
+        maximum_buffered_raster_bytes=256*1024**2,receipt=large))
+    canonical=dict(sparse.frames(source,wanted,clock=c,width=160,height=90))
+    assert small['windows']==4 and large['windows']==1
+    for tick in wanted:
+        np.testing.assert_array_equal(a[tick],b[tick])
+        np.testing.assert_array_equal(a[tick],canonical[tick])
+    assert small['maximum_buffered_raster_bytes']<=8*160*90*3
+    for budget in (0,True,257*1024**2):
+        with pytest.raises(ValueError,match='window buffer'):
+            list(buffered.frames(source,wanted,clock=c,maximum_buffered_raster_bytes=budget))
+
+
 def test_decoder_error_window_cannot_leak_pixels_to_model_or_cache(tmp_path,monkeypatch):
     import io
     from types import SimpleNamespace
