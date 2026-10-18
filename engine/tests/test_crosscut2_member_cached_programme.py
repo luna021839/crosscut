@@ -41,3 +41,10 @@ def test_whole_film_dp_does_not_skip_coverage_or_fake_cuts_with_same_source_zoom
 def test_nonfinite_input_never_becomes_a_best_member_film():
     with pytest.raises(ValueError,match='finite complete'):
         solve(np.array([0,30]),np.full((2,30),np.nan),[0,1],lambda f:np.zeros((2,2)),fps=30.)
+
+
+def test_explicit_unknown_risk_changes_no_measured_pair_or_finite_source_admission():
+    box=np.array([[.4,.2,.1,.1]]);pose=np.zeros((1,8,3))
+    cost=lambda known,risk:pair_cost(box,box,pose,pose,[known],[known],output_size=(1080,1920),unknown_geometry=risk)
+    np.testing.assert_array_equal(cost(True,2.),cost(True,4.))
+    assert np.isfinite(cost(False,4.)).all() and cost(False,4.)[0,0]>cost(False,2.)[0,0]

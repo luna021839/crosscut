@@ -40,19 +40,23 @@ def projected(boxes,poses,crops,*,output_size):
     return face,pose
 
 
-def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,output_size):
+def pair_cost(left_box,right_box,left_pose,right_pose,left_known,right_known,*,output_size,unknown_geometry=2.):
     """All physical state pairs, using the requested output's isotropic metric."""
     a,b=np.asarray(left_box,float),np.asarray(right_box,float)
     pa,pb=np.asarray(left_pose,float),np.asarray(right_pose,float)
     ka,kb=np.asarray(left_known,bool),np.asarray(right_known,bool)
-    if a.ndim!=2 or b.ndim!=2 or a.shape[1]!=4 or b.shape[1]!=4 or pa.shape!=(len(a),8,3) or pb.shape!=(len(b),8,3):
+    if (a.ndim!=2 or b.ndim!=2 or a.shape[1]!=4 or b.shape[1]!=4 or pa.shape!=(len(a),8,3) or pb.shape!=(len(b),8,3)
+            or ka.shape!=(len(a),) or kb.shape!=(len(b),) or type(unknown_geometry) not in (int,float)
+            or not np.isfinite(unknown_geometry) or not 0<=unknown_geometry<=4):
         raise ValueError('explicit source-native face/pose flanks required')
     aspect=output_size[0]/output_size[1];metric=np.array([aspect,1.])
     ca=a[:,:2]+a[:,2:]/2;cb=b[:,:2]+b[:,2:]/2
     height=np.sqrt(np.maximum(.0001,a[:,None,3]*b[None,:,3]))
     distance=np.linalg.norm((ca[:,None]-cb[None,:])*metric,axis=-1)/height
     scale=np.abs(np.log(np.maximum(.001,a[:,None,3])/np.maximum(.001,b[None,:,3])))
-    geometry=np.where(ka[:,None]&kb[None,:],np.minimum(4.,distance+scale/.3),2.)
+    # Explicit editorial risk for an unmeasured flank, never a measured
+    # contradiction or a source exclusion. Keep the original2 by default.
+    geometry=np.where(ka[:,None]&kb[None,:],np.minimum(4.,distance+scale/.3),unknown_geometry)
     bones=np.array([(0,2),(2,4),(1,3),(3,5)])
     va=(pa[:,bones[:,1],:2]-pa[:,bones[:,0],:2])*metric
     vb=(pb[:,bones[:,1],:2]-pb[:,bones[:,0],:2])*metric
