@@ -120,3 +120,22 @@ def test_unequal_candidate_counts_stay_pair_local_not_max_over_actors():
     assert result['sparse_arm_contradiction_relative_cost'].shape==(1,2)
     assert result['sparse_arm_contradiction_relative_cost'][0,0]>.24
     assert result['sparse_arm_contradiction_relative_cost'][0,1]==0.
+
+
+def test_digital_crop_cannot_hide_known_opposed_arm_to_get_clean_match():
+    a,b,left,right=pair(opposed=True)
+    before=compare(left,right)
+    for o in (a,b):o['camera_strip'][:]=[2.,.62,.5]
+    after=compare(features([a],fps=30.),features([b],fps=30.))
+    assert after['sparse_arm_contradiction_relative_cost'][0,0]==before['sparse_arm_contradiction_relative_cost'][0,0]
+    assert after['sparse_arm_action_credit_cap'][0,0]==0.
+
+
+def test_both_wholly_hidden_arm_has_no_added_visual_cost_but_no_false_match_credit():
+    a,b,_,_=pair(opposed=True)
+    for o in (a,b):
+        o['evidence'][:,[1,3,5]]=0
+        o['camera_strip'][:]=[6.,.62,.5]
+    after=compare(features([a],fps=30.),features([b],fps=30.))
+    assert after['sparse_arm_contradiction_relative_cost'][0,0]==0.
+    assert after['sparse_arm_action_credit_cap'][0,0]==0.

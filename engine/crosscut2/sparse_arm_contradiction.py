@@ -18,11 +18,15 @@ def compare(left,right):
         visible=(xy[...,0]>=0)&(xy[...,0]<=16/9)&(xy[...,1]>=0)&(xy[...,1]<=1.)
         kind=value['kind'][rows,endpoint][:,ARM_BONES]
         ambiguous=value['ambiguous'][rows,endpoint][:,ARM_BONES]
-        known=np.isin(kind,(1,2))&~ambiguous&visible[:,ARM_JOINTS].all(-1)
+        known=np.isin(kind,(1,2))&~ambiguous
         known&=value['independent_full_image_body_context'][:,None]
-        return value['unit'][rows,endpoint][:,ARM_BONES],kind,known
-    a,ka,known_a=observed(left);b,kb,known_b=observed(right)
-    known=known_a[:,None]&known_b[None]
+        return value['unit'][rows,endpoint][:,ARM_BONES],kind,known,visible[:,ARM_JOINTS].any(-1)
+    a,ka,known_a,shown_a=observed(left);b,kb,known_b,shown_b=observed(right)
+    original_known=known_a[:,None]&known_b[None]
+    # A digital crop cannot erase an independently measured opposition just
+    # by hiding the incoming wrist/elbow. Score a bone entering either view;
+    # both wholly hidden has no new visual cost, but earns no match credit.
+    known=original_known&(shown_a[:,None]|shown_b[None])
     raw=(1.-np.clip((a[:,None]*b[None]).sum(-1),-1.,1.))/2.
     # RTMO is MODEL_ONLY. Preserve the general pixel-supported convention
     # without inventing certification for these model-derived instances.
@@ -32,7 +36,7 @@ def compare(left,right):
         sparse_arm_direction_residual=np.where(known,raw,0.).max(-1),
         sparse_arm_direction_measured=known.any(-1),
         sparse_arm_bones_measured=known,
-        sparse_arm_action_credit_cap=np.where(known,np.maximum(0.,1.-2.*raw),1.).min(-1))
+        sparse_arm_action_credit_cap=np.where(original_known,np.maximum(0.,1.-2.*raw),1.).min(-1))
 
 
 def bound_credit(detail):
