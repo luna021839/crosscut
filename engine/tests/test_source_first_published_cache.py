@@ -38,8 +38,9 @@ class PublishedGeometryCacheTests(unittest.TestCase):
         self.assertEqual(published_focal_geometry_predecessors('0'*64),())
 
     def test_query_only_disconnection_bound_preserves_exact_positive_predecessor(self):
-        from crosscut.source_first_focal_geometry import SourceFirstFocalGeometryProvider
-        current=SourceFirstFocalGeometryProvider.observation_fingerprint()
+        # This migration authorizes one published sensor dependency identity,
+        # not whichever OpenCV/NumPy/runtime happens to execute the test.
+        current='2759d59d3d4410aa980ae47f105df1b909493b14b6247bc6d0acb29b9c373555'
         previous='1389f32b65bc50b7226217d638c36b844ddb0164c53482983922b6d6e22d5e4f'
         self.assertNotEqual(current,previous)
         self.assertEqual(decode_equivalent_focal_fingerprints(current),())

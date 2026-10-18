@@ -54,6 +54,10 @@ class SourceFirstFocalGeometryProvider:
             self.native_faces = NativeFocalFaceProvider(self.sources,
                 shared_source_frames=self.shared_source_frames)
             cleanup.callback(self.native_faces.close)
+            if feature_cache_directory is not None:
+                from .native_focal_observation_cache import PersistentNativeFocalFaces
+                self.native_faces = PersistentNativeFocalFaces(self.native_faces, feature_cache_directory)
+                cleanup.callback(self.native_faces.close)
             self.faces = DirectMemberDenseFaceProvider(self.sources, require_focal_consensus=True,
                 focal_candidate_provider=self.native_faces.candidates_at,
                 feature_cache_directory=feature_cache_directory,

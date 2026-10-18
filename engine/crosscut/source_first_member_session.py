@@ -56,6 +56,8 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
                 progress_callback(dict(phase='focal_geometry',elapsed_seconds=round(now-started,3),queries=queries,
                     body_frame_inference_count=focal.bodies.frame_inference_count,
                     native_face_inference_count=focal.native_faces.inference_frame_count,
+                    native_face_observation_cache=(focal.native_faces.diagnostics()
+                        if callable(getattr(focal.native_faces,'diagnostics',None)) else None),
                     unresolved_query_memo=focal._source_first_unresolved_memo.diagnostics(),
                     anchor_prefilter=focal._source_first_anchor_prefilter.diagnostics(),
                     decoder_locality=_decoder_locality_diagnostics(focal),
