@@ -47,7 +47,7 @@ def score(first,second,face_a,face_b,pose_a,pose_b,*,output_size,sampling=(1.,1.
         measured_arm_position_in_face_heights=joint_alignment,measured_arm_joint_count=int(common.sum()))
 
 
-def fit(face_a,face_b,pose_a,pose_b,*,existing,output_size,caps=(2.,2.),sampling=(1.,1.)):
+def fit(face_a,face_b,pose_a,pose_b,*,existing,output_size,caps=(2.,2.),sampling=(1.,1.),context_penalty=None):
     faces=np.asarray([face_a,face_b],float);old=np.asarray(existing,float)
     if (faces.shape!=(2,4) or old.shape!=(2,3) or not np.isfinite(faces).all()
             or not np.isfinite(old).all() or np.any(faces[:,2:]<=0)
@@ -94,6 +94,13 @@ def fit(face_a,face_b,pose_a,pose_b,*,existing,output_size,caps=(2.,2.),sampling
             pan=np.clip(pan,.5/z[:,None],1.-.5/z[:,None])
             candidates.append(np.c_[z,pan])
     measured=[score(v[0],v[1],face_a,face_b,pose_a,pose_b,output_size=output_size,sampling=sampling) for v in candidates]
+    if context_penalty is not None:
+        for candidate,measurement in zip(candidates,measured,strict=True):
+            penalty=float(context_penalty(candidate.copy()))
+            if not np.isfinite(penalty) or penalty<0:
+                raise ValueError('finite nonnegative observed interior context cost required')
+            measurement['interior_context_penalty']=penalty
+            measurement['cost']+=penalty
     at=min(range(len(candidates)),key=lambda i:measured[i]['cost'])
     return candidates[at],dict(before=measured[0],after=measured[at],original_camera_retained=at==0,
         output_aspect=output_size[0]/output_size[1],source_or_clock_or_pose_changed=False)

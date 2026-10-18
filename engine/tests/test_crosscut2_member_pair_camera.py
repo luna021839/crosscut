@@ -20,6 +20,26 @@ def test_a_good_existing_member_pair_is_not_changed_just_to_add_zoom():
     np.testing.assert_array_equal(cameras,old);assert receipt['original_camera_retained']
 
 
+def test_observed_interior_content_can_keep_a_wider_existing_pair():
+    a=np.array([.45,.2,.1,.1]);b=np.array([.42,.2,.16,.16]);pose=np.zeros((8,3))
+    old=np.array([[1.,.5,.5]]*2);seen=[]
+    def actual_context(cameras):
+        seen.append(cameras.copy())
+        return 100.*float(np.any(cameras[:,0]>1.01))
+    cameras,receipt=fit(a,b,pose,pose,existing=old,output_size=(1080,1920),context_penalty=actual_context)
+    np.testing.assert_array_equal(cameras,old)
+    assert receipt['original_camera_retained'] and len(seen)>1
+    assert receipt['after']['interior_context_penalty']==0.
+
+
+@pytest.mark.parametrize('penalty',[float('nan'),-1.])
+def test_invalid_interior_cost_is_not_silently_a_good_camera(penalty):
+    face=np.array([.4,.2,.15,.15]);pose=np.zeros((8,3))
+    with pytest.raises(ValueError,match='interior context'):
+        fit(face,face,pose,pose,existing=[[1.,.5,.5]]*2,output_size=(1080,1920),
+            context_penalty=lambda cameras:penalty)
+
+
 def test_sampling_capacity_and_measured_arm_clipping_are_not_disguised_as_face_quality():
     face=np.array([.45,.2,.1,.1]);pose=np.zeros((8,3));pose[4]=(.01,.5,.9)
     a=score([2.,.5,.5],[2.,.5,.5],face,face,pose,pose,output_size=(1080,1920),sampling=(1.,1.))
