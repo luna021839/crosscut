@@ -22,11 +22,11 @@ https://github.com/user-attachments/assets/d1d107bb-b16f-420e-bb7e-a39a3b5201e7
 
 https://github.com/user-attachments/assets/15652c5a-2f12-48c8-95b5-2d77b694c56c
 
-### 개인 직캠 · 의상 전환 비교
+### 개인 직캠 · 의상 전환
 
-**6초 비교 영상**. 왼쪽은 이전 방식, 오른쪽은 의상 전환을 개선한 결과입니다.
+**6초 시연**. 동작을 이어가며 의상이 전환되는 구간입니다.
 
-https://github.com/user-attachments/assets/d79b039e-259d-45ce-b604-9702d8fd54f1
+https://github.com/user-attachments/assets/b8298175-d136-4b12-8cf3-72fb4c0d78ab
 
 ## 해결한 문제
 
