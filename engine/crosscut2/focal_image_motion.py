@@ -1,0 +1,161 @@
+"""Common-clock focal IMAGE motion plus the actual terminal digital view rate.
+
+Matching face position at the cut does not match its visible movement. Native
+image motion is compared on the SAME music samples, preserving choreography
+reversals. Actual one-sided digital view rates are composed before comparison,
+so compensating a native pan is not counted twice. No cause/identity is inferred.
+"""
+import numpy as np
+
+TICKS = np.arange(-7, 7, dtype=np.int64)
+TICKS.setflags(write=False)
+
+
+def relative_cost(risk):
+    """Evidence relative to UNKNOWN, not an additional per-cut rhythm tax.
+
+    Raw risk stays0..1 and missing measurements remain explicitly.5. Only
+    their advantage/disadvantage over that neutral is added to the existing
+    objective; an entirely unobserved cue changes no old edit decision.
+    """
+    value=np.asarray(risk,float)
+    if not np.isfinite(value).all() or np.any((value<0)|(value>1)):
+        raise ValueError('A bounded focal image motion residual is required')
+    return value-.5
+
+
+def bound_connection_credit(detail):
+    """Only a measured, actual-camera flow can limit matched-action credit.
+
+    The existing UNKNOWN residual is .5. Advantage above that neutral can
+    cap, never create, a body/hand match benefit. Missing flow changes no
+    old benefit or source admission. Call after actual articulated scoring,
+    not on a native-view proposal a later digital track could compensate.
+    """
+    if 'focal_image_motion_rate' not in detail:return detail
+    risk=np.asarray(detail['focal_image_motion_rate'],float)
+    known=np.asarray(detail['focal_image_motion_measured'])
+    if known.dtype!=bool or known.shape!=risk.shape:
+        raise ValueError('Separate measured actual-camera focal flow required')
+    relative_cost(risk)  # Validate the same bounded residual, not a probability.
+    cap=np.where(known,np.maximum(0.,1.-2.*risk),1.)
+    result=dict(detail,focal_image_motion_action_credit_cap=cap)
+    for key in ('matched_action_change_density','actual_played_match_advantage'):
+        if key in result:result[key]=np.minimum(result[key],cap)
+    return result
+
+
+def _project(head, camera):
+    return (.5 + camera[..., :1] * (head[..., :2] - camera[..., 1:])) * [16 / 9, 1.]
+
+
+def describe(observation, *, fps):
+    """Only exact existing source-bound head samples; never interpolate gaps."""
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError('A positive actual output clock is required')
+    result = dict(velocity=np.zeros((13, 3)), known=np.zeros(13, bool),
+                  digital_velocity=np.zeros(3), digital_known=False, height=0., fps=float(fps),
+                  native_static_camera=False)
+    context = observation.get('focal_image_motion_context',observation.get('dense_subject_context'))
+    if context is None:
+        return result
+    clock, window, at = context['clock'], context['window'], context['at']
+    if clock.fps != fps or not np.array_equal(clock.output_frames, TICKS):
+        raise ValueError('Focal image motion requires the exact common14sample music clock')
+    from .subject_action_match import _sample
+    if not np.array_equal(_sample(window, clock), at):
+        raise ValueError('Focal image motion source/native binding changed')
+    heads = np.asarray(window.heads[at], float)
+    strips = np.asarray(observation['camera_strip'], float)
+    side = observation['side']
+    if (heads.shape != (14, 4) or strips.shape != (7, 3) or side not in (0, 1)
+            or not np.isfinite(strips).all() or np.any(strips[:, 0] < 1. - 1e-9)):
+        raise ValueError('Actual14heads and seven played view transforms required')
+    endpoint = 6 if side == 0 else 7
+    boundary = strips[-1 if side == 0 else 0]
+    result['native_static_camera'] = np.array_equal(strips, np.tile([1., .5, .5], (7, 1)))
+    known = ((heads[:, 2] > .019) & (heads[:, 3] >= .75)
+             & window.associated[at] & np.asarray(context['same_shot'], bool))
+    # A native association hole inside two output samples also breaks a step.
+    continuous = np.asarray(context['contiguous'], bool)
+    if continuous.shape != (13,):
+        raise ValueError('Exact observed source association intervals required')
+    values = np.c_[_project(heads, boundary), np.log(np.maximum(.001, heads[:, 2] * boundary[0]))]
+    result['velocity'] = np.diff(values, axis=0) * fps
+    result['known'] = known[:-1] & known[1:] & continuous
+    result['height'] = float(heads[endpoint, 2] * boundary[0])
+    first, last = (5, 6) if side == 0 else (7, 8)
+    if not result['known'][first]:
+        return result
+    # This difference is exactly the digital component of the two ACTUAL
+    # played frames, not an assumed stationary actor or a future camera path.
+    a, b = (strips[-2], strips[-1]) if side == 0 else (strips[0], strips[1])
+    actual_xy = _project(heads[last], b) - _project(heads[first], a)
+    native_xy = _project(heads[last], boundary) - _project(heads[first], boundary)
+    result['digital_velocity'] = np.r_[(actual_xy - native_xy) * fps, np.log(b[0] / a[0]) * fps]
+    result['digital_known'] = True
+    return result
+
+
+def _aggregate(gap, known, scale, fps):
+    known = known & ((TICKS[:-1] >= -4) & (TICKS[1:] <= 3))
+    tau = 6. / fps
+    xy = tau * np.linalg.norm(gap[..., :2], axis=-1) / scale[..., None]
+    zoom = tau * np.abs(gap[..., 2]) / np.log(1.5)
+    raw = np.maximum(xy, zoom)
+    bounded = raw / (1. + raw)
+    count = known.sum(-1)
+    return np.where(count > 0, (bounded * known).sum(-1) / np.maximum(1, count), .5), count > 0, count
+
+
+def static_camera_pairs(left, right, left_indices, right_indices, left_zooms, right_zooms):
+    """Vectorized proposal hypothesis, NOT an actual interval camera replay.
+
+    Inputs describe identity native views. A constant proposed crop scales
+    native image translation and face height, but not logarithmic size rate.
+    Its translation adds no velocity. Missing source association stays missing.
+    Final DP costs must still use the actual played terminal view rates.
+    """
+    if not left or not right or any(x['fps'] != left[0]['fps'] for x in (*left, *right)):
+        raise ValueError('Two nonempty native focal domains on one clock required')
+    if any(x['digital_known'] and not x['native_static_camera'] for x in (*left, *right)):
+        raise ValueError('Proposal rates require identity native static descriptions')
+    a, b = np.asarray(left_indices), np.asarray(right_indices)
+    za, zb = np.asarray(left_zooms, float), np.asarray(right_zooms, float)
+    if (a.ndim != 1 or a.dtype.kind not in 'iu' or b.dtype.kind not in 'iu'
+            or not a.shape == b.shape == za.shape == zb.shape
+            or np.any((a < 0) | (a >= len(left))) or np.any((b < 0) | (b >= len(right)))
+            or not np.isfinite(za).all() or not np.isfinite(zb).all() or np.any(za < 1.) or np.any(zb < 1.)):
+        raise ValueError('Actual paired native indices and finite crop zooms required')
+    va = np.asarray([x['velocity'] for x in left])[a].copy()
+    vb = np.asarray([x['velocity'] for x in right])[b].copy()
+    va[..., :2] *= za[:, None, None]
+    vb[..., :2] *= zb[:, None, None]
+    known = np.asarray([x['known'] for x in left])[a] & np.asarray([x['known'] for x in right])[b]
+    known &= np.asarray([x['digital_known'] for x in left])[a, None]
+    known &= np.asarray([x['digital_known'] for x in right])[b, None]
+    scale = np.maximum(.02, (np.asarray([x['height'] for x in left])[a] * za
+                            + np.asarray([x['height'] for x in right])[b] * zb) / 2.)
+    return _aggregate(va - vb, known, scale, left[0]['fps'])
+
+
+def matrix(left, right):
+    """Bounded time-mean mismatch of composed local image motion hypotheses.
+
+    The measured terminal view rate is a local continuation hypothesis over
+    the common source window, not an observed unplayed digital trajectory.
+    Unsupported values remain explicit UNKNOWN(.5), with a separate mask.
+    """
+    if not left or not right or any(x['fps'] != left[0]['fps'] for x in (*left, *right)):
+        raise ValueError('Two nonempty focal domains on one actual clock required')
+    va = np.asarray([x['velocity'] + x['digital_velocity'] for x in left])
+    vb = np.asarray([x['velocity'] + x['digital_velocity'] for x in right])
+    known = (np.asarray([x['known'] for x in left])[:, None]
+             & np.asarray([x['known'] for x in right])[None])
+    # Use the same local -4..+3 scope as articulated source motion. Do not
+    # turn distant native pans into evidence about the exposed seam.
+    known &= np.asarray([x['digital_known'] for x in left])[:, None, None]
+    known &= np.asarray([x['digital_known'] for x in right])[None, :, None]
+    scale = np.maximum(.02, (np.asarray([x['height'] for x in left])[:, None]
+                            + np.asarray([x['height'] for x in right])[None]) / 2)
+    return _aggregate(va[:, None] - vb[None], known, scale, left[0]['fps'])

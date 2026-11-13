@@ -1,0 +1,31 @@
+{
+  "binding_contract": "historical_train_fixture_binding_v1",
+  "source_receipt_sha256": "22bf5b8cabe06ce3085f65a0d19cc98e5abedf5d610810e23fc63f8f4780391a",
+  "plan_sha256": "1859f884d9fab65523d6f88da43b5a3b896d83032cbe2366f88af42f4620a708",
+  "config_report_sha256": "cedb17938c66163bda7f816779e0548a3c46a690bc64ec1479f212a18497c0c1",
+  "train_reference_ids": ["0O-bHFSeYxQ", "8yVatqZOCls"],
+  "data_id": "stageedit-dynamic-crop-v3-1e20cef85e36d412d47d",
+  "selected_tracks_sha256": "59480eb2b6c0bf954be997ec61cbbede9653a19b44dd4d3fe31ef9b534316236",
+  "direct_inputs": [
+    {
+      "kind": "snapshot", "reference_id": "0O-bHFSeYxQ",
+      "path": "/Volumes/CrossCutMedia/CrossCut-Training/causal-schema4-v1/bang-bang/schema4/0O-bHFSeYxQ-stageedit-feature-snapshot-06bbc77e0650fe09.json",
+      "sha256": "5f03ead4fdc8a5f1ba76ac587efac16a961cf282f958abccb9921e1edb8686ad"
+    },
+    {
+      "kind": "supervision", "reference_id": "0O-bHFSeYxQ",
+      "path": "/Volumes/CrossCutMedia/CrossCut-Scratch/reference-edits/bang-bang/evidence-10source-current-canonical-v3/downstream-v4/stageedit-training/0O-bHFSeYxQ-reference-supervision-stageedit-schema3-447806e937c2b40e.json",
+      "sha256": "941517722ffe81320f02de96a901485a4856ebc772adbb2c7289328958d4cef5"
+    },
+    {
+      "kind": "snapshot", "reference_id": "8yVatqZOCls",
+      "path": "/Volumes/CrossCutMedia/CrossCut-Training/causal-schema4-v1/blackhole/feature-snapshots/8yVatqZOCls-stageedit-feature-snapshot-5958a5efd42cf6a3.json",
+      "sha256": "d94a468d2a2cce757752d2a625230bf29e91c996db4f1cc1dd60a3e94279f0a2"
+    },
+    {
+      "kind": "supervision", "reference_id": "8yVatqZOCls",
+      "path": "/Volumes/CrossCutMedia/CrossCut-Training/causal-schema4-v1/blackhole/reference-training-materialization-v1/8yVatqZOCls-reference-supervision-stageedit-schema3-f9cac9bd9abe894e.json",
+      "sha256": "cdbfae49878b56b9278fe3ac2b7976bd59bcd091ba156f22eebce2e3ab4618cf"
+    }
+  ]
+}

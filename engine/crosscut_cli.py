@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Command-line entry point used by the native CrossCut app."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+from time import monotonic
+import traceback
+
+# Random-access analysis intentionally seeks between non-keyframes. OpenCV's
+# bundled FFmpeg can print harmless H.264 reference warnings for those seeks;
+# actual read failures are handled by the frame readers and full media probes.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
+from crosscut.doctor import runtime_report
+from crosscut.acquisition import acquire_sources
+from crosscut.events import EventReporter, ProgressRangeReporter
+from crosscut.ive import SourceMode
+from crosscut.member_post_render_qa import (
+    AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT,
+    AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT,
+)
+from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
+from crosscut.pipeline import (
+    AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
+    DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH,
+    _rendered_montage_config_from_policy,
+    analyze,
+)
+from crosscut.post_render_qa import (
+    PostRenderArtifactSet,
+    PostRenderQAConfig,
+    PostRenderQAVerdict,
+    discover_completed_artifact_sets,
+    evaluate_and_write_post_render_qa,
+)
+from crosscut.professional_montage_policy import load_professional_montage_policy
+from crosscut.professional_reference_gate import (
+    ProfessionalReferenceProfile,
+    evaluate_professional_reference_review,
+)
+from crosscut.reference_attribution import resolve_reference_attribution_file
+from crosscut.reference_boundary_supervision import (
+    augment_reference_boundary_requests_file,
+)
+from crosscut.reference_dataset import build_reference_dataset_file
+from crosscut.request import AnalysisRequest
+from crosscut.review_first_runtime import (
+    REVIEW_FIRST_TOTAL_BUDGET_SECONDS,
+    ReviewFirstDeadlineExceeded,
+    enforce_review_first_deadline,
+    artifact_disposition_payload_valid,
+)
+
+
+def _raise_analysis_cancellation(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+def _prepare_analysis_process_group() -> bool:
+    """Make app termination cover this CLI and every media-tool child."""
+
+    if os.name != "posix":
+        return False
+    if os.getpgrp() != os.getpid():
+        os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, _raise_analysis_cancellation)
+    return os.getpgrp() == os.getpid()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _result_contains_exposable_video(artifact: object) -> bool:
+    """Expose only QA-bound delivery or review-ready product video."""
+
+    output_paths = tuple(getattr(artifact, "output_paths", ()))
+    has_mp4 = any(Path(path).suffix.lower() == ".mp4" for path in output_paths)
+    manifest = getattr(artifact, "manifest", None)
+    if not isinstance(manifest, dict):
+        if has_mp4:
+            raise RuntimeError(
+                "MP4 is not exposed because its result manifest is missing"
+            )
+        return False
+    from crosscut2.member_app_job import ARTIFACT_CONTRACT, exposable_review
+    if manifest.get('contract') == ARTIFACT_CONTRACT:
+        return exposable_review(artifact)
+    request = manifest.get("request")
+    render = manifest.get("render")
+    if has_mp4 and (
+        not isinstance(request, dict)
+        or request.get("source_mode") not in {"automatic", "local"}
+        or request.get("edit_mode") not in {"group", "member"}
+        or str(request.get("group", "")).strip().upper() != "IVE"
+    ):
+        raise RuntimeError("MP4 is not exposed because its request scope is missing or invalid")
+    automatic_ive_scope = bool(
+        isinstance(request, dict)
+        and str(request.get("group", "")).strip().upper() == "IVE"
+        and str(request.get("source_mode", "")).strip().lower()
+        == "automatic"
+        and str(request.get("edit_mode", "")).strip().lower()
+        in {"group", "member"}
+    )
+    if not automatic_ive_scope:
+        return has_mp4
+    if has_mp4:
+        video_paths = [Path(path) for path in output_paths if Path(path).suffix.lower() == ".mp4"]
+        declared_video = render.get("video_path") if isinstance(render, dict) else None
+        if (not isinstance(declared_video, str) or not Path(declared_video).is_absolute()
+                or len(video_paths) != 1
+                or video_paths[0].resolve() != Path(declared_video).resolve()):
+            raise RuntimeError("automatic IVE MP4 output is not the unique QA-bound render path")
+    edit_mode = str(request.get("edit_mode", "")).strip().lower()
+    member = edit_mode == "member"
+    exposure = manifest.get("app_result_exposure")
+    qa = manifest.get("post_render_qa")
+    artifact_role = manifest.get("artifact_role")
+    expected_exposure_contract = (
+        AUTOMATIC_IVE_MEMBER_APP_RESULT_EXPOSURE_CONTRACT
+        if member
+        else APP_RESULT_EXPOSURE_CONTRACT
+    )
+    expected_qa_contract = (
+        AUTOMATIC_IVE_MEMBER_POST_RENDER_QA_CONTRACT
+        if member
+        else AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT
+    )
+    disposition = qa.get("review_first_disposition") if isinstance(qa, dict) else None
+    promotion_binding = qa.get("promotion_binding") if isinstance(qa, dict) else None
+    content_binding_passed = bool(
+        qa.get("content_binding_passed") is True
+        if member and isinstance(qa, dict)
+        else isinstance(promotion_binding, dict)
+        and promotion_binding.get("passed") is True
+    )
+    shared_contract = bool(
+        isinstance(render, dict)
+        and render.get("artifact_role") == artifact_role
+        and (not member or render.get("direct_full_frame") is True)
+        and isinstance(exposure, dict)
+        and exposure.get("contract") == expected_exposure_contract
+        and exposure.get("video_output_exposed") is True
+        and isinstance(qa, dict)
+        and qa.get("contract") == expected_qa_contract
+        and content_binding_passed
+        and isinstance(disposition, dict)
+        and artifact_disposition_payload_valid(disposition, role=artifact_role)
+    )
+    delivery_allowed = bool(
+        artifact_role == "delivery"
+        and shared_contract
+        and exposure.get("delivery_completion_message_allowed") is True
+        and qa.get("passed") is True
+        and disposition.get("status") == "APPROVED"
+    )
+    review_ready_allowed = bool(
+        artifact_role == "review_ready"
+        and shared_contract
+        and exposure.get("delivery_completion_message_allowed") is False
+        and qa.get("passed") is False
+        and disposition.get("status") == "REVIEW_READY"
+    )
+    allowed = bool(delivery_allowed or review_ready_allowed)
+    if has_mp4 and not allowed:
+        raise RuntimeError(
+            "automatic IVE MP4 is not exposed because mandatory post-render "
+            "QA did not authorize delivery or review-ready output"
+        )
+    return bool(has_mp4 and allowed)
+
+
+def _decoded_proxy_review_from_document(
+    document: dict[str, object],
+) -> tuple[dict[str, object], str]:
+    """Accept either a raw review or a no-rerender QA replay audit."""
+
+    if isinstance(document.get("boundaries"), list):
+        return (document, "root")
+    nested = document.get("decoded_proxy_review")
+    if isinstance(nested, dict) and isinstance(nested.get("boundaries"), list):
+        return (nested, "decoded_proxy_review")
+    raise ValueError(
+        "review JSON must be a decoded proxy review or contain "
+        "decoded_proxy_review"
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="crosscut_cli.py")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    subcommands.add_parser("doctor", help="check local media dependencies")
+    analyze_parser = subcommands.add_parser("analyze", help="analyze performance video sources")
+    analyze_parser.add_argument("--request", required=True, type=Path)
+    analyze_parser.add_argument("--debug", action="store_true")
+    analyze_parser.add_argument(
+        "--workflow-worker-deadline", type=float, help=argparse.SUPPRESS,
+    )
+    analyze_parser.add_argument(
+        "--allow-failed-comparison-render",
+        action="store_true",
+        help=(
+            "explicitly render an automatic GROUP comparison even when visual "
+            "timeline generation or final timeline QA fails"
+        ),
+    )
+    dataset_parser = subcommands.add_parser(
+        "build-reference-dataset",
+        help="convert conservative stage-mix attribution into training records",
+    )
+    dataset_parser.add_argument("--attribution", required=True, type=Path)
+    dataset_parser.add_argument("--output", required=True, type=Path)
+    dataset_parser.add_argument("--style-id", required=True)
+    dataset_parser.add_argument("--reference-id")
+    attribution_parser = subcommands.add_parser(
+        "resolve-reference-attribution",
+        help=(
+            "resolve synchronized visual evidence with UNKNOWN-aware temporal DP"
+        ),
+    )
+    attribution_parser.add_argument("--evidence", required=True, type=Path)
+    attribution_parser.add_argument("--output", required=True, type=Path)
+    boundary_parser = subcommands.add_parser(
+        "augment-reference-boundaries",
+        help=(
+            "add only UNKNOWN-aware frame-proven A-to-B boundary requests and "
+            "rerun attribution"
+        ),
+    )
+    boundary_parser.add_argument("--evidence", required=True, type=Path)
+    boundary_parser.add_argument("--output", required=True, type=Path)
+    boundary_parser.add_argument(
+        "--attribution-output",
+        type=Path,
+        help="optional destination for the post-augmentation attribution",
+    )
+    professional_gate_parser = subcommands.add_parser(
+        "professional-reference-gate",
+        help=(
+            "compare a decoded proxy review with five same-song human edits"
+        ),
+    )
+    professional_gate_parser.add_argument(
+        "--profile",
+        required=True,
+        type=Path,
+    )
+    professional_gate_parser.add_argument(
+        "--review",
+        required=True,
+        type=Path,
+    )
+    professional_gate_parser.add_argument(
+        "--output",
+        type=Path,
+        help="optional destination for the complete relative-gate report",
+    )
+    post_render_parser = subcommands.add_parser(
+        "post-render-qa",
+        help="fully decode and professionally audit one completed GROUP render",
+    )
+    artifact_source = post_render_parser.add_mutually_exclusive_group(required=True)
+    artifact_source.add_argument(
+        "--analysis",
+        type=Path,
+        help="exact timestamp-bound *-analysis.json artifact",
+    )
+    artifact_source.add_argument(
+        "--output-directory",
+        type=Path,
+        help="directory whose latest completed timestamp-bound artifact set is audited",
+    )
+    post_render_parser.add_argument(
+        "--report",
+        type=Path,
+        help="optional report destination (defaults beside the selected artifacts)",
+    )
+    post_render_parser.add_argument("--debug", action="store_true")
+    return parser
+
+
+def _completed_artifact_from_analysis(
+    analysis_path: Path,
+) -> PostRenderArtifactSet:
+    requested = PostRenderArtifactSet.from_analysis_path(analysis_path)
+    requested_path = requested.analysis_path.resolve()
+    completed = discover_completed_artifact_sets(requested.output_directory)
+    for artifact_set in completed:
+        if artifact_set.analysis_path.resolve() == requested_path:
+            return artifact_set
+    raise ValueError(
+        "지정한 analysis와 같은 타임스탬프의 완성된 "
+        "analysis/render-plan/selection/MP4 세트를 찾지 못했습니다."
+    )
+
+
+def _resolve_post_render_artifact_set(
+    *,
+    analysis_path: Path | None,
+    output_directory: Path | None,
+) -> tuple[PostRenderArtifactSet, int]:
+    if analysis_path is not None:
+        return (_completed_artifact_from_analysis(analysis_path), 1)
+    if output_directory is None:  # argparse enforces this; retain a safe API boundary.
+        raise ValueError("analysis 또는 output directory가 필요합니다.")
+    completed = discover_completed_artifact_sets(output_directory)
+    if not completed:
+        raise ValueError(
+            "출력 폴더에서 같은 타임스탬프의 완성된 "
+            "analysis/render-plan/selection/MP4 세트를 찾지 못했습니다."
+        )
+    return (completed[-1], len(completed))
+
+
+def _post_render_qa_policy_arguments(analysis_path: Path) -> dict:
+    """Recover the same independently loaded IVE policy, not report thresholds.
+
+    A stored review cannot select easier release thresholds. This standalone
+    recovery path accepts only the current shipped profile identity; different
+    or missing identities need an explicit migration, not a default-policy QA.
+    """
+    analysis = json.loads(analysis_path.read_text())
+    if not isinstance(analysis, dict):
+        raise ValueError("post-render analysis must be an object")
+    request = analysis.get("request") or {}
+    if (not isinstance(request, dict)
+            or str(request.get("group", "")).strip().upper() != "IVE"
+            or request.get("edit_mode") != "group"):
+        return {}
+    generation = analysis.get("stage_edit_generation")
+    declared = (generation.get("professional_montage_grammar_profile")
+        if isinstance(generation, dict) else analysis.get("professional_montage_grammar_profile"))
+    policy = load_professional_montage_policy(DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH)
+    if declared != policy.profile_identity:
+        raise ValueError("IVE 후처리 QA 프로필이 현재 검증된 편집 정책과 일치하지 않습니다.")
+    return {"config": PostRenderQAConfig(rendered_montage_grammar=
+        _rendered_montage_config_from_policy(policy, require_complete_role_duration_policy=True))}
+
+
+def _run_post_render_qa(arguments: argparse.Namespace, reporter: EventReporter) -> int:
+    reporter.status("완성 렌더의 후처리 QA 대상을 확인하는 중…")
+    reporter.progress(0.02, "타임스탬프가 일치하는 산출물 세트를 찾는 중…")
+    artifact_set, completed_count = _resolve_post_render_artifact_set(
+        analysis_path=arguments.analysis,
+        output_directory=arguments.output_directory,
+    )
+    reporter.progress(
+        0.08,
+        f"{artifact_set.base_name} 산출물 4종을 확인했습니다.",
+    )
+    if arguments.output_directory is not None and completed_count > 1:
+        reporter.emit(
+            "log",
+            level="info",
+            message=(
+                f"완성 세트 {completed_count}개 중 최신 세트 "
+                f"{artifact_set.base_name}을 선택했습니다."
+            ),
+        )
+    reporter.progress(
+        0.12,
+        "ffprobe 검사와 최종 MP4 전체 프레임 디코드를 시작합니다.",
+    )
+    report, report_path = evaluate_and_write_post_render_qa(
+        artifact_set,
+        output_path=arguments.report,
+        **_post_render_qa_policy_arguments(artifact_set.analysis_path),
+    )
+    payload = report.to_dict()
+    reporter.progress(
+        1.0,
+        f"후처리 QA가 {report.verdict.value} 판정으로 완료됐습니다.",
+    )
+    reporter.result(
+        outputs=[str(report_path)],
+        qa_report=str(report_path),
+        video_path=str(artifact_set.video_path.resolve()),
+        artifact_set=artifact_set.to_dict(),
+        verdict=report.verdict.value,
+        passed=report.passed,
+        issue_count=payload["issue_count"],
+        fail_issue_count=payload["fail_issue_count"],
+        conditional_issue_count=payload["conditional_issue_count"],
+        message=(
+            f"후처리 QA {report.verdict.value}: "
+            f"{Path(report_path).name}"
+        ),
+    )
+    if report.verdict is PostRenderQAVerdict.FAIL:
+        reporter.error(
+            "완성 렌더가 후처리 QA의 필수 품질 조건을 통과하지 못했습니다. "
+            f"상세 보고서: {report_path}"
+        )
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    _prepare_analysis_process_group()
+    if arguments.command == "doctor":
+        report = runtime_report()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["ready"] else 1
+
+    if arguments.command == "build-reference-dataset":
+        output = build_reference_dataset_file(
+            arguments.attribution,
+            arguments.output,
+            style_id=arguments.style_id,
+            reference_id=arguments.reference_id,
+        )
+        print(output)
+        return 0
+
+    if arguments.command == "resolve-reference-attribution":
+        output = resolve_reference_attribution_file(
+            arguments.evidence,
+            arguments.output,
+        )
+        print(output)
+        return 0
+
+    if arguments.command == "augment-reference-boundaries":
+        augmentation, evidence_output, attribution_output = (
+            augment_reference_boundary_requests_file(
+                arguments.evidence,
+                arguments.output,
+                attribution_output_path=arguments.attribution_output,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "analysis": "unknown_aware_reference_boundary_augmentation_v1",
+                    "evidence_output": str(evidence_output),
+                    "attribution_output": (
+                        str(attribution_output)
+                        if attribution_output is not None
+                        else None
+                    ),
+                    "added_request_count": augmentation.added_request_count,
+                    "added_resolved_hard_cut_count": (
+                        augmentation.added_resolved_hard_cut_count
+                    ),
+                    "total_resolved_hard_cut_count": (
+                        augmentation.resolved_hard_cut_count
+                    ),
+                    "skip_reason_counts": dict(
+                        augmentation.skip_reason_counts
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if arguments.command == "professional-reference-gate":
+        profile = ProfessionalReferenceProfile.from_file(arguments.profile)
+        review_document = json.loads(arguments.review.read_text(encoding="utf-8"))
+        if not isinstance(review_document, dict):
+            raise ValueError("proxy review JSON root must be an object")
+        raw_review, review_container_field = _decoded_proxy_review_from_document(
+            review_document
+        )
+        gate = evaluate_professional_reference_review(raw_review, profile)
+        gate.payload["candidate_evidence"] = {
+            "document_path": str(arguments.review.expanduser().resolve()),
+            "document_sha256": _sha256_file(arguments.review),
+            "review_container_field": review_container_field,
+            "no_rerender": True,
+        }
+        output = gate.write(arguments.output) if arguments.output else None
+        print(
+            json.dumps(
+                {
+                    "analysis": gate.payload["analysis"],
+                    "passed": gate.passed,
+                    "profile_path": str(profile.profile_path),
+                    "profile_sha256": profile.profile_sha256,
+                    "reference_count": profile.reference_count,
+                    "reference_cut_count": profile.reference_cut_count,
+                    "candidate_visible_cut_count": gate.payload[
+                        "candidate_visible_cut_count"
+                    ],
+                    "technical_issue_count": gate.payload[
+                        "technical_integrity"
+                    ]["issue_count"],
+                    "failed_components": [
+                        name
+                        for name, result in gate.payload["components"].items()
+                        if not bool(result["passed"])
+                    ],
+                    "output": str(output) if output is not None else None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if gate.passed else 1
+
+    reporter = EventReporter()
+    try:
+        if arguments.command == "post-render-qa":
+            return _run_post_render_qa(arguments, reporter)
+        request = AnalysisRequest.from_json_file(arguments.request)
+        reporter.status(
+            f"IVE {request.song} · {request.edit_mode.value} · {request.aspect_ratio.value}"
+        )
+        review_first_deadline = (
+            arguments.workflow_worker_deadline
+            if arguments.workflow_worker_deadline is not None
+            else monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
+            if bool(getattr(request, "review_first_enabled", False))
+            else None
+        )
+        with enforce_review_first_deadline(
+            review_first_deadline,
+            stage="source acquisition, analysis, render, and final QA",
+        ):
+            acquisition = None
+            if request.source_mode is SourceMode.AUTOMATIC:
+                acquisition = acquire_sources(request, reporter)
+                if request.acquire_only:
+                    reporter.progress(1.0, "IVE 소스 수집을 완료했습니다.")
+                    source_paths = [str(path) for path in acquisition.source_paths]
+                    reporter.result(
+                        outputs=source_paths,
+                        source_paths=source_paths,
+                        acquisition_manifest=str(acquisition.manifest_path),
+                        member_anchors=[
+                            anchor.as_dict() for anchor in acquisition.member_anchors
+                        ],
+                        message=(
+                            f"IVE {request.song} 소스 {len(source_paths)}개를 "
+                            "로컬 캐시에 준비했습니다."
+                        ),
+                    )
+                    return 0
+                request = request.with_materialized_sources(
+                    acquisition.source_paths,
+                    member_anchors=acquisition.member_anchors,
+                )
+                pipeline_reporter = ProgressRangeReporter(
+                    reporter,
+                    start=0.20,
+                    end=1.0,
+                )
+            else:
+                pipeline_reporter = reporter
+            artifact = analyze(
+                request,
+                pipeline_reporter,
+                allow_failed_comparison_render=(
+                    arguments.allow_failed_comparison_render
+                ),
+                review_rendered_proxies=(
+                    request.source_mode is SourceMode.AUTOMATIC
+                    and request.edit_mode.value == "group"
+                ),
+                review_first_deadline_monotonic_seconds=(
+                    review_first_deadline
+                ),
+                acquisition_identity_authority=(
+                    acquisition.member_identity_authority
+                    if acquisition is not None
+                    else None
+                ),
+                group_broadcast_slot_hints=(
+                    getattr(acquisition, "group_broadcast_slot_hints", ())
+                    if acquisition is not None else ()
+                ),
+            )
+        warnings = artifact.manifest.get("warnings") or []
+        for warning in warnings:
+            reporter.emit("log", level="warning", message=warning)
+        video_exposed = _result_contains_exposable_video(artifact)
+        artifact_role = artifact.manifest.get("artifact_role")
+        reporter.result(
+            outputs=[str(path) for path in artifact.output_paths],
+            artifact_result=(
+                artifact.manifest.get("post_render_qa", {}).get(
+                    "review_first_disposition"
+                )
+                if video_exposed else None
+            ),
+            source_paths=(
+                [str(path) for path in acquisition.source_paths]
+                if acquisition is not None
+                else [str(path) for path in request.sources]
+            ),
+            acquisition_manifest=(
+                str(acquisition.manifest_path) if acquisition is not None else None
+            ),
+            member_anchors=(
+                [anchor.as_dict() for anchor in acquisition.member_anchors]
+                if acquisition is not None
+                else [anchor.as_dict() for anchor in request.member_anchors]
+            ),
+            message=(
+                "QA 통과 전 확인할 검토용 교차편집 초안이 생성되었습니다."
+                if video_exposed and artifact_role == "review_ready"
+                else (
+                    "IVE 멤버 교차직캠이 완성되었습니다."
+                    if request.edit_mode.value == "member"
+                    else "IVE 그룹 교차편집이 완성되었습니다."
+                )
+                if video_exposed
+                else "IVE 분석은 완료됐지만 안전 게이트 때문에 영상은 만들지 않았습니다."
+            ),
+        )
+        return 0
+    except ReviewFirstDeadlineExceeded as exc:
+        reporter.error(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        reporter.error("작업이 취소되었습니다.")
+        return 130
+    except Exception as exc:  # CLI boundary: convert failures to the JSONL contract.
+        reporter.error(str(exc))
+        if getattr(arguments, "debug", False):
+            traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+def supervised_main(argv: list[str] | None = None) -> int:
+    """The native app entry point, including non-interruptible native calls."""
+    from crosscut.workflow_supervisor import run_supervised_workflow
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    parsed = _parser().parse_args(args)
+    if parsed.command != "analyze" or parsed.workflow_worker_deadline is not None:
+        return main(args)
+    # Both the default review path and opt-in strict comparison path own one
+    # acquisition-to-QA budget. The worker cannot restart it per candidate.
+    _prepare_analysis_process_group()
+    deadline = monotonic() + REVIEW_FIRST_TOTAL_BUDGET_SECONDS
+    try:
+        AnalysisRequest.from_json_file(parsed.request)
+        return run_supervised_workflow(
+            [sys.executable, str(Path(__file__).resolve()), *args,
+             "--workflow-worker-deadline", str(deadline)],
+            absolute_deadline_monotonic_seconds=deadline,
+        )
+    except subprocess.TimeoutExpired:
+        EventReporter().error(
+            "작업 전체 시간 제한을 초과해 하위 작업을 종료했습니다. "
+            "검증되지 않은 영상은 결과로 공개하지 않습니다."
+        )
+        return 1
+    except KeyboardInterrupt:
+        EventReporter().error("작업이 취소되었습니다.")
+        return 130
+    except Exception as exc:
+        EventReporter().error(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(supervised_main())

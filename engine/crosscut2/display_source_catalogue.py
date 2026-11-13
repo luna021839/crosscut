@@ -1,0 +1,439 @@
+"""Source-local physical observation catalogue and declared content quadrature.
+
+K always reads exact cached native inputs. Content integration uses nearest
+cached face/body rasters within six output frames and the same native shot;
+it does NOT claim a dense person track or new all-frame observations.
+"""
+import numpy as np
+from .physical_display_observations import (focal_metadata, duplicate_wrists,
+    UNMEASURED, MODEL_ONLY, PIXEL_SUPPORTED, CONTRADICTED)
+from .played_partial_pose import source_activity
+from .source_clock_action import endpoint_correspondence
+
+
+def upper_body_crop_loss(valid,projected):
+    """A focal close-up need not retain hips; its observed arms still matter.
+
+    Formation coverage has its separate original-family people term. A
+    face-count label cannot certify that a shot must show the lower body.
+    This changes framing preference only, not pose support or cut admission.
+    """
+    valid=np.asarray(valid)[...,:6];projected=np.asarray(projected)[...,:6,:]
+    lost=valid&((projected<0).any(-1)|(projected>1).any(-1))
+    return lost.sum(-1)/np.maximum(1,valid.sum(-1))
+
+
+def added_pixel_upscale_effort(displayed_height,native_pixels,measured,zoom,*,output_height):
+    """Only added interpolation beyond the original native-view sampling.
+
+    A 4K→1080p crop can enlarge a face without upsampling a single pixel.
+    Existing ROI readability still scores blur/clipping/native detail. No
+    measurement means the previous finite zoom effort, not a passing face.
+    """
+    shown,native,known,z=np.broadcast_arrays(displayed_height,native_pixels,measured,zoom)
+    need=shown*output_height/np.maximum(1e-9,native)
+    base=need/z
+    added=np.maximum(0.,np.log2(np.maximum(1e-9,need)))-np.maximum(0.,np.log2(np.maximum(1e-9,base)))
+    return np.where(known,np.maximum(0.,added),np.log2(z))
+
+
+def native_sampling_pixels(bank):
+    """Separate source pixel sampling from an optional facial blur observation.
+
+    Existing ROI records store face-height-in-native-pixels. Their ratio to
+    the same source-normalized box independently recovers the integer image
+    height. Only unanimous, float32-roundoff-consistent records permit this
+    transfer to other actually observed faces from that source. No blur,
+    contrast, missing face, or intervening person track is invented.
+    """
+    heads=np.asarray(bank['heads']);shape=heads.shape[:3]
+    values=np.asarray(bank.get('native_readability',np.zeros(shape+(4,))))
+    roi=np.asarray(bank.get('native_readability_valid',np.zeros(shape,bool)))
+    observed=np.asarray(bank.get('face_observation_valid',np.ones(shape[:2],bool)))
+    seen=(heads[...,2]>.019)&(heads[...,3]>=.75)&observed[...,None]
+    pixels=np.where(roi,values[...,3],0.).astype(float)
+    known=roi&seen&(pixels>0)
+    measured=pixels[known]/heads[...,2][known]
+    if len(measured):
+        heights=np.rint(measured)
+        height=int(heights[0])
+        tolerance=8*np.finfo(np.float32).eps*max(1,height)
+        if (0<height<=16384 and np.all(heights==height)
+                and np.all(np.abs(measured-height)<=tolerance)):
+            added=seen&~known
+            pixels[added]=heads[...,2][added].astype(float)*height
+            known|=added
+    return pixels,known
+
+
+class SourceCatalogue:
+    def __init__(self, nodes, bank, poses, rows, style, events, *, fps,member_hints=None,featured_factor=None,subjects=None,
+                 editorial_content=False,framing_evidence=None,person_attention=False,output_height=None,
+                 original_person_attention=False,direct_face_appearance=False,preferred_focal_height=.12):
+        if output_height is not None and (type(output_height) is not int or not 1<=output_height<=8192):
+            raise ValueError('Actual positive integer output pixel height required')
+        self.nodes=np.asarray(nodes,int);self.bank=bank;self.fps=fps;self.final=int(nodes[-1]);self.style=style
+        self.direct_face_appearance=bool(direct_face_appearance)
+        if self.direct_face_appearance:
+            vectors=np.asarray(bank.get('direct_face_vectors'));known=np.asarray(bank.get('direct_face_known'))
+            family=bank.get('direct_face_descriptor_family','');shape=bank['heads'].shape[:-1]
+            if (vectors.shape!=shape+(512,) or known.shape!=shape or known.dtype!=bool
+                    or not np.isfinite(vectors).all() or not isinstance(family,str) or len(family)!=64
+                    or np.any(np.abs(np.linalg.norm(vectors[known],axis=-1)-1.)>.001)):
+                raise ValueError('explicit source-bound direct face query fields required')
+        self.output_height=output_height
+        from .editorial_roles import focal_height_preference
+        self.preferred_focal_height=focal_height_preference(preferred_focal_height)
+        if self.preferred_focal_height!=.12 and not(editorial_content and output_height is not None):
+            raise ValueError('Changed focal size preference requires output-bound editorial content')
+        self.subjects=subjects
+        self.editorial_content=bool(editorial_content)
+        self.framing_evidence=framing_evidence
+        self.person_attention=bool(person_attention)
+        self.original_person_attention=bool(original_person_attention)
+        if self.original_person_attention and (not self.person_attention or 'original_people_observations' not in bank):
+            raise ValueError('original person competition requires explicit full-image observations and attention')
+        N=len(nodes);self.body=np.zeros((N,4,3,8,3),np.float32) if poses is None else np.asarray(poses,np.float32).copy()
+        self.member_hints=np.full(bank['heads'].shape[:3],-1,int) if member_hints is None else np.asarray(member_hints,int)
+        self.featured_factor=np.ones(bank['heads'].shape[:3]) if featured_factor is None else np.asarray(featured_factor,float)
+        if (self.member_hints.shape!=bank['heads'].shape[:3] or self.featured_factor.shape!=self.member_hints.shape
+                or not np.isfinite(self.featured_factor).all() or np.any((self.featured_factor<0)|(self.featured_factor>1.+1e-9))):
+            raise ValueError('source/head-bound soft featured-member evidence required')
+        self.evidence=np.where(self.body[...,2]>=.3,MODEL_ONLY,UNMEASURED).astype(np.uint8)
+        self.salience=np.full((N,2,8),.85,np.float32)
+        for row in rows:
+            raw=row.get('raw_body_hypotheses',row['body'])
+            for n,side in zip(*np.nonzero((row['indices']>=0)&(row['indices']<3))):
+                h=int(row['indices'][n,side]);sl=slice(side*2,side*2+2)
+                self.body[n,sl,h]=raw[n,sl]
+                reliability=row.get('body_reliability')
+                if reliability is not None and row.get('pixel_part_scope',np.zeros(N,bool))[n]:
+                    kind=np.where(reliability[n,sl]==1.,PIXEL_SUPPORTED,
+                        np.where(reliability[n,sl]==0.,CONTRADICTED,MODEL_ONLY))
+                    self.evidence[n,sl,h]=np.where(raw[n,sl,:,2]>=.3,kind,UNMEASURED)
+                if 'utility_parts' in row:self.salience[n,side,h]=np.exp(-row['utility_parts']['salience'][n,side]/1.1)
+        self.original_people=None
+        if 'original_people_observations' in bank:
+            from .original_people_subjects import OriginalPeople
+            self.original_people=OriginalPeople(bank)
+            self.body=self.original_people.body
+            self.evidence=np.where(self.original_people.supported,MODEL_ONLY,UNMEASURED).astype(np.uint8)
+        self.body_capacity=self.body.shape[2]
+        self.ambiguity=duplicate_wrists(self.body)
+        self.endpoint_matches=(self.original_people.endpoint_matches if self.original_people is not None else
+            endpoint_correspondence(bank['heads'],bank['vectors']) if 'vectors' in bank else np.full((N,3),-1,int))
+        self.physical=np.ones((N,2),bool)
+        self.native=np.asarray(bank['pose_native_indices'],int)
+        self.person_boxes=None
+        self.person_target_indices=None
+        if self.person_attention:
+            if self.original_person_attention:
+                mapping={native:np.c_[np.clip(row['boxes'],0.,1.),row['scores']]
+                    for native,row in self.original_people.raw['by_native'].items()}
+                self.person_target_indices=self.original_people.person_indices[:,[1,2]].copy()
+            else:mapping=bank.get('person_rectangles_by_native',{})
+            maximum=max((len(v) for v in mapping.values()),default=0)
+            self.person_boxes=np.zeros((N,2,max(1,maximum),5),np.float32)
+            for n,side in np.ndindex(N,2):
+                values=mapping.get(int(bank['native_indices'][n,side]))
+                if values is not None:self.person_boxes[n,side,:len(values)]=values
+        native_cuts=np.asarray(bank.get('native_cut_frames',[]),int)
+        for side in (0,1):
+            a,b=self.native[:,2*side],self.native[:,2*side+1]
+            self.physical[:,side]=b>a
+            for n,(first,last) in enumerate(zip(a,b)):
+                self.physical[n,side]&=not np.any((native_cuts>first)&(native_cuts<=last))
+            self.physical[:,side]&=(self.nodes-7>=0) if side==0 else (self.nodes+6<self.final)
+        self.quality=np.full(bank['heads'].shape[:3],.5,np.float32)
+        if 'native_readability_valid' in bank:
+            contrast,edge,clipped,height=np.moveaxis(bank['native_readability'],-1,0)
+            q=np.minimum(1.,height/120.)*np.minimum(1.,edge/.5)*np.minimum(1.,contrast/.075)*(1.-clipped)
+            self.quality=np.where(bank['native_readability_valid'],q,self.quality)
+        self.black=np.clip((style['presence'][...,0]-.8)/.2,0,1)
+        from .scene_readout import roi_readability
+        self.roi_readability,self.roi_readability_valid=roi_readability(bank)
+        self.native_face_pixels,self.native_face_pixels_measured=native_sampling_pixels(bank)
+        # Explicit numerical integration domain; never used as native K proof.
+        ticks=np.clip(self.nodes[:,None]+[-1,0],0,self.final-1).ravel()
+        measured=np.asarray(bank.get('face_observation_valid',np.ones((N,2),bool)))
+        if measured.shape!=(N,2) or measured.dtype!=bool:
+            raise ValueError('one explicit face observation availability per native endpoint required')
+        # A fine decision node with no source observation is not a detector-
+        # observed empty frame. It cannot erase nearby genuine quadrature
+        # samples or quietly make the most densely observed source cheapest.
+        order=np.flatnonzero(measured.ravel());order=order[np.argsort(ticks[order],kind='stable')]
+        ordered=ticks[order]
+        frames=np.arange(self.final);right=np.searchsorted(ordered,frames)
+        if len(ordered):
+            a=np.maximum(0,right-1);b=np.minimum(len(ordered)-1,right)
+            chosen=np.where(frames-ordered[a]<ordered[b]-frames,a,b)
+            original=order[chosen];self.near_n=original//2;self.near_side=original%2
+            closest=ordered[chosen];cuts=np.asarray(events,int)
+            self.content_scope=(np.abs(closest-frames)<=6)&(np.searchsorted(cuts,closest,side='right')==np.searchsorted(cuts,frames,side='right'))
+        else:
+            self.near_n=np.zeros(self.final,int);self.near_side=np.zeros(self.final,int)
+            self.content_scope=np.zeros(self.final,bool)
+        # Activity belongs to the SAME physical face sample used by rates(),
+        # not to the source or the face dominant in an unrelated native crop.
+        # Pose is unavailable for face3..7: those faces cannot borrow face0's
+        # motion. This is bounded sample quadrature, not a dense actor track.
+        self.own=np.zeros(bank['heads'].shape[:3])
+        for n in range(N):
+            for side in (0,1):
+                sl=slice(2*side,2*side+2)
+                for h in range(self.body_capacity):
+                    observation=dict(head=bank['heads'][n,side,h],body=self.body[n,sl,h],
+                        evidence=self.evidence[n,sl,h],ownership_ambiguity=self.ambiguity[n,sl,h],
+                        physical_window_valid=bool(self.physical[n,side]),native_indices=self.native[n,sl])
+                    self.own[n,side,h]=source_activity(observation,fps=fps)
+
+    def target_readability(self,n,side,head_index,*,displayed_height=None):
+        """Same original-detail ROI units for content and proposal quality.
+
+        UNKNOWN retains its explicit neutral.5 and separate validity mask.
+        Native detail remains unchanged. When output dimensions are explicit,
+        readable screen size belongs to the actual crop, not the original
+        broadcast view. Equally sampled, equally sized faces then agree.
+        """
+        height=self.bank['heads'][n,side,head_index,2]
+        size=np.minimum(1.,height/self.preferred_focal_height)
+        if self.output_height is not None and displayed_height is not None:
+            # Preserve the native view's float32 convention exactly; only a
+            # genuinely changed output size receives a different size factor.
+            size=np.where(np.asarray(displayed_height)==height,size,
+                np.minimum(1.,np.asarray(displayed_height)/self.preferred_focal_height))
+        return self.roi_readability[n,side,head_index]*size
+
+    def body_subject_context(self,n,side,h):
+        """Camera-independent body evidence for fixed delivery targets too.
+
+        Head motion may reuse an old face track while a contradicted ROI arm
+        may not. All body consumers must use the same derived support mask.
+        This native strip only requests that context; it is never held as a
+        candidate camera or copied across the actual film interval.
+        """
+        if self.subjects is None:return None
+        if self.original_people is None:return self.subjects.sample(n,side,h)
+        if not 0<=h<self.bank['heads'].shape[2]:return None
+        head=self.bank['heads'][n,side,h]
+        if head[2]<=.019 or head[3]<.75:return None
+        return self.observation(n,side,np.tile([1.,.5,.5],(7,1)),target_head_index=int(h)).get('dense_subject_context')
+
+    def observation(self,n,side,camera_strip,*,target_head_index=None,include_subjects=True):
+        camera_strip=np.asarray(camera_strip,float)
+        camera=camera_strip[-1 if side==0 else 0]
+        heads=self.bank['heads'][n:n+1,side:side+1]
+        selected,index,ambiguity,scene=focal_metadata(heads,camera.reshape(1,1,3))
+        displayed=int(index[0,0]);h=displayed;sl=slice(side*2,side*2+2)
+        target_attention=1. if displayed>=0 else 0.
+        if target_head_index is not None:
+            if (type(target_head_index) is not int or not 0<=target_head_index<heads.shape[2]
+                    or heads[0,0,target_head_index,2]<=.019 or heads[0,0,target_head_index,3]<.75):
+                raise ValueError('pinned target must be an actually observed face at this endpoint')
+            h=target_head_index
+            selected=heads[:,:,h].copy()
+            center=.5+camera[0]*(heads[0,0,:,:2]-camera[1:])
+            size=heads[0,0,:,2]*camera[0]
+            half=size[:,None]*[.45*9/16,.5]
+            extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
+            score=extent.prod(-1)*np.exp(-((center[:,0]-.5)/.4)**2)
+            score=np.where((heads[0,0,:,2]>.019)&(heads[0,0,:,3]>=.75),score,0.)
+            target_attention=float(score[h]/max(1e-12,float(score.max())))
+        body=np.zeros((2,8,3),np.float32) if not 0<=h<self.body_capacity else self.body[n,sl,h]
+        evidence=np.zeros((2,8),np.uint8) if not 0<=h<self.body_capacity else self.evidence[n,sl,h]
+        ownership=np.zeros((2,8),bool) if not 0<=h<self.body_capacity else self.ambiguity[n,sl,h]
+        appearance=np.zeros(128,np.float32)
+        if 0<=h<3 and 'vectors' in self.bank:
+            appearance=np.asarray(self.bank['vectors'][n,side,h],np.float32).copy()
+        appearance.setflags(write=False)
+        endpoint_native=int(self.native[n,1 if side==0 else 2])
+        before=h if side==0 else next((a for a,b in enumerate(self.endpoint_matches[n]) if b==h and b>=0),-1)
+        after=int(self.endpoint_matches[n,before]) if 0<=before<self.body_capacity else -1
+        if side==1:after=h
+        cuts=np.asarray(self.bank.get('native_cut_frames',[]),int)
+        if np.any((cuts>self.native[n,1])&(cuts<=self.native[n,2])):
+            if side==0:after=-1
+            else:before=-1
+        common=0<=h<self.body_capacity
+        common_body=np.zeros((4,8,3),np.float32);common_evidence=np.zeros((4,8),np.uint8);common_ambiguity=np.zeros((4,8),bool)
+        common_heads=np.zeros((4,4),np.float32);sample_mask=np.zeros(4,bool)
+        common_readability=np.full(4,.5);common_readability_valid=np.zeros(4,bool)
+        if common:
+            for source_side,target in enumerate((before,after)):
+                if not 0<=target<self.body_capacity:continue
+                endpoint=1 if source_side==0 else 2
+                slots=[endpoint]
+                if self.physical[n,source_side]:slots.append(0 if source_side==0 else 3)
+                for slot in slots:
+                    common_body[slot]=self.body[n,slot,target];common_evidence[slot]=self.evidence[n,slot,target]
+                    common_ambiguity[slot]=self.ambiguity[n,slot,target]
+                    common_heads[slot]=self.bank['heads'][n,source_side,target];sample_mask[slot]=True
+                common_readability[endpoint]=self.roi_readability[n,source_side,target]
+                common_readability_valid[endpoint]=self.roi_readability_valid[n,source_side,target]
+        elif h>=0:
+            # A fourth/later face has no cached body/appearance chain, but
+            # its actually pinned endpoint face is still observed. Do not
+            # discard that face or attach face0's body to fill the gap.
+            endpoint=1 if side==0 else 2
+            common_heads[endpoint]=self.bank['heads'][n,side,h];sample_mask[endpoint]=True
+            common_readability[endpoint]=self.roi_readability[n,side,h]
+            common_readability_valid[endpoint]=self.roi_readability_valid[n,side,h]
+        style_valid=bool(h>=0 and 'colour_valid' in self.style and self.style['colour_valid'][n,side,h])
+        colour=self.style['colour'][n,side,h].copy() if style_valid else np.zeros((2,40))
+        original_heads=np.zeros((4,8,4),np.float32)
+        original_heads[[1,2]]=self.bank['heads'][n]
+        visible_quality=0.
+        if h>=0:
+            head=selected[0,0];center=.5+camera[0]*(head[:2]-camera[1:])
+            half=head[2]*camera[0]*np.array([.45*9/16,.5])
+            extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
+            fraction=float(np.prod(extent/np.maximum(1e-9,2*half)))
+            if self.editorial_content:
+                visible_quality=float(self.target_readability(n,side,h,displayed_height=head[2]*camera[0])
+                    *fraction*self.featured_factor[n,side,h])
+            else:
+                visible_quality=float(np.sqrt(self.quality[n,side,h])*min(1.,head[2]*camera[0]/.22)
+                    *np.sqrt(self.salience[n,side,h])*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,h])
+        result=dict(head=selected[0,0],head_index=h,body=body,evidence=evidence,
+            ownership_ambiguity=ownership,physical_window_valid=bool(self.physical[n,side]),
+            native_indices=self.native[n,sl],camera_strip=camera_strip,side=side,
+            focal_ambiguity=float(ambiguity[0,0]),scene_kind=int(scene[0,0]),
+            target_pinned_before_camera=target_head_index is not None,
+            displayed_focal_head_index=displayed,target_is_displayed_focal=h==displayed,
+            target_attention_ratio=target_attention,
+            source_clock_body=common_body,source_clock_evidence=common_evidence,
+            source_clock_ambiguity=common_ambiguity,source_clock_subject_associated=common,
+            source_clock_endpoint_head_proxies=common_heads,
+            source_clock_observed_sample_mask=sample_mask,
+            source_clock_canonical_frame=int(self.nodes[n]),
+            source_clock_final_frame=self.final,
+            source_clock_subject_key=(int(self.nodes[n]),int(before),int(after)),
+            source_clock_output_frames=np.clip(int(self.nodes[n])+np.array([-7,-1,0,6]),0,self.final-1),
+            source_clock_native_indices=self.native[n].copy(),
+            source_clock_original_heads=original_heads,
+            source_clock_native_roi_readability=common_readability,
+            source_clock_native_roi_measured=common_readability_valid,
+            source_colour_histogram=colour,source_colour_valid=style_valid,
+            displayed_native_quality_proxy=visible_quality,
+            displayed_native_quality_measured=bool(h>=0 and self.roi_readability_valid[n,side,h]),
+            native_face_pixels=(0. if h<0 else float(self.native_face_pixels[n,side,h])),
+            native_face_pixels_measured=bool(h>=0 and self.native_face_pixels_measured[n,side,h]),
+            native_pixel_sampling_is_not_ROI_readability=True,
+            actual_output_pixel_height=self.output_height,
+            editorial_preferred_focal_height=self.preferred_focal_height,
+            target_native_ROI_readability=(0. if h<0 else float(self.roi_readability[n,side,h])),
+            target_original_role_factor=(0. if h<0 else float(self.featured_factor[n,side,h])),
+            displayed_native_quality_contract=('native_ROI_detail_actual_displayed_size_visibility_original_role_v2'
+                if self.editorial_content and self.output_height is not None else
+                'target_ROI_native_detail_visibility_original_role_v1' if self.editorial_content else 'legacy_display_quality_v1'),
+            recurrent_member_hint=-1 if h<0 else int(self.member_hints[n,side,h]),
+            individual_member_score_profile=(np.zeros(6) if h<0 or 'member_score_profiles' not in self.bank
+                else self.bank['member_score_profiles'][n,side,h]),
+            individual_member_score_support=(0. if h<0 or 'member_score_support' not in self.bank
+                else float(self.bank['member_score_support'][n,side,h])),
+            individual_member_score_directly_observed=bool(h>=0 and 'member_score_directly_observed' in self.bank
+                and self.bank['member_score_directly_observed'][n,side,h]),
+            individual_member_score_gallery=self.bank.get('member_score_gallery_identity',''),
+            source_clock_context_is_sparse_model_hypothesis=True,
+            appearance_vector=appearance,appearance_is_not_named_identity=True,
+            person_native_ordinal=endpoint_native,
+            person_rectangles=self.bank.get('person_rectangles_by_native',{}).get(endpoint_native))
+        if self.direct_face_appearance:
+            result.update(direct_face_vector=(np.zeros(512,np.float32) if h<0 else self.bank['direct_face_vectors'][n,side,h]),
+                direct_face_known=bool(h>=0 and self.bank['direct_face_known'][n,side,h]),
+                direct_face_descriptor_family=self.bank['direct_face_descriptor_family'])
+        if self.person_attention:
+            from .person_attention import competition
+            target=None if self.person_target_indices is None else int(self.person_target_indices[n,side,h]) if h>=0 else -1
+            value=competition(self.person_boxes[n,side],selected[0,0],camera,target_index=target)
+            if self.original_person_attention:
+                result.update(person_target_rectangle_index=target,person_rectangles=self.person_boxes[n,side],
+                    person_competition_box_family=self.original_people.raw['family'])
+            result.update(person_competition_deficit=float(value['deficit']),
+                person_competition_measured=bool(value['measured']),
+                person_competition_is_not_occlusion_or_ownership=True)
+            if value['measured']:
+                result['displayed_native_quality_proxy']*=1.-float(value['deficit'])
+        if self.original_people is not None:
+            return self.original_people.attach_context(result,n,side,h,self.subjects if include_subjects else None)
+        return result if self.subjects is None or not include_subjects else self.subjects.augment(result,n,side,h)
+
+    def rates(self,frames,cameras):
+        """Vectorized (...,len(frames),3) replay camera content rates."""
+        frames=np.asarray(frames,int);camera=np.asarray(cameras,float)
+        if camera.shape[-2:]!=(len(frames),3) or frames.min(initial=0)<0 or frames.max(initial=0)>=self.final:
+            raise ValueError('actual finite source-local replay frame/camera domain required')
+        n,side=self.near_n[frames],self.near_side[frames]
+        heads=self.bank['heads'][n,side]
+        center=.5+camera[...,None,:1]*(heads[...,:2]-camera[...,None,1:])
+        size=heads[...,2]*camera[...,None,0]
+        half=size[...,None]*[.45*9/16,.5]
+        extent=np.maximum(0.,np.minimum(1.,center+half)-np.maximum(0.,center-half))
+        scores=np.prod(extent,-1)*np.exp(-((center[...,0]-.5)/.4)**2)
+        seen=(heads[...,2]>.019)&(heads[...,3]>=.75)&self.content_scope[frames,None]
+        scores=np.where(seen,scores,0.);index=scores.argmax(-1)
+        h=heads[np.arange(len(frames)),index]
+        displayed_height=h[...,2]*camera[...,0]
+        focal_center=.5+camera[...,:1]*(h[...,:2]-camera[...,1:])
+        focal_half=displayed_height[...,None]*[.45*9/16,.5]
+        focal_extent=np.maximum(0.,np.minimum(1.,focal_center+focal_half)-np.maximum(0.,focal_center-focal_half))
+        fraction=np.prod(focal_extent/np.maximum(1e-8,2*focal_half),axis=-1)
+        quality=self.quality[n,side,index];salience=self.salience[n,side,index]
+        visibility=np.sqrt(quality)*np.minimum(1.,displayed_height/.22)*np.sqrt(salience)*fraction*(1.-self.black[n,side])*self.featured_factor[n,side,index]
+        visibility=np.where(scores.max(-1)>0,np.clip(visibility,0,1),0.)
+        body=self.body[n,np.where(side==0,1,2),np.minimum(index,self.body_capacity-1)]
+        valid=(body[...,2]>=.3)&(body[...,:2]>=0).all(-1)&(body[...,:2]<=1).all(-1)
+        valid&=(index<self.body_capacity)[...,None]&self.content_scope[frames,None]
+        projected=.5+camera[...,None,:1]*(body[...,:2]-camera[...,None,1:])
+        crop=(valid&((projected<0).any(-1)|(projected>1).any(-1))).sum(-1)/np.maximum(1,valid.sum(-1))
+        if self.editorial_content:
+            zoom_effort=np.log2(camera[...,0])
+            if self.output_height is not None:
+                crop=upper_body_crop_loss(valid,projected)
+                zoom_effort=added_pixel_upscale_effort(displayed_height,self.native_face_pixels[n,side,index],
+                    self.native_face_pixels_measured[n,side,index],camera[...,0],output_height=self.output_height)
+            # Native ROI deficits remain explicit; digital enlargement cannot
+            # create detail. Display size is a separate editorial preference
+            # (.12 unchanged by default), not new native detail or confidence.
+            # ROI deficits and UNKNOWN stay distinct. Global black background
+            # is style, not a recurring defect in an equally readable face.
+            readable=self.target_readability(n,side,index,displayed_height=displayed_height)
+            shown=np.where(scores.max(-1)>0,readable*fraction,0.)
+            role=1.-self.featured_factor[n,side,index]
+            # Viewer framing depends on the OUTPUT, not who zoomed it. An
+            # originally oversized face must not be exempt while an equally
+            # framed matched crop pays. This soft engineering effort leaves
+            # ordinary close-ups and every source/camera available.
+            tight=6.*np.maximum(0.,displayed_height-.30)
+            framing=0.
+            if self.framing_evidence is not None:
+                evidence=self.framing_evidence
+                target=evidence['height'][n,side];confidence=evidence['confidence'][n,side]
+                # A detector-observed EMPTY/occluded viewport is not an
+                # unobserved frame. It must not receive a free role-deficit
+                # exemption that makes legs-only footage beat readable faces.
+                # Unsupported temporal gaps remain unknown; no source ban.
+                known=self.content_scope[frames]
+                size_deficit=np.maximum(0.,np.log(np.maximum(.019,target)/np.maximum(.019,displayed_height)))/np.log(1.5)
+                # Formation evidence asks for people actually inside THIS
+                # viewport. It is not a hard requirement to show all6 always.
+                in_view=seen&(center[...,0]>=0)&(center[...,0]<=1)&(center[...,1]>=0)&(center[...,1]<=1)
+                count=(in_view&(size>=.5*np.maximum(.019,displayed_height)[...,None])).sum(-1)
+                wanted=evidence['people'][n,side]
+                coverage=np.maximum(0.,wanted-count)/np.maximum(1.,wanted)
+                framing=np.where(known,confidence*np.where(evidence['formation'][n,side],coverage,size_deficit),0.)
+            observed=1.-shown+crop+shown*role+tight+framing
+            # Missing temporal samples are neither a readable face nor an
+            # observed empty viewport. Retain the previous unfitted1 proxy,
+            # without fabricating face/framing/oversize evidence in the gap.
+            # Digital enlargement and movement still pay their real costs.
+            loss=np.where(self.content_scope[frames],observed,1.)+.1*zoom_effort
+            if self.person_attention:
+                from .person_attention import competition
+                targets=None if self.person_target_indices is None else self.person_target_indices[n,side,index]
+                value=competition(self.person_boxes[n,side],h,camera,target_index=targets)
+                # Same declared sparse quadrature as the face samples, not
+                # a dense rectangle track. Unobserved gaps retain UNKNOWN.
+                loss=loss+np.where(self.content_scope[frames],value['deficit'],.5)
+            return loss
+        return 1.-visibility+crop+.1*np.log(camera[...,0])/np.log(2.)-visibility*self.own[n,side,index]

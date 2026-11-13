@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>얼굴·동작 연결 비교 — 미평가 자료</title>
+<style>
+body{font:16px system-ui;background:#131619;color:#edf0f3;margin:24px auto;padding:0 20px;max-width:1400px}h1{font-size:24px}p{line-height:1.6;color:#bfc9d1}section{background:#1e252b;border:1px solid #3e4d57;border-radius:12px;padding:18px;margin:24px 0}.videos{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}video{width:100%;border-radius:6px;background:black}button,select,textarea{font:inherit;color:inherit;background:#283640;border:1px solid #617480;border-radius:6px;padding:8px;margin:5px 8px 5px 0}button{cursor:pointer}textarea{box-sizing:border-box;width:100%;height:65px}label{display:inline-block;margin:8px 14px 8px 0}small{color:#b4c2cc}#status{position:sticky;top:0;background:#131619;padding:12px;border-bottom:1px solid #617480;z-index:3}@media(max-width:800px){.videos{grid-template-columns:1fr}}
+</style>
+<h1>얼굴·동작 연결 비교</h1>
+<p>완성본이나 개선 승인 자료가 아닙니다. 같은 시점의 2초 영상 세 가지입니다. 가운데 순간에 얼굴 크기·위치와 팔·몸 동작이 함께 자연스럽게 이어지는지 비교해 주세요. 화려한 전환이 무조건 정답인 것은 아닙니다. 판단하기 어렵거나 전부 별로면 그대로 남겨 주세요.</p>
+<p>I AM 51–57초·XOXZ 55.5–73.4초는 이 자료에서 제외했습니다. E02는 기존에 좋다고 한 XOXZ 21–25초와 겹치므로 비교만 하고 학습에는 사용하지 않습니다. 선택은 이 브라우저에만 임시 저장되며, 외부 전송은 없습니다.</p>
+<div id="status">자료 불러오는 중…</div><main></main>
+<button id="export" disabled>평가 JSON 내보내기</button><small>원본 영상과 기존 결과물은 변경하지 않습니다.</small>
+<script>
+'use strict';
+const names={hold_A:'A 화면 유지',cut_A_B:'A → B 전환',hold_B:'B 화면 유지'};
+let packet,packetHash,labels={},activeSequence=null;const telemetry={};
+const status=document.querySelector('#status'),main=document.querySelector('main');
+function save(){localStorage.setItem('ive-preference-'+packetHash,JSON.stringify(labels));update();}
+function update(){const n=Object.values(labels).filter(x=>x.choice).length;status.textContent=`${n} / ${packet.events.length} 평가됨 · 실제 선호가 입력되기 전에는 학습되지 않습니다.`;}
+function pauseAll(except){document.querySelectorAll('video').forEach(v=>{if(v!==except)v.pause();});}
+function create(tag,text,parent){const e=document.createElement(tag);if(text)e.textContent=text;if(parent)parent.append(e);return e;}
+async function init(){
+ const response=await fetch('manifest.json',{cache:'no-store'});if(!response.ok)throw Error('manifest unavailable');
+ const raw=await response.arrayBuffer();packet=JSON.parse(new TextDecoder().decode(raw));
+ packetHash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',raw))].map(x=>x.toString(16).padStart(2,'0')).join('');
+ if(packet.contract!=='unlabelled_same_event_av_triplets_v1'||packet.actual_human_preferences_obtained!==false)throw Error('wrong packet');
+ labels=JSON.parse(localStorage.getItem('ive-preference-'+packetHash)||'{}');
+ for(const item of packet.events){
+   const section=create('section',null,main);create('h2',item.id,section);
+   const regressionOnly=item.global_seconds-30/packet.clip_fps<=25&&item.global_seconds+30/packet.clip_fps>=21;
+   if(regressionOnly)create('p','기존에 좋다고 한 구간과 겹침: 회귀 비교 전용 · 학습 제외',section);
+   create('small','중앙 연결 순간: 재생 시작 약 1초 뒤 · 모두 일반 속도(1배속)로 비교',section);
+   const grid=create('div',null,section);grid.className='videos';const videos=[];
+   telemetry[item.id]={};
+   for(const key of ['hold_A','cut_A_B','hold_B']){
+     const box=create('div',null,grid);create('h3',names[key],box);
+     const video=create('video',null,box);video.controls=true;video.preload='metadata';video.playsInline=true;video.src=item.clips[key];videos.push(video);
+     const events={normal_speed_started:false,ended:false};telemetry[item.id][key]=events;
+     video.addEventListener('play',()=>{if(activeSequence&&activeSequence.expected!==video)activeSequence.controller.abort();pauseAll(video);if(video.playbackRate===1&&!video.muted&&video.volume>0)events.normal_speed_started=true;});
+     video.addEventListener('ended',()=>events.ended=true);
+   }
+   const play=create('button','세 영상 순서대로 재생',section);
+   play.addEventListener('click',async()=>{
+     if(activeSequence&&activeSequence.button===play){activeSequence.controller.abort();pauseAll();return;}
+     if(activeSequence)activeSequence.controller.abort();
+     const sequence={controller:new AbortController(),expected:null,button:play};activeSequence=sequence;play.textContent='순서 재생 중지';
+     try{for(const video of videos){if(sequence.controller.signal.aborted)break;sequence.expected=video;pauseAll(video);video.currentTime=0;video.playbackRate=1;video.muted=false;
+       const finished=new Promise(resolve=>{const done=()=>{video.removeEventListener('ended',done);sequence.controller.signal.removeEventListener('abort',done);resolve();};video.addEventListener('ended',done,{once:true});sequence.controller.signal.addEventListener('abort',done,{once:true});});
+       await video.play();await finished;}}
+     finally{if(activeSequence===sequence)activeSequence=null;play.textContent='세 영상 순서대로 재생';}
+   });
+   const line=create('div',null,section);const label=create('label','가운데 연결이 가장 나은 선택: ',line);const select=create('select',null,label);
+   for(const [value,title] of [['','선택 안 함'],...Object.entries(names),['tie','셋이 비슷함'],['all_bad','셋 다 별로임'],['uncertain','판단 불가']]){const o=create('option',title,select);o.value=value;}
+   const note=create('textarea',null,section);note.placeholder='어느 손·팔·몸 동작 / 얼굴 크기 때문에 그렇게 느꼈는지 (선택)';
+   const row=labels[item.id]||{};select.value=row.choice||'';note.value=row.note||'';
+   const confirmLabel=create('label',null,section);const confirm=create('input',null,confirmLabel);confirm.type='checkbox';confirm.checked=!!row.self_reported_normal_av;
+   confirmLabel.append(document.createTextNode('세 영상을 1배속·소리와 함께 확인했음 (자가 확인)'));
+   function changed(){labels[item.id]={id:item.id,choice:select.value,note:note.value,self_reported_normal_av:confirm.checked,regression_only:regressionOnly,provenance:'user_browser_choice',at:new Date().toISOString()};save();}
+   select.addEventListener('change',changed);note.addEventListener('input',changed);confirm.addEventListener('change',changed);
+ }
+ document.querySelector('#export').disabled=false;update();
+}
+document.querySelector('#export').addEventListener('click',()=>{
+ const payload={contract:'same_event_user_preference_annotations_v1',packet_sha256:packetHash,
+   labels:Object.values(labels),playback_events_advisory_only:telemetry,
+   playback_events_do_not_prove_audio_was_heard:true,professional_quality_approved:false};
+ const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'});const url=URL.createObjectURL(blob);
+ const a=document.createElement('a');a.href=url;a.download='IVE-same-event-user-preferences.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+init().catch(error=>status.textContent='자료를 읽지 못했습니다: '+error.message);
+</script></html>

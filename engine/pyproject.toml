@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crosscut-stage-editor"
+version = "0.1.0"
+description = "Audio-aligned performance cross-editing and visual continuity engine"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "opencv-contrib-python>=4.10",
+  "scipy>=1.14",
+  "scenedetect==0.7.1",
+  "tensorflow==2.20.0",
+  "yt-dlp[default]>=2026.8.19",
+]
+
+[project.optional-dependencies]
+sequence-context-numba = [
+  "numba==0.65.1",
+]
+native-person-onnx = [
+  "onnxruntime==1.30.0",
+]
+semantic-parts-onnx = [
+  "onnxruntime==1.30.0",
+  "Pillow==12.2.0",
+]
+stage-edit-mlx = [
+  "mlx==0.32.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+[tool.setuptools]
+packages = ["crosscut", "crosscut2"]
+
+[tool.setuptools.package-data]
+crosscut = ["models/*", "licenses/*"]

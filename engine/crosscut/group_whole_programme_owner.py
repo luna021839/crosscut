@@ -1,0 +1,501 @@
+"""Normal GROUP whole-programme owner, on the installed controller lease.
+
+This is not a second app/render pipeline. Frozen musical/native opportunities,
+one native completion, paired actor/action selection and complete metadata all
+belong to the request's existing selected_completion phase. No quality stamp
+is manufactured; the normal final renderer and decoded QA remain required.
+"""
+from dataclasses import dataclass
+import math
+from pathlib import Path
+from time import monotonic
+
+from .group_cached_native_observations import CachedNativeInventory,load_cached_native_inventory
+from .group_cached_programme_inventory import build_cached_programme_inventory
+from .group_performer_family_owner import installed_pose_model
+from .group_source_domain import GroupSourceDomain
+from .group_whole_programme_search import programme_opportunities
+
+
+@dataclass(frozen=True,slots=True)
+class WholeProgrammeContext:
+    incumbent: object
+    domain: GroupSourceDomain
+    token: object
+    deadline: float
+
+
+def freeze_whole_sensing_recipes(cached, *, fps, maximum_recipes=64):
+    """A declared whole-song sensing frontier, not an old-cut patch scope.
+
+    Keep ALL physical base runs in search. This finite frontier determines
+    only where extra NN/actor/camera work can be spent in the existing lease.
+    Source-balanced bit reversal spreads probes over the complete song.
+    """
+    from collections import defaultdict
+    if (type(maximum_recipes) is not int or not 1<=maximum_recipes<=512
+            or type(fps) not in (int,float) or not math.isfinite(fps) or fps<=0):
+        raise ValueError('whole sensing frontier needs its explicit work bound')
+    by_source=defaultdict(dict)
+    for recipe in cached.recipes:
+        run=recipe.run
+        if run.protected_reference:continue
+        group=by_source[run.request_source_index]
+        previous=group.get(run.first_output_frame)
+        rank=(abs((run.end_output_frame-run.first_output_frame)/fps-2.2),run.identity)
+        if previous is None or rank<previous[0]:group[run.first_output_frame]=(rank,recipe)
+    ordered={}
+    for source,rows in by_source.items():
+        values=[v[1] for _,v in sorted(rows.items())]
+        width=max(1,(len(values)-1).bit_length())
+        ordered[source]=[v for _,v in sorted(enumerate(values),
+            key=lambda p:(int(format(p[0],f'0{width}b')[::-1],2),p[0]))]
+    selected=[];identities=set();source_counts=defaultdict(int)
+    def add(recipe):
+        if recipe.run.identity in identities or len(selected)>=maximum_recipes:return
+        identities.add(recipe.run.identity);selected.append(recipe)
+        source_counts[recipe.run.request_source_index]+=1
+    # Retain source coverage before spending the rest on coherent incidents.
+    for source,rows in sorted(ordered.items()):
+        if rows:add(rows[0])
+    by_span=defaultdict(list)
+    for recipe in cached.recipes:
+        if not recipe.run.protected_reference:
+            by_span[recipe.run.first_output_frame,recipe.run.end_output_frame].append(recipe)
+    by_first=defaultdict(list)
+    for (a,b),rows in by_span.items():
+        if len({r.run.request_source_index for r in rows})>=2:
+            by_first[a].append((b,rows))
+    anchors=sorted(by_first)
+    width=max(1,(len(anchors)-1).bit_length())
+    anchors=[v for _,v in sorted(enumerate(anchors),
+        key=lambda p:(int(format(p[0],f'0{width}b')[::-1],2),p[0]))]
+    for anchor in anchors:
+        cursor=anchor
+        # Three adjacent spans expose entry/return seams across broadcasters.
+        # Independent time-spread shots rarely have two observed sides of any
+        # selectable cut, even when their individual holds are well observed.
+        for _ in range(3):
+            choices=by_first.get(cursor,())
+            if not choices or len(selected)>=maximum_recipes:break
+            end,rows=min(choices,key=lambda p:(abs((p[0]-cursor)/fps-2.2),
+                -len({r.run.request_source_index for r in p[1]}),p[0]))
+            for recipe in sorted(rows,key=lambda r:(source_counts[r.run.request_source_index],
+                    r.run.request_source_index,r.run.identity)):
+                add(recipe)
+            cursor=end
+        if len(selected)>=maximum_recipes:break
+    for i in range(max(map(len,ordered.values()),default=0)):
+        for source,rows in sorted(ordered.items()):
+            if i<len(rows):add(rows[i])
+    return tuple(selected)
+
+
+def _whole_native_sample_indices(recipe):
+    """The original required flank/bridge addresses, before any work cap."""
+    grid=recipe.native_frame_indices;n=len(grid)
+    if n<2:raise ValueError('whole native hold needs its exact physical sample grid')
+    selected={0,min(1,n-1),min(2,n-1),n//2,max(0,n-3),max(0,n-2),n-1}
+    anchor=0
+    for i,native in enumerate(grid):
+        if native-grid[anchor]>12:
+            selected.add(max(anchor+1,i-1));anchor=max(anchor+1,i-1)
+    return tuple(sorted(selected))
+
+
+def freeze_whole_completion_recipe_groups(cached,sensing,*,maximum_packages=64):
+    """Freeze a CUT plus its same-source continuous-HOLD comparator together.
+
+    Both tangents and both actor bridges belong to one immutable dependency
+    union. The third recipe is a physically available continuous alternative
+    over the SAME span, not an old montage cell. Normal whole-song production
+    has no frozen outside original; entry/exit dependencies of these recipes
+    are nevertheless included. Scores/NN outcomes never choose these groups.
+    """
+    from collections import defaultdict
+    from .group_performer_family_owner import digest
+    if type(maximum_packages) is not int or not 1<=maximum_packages<=64:
+        raise ValueError('joint whole sensing packages need their frozen finite bound')
+    members={r.run.identity:r for r in cached.recipes if not r.run.protected_reference}
+    if (not isinstance(sensing,tuple) or len(sensing)>512
+            or any(r.run.identity not in members for r in sensing)
+            or len({r.run.identity for r in sensing})!=len(sensing)):
+        raise ValueError('joint whole sensing differs from its physical base recipes')
+    spans={(r.run.first_output_frame,r.run.end_output_frame,r.run.request_source_index):r
+        for r in members.values()}
+    by_first=defaultdict(list)
+    for r in sensing:by_first[r.run.first_output_frame].append(r)
+    families=defaultdict(list)
+    for left in sorted(sensing,key=lambda r:r.run.identity):
+        a,b=left.run.first_output_frame,left.run.end_output_frame
+        for right in sorted(by_first.get(b,()),key=lambda r:r.run.identity):
+            if left.run.request_source_index==right.run.request_source_index:continue
+            end=right.run.end_output_frame
+            hold=spans.get((a,end,left.run.request_source_index))
+            if hold is None:hold=spans.get((a,end,right.run.request_source_index))
+            if hold is None:continue  # Not a made-up continuous camera span.
+            rows=(left,right,hold)
+            identity='joint-cut-hold-'+digest(tuple(r.run.identity for r in rows))[:32]
+            families[left.run.request_source_index,right.run.request_source_index].append((identity,rows))
+    # Spread over time inside each source pair, then round-robin source pairs.
+    # This is a pre-observation work frontier, never a cut/actor quality rank.
+    ordered={}
+    for pair,rows in sorted(families.items()):
+        rows=sorted(rows,key=lambda row:(row[1][0].run.end_output_frame,row[0]))
+        width=max(1,(len(rows)-1).bit_length())
+        ordered[pair]=[r for _,r in sorted(enumerate(rows),key=lambda p:(
+            int(format(p[0],f'0{width}b')[::-1],2),p[0]))]
+    selected=[]
+    for i in range(max(map(len,ordered.values()),default=0)):
+        for pair,rows in sorted(ordered.items()):
+            if i<len(rows) and len(selected)<maximum_packages:selected.append(rows[i])
+    return tuple(selected)
+
+
+def freeze_whole_native_demands(cached, *, maximum_demands=16384, sensing_recipes=None,
+        completion_recipe_groups=()):
+    """Outcome-independent finite source/time census, BEFORE the first NN.
+
+    Each recipe requests both three-frame flanks, its midpoint and exact
+    frozen-grid bridge addresses with at most 12 native frames between them.
+    Sparse endpoints cannot become a connected path across an unobserved gap.
+    When the
+    physical union is too large, a deterministic source-balanced/time-spread
+    subset is declared once. Unrequested addresses remain UNKNOWN, not bad
+    media. No new inputs are picked after inspecting appearance or action.
+    """
+    from collections import defaultdict
+    from .group_source_changing_owner import NativeMotionDemand
+    if type(maximum_demands) is not int or not 1<=maximum_demands<=16384:
+        raise ValueError('whole native input census needs a finite declared bound')
+    physical={}
+    recipes={r.run.identity:r for r in (cached.recipes if sensing_recipes is None else sensing_recipes)}
+    for _,group in completion_recipe_groups:
+        recipes.update((r.run.identity,r) for r in group)
+    for recipe in recipes.values():
+        run=recipe.run
+        for i in _whole_native_sample_indices(recipe):
+            key=(run.request_source_index,recipe.native_frame_indices[i],None)
+            demand=NativeMotionDemand(key[0],key[1],run.first_output_frame+i,
+                f'whole-source-{key[0]}','moving_closeup',require_appearance=True)
+            prior=physical.get(key)
+            if prior is None or demand.output_tick<prior.output_tick:physical[key]=demand
+    by_source=defaultdict(list)
+    for key in sorted(physical):by_source[key[0]].append(physical[key])
+    def order(rows):
+        width=max(1,(len(rows)-1).bit_length())
+        return sorted(enumerate(rows),key=lambda p:(int(format(p[0],f'0{width}b')[::-1],2),p[0]))
+    ordered={source:order(rows) for source,rows in by_source.items()}
+    selected=[]
+    for i in range(max(map(len,ordered.values()),default=0)):
+        for source,rows in sorted(ordered.items()):
+            if i<len(rows) and len(selected)<maximum_demands:selected.append(rows[i][1])
+    return tuple(selected),dict(physical_union_count=len(physical),declared_native_inputs=len(selected),
+        unrequested_native_inputs=len(physical)-len(selected),
+        truncation_policy='pre-observation-source-balanced-bit-reversed-time-order',
+        selection_scores_used=False)
+
+
+def freeze_whole_completion_packages(sensing, demands,*,recipe_groups=None):
+    """Bind complete original requirements without shrinking them after a cap."""
+    from .group_native_motion_completion_schedule import NativeMotionCompletionPackage
+    available={d.native_key for d in demands}
+    packages=[]
+    groups=tuple((r.run.identity,(r,)) for r in sensing) if recipe_groups is None else recipe_groups
+    for identity,group in groups:
+        keys=[]
+        if len(group)>=2:
+            # Both sides of the actual cut lead the execution order. Remaining
+            # entry/exit flanks and actor/support bridges follow in THIS union.
+            left,right=group[:2]
+            keys.extend((left.run.request_source_index,n,None) for n in left.native_frame_indices[-3:])
+            keys.extend((right.run.request_source_index,n,None) for n in right.native_frame_indices[:3])
+        for recipe in group:
+            keys.extend((recipe.run.request_source_index,recipe.native_frame_indices[i],None)
+                for i in _whole_native_sample_indices(recipe))
+        keys=tuple(dict.fromkeys(keys))
+        packages.append(NativeMotionCompletionPackage(identity,keys,
+            tuple(k for k in keys if k not in available)))
+    if len(packages)>64:raise ValueError('whole native holds exceeded their frozen completion-package bound')
+    return tuple(packages)
+
+
+def union_cached_whole_demands(cached, demands, *, indexed_addresses, maximum_demands=16384,
+        check=None):
+    """Reuse all bound cache addresses that an exact candidate sampler uses.
+
+    This census occurs BEFORE the one NN completion. Address presence is not
+    successful actor evidence: conflicts/failed captures remain in the normal
+    importer, and unobserved candidate durations remain physically eligible.
+    """
+    from collections import defaultdict
+    from .group_source_changing_owner import NativeMotionDemand
+    if (type(maximum_demands) is not int or not 1<=maximum_demands<=16384
+            or not isinstance(demands,tuple) or len(demands)>maximum_demands
+            or any(not isinstance(d,NativeMotionDemand) for d in demands)
+            or not isinstance(indexed_addresses,(set,frozenset)) or len(indexed_addresses)>16384
+            or any(not isinstance(k,tuple) or len(k)!=2 or any(type(n) is not int or n<0 for n in k)
+                for k in indexed_addresses) or check is not None and not callable(check)):
+        raise ValueError('whole cache reuse needs a finite bound physical address census')
+    existing={d.native_key for d in demands};extra={}
+    for i,recipe in enumerate(cached.recipes):
+        if check is not None and i%128==0:check()
+        source=recipe.run.request_source_index
+        for offset,native in enumerate(recipe.native_frame_indices):
+            key=(source,native,None)
+            if (source,native) not in indexed_addresses or key in existing:continue
+            tick=recipe.run.first_output_frame+offset
+            extra[key]=min(tick,extra.get(key,tick))
+    by_source=defaultdict(list)
+    for key,tick in sorted(extra.items()):by_source[key[0]].append((key,tick))
+    selected=[]
+    for i in range(max(map(len,by_source.values()),default=0)):
+        for source,rows in sorted(by_source.items()):
+            if i<len(rows) and len(demands)+len(selected)<maximum_demands:
+                key,tick=rows[i]
+                selected.append(NativeMotionDemand(key[0],key[1],tick,
+                    f'whole-source-{source}','other',require_appearance=True))
+    return (*demands,*selected),dict(indexed_native_addresses=len(indexed_addresses),
+        added_cached_native_addresses=len(selected),unrequested_cached_native_addresses=len(extra)-len(selected),
+        cache_address_presence_is_observation_validation=False)
+
+
+def _opportunities(original, domain, rhythm, section_plan, protected):
+    from .group_review_interval_compile import output_offsets
+    events=set()
+    for source in domain.eligible_indices:
+        local=domain.eligible_index(source);warp=domain.source_timewarps[local]
+        for seconds in domain.cuts_for_request(source):
+            master=(seconds-domain.audio_offsets[local] if warp is None else warp.source_to_master(seconds))
+            tick=round((master-original.master_audio_start)*original.fps)
+            events.update(t for t in (tick-1,tick,tick+1) if 0<t<original.output_frame_count)
+    common=original.master_audio_start
+    return programme_opportunities(output_frame_count=original.output_frame_count,fps=original.fps,
+        beat_seconds=tuple(t-common for t in rhythm.beat_times_seconds),
+        phrase_seconds=tuple(p.start_seconds-common for p in rhythm.phrase_candidates),
+        section_seconds=tuple(s.start_seconds-common for s in section_plan.sections),
+        native_cut_ticks=tuple(sorted(events)),protected_spans=protected,
+        protected_recipe_boundaries=tuple(t for t in output_offsets(original) if any(a<t<b for a,b in protected)))
+
+
+def produce_whole_programme(*,controller,request,eligible_indices,offsets,timewarps,scene_cut_times,
+        rhythm,section_plan,domain=None,cached_inventories=None,assets=None,
+        recorded_index=None,recorded_bindings=None,maximum_new_native_inputs=512):
+    """Called only inside the SAME normal selected_completion phase.
+
+    Explicit inputs are also usable by a real-media diagnostic; they do not
+    replace normal validation, raw-parent binding or the controller itself.
+    """
+    from types import SimpleNamespace
+    from .request_work_lease import current_request_work_phase
+    from .group_joint_observations import GroupJointObservationSession,_file_identity
+    from .group_joint_source_camera import JointGroupWorkBudget
+    from .group_source_changing_owner import NativeFamilySensors,NativeMotionViews,installed_native_assets
+    from .group_review_actor_appearance import register_review_sface
+    from .face_identity import _default_model_path
+    from .render_frame_schedule import probe_render_frame_clock
+    from .group_whole_programme_native import (
+        freeze_whole_native_inventory,select_whole_native_programme,materialize_whole_native_selection,
+    )
+    port=current_request_work_phase()
+    if type(maximum_new_native_inputs) is not int or not 0<=maximum_new_native_inputs<=512:
+        raise ValueError('whole programme new native inputs need the original finite allowance')
+    if port is None or port.name!='selected_completion' or controller._request_work_lease.active is not port:
+        raise ValueError('whole GROUP production needs its existing live selected_completion lease')
+    def remaining():
+        port._check()
+        return max(.01,port.deadline-float(controller.runtime._clock()))
+    old=controller.incumbent
+    started=stage_started=monotonic();stage_seconds={}
+    from .pipeline import _validate_review_first_group_bundle
+    _validate_review_first_group_bundle(old,eligible_indices=eligible_indices,offsets=offsets,timewarps=timewarps,
+        common_start=old.render_plan.master_audio_start,phrase_times=old.phrase_times)
+    token=controller.transaction_token()
+    identities=tuple(_file_identity(old.render_plan.sources[i]) for i in eligible_indices)
+    if domain is None:
+        clocks=[]
+        for source in eligible_indices:
+            port.charge('source_probes')
+            clocks.append(probe_render_frame_clock(old.render_plan.sources[source],
+                timeout_seconds=min(10.,remaining())))
+        domain=GroupSourceDomain(old.render_plan.sources,tuple(eligible_indices),tuple(offsets),tuple(timewarps),
+            tuple(tuple(c) for c in scene_cut_times),tuple(clocks))
+    if (domain.request_sources!=old.render_plan.sources or domain.eligible_indices!=tuple(eligible_indices)
+            or domain.audio_offsets!=tuple(offsets) or domain.source_timewarps!=tuple(timewarps)
+            or domain.scene_cut_times!=tuple(tuple(c) for c in scene_cut_times)):
+        raise ValueError('whole GROUP producer changed its external alignment/source authority')
+    external=controller.external_original_reference
+    protected=() if external is None else external.protected_output_intervals
+    if external is not None:external.validate_source_domain(domain)
+    context=WholeProgrammeContext(old,domain,token,port.deadline)
+    if cached_inventories is None:
+        cached_inventories={}
+        root=getattr(request,'source_cache_directory',None)
+        derived=getattr(request,'visual_feature_derived_cache_directory',None)
+        if root is None and derived is None:
+            cached_inventories={source:CachedNativeInventory((),0,0,0,0) for source in eligible_indices}
+        else:
+            from .visual_score import _visual_analyzer_fingerprint
+            from .visual_feature_cache import PersistentVisualFeatureCache
+            analyzer=_visual_analyzer_fingerprint()
+            for source in eligible_indices:
+                cache=PersistentVisualFeatureCache(source_cache_directory=root or derived,
+                    source_path=old.render_plan.sources[source],analyzer=analyzer,derived_cache_directory=derived)
+                cached_inventories[source]=load_cached_native_inventory(cache,source_index=source,
+                    source_clock=domain.clocks_by_request[source],deadline_seconds=min(60.,remaining()))
+    opportunities=_opportunities(old.render_plan,domain,rhythm,section_plan,protected)
+    cached=build_cached_programme_inventory(original=old.render_plan,domain=domain,inventories=cached_inventories,
+        opportunities=opportunities,protected_spans=protected,maximum_seconds=min(30.,remaining()))
+    sensing=freeze_whole_sensing_recipes(cached,fps=old.render_plan.fps)
+    recipe_groups=freeze_whole_completion_recipe_groups(cached,sensing)
+    demands,census=freeze_whole_native_demands(cached,sensing_recipes=sensing,
+        completion_recipe_groups=recipe_groups)
+    census['sensed_recipe_count']=len(sensing)
+    census['all_base_run_count']=len(cached.recipes)
+    census['sensing_frontier_basis']='source-balanced-shared-seam-chains-before-observation'
+    stage_seconds['physical_inventory']=monotonic()-stage_started;stage_started=monotonic()
+    if assets is None:
+        from .body_pose_2d import RTMPOSE_BODY7_MODEL_SHA256
+        model=installed_pose_model(getattr(request,'source_cache_directory',None))
+        assets=installed_native_assets(SimpleNamespace(model_path=model,model_sha256=RTMPOSE_BODY7_MODEL_SHA256))
+    # Reserve real metadata rasters, not a second detector completion after
+    # search. NN/decode/evidence/time allowances never reset between stages.
+    budget=JointGroupWorkBudget(absolute_deadline=port.deadline,maximum_new_decodes=1024,
+        maximum_model_calls=8192,maximum_projected_cache_bytes=32*1024**2)
+    with GroupJointObservationSession(domain=domain,budget=budget) as session:
+        sensors=NativeFamilySensors(session,assets)
+        register_review_sface(session,_default_model_path())
+        fact_cache=None;cache_hit=False;cache_saved=False
+        if recorded_index is not None:
+            if recorded_bindings is None:raise ValueError('recorded native input omitted its actual source manifest')
+            sensors.bind_recorded_motion_index(recorded_index,
+                source_identities=recorded_bindings['source_identities'],
+                source_content_sha256=recorded_bindings['source_content_sha256'])
+        elif getattr(request,'source_cache_directory',None) is not None:
+            from .group_whole_native_cache import WholeNativeFactCache
+            fact_cache=WholeNativeFactCache(root=request.source_cache_directory,sensors=sensors)
+            cache_hit=fact_cache.bind_existing()
+        import json
+        from .group_performer_family_owner import digest
+        indexed=set()
+        if sensors.recorded_motion_index is not None:
+            for source,binding in sensors.recorded_motion_bindings.items():
+                aliases=[binding]
+                extra=getattr(sensors,'recorded_motion_additional_bindings',{}).get(source)
+                if extra is not None:aliases.append(extra)
+                for alias in aliases:
+                    indexed.update((source,n) for n in sensors.recorded_motion_index.native_addresses_for_binding(
+                        source=source,clock=digest(domain.clocks_by_request[source].to_dict()),
+                        identity=json.loads(alias)['recorded_file_identity']))
+        demands,cache_census=union_cached_whole_demands(cached,demands,indexed_addresses=indexed,check=port._check)
+        census.update(cache_census)
+        census['declared_native_inputs']=len(demands)
+        census['physical_union_count']+=cache_census['added_cached_native_addresses']
+        # Cache-address reuse may expand the input census, but neither a cap
+        # nor cached outcomes can shrink a package's ORIGINAL dependencies.
+        packages=freeze_whole_completion_packages(sensing,demands,recipe_groups=recipe_groups)
+        census['joint_cut_with_continuous_hold_packages']=len(packages)
+        census['original_package_requirements_before_input_cap']=sum(len(p.native_keys) for p in packages)
+        census['unrequested_original_package_requirements']=sum(len(p.unrequested_native_keys) for p in packages)
+        inventory=sensors.motion_inventory(demands)
+        # Freeze this allocation before NN outcomes. Leave time for the SAME
+        # request's whole graph, selection and real metadata pixel reads.
+        # These reserves are not a calibrated latency or quality guarantee.
+        # Previous real warm production used about 85s AFTER native work.
+        # Keep that producer/consumer reserve inside the ORIGINAL lease;
+        # otherwise a cold completion predictably spends its render/metadata
+        # runway and loses a valid plan late. This is not an app latency SLA.
+        downstream_reserve=min(85.,remaining()*.80)
+        downstream_identity_reserve=min(4096,math.ceil(
+            port.remaining_capacity(('identity_reads',))['identity_reads']*.55))
+        def preserve_downstream():
+            return (remaining()<=downstream_reserve or
+                port.remaining_capacity(('identity_reads',))['identity_reads']<=downstream_identity_reserve)
+        settled_chunks=0
+        def preserve_settled(inventory):
+            nonlocal settled_chunks
+            settled_chunks+=1
+            # Bounded checkpoints, not a quadratic full-archive rewrite on
+            # every seven-input settlement. Always persist the final snapshot.
+            if settled_chunks%4==0:fact_cache.preserve_completed(inventory)
+        completed=sensors.complete_motion_inventory_once(inventory,maximum_new_observations=maximum_new_native_inputs,
+            maximum_new_raw_observations=maximum_new_native_inputs,
+            completion_packages=packages,stop_new_work=preserve_downstream,
+            on_chunk_settled=None if fact_cache is None else preserve_settled)
+        if fact_cache is not None:cache_saved=fact_cache.preserve_completed(completed)
+        stage_seconds['cache_and_native_completion']=monotonic()-stage_started;stage_started=monotonic()
+        views=NativeMotionViews(sensors,completed)
+        complete_keys={s.demand.native_key for s in completed.supplies if s.state=='NATIVE_ROWS_AVAILABLE'}
+        complete_groups={p.identity for p in packages if set(p.native_keys)<=complete_keys}
+        joint_projection=tuple(dict.fromkeys(r.run.identity for identity,group in recipe_groups
+            if identity in complete_groups for r in group))
+        bank=freeze_whole_native_inventory(context=context,domain=domain,cached=cached,views=views,
+            protected_spans=protected,work_port=port,maximum_seconds=min(30.,remaining()),
+            completed_joint_recipe_ids=joint_projection)
+        stage_seconds['actor_paths_and_prefit_cameras']=monotonic()-stage_started;stage_started=monotonic()
+        control,selected=select_whole_native_programme(inventory=bank,work_port=port,
+            maximum_seconds=min(20.,remaining()))
+        stage_seconds['paired_whole_selection']=monotonic()-stage_started;stage_started=monotonic()
+        candidate=materialize_whole_native_selection(context=context,inventory=bank,selection=selected,views=views)
+        _validate_review_first_group_bundle(candidate,eligible_indices=eligible_indices,offsets=offsets,timewarps=timewarps,
+            common_start=old.render_plan.master_audio_start,phrase_times=old.phrase_times)
+        port._check()
+        if identities!=tuple(_file_identity(old.render_plan.sources[i]) for i in eligible_indices):
+            raise ValueError('whole GROUP source changed before atomic owner publication')
+        controller.promote(candidate,plan=candidate.render_plan,authority=candidate.candidate_origin,_token=token)
+        stage_seconds['full_native_metadata_and_publication']=monotonic()-stage_started
+        by_id={r.run.identity:r for r in bank.recipes}
+        selected_recipes=tuple(by_id[r.identity] for r in selected.runs)
+        sensing_ids={r.run.identity for r in sensing}
+        from collections import Counter
+        return dict(state='COMPLETE_WHOLE_PROGRAMME_SELECTED_FOR_REVIEW',census=census,
+            inventory=bank.evidence(),control=control.to_dict(),selected=selected.to_dict(),
+            actor_action_changed_plan=tuple(r.identity for r in control.runs)!=tuple(r.identity for r in selected.runs),
+            native_completion_status=completed.status,native_work=budget.to_dict(),
+            native_input_schedule=json.loads(completed.completion_schedule_json),
+            declared_downstream_reserve_seconds=downstream_reserve,
+            declared_downstream_identity_reads=downstream_identity_reserve,
+            native_supply_states=dict(Counter(s.state for s in completed.supplies)),
+            fully_observed_required_input_packages=sum(set(p.native_keys)<=complete_keys for p in packages),
+            native_package_inputs_certify_full_actor_or_camera_support=False,
+            selected_actor_runs=sum(r.actor_path is not None for r in selected_recipes),
+            selected_authored_camera_runs=sum(r.side is not None and r.side.camera is not None for r in selected_recipes),
+            selected_sensed_recipe_runs=sum(r.base.run.identity in sensing_ids for r in selected_recipes),
+            selected_projected_recipe_runs=sum(r.base.run.identity in bank.projected_base_recipe_ids
+                for r in selected_recipes),
+            selected_native_observed_output_frames=sum((r.run.request_source_index,n,None) in complete_keys
+                for r in selected_recipes for n in r.base.native_frame_indices),
+            selected_output_frames=sum(r.run.end_output_frame-r.run.first_output_frame for r in selected_recipes),
+            stage_seconds=stage_seconds,elapsed_seconds=monotonic()-started,
+            native_fact_cache_hit=cache_hit,native_fact_cache_preserved=cache_saved,
+            native_fact_cache_checkpoint_stride=4,
+            normal_controller_revision=controller.transaction_token().revision,
+            rendered_movie=False,professional_quality_approved=False)
+
+
+def attempt_whole_programme(*,controller,work,request,reporter=None,**inputs):
+    """One normal entry; an unavailable model is not repeated legacy work."""
+    old=controller.incumbent
+    if old.native_motion_production is not None:return None
+    # Decline unsupported active owners instead of throwing their learned,
+    # look or previous native evidence away to manufacture a passing result.
+    unsupported=tuple(name for name in ('dynamic_crop_application','cut_local_sync','splice_graph_authorization',
+        'output_geometry_deferral','stage_edit_dynamic_crop_version','stage_edit_dynamic_crop_v3_decodes',
+        'dynamic_crop_motion_timeline_v3','normal_interval_review','performer_family_review','boundary_look_match')
+        if getattr(old,name) is not None)
+    if unsupported:
+        if reporter is not None:reporter.log('전곡 native 선택 보류: 기존 활성 소유자 보존 필요 · '+', '.join(unsupported))
+        return None
+    if inputs.get('assets') is None:
+        root=getattr(request,'source_cache_directory',None)
+        if root is None or not (Path(root)/'models/source-first/rtmpose_body7.onnx').is_file():
+            if reporter is not None:reporter.log('전곡 native 선택: 설치된 RTMPose 입력 없음 · 추가 다운로드/재분석 안 함')
+            return None
+    from .request_work_lease import RequestWorkExhausted
+    from .group_joint_source_camera import JointGroupBudgetExhausted
+    try:
+        return work.run('selected_completion',lambda:controller.run_optional('whole_native_programme',
+            lambda:produce_whole_programme(controller=controller,request=request,**inputs)))
+    except (RequestWorkExhausted,JointGroupBudgetExhausted,TimeoutError) as exc:
+        if reporter is not None:reporter.log('전곡 native 선택 예산 종료 · 완전한 incumbent 유지 · '+str(exc))
+        return None

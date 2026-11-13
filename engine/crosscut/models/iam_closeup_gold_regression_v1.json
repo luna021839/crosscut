@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "contract": "user_approved_scalar_only_closeup_boundary_regression_exemplar_v1",
+  "analysis_basis": "iam_local_51_57s_exact_endpoint_scalar_regression_v1",
+  "scope": {
+    "artist": "IVE",
+    "song": "I AM",
+    "review_window_start_seconds": 51.0,
+    "review_window_end_seconds": 57.0,
+    "fps": 29.97,
+    "video_sha256": "cfe23a5f4053484f379559c3f6bcb754593bdbd5c9dd3581b33e270ec190c2c5",
+    "render_plan_sha256": "69240e1b5431ca6f80febe424587ceabd0a60d40b1e548f40945c01526b1a6d8",
+    "analysis_sha256": "bd41d295704fcaee449d12371c093b72b08a7c7455342d1234f909c8384826e7"
+  },
+  "artifact_policy": {
+    "artifact_role": "regression_exemplar",
+    "user_approved_positive": true,
+    "calibration_authority": false,
+    "hard_gate": false,
+    "production_selection_authority": false,
+    "may_activate_direction_threshold": false
+  },
+  "privacy": {
+    "derived_scalars_only": true,
+    "raw_vectors_stored": false,
+    "raw_pixels_stored": false,
+    "local_absolute_paths_stored": false,
+    "appearance_embeddings_stored": false,
+    "face_identity_claimed": false
+  },
+  "measurement_contract": {
+    "shot_type": "closeup",
+    "face_detector_backend": "yunet",
+    "face_detector_model_name": "face_detection_yunet_2023mar.onnx",
+    "face_detector_model_sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    "pose_endpoint_backend": "opencv_zoo_mediapipe_pose_2023mar",
+    "both_endpoints_require_exact_backends": true,
+    "face_height_ratio_semantics": "incoming_face_height_over_outgoing_face_height",
+    "center_delta_semantics": "normalized_output_frame_euclidean_distance",
+    "endpoint_pose_cosine_semantics": "identity_free_same_time_endpoint_pose_shape_cosine_not_motion_direction",
+    "motion_direction_cosine_semantics": "audit_only_unbound",
+    "motion_phase_semantics": "derived_scalar_audit_only"
+  },
+  "professional_motion_profile_reference": {
+    "schema_version": 1,
+    "analysis_basis": "ive_20_human_reference_build_chorus_bridge_close_switch_motion_profile_v1",
+    "file_sha256": "005a21f79ab1e0b5de76d3299ca2f61b54eb460b88cfb2f88dd392d93e9419b6",
+    "content_sha256": "9f70c549acbda2e80f3497b57c189ddbb5df4e4bbd4f5eda9095c5af699ae680",
+    "recommendation_contract": "both_moving_pose_phase_compatible_continuity_compatible_bounded_soft_v1",
+    "both_moving_minimum_pose_motion": 0.0002705025925969218,
+    "continuity_compatible_minimum_score": -0.49213925079872173,
+    "same_time_pose_soft_qualifier_cosine": 0.8486102174679628,
+    "same_time_pose_is_hard_threshold": false,
+    "direction_threshold_bound": false,
+    "direction_used_for_activation": false
+  },
+  "boundaries": [
+    {
+      "frame_index": 1607,
+      "master_time_seconds": 53.6202869536,
+      "classification": "user_approved_positive_cross_broadcaster_closeup",
+      "outgoing": {
+        "source_index": 8,
+        "youtube_video_id": "5MGr54kHBQk",
+        "broadcaster": "Mnet"
+      },
+      "incoming": {
+        "source_index": 6,
+        "youtube_video_id": "vMXGX4Dp3iM",
+        "broadcaster": "MBC"
+      },
+      "endpoint_backends": {
+        "outgoing_face_detector": "yunet",
+        "incoming_face_detector": "yunet",
+        "outgoing_pose_backend": "opencv_zoo_mediapipe_pose_2023mar",
+        "incoming_pose_backend": "opencv_zoo_mediapipe_pose_2023mar"
+      },
+      "metrics": {
+        "face_height_ratio": 0.9582126995,
+        "center_delta": 0.0734785017,
+        "endpoint_pose_cosine": 0.9519863859,
+        "outgoing_pose_motion": 3.8699323369,
+        "incoming_pose_motion": 4.7729826637,
+        "motion_direction_cosine": -0.0451399044,
+        "motion_phase": 0.4774300478
+      }
+    },
+    {
+      "frame_index": 1640,
+      "master_time_seconds": 54.7213880547,
+      "classification": "user_approved_positive_cross_broadcaster_closeup",
+      "outgoing": {
+        "source_index": 6,
+        "youtube_video_id": "vMXGX4Dp3iM",
+        "broadcaster": "MBC"
+      },
+      "incoming": {
+        "source_index": 1,
+        "youtube_video_id": "dus7C4CTWUk",
+        "broadcaster": "Mnet"
+      },
+      "endpoint_backends": {
+        "outgoing_face_detector": "yunet",
+        "incoming_face_detector": "yunet",
+        "outgoing_pose_backend": "opencv_zoo_mediapipe_pose_2023mar",
+        "incoming_pose_backend": "opencv_zoo_mediapipe_pose_2023mar"
+      },
+      "metrics": {
+        "face_height_ratio": 1.0021320687,
+        "center_delta": 0.0601054621,
+        "endpoint_pose_cosine": 0.8722635848,
+        "outgoing_pose_motion": 7.3771830875,
+        "incoming_pose_motion": 4.3790995944,
+        "motion_direction_cosine": -0.2934741370,
+        "motion_phase": 0.3532629315
+      }
+    }
+  ],
+  "provenance": {
+    "content_hash_algorithm": "sha256_of_canonical_json_with_provenance_content_sha256_null",
+    "content_sha256": "09cb801bbf90edff6444968db7f9ed67f1e5c93b50778502db57fd33f6a64cef",
+    "source_hashes_bound": true,
+    "user_approval_bound": true
+  }
+}

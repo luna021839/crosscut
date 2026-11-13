@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>교차편집 유지·전환 비교 — 실제 응답 전 미평가</title>
+<style>
+body{font:16px system-ui;background:#12171d;color:#edf1f5;margin:26px auto;padding:0 20px;max-width:1420px}h1{font-size:25px}p{line-height:1.6;color:#bac8d4}.pair{background:#1c252f;border:1px solid #425467;border-radius:12px;padding:18px;margin:22px 0}.videos{display:grid;grid-template-columns:1fr 1fr;gap:18px}video{width:100%;background:black}button,select,textarea{font:inherit;color:inherit;background:#293a4a;border:1px solid #667d93;border-radius:6px;padding:9px;margin:6px 8px 6px 0}button{cursor:pointer}textarea{box-sizing:border-box;width:100%;height:64px}label{display:inline-block;margin:8px 10px 8px 0}small{color:#b6c5d2}#status{position:sticky;top:0;background:#12171d;padding:12px;border-bottom:1px solid #667d93;z-index:2}@media(max-width:850px){.videos{grid-template-columns:1fr}}
+</style>
+<h1>같은 장면, 화면을 유지할까 전환할까</h1>
+<p>각 A/B는 약 8초입니다. 앞 약 4초는 같은 실제 편집이고, 가운데 이후 한쪽만 다른 무대로 바뀝니다. 얼굴 크기뿐 아니라 같은 인물·팔과 몸 동작·전환 타이밍을 함께 봐 주세요. 완성본이나 품질 합격 자료가 아닙니다.</p>
+<p>좋다고 했던 XOXZ 21–25초·55.5–73.4초와 겹치는 문맥은 제외했습니다. 일부 대안에는 원본 방송의 카메라 컷이 그대로 있습니다. 선택은 이 브라우저에만 저장되며, 내보내기 전에는 학습 자료로 쓰지 않습니다.</p>
+<div id="status">실제 영상 불러오는 중…</div><main></main>
+<button id="export" disabled>내 평가 JSON 내보내기</button><small>동률·둘 다 별로·판단 불가도 그대로 남깁니다.</small>
+<script>
+'use strict';
+let packet,packetHash,labels={},playing=null;const telemetry={};
+const status=document.querySelector('#status'),main=document.querySelector('main');
+function create(tag,text,parent){const node=document.createElement(tag);if(text)node.textContent=text;if(parent)parent.append(node);return node;}
+function update(){const n=Object.values(labels).filter(x=>x.choice).length;status.textContent=`${n} / ${packet.events.length} 평가됨 · ${n?'브라우저에만 저장됨 · 아직 학습하지 않음':'실제 입력된 선호 라벨 0개'}`;}
+function save(){localStorage.setItem('ive-hk-'+packetHash,JSON.stringify(labels));update();}
+function stop(except){document.querySelectorAll('video').forEach(v=>{if(v!==except)v.pause();});}
+async function init(){
+ const response=await fetch('manifest.json',{cache:'no-store'});if(!response.ok)throw Error('manifest unavailable');
+ const raw=await response.arrayBuffer();packet=JSON.parse(new TextDecoder().decode(raw));
+ packetHash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',raw))].map(x=>x.toString(16).padStart(2,'0')).join('');
+ if(packet.contract!=='unlabelled_same_event_hk_av_pairs_v2'||packet.actual_human_preferences_obtained!==false)throw Error('wrong packet');
+ labels=JSON.parse(localStorage.getItem('ive-hk-'+packetHash)||'{}');
+ for(const item of packet.events){
+  const section=create('section',null,main);section.className='pair';create('h2',item.id,section);
+  create('small',`전환 비교 지점: 재생 시작 ${packet.branch_at_seconds.toFixed(2)}초 뒤 · 순서만 A/B로 가림`,section);
+  const grid=create('div',null,section);grid.className='videos';const videos=[];telemetry[item.id]={};
+  for(const letter of ['A','B']){
+   const box=create('div',null,grid);create('h3',letter,box);const video=create('video',null,box);
+   video.controls=true;video.preload='metadata';video.playsInline=true;video.src=item.clips[letter];videos.push(video);
+   const events={normal_speed_started:false,ended:false};telemetry[item.id][letter]=events;
+   video.addEventListener('play',()=>{if(playing&&playing.expected!==video){playing.aborted=true;playing.resolve?.();}stop(video);if(video.playbackRate===1&&!video.muted&&video.volume>0)events.normal_speed_started=true;});
+   video.addEventListener('ended',()=>events.ended=true);
+  }
+  const play=create('button','A → B 소리 켜고 순서대로 재생',section);
+  play.addEventListener('click',async()=>{
+   if(playing){playing.aborted=true;playing.resolve?.();stop();}
+   const sequence={aborted:false,resolve:null,expected:null};playing=sequence;play.disabled=true;
+   try{for(const video of videos){if(sequence.aborted)break;sequence.expected=video;stop(video);video.currentTime=0;video.playbackRate=1;video.muted=false;
+    const ended=new Promise(resolve=>{sequence.resolve=resolve;video.addEventListener('ended',resolve,{once:true});video.addEventListener('error',resolve,{once:true});});
+    await video.play();await ended;}}
+   catch(error){create('p','재생 버튼으로 각 영상을 직접 확인해 주세요.',section);}
+   finally{if(playing===sequence)playing=null;play.disabled=false;}
+  });
+  const line=create('label','전체적으로 더 자연스럽고 볼만한 쪽: ',section);const select=create('select',null,line);
+  for(const [value,title] of [['','선택 안 함'],['A','A가 낫다'],['B','B가 낫다'],['tie','비슷함'],['all_bad','둘 다 별로임'],['uncertain','판단 불가']]){const option=create('option',title,select);option.value=value;}
+  const note=create('textarea',null,section);note.placeholder='얼굴 크기 / 같은 인물 / 팔·몸 동작 / 전환 타이밍 등 (선택)';
+  const row=labels[item.id]||{};select.value=row.choice||'';note.value=row.note||'';
+  const checkLabel=create('label',null,section);const check=create('input',null,checkLabel);check.type='checkbox';check.checked=!!row.self_reported_normal_av;
+  checkLabel.append(document.createTextNode('A/B를 1배속·소리와 함께 확인했음 (자가 확인)'));
+  function changed(){labels[item.id]={id:item.id,choice:select.value,note:note.value,self_reported_normal_av:check.checked,
+    provenance:'user_browser_choice',at:new Date().toISOString()};save();}
+  select.addEventListener('change',changed);note.addEventListener('input',changed);check.addEventListener('change',changed);
+ }
+ document.querySelector('#export').disabled=false;update();
+}
+document.querySelector('#export').addEventListener('click',()=>{
+ const payload={contract:'same_event_user_hk_annotations_v2',packet_sha256:packetHash,labels:Object.values(labels),
+  playback_events_advisory_only:telemetry,playback_events_do_not_prove_audio_was_heard:true,professional_quality_approved:false};
+ const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'}));
+ const link=document.createElement('a');link.href=url;link.download='IVE-HK-user-preferences.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+init().catch(error=>status.textContent='자료를 읽지 못했습니다: '+error.message);
+</script></html>
